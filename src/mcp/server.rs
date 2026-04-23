@@ -4,7 +4,6 @@
 
 use super::types::*;
 use crate::auth::{AuthManager, AuthResult, Permission};
-use crate::plugins::PluginInstaller;
 use crate::server::VultrinoServer;
 use crate::{CredentialMetadata, ExecuteRequest};
 use glob::Pattern;
@@ -269,52 +268,51 @@ impl McpServer {
             },
         ];
 
-        // Add tools from installed plugins
-        if let Ok(plugin_tools) = self.get_plugin_tools().await {
-            tools.extend(plugin_tools);
-        }
+        // Add tools from every live plugin in the registry (built-in + loaded
+        // installed plugins). The registry is the single source of truth —
+        // disabled installed plugins are filtered out at load time.
+        tools.extend(self.get_plugin_tools().await);
 
         let result = ToolsListResult { tools };
         serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
     }
 
-    /// Get tools from installed plugins
-    async fn get_plugin_tools(&self) -> Result<Vec<Tool>, Box<dyn std::error::Error + Send + Sync>> {
-        let installer = PluginInstaller::default();
-        let installed = installer.list().await?;
+    /// Enumerate MCP tools from every live plugin in the registry.
+    ///
+    /// Tool names are prefixed with the plugin name — `{plugin}_{tool}` — so
+    /// two plugins can expose same-named tools without collision. Schemas are
+    /// sourced in priority order:
+    ///   1. Manifest-derived (installed plugins: pulls action parameters)
+    ///   2. `McpToolDefinition::input_schema` (built-in plugins set this)
+    ///   3. A minimal `{credential}` default
+    async fn get_plugin_tools(&self) -> Vec<Tool> {
+        let vultrino = self.vultrino.read().await;
+        let plugins = vultrino.plugins().all();
+        drop(vultrino);
 
         let mut tools = Vec::new();
+        for plugin in plugins {
+            let plugin_name = plugin.name().to_string();
+            let manifest = plugin.manifest();
 
-        for info in installed {
-            if !info.enabled {
-                continue;
-            }
+            for mcp_tool in plugin.mcp_tool_definitions() {
+                let mut input_schema = manifest
+                    .and_then(|m| m.actions.iter().find(|a| a.name == mcp_tool.action))
+                    .map(|action| mcp_tool.generate_input_schema(action))
+                    .or_else(|| mcp_tool.input_schema.clone())
+                    .unwrap_or_else(|| {
+                        json!({
+                            "type": "object",
+                            "properties": {
+                                "credential": {
+                                    "type": "string",
+                                    "description": "Credential alias to use"
+                                }
+                            },
+                            "required": ["credential"]
+                        })
+                    });
 
-            for mcp_tool in &info.manifest.mcp_tools {
-                // Find the corresponding action to generate schema
-                let action = info
-                    .manifest
-                    .actions
-                    .iter()
-                    .find(|a| a.name == mcp_tool.action);
-
-                let mut input_schema = if let Some(action) = action {
-                    mcp_tool.generate_input_schema(action)
-                } else {
-                    // Default schema with just credential
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "credential": {
-                                "type": "string",
-                                "description": "Credential alias to use"
-                            }
-                        },
-                        "required": ["credential"]
-                    })
-                };
-
-                // Add api_key to all plugin tools
                 if let Some(props) = input_schema.get_mut("properties") {
                     props["api_key"] = json!({
                         "type": "string",
@@ -323,15 +321,17 @@ impl McpServer {
                 }
                 if let Some(required) = input_schema.get_mut("required") {
                     if let Some(arr) = required.as_array_mut() {
-                        arr.insert(0, json!("api_key"));
+                        if !arr.iter().any(|v| v.as_str() == Some("api_key")) {
+                            arr.insert(0, json!("api_key"));
+                        }
                     }
                 }
 
-                let tool_name = format!("{}_{}", info.manifest.plugin.name.replace('-', "_"), mcp_tool.name);
+                let tool_name = format!("{}_{}", plugin_name.replace('-', "_"), mcp_tool.name);
                 let description = mcp_tool
                     .description
                     .clone()
-                    .unwrap_or_else(|| format!("{} from {} plugin", mcp_tool.action, info.manifest.plugin.name));
+                    .unwrap_or_else(|| format!("{} from {} plugin", mcp_tool.action, plugin_name));
 
                 tools.push(Tool {
                     name: tool_name,
@@ -340,8 +340,7 @@ impl McpServer {
                 });
             }
         }
-
-        Ok(tools)
+        tools
     }
 
     /// Handle tools/call request
@@ -409,71 +408,55 @@ impl McpServer {
             return Some(Err(msg));
         }
 
-        // Find the plugin and tool
-        let installer = PluginInstaller::default();
-        let installed = match installer.list().await {
-            Ok(list) => list,
-            Err(e) => return Some(Err(format!("Failed to list plugins: {}", e))),
-        };
+        // Walk the registry (single source of truth for live plugins) to
+        // find the plugin that owns `tool_name`.
+        let vultrino = self.vultrino.read().await;
+        let plugins = vultrino.plugins().all();
+        drop(vultrino);
 
-        for info in installed {
-            if !info.enabled {
+        for plugin in plugins {
+            let plugin_name = plugin.name().to_string();
+            let prefix = format!("{}_", plugin_name.replace('-', "_"));
+            if !tool_name.starts_with(&prefix) {
                 continue;
             }
+            let short_name = &tool_name[prefix.len()..];
 
-            let plugin_prefix = format!("{}_", info.manifest.plugin.name.replace('-', "_"));
-            if !tool_name.starts_with(&plugin_prefix) {
-                continue;
-            }
-
-            let short_name = &tool_name[plugin_prefix.len()..];
-
-            // Find the MCP tool definition
-            let mcp_tool = match info
-                .manifest
-                .mcp_tools
-                .iter()
+            let mcp_tool = match plugin
+                .mcp_tool_definitions()
+                .into_iter()
                 .find(|t| t.name == short_name)
             {
                 Some(t) => t,
                 None => continue,
             };
 
-            // Get the credential from args
             let credential = match args.get("credential").and_then(|v| v.as_str()) {
                 Some(c) => c.to_string(),
                 None => return Some(Err("Missing 'credential' argument".to_string())),
             };
 
-            // Check credential access
             if let Err(msg) = Self::check_credential_access(&auth, &credential) {
                 return Some(Err(msg));
             }
 
-            // Build execute request for the plugin action
             let request = ExecuteRequest {
                 credential: credential.clone(),
-                action: format!("{}.{}", info.manifest.plugin.name, mcp_tool.action),
+                action: format!("{}.{}", plugin_name, mcp_tool.action),
                 params: args.clone(),
             };
 
-            // Execute through Vultrino
             let vultrino = self.vultrino.read().await;
-            let response = match vultrino
-                .execute_with_auth(request, Some(&auth))
-                .await
-            {
+            let response = match vultrino.execute_with_auth(request, Some(&auth)).await {
                 Ok(r) => r,
                 Err(e) => return Some(Err(format!("Plugin execution failed: {}", e))),
             };
 
-            // Format response
             let body_text = String::from_utf8_lossy(&response.body);
             let output = format!(
                 "Plugin: {} | Action: {}\nStatus: {}\n\nResult:\n{}",
-                info.manifest.plugin.name, mcp_tool.action, response.status, body_text
+                plugin_name, mcp_tool.action, response.status, body_text
             );
-
             return Some(Ok(vec![ToolContent::Text { text: output }]));
         }
 

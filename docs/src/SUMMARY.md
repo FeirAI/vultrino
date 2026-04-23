@@ -36,6 +36,7 @@
 - [Installing Plugins](./plugins/installing.md)
 - [Developing Plugins](./plugins/developing.md)
 - [PGP Signing](./plugins/pgp.md)
+- [SSH (Deploy & Remote Exec)](./plugins/ssh.md)
 
 # API Reference
 

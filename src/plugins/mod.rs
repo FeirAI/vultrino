@@ -12,6 +12,7 @@
 mod http;
 mod hmac;
 mod ecdsa;
+mod ssh;
 pub mod installer;
 pub mod loader;
 pub mod types;
@@ -20,6 +21,7 @@ pub mod wasm;
 pub use http::HttpPlugin;
 pub use hmac::HmacPlugin;
 pub use ecdsa::EcdsaPlugin;
+pub use ssh::SshPlugin;
 pub use installer::PluginInstaller;
 pub use loader::{PluginLoader, PluginRegistryExt};
 pub use types::{
@@ -191,6 +193,7 @@ impl PluginRegistry {
         registry.register(Arc::new(HttpPlugin::new()));
         registry.register(Arc::new(HmacPlugin::new()));
         registry.register(Arc::new(EcdsaPlugin::new()));
+        registry.register(Arc::new(SshPlugin::new()));
 
         registry
     }
@@ -403,5 +406,31 @@ mod tests {
         let registry = PluginRegistry::new();
         let names = registry.list();
         assert!(names.contains(&"http".to_string()));
+    }
+
+    #[test]
+    fn test_registry_exposes_builtin_ssh_mcp_tools() {
+        // Regression guard: MCP agents can only reach a built-in plugin's
+        // tools if `all_mcp_tools()` surfaces them. The mcp/server.rs layer
+        // walks this list when building tools/list and dispatching
+        // tools/call. If this assertion breaks, ssh_deploy / ssh_run will
+        // silently disappear from agent tool lists.
+        let registry = PluginRegistry::new();
+        let pairs = registry.all_mcp_tools();
+        let tool_names: Vec<String> = pairs
+            .iter()
+            .filter(|(p, _)| p == "ssh")
+            .map(|(_, t)| t.name.clone())
+            .collect();
+        assert!(
+            tool_names.contains(&"deploy".to_string()),
+            "ssh plugin must expose a 'deploy' MCP tool; got {:?}",
+            tool_names
+        );
+        assert!(
+            tool_names.contains(&"run".to_string()),
+            "ssh plugin must expose a 'run' MCP tool; got {:?}",
+            tool_names
+        );
     }
 }

@@ -100,8 +100,15 @@ vultrino add --alias <name> -t oauth2 \        # Add OAuth2 credential
   --client-id <id> --client-secret <secret> \
   --token-url https://oauth.example.com/token \
   --scopes "read,write"
+vultrino add --alias <name> -t ssh_password \  # Add SSH (password) credential
+  --ssh-host <host> --ssh-user <user>          # for ssh plugin deploy/run
 vultrino list                                   # List all credentials
 vultrino remove <alias>                         # Remove a credential
+
+# Per-credential defaults (non-secret configuration)
+vultrino meta set <alias> <key> <value>         # e.g. deploy.source_dir, run.commands
+vultrino meta list <alias>                      # Show all metadata for a credential
+vultrino meta unset <alias> <key>               # Remove a metadata key
 
 # Making Requests
 vultrino request <alias> <url>                  # GET request
@@ -110,6 +117,8 @@ vultrino request <alias> <url> -X POST -d '{}'  # POST with body
 # Plugin Actions
 vultrino action <credential> <plugin.action>    # Execute plugin action
 vultrino action my-pgp pgp-signing.sign_cleartext -p '{"data":"Hello"}'
+vultrino action my-server ssh.deploy            # Rsync via stored SSH credential
+vultrino action my-server ssh.run               # Run a configured command sequence
 
 # Plugin Management
 vultrino plugin install <path-or-url>           # Install a plugin
@@ -245,7 +254,18 @@ Available MCP tools:
 
 ## Plugin System
 
-Vultrino supports WASM plugins for extending functionality with custom credential types and actions.
+Vultrino ships with built-in plugins and also supports WASM plugins for extending functionality with custom credential types and actions.
+
+### Built-in Plugins
+
+| Plugin | Credential Types          | Actions                                 |
+|--------|---------------------------|-----------------------------------------|
+| `http` | `api_key`, `basic_auth`, `oauth2` | `request`                       |
+| `hmac` | `hmac_api_key`            | `request`, `sign`                       |
+| `ecdsa`| `ecdsa_key`               | `sign`, `sign_l1_action`                |
+| `ssh`  | `ssh_password`            | `deploy` (rsync), `run` (remote exec)   |
+
+The `ssh` plugin requires `sshpass`, `ssh`, and `rsync` on the host's `PATH`. See [the SSH plugin docs](docs/src/plugins/ssh.md) for the full credential schema, metadata keys, override-lock model, and a worked deploy + restart example.
 
 ### Installing Plugins
 
@@ -325,7 +345,8 @@ cargo build --release --target wasm32-wasip1
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `VULTRINO_PASSWORD` | Storage encryption password | Required |
+| `VULTRINO_PASSWORD` | Storage encryption password | Required (or prompts / `VULTRINO_PASSWORD_FILE`) |
+| `VULTRINO_PASSWORD_FILE` | Path to a file containing the storage password. Useful for unattended agents — `chmod 600` it; trailing newline is stripped. Ignored if `VULTRINO_PASSWORD` is also set. | — |
 | `VULTRINO_DATA_DIR` | Data directory path | `~/.vultrino` or platform default |
 
 ### Storage Location
@@ -349,6 +370,9 @@ cargo build --release --target wasm32-wasip1
 | `api_key` | API key/token | Header injection (default: `Authorization: Bearer <key>`) |
 | `basic_auth` | Username/password | Base64 encoded `Authorization: Basic` header |
 | `oauth2` | OAuth2 client credentials | Automatic token fetch/refresh, `Authorization: Bearer <token>` |
+| `hmac_api_key` | HMAC-signed API key (e.g. Binance-style exchanges) | SHA-256 signature over query string / body |
+| `ecdsa_key` | ECDSA private key (Ethereum / Hyperliquid) | On-the-fly signing of requests or arbitrary payloads |
+| `ssh_password` | SSH host + password (for `ssh` plugin) | `sshpass`-fed password to `ssh` / `rsync`; password never leaves Vultrino |
 
 ### Best Practices
 

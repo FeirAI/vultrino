@@ -69,6 +69,8 @@ pub enum CredentialType {
     HmacApiKey,
     /// ECDSA private key for signing (e.g., Ethereum, Hyperliquid)
     EcdsaKey,
+    /// SSH connection with password authentication
+    SshPassword,
     /// Custom credential type
     Custom(String),
 }
@@ -83,6 +85,7 @@ impl std::fmt::Display for CredentialType {
             CredentialType::Certificate => write!(f, "certificate"),
             CredentialType::HmacApiKey => write!(f, "hmac_api_key"),
             CredentialType::EcdsaKey => write!(f, "ecdsa_key"),
+            CredentialType::SshPassword => write!(f, "ssh_password"),
             CredentialType::Custom(name) => write!(f, "custom:{}", name),
         }
     }
@@ -217,6 +220,19 @@ pub enum CredentialData {
         testnet: bool,
     },
 
+    /// SSH connection with password authentication
+    SshPassword {
+        /// Hostname or IP address of the SSH server
+        host: String,
+        /// SSH port (default: 22)
+        #[serde(default = "default_ssh_port")]
+        port: u16,
+        /// SSH username
+        user: String,
+        /// SSH password (required by sshpass)
+        password: Secret,
+    },
+
     /// Custom credential data
     Custom(HashMap<String, Secret>),
 }
@@ -237,6 +253,10 @@ fn default_recv_window() -> u64 {
     5000
 }
 
+fn default_ssh_port() -> u16 {
+    22
+}
+
 impl CredentialData {
     /// Get the credential type for this data
     pub fn credential_type(&self) -> CredentialType {
@@ -248,6 +268,7 @@ impl CredentialData {
             CredentialData::Certificate { .. } => CredentialType::Certificate,
             CredentialData::HmacApiKey { .. } => CredentialType::HmacApiKey,
             CredentialData::EcdsaKey { .. } => CredentialType::EcdsaKey,
+            CredentialData::SshPassword { .. } => CredentialType::SshPassword,
             CredentialData::Custom(_) => CredentialType::Custom("custom".to_string()),
         }
     }

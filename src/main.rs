@@ -45,6 +45,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Start the Vultrino server
     Serve {
@@ -138,6 +139,22 @@ enum Commands {
         /// Use testnet (for ecdsa_key type)
         #[arg(long)]
         testnet: bool,
+
+        /// SSH host (for ssh_password type)
+        #[arg(long)]
+        ssh_host: Option<String>,
+
+        /// SSH port (for ssh_password type, default: 22)
+        #[arg(long, default_value = "22")]
+        ssh_port: u16,
+
+        /// SSH username (for ssh_password type)
+        #[arg(long)]
+        ssh_user: Option<String>,
+
+        /// SSH password (for ssh_password type, will prompt if not provided)
+        #[arg(long)]
+        ssh_password: Option<String>,
     },
 
     /// List stored credentials
@@ -236,6 +253,37 @@ enum Commands {
         /// Output only the result (no status info)
         #[arg(short, long)]
         quiet: bool,
+    },
+
+    /// Manage credential metadata (non-secret per-instance configuration)
+    Meta {
+        #[command(subcommand)]
+        command: MetaCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum MetaCommands {
+    /// Set a metadata key on a credential
+    Set {
+        /// Credential alias or ID
+        alias: String,
+        /// Metadata key (e.g., "deploy.source_dir")
+        key: String,
+        /// Value to set (use @filename to read from a file)
+        value: String,
+    },
+    /// Remove a metadata key from a credential
+    Unset {
+        /// Credential alias or ID
+        alias: String,
+        /// Metadata key to remove
+        key: String,
+    },
+    /// List all metadata keys on a credential
+    List {
+        /// Credential alias or ID
+        alias: String,
     },
 }
 
@@ -404,6 +452,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             private_key,
             api_address,
             testnet,
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_password,
         } => {
             add_credential(
                 config,
@@ -428,6 +480,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     private_key,
                     api_address,
                     testnet,
+                    ssh_host,
+                    ssh_port,
+                    ssh_user,
+                    ssh_password,
                 },
             )
             .await?;
@@ -515,22 +571,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 reload_plugin(name).await?;
             }
         },
+        Commands::Meta { command } => match command {
+            MetaCommands::Set { alias, key, value } => {
+                metadata_set(config, alias, key, value).await?;
+            }
+            MetaCommands::Unset { alias, key } => {
+                metadata_unset(config, alias, key).await?;
+            }
+            MetaCommands::List { alias } => {
+                metadata_list(config, alias).await?;
+            }
+        },
     }
 
     Ok(())
 }
 
-/// Get the storage password from environment or prompt
+/// Get the storage password.
+///
+/// Source precedence, so agents and CI can run non-interactively:
+///   1. `VULTRINO_PASSWORD`      — password inline in env
+///   2. `VULTRINO_PASSWORD_FILE` — path to a file whose contents are the password
+///   3. Interactive prompt
+///
+/// For the file path, we trim trailing whitespace/newlines and warn on Unix if
+/// the file's permissions are world/group readable — the file is effectively
+/// the encryption key, so it should be `chmod 600`.
 fn get_storage_password() -> Result<SecretString, Box<dyn std::error::Error>> {
-    // Check environment variable first
     if let Ok(password) = std::env::var("VULTRINO_PASSWORD") {
         return Ok(SecretString::from(password));
     }
 
-    // Prompt for password
+    if let Ok(path) = std::env::var("VULTRINO_PASSWORD_FILE") {
+        let path = std::path::PathBuf::from(path);
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            format!(
+                "VULTRINO_PASSWORD_FILE {}: {}",
+                path.display(),
+                e
+            )
+        })?;
+        let password = raw.trim_end_matches(['\n', '\r']).to_string();
+        if password.is_empty() {
+            return Err(format!(
+                "VULTRINO_PASSWORD_FILE {} is empty",
+                path.display()
+            )
+            .into());
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    eprintln!(
+                        "warning: {} has permissions {:o} (should be 600); this file is your vault encryption key",
+                        path.display(),
+                        mode
+                    );
+                }
+            }
+        }
+
+        return Ok(SecretString::from(password));
+    }
+
     eprint!("Enter storage password: ");
     io::stderr().flush()?;
-
     let password = rpassword::read_password()?;
     Ok(SecretString::from(password))
 }
@@ -712,6 +821,11 @@ struct AddCredentialArgs {
     private_key: Option<String>,
     api_address: Option<String>,
     testnet: bool,
+    // SSH Password fields
+    ssh_host: Option<String>,
+    ssh_port: u16,
+    ssh_user: Option<String>,
+    ssh_password: Option<String>,
 }
 
 /// Add a new credential
@@ -812,6 +926,23 @@ async fn add_credential(
                 private_key: Secret::new(private_key),
                 api_address: args.api_address,
                 testnet: args.testnet,
+            }
+        }
+        "ssh_password" => {
+            let host = args.ssh_host.ok_or("SSH host is required (--ssh-host)")?;
+            let user = args.ssh_user.ok_or("SSH user is required (--ssh-user)")?;
+            let password = if let Some(p) = args.ssh_password {
+                p
+            } else {
+                eprint!("Enter SSH password: ");
+                io::stderr().flush()?;
+                rpassword::read_password()?
+            };
+            CredentialData::SshPassword {
+                host,
+                port: args.ssh_port,
+                user,
+                password: Secret::new(password),
             }
         }
         other => {
@@ -922,6 +1053,78 @@ async fn show_credential_info(config: Config, alias: String) -> Result<(), Box<d
         }
     }
 
+    Ok(())
+}
+
+async fn load_credential_mut(
+    storage: &Arc<dyn StorageBackend>,
+    alias: &str,
+) -> Result<Credential, Box<dyn std::error::Error>> {
+    storage
+        .get_by_alias(alias)
+        .await?
+        .or(storage.get(alias).await?)
+        .ok_or_else(|| format!("Credential '{}' not found", alias).into())
+}
+
+async fn metadata_set(
+    config: Config,
+    alias: String,
+    key: String,
+    value: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = init_storage(&config).await?;
+    let mut credential = load_credential_mut(&storage, &alias).await?;
+
+    let resolved_value = if let Some(path) = value.strip_prefix('@') {
+        std::fs::read_to_string(path)?.trim_end().to_string()
+    } else {
+        value
+    };
+
+    credential
+        .metadata
+        .insert(key.clone(), resolved_value.clone());
+    credential.updated_at = chrono::Utc::now();
+    storage.update(&credential).await?;
+
+    println!("Set {}={} on '{}'", key, resolved_value, credential.alias);
+    Ok(())
+}
+
+async fn metadata_unset(
+    config: Config,
+    alias: String,
+    key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = init_storage(&config).await?;
+    let mut credential = load_credential_mut(&storage, &alias).await?;
+
+    if credential.metadata.remove(&key).is_none() {
+        println!("Metadata key '{}' not found on '{}'", key, credential.alias);
+        return Ok(());
+    }
+    credential.updated_at = chrono::Utc::now();
+    storage.update(&credential).await?;
+
+    println!("Removed {} from '{}'", key, credential.alias);
+    Ok(())
+}
+
+async fn metadata_list(
+    config: Config,
+    alias: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = init_storage(&config).await?;
+    let credential = load_credential_mut(&storage, &alias).await?;
+
+    if credential.metadata.is_empty() {
+        println!("No metadata set on '{}'", credential.alias);
+    } else {
+        for (key, value) in &credential.metadata {
+            println!("{}={}", key, value);
+        }
+    }
     Ok(())
 }
 
