@@ -155,6 +155,30 @@ enum Commands {
         /// SSH password (for ssh_password type, will prompt if not provided)
         #[arg(long)]
         ssh_password: Option<String>,
+
+        /// Postgres host (for postgres type)
+        #[arg(long)]
+        pg_host: Option<String>,
+
+        /// Postgres port (for postgres type, default: 5432)
+        #[arg(long, default_value = "5432")]
+        pg_port: u16,
+
+        /// Postgres database name (for postgres type)
+        #[arg(long)]
+        pg_database: Option<String>,
+
+        /// Postgres username (for postgres type)
+        #[arg(long)]
+        pg_user: Option<String>,
+
+        /// Postgres password (for postgres type, will prompt if not provided)
+        #[arg(long)]
+        pg_password: Option<String>,
+
+        /// Postgres sslmode (for postgres type, default: prefer)
+        #[arg(long, default_value = "prefer")]
+        pg_sslmode: String,
     },
 
     /// List stored credentials
@@ -456,6 +480,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ssh_port,
             ssh_user,
             ssh_password,
+            pg_host,
+            pg_port,
+            pg_database,
+            pg_user,
+            pg_password,
+            pg_sslmode,
         } => {
             add_credential(
                 config,
@@ -484,6 +514,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ssh_port,
                     ssh_user,
                     ssh_password,
+                    pg_host,
+                    pg_port,
+                    pg_database,
+                    pg_user,
+                    pg_password,
+                    pg_sslmode,
                 },
             )
             .await?;
@@ -826,6 +862,13 @@ struct AddCredentialArgs {
     ssh_port: u16,
     ssh_user: Option<String>,
     ssh_password: Option<String>,
+    // Postgres fields
+    pg_host: Option<String>,
+    pg_port: u16,
+    pg_database: Option<String>,
+    pg_user: Option<String>,
+    pg_password: Option<String>,
+    pg_sslmode: String,
 }
 
 /// Add a new credential
@@ -943,6 +986,28 @@ async fn add_credential(
                 port: args.ssh_port,
                 user,
                 password: Secret::new(password),
+            }
+        }
+        "postgres" => {
+            let host = args.pg_host.ok_or("Postgres host is required (--pg-host)")?;
+            let database = args
+                .pg_database
+                .ok_or("Postgres database is required (--pg-database)")?;
+            let user = args.pg_user.ok_or("Postgres user is required (--pg-user)")?;
+            let password = if let Some(p) = args.pg_password {
+                p
+            } else {
+                eprint!("Enter Postgres password: ");
+                io::stderr().flush()?;
+                rpassword::read_password()?
+            };
+            CredentialData::Postgres {
+                host,
+                port: args.pg_port,
+                database,
+                user,
+                password: Secret::new(password),
+                sslmode: args.pg_sslmode,
             }
         }
         other => {

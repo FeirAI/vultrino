@@ -71,6 +71,8 @@ pub enum CredentialType {
     EcdsaKey,
     /// SSH connection with password authentication
     SshPassword,
+    /// PostgreSQL connection credentials
+    Postgres,
     /// Custom credential type
     Custom(String),
 }
@@ -86,6 +88,7 @@ impl std::fmt::Display for CredentialType {
             CredentialType::HmacApiKey => write!(f, "hmac_api_key"),
             CredentialType::EcdsaKey => write!(f, "ecdsa_key"),
             CredentialType::SshPassword => write!(f, "ssh_password"),
+            CredentialType::Postgres => write!(f, "postgres"),
             CredentialType::Custom(name) => write!(f, "custom:{}", name),
         }
     }
@@ -233,6 +236,24 @@ pub enum CredentialData {
         password: Secret,
     },
 
+    /// PostgreSQL connection credentials
+    Postgres {
+        /// Hostname or IP address of the Postgres server
+        host: String,
+        /// Postgres port (default: 5432)
+        #[serde(default = "default_postgres_port")]
+        port: u16,
+        /// Database name
+        database: String,
+        /// Postgres role / username
+        user: String,
+        /// Database password (passed to psql/pg_dump via PGPASSWORD env)
+        password: Secret,
+        /// libpq sslmode: disable, allow, prefer (default), require, verify-ca, verify-full
+        #[serde(default = "default_postgres_sslmode")]
+        sslmode: String,
+    },
+
     /// Custom credential data
     Custom(HashMap<String, Secret>),
 }
@@ -257,6 +278,14 @@ fn default_ssh_port() -> u16 {
     22
 }
 
+fn default_postgres_port() -> u16 {
+    5432
+}
+
+fn default_postgres_sslmode() -> String {
+    "prefer".to_string()
+}
+
 impl CredentialData {
     /// Get the credential type for this data
     pub fn credential_type(&self) -> CredentialType {
@@ -269,6 +298,7 @@ impl CredentialData {
             CredentialData::HmacApiKey { .. } => CredentialType::HmacApiKey,
             CredentialData::EcdsaKey { .. } => CredentialType::EcdsaKey,
             CredentialData::SshPassword { .. } => CredentialType::SshPassword,
+            CredentialData::Postgres { .. } => CredentialType::Postgres,
             CredentialData::Custom(_) => CredentialType::Custom("custom".to_string()),
         }
     }

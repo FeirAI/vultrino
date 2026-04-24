@@ -102,6 +102,9 @@ vultrino add --alias <name> -t oauth2 \        # Add OAuth2 credential
   --scopes "read,write"
 vultrino add --alias <name> -t ssh_password \  # Add SSH (password) credential
   --ssh-host <host> --ssh-user <user>          # for ssh plugin deploy/run
+vultrino add --alias <name> -t postgres \      # Add Postgres credential
+  --pg-host <host> --pg-database <db> \        # for postgres plugin run_sql/backup
+  --pg-user <user> --pg-sslmode require
 vultrino list                                   # List all credentials
 vultrino remove <alias>                         # Remove a credential
 
@@ -119,6 +122,8 @@ vultrino action <credential> <plugin.action>    # Execute plugin action
 vultrino action my-pgp pgp-signing.sign_cleartext -p '{"data":"Hello"}'
 vultrino action my-server ssh.deploy            # Rsync via stored SSH credential
 vultrino action my-server ssh.run               # Run a configured command sequence
+vultrino action my-db postgres.run_sql          # Apply the configured migration script
+vultrino action my-db postgres.backup           # pg_dump to the configured output dir
 
 # Plugin Management
 vultrino plugin install <path-or-url>           # Install a plugin
@@ -258,14 +263,17 @@ Vultrino ships with built-in plugins and also supports WASM plugins for extendin
 
 ### Built-in Plugins
 
-| Plugin | Credential Types          | Actions                                 |
-|--------|---------------------------|-----------------------------------------|
-| `http` | `api_key`, `basic_auth`, `oauth2` | `request`                       |
-| `hmac` | `hmac_api_key`            | `request`, `sign`                       |
-| `ecdsa`| `ecdsa_key`               | `sign`, `sign_l1_action`                |
-| `ssh`  | `ssh_password`            | `deploy` (rsync), `run` (remote exec)   |
+| Plugin    | Credential Types                  | Actions                                  |
+|-----------|-----------------------------------|------------------------------------------|
+| `http`    | `api_key`, `basic_auth`, `oauth2` | `request`                                |
+| `hmac`    | `hmac_api_key`                    | `request`, `sign`                        |
+| `ecdsa`   | `ecdsa_key`                       | `sign`, `sign_l1_action`                 |
+| `ssh`     | `ssh_password`                    | `deploy` (rsync), `run` (remote exec)    |
+| `postgres`| `postgres`                        | `run_sql` (migrations/maintenance), `backup` (pg_dump) |
 
 The `ssh` plugin requires `sshpass`, `ssh`, and `rsync` on the host's `PATH`. See [the SSH plugin docs](docs/src/plugins/ssh.md) for the full credential schema, metadata keys, override-lock model, and a worked deploy + restart example.
+
+The `postgres` plugin requires `psql` and `pg_dump` (from `postgresql-client` or Homebrew's `libpq`). See [the Postgres plugin docs](docs/src/plugins/postgres.md) for the credential schema, metadata keys, SQL-override lock model, and a worked migration + nightly-backup example.
 
 ### Installing Plugins
 
@@ -373,6 +381,7 @@ cargo build --release --target wasm32-wasip1
 | `hmac_api_key` | HMAC-signed API key (e.g. Binance-style exchanges) | SHA-256 signature over query string / body |
 | `ecdsa_key` | ECDSA private key (Ethereum / Hyperliquid) | On-the-fly signing of requests or arbitrary payloads |
 | `ssh_password` | SSH host + password (for `ssh` plugin) | `sshpass`-fed password to `ssh` / `rsync`; password never leaves Vultrino |
+| `postgres` | PostgreSQL connection (for `postgres` plugin) | Password passed to `psql`/`pg_dump` via `PGPASSWORD` env; never leaves Vultrino |
 
 ### Best Practices
 

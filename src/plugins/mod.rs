@@ -12,6 +12,7 @@
 mod http;
 mod hmac;
 mod ecdsa;
+mod postgres;
 mod ssh;
 pub mod installer;
 pub mod loader;
@@ -21,6 +22,7 @@ pub mod wasm;
 pub use http::HttpPlugin;
 pub use hmac::HmacPlugin;
 pub use ecdsa::EcdsaPlugin;
+pub use postgres::PostgresPlugin;
 pub use ssh::SshPlugin;
 pub use installer::PluginInstaller;
 pub use loader::{PluginLoader, PluginRegistryExt};
@@ -194,6 +196,7 @@ impl PluginRegistry {
         registry.register(Arc::new(HmacPlugin::new()));
         registry.register(Arc::new(EcdsaPlugin::new()));
         registry.register(Arc::new(SshPlugin::new()));
+        registry.register(Arc::new(PostgresPlugin::new()));
 
         registry
     }
@@ -409,28 +412,34 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_exposes_builtin_ssh_mcp_tools() {
+    fn test_registry_exposes_builtin_mcp_tools() {
         // Regression guard: MCP agents can only reach a built-in plugin's
         // tools if `all_mcp_tools()` surfaces them. The mcp/server.rs layer
         // walks this list when building tools/list and dispatching
-        // tools/call. If this assertion breaks, ssh_deploy / ssh_run will
+        // tools/call. If this assertion breaks, the named tools will
         // silently disappear from agent tool lists.
         let registry = PluginRegistry::new();
         let pairs = registry.all_mcp_tools();
-        let tool_names: Vec<String> = pairs
-            .iter()
-            .filter(|(p, _)| p == "ssh")
-            .map(|(_, t)| t.name.clone())
-            .collect();
+        let lookup = |plugin: &str| -> Vec<String> {
+            pairs
+                .iter()
+                .filter(|(p, _)| p == plugin)
+                .map(|(_, t)| t.name.clone())
+                .collect()
+        };
+
+        let ssh_tools = lookup("ssh");
         assert!(
-            tool_names.contains(&"deploy".to_string()),
-            "ssh plugin must expose a 'deploy' MCP tool; got {:?}",
-            tool_names
+            ssh_tools.contains(&"deploy".to_string()) && ssh_tools.contains(&"run".to_string()),
+            "ssh plugin must expose 'deploy' and 'run' MCP tools; got {:?}",
+            ssh_tools
         );
+
+        let pg_tools = lookup("postgres");
         assert!(
-            tool_names.contains(&"run".to_string()),
-            "ssh plugin must expose a 'run' MCP tool; got {:?}",
-            tool_names
+            pg_tools.contains(&"run_sql".to_string()) && pg_tools.contains(&"backup".to_string()),
+            "postgres plugin must expose 'run_sql' and 'backup' MCP tools; got {:?}",
+            pg_tools
         );
     }
 }
