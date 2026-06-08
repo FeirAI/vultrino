@@ -11,7 +11,7 @@ use chrono::Duration;
 use secrecy::SecretString;
 use tempfile::tempdir;
 
-use vultrino::auth::{AuthResult, NewUseToken, UseToken};
+use vultrino::auth::{NewUseToken, UseToken};
 use vultrino::config::Config;
 use vultrino::plugins::{Plugin, PluginError, PluginRequest};
 use vultrino::router::CredentialResolver;
@@ -89,10 +89,7 @@ fn echo_request(credential: &str) -> ExecuteRequest {
 }
 
 fn token_auth(token: &UseToken) -> ExecAuth {
-    ExecAuth {
-        auth: Some(AuthResult::for_use_token(token)),
-        use_token_id: Some(token.id.clone()),
-    }
+    ExecAuth::from_use_token(token.clone())
 }
 
 #[tokio::test]
@@ -190,6 +187,48 @@ async fn test_token_credential_scope_enforced() {
     assert!(format!("{}", err).to_lowercase().contains("access denied"));
     let after = storage.get_use_token(&token.id).await.unwrap().unwrap();
     assert_eq!(after.uses, 0);
+}
+
+/// The token's ACTION scope is enforced authoritatively in the server seam
+/// (`execute_gated`), not only at the MCP/HTTP edge — so it's defended in depth.
+#[tokio::test]
+async fn test_token_action_scope_enforced_at_server() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred").await;
+
+    // Token allowed only for postgres.run_sql, but the request is mock.echo.
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "wrong-action".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: Some("postgres.run_sql".to_string()),
+        max_uses: Some(1),
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    let err = server
+        .execute_gated(echo_request("api-cred"), token_auth(&token))
+        .await
+        .unwrap_err();
+    assert!(format!("{}", err).to_lowercase().contains("not scoped to action"));
+    // Out-of-scope action must NOT consume the token.
+    let after = storage.get_use_token(&token.id).await.unwrap().unwrap();
+    assert_eq!(after.uses, 0);
+
+    // The in-scope action (via a glob token) is allowed and consumes.
+    let (_f2, ok_token) = UseToken::create(NewUseToken {
+        name: "ok-action".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: Some("mock.*".to_string()),
+        max_uses: Some(1),
+        expires_in: None,
+    });
+    storage.store_use_token(&ok_token).await.unwrap();
+    server
+        .execute_gated(echo_request("api-cred"), token_auth(&ok_token))
+        .await
+        .unwrap();
+    assert_eq!(storage.get_use_token(&ok_token.id).await.unwrap().unwrap().uses, 1);
 }
 
 /// Two `FileStorage` instances over the same file model the web + MCP processes.

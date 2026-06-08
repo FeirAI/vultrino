@@ -99,6 +99,31 @@ pub struct NewUseToken {
     pub expires_in: Option<Duration>,
 }
 
+impl NewUseToken {
+    /// Validate the parameters before minting, so footguns fail loudly at
+    /// creation rather than producing a silently-useless token:
+    /// - an empty credential scope (use `*` for "any"),
+    /// - `max_uses == 0` (immediately exhausted),
+    /// - a scope glob that does not compile (which would otherwise silently
+    ///   degrade to exact-string match and never match anything).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.credential_scope.trim().is_empty() {
+            return Err("credential scope must not be empty (use '*' for any credential)".to_string());
+        }
+        if self.max_uses == Some(0) {
+            return Err("max uses must be at least 1".to_string());
+        }
+        glob::Pattern::new(&self.credential_scope).map_err(|e| {
+            format!("invalid credential scope pattern '{}': {}", self.credential_scope, e)
+        })?;
+        if let Some(action) = &self.action_scope {
+            glob::Pattern::new(action)
+                .map_err(|e| format!("invalid action scope pattern '{}': {}", action, e))?;
+        }
+        Ok(())
+    }
+}
+
 impl UseToken {
     /// Mint a new use token, returning the plaintext token (shown once) and the
     /// stored record. The plaintext never touches disk — only its hash is kept.

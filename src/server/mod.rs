@@ -2,7 +2,7 @@
 //!
 //! Provides JSON API mode for execute requests.
 
-use crate::auth::{AuthManager, AuthResult, Permission};
+use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
 use crate::config::Config;
 use crate::plugins::PluginRegistry;
 use crate::policy::PolicyEngine;
@@ -15,13 +15,15 @@ use tracing::{info, warn};
 /// Authentication context for an execution.
 ///
 /// Carries the permission/scope source (`auth`) and, when a use token is driving
-/// the request, the token id so it can be consumed (reserved) on execution.
+/// the request, the **whole token** so the server can authoritatively enforce
+/// its credential *and* action scope at the seam where the token is spent, and
+/// consume it by id — a single source of truth rather than a separate id field.
 #[derive(Default)]
 pub struct ExecAuth {
     /// Real (API key) or synthesized (use token) auth result. `None` = local.
     pub auth: Option<AuthResult>,
-    /// Set when the presented secret was a use token; consumed on execution.
-    pub use_token_id: Option<String>,
+    /// The use token driving this request, if any.
+    pub use_token: Option<UseToken>,
 }
 
 impl ExecAuth {
@@ -29,7 +31,17 @@ impl ExecAuth {
     pub fn from_api_key(auth: AuthResult) -> Self {
         Self {
             auth: Some(auth),
-            use_token_id: None,
+            use_token: None,
+        }
+    }
+
+    /// Build an `ExecAuth` for a use-token-authenticated request. Derives both
+    /// the synthesized auth and the consume target from the one token, so they
+    /// cannot diverge.
+    pub fn from_use_token(token: UseToken) -> Self {
+        Self {
+            auth: Some(AuthResult::for_use_token(&token)),
+            use_token: Some(token),
         }
     }
 }
@@ -173,6 +185,26 @@ impl VultrinoServer {
         let credential = self.resolver.resolve(&request.credential).await?;
         let (plugin_name, action_name) = parse_action(&request.action)?;
 
+        // Authoritative use-token scope enforcement at the seam where the token
+        // is actually spent — both credential and action scope, so the token's
+        // single-action restriction is defended in depth rather than only at the
+        // (MCP/HTTP) edge.
+        if let Some(token) = &exec_auth.use_token {
+            let full_action = format!("{}.{}", plugin_name, action_name);
+            if !token.allows_credential(&credential.alias) {
+                return Err(VultrinoError::PolicyDenied(format!(
+                    "Use token is not scoped to credential '{}'",
+                    credential.alias
+                )));
+            }
+            if !token.allows_action(&full_action) {
+                return Err(VultrinoError::PolicyDenied(format!(
+                    "Use token is not scoped to action '{}'",
+                    full_action
+                )));
+            }
+        }
+
         // Evaluate policy (URL / method / rate limits).
         let url = request.params.get("url").and_then(|v| v.as_str());
         let method = request.params.get("method").and_then(|v| v.as_str());
@@ -198,7 +230,7 @@ impl VultrinoServer {
             action_name,
             request.params.clone(),
             context,
-            exec_auth.use_token_id.as_deref(),
+            exec_auth.use_token.as_ref().map(|t| t.id.as_str()),
         )
         .await
     }

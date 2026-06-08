@@ -1747,13 +1747,15 @@ async fn create_use_token(
         None => None,
     };
 
-    let (full_token, token) = UseToken::create(NewUseToken {
+    let params = NewUseToken {
         name: name.clone(),
         credential_scope: credential,
         action_scope: action.filter(|s| !s.is_empty()),
         max_uses: uses,
         expires_in,
-    });
+    };
+    params.validate()?;
+    let (full_token, token) = UseToken::create(params);
 
     storage.store_use_token(&token).await?;
 
@@ -1847,14 +1849,14 @@ async fn revoke_use_token(config: Config, id: String) -> Result<(), Box<dyn std:
     let storage = init_storage(&config).await?;
     let tokens = storage.list_use_tokens().await?;
 
-    let token = tokens
+    let token_id = tokens
         .iter()
         .find(|t| t.id == id || t.token_prefix.contains(&id) || t.name == id)
+        .map(|t| t.id.clone())
         .ok_or_else(|| format!("Use token '{}' not found", id))?;
 
-    let mut token = token.clone();
-    token.revoked = true;
-    storage.store_use_token(&token).await?;
+    // Atomic read-modify-write under the storage lock (no get→store race).
+    let token = storage.set_use_token_revoked(&token_id).await?;
 
     println!("Use token '{}' (ID: {}) revoked", token.name, token.id);
     Ok(())

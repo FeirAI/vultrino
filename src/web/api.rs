@@ -104,14 +104,10 @@ pub struct ExecuteApiResponse {
 }
 
 /// Resolve a bearer secret (API key `vk_` or use token `vut_`) into an
-/// [`ExecAuth`] for a specific credential + action, enforcing a use token's
-/// credential/action scoping. Returns `(exec_auth, principal_id)`.
-async fn resolve_exec_auth(
-    state: &AppState,
-    secret: &str,
-    credential: &str,
-    full_action: &str,
-) -> Result<(ExecAuth, String), Response> {
+/// [`ExecAuth`]. A use token's credential/action scope is enforced
+/// authoritatively in the server (`execute_gated`); here we only authenticate
+/// and fail fast on an unusable token.
+async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, Response> {
     if UseToken::looks_like_token(secret) {
         let _ = state.storage.reload().await;
         let token = match state.storage.get_use_token_by_hash(&UseToken::hash(secret)).await {
@@ -121,36 +117,13 @@ async fn resolve_exec_auth(
         if let Err(e) = token.check_usable() {
             return Err(error_response(StatusCode::FORBIDDEN, "token_unusable", e.to_string()));
         }
-        if !token.allows_credential(credential) {
-            return Err(error_response(
-                StatusCode::FORBIDDEN,
-                "credential_denied",
-                format!("Use token not scoped to credential: {}", credential),
-            ));
-        }
-        if !token.allows_action(full_action) {
-            return Err(error_response(
-                StatusCode::FORBIDDEN,
-                "action_denied",
-                format!("Use token not scoped to action: {}", full_action),
-            ));
-        }
-        let auth = AuthResult::for_use_token(&token);
-        let id = token.id.clone();
-        Ok((
-            ExecAuth {
-                auth: Some(auth),
-                use_token_id: Some(token.id),
-            },
-            id,
-        ))
+        Ok(ExecAuth::from_use_token(token))
     } else {
         let (key, role) = match validate_api_key(state, secret).await {
             Ok(kr) => kr,
             Err(e) => return Err(error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", e)),
         };
-        let id = key.id.clone();
-        Ok((ExecAuth::from_api_key(AuthResult { api_key: key, role }), id))
+        Ok(ExecAuth::from_api_key(AuthResult { api_key: key, role }))
     }
 }
 
@@ -172,11 +145,10 @@ pub async fn api_execute(
         }
     };
 
-    let (exec_auth, _principal_id) =
-        match resolve_exec_auth(&state, &secret, &request.credential, "http.request").await {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    let exec_auth = match resolve_exec_auth(&state, &secret).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     // Build the execute request
     let execute_request = ExecuteRequest {
