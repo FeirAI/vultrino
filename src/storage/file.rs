@@ -151,7 +151,7 @@ impl FileStorage {
         };
 
         // Write initial empty storage (through the cross-process lock).
-        storage.locked_mutate(|_| Ok(()))?;
+        storage.locked_mutate(|_| Ok(())).await?;
 
         Ok(storage)
     }
@@ -238,9 +238,30 @@ impl FileStorage {
     /// refreshes the in-memory cache — all while holding the lock. This is what
     /// makes the single-use-token check-and-increment and the approval
     /// execution-claim atomic even though the web and MCP servers run as
-    /// separate processes sharing one encrypted file. The closure operates
-    /// purely on the in-memory snapshot and must not perform I/O.
-    fn locked_mutate<T>(
+    /// separate processes sharing one encrypted file.
+    ///
+    /// The lock acquisition + decrypt/encrypt + file I/O are all *blocking*. On a
+    /// multi-thread runtime (the web and MCP servers) we run them inside
+    /// [`tokio::task::block_in_place`], which hands the worker's other tasks to a
+    /// replacement thread so a held lock can't stall unrelated requests. On a
+    /// current-thread runtime (unit tests) `block_in_place` would panic, so we
+    /// run inline. The closure operates purely on the in-memory snapshot read
+    /// from disk and must not perform I/O.
+    async fn locked_mutate<T>(
+        &self,
+        f: impl FnOnce(&mut StorageCache) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        match Handle::current().runtime_flavor() {
+            RuntimeFlavor::CurrentThread => self.locked_mutate_blocking(f),
+            _ => tokio::task::block_in_place(|| self.locked_mutate_blocking(f)),
+        }
+    }
+
+    /// The blocking read-modify-write body of [`Self::locked_mutate`]. Holds the
+    /// advisory file lock for the whole cycle; must only be called off the async
+    /// reactor (via `block_in_place` or a current-thread runtime).
+    fn locked_mutate_blocking<T>(
         &self,
         f: impl FnOnce(&mut StorageCache) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
@@ -290,6 +311,7 @@ impl StorageBackend for FileStorage {
             cache.credentials.insert(credential.id.clone(), credential.clone());
             Ok(())
         })
+            .await
     }
 
     async fn get(&self, id: &str) -> Result<Option<Credential>, StorageError> {
@@ -320,6 +342,7 @@ impl StorageBackend for FileStorage {
                 Err(StorageError::NotFound(id.to_string()))
             }
         })
+            .await
     }
 
     async fn update(&self, credential: &Credential) -> Result<(), StorageError> {
@@ -346,6 +369,7 @@ impl StorageBackend for FileStorage {
             cache.credentials.insert(credential.id.clone(), credential.clone());
             Ok(())
         })
+            .await
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {
@@ -371,6 +395,7 @@ impl StorageBackend for FileStorage {
             cache.roles.insert(role.id.clone(), role.clone());
             Ok(())
         })
+            .await
     }
 
     async fn get_role(&self, id: &str) -> Result<Option<Role>, StorageError> {
@@ -401,6 +426,7 @@ impl StorageBackend for FileStorage {
                 Err(StorageError::RoleNotFound(id.to_string()))
             }
         })
+            .await
     }
 
     async fn store_api_key(&self, key: &ApiKey) -> Result<(), StorageError> {
@@ -409,6 +435,7 @@ impl StorageBackend for FileStorage {
             cache.api_keys.insert(key.id.clone(), key.clone());
             Ok(())
         })
+            .await
     }
 
     async fn get_api_key_by_hash(&self, hash: &str) -> Result<Option<ApiKey>, StorageError> {
@@ -434,6 +461,7 @@ impl StorageBackend for FileStorage {
                 Err(StorageError::ApiKeyNotFound(id.to_string()))
             }
         })
+            .await
     }
 
     async fn update_api_key_last_used(&self, id: &str) -> Result<(), StorageError> {
@@ -445,6 +473,7 @@ impl StorageBackend for FileStorage {
                 Err(StorageError::ApiKeyNotFound(id.to_string()))
             }
         })
+            .await
     }
 
     // ==================== Use Token Storage ====================
@@ -457,6 +486,7 @@ impl StorageBackend for FileStorage {
             cache.use_tokens.insert(token.id.clone(), token.clone());
             Ok(())
         })
+            .await
     }
 
     async fn get_use_token(&self, id: &str) -> Result<Option<UseToken>, StorageError> {
@@ -487,6 +517,7 @@ impl StorageBackend for FileStorage {
                 Err(StorageError::UseTokenNotFound(id.to_string()))
             }
         })
+            .await
     }
 
     async fn consume_use_token(&self, id: &str) -> Result<UseToken, StorageError> {
@@ -505,6 +536,7 @@ impl StorageBackend for FileStorage {
             token.last_used_at = Some(Utc::now());
             Ok(token.clone())
         })
+            .await
     }
 
     async fn set_use_token_revoked(&self, id: &str) -> Result<UseToken, StorageError> {
@@ -516,6 +548,7 @@ impl StorageBackend for FileStorage {
             token.revoked = true;
             Ok(token.clone())
         })
+            .await
     }
 
     async fn reload(&self) -> Result<(), StorageError> {
