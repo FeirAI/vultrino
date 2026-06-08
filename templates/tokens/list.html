@@ -70,6 +70,7 @@ function copyToken() {
                 <th>Credential</th>
                 <th>Action</th>
                 <th>Uses</th>
+                <th>Approval</th>
                 <th>Expires</th>
                 <th>Status</th>
                 <th></th>
@@ -86,6 +87,7 @@ function copyToken() {
                 <td><span class="badge">{{ token.credential_scope }}</span></td>
                 <td>{{ token.action_scope }}</td>
                 <td>{{ token.uses_display }}</td>
+                <td>{% if token.require_approval %}required{% else %}&mdash;{% endif %}</td>
                 <td>{{ token.expires }}</td>
                 <td><span class="badge">{{ token.status }}</span></td>
                 <td class="cell-actions">

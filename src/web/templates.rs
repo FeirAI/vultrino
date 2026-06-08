@@ -289,6 +289,7 @@ pub struct UseTokenDisplay {
     pub credential_scope: String,
     pub action_scope: String,
     pub uses_display: String,
+    pub require_approval: bool,
     pub expires: String,
     pub last_used: String,
     pub status: String,
@@ -317,6 +318,7 @@ impl From<&crate::auth::UseToken> for UseTokenDisplay {
             credential_scope: t.credential_scope.clone(),
             action_scope: t.action_scope.clone().unwrap_or_else(|| "any action".to_string()),
             uses_display,
+            require_approval: t.require_approval,
             expires: t
                 .expires_at
                 .map(|e| e.format("%Y-%m-%d %H:%M").to_string())
@@ -348,6 +350,93 @@ pub struct UseTokenNewTemplate {
     pub username: String,
     pub error: Option<String>,
     pub csrf_token: String,
+}
+
+// ============== Approvals ==============
+
+/// Approval row / detail for the approvals page.
+#[derive(Debug, Clone)]
+pub struct ApprovalDisplay {
+    pub id: String,
+    pub status: String,
+    pub status_class: String,
+    pub summary: String,
+    pub credential: String,
+    pub action: String,
+    pub requested_by: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub is_pending: bool,
+    pub decided_by: String,
+    pub result_summary: String,
+    pub params_pretty: String,
+}
+
+impl From<&crate::approval::ApprovalRequest> for ApprovalDisplay {
+    fn from(a: &crate::approval::ApprovalRequest) -> Self {
+        use crate::approval::ApprovalStatus;
+        let status_class = match a.status {
+            ApprovalStatus::Pending => "badge-pending",
+            ApprovalStatus::Approved => "badge-success",
+            ApprovalStatus::Denied => "badge-danger",
+            ApprovalStatus::Expired => "badge-muted",
+        };
+        let result_summary = if let Some(err) = &a.result_error {
+            format!("execution error: {}", err)
+        } else if let Some(status) = a.result_status {
+            format!("executed, status {}", status)
+        } else if a.status == ApprovalStatus::Approved {
+            "approved, awaiting agent poll to execute".to_string()
+        } else {
+            String::new()
+        };
+        let params_pretty = serde_json::to_string_pretty(&a.params).unwrap_or_default();
+        Self {
+            id: a.id.clone(),
+            status: a.status.to_string(),
+            status_class: status_class.to_string(),
+            summary: a.summary.clone(),
+            credential: a.credential.clone(),
+            action: a.action.clone(),
+            requested_by: a.requester.describe(),
+            created_at: a.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+            expires_at: a.expires_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+            is_pending: a.status == ApprovalStatus::Pending && !a.is_past_ttl(),
+            decided_by: a.decided_by.clone().unwrap_or_default(),
+            result_summary,
+            params_pretty,
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "approvals/list.html")]
+pub struct ApprovalsListTemplate {
+    pub username: String,
+    pub approvals: Vec<ApprovalDisplay>,
+    pub flash: Option<FlashMessage>,
+    pub csrf_token: String,
+}
+
+/// Confirmation page shown when an out-of-band (token) link is opened, so a
+/// link prefetch can't silently approve/deny — the human must click Confirm.
+#[derive(Template)]
+#[template(path = "approvals/confirm.html")]
+pub struct ApprovalConfirmTemplate {
+    pub id: String,
+    pub token: String,
+    pub decision: String,
+    pub decision_word: String,
+    pub summary: String,
+}
+
+/// Simple standalone confirmation page for out-of-band (token) decisions.
+#[derive(Template)]
+#[template(path = "approvals/decided.html")]
+pub struct ApprovalDecidedTemplate {
+    pub title: String,
+    pub message: String,
+    pub ok: bool,
 }
 
 // ============== Audit Log ==============

@@ -955,7 +955,7 @@ code {
     }
 }
 
-/* ============== Use Tokens ============== */
+/* ============== Use Tokens & Approvals ============== */
 
 .page-intro {
     color: var(--color-text-muted);
@@ -968,4 +968,112 @@ code {
     color: var(--color-text-muted);
     font-size: 0.8125rem;
     margin-top: var(--spacing-xs);
+}
+
+.form-checkbox label {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    font-weight: 400;
+    cursor: pointer;
+}
+
+.form-checkbox input {
+    width: auto;
+}
+
+/* Status badges */
+.badge-pending { background-color: var(--color-warning-bg); color: var(--color-warning); }
+.badge-success { background-color: var(--color-success-bg); color: var(--color-success); }
+.badge-danger  { background-color: var(--color-danger-bg);  color: var(--color-danger); }
+.badge-muted   { background-color: var(--color-bg); color: var(--color-text-muted); }
+
+/* Approval cards */
+.approval-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-md);
+}
+
+.approval-card {
+    background-color: var(--color-bg-white);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    padding: var(--spacing-lg);
+}
+
+.approval-head {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    margin-bottom: var(--spacing-sm);
+}
+
+.approval-summary {
+    font-weight: 600;
+    word-break: break-all;
+}
+
+.approval-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--spacing-xs) var(--spacing-lg);
+    color: var(--color-text-muted);
+    font-size: 0.8125rem;
+    margin-bottom: var(--spacing-sm);
+}
+
+.approval-meta strong {
+    color: var(--color-text);
+    font-weight: 500;
+}
+
+.approval-params summary {
+    cursor: pointer;
+    color: var(--color-text-muted);
+    font-size: 0.8125rem;
+}
+
+.approval-params pre {
+    background-color: var(--color-bg);
+    border-radius: var(--radius-md);
+    padding: var(--spacing-md);
+    overflow-x: auto;
+    font-size: 0.8125rem;
+    margin-top: var(--spacing-sm);
+}
+
+.approval-actions {
+    display: flex;
+    gap: var(--spacing-sm);
+    margin-top: var(--spacing-md);
+}
+
+/* Out-of-band decision pages */
+.decide-page {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    background-color: var(--color-bg);
+    padding: var(--spacing-lg);
+}
+
+.decide-card {
+    background-color: var(--color-bg-white);
+    border: 1px solid var(--color-border);
+    border-top: 4px solid var(--color-primary);
+    border-radius: var(--radius-lg);
+    padding: var(--spacing-2xl);
+    max-width: 30rem;
+    text-align: center;
+}
+
+.decide-card.decide-ok { border-top-color: var(--color-success); }
+.decide-card.decide-err { border-top-color: var(--color-danger); }
+
+.decide-summary {
+    color: var(--color-text-muted);
+    word-break: break-all;
+    margin-bottom: var(--spacing-lg);
 }

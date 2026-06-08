@@ -41,6 +41,8 @@ pub struct Config {
     pub policies: Vec<Policy>,
     /// MCP server configuration
     pub mcp: McpConfig,
+    /// Action approval configuration
+    pub approval: crate::approval::ApprovalConfig,
 }
 
 impl Config {
@@ -73,6 +75,7 @@ impl Config {
         let storage = raw.storage.unwrap_or_default().try_into()?;
         let logging = raw.logging.unwrap_or_default().into();
         let mcp = raw.mcp.unwrap_or_default().into();
+        let approval = raw.approvals.map(Into::into).unwrap_or_default();
 
         let policies = raw
             .policies
@@ -86,6 +89,7 @@ impl Config {
             logging,
             policies,
             mcp,
+            approval,
         })
     }
 
@@ -97,6 +101,7 @@ impl Config {
             logging: LoggingConfig::default(),
             policies: vec![],
             mcp: McpConfig::default(),
+            approval: crate::approval::ApprovalConfig::default(),
         }
     }
 

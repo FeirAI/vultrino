@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn, Level};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use vultrino::approval::ApprovalStatus;
 use vultrino::auth::{
     AuthManager, NewUseToken, Permission, UseToken, ROLE_ADMIN, ROLE_EXECUTOR, ROLE_READ_ONLY,
 };
@@ -292,6 +293,12 @@ enum Commands {
         #[command(subcommand)]
         command: TokenCommands,
     },
+
+    /// Manage action approvals (human-in-the-loop)
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -316,6 +323,10 @@ enum TokenCommands {
         /// Expiration (e.g. "10m", "24h", "7d"; omit for never)
         #[arg(short, long)]
         expires: Option<String>,
+
+        /// Require human approval for every use of this token
+        #[arg(long)]
+        require_approval: bool,
     },
 
     /// List use tokens
@@ -328,6 +339,38 @@ enum TokenCommands {
     /// Revoke a use token
     Revoke {
         /// Token id, prefix, or name
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalCommands {
+    /// List approval requests
+    List {
+        /// Output format (table, json)
+        #[arg(short, long, default_value = "table")]
+        format: String,
+    },
+
+    /// Show an approval's status, running it if it has been approved
+    Status {
+        /// Approval id
+        id: String,
+
+        /// Poll until the request is decided (and executed if approved)
+        #[arg(short, long)]
+        wait: bool,
+    },
+
+    /// Approve a pending request
+    Approve {
+        /// Approval id
+        id: String,
+    },
+
+    /// Deny a pending request
+    Deny {
+        /// Approval id
         id: String,
     },
 }
@@ -671,14 +714,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 action,
                 uses,
                 expires,
+                require_approval,
             } => {
-                create_use_token(config, name, credential, action, uses, expires).await?;
+                create_use_token(config, name, credential, action, uses, expires, require_approval)
+                    .await?;
             }
             TokenCommands::List { format } => {
                 list_use_tokens(config, format).await?;
             }
             TokenCommands::Revoke { id } => {
                 revoke_use_token(config, id).await?;
+            }
+        },
+        Commands::Approval { command } => match command {
+            ApprovalCommands::List { format } => {
+                list_approvals(config, format).await?;
+            }
+            ApprovalCommands::Status { id, wait } => {
+                approval_status(config, id, wait).await?;
+            }
+            ApprovalCommands::Approve { id } => {
+                decide_approval(config, id, true).await?;
+            }
+            ApprovalCommands::Deny { id } => {
+                decide_approval(config, id, false).await?;
             }
         },
     }
@@ -1294,6 +1353,23 @@ level = "info"
 enabled = true
 transport = "stdio"
 
+# Action approvals (human-in-the-loop). Approvals are enabled automatically
+# when a notifier is configured, or set `enabled = true` explicitly to use the
+# admin panel only. Flag a credential to always require approval with:
+#   vultrino meta set <alias> require_approval true
+# [approvals]
+# enabled = true
+# ttl_secs = 3600
+# public_base_url = "https://vultrino.example.com"  # used in approve/deny links
+#
+# [approvals.telegram]
+# bot_token = "123456:ABC-DEF..."
+# chat_id = "987654321"
+#
+# [approvals.webhook]
+# url = "https://hooks.example.com/vultrino-approvals"
+# auth_header = "Bearer your-webhook-secret"
+
 # Example policies (uncomment to enable)
 # [[policies]]
 # name = "github-readonly"
@@ -1739,6 +1815,7 @@ async fn create_use_token(
     action: Option<String>,
     uses: Option<u32>,
     expires: Option<String>,
+    require_approval: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
 
@@ -1752,6 +1829,7 @@ async fn create_use_token(
         credential_scope: credential,
         action_scope: action.filter(|s| !s.is_empty()),
         max_uses: uses,
+        require_approval,
         expires_in,
     });
 
@@ -1778,6 +1856,9 @@ async fn create_use_token(
         println!("Expires:    {}", exp.format("%Y-%m-%d %H:%M:%S UTC"));
     } else {
         println!("Expires:    Never");
+    }
+    if token.require_approval {
+        println!("Approval:   required for every use");
     }
     println!("\nGive this token to an agent in place of an API key (the 'api_key' field).");
 
@@ -1857,6 +1938,156 @@ async fn revoke_use_token(config: Config, id: String) -> Result<(), Box<dyn std:
     storage.store_use_token(&token).await?;
 
     println!("Use token '{}' (ID: {}) revoked", token.name, token.id);
+    Ok(())
+}
+
+// ==================== Approval Management ====================
+
+/// List approval requests.
+async fn list_approvals(config: Config, format: String) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = init_storage(&config).await?;
+    let mut approvals = storage.list_approvals().await?;
+    approvals.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    if approvals.is_empty() {
+        println!("No approval requests");
+        return Ok(());
+    }
+
+    match format.as_str() {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&approvals)?);
+        }
+        _ => {
+            println!(
+                "{:<40} {:<10} {:<24} REQUESTED BY",
+                "ID", "STATUS", "SUMMARY"
+            );
+            println!("{}", "-".repeat(110));
+            for a in &approvals {
+                let summary = if a.summary.len() > 22 {
+                    format!("{}...", &a.summary[..19])
+                } else {
+                    a.summary.clone()
+                };
+                println!(
+                    "{:<40} {:<10} {:<24} {}",
+                    a.id,
+                    a.status.to_string(),
+                    summary,
+                    a.requester.describe()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Show an approval's status, executing it if it has been approved.
+async fn approval_status(
+    config: Config,
+    id: String,
+    wait: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = init_storage(&config).await?;
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage, resolver);
+    server.load_plugins().await?;
+
+    loop {
+        // None = trusted local/admin caller (no principal ownership check).
+        let approval = server.check_and_resume_approval(&id, None).await?;
+
+        match approval.status {
+            ApprovalStatus::Pending => {
+                if wait {
+                    eprint!(".");
+                    io::stderr().flush()?;
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
+                println!("Status:  PENDING");
+                println!("Summary: {}", approval.summary);
+                println!("Expires: {}", approval.expires_at.format("%Y-%m-%d %H:%M UTC"));
+                println!("\nWaiting on a human decision. Approve in the admin panel, or run:");
+                println!("  vultrino approval approve {}", approval.id);
+            }
+            ApprovalStatus::Denied => {
+                if wait {
+                    eprintln!();
+                }
+                println!("Status:  DENIED");
+                if let Some(note) = &approval.decision_note {
+                    println!("Reason:  {}", note);
+                }
+            }
+            ApprovalStatus::Expired => {
+                if wait {
+                    eprintln!();
+                }
+                println!("Status:  EXPIRED (no decision before TTL)");
+            }
+            ApprovalStatus::Approved if !approval.executed => {
+                // Approved, but the action is still running (another worker holds
+                // the claim) or hit a transient start error. Keep polling.
+                if wait {
+                    eprint!(".");
+                    io::stderr().flush()?;
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
+                println!("Status:  APPROVED (action is executing; run again for the result)");
+                if let Some(err) = &approval.result_error {
+                    println!("Note:    {}", err);
+                }
+            }
+            ApprovalStatus::Approved => {
+                if wait {
+                    eprintln!();
+                }
+                println!("Status:  APPROVED");
+                if let Some(err) = &approval.result_error {
+                    println!("Execution failed: {}", err);
+                } else {
+                    println!("Result status: {}", approval.result_status.unwrap_or(0));
+                    if let Some(body) = &approval.result_body {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+                            println!("{}", serde_json::to_string_pretty(&json)?);
+                        } else {
+                            println!("{}", body);
+                        }
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    Ok(())
+}
+
+/// Approve or deny a pending approval request.
+async fn decide_approval(
+    config: Config,
+    id: String,
+    approve: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = init_storage(&config).await?;
+
+    // Atomic read-modify-write under the storage lock (no separate reload+update
+    // window that a concurrent writer could clobber).
+    storage
+        .decide_approval(&id, approve, "cli", None)
+        .await
+        .map_err(|e| format!("Could not update approval: {}", e))?;
+
+    if approve {
+        println!("Approval '{}' approved. The agent will run the action on its next check.", id);
+    } else {
+        println!("Approval '{}' denied. The action will not run.", id);
+    }
+
     Ok(())
 }
 
@@ -1975,6 +2206,25 @@ async fn make_request_via_api(
                 e.to_string()
             }
         })?;
+
+    // 202 Accepted means the action is gated on human approval and has NOT run.
+    if api_response.status() == reqwest::StatusCode::ACCEPTED {
+        let result: serde_json::Value = api_response.json().await.unwrap_or_default();
+        let approval_id = result["approval_id"].as_str().unwrap_or("");
+        let message = result["message"]
+            .as_str()
+            .unwrap_or("This action requires human approval before it runs.");
+        eprintln!("[~] APPROVAL REQUIRED — the action has NOT run.");
+        eprintln!("    {}", message);
+        if !approval_id.is_empty() {
+            eprintln!("    approval_id: {}", approval_id);
+            eprintln!(
+                "    Once approved, fetch the result with: vultrino approval status {} --wait",
+                approval_id
+            );
+        }
+        return Ok(());
+    }
 
     if !api_response.status().is_success() {
         let status = api_response.status();

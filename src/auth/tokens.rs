@@ -55,6 +55,10 @@ pub struct UseToken {
     /// How many uses have been consumed so far.
     #[serde(default)]
     pub uses: u32,
+    /// If true, every action driven by this token requires human approval
+    /// before it executes (see the `approval` module).
+    #[serde(default)]
+    pub require_approval: bool,
     /// Optional expiry. `None` = never expires (only `max_uses` bounds it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
@@ -96,6 +100,7 @@ pub struct NewUseToken {
     pub credential_scope: String,
     pub action_scope: Option<String>,
     pub max_uses: Option<u32>,
+    pub require_approval: bool,
     pub expires_in: Option<Duration>,
 }
 
@@ -116,6 +121,7 @@ impl UseToken {
             action_scope: params.action_scope,
             max_uses: params.max_uses,
             uses: 0,
+            require_approval: params.require_approval,
             expires_at: params.expires_in.map(|d| now + d),
             created_at: now,
             last_used_at: None,
@@ -192,6 +198,7 @@ pub struct UseTokenMetadata {
     pub max_uses: Option<u32>,
     pub uses: u32,
     pub remaining_uses: Option<u32>,
+    pub require_approval: bool,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
@@ -209,6 +216,7 @@ impl From<&UseToken> for UseTokenMetadata {
             max_uses: t.max_uses,
             uses: t.uses,
             remaining_uses: t.remaining_uses(),
+            require_approval: t.require_approval,
             expires_at: t.expires_at,
             created_at: t.created_at,
             last_used_at: t.last_used_at,
@@ -268,6 +276,7 @@ mod tests {
             credential_scope: "deploy-*".to_string(),
             action_scope: Some("ssh.deploy".to_string()),
             max_uses: Some(1),
+            require_approval: false,
             expires_in: Some(Duration::minutes(10)),
         });
 
@@ -287,6 +296,7 @@ mod tests {
             credential_scope: "github-*".to_string(),
             action_scope: Some("http.request".to_string()),
             max_uses: None,
+            require_approval: false,
             expires_in: None,
         });
 
@@ -303,6 +313,7 @@ mod tests {
             credential_scope: "*".to_string(),
             action_scope: Some("postgres.*".to_string()),
             max_uses: None,
+            require_approval: false,
             expires_in: None,
         });
         assert!(glob.allows_action("postgres.run_sql"));
@@ -315,6 +326,7 @@ mod tests {
             credential_scope: "*".to_string(),
             action_scope: None,
             max_uses: None,
+            require_approval: false,
             expires_in: None,
         });
         assert!(any.allows_action("anything.at_all"));
@@ -327,6 +339,7 @@ mod tests {
             credential_scope: "*".to_string(),
             action_scope: None,
             max_uses: Some(1),
+            require_approval: false,
             expires_in: None,
         });
         assert!(t.check_usable().is_ok());

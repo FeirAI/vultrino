@@ -143,6 +143,14 @@ impl WebServer {
             .route("/tokens/new", get(routes::token_new))
             .route("/tokens/new", post(routes::token_create))
             .route("/tokens/{id}/revoke", post(routes::token_revoke))
+            // Action approvals
+            .route("/approvals", get(routes::approvals_list))
+            .route("/approvals/{id}/approve", post(routes::approval_approve))
+            .route("/approvals/{id}/deny", post(routes::approval_deny))
+            // Out-of-band decision links (Telegram / webhook / email).
+            // Capability-token authorized, no session required.
+            .route("/approvals/{id}/decide", get(routes::approval_decide_confirm))
+            .route("/approvals/{id}/decide", post(routes::approval_decide_submit))
             .route("/audit", get(routes::audit_log))
             // API endpoints for HTMX (web UI)
             .route("/api/stats", get(routes::api_stats))
@@ -150,6 +158,7 @@ impl WebServer {
             .route("/api/v1/health", get(api::api_health))
             .route("/api/v1/credentials", get(api::api_list_credentials))
             .route("/api/v1/execute", post(api::api_execute))
+            .route("/api/v1/approvals/{id}", get(api::api_check_approval))
             // Static files
             .nest_service("/static", static_dir);
 
@@ -190,6 +199,14 @@ impl WebServer {
             .layer(session_layer)
             .layer(TraceLayer::new_for_http())
             .with_state(self.app_state.clone())
+    }
+
+    /// Consume the server and return its configured Axum router.
+    ///
+    /// Useful for in-process testing (e.g. `tower::ServiceExt::oneshot`) without
+    /// binding a socket.
+    pub fn into_router(self) -> Router {
+        self.build_router()
     }
 
     /// Run the web server

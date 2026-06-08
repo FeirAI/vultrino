@@ -28,6 +28,7 @@ Vultrino is a secure credential proxy that allows AI agents, LLMs, and automated
 - **Plugin System** — Extend with custom credential types and actions via WASM plugins
 - **MCP Integration** — Native Model Context Protocol support for LLM tools
 - **Use Tokens** — Single-use or time-scoped grants that let an agent perform one specific action
+- **Action Approvals** — Human-in-the-loop sign-off (admin panel, Telegram, or webhook/email) before an action runs
 - **Web UI** — Clean admin interface for managing credentials, roles, and API keys
 - **Encrypted Storage** — AES-256-GCM encryption with Argon2 key derivation
 - **Policy Engine** — URL patterns, method restrictions, rate limiting
@@ -143,8 +144,16 @@ vultrino token create deploy-once \              # one-shot, expires in 10 minut
   --credential "deploy-*" --action ssh.deploy --uses 1 --expires 10m
 vultrino token create reporter \                 # time-scoped, unlimited uses for 24h
   --credential github-api --action http.request --expires 24h
+vultrino token create risky --credential prod-db --require-approval  # gate every use
 vultrino token list
 vultrino token revoke <id|prefix|name>
+
+# Action Approvals (human-in-the-loop)
+vultrino approval list                           # see pending/decided requests
+vultrino approval status <id>                    # show status; runs it if approved
+vultrino approval status <id> --wait             # block until decided, then return result
+vultrino approval approve <id>
+vultrino approval deny <id>
 
 # Server Modes
 vultrino web                                    # Start web UI
@@ -251,6 +260,7 @@ Available MCP tools:
 - `http_request` — Make authenticated HTTP requests
 - `list_credentials` — List available credentials
 - `get_credential_info` — Get credential metadata
+- `check_approval` — Poll a pending action approval and retrieve its result once approved
 - Plugin tools (e.g., `pgp_sign`, `pgp_verify`)
 
 **Example MCP Request:**
@@ -286,11 +296,72 @@ vultrino token create deploy-once \
 - **Scoped** to a credential glob (`--credential`) and optionally a single action
   or `plugin.*` glob (`--action`).
 - Uses are counted **fail-closed**: the use is spent the moment the action runs,
-  even if the downstream call errors, and the check-and-increment is atomic across
-  processes (file-locked), so a single-use token can never run twice.
+  even if the downstream call errors, so a single-use token can never run twice.
+- Add `--require-approval` to gate every use behind a human decision (below).
 
 Manage tokens in the **Use Tokens** page of the web UI or with
 `vultrino token list` / `vultrino token revoke`.
+
+## Action Approvals
+
+Some actions are too consequential to let an agent run unsupervised. Mark them and
+Vultrino will pause for a human before the action executes — the agent never sees
+the result until someone signs off.
+
+**What triggers approval** (any of):
+- A credential flagged with `vultrino meta set <alias> require_approval true`
+- A use token created with `--require-approval`
+- A matching policy rule with `action = "prompt"`
+
+**How it works (and what the agent sees):**
+
+1. The agent calls a tool. Instead of a result it gets a clear **"APPROVAL
+   REQUIRED"** message with an `approval_id` — the action has *not* run.
+2. The agent polls the `check_approval` MCP tool (or `GET /api/v1/approvals/{id}`,
+   or `vultrino approval status <id> --wait`) with that id.
+3. A human approves or denies it — in the **Approvals** page of the admin panel,
+   via a **Telegram** button, or via a link delivered by **webhook/email**.
+4. Once approved, the next poll runs the action and returns the real result. If
+   denied or expired, the agent is told to stop.
+
+Configure out-of-band notifications under `[approvals]` in `config.toml`:
+
+```toml
+[approvals]
+enabled = true
+ttl_secs = 3600                                   # auto-expire undecided requests
+public_base_url = "https://vultrino.example.com"  # used in approve/deny links
+
+[approvals.telegram]                              # inline Approve/Deny buttons
+bot_token = "123456:ABC-DEF..."
+chat_id = "987654321"
+
+[approvals.webhook]                               # POST to any URL (email/Slack/...)
+url = "https://hooks.example.com/vultrino-approvals"
+auth_header = "Bearer your-webhook-secret"
+```
+
+Out-of-band links carry a single-use capability token and open a confirmation
+page (a link prefetch can't auto-decide), so the admin panel session is never
+required to approve from Telegram/email.
+
+**Notes & guarantees:**
+- Single-use/limited-use tokens are enforced **fail-closed** with a cross-process
+  file lock, so a token can never drive more than `max_uses` executions even
+  when the web and MCP servers run as separate processes sharing one vault.
+- Approved actions execute **at most once**: execution is claimed atomically, a
+  crashed mid-execution claim is auto-recovered after a timeout, and a transient
+  pre-execution failure (e.g. a plugin not yet loaded) is retried rather than
+  marked done.
+- An agent may only poll approvals created by the **same principal** (API key or
+  use token) that made the original request.
+- Set `public_base_url` to an **HTTPS** address so Telegram/email approve-deny
+  links are confidential, and avoid running the web server at `DEBUG` log level
+  in production (request URIs, which carry the link's capability token, are
+  logged at `DEBUG`).
+- An approval-gated single-use token can open more than one *pending* approval;
+  only the first approved one will execute (the rest fail closed at run time), so
+  review token-gated requests with that in mind.
 
 ## Plugin System
 

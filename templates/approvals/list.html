@@ -1,0 +1,70 @@
+{% extends "layout.html" %}
+
+{% block title %}Approvals - Vultrino{% endblock %}
+{% block nav_approvals %}active{% endblock %}
+{% block page_title %}Action Approvals{% endblock %}
+
+{% block flash_message %}
+{% if let Some(f) = flash %}
+<div class="flash {{ f.kind.as_class() }}">{{ f.message }}</div>
+{% endif %}
+{% endblock %}
+
+{% block content %}
+<p class="page-intro">
+    Actions that require human approval pause here. Approve one and the waiting agent will run it
+    on its next poll and receive the result; deny it and the agent is told to stop.
+</p>
+
+{% if approvals.is_empty() %}
+<div class="empty-state">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M9 11l3 3L22 4"></path>
+        <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
+    </svg>
+    <h3>No approval requests</h3>
+    <p>When an agent triggers an action that needs sign-off, it will appear here.</p>
+</div>
+{% else %}
+<div class="approval-list">
+    {% for approval in approvals %}
+    <div class="approval-card">
+        <div class="approval-head">
+            <span class="badge {{ approval.status_class }}">{{ approval.status }}</span>
+            <span class="approval-summary">{{ approval.summary }}</span>
+        </div>
+        <div class="approval-meta">
+            <span><strong>Credential:</strong> {{ approval.credential }}</span>
+            <span><strong>Action:</strong> {{ approval.action }}</span>
+            <span><strong>Requested by:</strong> {{ approval.requested_by }}</span>
+            <span><strong>Created:</strong> {{ approval.created_at }}</span>
+            <span><strong>Expires:</strong> {{ approval.expires_at }}</span>
+            {% if !approval.decided_by.is_empty() %}
+            <span><strong>Decided by:</strong> {{ approval.decided_by }}</span>
+            {% endif %}
+            {% if !approval.result_summary.is_empty() %}
+            <span><strong>Result:</strong> {{ approval.result_summary }}</span>
+            {% endif %}
+        </div>
+        <details class="approval-params">
+            <summary>Request parameters</summary>
+            <pre>{{ approval.params_pretty }}</pre>
+        </details>
+        {% if approval.is_pending %}
+        <div class="approval-actions">
+            <form action="/approvals/{{ approval.id }}/approve" method="post" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit" class="btn btn-primary">Approve</button>
+            </form>
+            <form action="/approvals/{{ approval.id }}/deny" method="post" class="inline-form"
+                  onsubmit="return confirm('Deny this action?')">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit" class="btn btn-danger">Deny</button>
+            </form>
+        </div>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+{% endblock %}
