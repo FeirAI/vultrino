@@ -1,0 +1,112 @@
+{% extends "layout.html" %}
+
+{% block title %}Use Tokens - Vultrino{% endblock %}
+{% block nav_tokens %}active{% endblock %}
+{% block page_title %}Use Tokens{% endblock %}
+
+{% block page_actions %}
+<a href="/tokens/new" class="btn btn-primary">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="12" y1="5" x2="12" y2="19"></line>
+        <line x1="5" y1="12" x2="19" y2="12"></line>
+    </svg>
+    Create Use Token
+</a>
+{% endblock %}
+
+{% block flash_message %}
+{% if let Some(f) = flash %}
+<div class="flash {{ f.kind.as_class() }}">{{ f.message }}</div>
+{% endif %}
+{% endblock %}
+
+{% block content %}
+{% if let Some(token) = new_token %}
+<div class="new-key-banner">
+    <div class="new-key-header">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+            <polyline points="22 4 12 14.01 9 11.01"></polyline>
+        </svg>
+        <h3>Use Token Created</h3>
+    </div>
+    <p>Copy this token now. It will not be shown again. Give it to the agent in place of an API key.</p>
+    <div class="key-display">
+        <code id="new-use-token">{{ token }}</code>
+        <button type="button" class="btn-copy" onclick="copyToken()">Copy</button>
+    </div>
+</div>
+<script>
+function copyToken() {
+    const t = document.getElementById('new-use-token').textContent;
+    navigator.clipboard.writeText(t);
+}
+</script>
+{% endif %}
+
+<p class="page-intro">
+    A use token is a narrow, single-purpose grant: it authorizes one kind of action against
+    one credential (or glob), optionally limited to a number of uses and/or a time window.
+    Hand it to an agent in the <code>api_key</code> field.
+</p>
+
+{% if tokens.is_empty() %}
+<div class="empty-state">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="9"></circle>
+        <polyline points="12 7 12 12 15 14"></polyline>
+    </svg>
+    <h3>No use tokens yet</h3>
+    <p>Create a scoped, single-use or time-limited token for an agent.</p>
+    <a href="/tokens/new" class="btn btn-primary">Create Use Token</a>
+</div>
+{% else %}
+<div class="table-container">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Token</th>
+                <th>Credential</th>
+                <th>Action</th>
+                <th>Uses</th>
+                <th>Expires</th>
+                <th>Status</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for token in tokens %}
+            <tr>
+                <td>
+                    <div class="cell-primary">{{ token.name }}</div>
+                    <div class="cell-secondary">Last used {{ token.last_used }}</div>
+                </td>
+                <td><code class="key-prefix">{{ token.token_prefix }}</code></td>
+                <td><span class="badge">{{ token.credential_scope }}</span></td>
+                <td>{{ token.action_scope }}</td>
+                <td>{{ token.uses_display }}</td>
+                <td>{{ token.expires }}</td>
+                <td><span class="badge">{{ token.status }}</span></td>
+                <td class="cell-actions">
+                    {% if !token.revoked %}
+                    <form action="/tokens/{{ token.id }}/revoke" method="post" class="inline-form"
+                          onsubmit="return confirm('Revoke this use token?')">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button type="submit" class="btn-icon btn-danger" title="Revoke">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <line x1="15" y1="9" x2="9" y2="15"></line>
+                                <line x1="9" y1="9" x2="15" y2="15"></line>
+                            </svg>
+                        </button>
+                    </form>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+{% endblock %}

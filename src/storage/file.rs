@@ -3,7 +3,7 @@
 //! Stores credentials in an encrypted JSON file on disk.
 
 use super::{StorageBackend, StorageError};
-use crate::auth::{ApiKey, Role};
+use crate::auth::{ApiKey, Role, UseToken};
 use crate::crypto::{decrypt, derive_key, encrypt, generate_salt, EncryptedData, MasterKey};
 use crate::{Credential, CredentialMetadata};
 use async_trait::async_trait;
@@ -38,6 +38,9 @@ struct StorageCache {
     /// API keys by ID
     #[serde(default)]
     api_keys: HashMap<String, ApiKey>,
+    /// Use tokens by ID
+    #[serde(default)]
+    use_tokens: HashMap<String, UseToken>,
 
     // Secondary indexes for O(1) lookups (not serialized, rebuilt on load)
     /// Index: credential alias -> credential ID
@@ -49,6 +52,9 @@ struct StorageCache {
     /// Index: API key hash -> API key ID
     #[serde(skip)]
     api_key_hash_index: HashMap<String, String>,
+    /// Index: use token hash -> use token ID
+    #[serde(skip)]
+    use_token_hash_index: HashMap<String, String>,
 }
 
 impl StorageCache {
@@ -58,6 +64,7 @@ impl StorageCache {
         self.alias_index.clear();
         self.role_name_index.clear();
         self.api_key_hash_index.clear();
+        self.use_token_hash_index.clear();
 
         // Rebuild credential alias index
         for (id, cred) in &self.credentials {
@@ -72,6 +79,11 @@ impl StorageCache {
         // Rebuild API key hash index
         for (id, key) in &self.api_keys {
             self.api_key_hash_index.insert(key.key_hash.clone(), id.clone());
+        }
+
+        // Rebuild use token hash index
+        for (id, token) in &self.use_tokens {
+            self.use_token_hash_index.insert(token.token_hash.clone(), id.clone());
         }
     }
 }
@@ -120,8 +132,8 @@ impl FileStorage {
             salt,
         };
 
-        // Write initial empty storage
-        storage.save().await?;
+        // Write initial empty storage (through the cross-process lock).
+        storage.locked_mutate(|_| Ok(()))?;
 
         Ok(storage)
     }
@@ -142,27 +154,9 @@ impl FileStorage {
         // Derive key from password
         let master_key = derive_key(password, &salt)?;
 
-        // Decrypt data
+        // Decrypt + parse (tolerates the legacy credentials-only format)
         let decrypted = decrypt(&storage_file.data, &master_key)?;
-
-        // Try to parse as new format (StorageCache), fall back to old format (just credentials)
-        let mut cache: StorageCache = serde_json::from_slice(&decrypted)
-            .or_else(|_| {
-                // Try old format: just a HashMap of credentials
-                let credentials: HashMap<String, Credential> = serde_json::from_slice(&decrypted)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                Ok::<_, StorageError>(StorageCache {
-                    credentials,
-                    roles: HashMap::new(),
-                    api_keys: HashMap::new(),
-                    alias_index: HashMap::new(),
-                    role_name_index: HashMap::new(),
-                    api_key_hash_index: HashMap::new(),
-                })
-            })?;
-
-        // Rebuild secondary indexes from loaded data
-        cache.rebuild_indexes();
+        let cache = Self::parse_cache(&decrypted)?;
 
         Ok(Self {
             path,
@@ -172,68 +166,92 @@ impl FileStorage {
         })
     }
 
+    /// Parse decrypted bytes into a `StorageCache`, tolerating the legacy
+    /// "just a map of credentials" format, and rebuild secondary indexes.
+    fn parse_cache(decrypted: &[u8]) -> Result<StorageCache, StorageError> {
+        let mut cache: StorageCache = serde_json::from_slice(decrypted).or_else(|_| {
+            let credentials: HashMap<String, Credential> = serde_json::from_slice(decrypted)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            Ok::<_, StorageError>(StorageCache {
+                credentials,
+                ..Default::default()
+            })
+        })?;
+        cache.rebuild_indexes();
+        Ok(cache)
+    }
+
+    /// Read and decrypt the authoritative on-disk cache (blocking).
+    fn read_cache_from_disk_sync(&self) -> Result<StorageCache, StorageError> {
+        if !self.path.exists() {
+            return Ok(StorageCache::default());
+        }
+        let content = std::fs::read_to_string(&self.path)?;
+        let storage_file: StorageFile = serde_json::from_str(&content)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let decrypted = decrypt(&storage_file.data, &self.master_key)?;
+        Self::parse_cache(&decrypted)
+    }
+
+    /// Encrypt and atomically write a cache to disk (blocking).
+    fn write_cache_to_disk_sync(&self, cache: &StorageCache) -> Result<(), StorageError> {
+        let data =
+            serde_json::to_vec(cache).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let encrypted = encrypt(&data, &self.master_key)?;
+        let storage_file = StorageFile {
+            version: 3, // v3 adds use_tokens + approvals
+            salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &self.salt),
+            data: encrypted,
+        };
+        let content = serde_json::to_string_pretty(&storage_file)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let temp_path = self.path.with_extension("tmp");
+        std::fs::write(&temp_path, &content)?;
+        std::fs::rename(&temp_path, &self.path)?;
+        Ok(())
+    }
+
+    /// Perform a **cross-process atomic** read-modify-write of the storage file.
+    ///
+    /// Acquires an exclusive advisory lock on a sidecar `.lock` file, then reads
+    /// the authoritative on-disk state, applies `f`, persists the result, and
+    /// refreshes the in-memory cache — all while holding the lock. This is what
+    /// makes the single-use-token check-and-increment and the approval
+    /// execution-claim atomic even though the web and MCP servers run as
+    /// separate processes sharing one encrypted file. The closure operates
+    /// purely on the in-memory snapshot and must not perform I/O.
+    fn locked_mutate<T>(
+        &self,
+        f: impl FnOnce(&mut StorageCache) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let lock_path = self.path.with_extension("lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        let mut flock = fd_lock::RwLock::new(lock_file);
+        // Blocks until no other process/thread holds the lock.
+        let _guard = flock.write().map_err(StorageError::Io)?;
+
+        // Authoritative read from disk (not the possibly-stale in-memory cache).
+        let mut cache = self.read_cache_from_disk_sync()?;
+        let result = f(&mut cache)?;
+        self.write_cache_to_disk_sync(&cache)?;
+        *self.cache.write() = cache;
+        Ok(result)
+        // `_guard` dropped here releases the lock.
+    }
+
     /// Reload data from disk (for picking up external changes)
     pub async fn reload(&self) -> Result<(), StorageError> {
         let content = fs::read_to_string(&self.path).await?;
         let storage_file: StorageFile = serde_json::from_str(&content)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-
-        // Decrypt data
         let decrypted = decrypt(&storage_file.data, &self.master_key)?;
-
-        // Parse as StorageCache
-        let mut cache: StorageCache = serde_json::from_slice(&decrypted)
-            .or_else(|_| {
-                // Try old format: just a HashMap of credentials
-                let credentials: HashMap<String, Credential> = serde_json::from_slice(&decrypted)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                Ok::<_, StorageError>(StorageCache {
-                    credentials,
-                    roles: HashMap::new(),
-                    api_keys: HashMap::new(),
-                    alias_index: HashMap::new(),
-                    role_name_index: HashMap::new(),
-                    api_key_hash_index: HashMap::new(),
-                })
-            })?;
-
-        // Rebuild secondary indexes from loaded data
-        cache.rebuild_indexes();
-
-        // Update cache
+        let cache = Self::parse_cache(&decrypted)?;
         *self.cache.write() = cache;
-
-        Ok(())
-    }
-
-    /// Save the current state to disk
-    async fn save(&self) -> Result<(), StorageError> {
-        let data = {
-            let cache = self.cache.read();
-            serde_json::to_vec(&*cache)
-                .map_err(|e| StorageError::Serialization(e.to_string()))?
-        };
-
-        // Encrypt data
-        let encrypted = encrypt(&data, &self.master_key)?;
-
-        let storage_file = StorageFile {
-            version: 2, // Bump version for new format
-            salt: base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                &self.salt,
-            ),
-            data: encrypted,
-        };
-
-        let content = serde_json::to_string_pretty(&storage_file)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-
-        // Write atomically by writing to temp file first
-        let temp_path = self.path.with_extension("tmp");
-        fs::write(&temp_path, &content).await?;
-        fs::rename(&temp_path, &self.path).await?;
-
         Ok(())
     }
 }
@@ -241,22 +259,16 @@ impl FileStorage {
 #[async_trait]
 impl StorageBackend for FileStorage {
     async fn store(&self, credential: &Credential) -> Result<(), StorageError> {
-        {
-            let mut cache = self.cache.write();
-
-            // Check for duplicate alias using index (O(1) lookup)
+        self.locked_mutate(|cache| {
             if let Some(existing_id) = cache.alias_index.get(&credential.alias) {
                 if existing_id != &credential.id {
                     return Err(StorageError::AlreadyExists(credential.alias.clone()));
                 }
             }
-
-            // Update index
             cache.alias_index.insert(credential.alias.clone(), credential.id.clone());
             cache.credentials.insert(credential.id.clone(), credential.clone());
-        }
-
-        self.save().await
+            Ok(())
+        })
     }
 
     async fn get(&self, id: &str) -> Result<Option<Credential>, StorageError> {
@@ -266,7 +278,6 @@ impl StorageBackend for FileStorage {
 
     async fn get_by_alias(&self, alias: &str) -> Result<Option<Credential>, StorageError> {
         let cache = self.cache.read();
-        // O(1) lookup using index
         if let Some(id) = cache.alias_index.get(alias) {
             Ok(cache.credentials.get(id).cloned())
         } else {
@@ -280,78 +291,65 @@ impl StorageBackend for FileStorage {
     }
 
     async fn delete(&self, id: &str) -> Result<(), StorageError> {
-        {
-            let mut cache = self.cache.write();
+        self.locked_mutate(|cache| {
             if let Some(cred) = cache.credentials.remove(id) {
-                // Remove from alias index
                 cache.alias_index.remove(&cred.alias);
+                Ok(())
             } else {
-                return Err(StorageError::NotFound(id.to_string()));
+                Err(StorageError::NotFound(id.to_string()))
             }
-        }
-
-        self.save().await
+        })
     }
 
     async fn update(&self, credential: &Credential) -> Result<(), StorageError> {
-        {
-            let mut cache = self.cache.write();
-            let old_cred = cache.credentials.get(&credential.id)
+        self.locked_mutate(|cache| {
+            let old_cred = cache
+                .credentials
+                .get(&credential.id)
                 .ok_or_else(|| StorageError::NotFound(credential.id.clone()))?
                 .clone();
 
-            // Check for duplicate alias using index (O(1) lookup)
             if let Some(existing_id) = cache.alias_index.get(&credential.alias) {
                 if existing_id != &credential.id {
                     return Err(StorageError::AlreadyExists(credential.alias.clone()));
                 }
             }
 
-            // Update alias index if alias changed
             if old_cred.alias != credential.alias {
                 cache.alias_index.remove(&old_cred.alias);
-                cache.alias_index.insert(credential.alias.clone(), credential.id.clone());
+                cache
+                    .alias_index
+                    .insert(credential.alias.clone(), credential.id.clone());
             }
 
             cache.credentials.insert(credential.id.clone(), credential.clone());
-        }
-
-        self.save().await
+            Ok(())
+        })
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {
-        // Check if we can read the storage file
         if !self.path.exists() {
             return Err(StorageError::Unavailable(
                 "Storage file does not exist".to_string(),
             ));
         }
-
-        // Try to read the file
         fs::metadata(&self.path).await?;
-
         Ok(())
     }
 
     // ==================== Auth Storage ====================
 
     async fn store_role(&self, role: &Role) -> Result<(), StorageError> {
-        {
-            let mut cache = self.cache.write();
-
-            // Check for duplicate name using index (O(1) lookup)
+        self.locked_mutate(|cache| {
             if let Some(existing_id) = cache.role_name_index.get(&role.name) {
                 if existing_id != &role.id {
                     return Err(StorageError::RoleAlreadyExists(role.name.clone()));
                 }
             }
-
-            // Update index
             cache.role_name_index.insert(role.name.clone(), role.id.clone());
             cache.roles.insert(role.id.clone(), role.clone());
-        }
-
-        self.save().await
+            Ok(())
+        })
     }
 
     async fn get_role(&self, id: &str) -> Result<Option<Role>, StorageError> {
@@ -361,7 +359,6 @@ impl StorageBackend for FileStorage {
 
     async fn get_role_by_name(&self, name: &str) -> Result<Option<Role>, StorageError> {
         let cache = self.cache.read();
-        // O(1) lookup using index
         if let Some(id) = cache.role_name_index.get(name) {
             Ok(cache.roles.get(id).cloned())
         } else {
@@ -375,33 +372,26 @@ impl StorageBackend for FileStorage {
     }
 
     async fn delete_role(&self, id: &str) -> Result<(), StorageError> {
-        {
-            let mut cache = self.cache.write();
+        self.locked_mutate(|cache| {
             if let Some(role) = cache.roles.remove(id) {
-                // Remove from name index
                 cache.role_name_index.remove(&role.name);
+                Ok(())
             } else {
-                return Err(StorageError::RoleNotFound(id.to_string()));
+                Err(StorageError::RoleNotFound(id.to_string()))
             }
-        }
-
-        self.save().await
+        })
     }
 
     async fn store_api_key(&self, key: &ApiKey) -> Result<(), StorageError> {
-        {
-            let mut cache = self.cache.write();
-            // Update index
+        self.locked_mutate(|cache| {
             cache.api_key_hash_index.insert(key.key_hash.clone(), key.id.clone());
             cache.api_keys.insert(key.id.clone(), key.clone());
-        }
-
-        self.save().await
+            Ok(())
+        })
     }
 
     async fn get_api_key_by_hash(&self, hash: &str) -> Result<Option<ApiKey>, StorageError> {
         let cache = self.cache.read();
-        // O(1) lookup using index
         if let Some(id) = cache.api_key_hash_index.get(hash) {
             Ok(cache.api_keys.get(id).cloned())
         } else {
@@ -415,34 +405,99 @@ impl StorageBackend for FileStorage {
     }
 
     async fn delete_api_key(&self, id: &str) -> Result<(), StorageError> {
-        {
-            let mut cache = self.cache.write();
+        self.locked_mutate(|cache| {
             if let Some(key) = cache.api_keys.remove(id) {
-                // Remove from hash index
                 cache.api_key_hash_index.remove(&key.key_hash);
+                Ok(())
             } else {
-                return Err(StorageError::ApiKeyNotFound(id.to_string()));
+                Err(StorageError::ApiKeyNotFound(id.to_string()))
             }
-        }
-
-        self.save().await
+        })
     }
 
     async fn update_api_key_last_used(&self, id: &str) -> Result<(), StorageError> {
-        {
-            let mut cache = self.cache.write();
+        self.locked_mutate(|cache| {
             if let Some(key) = cache.api_keys.get_mut(id) {
                 key.last_used_at = Some(Utc::now());
+                Ok(())
             } else {
-                return Err(StorageError::ApiKeyNotFound(id.to_string()));
+                Err(StorageError::ApiKeyNotFound(id.to_string()))
             }
-        }
+        })
+    }
 
-        self.save().await
+    // ==================== Use Token Storage ====================
+
+    async fn store_use_token(&self, token: &UseToken) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            cache
+                .use_token_hash_index
+                .insert(token.token_hash.clone(), token.id.clone());
+            cache.use_tokens.insert(token.id.clone(), token.clone());
+            Ok(())
+        })
+    }
+
+    async fn get_use_token(&self, id: &str) -> Result<Option<UseToken>, StorageError> {
+        let cache = self.cache.read();
+        Ok(cache.use_tokens.get(id).cloned())
+    }
+
+    async fn get_use_token_by_hash(&self, hash: &str) -> Result<Option<UseToken>, StorageError> {
+        let cache = self.cache.read();
+        if let Some(id) = cache.use_token_hash_index.get(hash) {
+            Ok(cache.use_tokens.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_use_tokens(&self) -> Result<Vec<UseToken>, StorageError> {
+        let cache = self.cache.read();
+        Ok(cache.use_tokens.values().cloned().collect())
+    }
+
+    async fn delete_use_token(&self, id: &str) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            if let Some(token) = cache.use_tokens.remove(id) {
+                cache.use_token_hash_index.remove(&token.token_hash);
+                Ok(())
+            } else {
+                Err(StorageError::UseTokenNotFound(id.to_string()))
+            }
+        })
+    }
+
+    async fn consume_use_token(&self, id: &str) -> Result<UseToken, StorageError> {
+        // Authoritative check-and-increment under the cross-process lock, against
+        // the on-disk state — so a single-use token can never drive two
+        // executions even across the web/MCP process split.
+        self.locked_mutate(|cache| {
+            let token = cache
+                .use_tokens
+                .get_mut(id)
+                .ok_or_else(|| StorageError::UseTokenNotFound(id.to_string()))?;
+            token
+                .check_usable()
+                .map_err(|e| StorageError::UseTokenUnusable(e.to_string()))?;
+            token.uses += 1;
+            token.last_used_at = Some(Utc::now());
+            Ok(token.clone())
+        })
+    }
+
+    async fn set_use_token_revoked(&self, id: &str) -> Result<UseToken, StorageError> {
+        self.locked_mutate(|cache| {
+            let token = cache
+                .use_tokens
+                .get_mut(id)
+                .ok_or_else(|| StorageError::UseTokenNotFound(id.to_string()))?;
+            token.revoked = true;
+            Ok(token.clone())
+        })
     }
 
     async fn reload(&self) -> Result<(), StorageError> {
-        // Call the inherent reload method
         FileStorage::reload(self).await
     }
 }

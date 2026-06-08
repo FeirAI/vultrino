@@ -11,7 +11,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn, Level};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use vultrino::auth::{AuthManager, Permission, ROLE_ADMIN, ROLE_EXECUTOR, ROLE_READ_ONLY};
+use vultrino::auth::{
+    AuthManager, NewUseToken, Permission, UseToken, ROLE_ADMIN, ROLE_EXECUTOR, ROLE_READ_ONLY,
+};
 use vultrino::config::{Config, StorageBackendType};
 use vultrino::mcp::McpServer;
 use vultrino::plugins::PluginInstaller;
@@ -283,6 +285,50 @@ enum Commands {
     Meta {
         #[command(subcommand)]
         command: MetaCommands,
+    },
+
+    /// Manage use tokens (single-use / time-scoped agent grants)
+    Token {
+        #[command(subcommand)]
+        command: TokenCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCommands {
+    /// Create a new use token (prints the token once)
+    Create {
+        /// Token name (for identification)
+        name: String,
+
+        /// Credential alias or glob this token may use (e.g. "github-*" or "*")
+        #[arg(short, long)]
+        credential: String,
+
+        /// Restrict to a single action or glob (e.g. "http.request", "postgres.*")
+        #[arg(short, long)]
+        action: Option<String>,
+
+        /// Maximum number of uses (omit for unlimited; 1 = single-use)
+        #[arg(short, long)]
+        uses: Option<u32>,
+
+        /// Expiration (e.g. "10m", "24h", "7d"; omit for never)
+        #[arg(short, long)]
+        expires: Option<String>,
+    },
+
+    /// List use tokens
+    List {
+        /// Output format (table, json)
+        #[arg(short, long, default_value = "table")]
+        format: String,
+    },
+
+    /// Revoke a use token
+    Revoke {
+        /// Token id, prefix, or name
+        id: String,
     },
 }
 
@@ -616,6 +662,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             MetaCommands::List { alias } => {
                 metadata_list(config, alias).await?;
+            }
+        },
+        Commands::Token { command } => match command {
+            TokenCommands::Create {
+                name,
+                credential,
+                action,
+                uses,
+                expires,
+            } => {
+                create_use_token(config, name, credential, action, uses, expires).await?;
+            }
+            TokenCommands::List { format } => {
+                list_use_tokens(config, format).await?;
+            }
+            TokenCommands::Revoke { id } => {
+                revoke_use_token(config, id).await?;
             }
         },
     }
@@ -1634,6 +1697,166 @@ async fn revoke_api_key(config: Config, id: String) -> Result<(), Box<dyn std::e
     storage.delete_api_key(&key_id).await?;
     println!("API key '{}' (ID: {}) revoked", key_name, key_id);
 
+    Ok(())
+}
+
+// ==================== Use Token Management ====================
+
+/// Parse a short token expiry (s, m=minutes, h, d, w).
+fn parse_token_expiration(s: &str) -> Result<Option<Duration>, String> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() || s == "never" {
+        return Ok(None);
+    }
+    // Split off the trailing unit char on a UTF-8 boundary (a byte index split
+    // would panic on multibyte input like "10€").
+    let unit_ch = s.chars().last().unwrap();
+    let num_str = &s[..s.len() - unit_ch.len_utf8()];
+    let unit = unit_ch.to_string();
+    let unit = unit.as_str();
+    let n: i64 = num_str
+        .parse()
+        .map_err(|_| format!("Invalid duration '{}'. Use e.g. 10m, 24h, 7d.", s))?;
+    let d = match unit {
+        "s" => Duration::seconds(n),
+        "m" => Duration::minutes(n),
+        "h" => Duration::hours(n),
+        "d" => Duration::days(n),
+        "w" => Duration::weeks(n),
+        _ => return Err(format!("Invalid duration unit in '{}'. Use s, m, h, d, or w.", s)),
+    };
+    if d <= Duration::zero() {
+        return Err("Duration must be positive".to_string());
+    }
+    Ok(Some(d))
+}
+
+/// Create a new use token.
+async fn create_use_token(
+    config: Config,
+    name: String,
+    credential: String,
+    action: Option<String>,
+    uses: Option<u32>,
+    expires: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = init_storage(&config).await?;
+
+    let expires_in = match expires {
+        Some(s) => parse_token_expiration(&s)?,
+        None => None,
+    };
+
+    let (full_token, token) = UseToken::create(NewUseToken {
+        name: name.clone(),
+        credential_scope: credential,
+        action_scope: action.filter(|s| !s.is_empty()),
+        max_uses: uses,
+        expires_in,
+    });
+
+    storage.store_use_token(&token).await?;
+
+    println!("Use token created successfully!\n");
+    println!("Token: {}", full_token);
+    println!("\n*** SAVE THIS TOKEN - IT WILL NOT BE SHOWN AGAIN ***\n");
+    println!("Name:       {}", token.name);
+    println!("ID:         {}", token.id);
+    println!("Credential: {}", token.credential_scope);
+    println!(
+        "Action:     {}",
+        token.action_scope.as_deref().unwrap_or("any action")
+    );
+    println!(
+        "Uses:       {}",
+        token
+            .max_uses
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "unlimited".to_string())
+    );
+    if let Some(exp) = token.expires_at {
+        println!("Expires:    {}", exp.format("%Y-%m-%d %H:%M:%S UTC"));
+    } else {
+        println!("Expires:    Never");
+    }
+    println!("\nGive this token to an agent in place of an API key (the 'api_key' field).");
+
+    Ok(())
+}
+
+/// List use tokens.
+async fn list_use_tokens(config: Config, format: String) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = init_storage(&config).await?;
+    let mut tokens = storage.list_use_tokens().await?;
+    tokens.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    if tokens.is_empty() {
+        println!("No use tokens found");
+        return Ok(());
+    }
+
+    match format.as_str() {
+        "json" => {
+            let meta: Vec<vultrino::auth::UseTokenMetadata> =
+                tokens.iter().map(|t| t.into()).collect();
+            println!("{}", serde_json::to_string_pretty(&meta)?);
+        }
+        _ => {
+            println!(
+                "{:<18} {:<14} {:<16} {:<16} {:<10} {:<10} STATUS",
+                "NAME", "PREFIX", "CREDENTIAL", "ACTION", "USES", "EXPIRES"
+            );
+            println!("{}", "-".repeat(100));
+            for t in &tokens {
+                let uses = match t.max_uses {
+                    Some(m) => format!("{}/{}", t.uses, m),
+                    None => format!("{}/\u{221E}", t.uses),
+                };
+                let expires = t
+                    .expires_at
+                    .map(|e| e.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "Never".to_string());
+                let status = if t.revoked {
+                    "revoked"
+                } else if t.is_expired() {
+                    "expired"
+                } else if t.is_exhausted() {
+                    "exhausted"
+                } else {
+                    "active"
+                };
+                println!(
+                    "{:<18} {:<14} {:<16} {:<16} {:<10} {:<10} {}",
+                    t.name,
+                    format!("{}...", t.token_prefix),
+                    t.credential_scope,
+                    t.action_scope.as_deref().unwrap_or("any"),
+                    uses,
+                    expires,
+                    status,
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Revoke a use token by id, prefix, or name.
+async fn revoke_use_token(config: Config, id: String) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = init_storage(&config).await?;
+    let tokens = storage.list_use_tokens().await?;
+
+    let token = tokens
+        .iter()
+        .find(|t| t.id == id || t.token_prefix.contains(&id) || t.name == id)
+        .ok_or_else(|| format!("Use token '{}' not found", id))?;
+
+    let mut token = token.clone();
+    token.revoked = true;
+    storage.store_use_token(&token).await?;
+
+    println!("Use token '{}' (ID: {}) revoked", token.name, token.id);
     Ok(())
 }
 

@@ -50,7 +50,7 @@ fn get_client_ip(headers: &HeaderMap, socket_addr: &SocketAddr) -> IpAddr {
     socket_addr.ip()
 }
 
-use crate::auth::Permission;
+use crate::auth::{NewUseToken, Permission, UseToken};
 use crate::plugins::PluginInstaller;
 use crate::{Credential, CredentialData, Secret};
 
@@ -61,7 +61,8 @@ use super::templates::{
     AuditLogTemplate, ApiKeyDisplay, CredentialDisplay, CredentialNewTemplate,
     CredentialsListTemplate, DashboardStats, DashboardTemplate, FlashKind, FlashMessage,
     KeyNewTemplate, KeysListTemplate, LoginTemplate, PluginCredentialType, RoleDisplay,
-    RoleNewTemplate, RoleOption, RolesListTemplate,
+    RoleNewTemplate, RoleOption, RolesListTemplate, UseTokenDisplay, UseTokenNewTemplate,
+    UseTokensListTemplate,
 };
 
 // ============== Login/Logout ==============
@@ -887,6 +888,162 @@ pub async fn audit_log(auth: RequireAuth) -> impl IntoResponse {
     Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
 }
 
+// ============== Use Tokens ==============
+
+/// Render the use-token listing (optionally surfacing a freshly-minted token).
+async fn render_tokens_list(
+    state: &AppState,
+    session: &tower_sessions::Session,
+    username: String,
+    new_token: Option<String>,
+    flash: Option<FlashMessage>,
+) -> Html<String> {
+    let _ = state.storage.reload().await;
+    let mut tokens = state.storage.list_use_tokens().await.unwrap_or_default();
+    // Newest first.
+    tokens.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let token_displays: Vec<UseTokenDisplay> = tokens.iter().map(UseTokenDisplay::from).collect();
+    let csrf_token = get_or_create_csrf_token(session).await.unwrap_or_default();
+
+    let template = UseTokensListTemplate {
+        username,
+        tokens: token_displays,
+        flash,
+        new_token,
+        csrf_token,
+    };
+    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+}
+
+pub async fn tokens_list(
+    State(state): State<AppState>,
+    session: Session,
+    auth: RequireAuth,
+) -> impl IntoResponse {
+    render_tokens_list(&state, &session, auth.session.username, None, None).await
+}
+
+pub async fn token_new(session: Session, auth: RequireAuth) -> impl IntoResponse {
+    let csrf_token = get_or_create_csrf_token(&session).await.unwrap_or_default();
+    let template = UseTokenNewTemplate {
+        username: auth.session.username,
+        error: None,
+        csrf_token,
+    };
+    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+}
+
+#[derive(Deserialize)]
+pub struct UseTokenForm {
+    name: String,
+    credential_scope: String,
+    action_scope: Option<String>,
+    max_uses: Option<String>,
+    expires: Option<String>,
+    csrf_token: String,
+}
+
+pub async fn token_create(
+    State(state): State<AppState>,
+    session: Session,
+    auth: RequireAuth,
+    Form(form): Form<UseTokenForm>,
+) -> Response {
+    if !validate_csrf_token(&session, &form.csrf_token).await {
+        return render_token_new_error(&session, auth, "Invalid security token. Please try again.")
+            .await
+            .into_response();
+    }
+
+    let name = form.name.trim().to_string();
+    if name.is_empty() {
+        return render_token_new_error(&session, auth, "Name is required").await.into_response();
+    }
+    let credential_scope = form.credential_scope.trim().to_string();
+    if credential_scope.is_empty() {
+        return render_token_new_error(&session, auth, "Credential scope is required (use * for any)")
+            .await
+            .into_response();
+    }
+    let action_scope = form
+        .action_scope
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let max_uses = match form.max_uses.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) => match s.parse::<u32>() {
+            Ok(n) if n >= 1 => Some(n),
+            _ => {
+                return render_token_new_error(&session, auth, "Max uses must be a positive whole number")
+                    .await
+                    .into_response();
+            }
+        },
+    };
+
+    let expires_in = match form.expires.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) => match parse_short_duration(s) {
+            Ok(d) => d,
+            Err(e) => return render_token_new_error(&session, auth, &e).await.into_response(),
+        },
+    };
+
+    let (full_token, token) = UseToken::create(NewUseToken {
+        name,
+        credential_scope,
+        action_scope,
+        max_uses,
+        expires_in,
+    });
+
+    if let Err(e) = state.storage.store_use_token(&token).await {
+        return render_token_new_error(&session, auth, &format!("Failed to save token: {}", e))
+            .await
+            .into_response();
+    }
+
+    render_tokens_list(
+        &state,
+        &session,
+        auth.session.username,
+        Some(full_token),
+        Some(FlashMessage {
+            kind: FlashKind::Success,
+            message: "Use token created".to_string(),
+        }),
+    )
+    .await
+    .into_response()
+}
+
+async fn render_token_new_error(session: &Session, auth: RequireAuth, error: &str) -> impl IntoResponse {
+    let csrf_token = get_or_create_csrf_token(session).await.unwrap_or_default();
+    let template = UseTokenNewTemplate {
+        username: auth.session.username,
+        error: Some(error.to_string()),
+        csrf_token,
+    };
+    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+}
+
+pub async fn token_revoke(
+    State(state): State<AppState>,
+    session: Session,
+    _auth: RequireAuth,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteForm>,
+) -> impl IntoResponse {
+    if !validate_csrf_token(&session, &form.csrf_token).await {
+        return Redirect::to("/tokens").into_response();
+    }
+    // Mark revoked (preserve the audit trail) rather than hard-deleting.
+    let _ = state.storage.set_use_token_revoked(&id).await;
+    let _ = regenerate_csrf_token(&session).await;
+    Redirect::to("/tokens").into_response()
+}
+
 // ============== API Endpoints ==============
 
 pub async fn api_stats(
@@ -906,6 +1063,37 @@ pub async fn api_stats(
 }
 
 // ============== Helpers ==============
+
+/// Parse a short-lived duration for use tokens. Unlike [`parse_duration`] (used
+/// for API keys, where `m` means months), here `m` means **minutes** because use
+/// tokens are typically scoped to seconds/minutes/hours. Units: s, m, h, d, w.
+fn parse_short_duration(s: &str) -> Result<Option<chrono::Duration>, String> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() || s == "never" {
+        return Ok(None);
+    }
+    // Split off the trailing unit char on a UTF-8 boundary (a byte index split
+    // would panic on multibyte input like "30€").
+    let unit_ch = s.chars().last().unwrap();
+    let num_str = &s[..s.len() - unit_ch.len_utf8()];
+    let unit_string = unit_ch.to_string();
+    let unit = unit_string.as_str();
+    let n: i64 = num_str
+        .parse()
+        .map_err(|_| format!("Invalid duration '{}'. Use e.g. 30m, 24h, 7d.", s))?;
+    let duration = match unit {
+        "s" => chrono::Duration::seconds(n),
+        "m" => chrono::Duration::minutes(n),
+        "h" => chrono::Duration::hours(n),
+        "d" => chrono::Duration::days(n),
+        "w" => chrono::Duration::weeks(n),
+        _ => return Err(format!("Invalid duration unit in '{}'. Use s, m, h, d, or w.", s)),
+    };
+    if duration <= chrono::Duration::zero() {
+        return Err("Duration must be positive".to_string());
+    }
+    Ok(Some(duration))
+}
 
 fn parse_duration(s: &str) -> Result<Option<chrono::Duration>, String> {
     let s = s.trim().to_lowercase();

@@ -3,8 +3,8 @@
 //! Exposes Vultrino capabilities through the Model Context Protocol.
 
 use super::types::*;
-use crate::auth::{AuthManager, AuthResult, Permission};
-use crate::server::VultrinoServer;
+use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
+use crate::server::{ExecAuth, VultrinoServer};
 use crate::{CredentialMetadata, ExecuteRequest};
 use glob::Pattern;
 use serde_json::json;
@@ -12,6 +12,24 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+
+/// A successfully authenticated MCP caller — either a long-lived API key or a
+/// narrow, ephemeral use token.
+enum McpPrincipal {
+    ApiKey(AuthResult),
+    UseToken { auth: AuthResult, token: Box<UseToken> },
+}
+
+impl McpPrincipal {
+    /// The permission/scope source for this principal.
+    fn auth(&self) -> &AuthResult {
+        match self {
+            McpPrincipal::ApiKey(a) => a,
+            McpPrincipal::UseToken { auth, .. } => auth,
+        }
+    }
+}
+
 
 /// MCP Server for Vultrino
 pub struct McpServer {
@@ -60,6 +78,68 @@ impl McpServer {
             return Err(format!("Access denied to credential: {}", alias));
         }
         Ok(())
+    }
+
+    /// Resolve a presented secret into an authenticated principal. The secret
+    /// may be an API key (`vk_...`) or a use token (`vut_...`).
+    async fn resolve_principal(&self, secret: &str) -> Result<McpPrincipal, String> {
+        if UseToken::looks_like_token(secret) {
+            // Use tokens live in storage; reload so a token minted by the web UI
+            // or CLI after this server started is visible.
+            let vultrino = self.vultrino.read().await;
+            let _ = vultrino.storage().reload().await;
+            let token = vultrino
+                .storage()
+                .get_use_token_by_hash(&UseToken::hash(secret))
+                .await
+                .map_err(|e| format!("Storage error: {}", e))?
+                .ok_or_else(|| "Invalid use token".to_string())?;
+            drop(vultrino);
+
+            token
+                .check_usable()
+                .map_err(|e| format!("Use token cannot be used: {}", e))?;
+
+            let auth = AuthResult::for_use_token(&token);
+            Ok(McpPrincipal::UseToken {
+                auth,
+                token: Box::new(token),
+            })
+        } else {
+            let auth = self.validate_api_key(secret).await?;
+            Ok(McpPrincipal::ApiKey(auth))
+        }
+    }
+
+    /// Build an [`ExecAuth`] for the given principal, enforcing a use token's
+    /// credential/action scoping (API-key scoping is enforced in the server).
+    fn build_exec_auth(
+        principal: &McpPrincipal,
+        credential: &str,
+        full_action: &str,
+    ) -> Result<ExecAuth, String> {
+        match principal {
+            McpPrincipal::ApiKey(auth) => Ok(ExecAuth::from_api_key(auth.clone())),
+            McpPrincipal::UseToken { auth, token } => {
+                if !token.allows_credential(credential) {
+                    return Err(format!(
+                        "This use token is not scoped to credential '{}' (allowed: {})",
+                        credential, token.credential_scope
+                    ));
+                }
+                if !token.allows_action(full_action) {
+                    let allowed = token.action_scope.as_deref().unwrap_or("any");
+                    return Err(format!(
+                        "This use token is not scoped to action '{}' (allowed: {})",
+                        full_action, allowed
+                    ));
+                }
+                Ok(ExecAuth {
+                    auth: Some(auth.clone()),
+                    use_token_id: Some(token.id.clone()),
+                })
+            }
+        }
     }
 
     /// Run the MCP server over stdio
@@ -392,21 +472,16 @@ impl McpServer {
         tool_name: &str,
         args: serde_json::Value,
     ) -> Option<Result<Vec<ToolContent>, String>> {
-        // Extract and validate API key
-        let api_key = match args.get("api_key").and_then(|v| v.as_str()) {
+        // Extract the presented secret (API key or use token).
+        let secret = match args.get("api_key").and_then(|v| v.as_str()) {
             Some(k) => k,
             None => return Some(Err("Missing 'api_key' argument".to_string())),
         };
 
-        let auth = match self.validate_api_key(api_key).await {
-            Ok(a) => a,
+        let principal = match self.resolve_principal(secret).await {
+            Ok(p) => p,
             Err(e) => return Some(Err(e)),
         };
-
-        // Check execute permission
-        if let Err(msg) = Self::check_permission(&auth, Permission::Execute) {
-            return Some(Err(msg));
-        }
 
         // Walk the registry (single source of truth for live plugins) to
         // find the plugin that owns `tool_name`.
@@ -436,19 +511,21 @@ impl McpServer {
                 None => return Some(Err("Missing 'credential' argument".to_string())),
             };
 
-            if let Err(msg) = Self::check_credential_access(&auth, &credential) {
-                return Some(Err(msg));
-            }
+            let full_action = format!("{}.{}", plugin_name, mcp_tool.action);
+            let exec_auth = match Self::build_exec_auth(&principal, &credential, &full_action) {
+                Ok(a) => a,
+                Err(e) => return Some(Err(e)),
+            };
 
             let request = ExecuteRequest {
                 credential: credential.clone(),
-                action: format!("{}.{}", plugin_name, mcp_tool.action),
+                action: full_action.clone(),
                 params: args.clone(),
             };
 
             let vultrino = self.vultrino.read().await;
-            let response = match vultrino.execute_with_auth(request, Some(&auth)).await {
-                Ok(r) => r,
+            let response = match vultrino.execute_gated(request, exec_auth).await {
+                Ok(resp) => resp,
                 Err(e) => return Some(Err(format!("Plugin execution failed: {}", e))),
             };
 
@@ -504,9 +581,10 @@ impl McpServer {
         let args: Args = serde_json::from_value(args)
             .map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
-        // Validate API key and check permission
-        let auth = self.validate_api_key(&args.api_key).await?;
-        Self::check_permission(&auth, Permission::Read)?;
+        // Authenticate (API key or use token) and check permission.
+        let principal = self.resolve_principal(&args.api_key).await?;
+        let auth = principal.auth();
+        Self::check_permission(auth, Permission::Read)?;
 
         let vultrino = self.vultrino.read().await;
         let credentials = vultrino
@@ -559,10 +637,9 @@ impl McpServer {
         let args: HttpRequestArgs =
             serde_json::from_value(args).map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
-        // Validate API key and check permissions
-        let auth = self.validate_api_key(&args.api_key).await?;
-        Self::check_permission(&auth, Permission::Execute)?;
-        Self::check_credential_access(&auth, &args.credential)?;
+        // Resolve the caller (API key or use token) and build the auth context.
+        let principal = self.resolve_principal(&args.api_key).await?;
+        let exec_auth = Self::build_exec_auth(&principal, &args.credential, "http.request")?;
 
         // Build execute request
         let request = ExecuteRequest {
@@ -577,10 +654,10 @@ impl McpServer {
             }),
         };
 
-        // Execute through Vultrino with auth context
+        // Execute through Vultrino.
         let vultrino = self.vultrino.read().await;
         let response = vultrino
-            .execute_with_auth(request, Some(&auth))
+            .execute_gated(request, exec_auth)
             .await
             .map_err(|e| format!("Request failed: {}", e))?;
 
@@ -611,10 +688,11 @@ impl McpServer {
         let args: GetCredentialInfoArgs =
             serde_json::from_value(args).map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
-        // Validate API key and check permissions
-        let auth = self.validate_api_key(&args.api_key).await?;
-        Self::check_permission(&auth, Permission::Read)?;
-        Self::check_credential_access(&auth, &args.credential)?;
+        // Authenticate (API key or use token) and check permissions.
+        let principal = self.resolve_principal(&args.api_key).await?;
+        let auth = principal.auth();
+        Self::check_permission(auth, Permission::Read)?;
+        Self::check_credential_access(auth, &args.credential)?;
 
         let vultrino = self.vultrino.read().await;
 
@@ -653,6 +731,7 @@ impl McpServer {
             None => Err(format!("Credential not found: {}", args.credential)),
         }
     }
+
 }
 
 #[cfg(test)]

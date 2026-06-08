@@ -27,6 +27,7 @@ Vultrino is a secure credential proxy that allows AI agents, LLMs, and automated
 - **Scoped API Keys** — Restrict which credentials each API key can access using glob patterns
 - **Plugin System** — Extend with custom credential types and actions via WASM plugins
 - **MCP Integration** — Native Model Context Protocol support for LLM tools
+- **Use Tokens** — Single-use or time-scoped grants that let an agent perform one specific action
 - **Web UI** — Clean admin interface for managing credentials, roles, and API keys
 - **Encrypted Storage** — AES-256-GCM encryption with Argon2 key derivation
 - **Policy Engine** — URL patterns, method restrictions, rate limiting
@@ -136,6 +137,14 @@ vultrino role create <name> --permissions read,execute --scopes "github-*"
 vultrino role list
 vultrino key create <name> --role <role-name>
 vultrino key list
+
+# Use Tokens (single-use / time-scoped agent grants)
+vultrino token create deploy-once \              # one-shot, expires in 10 minutes
+  --credential "deploy-*" --action ssh.deploy --uses 1 --expires 10m
+vultrino token create reporter \                 # time-scoped, unlimited uses for 24h
+  --credential github-api --action http.request --expires 24h
+vultrino token list
+vultrino token revoke <id|prefix|name>
 
 # Server Modes
 vultrino web                                    # Start web UI
@@ -256,6 +265,32 @@ Available MCP tools:
   }
 }}
 ```
+
+## Use Tokens
+
+A **use token** is a narrow, ephemeral grant — the opposite of a durable API key.
+It authorizes *one kind of action* against *one credential (or glob)*, optionally
+capped to a number of uses and/or a time window. Hand it to an agent in the same
+place as an API key (the `api_key` field, or `Authorization: Bearer`); it is
+recognized by its `vut_` prefix.
+
+```bash
+# "POST to the deploy webhook once, in the next 10 minutes"
+vultrino token create deploy-once \
+  --credential deploy-hook --action http.request --uses 1 --expires 10m
+# Output: vut_xxxxxxxx... (shown once)
+```
+
+- **Single-use** (`--uses 1`) or **limited-use** (`--uses N`); omit for unlimited.
+- **Time-scoped** with `--expires` (`30m`, `24h`, `7d`; omit for never).
+- **Scoped** to a credential glob (`--credential`) and optionally a single action
+  or `plugin.*` glob (`--action`).
+- Uses are counted **fail-closed**: the use is spent the moment the action runs,
+  even if the downstream call errors, and the check-and-increment is atomic across
+  processes (file-locked), so a single-use token can never run twice.
+
+Manage tokens in the **Use Tokens** page of the web UI or with
+`vultrino token list` / `vultrino token revoke`.
 
 ## Plugin System
 

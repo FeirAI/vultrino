@@ -6,6 +6,7 @@
 //! - Checking permissions for operations
 
 use super::manager::AuthManager;
+use super::tokens::UseToken;
 use super::types::{ApiKey, Permission, Role};
 use thiserror::Error;
 
@@ -41,6 +42,32 @@ pub struct AuthResult {
 }
 
 impl AuthResult {
+    /// Build an ephemeral [`AuthResult`] representing a use token: a one-off role
+    /// granting `read` + `execute` scoped to exactly the token's credential
+    /// scope. The token's action restriction (which no role can express) is
+    /// enforced separately by the caller.
+    pub fn for_use_token(token: &UseToken) -> Self {
+        let role = Role {
+            id: format!("use-token-role:{}", token.id),
+            name: format!("use-token:{}", token.name),
+            description: Some("Ephemeral grant backing a use token".to_string()),
+            permissions: [Permission::Read, Permission::Execute].into_iter().collect(),
+            credential_scopes: vec![token.credential_scope.clone()],
+            created_at: token.created_at,
+        };
+        let api_key = ApiKey {
+            id: token.id.clone(),
+            key_prefix: token.token_prefix.clone(),
+            key_hash: token.token_hash.clone(),
+            name: token.name.clone(),
+            role_id: role.id.clone(),
+            expires_at: token.expires_at,
+            created_at: token.created_at,
+            last_used_at: token.last_used_at,
+        };
+        Self { api_key, role }
+    }
+
     /// Check if the authenticated user has a specific permission
     pub fn has_permission(&self, permission: Permission) -> bool {
         self.role.has_permission(permission)

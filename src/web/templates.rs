@@ -278,6 +278,78 @@ pub struct KeyNewTemplate {
     pub csrf_token: String,
 }
 
+// ============== Use Tokens ==============
+
+/// Use token row for the listing table.
+#[derive(Debug, Clone)]
+pub struct UseTokenDisplay {
+    pub id: String,
+    pub name: String,
+    pub token_prefix: String,
+    pub credential_scope: String,
+    pub action_scope: String,
+    pub uses_display: String,
+    pub expires: String,
+    pub last_used: String,
+    pub status: String,
+    pub revoked: bool,
+}
+
+impl From<&crate::auth::UseToken> for UseTokenDisplay {
+    fn from(t: &crate::auth::UseToken) -> Self {
+        let uses_display = match t.max_uses {
+            Some(max) => format!("{} / {}", t.uses, max),
+            None => format!("{} / \u{221E}", t.uses),
+        };
+        let status = if t.revoked {
+            "revoked".to_string()
+        } else if t.is_expired() {
+            "expired".to_string()
+        } else if t.is_exhausted() {
+            "exhausted".to_string()
+        } else {
+            "active".to_string()
+        };
+        Self {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            token_prefix: format!("{}...", t.token_prefix),
+            credential_scope: t.credential_scope.clone(),
+            action_scope: t.action_scope.clone().unwrap_or_else(|| "any action".to_string()),
+            uses_display,
+            expires: t
+                .expires_at
+                .map(|e| e.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "Never".to_string()),
+            last_used: t
+                .last_used_at
+                .map(|e| e.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "Never".to_string()),
+            status,
+            revoked: t.revoked,
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "tokens/list.html")]
+pub struct UseTokensListTemplate {
+    pub username: String,
+    pub tokens: Vec<UseTokenDisplay>,
+    pub flash: Option<FlashMessage>,
+    /// Newly-minted token, shown once.
+    pub new_token: Option<String>,
+    pub csrf_token: String,
+}
+
+#[derive(Template)]
+#[template(path = "tokens/new.html")]
+pub struct UseTokenNewTemplate {
+    pub username: String,
+    pub error: Option<String>,
+    pub csrf_token: String,
+}
+
 // ============== Audit Log ==============
 
 #[derive(Debug, Clone)]

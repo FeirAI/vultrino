@@ -8,9 +8,31 @@ use crate::plugins::PluginRegistry;
 use crate::policy::PolicyEngine;
 use crate::router::CredentialResolver;
 use crate::storage::StorageBackend;
-use crate::{ExecuteRequest, ExecuteResponse, RequestContext, VultrinoError};
+use crate::{Credential, ExecuteRequest, ExecuteResponse, RequestContext, VultrinoError};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Authentication context for an execution.
+///
+/// Carries the permission/scope source (`auth`) and, when a use token is driving
+/// the request, the token id so it can be consumed (reserved) on execution.
+#[derive(Default)]
+pub struct ExecAuth {
+    /// Real (API key) or synthesized (use token) auth result. `None` = local.
+    pub auth: Option<AuthResult>,
+    /// Set when the presented secret was a use token; consumed on execution.
+    pub use_token_id: Option<String>,
+}
+
+impl ExecAuth {
+    /// Build an `ExecAuth` for an API-key-authenticated request.
+    pub fn from_api_key(auth: AuthResult) -> Self {
+        Self {
+            auth: Some(auth),
+            use_token_id: None,
+        }
+    }
+}
 
 /// Main Vultrino server
 pub struct VultrinoServer {
@@ -72,7 +94,7 @@ impl VultrinoServer {
 
     /// Load all installed WASM plugins
     pub async fn load_plugins(&self) -> Result<(), VultrinoError> {
-        use crate::plugins::{PluginLoader, PluginInstaller};
+        use crate::plugins::{PluginInstaller, PluginLoader};
 
         let installer = PluginInstaller::default();
         let installed = installer.list().await.map_err(|e| {
@@ -100,31 +122,45 @@ impl VultrinoServer {
         Ok(())
     }
 
-    /// Execute a request through Vultrino
+    /// Execute a request through Vultrino (no authentication / local use).
     pub async fn execute(&self, request: ExecuteRequest) -> Result<ExecuteResponse, VultrinoError> {
         self.execute_with_auth(request, None).await
     }
 
-    /// Execute a request with optional authentication
+    /// Execute a request with optional API-key authentication.
     pub async fn execute_with_auth(
         &self,
         request: ExecuteRequest,
         auth: Option<&AuthResult>,
     ) -> Result<ExecuteResponse, VultrinoError> {
+        let exec_auth = match auth {
+            Some(a) => ExecAuth::from_api_key(a.clone()),
+            None => ExecAuth::default(),
+        };
+        self.execute_gated(request, exec_auth).await
+    }
+
+    /// Execute a request with a full auth context.
+    ///
+    /// Checks permission + credential scope, evaluates policy, and runs the
+    /// action. When the auth context carries a use token, the token is consumed
+    /// (reserved, fail-closed) just before the action runs.
+    pub async fn execute_gated(
+        &self,
+        request: ExecuteRequest,
+        exec_auth: ExecAuth,
+    ) -> Result<ExecuteResponse, VultrinoError> {
         let mut context = RequestContext::new();
 
-        // Add auth info to context if available
-        if let Some(auth_result) = auth {
+        // Permission + scope checks (only when authenticated).
+        if let Some(auth_result) = &exec_auth.auth {
             context = context.with_auth(auth_result);
 
-            // Check permission to execute
             if !auth_result.has_permission(Permission::Execute) {
                 return Err(VultrinoError::PolicyDenied(
                     "Missing 'execute' permission".to_string(),
                 ));
             }
-
-            // Check credential scope
             if !auth_result.can_access_credential(&request.credential) {
                 return Err(VultrinoError::PolicyDenied(format!(
                     "Access denied to credential: {}",
@@ -133,35 +169,16 @@ impl VultrinoServer {
             }
         }
 
-        // Resolve credential
+        // Resolve credential and parse the action.
         let credential = self.resolver.resolve(&request.credential).await?;
-
-        // Parse action to get plugin and action name
         let (plugin_name, action_name) = parse_action(&request.action)?;
 
-        // Get plugin
-        let plugin = self
-            .plugins
-            .get(plugin_name)
-            .ok_or_else(|| VultrinoError::Plugin(crate::plugins::PluginError::NotFound(plugin_name.to_string())))?;
-
-        // Extract URL for policy evaluation (if HTTP request)
-        let url = request
-            .params
-            .get("url")
-            .and_then(|v| v.as_str());
-        let method = request
-            .params
-            .get("method")
-            .and_then(|v| v.as_str());
-
-        // Evaluate policy
-        let decision = self.policy_engine.evaluate(
-            &credential.alias,
-            url,
-            method,
-            &context,
-        );
+        // Evaluate policy (URL / method / rate limits).
+        let url = request.params.get("url").and_then(|v| v.as_str());
+        let method = request.params.get("method").and_then(|v| v.as_str());
+        let decision = self
+            .policy_engine
+            .evaluate(&credential.alias, url, method, &context);
 
         match decision {
             crate::policy::PolicyDecision::Allow => {}
@@ -169,17 +186,51 @@ impl VultrinoServer {
                 return Err(VultrinoError::PolicyDenied(reason));
             }
             crate::policy::PolicyDecision::Prompt => {
-                // Future: implement interactive prompting
                 return Err(VultrinoError::PolicyDenied(
                     "Request requires user approval (not implemented)".to_string(),
                 ));
             }
         }
 
-        // Validate params
-        plugin.validate_params(action_name, &request.params)?;
+        self.run_action(
+            credential,
+            plugin_name,
+            action_name,
+            request.params.clone(),
+            context,
+            exec_auth.use_token_id.as_deref(),
+        )
+        .await
+    }
 
-        // Execute through plugin
+    /// Run a plugin action against a resolved credential.
+    ///
+    /// The plugin is resolved and params validated *before* the use token is
+    /// consumed, so a not-loaded plugin or bad params never burns a use. The
+    /// token is then reserved (fail-closed) immediately before the action runs.
+    async fn run_action(
+        &self,
+        credential: Credential,
+        plugin_name: &str,
+        action_name: &str,
+        params: serde_json::Value,
+        context: RequestContext,
+        use_token_id: Option<&str>,
+    ) -> Result<ExecuteResponse, VultrinoError> {
+        let plugin = self.plugins.get(plugin_name).ok_or_else(|| {
+            VultrinoError::Plugin(crate::plugins::PluginError::NotFound(plugin_name.to_string()))
+        })?;
+
+        // Validate params for the action.
+        plugin.validate_params(action_name, &params)?;
+
+        // Reserve the use token atomically, fail-closed, before the side effect.
+        if let Some(tid) = use_token_id {
+            self.storage.consume_use_token(tid).await.map_err(|e| {
+                VultrinoError::PolicyDenied(format!("Use token cannot be used: {}", e))
+            })?;
+        }
+
         let request_id = context.request_id.clone();
         let credential_id = credential.id.clone();
         let credential_alias = credential.alias.clone();
@@ -189,17 +240,17 @@ impl VultrinoServer {
         let plugin_request = crate::plugins::PluginRequest {
             credential,
             action: action_name.to_string(),
-            params: request.params.clone(),
+            params,
             context,
         };
 
         let response = plugin.execute(plugin_request).await?;
 
-        // If the credential was updated (e.g., OAuth2 token refresh), persist it
+        // Persist any credential update (e.g. OAuth2 token refresh).
         if let Some(updated_data) = &response.updated_credential {
             let updated_credential = crate::Credential {
                 id: credential_id,
-                alias: credential_alias,
+                alias: credential_alias.clone(),
                 credential_type: updated_data.credential_type(),
                 data: updated_data.clone(),
                 metadata: credential_metadata,
@@ -208,29 +259,22 @@ impl VultrinoServer {
             };
 
             if let Err(e) = self.storage.store(&updated_credential).await {
-                tracing::warn!(
+                warn!(
                     request_id = %request_id,
                     error = %e,
                     "Failed to persist updated credential (token refresh)"
                 );
-            } else {
-                tracing::debug!(
-                    request_id = %request_id,
-                    "Persisted updated credential after token refresh"
-                );
             }
         }
 
-        // Record for rate limiting
-        self.policy_engine.record_request(&request.credential);
+        // Record for rate limiting.
+        self.policy_engine.record_request(&credential_alias);
 
-        // Audit log
         info!(
             request_id = %request_id,
-            credential = %request.credential,
-            action = %request.action,
+            credential = %credential_alias,
+            action = %format!("{}.{}", plugin_name, action_name),
             status = response.status,
-            api_key = auth.map(|a| a.api_key.name.as_str()),
             "Request executed"
         );
 
