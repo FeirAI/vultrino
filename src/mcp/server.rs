@@ -3,7 +3,7 @@
 //! Exposes Vultrino capabilities through the Model Context Protocol.
 
 use super::types::*;
-use crate::approval::{ApprovalStatus, RequesterInfo};
+use crate::approval::ApprovalStatus;
 use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
 use crate::server::{ExecAuth, VultrinoServer};
 use crate::{CredentialMetadata, ExecuteRequest, ExecutionOutcome};
@@ -151,42 +151,13 @@ impl McpServer {
         }
     }
 
-    /// Build an [`ExecAuth`] for the given principal, enforcing a use token's
-    /// credential/action scoping (API-key scoping is enforced in the server).
-    fn build_exec_auth(
-        principal: &McpPrincipal,
-        credential: &str,
-        full_action: &str,
-    ) -> Result<ExecAuth, String> {
+    /// Build an [`ExecAuth`] for the given principal. A use token's credential
+    /// and action scope is enforced authoritatively in the server
+    /// (`execute_gated`), so this is a straight conversion.
+    fn build_exec_auth(principal: &McpPrincipal) -> ExecAuth {
         match principal {
-            McpPrincipal::ApiKey(auth) => Ok(ExecAuth::from_api_key(auth.clone())),
-            McpPrincipal::UseToken { auth, token } => {
-                if !token.allows_credential(credential) {
-                    return Err(format!(
-                        "This use token is not scoped to credential '{}' (allowed: {})",
-                        credential, token.credential_scope
-                    ));
-                }
-                if !token.allows_action(full_action) {
-                    let allowed = token.action_scope.as_deref().unwrap_or("any");
-                    return Err(format!(
-                        "This use token is not scoped to action '{}' (allowed: {})",
-                        full_action, allowed
-                    ));
-                }
-                let requester = RequesterInfo {
-                    principal_kind: "use_token".to_string(),
-                    principal_id: Some(token.id.clone()),
-                    principal_name: Some(token.name.clone()),
-                    role: None,
-                };
-                Ok(ExecAuth {
-                    auth: Some(auth.clone()),
-                    use_token_id: Some(token.id.clone()),
-                    force_approval: token.require_approval,
-                    requester,
-                })
-            }
+            McpPrincipal::ApiKey(auth) => ExecAuth::from_api_key(auth.clone()),
+            McpPrincipal::UseToken { token, .. } => ExecAuth::from_use_token((**token).clone()),
         }
     }
 
@@ -612,10 +583,7 @@ impl McpServer {
             };
 
             let full_action = format!("{}.{}", plugin_name, mcp_tool.action);
-            let exec_auth = match Self::build_exec_auth(&principal, &credential, &full_action) {
-                Ok(a) => a,
-                Err(e) => return Some(Err(e)),
-            };
+            let exec_auth = Self::build_exec_auth(&principal);
 
             let request = ExecuteRequest {
                 credential: credential.clone(),
@@ -744,7 +712,7 @@ impl McpServer {
 
         // Resolve the caller (API key or use token) and build the auth context.
         let principal = self.resolve_principal(&args.api_key).await?;
-        let exec_auth = Self::build_exec_auth(&principal, &args.credential, "http.request")?;
+        let exec_auth = Self::build_exec_auth(&principal);
 
         // Build execute request
         let request = ExecuteRequest {

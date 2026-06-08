@@ -42,6 +42,9 @@ pub enum StorageError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    #[error("Storage file version {found} is newer than this build supports (max {supported}); upgrade vultrino")]
+    UnsupportedVersion { found: u32, supported: u32 },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

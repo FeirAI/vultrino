@@ -995,14 +995,18 @@ pub async fn token_create(
 
     let require_approval = matches!(form.require_approval.as_deref(), Some("true") | Some("on") | Some("1"));
 
-    let (full_token, token) = UseToken::create(NewUseToken {
+    let params = NewUseToken {
         name,
         credential_scope,
         action_scope,
         max_uses,
         require_approval,
         expires_in,
-    });
+    };
+    if let Err(e) = params.validate() {
+        return render_token_new_error(&session, auth, &e).await.into_response();
+    }
+    let (full_token, token) = UseToken::create(params);
 
     if let Err(e) = state.storage.store_use_token(&token).await {
         return render_token_new_error(&session, auth, &format!("Failed to save token: {}", e))

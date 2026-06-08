@@ -162,7 +162,7 @@ async fn test_token_authorized_execution_consumes_use() {
 
     let exec_auth = ExecAuth {
         auth: Some(AuthResult::for_use_token(&token)),
-        use_token_id: Some(token.id.clone()),
+        use_token: Some(token.clone()),
         force_approval: false,
         requester: RequesterInfo::default(),
     };
@@ -181,7 +181,7 @@ async fn test_token_authorized_execution_consumes_use() {
     // A second attempt is denied because the token is exhausted (fail-closed).
     let exec_auth2 = ExecAuth {
         auth: Some(AuthResult::for_use_token(&after)),
-        use_token_id: Some(token.id.clone()),
+        use_token: Some(token.clone()),
         force_approval: false,
         requester: RequesterInfo::default(),
     };
@@ -210,7 +210,7 @@ async fn test_token_credential_scope_enforced() {
 
     let exec_auth = ExecAuth {
         auth: Some(AuthResult::for_use_token(&token)),
-        use_token_id: Some(token.id.clone()),
+        use_token: Some(token.clone()),
         force_approval: false,
         requester: RequesterInfo::default(),
     };
@@ -224,6 +224,52 @@ async fn test_token_credential_scope_enforced() {
     assert!(format!("{}", err).to_lowercase().contains("access denied"));
     let after = storage.get_use_token(&token.id).await.unwrap().unwrap();
     assert_eq!(after.uses, 0);
+}
+
+/// The token's ACTION scope is enforced authoritatively in the server seam
+/// (`execute_gated`), not only at the MCP/HTTP edge — defended in depth.
+#[tokio::test]
+async fn test_token_action_scope_enforced_at_server() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred", false).await;
+
+    // Token allowed only for postgres.run_sql, but the request is mock.echo.
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "wrong-action".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: Some("postgres.run_sql".to_string()),
+        max_uses: Some(1),
+        require_approval: false,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    let err = server
+        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .await
+        .unwrap_err();
+    assert!(format!("{}", err).to_lowercase().contains("not scoped to action"));
+    assert_eq!(storage.get_use_token(&token.id).await.unwrap().unwrap().uses, 0);
+
+    // An in-scope glob action is allowed and consumes.
+    let (_f2, ok_token) = UseToken::create(NewUseToken {
+        name: "ok-action".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: Some("mock.*".to_string()),
+        max_uses: Some(1),
+        require_approval: false,
+        expires_in: None,
+    });
+    storage.store_use_token(&ok_token).await.unwrap();
+    match server
+        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(ok_token.clone()))
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Completed(_) => {}
+        _ => panic!("expected completed"),
+    }
+    assert_eq!(storage.get_use_token(&ok_token.id).await.unwrap().unwrap().uses, 1);
 }
 
 // ==================== Approvals ====================
@@ -311,7 +357,7 @@ async fn test_token_force_approval_consumes_on_resume() {
 
     let exec_auth = ExecAuth {
         auth: Some(AuthResult::for_use_token(&token)),
-        use_token_id: Some(token.id.clone()),
+        use_token: Some(token.clone()),
         force_approval: token.require_approval,
         requester: RequesterInfo {
             principal_kind: "use_token".to_string(),
@@ -420,7 +466,7 @@ async fn test_ownership_check_blocks_foreign_principal() {
 
     let exec_auth = ExecAuth {
         auth: None,
-        use_token_id: None,
+        use_token: None,
         force_approval: false,
         requester: RequesterInfo {
             principal_kind: "api_key".to_string(),
@@ -481,7 +527,7 @@ async fn test_preflight_failure_is_retryable_and_does_not_burn_token() {
     };
     let exec_auth = ExecAuth {
         auth: Some(AuthResult::for_use_token(&token)),
-        use_token_id: Some(token.id.clone()),
+        use_token: Some(token.clone()),
         force_approval: true,
         requester: RequesterInfo::default(),
     };

@@ -20,6 +20,24 @@ use tokio::fs;
 /// (the claiming process likely crashed) and may be re-claimed.
 const STALE_EXECUTING_SECS: i64 = 120;
 
+/// Highest on-disk storage format version this build understands. A vault whose
+/// recorded version is greater than this was written by a newer vultrino; we
+/// refuse to open it rather than silently round-trip (and drop) fields we don't
+/// know about.
+const STORAGE_VERSION: u32 = 3;
+
+/// Refuse to open a vault written by a newer binary.
+fn check_version(found: u32) -> Result<(), StorageError> {
+    if found > STORAGE_VERSION {
+        Err(StorageError::UnsupportedVersion {
+            found,
+            supported: STORAGE_VERSION,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// File-based storage with AES-256-GCM encryption
 pub struct FileStorage {
     /// Path to the storage file
@@ -151,6 +169,7 @@ impl FileStorage {
         let content = fs::read_to_string(&path).await?;
         let storage_file: StorageFile = serde_json::from_str(&content)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        check_version(storage_file.version)?;
 
         // Decode salt
         let salt = base64::Engine::decode(
@@ -197,6 +216,7 @@ impl FileStorage {
         let content = std::fs::read_to_string(&self.path)?;
         let storage_file: StorageFile = serde_json::from_str(&content)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        check_version(storage_file.version)?;
         let decrypted = decrypt(&storage_file.data, &self.master_key)?;
         Self::parse_cache(&decrypted)
     }
@@ -207,7 +227,7 @@ impl FileStorage {
             serde_json::to_vec(cache).map_err(|e| StorageError::Serialization(e.to_string()))?;
         let encrypted = encrypt(&data, &self.master_key)?;
         let storage_file = StorageFile {
-            version: 3, // v3 adds use_tokens + approvals
+            version: STORAGE_VERSION,
             salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &self.salt),
             data: encrypted,
         };
@@ -257,6 +277,7 @@ impl FileStorage {
         let content = fs::read_to_string(&self.path).await?;
         let storage_file: StorageFile = serde_json::from_str(&content)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        check_version(storage_file.version)?;
         let decrypted = decrypt(&storage_file.data, &self.master_key)?;
         let cache = Self::parse_cache(&decrypted)?;
         *self.cache.write() = cache;
@@ -607,6 +628,17 @@ mod tests {
     use crate::{CredentialData, Secret};
     use std::collections::HashSet;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_version_gate() {
+        // Current and older versions open; a newer version is refused.
+        assert!(check_version(STORAGE_VERSION).is_ok());
+        assert!(check_version(STORAGE_VERSION - 1).is_ok());
+        assert!(matches!(
+            check_version(STORAGE_VERSION + 1),
+            Err(StorageError::UnsupportedVersion { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn test_file_storage_roundtrip() {

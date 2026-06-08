@@ -5,7 +5,7 @@
 use crate::approval::{
     ApprovalNotifier, ApprovalRequest, ApprovalStatus, NewApproval, RequesterInfo,
 };
-use crate::auth::{AuthManager, AuthResult, Permission};
+use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
 use crate::config::Config;
 use crate::plugins::PluginRegistry;
 use crate::policy::PolicyEngine;
@@ -19,15 +19,18 @@ use tracing::{info, warn};
 
 /// Authentication context for a (possibly approval-gated) execution.
 ///
-/// This carries everything the gating logic needs: the permission/scope source
-/// (`auth`), whether a use token is driving the request (so it can be consumed
-/// on execution), a force-approval flag, and who to record as the requester.
+/// Carries the permission/scope source (`auth`) and, when a use token is driving
+/// the request, the **whole token** so the server can authoritatively enforce
+/// its credential *and* action scope at the seam where the token is spent and
+/// consume it — a single source of truth. Also carries the force-approval flag
+/// and the requester identity for the approval record.
 #[derive(Default)]
 pub struct ExecAuth {
     /// Real (API key) or synthesized (use token) auth result. `None` = local.
     pub auth: Option<AuthResult>,
-    /// Set when the presented secret was a use token; consumed on execution.
-    pub use_token_id: Option<String>,
+    /// The use token driving this request, if any (single source of truth for
+    /// scope enforcement and consumption).
+    pub use_token: Option<UseToken>,
     /// Force human approval for this request (e.g. a token's `require_approval`).
     pub force_approval: bool,
     /// Who/what made the request, for the approval record.
@@ -45,9 +48,27 @@ impl ExecAuth {
         };
         Self {
             auth: Some(auth),
-            use_token_id: None,
+            use_token: None,
             force_approval: false,
             requester,
+        }
+    }
+
+    /// Build an `ExecAuth` for a use-token-authenticated request. Derives the
+    /// synthesized auth, the consume target, the force-approval flag, and the
+    /// requester from the one token, so they cannot diverge.
+    pub fn from_use_token(token: UseToken) -> Self {
+        let requester = RequesterInfo {
+            principal_kind: "use_token".to_string(),
+            principal_id: Some(token.id.clone()),
+            principal_name: Some(token.name.clone()),
+            role: None,
+        };
+        Self {
+            auth: Some(AuthResult::for_use_token(&token)),
+            force_approval: token.require_approval,
+            requester,
+            use_token: Some(token),
         }
     }
 }
@@ -237,6 +258,25 @@ impl VultrinoServer {
         let (plugin_name, action_name) = parse_action(&request.action)?;
         let full_action = format!("{}.{}", plugin_name, action_name);
 
+        // Authoritative use-token scope enforcement at the seam where the token
+        // is actually spent — both credential and action scope, so the token's
+        // single-action restriction is defended in depth rather than only at the
+        // (MCP/HTTP) edge.
+        if let Some(token) = &exec_auth.use_token {
+            if !token.allows_credential(&credential.alias) {
+                return Err(VultrinoError::PolicyDenied(format!(
+                    "Use token is not scoped to credential '{}'",
+                    credential.alias
+                )));
+            }
+            if !token.allows_action(&full_action) {
+                return Err(VultrinoError::PolicyDenied(format!(
+                    "Use token is not scoped to action '{}'",
+                    full_action
+                )));
+            }
+        }
+
         // Evaluate policy (URL / method / rate limits). A `Prompt` decision
         // routes into the approval flow rather than failing.
         let url = request.params.get("url").and_then(|v| v.as_str());
@@ -282,7 +322,7 @@ impl VultrinoServer {
                 action: full_action.clone(),
                 params: request.params.clone(),
                 requester: exec_auth.requester.clone(),
-                use_token_id: exec_auth.use_token_id.clone(),
+                use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
                 ttl: self.approval_config.ttl(),
             });
             self.storage.store_approval(&approval).await?;
@@ -306,7 +346,7 @@ impl VultrinoServer {
                 action_name,
                 request.params.clone(),
                 context,
-                exec_auth.use_token_id.as_deref(),
+                exec_auth.use_token.as_ref().map(|t| t.id.as_str()),
             )
             .await
             .map_err(|re| re.error)?;
