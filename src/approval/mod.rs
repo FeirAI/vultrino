@@ -17,10 +17,14 @@
 //!    (lazily, in the serving process) and the real result is returned.
 //!
 //! ## Out-of-band approval (Telegram / webhook / email)
-//! Each request carries a single-use **decision token** (only its hash is
-//! stored). Approve/deny links embedding that token point at the web server's
-//! `/approvals/{id}/decide` endpoint, so a Telegram inline button or an email
-//! link can authorize a decision without a logged-in session.
+//! Each request carries a single-**decision** capability token (only its hash is
+//! stored): it authorizes one approve/deny while the request is pending and is
+//! moot once a decision is recorded (the request is no longer pending) or the
+//! TTL elapses. Approve/deny links embedding that token point at the web
+//! server's `/approvals/{id}/decide` endpoint, so a Telegram inline button or an
+//! email link can authorize a decision without a logged-in session. Because the
+//! token travels in the link, set `public_base_url` to an HTTPS address and
+//! avoid logging request URIs at DEBUG.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

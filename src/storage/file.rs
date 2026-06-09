@@ -654,6 +654,18 @@ impl StorageBackend for FileStorage {
             .await
     }
 
+    async fn heartbeat_approval(&self, id: &str) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            if let Some(approval) = cache.approvals.get_mut(id) {
+                if approval.executing && !approval.executed {
+                    approval.executing_since = Some(Utc::now());
+                }
+            }
+            Ok(())
+        })
+            .await
+    }
+
     async fn reload(&self) -> Result<(), StorageError> {
         FileStorage::reload(self).await
     }

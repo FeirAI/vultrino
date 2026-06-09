@@ -17,6 +17,12 @@ use crate::{
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// While a serving process executes an approved action, it refreshes the
+/// approval's execution claim this often so a slow-but-alive worker is never
+/// mistaken for a crashed one. Must be comfortably smaller than the storage
+/// backend's stale-claim timeout.
+const EXECUTION_HEARTBEAT_SECS: u64 = 30;
+
 /// Authentication context for a (possibly approval-gated) execution.
 ///
 /// Carries the permission/scope source (`auth`) and, when a use token is driving
@@ -81,16 +87,29 @@ impl ExecAuth {
 /// approval can safely retry. `committed = true` means the plugin was invoked
 /// and the action may have had an external effect — it must not be retried.
 struct RunError {
-    committed: bool,
+    /// True only when retrying could plausibly succeed: a *transient* preflight
+    /// failure such as a plugin that isn't loaded yet. A *permanent* preflight
+    /// failure (unusable use token, invalid params, missing credential) or a
+    /// committed `plugin.execute` failure sets this false — a resumed approval is
+    /// then finalized terminally instead of busy-polling forever.
+    retryable: bool,
     error: VultrinoError,
 }
 
 impl RunError {
-    fn preflight(error: VultrinoError) -> Self {
-        Self { committed: false, error }
+    /// A transient preflight failure (e.g. plugin not loaded) — safe to retry.
+    fn retryable(error: VultrinoError) -> Self {
+        Self { retryable: true, error }
     }
+    /// A permanent preflight failure (unusable token, bad params, missing
+    /// credential) — nothing ran, but retrying won't help.
+    fn terminal(error: VultrinoError) -> Self {
+        Self { retryable: false, error }
+    }
+    /// The plugin began executing and then failed — may have side-effected, so
+    /// it must not be retried.
     fn committed(error: VultrinoError) -> Self {
-        Self { committed: true, error }
+        Self { retryable: false, error }
     }
 }
 
@@ -136,6 +155,22 @@ impl VultrinoServer {
         // Build approval subsystem from config
         let approval_config = config.approval.clone();
         let notifiers = crate::approval::build_notifiers(&approval_config);
+
+        // Warn operators about approval configs that gate actions but can't
+        // actually deliver a request to a human out of band.
+        if approval_config.enabled {
+            if notifiers.is_empty() {
+                warn!(
+                    "approvals are enabled with no notifier configured — pending requests are \
+                     only visible via the web admin panel (`vultrino web`)"
+                );
+            } else if approval_config.public_base_url.is_none() {
+                warn!(
+                    "approvals have a notifier but no public_base_url — Telegram/webhook \
+                     approve/deny links can't be built; approvals must be decided in the admin panel"
+                );
+            }
+        }
 
         Self {
             config,
@@ -377,21 +412,24 @@ impl VultrinoServer {
         use_token_id: Option<&str>,
     ) -> Result<ExecuteResponse, RunError> {
         // Preflight (no side effects yet, no token consumed): resolve + validate.
+        // A not-loaded plugin is *transient* (it may load later → retryable);
+        // invalid params are *permanent* (a retry can't fix them → terminal).
         let plugin = self.plugins.get(plugin_name).ok_or_else(|| {
-            RunError::preflight(VultrinoError::Plugin(
+            RunError::retryable(VultrinoError::Plugin(
                 crate::plugins::PluginError::NotFound(plugin_name.to_string()),
             ))
         })?;
         plugin
             .validate_params(action_name, &params)
-            .map_err(|e| RunError::preflight(e.into()))?;
+            .map_err(|e| RunError::terminal(e.into()))?;
 
         // Reserve the use token atomically, fail-closed, just before the side
-        // effect. A failure here (exhausted/expired/revoked) is still preflight —
-        // nothing has run.
+        // effect. A failure here (exhausted/expired/revoked) means nothing ran
+        // AND the token will never become usable, so it is terminal — a resumed
+        // approval finalizes with the error rather than retrying forever.
         if let Some(tid) = use_token_id {
             self.storage.consume_use_token(tid).await.map_err(|e| {
-                RunError::preflight(VultrinoError::PolicyDenied(format!(
+                RunError::terminal(VultrinoError::PolicyDenied(format!(
                     "Use token cannot be used: {}",
                     e
                 )))
@@ -455,13 +493,15 @@ impl VultrinoServer {
     /// Run a previously-approved action. Builds the request from the stored
     /// approval and executes it (consuming the use token, if any).
     async fn resume_approved(&self, approval: &ApprovalRequest) -> Result<ExecuteResponse, RunError> {
+        // A credential that has gone missing, or an unparseable action, won't
+        // recover on retry → terminal.
         let credential = self
             .resolver
             .resolve(&approval.credential)
             .await
-            .map_err(RunError::preflight)?;
+            .map_err(RunError::terminal)?;
         let (plugin_name, action_name) =
-            parse_action(&approval.action).map_err(RunError::preflight)?;
+            parse_action(&approval.action).map_err(RunError::terminal)?;
         let context = RequestContext::new();
         self.run_action(
             credential,
@@ -523,28 +563,53 @@ impl VultrinoServer {
         if approval.status == ApprovalStatus::Approved && !approval.executed {
             match self.storage.claim_approval_for_execution(id).await? {
                 Some(mut claimed) => {
-                    match self.resume_approved(&claimed).await {
+                    // Run the (possibly slow) action while heartbeating the claim,
+                    // so a live worker's claim is never judged stale and re-run by
+                    // another process. Resume against a clone so `claimed` stays
+                    // free to mutate with the result. The select cancels the
+                    // heartbeat loop as soon as the action finishes.
+                    let resume_input = claimed.clone();
+                    let hb_storage = self.storage.clone();
+                    let hb_id = id.to_string();
+                    let resume_fut = self.resume_approved(&resume_input);
+                    tokio::pin!(resume_fut);
+                    let outcome = loop {
+                        tokio::select! {
+                            r = &mut resume_fut => break r,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(
+                                EXECUTION_HEARTBEAT_SECS,
+                            )) => {
+                                let _ = hb_storage.heartbeat_approval(&hb_id).await;
+                            }
+                        }
+                    };
+
+                    match outcome {
                         Ok(resp) => {
                             claimed.result_status = Some(resp.status);
-                            claimed.result_body =
-                                Some(String::from_utf8_lossy(&resp.body).to_string());
+                            // The full body already went to the live caller; cap
+                            // what we persist into the (encrypted) vault so a large
+                            // response can't bloat the approval record unbounded.
+                            claimed.result_body = Some(cap_result_body(&resp.body));
                             claimed.result_error = None;
                             claimed.executed = true;
                             claimed.executing = false;
                             claimed.executing_since = None;
                         }
-                        Err(re) if re.committed => {
-                            // The plugin ran (or may have); the action may have had
-                            // side effects. Terminal — do not retry.
+                        // Not retryable: either the plugin ran and may have
+                        // side-effected (committed), or a permanent preflight
+                        // failure (unusable token, bad params, missing credential).
+                        // Finalize terminally so the agent isn't told to poll forever.
+                        Err(re) if !re.retryable => {
                             claimed.result_error = Some(re.error.to_string());
                             claimed.executed = true;
                             claimed.executing = false;
                             claimed.executing_since = None;
                         }
+                        // Transient preflight failure (e.g. plugin not loaded yet) —
+                        // nothing ran. Release the claim and leave it un-executed so
+                        // a later poll can retry.
                         Err(re) => {
-                            // Preflight failure (plugin not loaded, bad params,
-                            // unusable token) — nothing ran. Release the claim and
-                            // leave it un-executed so a later poll can retry.
                             claimed.executing = false;
                             claimed.executing_since = None;
                             claimed.result_error = Some(format!(
@@ -619,6 +684,24 @@ impl VultrinoServer {
     pub fn requires_auth(&self) -> bool {
         self.require_auth
     }
+}
+
+/// Max bytes of an action response body persisted into an approval record. The
+/// full body is returned to the live caller; only the stored copy is capped.
+const MAX_STORED_RESULT_BODY: usize = 64 * 1024;
+
+/// Render a response body for storage in an approval record, truncating to
+/// [`MAX_STORED_RESULT_BODY`] on a UTF-8 boundary with a marker.
+fn cap_result_body(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    if text.len() <= MAX_STORED_RESULT_BODY {
+        return text.into_owned();
+    }
+    let mut end = MAX_STORED_RESULT_BODY;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…[truncated {} bytes]", &text[..end], text.len() - end)
 }
 
 /// Parse action string into plugin name and action name

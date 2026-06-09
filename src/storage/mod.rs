@@ -193,6 +193,14 @@ pub trait StorageBackend: Send + Sync {
         ))
     }
 
+    /// Refresh the execution-claim timestamp of an in-flight approval (a
+    /// liveness heartbeat). Keeps a slow-but-alive worker from having its claim
+    /// judged stale and re-taken by another process. No-op if the approval is no
+    /// longer executing.
+    async fn heartbeat_approval(&self, _id: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Atomically approve or deny a pending approval (read-modify-write under the
     /// backend's lock), returning the updated request. Errors with
     /// [`StorageError::Conflict`] if it is no longer pending.

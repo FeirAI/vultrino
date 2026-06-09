@@ -572,6 +572,75 @@ async fn test_stale_execution_claim_recovers() {
     assert_eq!(resumed.result_status, Some(200));
 }
 
+/// A heartbeat on an in-flight claim refreshes executing_since, so a claim that
+/// would otherwise look stale is NOT re-taken — protecting a slow-but-alive
+/// worker from a double-run.
+#[tokio::test]
+async fn test_heartbeat_prevents_stale_reclaim() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "gated-cred", true).await;
+
+    let approval = match server
+        .execute_gated(echo_request("gated-cred"), ExecAuth::default())
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(a) => a,
+        _ => panic!("expected pending"),
+    };
+    storage.decide_approval(&approval.id, true, "t", None).await.unwrap();
+
+    // Worker A claims, then its claim ages past the stale window...
+    let claimed = storage.claim_approval_for_execution(&approval.id).await.unwrap();
+    assert!(claimed.is_some(), "first claim should succeed");
+    let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    a.executing_since = Some(chrono::Utc::now() - Duration::seconds(300));
+    storage.update_approval(&a).await.unwrap();
+
+    // ...but a heartbeat refreshes it, so a competing claim is refused.
+    storage.heartbeat_approval(&approval.id).await.unwrap();
+    let reclaim = storage.claim_approval_for_execution(&approval.id).await.unwrap();
+    assert!(reclaim.is_none(), "a heartbeated (live) claim must not be re-taken");
+}
+
+/// A use-token-gated approval whose token has become unusable by the time it is
+/// approved finalizes TERMINALLY (executed, with an error) rather than telling
+/// the agent to poll forever.
+#[tokio::test]
+async fn test_resume_with_unusable_token_is_terminal() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred", false).await;
+
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "gated".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: Some(1),
+        require_approval: true,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    let approval = match server
+        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(a) => a,
+        _ => panic!("expected pending"),
+    };
+    storage.decide_approval(&approval.id, true, "t", None).await.unwrap();
+
+    // Token is revoked after approval but before the agent polls to execute.
+    storage.set_use_token_revoked(&token.id).await.unwrap();
+
+    let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    assert!(resumed.executed, "an unusable-token resume must be terminal, not retryable");
+    assert!(resumed.result_status.is_none());
+    let err = resumed.result_error.unwrap().to_lowercase();
+    assert!(err.contains("use token") || err.contains("revoked"));
+}
+
 #[tokio::test]
 async fn test_approvals_disabled_denies_gated_action() {
     // A credential flagged for approval, but approvals disabled in config → deny.
