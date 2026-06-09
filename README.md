@@ -27,6 +27,7 @@ Vultrino is a secure credential proxy that allows AI agents, LLMs, and automated
 - **Scoped API Keys** — Restrict which credentials each API key can access using glob patterns
 - **Plugin System** — Extend with custom credential types and actions via WASM plugins
 - **MCP Integration** — Native Model Context Protocol support for LLM tools
+- **Use Tokens** — Single-use or time-scoped grants that let an agent perform one specific action
 - **Web UI** — Clean admin interface for managing credentials, roles, and API keys
 - **Encrypted Storage** — AES-256-GCM encryption with Argon2 key derivation
 - **Policy Engine** — URL patterns, method restrictions, rate limiting
@@ -102,6 +103,9 @@ vultrino add --alias <name> -t oauth2 \        # Add OAuth2 credential
   --scopes "read,write"
 vultrino add --alias <name> -t ssh_password \  # Add SSH (password) credential
   --ssh-host <host> --ssh-user <user>          # for ssh plugin deploy/run
+vultrino add --alias <name> -t postgres \      # Add Postgres credential
+  --pg-host <host> --pg-database <db> \        # for postgres plugin run_sql/backup
+  --pg-user <user> --pg-sslmode require
 vultrino list                                   # List all credentials
 vultrino remove <alias>                         # Remove a credential
 
@@ -119,6 +123,8 @@ vultrino action <credential> <plugin.action>    # Execute plugin action
 vultrino action my-pgp pgp-signing.sign_cleartext -p '{"data":"Hello"}'
 vultrino action my-server ssh.deploy            # Rsync via stored SSH credential
 vultrino action my-server ssh.run               # Run a configured command sequence
+vultrino action my-db postgres.run_sql          # Apply the configured migration script
+vultrino action my-db postgres.backup           # pg_dump to the configured output dir
 
 # Plugin Management
 vultrino plugin install <path-or-url>           # Install a plugin
@@ -131,6 +137,14 @@ vultrino role create <name> --permissions read,execute --scopes "github-*"
 vultrino role list
 vultrino key create <name> --role <role-name>
 vultrino key list
+
+# Use Tokens (single-use / time-scoped agent grants)
+vultrino token create deploy-once \              # one-shot, expires in 10 minutes
+  --credential "deploy-*" --action ssh.deploy --uses 1 --expires 10m
+vultrino token create reporter \                 # time-scoped, unlimited uses for 24h
+  --credential github-api --action http.request --expires 24h
+vultrino token list
+vultrino token revoke <id|prefix|name>
 
 # Server Modes
 vultrino web                                    # Start web UI
@@ -252,20 +266,49 @@ Available MCP tools:
 }}
 ```
 
+## Use Tokens
+
+A **use token** is a narrow, ephemeral grant — the opposite of a durable API key.
+It authorizes *one kind of action* against *one credential (or glob)*, optionally
+capped to a number of uses and/or a time window. Hand it to an agent in the same
+place as an API key (the `api_key` field, or `Authorization: Bearer`); it is
+recognized by its `vut_` prefix.
+
+```bash
+# "POST to the deploy webhook once, in the next 10 minutes"
+vultrino token create deploy-once \
+  --credential deploy-hook --action http.request --uses 1 --expires 10m
+# Output: vut_xxxxxxxx... (shown once)
+```
+
+- **Single-use** (`--uses 1`) or **limited-use** (`--uses N`); omit for unlimited.
+- **Time-scoped** with `--expires` (`30m`, `24h`, `7d`; omit for never).
+- **Scoped** to a credential glob (`--credential`) and optionally a single action
+  or `plugin.*` glob (`--action`).
+- Uses are counted **fail-closed**: the use is spent the moment the action runs,
+  even if the downstream call errors, and the check-and-increment is atomic across
+  processes (file-locked), so a single-use token can never run twice.
+
+Manage tokens in the **Use Tokens** page of the web UI or with
+`vultrino token list` / `vultrino token revoke`.
+
 ## Plugin System
 
 Vultrino ships with built-in plugins and also supports WASM plugins for extending functionality with custom credential types and actions.
 
 ### Built-in Plugins
 
-| Plugin | Credential Types          | Actions                                 |
-|--------|---------------------------|-----------------------------------------|
-| `http` | `api_key`, `basic_auth`, `oauth2` | `request`                       |
-| `hmac` | `hmac_api_key`            | `request`, `sign`                       |
-| `ecdsa`| `ecdsa_key`               | `sign`, `sign_l1_action`                |
-| `ssh`  | `ssh_password`            | `deploy` (rsync), `run` (remote exec)   |
+| Plugin    | Credential Types                  | Actions                                  |
+|-----------|-----------------------------------|------------------------------------------|
+| `http`    | `api_key`, `basic_auth`, `oauth2` | `request`                                |
+| `hmac`    | `hmac_api_key`                    | `request`, `sign`                        |
+| `ecdsa`   | `ecdsa_key`                       | `sign`, `sign_l1_action`                 |
+| `ssh`     | `ssh_password`                    | `deploy` (rsync), `run` (remote exec)    |
+| `postgres`| `postgres`                        | `run_sql` (migrations/maintenance), `backup` (pg_dump) |
 
 The `ssh` plugin requires `sshpass`, `ssh`, and `rsync` on the host's `PATH`. See [the SSH plugin docs](docs/src/plugins/ssh.md) for the full credential schema, metadata keys, override-lock model, and a worked deploy + restart example.
+
+The `postgres` plugin requires `psql` and `pg_dump` (from `postgresql-client` or Homebrew's `libpq`). See [the Postgres plugin docs](docs/src/plugins/postgres.md) for the credential schema, metadata keys, SQL-override lock model, and a worked migration + nightly-backup example.
 
 ### Installing Plugins
 
@@ -373,6 +416,7 @@ cargo build --release --target wasm32-wasip1
 | `hmac_api_key` | HMAC-signed API key (e.g. Binance-style exchanges) | SHA-256 signature over query string / body |
 | `ecdsa_key` | ECDSA private key (Ethereum / Hyperliquid) | On-the-fly signing of requests or arbitrary payloads |
 | `ssh_password` | SSH host + password (for `ssh` plugin) | `sshpass`-fed password to `ssh` / `rsync`; password never leaves Vultrino |
+| `postgres` | PostgreSQL connection (for `postgres` plugin) | Password passed to `psql`/`pg_dump` via `PGPASSWORD` env; never leaves Vultrino |
 
 ### Best Practices
 

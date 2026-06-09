@@ -11,9 +11,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::auth::{AuthResult, Permission};
+use crate::auth::{AuthResult, Permission, UseToken};
 use crate::router::CredentialResolver;
-use crate::server::VultrinoServer;
+use crate::server::{ExecAuth, VultrinoServer};
 use crate::ExecuteRequest;
 
 use super::server::AppState;
@@ -103,14 +103,38 @@ pub struct ExecuteApiResponse {
     pub body: String,
 }
 
+/// Resolve a bearer secret (API key `vk_` or use token `vut_`) into an
+/// [`ExecAuth`]. A use token's credential/action scope is enforced
+/// authoritatively in the server (`execute_gated`); here we only authenticate
+/// and fail fast on an unusable token.
+async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, Response> {
+    if UseToken::looks_like_token(secret) {
+        let _ = state.storage.reload().await;
+        let token = match state.storage.get_use_token_by_hash(&UseToken::hash(secret)).await {
+            Ok(Some(t)) => t,
+            _ => return Err(error_response(StatusCode::UNAUTHORIZED, "invalid_token", "Invalid use token")),
+        };
+        if let Err(e) = token.check_usable() {
+            return Err(error_response(StatusCode::FORBIDDEN, "token_unusable", e.to_string()));
+        }
+        Ok(ExecAuth::from_use_token(token))
+    } else {
+        let (key, role) = match validate_api_key(state, secret).await {
+            Ok(kr) => kr,
+            Err(e) => return Err(error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", e)),
+        };
+        Ok(ExecAuth::from_api_key(AuthResult { api_key: key, role }))
+    }
+}
+
 /// Execute an authenticated HTTP request
 pub async fn api_execute(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ExecuteApiRequest>,
 ) -> Response {
-    // Extract and validate API key
-    let api_key = match extract_api_key(&headers) {
+    // Extract bearer secret (API key or use token).
+    let secret = match extract_api_key(&headers) {
         Some(key) => key,
         None => {
             return error_response(
@@ -121,36 +145,10 @@ pub async fn api_execute(
         }
     };
 
-    // Reload auth manager from storage to pick up any new keys
-    let (key, role) = match validate_api_key(&state, &api_key).await {
-        Ok((k, r)) => (k, r),
-        Err(e) => {
-            return error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", e)
-        }
+    let exec_auth = match resolve_exec_auth(&state, &secret).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-
-    let auth_result = AuthResult {
-        api_key: key,
-        role: role.clone(),
-    };
-
-    // Check execute permission
-    if !auth_result.has_permission(Permission::Execute) {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "permission_denied",
-            "API key does not have 'execute' permission",
-        );
-    }
-
-    // Check credential access
-    if !auth_result.can_access_credential(&request.credential) {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "credential_denied",
-            format!("Access denied to credential: {}", request.credential),
-        );
-    }
 
     // Build the execute request
     let execute_request = ExecuteRequest {
@@ -174,8 +172,8 @@ pub async fn api_execute(
         tracing::warn!("Failed to load plugins: {}", e);
     }
 
-    // Execute with auth
-    match server.execute_with_auth(execute_request, Some(&auth_result)).await {
+    // Execute with the resolved auth context.
+    match server.execute_gated(execute_request, exec_auth).await {
         Ok(response) => {
             let body_str = String::from_utf8_lossy(&response.body).to_string();
             let headers: HashMap<String, String> = response

@@ -37,6 +37,7 @@
 - [Developing Plugins](./plugins/developing.md)
 - [PGP Signing](./plugins/pgp.md)
 - [SSH (Deploy & Remote Exec)](./plugins/ssh.md)
+- [Postgres (SQL & Backup)](./plugins/postgres.md)
 
 # API Reference
 

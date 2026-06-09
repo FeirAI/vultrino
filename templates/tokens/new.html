@@ -1,0 +1,50 @@
+{% extends "layout.html" %}
+
+{% block title %}Create Use Token - Vultrino{% endblock %}
+{% block nav_tokens %}active{% endblock %}
+{% block page_title %}Create Use Token{% endblock %}
+
+{% block content %}
+{% if let Some(err) = error %}
+<div class="flash flash-error">{{ err }}</div>
+{% endif %}
+
+<form action="/tokens/new" method="post" class="form-card">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <div class="form-group">
+        <label for="name">Name</label>
+        <input type="text" id="name" name="name" required placeholder="deploy-once">
+        <p class="form-help">A label to identify this token.</p>
+    </div>
+
+    <div class="form-group">
+        <label for="credential_scope">Credential scope</label>
+        <input type="text" id="credential_scope" name="credential_scope" required placeholder="github-* or my-deploy-key or *">
+        <p class="form-help">Exact alias, glob pattern (<code>github-*</code>), or <code>*</code> for any credential.</p>
+    </div>
+
+    <div class="form-group">
+        <label for="action_scope">Action scope (optional)</label>
+        <input type="text" id="action_scope" name="action_scope" placeholder="http.request, ssh.deploy, postgres.* (blank = any)">
+        <p class="form-help">Restrict to a single action or a <code>plugin.*</code> glob. Leave blank to allow any action.</p>
+    </div>
+
+    <div class="form-group">
+        <label for="max_uses">Max uses (optional)</label>
+        <input type="number" id="max_uses" name="max_uses" min="1" placeholder="1 for single-use, blank for unlimited">
+        <p class="form-help">How many times the token may drive an action. Blank = unlimited within the time window.</p>
+    </div>
+
+    <div class="form-group">
+        <label for="expires">Expires in (optional)</label>
+        <input type="text" id="expires" name="expires" placeholder="10m, 24h, 7d (blank = never)">
+        <p class="form-help">Time window, e.g. <code>30m</code>, <code>24h</code>, <code>7d</code>. Blank = never expires.</p>
+    </div>
+
+    <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Create Token</button>
+        <a href="/tokens" class="btn btn-secondary">Cancel</a>
+    </div>
+</form>
+{% endblock %}

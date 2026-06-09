@@ -72,6 +72,7 @@ rpassword = "7"
 zeroize = "1"
 shellexpand = "3"
 tempfile = "3"
+fd-lock = "4.0.4"
 
 # Future optional features
 # ethers = { version = "2", optional = true }
