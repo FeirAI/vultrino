@@ -112,6 +112,7 @@ vultrino remove <alias>                         # Remove a credential
 
 # Per-credential defaults (non-secret configuration)
 vultrino meta set <alias> <key> <value>         # e.g. deploy.source_dir, run.commands
+vultrino meta set <alias> allowed_hosts "api.github.com, *.example.com"  # restrict destinations
 vultrino meta list <alias>                      # Show all metadata for a credential
 vultrino meta unset <alias> <key>               # Remove a metadata key
 
@@ -499,6 +500,27 @@ cargo build --release --target wasm32-wasip1
 | `ecdsa_key` | ECDSA private key (Ethereum / Hyperliquid) | On-the-fly signing of requests or arbitrary payloads |
 | `ssh_password` | SSH host + password (for `ssh` plugin) | `sshpass`-fed password to `ssh` / `rsync`; password never leaves Vultrino |
 | `postgres` | PostgreSQL connection (for `postgres` plugin) | Password passed to `psql`/`pg_dump` via `PGPASSWORD` env; never leaves Vultrino |
+
+### Agent-boundary protections
+
+- **Egress redaction** — any injected credential material found in an upstream
+  response (e.g. an echo/reflector endpoint returning the request headers) is
+  replaced with `[REDACTED:vultrino]` before the response reaches the agent.
+- **No automatic redirects** — proxied requests do not follow 3xx responses;
+  the status and `Location` header are returned to the caller, and a new
+  request to the new target is re-validated (SSRF + policy) from scratch.
+- **Per-credential host binding** — set `vultrino meta set <alias>
+  allowed_hosts "api.github.com, *.example.com"` to restrict which hosts a
+  credential may ever be sent to, independent of policy configuration.
+- **Immediate revocation** — API keys are validated against storage on every
+  call, so `vultrino auth revoke` takes effect immediately in running web/MCP
+  servers (matching use-token semantics).
+- **Sandboxed plugins** — WASM plugins run with no filesystem, network, env,
+  or stdio access, a CPU (fuel) budget, a memory cap, and a wall-clock
+  timeout, and execute off the async runtime.
+- **Response/size limits** — upstream responses are capped at 10 MB and all
+  outbound requests carry timeouts, so a hostile upstream cannot hang or
+  OOM the proxy.
 
 ### Best Practices
 

@@ -21,6 +21,7 @@ pub struct RawServerConfig {
     pub bind: Option<String>,
     pub mode: Option<String>,
     pub tls: Option<RawTlsConfig>,
+    pub trusted_proxies: Option<Vec<String>>,
 }
 
 impl From<RawServerConfig> for ServerConfig {
@@ -35,6 +36,7 @@ impl From<RawServerConfig> for ServerConfig {
                 cert_path: PathBuf::from(t.cert_path),
                 key_path: PathBuf::from(t.key_path),
             }),
+            trusted_proxies: raw.trusted_proxies.unwrap_or_default(),
         }
     }
 }

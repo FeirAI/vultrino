@@ -151,6 +151,21 @@ Agent: "Your GitHub profile shows you're logged in as 'username' with 42 public 
 
 If the credential, use token, or a policy requires human approval, `http_request` returns an **"APPROVAL REQUIRED"** message with an `approval_id` instead of a result — the action has **not** run. The agent should then poll `check_approval` (below) with that id.
 
+**Boundary behavior:**
+
+- **Redirects are not followed.** A 3xx response is returned as-is (status +
+  `Location` header); issue a new request to the new URL — it gets the same
+  SSRF and policy validation as any other request.
+- **Egress redaction.** If the upstream response contains the injected
+  credential material (e.g. an echo endpoint reflecting request headers), it
+  is replaced with `[REDACTED:vultrino]` before the response reaches the
+  agent.
+- **Host binding.** If the credential has `allowed_hosts` metadata
+  (comma-separated hosts / `*.domain` wildcards), requests to any other host
+  are rejected before the credential is attached.
+- **Limits.** Response bodies are capped at 10 MB and requests time out after
+  60 seconds.
+
 ---
 
 ### check_approval

@@ -52,8 +52,15 @@ pub struct HmacRequestParams {
 impl HmacPlugin {
     /// Create a new HMAC plugin
     pub fn new() -> Self {
+        // Same hardening as the http plugin: no auto-redirects (SSRF/policy
+        // checks only cover the initial URL and the API-key header would
+        // follow a 3xx cross-host), plus timeouts so a stalled upstream
+        // cannot hang the proxy.
         let client = Client::builder()
             .user_agent("vultrino/0.1.0")
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -241,7 +248,7 @@ impl HmacPlugin {
 
         // Extract response details
         let status = response.status().as_u16();
-        let response_headers: HashMap<String, String> = response
+        let mut response_headers: HashMap<String, String> = response
             .headers()
             .iter()
             .filter_map(|(k, v)| {
@@ -251,11 +258,13 @@ impl HmacPlugin {
             })
             .collect();
 
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| PluginError::Http(e.to_string()))?
-            .to_vec();
+        let mut body = super::http::HttpPlugin::read_body_capped(response).await?;
+
+        // Scrub the injected API key (and the secret, defensively) from the
+        // response before it reaches the agent — an echo endpoint would
+        // otherwise hand the agent its own injected header back.
+        let secrets = vec![api_key, api_secret];
+        super::http::HttpPlugin::redact_response(&mut body, &mut response_headers, &secrets);
 
         Ok(ExecuteResponse {
             status,

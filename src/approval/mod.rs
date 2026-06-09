@@ -398,6 +398,17 @@ pub fn build_notifiers(cfg: &ApprovalConfig) -> Vec<std::sync::Arc<dyn ApprovalN
     notifiers
 }
 
+/// Notifier HTTP client with tight timeouts: notification dispatch is awaited
+/// inline on the execute path, so a stalled Telegram/webhook endpoint must
+/// never hang an agent's request.
+fn notifier_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default()
+}
+
 /// Telegram bot notifier: sends a message with inline Approve/Deny URL buttons.
 pub struct TelegramNotifier {
     config: TelegramConfig,
@@ -408,7 +419,7 @@ impl TelegramNotifier {
     pub fn new(config: TelegramConfig) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: notifier_client(),
         }
     }
 }
@@ -482,7 +493,7 @@ impl WebhookNotifier {
     pub fn new(config: WebhookConfig) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: notifier_client(),
         }
     }
 }

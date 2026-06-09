@@ -56,11 +56,35 @@ struct TokenResponse {
 /// Buffer time before token expiration to trigger refresh (5 minutes)
 const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
 
+/// Wall-clock bound on any outbound request (the proxy must never hang on a
+/// stalled upstream).
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cap on a buffered upstream response body (memory-exhaustion guard).
+const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Marker substituted for injected credential material found in an upstream
+/// response before it is handed back to the agent.
+const REDACTION_MARKER: &str = "[REDACTED:vultrino]";
+
+/// Credential metadata key restricting which hosts this credential may be
+/// sent to (comma-separated exact hosts or `*.domain` wildcards).
+pub const ALLOWED_HOSTS_METADATA_KEY: &str = "allowed_hosts";
+
 impl HttpPlugin {
     /// Create a new HTTP plugin
     pub fn new() -> Self {
+        // Redirects are deliberately disabled: SSRF and policy checks run
+        // against the initial URL only, and reqwest forwards custom credential
+        // headers (e.g. X-API-Key) across hosts on 3xx. A 3xx is returned to
+        // the caller, which can re-issue the request and have the new target
+        // re-validated.
         let client = Client::builder()
             .user_agent("vultrino/0.1.0")
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .expect("Failed to create HTTP client");
 
@@ -378,6 +402,106 @@ impl HttpPlugin {
         }
     }
 
+    /// Returns true if `host` matches `pattern` (exact, case-insensitive, or a
+    /// `*.domain` wildcard covering subdomains and the apex).
+    fn host_matches(host: &str, pattern: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        let pattern = pattern.to_ascii_lowercase();
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            host == suffix || host.ends_with(&format!(".{}", suffix))
+        } else {
+            host == pattern
+        }
+    }
+
+    /// Enforce the credential's `allowed_hosts` metadata (if set): the
+    /// credential may only be injected into requests to those hosts. This is
+    /// a per-credential binding independent of the policy engine, so a
+    /// missing or fail-open policy cannot send the credential to an
+    /// agent-chosen reflector.
+    fn enforce_allowed_hosts(
+        credential: &crate::Credential,
+        url: &url::Url,
+    ) -> Result<(), PluginError> {
+        let Some(allowed) = credential.metadata.get(ALLOWED_HOSTS_METADATA_KEY) else {
+            return Ok(());
+        };
+        let host = url
+            .host_str()
+            .ok_or_else(|| PluginError::InvalidParams("URL must have a host".to_string()))?;
+        let patterns: Vec<&str> = allowed
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if patterns.is_empty() || patterns.iter().any(|p| Self::host_matches(host, p)) {
+            return Ok(());
+        }
+        Err(PluginError::InvalidParams(format!(
+            "Credential '{}' is restricted to hosts [{}] and may not be sent to '{}'",
+            credential.alias, allowed, host
+        )))
+    }
+
+    /// The secret strings that `inject_credentials` places into a request.
+    /// Used to scrub the upstream response: an agent can point a request at a
+    /// header-echoing endpoint and read back its own injected credential, so
+    /// the secret must not survive the round trip.
+    fn injected_secret_material(cred_data: &CredentialData) -> Vec<String> {
+        match cred_data {
+            CredentialData::ApiKey { key, .. } => vec![key.expose().to_string()],
+            CredentialData::BasicAuth { username, password } => {
+                let encoded =
+                    STANDARD.encode(format!("{}:{}", username, password.expose()).as_bytes());
+                vec![password.expose().to_string(), encoded]
+            }
+            CredentialData::OAuth2 { access_token, .. } => access_token
+                .iter()
+                .map(|t| t.expose().to_string())
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    /// Replace every occurrence of `needle` in `haystack` with the redaction
+    /// marker. Byte-level so binary bodies are handled too.
+    fn redact_bytes(haystack: &mut Vec<u8>, needle: &[u8]) {
+        // Too-short needles (test fixtures, empty strings) would mangle
+        // unrelated content; real secrets are comfortably longer.
+        if needle.len() < 4 || haystack.len() < needle.len() {
+            return;
+        }
+        let mut out: Vec<u8> = Vec::with_capacity(haystack.len());
+        let mut i = 0;
+        while i < haystack.len() {
+            if i + needle.len() <= haystack.len() && &haystack[i..i + needle.len()] == needle {
+                out.extend_from_slice(REDACTION_MARKER.as_bytes());
+                i += needle.len();
+            } else {
+                out.push(haystack[i]);
+                i += 1;
+            }
+        }
+        *haystack = out;
+    }
+
+    /// Scrub injected credential material from a response body and headers.
+    /// pub(crate): the hmac plugin reuses this for its own responses.
+    pub(crate) fn redact_response(
+        body: &mut Vec<u8>,
+        headers: &mut HashMap<String, String>,
+        secrets: &[String],
+    ) {
+        for secret in secrets {
+            Self::redact_bytes(body, secret.as_bytes());
+            for value in headers.values_mut() {
+                if secret.len() >= 4 && value.contains(secret.as_str()) {
+                    *value = value.replace(secret.as_str(), REDACTION_MARKER);
+                }
+            }
+        }
+    }
+
     /// Validate URL for SSRF protection
     fn validate_url_ssrf(url_str: &str) -> Result<url::Url, PluginError> {
         let url = url::Url::parse(url_str)
@@ -432,10 +556,15 @@ impl HttpPlugin {
     async fn execute_request(
         &self,
         params: HttpRequestParams,
-        cred_data: &CredentialData,
+        credential: &crate::Credential,
     ) -> Result<ExecuteResponse, PluginError> {
+        let cred_data = &credential.data;
+
         // Validate URL for SSRF before proceeding
         let validated_url = Self::validate_url_ssrf(&params.url)?;
+
+        // Per-credential host binding (independent of the policy engine)
+        Self::enforce_allowed_hosts(credential, &validated_url)?;
 
         // Parse method
         let method = Method::from_str(&params.method.to_uppercase())
@@ -482,7 +611,7 @@ impl HttpPlugin {
 
         // Extract response details
         let status = response.status().as_u16();
-        let response_headers: HashMap<String, String> = response
+        let mut response_headers: HashMap<String, String> = response
             .headers()
             .iter()
             .filter_map(|(k, v)| {
@@ -492,11 +621,12 @@ impl HttpPlugin {
             })
             .collect();
 
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| PluginError::Http(e.to_string()))?
-            .to_vec();
+        let mut body = Self::read_body_capped(response).await?;
+
+        // Scrub any injected credential material before the response reaches
+        // the agent (core invariant: agents never see secrets).
+        let secrets = Self::injected_secret_material(&effective_cred);
+        Self::redact_response(&mut body, &mut response_headers, &secrets);
 
         Ok(ExecuteResponse {
             status,
@@ -504,6 +634,36 @@ impl HttpPlugin {
             body,
             updated_credential,
         })
+    }
+
+    /// Buffer the response body, refusing to read past MAX_RESPONSE_BYTES.
+    /// pub(crate): the hmac plugin reuses this for its own responses.
+    pub(crate) async fn read_body_capped(
+        mut response: reqwest::Response,
+    ) -> Result<Vec<u8>, PluginError> {
+        if let Some(len) = response.content_length() {
+            if len as usize > MAX_RESPONSE_BYTES {
+                return Err(PluginError::ExecutionFailed(format!(
+                    "Upstream response of {} bytes exceeds the {} byte limit",
+                    len, MAX_RESPONSE_BYTES
+                )));
+            }
+        }
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| PluginError::Http(e.to_string()))?
+        {
+            if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(PluginError::ExecutionFailed(format!(
+                    "Upstream response exceeds the {} byte limit",
+                    MAX_RESPONSE_BYTES
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 }
 
@@ -537,7 +697,7 @@ impl Plugin for HttpPlugin {
                 let params: HttpRequestParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
 
-                self.execute_request(params, &request.credential.data).await
+                self.execute_request(params, &request.credential).await
             }
             _ => Err(PluginError::UnsupportedAction(request.action)),
         }
@@ -890,5 +1050,90 @@ mod tests {
 
         let result = plugin.inject_credentials(&mut headers, &cred_data);
         assert!(result.is_err());
+    }
+
+    // Egress redaction tests (core invariant: agents never see secrets)
+
+    #[test]
+    fn test_redact_secret_from_body() {
+        let mut body = b"{\"echoed\":\"Bearer sk-super-secret-key-123\"}".to_vec();
+        HttpPlugin::redact_bytes(&mut body, b"sk-super-secret-key-123");
+        let s = String::from_utf8(body).unwrap();
+        assert!(!s.contains("sk-super-secret-key-123"));
+        assert!(s.contains(REDACTION_MARKER));
+    }
+
+    #[test]
+    fn test_redact_short_needles_skipped() {
+        let mut body = b"a pass in text".to_vec();
+        HttpPlugin::redact_bytes(&mut body, b"a");
+        assert_eq!(body, b"a pass in text".to_vec());
+    }
+
+    #[test]
+    fn test_redact_response_headers_and_body_for_basic_auth() {
+        let cred = CredentialData::BasicAuth {
+            username: "user".to_string(),
+            password: Secret::new("hunter2-very-secret"),
+        };
+        let secrets = HttpPlugin::injected_secret_material(&cred);
+        // both the raw password and the encoded Authorization value are scrubbed
+        let encoded = STANDARD.encode("user:hunter2-very-secret");
+        let mut body = format!("Basic {} raw=hunter2-very-secret", encoded).into_bytes();
+        let mut headers = HashMap::from([(
+            "x-echoed-auth".to_string(),
+            format!("Basic {}", encoded),
+        )]);
+        HttpPlugin::redact_response(&mut body, &mut headers, &secrets);
+        let s = String::from_utf8(body).unwrap();
+        assert!(!s.contains("hunter2-very-secret"));
+        assert!(!s.contains(&encoded));
+        assert!(!headers["x-echoed-auth"].contains(&encoded));
+    }
+
+    // allowed_hosts binding tests
+
+    #[test]
+    fn test_host_matches() {
+        assert!(HttpPlugin::host_matches("api.github.com", "api.github.com"));
+        assert!(HttpPlugin::host_matches("API.GITHUB.COM", "api.github.com"));
+        assert!(HttpPlugin::host_matches("api.github.com", "*.github.com"));
+        assert!(HttpPlugin::host_matches("github.com", "*.github.com"));
+        assert!(!HttpPlugin::host_matches("github.com.evil.com", "*.github.com"));
+        assert!(!HttpPlugin::host_matches("evilgithub.com", "*.github.com"));
+    }
+
+    #[test]
+    fn test_enforce_allowed_hosts() {
+        let cred = crate::Credential::new(
+            "github".to_string(),
+            CredentialData::ApiKey {
+                key: Secret::new("k-1234567890"),
+                header_name: "Authorization".to_string(),
+                header_prefix: "Bearer ".to_string(),
+            },
+        )
+        .with_metadata(ALLOWED_HOSTS_METADATA_KEY, "api.github.com, *.example.com");
+
+        let ok = url::Url::parse("https://api.github.com/repos").unwrap();
+        assert!(HttpPlugin::enforce_allowed_hosts(&cred, &ok).is_ok());
+        let ok2 = url::Url::parse("https://sub.example.com/x").unwrap();
+        assert!(HttpPlugin::enforce_allowed_hosts(&cred, &ok2).is_ok());
+        let bad = url::Url::parse("https://evil.com/echo").unwrap();
+        assert!(HttpPlugin::enforce_allowed_hosts(&cred, &bad).is_err());
+    }
+
+    #[test]
+    fn test_enforce_allowed_hosts_absent_means_unrestricted() {
+        let cred = crate::Credential::new(
+            "open".to_string(),
+            CredentialData::ApiKey {
+                key: Secret::new("k-1234567890"),
+                header_name: "Authorization".to_string(),
+                header_prefix: "Bearer ".to_string(),
+            },
+        );
+        let any = url::Url::parse("https://anywhere.example/").unwrap();
+        assert!(HttpPlugin::enforce_allowed_hosts(&cred, &any).is_ok());
     }
 }

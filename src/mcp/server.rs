@@ -46,26 +46,28 @@ pub struct McpServer {
     vultrino: Arc<RwLock<VultrinoServer>>,
     /// Whether initialized
     initialized: bool,
-    /// Auth manager for validating API keys (required)
-    auth_manager: Arc<RwLock<AuthManager>>,
 }
 
 impl McpServer {
-    /// Create a new MCP server with auth manager (required)
-    pub fn new(vultrino: Arc<RwLock<VultrinoServer>>, auth_manager: Arc<RwLock<AuthManager>>) -> Self {
+    /// Create a new MCP server
+    pub fn new(vultrino: Arc<RwLock<VultrinoServer>>) -> Self {
         Self {
             vultrino,
             initialized: false,
-            auth_manager,
         }
     }
 
-    /// Validate an API key and return auth result
+    /// Validate an API key and return auth result.
+    ///
+    /// Storage-authoritative: a key revoked (or role-changed) via the CLI or
+    /// web UI after this server started must stop working immediately, so no
+    /// in-memory snapshot is consulted.
     async fn validate_api_key(&self, api_key: &str) -> Result<AuthResult, String> {
-        let manager = self.auth_manager.read().await;
-        let (key, role) = manager
-            .validate_key(api_key)
-            .map_err(|e| format!("Invalid API key: {}", e))?;
+        let vultrino = self.vultrino.read().await;
+        let (key, role) =
+            AuthManager::validate_key_against_storage(vultrino.storage().as_ref(), api_key)
+                .await
+                .map_err(|e| format!("Invalid API key: {}", e))?;
 
         Ok(AuthResult {
             api_key: key,
@@ -209,13 +211,15 @@ impl McpServer {
                 continue;
             }
 
-            debug!(request = %line, "Received MCP request");
+            // Never log the raw line: tool-call params carry the agent's
+            // bearer secret (api_key / use token).
+            debug!(bytes = line.len(), "Received MCP request");
 
             let response = self.handle_message(line).await;
 
             if let Some(response) = response {
                 let response_str = serde_json::to_string(&response)?;
-                debug!(response = %response_str, "Sending MCP response");
+                debug!(bytes = response_str.len(), "Sending MCP response");
                 stdout.write_all(response_str.as_bytes()).await?;
                 stdout.write_all(b"\n").await?;
                 stdout.flush().await?;
@@ -252,7 +256,6 @@ impl McpServer {
             }
             "tools/list" => self.handle_tools_list(&request).await,
             "tools/call" => self.handle_tools_call(&request).await,
-            "resources/list" => self.handle_resources_list(&request).await,
             "ping" => Ok(json!({})),
             method => {
                 warn!(method = %method, "Unknown MCP method");
@@ -277,10 +280,11 @@ impl McpServer {
                 tools: Some(ToolsCapability {
                     list_changed: Some(false),
                 }),
-                resources: Some(ResourcesCapability {
-                    subscribe: Some(false),
-                    list_changed: Some(false),
-                }),
+                // No resources capability: resources/list had no auth and
+                // enumerated every credential to any MCP client, and
+                // resources/read was never implemented. Reinstate only with
+                // per-principal scoping (see REVIEW.md).
+                resources: None,
                 prompts: None,
             },
             server_info: ServerInfo {
@@ -621,33 +625,6 @@ impl McpServer {
         }
 
         None
-    }
-
-    /// Handle resources/list request
-    async fn handle_resources_list(
-        &self,
-        _request: &JsonRpcRequest,
-    ) -> Result<serde_json::Value, (i32, String)> {
-        // List credentials as resources
-        let vultrino = self.vultrino.read().await;
-        let credentials = vultrino
-            .storage()
-            .list()
-            .await
-            .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-
-        let resources: Vec<Resource> = credentials
-            .iter()
-            .map(|c| Resource {
-                uri: format!("vultrino://credential/{}", c.alias),
-                name: c.alias.clone(),
-                description: c.metadata.get("description").cloned(),
-                mime_type: Some("application/json".to_string()),
-            })
-            .collect();
-
-        let result = ResourcesListResult { resources };
-        serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
     }
 
     /// Tool: list_credentials

@@ -137,6 +137,12 @@ pub struct ServerConfig {
     pub mode: ServerMode,
     /// TLS configuration (optional)
     pub tls: Option<TlsConfig>,
+    /// Reverse proxies whose X-Forwarded-For / X-Real-IP headers are trusted
+    /// (exact IPs or CIDR blocks, e.g. "10.0.0.5" or "10.0.0.0/8"). Empty
+    /// (the default) means forwarding headers are ignored and the direct
+    /// socket address is used — otherwise any client could spoof its IP and
+    /// bypass login rate limiting.
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -145,6 +151,7 @@ impl Default for ServerConfig {
             bind: "127.0.0.1:7878".to_string(),
             mode: ServerMode::Local,
             tls: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }

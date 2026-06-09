@@ -506,3 +506,72 @@ async fn test_oauth2_credential_scoped_access() {
     assert!(!validated_role.can_access_credential("api-key-stripe"));
     assert!(!validated_role.can_access_credential("basic-auth-db"));
 }
+
+/// Storage-authoritative validation: a key revoked (or role-changed) by
+/// another process must stop working immediately, without the validating
+/// process rebuilding any in-memory snapshot. Regression test for the stale
+/// AuthManager finding (REVIEW.md H1).
+#[tokio::test]
+async fn test_revocation_propagates_across_processes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.json");
+    let password = SecretString::from("test-password");
+
+    // "Process A" (e.g. the CLI) creates a key.
+    let storage_a = FileStorage::new(&path, &password).await.unwrap();
+    let manager = AuthManager::new();
+    let (full_key, api_key) = manager
+        .create_api_key("revocable", ROLE_EXECUTOR, None)
+        .unwrap();
+    storage_a.store_api_key(&api_key).await.unwrap();
+
+    // "Process B" (e.g. the MCP server) validates straight against storage.
+    let storage_b = FileStorage::new(&path, &password).await.unwrap();
+    let (validated, role) =
+        AuthManager::validate_key_against_storage(&storage_b, &full_key)
+            .await
+            .unwrap();
+    assert_eq!(validated.name, "revocable");
+    assert_eq!(role.name, ROLE_EXECUTOR);
+
+    // Process A revokes the key (writes only to storage, like `vultrino auth revoke`).
+    storage_a.delete_api_key(&api_key.id).await.unwrap();
+
+    // Process B must reject the key on the very next call — no restart, no
+    // explicit reload by the caller.
+    let result = AuthManager::validate_key_against_storage(&storage_b, &full_key).await;
+    assert!(result.is_err(), "revoked key must stop validating immediately");
+}
+
+/// A key bound to a custom role stored in the vault validates via storage,
+/// and garbage input is rejected.
+#[tokio::test]
+async fn test_storage_authoritative_validation_custom_role_and_bad_keys() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.json");
+    let password = SecretString::from("test-password");
+
+    let storage = FileStorage::new(&path, &password).await.unwrap();
+    let manager = AuthManager::new();
+    let role = manager
+        .create_role("deploy-bot", [Permission::Execute].into_iter().collect(), vec![], None)
+        .unwrap();
+    storage.store_role(&role).await.unwrap();
+    let (full_key, api_key) = manager
+        .create_api_key("deployer", &role.name, None)
+        .unwrap();
+    storage.store_api_key(&api_key).await.unwrap();
+
+    let (_, validated_role) =
+        AuthManager::validate_key_against_storage(&storage, &full_key)
+            .await
+            .unwrap();
+    assert_eq!(validated_role.name, "deploy-bot");
+
+    assert!(AuthManager::validate_key_against_storage(&storage, "vk_nonexistent")
+        .await
+        .is_err());
+    assert!(AuthManager::validate_key_against_storage(&storage, "not-even-a-key")
+        .await
+        .is_err());
+}

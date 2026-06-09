@@ -38,11 +38,13 @@ transport = "stdio"
 [server]
 bind = "127.0.0.1:7878"  # Address for HTTP proxy
 mode = "local"            # "local" or "server"
+# trusted_proxies = ["127.0.0.1", "10.0.0.0/8"]
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `bind` | Address and port for the HTTP proxy | `127.0.0.1:7878` |
+| `trusted_proxies` | Reverse proxies (IPs or CIDR blocks) whose `X-Forwarded-For`/`X-Real-IP` headers are trusted for client-IP attribution (login rate limiting). When empty (default), forwarding headers are ignored and the direct socket address is used. | `[]` |
 | `mode` | Deployment mode (`local` or `server`) | `local` |
 
 ### Storage Section

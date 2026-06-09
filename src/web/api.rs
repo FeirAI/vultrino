@@ -33,9 +33,11 @@ fn extract_api_key(headers: &axum::http::HeaderMap) -> Option<String> {
 /// Validate the API key using the cached AuthManager
 /// Auth data is refreshed when keys/roles are modified through the web UI
 async fn validate_api_key(state: &AppState, api_key: &str) -> Result<(ApiKey, Role), String> {
-    let auth_manager = state.auth_manager.read().await;
-    auth_manager
-        .validate_key(api_key)
+    // Storage-authoritative (see AuthManager::validate_key_against_storage):
+    // a key revoked or role-changed by another process (CLI, MCP) is honored
+    // immediately instead of surviving in this process's startup snapshot.
+    crate::auth::AuthManager::validate_key_against_storage(state.storage.as_ref(), api_key)
+        .await
         .map_err(|e| e.to_string())
 }
 

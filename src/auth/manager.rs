@@ -292,6 +292,59 @@ impl AuthManager {
         Ok((api_key.clone(), role))
     }
 
+    /// Validate an API key against **authoritative storage** rather than this
+    /// manager's in-memory snapshot. The snapshot is built at process startup,
+    /// so a key revoked — or a role changed — through another process (CLI,
+    /// web UI) would otherwise keep working here until restart. This mirrors
+    /// how use tokens are validated (storage reload + lookup at every auth
+    /// edge). Fail-closed: a storage reload error rejects the key. Storage
+    /// error details are logged, not returned, so they cannot reach an agent.
+    pub async fn validate_key_against_storage(
+        storage: &dyn crate::storage::StorageBackend,
+        key: &str,
+    ) -> AuthResult<(ApiKey, Role)> {
+        if !key.starts_with(KEY_PREFIX) {
+            return Err(AuthManagerError::InvalidKey);
+        }
+        let key_hash = Self::hash_key(key);
+
+        if let Err(e) = storage.reload().await {
+            tracing::warn!(error = %e, "API key validation failed: storage reload error");
+            return Err(AuthManagerError::Storage("unavailable".to_string()));
+        }
+        let api_key = storage
+            .get_api_key_by_hash(&key_hash)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "API key validation failed: storage lookup error");
+                AuthManagerError::Storage("unavailable".to_string())
+            })?
+            .ok_or(AuthManagerError::InvalidKey)?;
+
+        if api_key.is_expired() {
+            return Err(AuthManagerError::KeyExpired);
+        }
+
+        // Predefined roles use their name as a stable id and are never read
+        // from storage (matching `from_data`, which ignores storage records
+        // with predefined names), so a stored record cannot redefine them.
+        let role = match api_key.role_id.as_str() {
+            ROLE_ADMIN => admin_role(),
+            ROLE_READ_ONLY => read_only_role(),
+            ROLE_EXECUTOR => executor_role(),
+            _ => storage
+                .get_role(&api_key.role_id)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "API key validation failed: role lookup error");
+                    AuthManagerError::Storage("unavailable".to_string())
+                })?
+                .ok_or_else(|| AuthManagerError::RoleNotFound(api_key.role_id.clone()))?,
+        };
+
+        Ok((api_key, role))
+    }
+
     /// Update last used timestamp for a key
     pub fn update_key_last_used(&self, key_hash: &str) {
         let mut by_hash = self.keys_by_hash.write();

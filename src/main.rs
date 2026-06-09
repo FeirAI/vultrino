@@ -856,11 +856,9 @@ async fn run_server(config: Config, bind: String) -> Result<(), Box<dyn std::err
 async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
 
-    // Load auth manager for API key validation
-    let stored_roles = storage.list_roles().await?;
-    let stored_keys = storage.list_api_keys().await?;
-    let auth_manager = Arc::new(RwLock::new(AuthManager::from_data(stored_roles, stored_keys)));
-
+    // API keys are validated storage-authoritatively per call (see
+    // AuthManager::validate_key_against_storage), so no startup snapshot of
+    // keys/roles is taken here — revocations apply immediately.
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage, resolver);
 
@@ -870,7 +868,7 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     }
 
     let vultrino = Arc::new(RwLock::new(server));
-    let mut mcp = McpServer::new(vultrino, auth_manager);
+    let mut mcp = McpServer::new(vultrino);
 
     mcp.run_stdio().await?;
 

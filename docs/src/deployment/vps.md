@@ -150,6 +150,14 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
+    # NOTE: for vultrino to honor X-Forwarded-For / X-Real-IP from this proxy
+    # (so login rate limiting sees real client IPs instead of the proxy's),
+    # list the proxy's address in vultrino's config:
+    #
+    #   [server]
+    #   trusted_proxies = ["127.0.0.1"]
+    #
+    # Without it, forwarding headers are ignored (they are client-spoofable).
 
     # API/Proxy endpoint (optional)
     location /proxy/ {

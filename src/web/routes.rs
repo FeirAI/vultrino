@@ -23,31 +23,84 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
-/// Extract client IP from request, considering X-Forwarded-For for reverse proxy setups
-fn get_client_ip(headers: &HeaderMap, socket_addr: &SocketAddr) -> IpAddr {
-    // Check X-Forwarded-For header first (for reverse proxy setups)
-    if let Some(forwarded) = headers.get("x-forwarded-for") {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            // Take the first IP in the chain (original client)
-            if let Some(first_ip) = forwarded_str.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
-                    return ip;
-                }
+/// Extract the client IP used for login rate limiting / lockout.
+///
+/// Forwarding headers (X-Forwarded-For, X-Real-IP) are client-controlled, so
+/// they are honored ONLY when the direct peer is a configured trusted proxy;
+/// otherwise an attacker could rotate the header per attempt to bypass the
+/// lockout, or lock out arbitrary spoofed addresses. When the peer is
+/// trusted, the *rightmost* X-Forwarded-For entry that is not itself a
+/// trusted proxy is used — everything left of it is attacker-suppliable.
+fn get_client_ip(headers: &HeaderMap, socket_addr: &SocketAddr, trusted_proxies: &[String]) -> IpAddr {
+    let peer = socket_addr.ip();
+    if !is_trusted_proxy(&peer, trusted_proxies) {
+        return peer;
+    }
+
+    if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        for hop in forwarded.split(',').rev() {
+            match hop.trim().parse::<IpAddr>() {
+                Ok(ip) if is_trusted_proxy(&ip, trusted_proxies) => continue,
+                Ok(ip) => return ip,
+                // Malformed entry: stop trusting the chain rather than
+                // letting garbage push attribution onto another hop.
+                Err(_) => break,
             }
         }
     }
 
-    // Check X-Real-IP header (nginx)
-    if let Some(real_ip) = headers.get("x-real-ip") {
-        if let Ok(ip_str) = real_ip.to_str() {
-            if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
-                return ip;
-            }
-        }
+    // X-Real-IP (nginx), only from a trusted peer
+    if let Some(ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+    {
+        return ip;
     }
 
-    // Fall back to direct connection IP
-    socket_addr.ip()
+    peer
+}
+
+/// True if `ip` matches any entry in `trusted` (exact IP or CIDR block).
+fn is_trusted_proxy(ip: &IpAddr, trusted: &[String]) -> bool {
+    trusted.iter().any(|t| ip_matches_pattern(ip, t.trim()))
+}
+
+fn ip_matches_pattern(ip: &IpAddr, pattern: &str) -> bool {
+    if let Some((net, bits)) = pattern.split_once('/') {
+        match (net.parse::<IpAddr>(), bits.parse::<u32>()) {
+            (Ok(net), Ok(bits)) => cidr_contains(&net, bits, ip),
+            _ => false,
+        }
+    } else {
+        pattern.parse::<IpAddr>().map(|p| p == *ip).unwrap_or(false)
+    }
+}
+
+fn cidr_contains(net: &IpAddr, prefix: u32, ip: &IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(i)) => {
+            if prefix > 32 {
+                return false;
+            }
+            if prefix == 0 {
+                return true;
+            }
+            let mask = u32::MAX << (32 - prefix);
+            u32::from(*n) & mask == u32::from(*i) & mask
+        }
+        (IpAddr::V6(n), IpAddr::V6(i)) => {
+            if prefix > 128 {
+                return false;
+            }
+            if prefix == 0 {
+                return true;
+            }
+            let mask = u128::MAX << (128 - prefix);
+            u128::from(*n) & mask == u128::from(*i) & mask
+        }
+        _ => false,
+    }
 }
 
 use crate::approval::ApprovalStatus;
@@ -88,7 +141,7 @@ pub async fn login_submit(
     Form(form): Form<LoginForm>,
 ) -> Response {
     // Get client IP for rate limiting
-    let client_ip = get_client_ip(&headers, &addr);
+    let client_ip = get_client_ip(&headers, &addr, &state.config.server.trusted_proxies);
     let rate_limiter = &state.rate_limiter;
 
     // Check rate limit before processing
@@ -1327,5 +1380,66 @@ mod tests {
     fn test_parse_duration_invalid() {
         assert!(parse_duration("invalid").is_err());
         assert!(parse_duration("30x").is_err());
+    }
+
+    // get_client_ip / trusted-proxy tests (login lockout bypass hardening)
+
+    fn xff(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", value.parse().unwrap());
+        h
+    }
+
+    fn sock(ip: &str) -> SocketAddr {
+        format!("{}:12345", ip).parse().unwrap()
+    }
+
+    #[test]
+    fn test_client_ip_ignores_forwarding_headers_from_untrusted_peer() {
+        // No trusted proxies configured: a spoofed XFF must not change attribution.
+        let ip = get_client_ip(&xff("1.2.3.4"), &sock("203.0.113.9"), &[]);
+        assert_eq!(ip, "203.0.113.9".parse::<IpAddr>().unwrap());
+
+        // Peer not in the trusted list: same.
+        let trusted = vec!["10.0.0.1".to_string()];
+        let ip = get_client_ip(&xff("1.2.3.4"), &sock("203.0.113.9"), &trusted);
+        assert_eq!(ip, "203.0.113.9".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_client_ip_uses_rightmost_untrusted_hop_behind_trusted_proxy() {
+        let trusted = vec!["10.0.0.0/8".to_string()];
+        // Client spoofed "1.2.3.4"; the proxy at 10.0.0.1 appended the real
+        // client 198.51.100.7. The rightmost non-trusted hop wins.
+        let headers = xff("1.2.3.4, 198.51.100.7");
+        let ip = get_client_ip(&headers, &sock("10.0.0.1"), &trusted);
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+
+        // Chain that ends in another trusted proxy: skip it.
+        let headers = xff("198.51.100.7, 10.0.0.2");
+        let ip = get_client_ip(&headers, &sock("10.0.0.1"), &trusted);
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_client_ip_malformed_chain_falls_back_to_peer() {
+        let trusted = vec!["10.0.0.1".to_string()];
+        let headers = xff("not-an-ip, also-bad");
+        let ip = get_client_ip(&headers, &sock("10.0.0.1"), &trusted);
+        assert_eq!(ip, "10.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_cidr_matching() {
+        let ip4: IpAddr = "10.1.2.3".parse().unwrap();
+        assert!(ip_matches_pattern(&ip4, "10.0.0.0/8"));
+        assert!(!ip_matches_pattern(&ip4, "192.168.0.0/16"));
+        assert!(ip_matches_pattern(&ip4, "10.1.2.3"));
+        assert!(!ip_matches_pattern(&ip4, "10.1.2.4"));
+        assert!(!ip_matches_pattern(&ip4, "10.0.0.0/33")); // invalid prefix
+
+        let ip6: IpAddr = "fd00::1".parse().unwrap();
+        assert!(ip_matches_pattern(&ip6, "fd00::/8"));
+        assert!(!ip_matches_pattern(&ip6, "10.0.0.0/8")); // family mismatch
     }
 }

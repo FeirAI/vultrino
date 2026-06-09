@@ -52,9 +52,23 @@ struct WasmResponse {
     error: Option<String>,
 }
 
+/// CPU budget per plugin invocation, in wasmtime fuel units (~1 unit per
+/// wasm instruction). Generous enough for heavy crypto (e.g. PGP signing),
+/// small enough that a spinning plugin traps within seconds instead of
+/// hanging the proxy forever.
+const PLUGIN_FUEL: u64 = 5_000_000_000;
+
+/// Hard cap on a plugin instance's linear memory growth.
+const PLUGIN_MAX_MEMORY_BYTES: usize = 128 * 1024 * 1024;
+
+/// Wall-clock bound on a single plugin invocation. Belt-and-braces on top of
+/// fuel: fuel bounds wasm CPU, this bounds the caller's wait.
+const PLUGIN_WALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// State for WASM store
 struct WasmState {
     wasi: WasiP1Ctx,
+    limits: StoreLimits,
 }
 
 /// Wasmtime-based WASM runtime
@@ -68,6 +82,7 @@ impl WasmtimeRuntime {
     pub fn new() -> Result<Self, PluginError> {
         let mut config = Config::new();
         config.wasm_backtrace_details(WasmBacktraceDetails::Enable);
+        config.consume_fuel(true);
 
         let engine = Engine::new(&config)
             .map_err(|e| PluginError::Wasm(format!("Engine creation failed: {}", e)))?;
@@ -88,11 +103,22 @@ impl WasmtimeRuntime {
 
     /// Create a store with WASI context
     fn create_store(&self) -> Store<WasmState> {
-        let wasi = wasmtime_wasi::WasiCtxBuilder::new()
-            .inherit_stdio()
-            .build_p1();
+        // Deliberately NOT inherit_stdio(): in MCP mode the host's stdout *is*
+        // the JSON-RPC channel to the agent, so a plugin with the real fds
+        // could leak the decrypted credential to the agent or inject protocol
+        // messages. With nothing set, WASI stdin reads empty and
+        // stdout/stderr discard.
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new().build_p1();
 
-        Store::new(&self.engine, WasmState { wasi })
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(PLUGIN_MAX_MEMORY_BYTES)
+            .build();
+
+        let mut store = Store::new(&self.engine, WasmState { wasi, limits });
+        store.limiter(|state| &mut state.limits);
+        // Only errors when fuel is not enabled on the engine; it always is.
+        let _ = store.set_fuel(PLUGIN_FUEL);
+        store
     }
 
     /// Create a linker with WASI imports
@@ -417,7 +443,29 @@ impl Plugin for WasmPlugin {
         let cred_json = serde_json::to_value(&request.credential.data)
             .map_err(|e| PluginError::ExecutionFailed(format!("Failed to serialize credential: {}", e)))?;
 
-        self.runtime.read().execute_action(&request.action, &cred_json, &request.params)
+        // Wasm execution is synchronous; run it on the blocking pool so a slow
+        // plugin cannot stall the async workers serving other requests, and
+        // bound the caller's wait. On timeout the detached task still ends:
+        // fuel exhaustion traps the guest.
+        let runtime = self.runtime.clone();
+        let action = request.action.clone();
+        let params = request.params.clone();
+        let name = self.manifest.plugin.name.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            runtime.read().execute_action(&action, &cred_json, &params)
+        });
+        match tokio::time::timeout(PLUGIN_WALL_TIMEOUT, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join_err)) => Err(PluginError::Wasm(format!(
+                "plugin '{}' execution task failed: {}",
+                name, join_err
+            ))),
+            Err(_) => Err(PluginError::ExecutionFailed(format!(
+                "plugin '{}' timed out after {}s",
+                name,
+                PLUGIN_WALL_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     fn manifest(&self) -> Option<&PluginManifest> {
@@ -488,5 +536,17 @@ impl Plugin for WasmPlugin {
         }
 
         Ok(CredentialData::Custom(secrets))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_is_fuel_limited() {
+        let runtime = WasmtimeRuntime::new().unwrap();
+        let store = runtime.create_store();
+        assert_eq!(store.get_fuel().unwrap(), PLUGIN_FUEL);
     }
 }
