@@ -3,6 +3,7 @@
 //! Stores credentials in an encrypted JSON file on disk.
 
 use super::{StorageBackend, StorageError};
+use crate::approval::ApprovalRequest;
 use crate::auth::{ApiKey, Role, UseToken};
 use crate::crypto::{decrypt, derive_key, encrypt, generate_salt, EncryptedData, MasterKey};
 use crate::{Credential, CredentialMetadata};
@@ -14,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+
+/// An approval whose execution claim is older than this is considered stale
+/// (the claiming process likely crashed) and may be re-claimed.
+const STALE_EXECUTING_SECS: i64 = 120;
 
 /// Highest on-disk storage format version this build understands. A vault whose
 /// recorded version is greater than this was written by a newer vultrino; we
@@ -59,6 +64,9 @@ struct StorageCache {
     /// Use tokens by ID
     #[serde(default)]
     use_tokens: HashMap<String, UseToken>,
+    /// Approval requests by ID
+    #[serde(default)]
+    approvals: HashMap<String, ApprovalRequest>,
 
     // Secondary indexes for O(1) lookups (not serialized, rebuilt on load)
     /// Index: credential alias -> credential ID
@@ -547,6 +555,113 @@ impl StorageBackend for FileStorage {
                 .ok_or_else(|| StorageError::UseTokenNotFound(id.to_string()))?;
             token.revoked = true;
             Ok(token.clone())
+        })
+            .await
+    }
+
+    // ==================== Approval Storage ====================
+
+    async fn store_approval(&self, approval: &ApprovalRequest) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            cache.approvals.insert(approval.id.clone(), approval.clone());
+            Ok(())
+        })
+            .await
+    }
+
+    async fn get_approval(&self, id: &str) -> Result<Option<ApprovalRequest>, StorageError> {
+        let cache = self.cache.read();
+        Ok(cache.approvals.get(id).cloned())
+    }
+
+    async fn list_approvals(&self) -> Result<Vec<ApprovalRequest>, StorageError> {
+        let cache = self.cache.read();
+        Ok(cache.approvals.values().cloned().collect())
+    }
+
+    async fn update_approval(&self, approval: &ApprovalRequest) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            if !cache.approvals.contains_key(&approval.id) {
+                return Err(StorageError::ApprovalNotFound(approval.id.clone()));
+            }
+            cache.approvals.insert(approval.id.clone(), approval.clone());
+            Ok(())
+        })
+            .await
+    }
+
+    async fn delete_approval(&self, id: &str) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            if cache.approvals.remove(id).is_none() {
+                return Err(StorageError::ApprovalNotFound(id.to_string()));
+            }
+            Ok(())
+        })
+            .await
+    }
+
+    async fn decide_approval(
+        &self,
+        id: &str,
+        approve: bool,
+        by: &str,
+        note: Option<String>,
+    ) -> Result<ApprovalRequest, StorageError> {
+        self.locked_mutate(|cache| {
+            let approval = cache
+                .approvals
+                .get_mut(id)
+                .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
+            let result = if approve {
+                approval.approve(by, note)
+            } else {
+                approval.deny(by, note)
+            };
+            result.map_err(|e| StorageError::Conflict(e.to_string()))?;
+            Ok(approval.clone())
+        })
+            .await
+    }
+
+    async fn claim_approval_for_execution(
+        &self,
+        id: &str,
+    ) -> Result<Option<ApprovalRequest>, StorageError> {
+        use crate::approval::ApprovalStatus;
+        self.locked_mutate(|cache| {
+            let approval = match cache.approvals.get_mut(id) {
+                Some(a) => a,
+                None => return Err(StorageError::ApprovalNotFound(id.to_string())),
+            };
+            // A claim already held by another worker is only honored if it is
+            // recent; a stale claim (its owner likely crashed) may be re-taken.
+            let stale = approval.executing
+                && approval
+                    .executing_since
+                    .map(|t| (Utc::now() - t).num_seconds() > STALE_EXECUTING_SECS)
+                    .unwrap_or(true);
+            if approval.status != ApprovalStatus::Approved
+                || approval.executed
+                || (approval.executing && !stale)
+            {
+                Ok(None)
+            } else {
+                approval.executing = true;
+                approval.executing_since = Some(Utc::now());
+                Ok(Some(approval.clone()))
+            }
+        })
+            .await
+    }
+
+    async fn heartbeat_approval(&self, id: &str) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            if let Some(approval) = cache.approvals.get_mut(id) {
+                if approval.executing && !approval.executed {
+                    approval.executing_since = Some(Utc::now());
+                }
+            }
+            Ok(())
         })
             .await
     }

@@ -42,6 +42,13 @@
         <p class="form-help">Time window, e.g. <code>30m</code>, <code>24h</code>, <code>7d</code>. Blank = never expires.</p>
     </div>
 
+    <div class="form-group form-checkbox">
+        <label>
+            <input type="checkbox" name="require_approval" value="true">
+            Require human approval for every use of this token
+        </label>
+    </div>
+
     <div class="form-actions">
         <button type="submit" class="btn btn-primary">Create Token</button>
         <a href="/tokens" class="btn btn-secondary">Cancel</a>

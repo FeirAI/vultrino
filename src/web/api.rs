@@ -4,17 +4,18 @@
 //! Vultrino using API keys instead of session-based authentication.
 
 use axum::{
-    extract::{Json, State},
+    extract::{Json, Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::approval::ApprovalStatus;
 use crate::auth::{AuthResult, Permission, UseToken};
 use crate::router::CredentialResolver;
 use crate::server::{ExecAuth, VultrinoServer};
-use crate::ExecuteRequest;
+use crate::{ExecuteRequest, ExecutionOutcome};
 
 use super::server::AppState;
 
@@ -127,6 +128,30 @@ async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, R
     }
 }
 
+/// Authenticate a caller and return its principal id (without action scoping),
+/// for read-only operations like polling an approval.
+async fn resolve_caller_id(state: &AppState, secret: &str) -> Result<String, Response> {
+    if UseToken::looks_like_token(secret) {
+        let _ = state.storage.reload().await;
+        match state.storage.get_use_token_by_hash(&UseToken::hash(secret)).await {
+            // Polling is read-only, so an exhausted/expired token still
+            // authenticates — but a revoked token is rejected.
+            Ok(Some(t)) if !t.revoked => Ok(t.id),
+            Ok(Some(_)) => Err(error_response(
+                StatusCode::FORBIDDEN,
+                "token_revoked",
+                "Use token has been revoked",
+            )),
+            _ => Err(error_response(StatusCode::UNAUTHORIZED, "invalid_token", "Invalid use token")),
+        }
+    } else {
+        match validate_api_key(state, secret).await {
+            Ok((key, _role)) => Ok(key.id),
+            Err(e) => Err(error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", e)),
+        }
+    }
+}
+
 /// Execute an authenticated HTTP request
 pub async fn api_execute(
     State(state): State<AppState>,
@@ -172,9 +197,9 @@ pub async fn api_execute(
         tracing::warn!("Failed to load plugins: {}", e);
     }
 
-    // Execute with the resolved auth context.
+    // Execute, gating on approval when required.
     match server.execute_gated(execute_request, exec_auth).await {
-        Ok(response) => {
+        Ok(ExecutionOutcome::Completed(response)) => {
             let body_str = String::from_utf8_lossy(&response.body).to_string();
             let headers: HashMap<String, String> = response
                 .headers
@@ -192,8 +217,118 @@ pub async fn api_execute(
             )
                 .into_response()
         }
+        Ok(ExecutionOutcome::Pending(approval)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "outcome": "pending_approval",
+                "approval_id": approval.id,
+                "message": format!(
+                    "This action requires human approval before it runs. It has NOT executed. \
+                     Poll GET /api/v1/approvals/{} with your bearer token to retrieve the result \
+                     once a human approves.",
+                    approval.id
+                ),
+                "summary": approval.summary,
+                "expires_at": approval.expires_at,
+            })),
+        )
+            .into_response(),
         Err(e) => error_response(StatusCode::BAD_REQUEST, "execute_error", e.to_string()),
     }
+}
+
+/// Poll an approval request and, once approved, run the action and return its
+/// result. The caller may only poll approvals it requested.
+pub async fn api_check_approval(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let secret = match extract_api_key(&headers) {
+        Some(key) => key,
+        None => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "missing_api_key",
+                "Authorization header with Bearer token required",
+            )
+        }
+    };
+
+    let principal_id = match resolve_caller_id(&state, &secret).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let resolver = CredentialResolver::new(state.storage.clone());
+    let server = VultrinoServer::new(state.config.clone(), state.storage.clone(), resolver);
+    if let Err(e) = server.load_plugins().await {
+        tracing::warn!("Failed to load plugins: {}", e);
+    }
+
+    // Ownership is enforced inside check_and_resume_approval BEFORE any
+    // execution, so a non-owner can never trigger another principal's action.
+    let approval = match server
+        .check_and_resume_approval(&id, Some(&principal_id))
+        .await
+    {
+        Ok(a) => a,
+        Err(crate::VultrinoError::PolicyDenied(msg)) => {
+            return error_response(StatusCode::FORBIDDEN, "not_authorized", msg)
+        }
+        Err(e) => return error_response(StatusCode::NOT_FOUND, "approval_not_found", e.to_string()),
+    };
+
+    let mut body = serde_json::json!({
+        "approval_id": approval.id,
+        "status": approval.status.to_string(),
+        "summary": approval.summary,
+        "executed": approval.executed,
+    });
+    // Per-status guidance, mirroring the MCP `check_approval` tool so the two
+    // transports present the same contract to an agent.
+    match approval.status {
+        ApprovalStatus::Pending => {
+            body["message"] = serde_json::json!(
+                "Awaiting human approval. The action has NOT run. Poll this endpoint again \
+                 every ~10-30 seconds with your bearer token."
+            );
+            body["expires_at"] = serde_json::json!(approval.expires_at);
+        }
+        ApprovalStatus::Denied => {
+            body["message"] = serde_json::json!(
+                "This approval was denied; the action did not run. Do not retry."
+            );
+            if let Some(note) = &approval.decision_note {
+                body["decision_note"] = serde_json::json!(note);
+            }
+        }
+        ApprovalStatus::Expired => {
+            body["message"] = serde_json::json!(
+                "This approval expired before a human decided; the action did not run. Submit a \
+                 fresh request if you still need it."
+            );
+        }
+        ApprovalStatus::Approved => {
+            if !approval.executed {
+                body["message"] = serde_json::json!(
+                    "Approved; the action is being executed now. Poll again in ~10-30 seconds to \
+                     get the result."
+                );
+            } else if let Some(err) = &approval.result_error {
+                body["message"] = serde_json::json!("Approved, but the action failed to execute.");
+                body["error"] = serde_json::json!(err);
+            } else {
+                body["message"] = serde_json::json!("Approved and executed.");
+                body["result"] = serde_json::json!({
+                    "status": approval.result_status,
+                    "body": approval.result_body,
+                });
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 // ============== List Credentials ==============

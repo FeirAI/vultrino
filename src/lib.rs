@@ -4,6 +4,7 @@
 //! It acts as a secure proxy that injects authentication into requests
 //! while keeping the actual credentials hidden from the AI.
 
+pub mod approval;
 pub mod auth;
 pub mod config;
 pub mod crypto;
@@ -474,6 +475,59 @@ impl ExecuteResponse {
     pub fn with_updated_credential(mut self, credential: CredentialData) -> Self {
         self.updated_credential = Some(credential);
         self
+    }
+}
+
+/// Outcome of a (possibly approval-gated) execution.
+///
+/// Most callers run an action and get a [`ExecuteResponse`] back. But when an
+/// action requires human approval, the action does *not* run yet — the caller
+/// receives a [`ExecutionOutcome::Pending`] carrying the open
+/// [`approval::ApprovalRequest`] so it can tell the agent how to check back.
+// `Completed` is the hot path and is kept inline; `Pending` (the rare gated
+// path) is boxed so it doesn't bloat the enum. The residual size gap between the
+// inline `Completed` and the boxed pointer is intentional.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum ExecutionOutcome {
+    /// The action ran and produced a response.
+    Completed(ExecuteResponse),
+    /// The action is gated on human approval; nothing has run yet.
+    /// Boxed because an `ApprovalRequest` is much larger than `ExecuteResponse`.
+    Pending(Box<approval::ApprovalRequest>),
+}
+
+impl ExecutionOutcome {
+    /// Collapse to an [`ExecuteResponse`], rendering a `Pending` outcome as a
+    /// `202 Accepted` body describing the open approval (so callers that only
+    /// understand responses still surface the pending state to the agent).
+    pub fn into_response(self) -> ExecuteResponse {
+        match self {
+            ExecutionOutcome::Completed(resp) => resp,
+            ExecutionOutcome::Pending(approval) => {
+                let body = serde_json::json!({
+                    "outcome": "pending_approval",
+                    "approval_id": approval.id,
+                    "message": format!(
+                        "This action requires human approval before it runs. It has NOT executed. \
+                         To get the result, poll this approval by its approval_id '{id}' — \
+                         e.g. `vultrino approval status {id}` (CLI), the `check_approval` tool (MCP), \
+                         or GET /api/v1/approvals/{id} (HTTP API). It stays pending until approved \
+                         or it expires at {expires}.",
+                        id = approval.id,
+                        expires = approval.expires_at.format("%Y-%m-%d %H:%M UTC"),
+                    ),
+                    "summary": approval.summary,
+                    "expires_at": approval.expires_at,
+                });
+                ExecuteResponse {
+                    status: 202,
+                    headers: HashMap::new(),
+                    body: serde_json::to_vec(&body).unwrap_or_default(),
+                    updated_credential: None,
+                }
+            }
+        }
     }
 }
 

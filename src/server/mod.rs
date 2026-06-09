@@ -2,47 +2,114 @@
 //!
 //! Provides JSON API mode for execute requests.
 
+use crate::approval::{
+    ApprovalNotifier, ApprovalRequest, ApprovalStatus, NewApproval, RequesterInfo,
+};
 use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
 use crate::config::Config;
 use crate::plugins::PluginRegistry;
 use crate::policy::PolicyEngine;
 use crate::router::CredentialResolver;
 use crate::storage::StorageBackend;
-use crate::{Credential, ExecuteRequest, ExecuteResponse, RequestContext, VultrinoError};
+use crate::{
+    Credential, ExecuteRequest, ExecuteResponse, ExecutionOutcome, RequestContext, VultrinoError,
+};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Authentication context for an execution.
+/// While a serving process executes an approved action, it refreshes the
+/// approval's execution claim this often so a slow-but-alive worker is never
+/// mistaken for a crashed one. Must be comfortably smaller than the storage
+/// backend's stale-claim timeout.
+const EXECUTION_HEARTBEAT_SECS: u64 = 30;
+
+/// Authentication context for a (possibly approval-gated) execution.
 ///
 /// Carries the permission/scope source (`auth`) and, when a use token is driving
 /// the request, the **whole token** so the server can authoritatively enforce
-/// its credential *and* action scope at the seam where the token is spent, and
-/// consume it by id — a single source of truth rather than a separate id field.
+/// its credential *and* action scope at the seam where the token is spent and
+/// consume it — a single source of truth. Also carries the force-approval flag
+/// and the requester identity for the approval record.
 #[derive(Default)]
 pub struct ExecAuth {
     /// Real (API key) or synthesized (use token) auth result. `None` = local.
     pub auth: Option<AuthResult>,
-    /// The use token driving this request, if any.
+    /// The use token driving this request, if any (single source of truth for
+    /// scope enforcement and consumption).
     pub use_token: Option<UseToken>,
+    /// Force human approval for this request (e.g. a token's `require_approval`).
+    pub force_approval: bool,
+    /// Who/what made the request, for the approval record.
+    pub requester: RequesterInfo,
 }
 
 impl ExecAuth {
     /// Build an `ExecAuth` for an API-key-authenticated request.
     pub fn from_api_key(auth: AuthResult) -> Self {
+        let requester = RequesterInfo {
+            principal_kind: "api_key".to_string(),
+            principal_id: Some(auth.api_key.id.clone()),
+            principal_name: Some(auth.api_key.name.clone()),
+            role: Some(auth.role.name.clone()),
+        };
         Self {
             auth: Some(auth),
             use_token: None,
+            force_approval: false,
+            requester,
         }
     }
 
-    /// Build an `ExecAuth` for a use-token-authenticated request. Derives both
-    /// the synthesized auth and the consume target from the one token, so they
-    /// cannot diverge.
+    /// Build an `ExecAuth` for a use-token-authenticated request. Derives the
+    /// synthesized auth, the consume target, the force-approval flag, and the
+    /// requester from the one token, so they cannot diverge.
     pub fn from_use_token(token: UseToken) -> Self {
+        let requester = RequesterInfo {
+            principal_kind: "use_token".to_string(),
+            principal_id: Some(token.id.clone()),
+            principal_name: Some(token.name.clone()),
+            role: None,
+        };
         Self {
             auth: Some(AuthResult::for_use_token(&token)),
+            force_approval: token.require_approval,
+            requester,
             use_token: Some(token),
         }
+    }
+}
+
+/// Error from [`VultrinoServer::run_action`], tagged with whether the
+/// side-effecting `plugin.execute` had begun.
+///
+/// `committed = false` means the failure happened during preflight (plugin not
+/// loaded, invalid params, unusable token) — nothing ran, so resuming an
+/// approval can safely retry. `committed = true` means the plugin was invoked
+/// and the action may have had an external effect — it must not be retried.
+struct RunError {
+    /// True only when retrying could plausibly succeed: a *transient* preflight
+    /// failure such as a plugin that isn't loaded yet. A *permanent* preflight
+    /// failure (unusable use token, invalid params, missing credential) or a
+    /// committed `plugin.execute` failure sets this false — a resumed approval is
+    /// then finalized terminally instead of busy-polling forever.
+    retryable: bool,
+    error: VultrinoError,
+}
+
+impl RunError {
+    /// A transient preflight failure (e.g. plugin not loaded) — safe to retry.
+    fn retryable(error: VultrinoError) -> Self {
+        Self { retryable: true, error }
+    }
+    /// A permanent preflight failure (unusable token, bad params, missing
+    /// credential) — nothing ran, but retrying won't help.
+    fn terminal(error: VultrinoError) -> Self {
+        Self { retryable: false, error }
+    }
+    /// The plugin began executing and then failed — may have side-effected, so
+    /// it must not be retried.
+    fn committed(error: VultrinoError) -> Self {
+        Self { retryable: false, error }
     }
 }
 
@@ -62,6 +129,10 @@ pub struct VultrinoServer {
     auth_manager: Arc<AuthManager>,
     /// Whether authentication is required
     require_auth: bool,
+    /// Action approval configuration
+    approval_config: crate::approval::ApprovalConfig,
+    /// Out-of-band approval notifiers (Telegram, webhook, ...)
+    notifiers: Vec<Arc<dyn ApprovalNotifier>>,
 }
 
 impl VultrinoServer {
@@ -81,6 +152,26 @@ impl VultrinoServer {
         // By default, don't require auth in local mode
         let require_auth = config.server.mode == crate::config::ServerMode::Server;
 
+        // Build approval subsystem from config
+        let approval_config = config.approval.clone();
+        let notifiers = crate::approval::build_notifiers(&approval_config);
+
+        // Warn operators about approval configs that gate actions but can't
+        // actually deliver a request to a human out of band.
+        if approval_config.enabled {
+            if notifiers.is_empty() {
+                warn!(
+                    "approvals are enabled with no notifier configured — pending requests are \
+                     only visible via the web admin panel (`vultrino web`)"
+                );
+            } else if approval_config.public_base_url.is_none() {
+                warn!(
+                    "approvals have a notifier but no public_base_url — Telegram/webhook \
+                     approve/deny links can't be built; approvals must be decided in the admin panel"
+                );
+            }
+        }
+
         Self {
             config,
             resolver,
@@ -89,6 +180,8 @@ impl VultrinoServer {
             storage,
             auth_manager,
             require_auth,
+            approval_config,
+            notifiers,
         }
     }
 
@@ -106,7 +199,7 @@ impl VultrinoServer {
 
     /// Load all installed WASM plugins
     pub async fn load_plugins(&self) -> Result<(), VultrinoError> {
-        use crate::plugins::{PluginInstaller, PluginLoader};
+        use crate::plugins::{PluginLoader, PluginInstaller};
 
         let installer = PluginInstaller::default();
         let installed = installer.list().await.map_err(|e| {
@@ -135,11 +228,19 @@ impl VultrinoServer {
     }
 
     /// Execute a request through Vultrino (no authentication / local use).
+    ///
+    /// If the action requires approval, this returns a `202` response whose body
+    /// describes the pending approval (see [`ExecutionOutcome::into_response`]).
     pub async fn execute(&self, request: ExecuteRequest) -> Result<ExecuteResponse, VultrinoError> {
         self.execute_with_auth(request, None).await
     }
 
     /// Execute a request with optional API-key authentication.
+    ///
+    /// Backwards-compatible wrapper that collapses the [`ExecutionOutcome`] into
+    /// an [`ExecuteResponse`]. Callers that want to distinguish a pending
+    /// approval from a completed action (e.g. the MCP layer) should call
+    /// [`Self::execute_gated`] directly.
     pub async fn execute_with_auth(
         &self,
         request: ExecuteRequest,
@@ -149,19 +250,25 @@ impl VultrinoServer {
             Some(a) => ExecAuth::from_api_key(a.clone()),
             None => ExecAuth::default(),
         };
-        self.execute_gated(request, exec_auth).await
+        Ok(self.execute_gated(request, exec_auth).await?.into_response())
     }
 
-    /// Execute a request with a full auth context.
+    /// Execute a request, gating it on human approval when required.
     ///
-    /// Checks permission + credential scope, evaluates policy, and runs the
-    /// action. When the auth context carries a use token, the token is consumed
-    /// (reserved, fail-closed) just before the action runs.
+    /// Approval is required when **any** of these hold:
+    /// - the credential is flagged with metadata `require_approval = "true"`,
+    /// - a matching policy returns `Prompt`,
+    /// - the auth context forces it (e.g. a use token with `require_approval`).
+    ///
+    /// When gated, the action does **not** run: an [`ApprovalRequest`] is
+    /// created, persisted, and announced to the configured notifiers, and
+    /// [`ExecutionOutcome::Pending`] is returned. Otherwise the action runs
+    /// immediately (consuming the use token, if any).
     pub async fn execute_gated(
         &self,
         request: ExecuteRequest,
         exec_auth: ExecAuth,
-    ) -> Result<ExecuteResponse, VultrinoError> {
+    ) -> Result<ExecutionOutcome, VultrinoError> {
         let mut context = RequestContext::new();
 
         // Permission + scope checks (only when authenticated).
@@ -181,16 +288,16 @@ impl VultrinoServer {
             }
         }
 
-        // Resolve credential and parse the action.
+        // Resolve credential and normalize the action.
         let credential = self.resolver.resolve(&request.credential).await?;
         let (plugin_name, action_name) = parse_action(&request.action)?;
+        let full_action = format!("{}.{}", plugin_name, action_name);
 
         // Authoritative use-token scope enforcement at the seam where the token
         // is actually spent — both credential and action scope, so the token's
         // single-action restriction is defended in depth rather than only at the
         // (MCP/HTTP) edge.
         if let Some(token) = &exec_auth.use_token {
-            let full_action = format!("{}.{}", plugin_name, action_name);
             if !token.allows_credential(&credential.alias) {
                 return Err(VultrinoError::PolicyDenied(format!(
                     "Use token is not scoped to credential '{}'",
@@ -205,41 +312,96 @@ impl VultrinoServer {
             }
         }
 
-        // Evaluate policy (URL / method / rate limits).
+        // Evaluate policy (URL / method / rate limits). A `Prompt` decision
+        // routes into the approval flow rather than failing.
         let url = request.params.get("url").and_then(|v| v.as_str());
         let method = request.params.get("method").and_then(|v| v.as_str());
         let decision = self
             .policy_engine
             .evaluate(&credential.alias, url, method, &context);
 
+        let mut needs_approval = exec_auth.force_approval;
         match decision {
             crate::policy::PolicyDecision::Allow => {}
             crate::policy::PolicyDecision::Deny(reason) => {
                 return Err(VultrinoError::PolicyDenied(reason));
             }
             crate::policy::PolicyDecision::Prompt => {
-                return Err(VultrinoError::PolicyDenied(
-                    "Request requires user approval (not implemented)".to_string(),
-                ));
+                needs_approval = true;
             }
         }
 
-        self.run_action(
-            credential,
-            plugin_name,
-            action_name,
-            request.params.clone(),
-            context,
-            exec_auth.use_token.as_ref().map(|t| t.id.as_str()),
-        )
-        .await
+        // Credential-level opt-in: `vultrino meta set <cred> require_approval true`.
+        if credential
+            .metadata
+            .get("require_approval")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+        {
+            needs_approval = true;
+        }
+
+        if needs_approval {
+            if !self.approval_config.enabled {
+                return Err(VultrinoError::PolicyDenied(
+                    "This action requires human approval, but approvals are not enabled on this \
+                     Vultrino instance"
+                        .to_string(),
+                ));
+            }
+
+            // Open an approval request. The use token is NOT consumed yet — it is
+            // reserved when the approved action actually runs.
+            let (approval, decision_token) = ApprovalRequest::open(NewApproval {
+                credential: credential.alias.clone(),
+                action: full_action.clone(),
+                params: request.params.clone(),
+                requester: exec_auth.requester.clone(),
+                use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
+                ttl: self.approval_config.ttl(),
+            });
+            self.storage.store_approval(&approval).await?;
+            self.dispatch_notifications(&approval, &decision_token).await;
+
+            info!(
+                approval_id = %approval.id,
+                credential = %credential.alias,
+                action = %full_action,
+                "Action gated on human approval"
+            );
+
+            return Ok(ExecutionOutcome::Pending(Box::new(approval)));
+        }
+
+        // Not gated: run now (reserving the use token first, fail-closed).
+        let response = self
+            .run_action(
+                credential,
+                plugin_name,
+                action_name,
+                request.params.clone(),
+                context,
+                exec_auth.use_token.as_ref().map(|t| t.id.as_str()),
+            )
+            .await
+            .map_err(|re| re.error)?;
+
+        Ok(ExecutionOutcome::Completed(response))
     }
 
     /// Run a plugin action against a resolved credential.
     ///
-    /// The plugin is resolved and params validated *before* the use token is
-    /// consumed, so a not-loaded plugin or bad params never burns a use. The
-    /// token is then reserved (fail-closed) immediately before the action runs.
+    /// This is the shared core invoked both by the immediate path
+    /// ([`Self::execute_gated`]) and the deferred path after approval
+    /// ([`Self::resume_approved`]). It does **not** evaluate approval policy —
+    /// that decision has already been made by the caller.
+    ///
+    /// Ordering matters: the plugin is resolved and params validated *before*
+    /// the use token is consumed, so a not-loaded plugin or bad params never
+    /// burns a use. The token is then reserved (fail-closed) immediately before
+    /// `plugin.execute`, which is the point of no return. Errors are tagged with
+    /// [`RunError::committed`] so a caller resuming an approval can tell a
+    /// retryable preflight failure from a terminal post-side-effect one.
     async fn run_action(
         &self,
         credential: Credential,
@@ -248,18 +410,29 @@ impl VultrinoServer {
         params: serde_json::Value,
         context: RequestContext,
         use_token_id: Option<&str>,
-    ) -> Result<ExecuteResponse, VultrinoError> {
+    ) -> Result<ExecuteResponse, RunError> {
+        // Preflight (no side effects yet, no token consumed): resolve + validate.
+        // A not-loaded plugin is *transient* (it may load later → retryable);
+        // invalid params are *permanent* (a retry can't fix them → terminal).
         let plugin = self.plugins.get(plugin_name).ok_or_else(|| {
-            VultrinoError::Plugin(crate::plugins::PluginError::NotFound(plugin_name.to_string()))
+            RunError::retryable(VultrinoError::Plugin(
+                crate::plugins::PluginError::NotFound(plugin_name.to_string()),
+            ))
         })?;
+        plugin
+            .validate_params(action_name, &params)
+            .map_err(|e| RunError::terminal(e.into()))?;
 
-        // Validate params for the action.
-        plugin.validate_params(action_name, &params)?;
-
-        // Reserve the use token atomically, fail-closed, before the side effect.
+        // Reserve the use token atomically, fail-closed, just before the side
+        // effect. A failure here (exhausted/expired/revoked) means nothing ran
+        // AND the token will never become usable, so it is terminal — a resumed
+        // approval finalizes with the error rather than retrying forever.
         if let Some(tid) = use_token_id {
             self.storage.consume_use_token(tid).await.map_err(|e| {
-                VultrinoError::PolicyDenied(format!("Use token cannot be used: {}", e))
+                RunError::terminal(VultrinoError::PolicyDenied(format!(
+                    "Use token cannot be used: {}",
+                    e
+                )))
             })?;
         }
 
@@ -276,7 +449,11 @@ impl VultrinoServer {
             context,
         };
 
-        let response = plugin.execute(plugin_request).await?;
+        // Point of no return: the action may now have side effects.
+        let response = plugin
+            .execute(plugin_request)
+            .await
+            .map_err(|e| RunError::committed(e.into()))?;
 
         // Persist any credential update (e.g. OAuth2 token refresh).
         if let Some(updated_data) = &response.updated_credential {
@@ -313,6 +490,171 @@ impl VultrinoServer {
         Ok(response)
     }
 
+    /// Run a previously-approved action. Builds the request from the stored
+    /// approval and executes it (consuming the use token, if any).
+    async fn resume_approved(&self, approval: &ApprovalRequest) -> Result<ExecuteResponse, RunError> {
+        // A credential that has gone missing, or an unparseable action, won't
+        // recover on retry → terminal.
+        let credential = self
+            .resolver
+            .resolve(&approval.credential)
+            .await
+            .map_err(RunError::terminal)?;
+        let (plugin_name, action_name) =
+            parse_action(&approval.action).map_err(RunError::terminal)?;
+        let context = RequestContext::new();
+        self.run_action(
+            credential,
+            plugin_name,
+            action_name,
+            approval.params.clone(),
+            context,
+            approval.use_token_id.as_deref(),
+        )
+        .await
+    }
+
+    /// Look up an approval and, if it has been approved but not yet run, execute
+    /// it now and record the result. This is the polling entry point an agent
+    /// calls via `check_approval` (MCP), `GET /api/v1/approvals/{id}` (HTTP), or
+    /// `vultrino approval status` (CLI).
+    ///
+    /// `expected_principal`, when `Some`, must match the approval's requester —
+    /// the ownership check happens **before** any execution, so a non-owner can
+    /// never trigger another principal's approved action. Pass `None` for a
+    /// trusted local caller (CLI/admin).
+    ///
+    /// Storage is reloaded first so a decision made by another process (the web
+    /// admin panel, a Telegram button) is picked up.
+    pub async fn check_and_resume_approval(
+        &self,
+        id: &str,
+        expected_principal: Option<&str>,
+    ) -> Result<ApprovalRequest, VultrinoError> {
+        // Best-effort: pick up cross-process decisions.
+        let _ = self.storage.reload().await;
+
+        let mut approval = self
+            .storage
+            .get_approval(id)
+            .await?
+            .ok_or_else(|| VultrinoError::InvalidRequest(format!("Approval not found: {}", id)))?;
+
+        // Ownership check BEFORE any side effect: a non-owner must not be able to
+        // trigger execution of someone else's approved action.
+        if let Some(pid) = expected_principal {
+            if approval.requester.principal_id.as_deref() != Some(pid) {
+                return Err(VultrinoError::PolicyDenied(
+                    "This approval was requested by a different principal; you are not authorized \
+                     to access it"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // Auto-expire stale pending requests.
+        if approval.expire_if_due() {
+            let _ = self.storage.update_approval(&approval).await;
+            return Ok(approval);
+        }
+
+        // Approved but not yet executed → run it now (claiming first to avoid a
+        // double-run if two polls race).
+        if approval.status == ApprovalStatus::Approved && !approval.executed {
+            match self.storage.claim_approval_for_execution(id).await? {
+                Some(mut claimed) => {
+                    // Run the (possibly slow) action while heartbeating the claim,
+                    // so a live worker's claim is never judged stale and re-run by
+                    // another process. Resume against a clone so `claimed` stays
+                    // free to mutate with the result. The select cancels the
+                    // heartbeat loop as soon as the action finishes.
+                    let resume_input = claimed.clone();
+                    let hb_storage = self.storage.clone();
+                    let hb_id = id.to_string();
+                    let resume_fut = self.resume_approved(&resume_input);
+                    tokio::pin!(resume_fut);
+                    let outcome = loop {
+                        tokio::select! {
+                            r = &mut resume_fut => break r,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(
+                                EXECUTION_HEARTBEAT_SECS,
+                            )) => {
+                                let _ = hb_storage.heartbeat_approval(&hb_id).await;
+                            }
+                        }
+                    };
+
+                    match outcome {
+                        Ok(resp) => {
+                            claimed.result_status = Some(resp.status);
+                            // The full body already went to the live caller; cap
+                            // what we persist into the (encrypted) vault so a large
+                            // response can't bloat the approval record unbounded.
+                            claimed.result_body = Some(cap_result_body(&resp.body));
+                            claimed.result_error = None;
+                            claimed.executed = true;
+                            claimed.executing = false;
+                            claimed.executing_since = None;
+                        }
+                        // Not retryable: either the plugin ran and may have
+                        // side-effected (committed), or a permanent preflight
+                        // failure (unusable token, bad params, missing credential).
+                        // Finalize terminally so the agent isn't told to poll forever.
+                        Err(re) if !re.retryable => {
+                            claimed.result_error = Some(re.error.to_string());
+                            claimed.executed = true;
+                            claimed.executing = false;
+                            claimed.executing_since = None;
+                        }
+                        // Transient preflight failure (e.g. plugin not loaded yet) —
+                        // nothing ran. Release the claim and leave it un-executed so
+                        // a later poll can retry.
+                        Err(re) => {
+                            claimed.executing = false;
+                            claimed.executing_since = None;
+                            claimed.result_error = Some(format!(
+                                "could not start the approved action (will retry on next check): {}",
+                                re.error
+                            ));
+                        }
+                    }
+                    self.storage.update_approval(&claimed).await?;
+                    return Ok(claimed);
+                }
+                None => {
+                    // Another worker owns/owned execution; return the latest.
+                    approval = self.storage.get_approval(id).await?.unwrap_or(approval);
+                }
+            }
+        }
+
+        Ok(approval)
+    }
+
+    /// Deliver an approval to all configured notifiers (best-effort).
+    async fn dispatch_notifications(&self, approval: &ApprovalRequest, decision_token: &str) {
+        if self.notifiers.is_empty() {
+            return;
+        }
+        let base = self.approval_config.public_base_url.as_deref().unwrap_or("");
+        let links = approval.links(base, decision_token);
+        for notifier in &self.notifiers {
+            if let Err(e) = notifier.notify(approval, &links).await {
+                warn!(
+                    channel = notifier.channel(),
+                    approval_id = %approval.id,
+                    error = %e,
+                    "Failed to deliver approval notification"
+                );
+            }
+        }
+    }
+
+    /// Whether the approval subsystem is enabled.
+    pub fn approvals_enabled(&self) -> bool {
+        self.approval_config.enabled
+    }
+
     /// Get a reference to the storage backend
     pub fn storage(&self) -> &Arc<dyn StorageBackend> {
         &self.storage
@@ -342,6 +684,24 @@ impl VultrinoServer {
     pub fn requires_auth(&self) -> bool {
         self.require_auth
     }
+}
+
+/// Max bytes of an action response body persisted into an approval record. The
+/// full body is returned to the live caller; only the stored copy is capped.
+const MAX_STORED_RESULT_BODY: usize = 64 * 1024;
+
+/// Render a response body for storage in an approval record, truncating to
+/// [`MAX_STORED_RESULT_BODY`] on a UTF-8 boundary with a marker.
+fn cap_result_body(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    if text.len() <= MAX_STORED_RESULT_BODY {
+        return text.into_owned();
+    }
+    let mut end = MAX_STORED_RESULT_BODY;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…[truncated {} bytes]", &text[..end], text.len() - end)
 }
 
 /// Parse action string into plugin name and action name

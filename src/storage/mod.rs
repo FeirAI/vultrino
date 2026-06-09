@@ -6,6 +6,7 @@ mod file;
 
 pub use file::FileStorage;
 
+use crate::approval::ApprovalRequest;
 use crate::auth::{ApiKey, Role, UseToken};
 use crate::{Credential, CredentialMetadata};
 use async_trait::async_trait;
@@ -34,6 +35,12 @@ pub enum StorageError {
 
     #[error("Use token cannot be used: {0}")]
     UseTokenUnusable(String),
+
+    #[error("Approval request not found: {0}")]
+    ApprovalNotFound(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
 
     #[error("Storage file version {found} is newer than this build supports (max {supported}); upgrade vultrino")]
     UnsupportedVersion { found: u32, supported: u32 },
@@ -146,9 +153,9 @@ pub trait StorageBackend: Send + Sync {
     /// Atomically reserve one use of a token: validate it is usable, increment
     /// its use count, stamp `last_used_at`, persist, and return the updated
     /// token. This is the authoritative single-use gate — the check and the
-    /// increment happen atomically (cross-process) so a single-use token can
-    /// never drive two executions. Fail-closed: the use is reserved even if the
-    /// caller's downstream action later errors.
+    /// increment happen under the backend's lock so a single-use token can never
+    /// drive two executions within a process. Fail-closed: the use is reserved
+    /// even if the caller's downstream action later errors.
     async fn consume_use_token(&self, _id: &str) -> Result<UseToken, StorageError> {
         Err(StorageError::Unavailable(
             "use tokens not supported by this storage backend".to_string(),
@@ -158,6 +165,69 @@ pub trait StorageBackend: Send + Sync {
     /// Atomically mark a use token revoked, returning the updated token.
     async fn set_use_token_revoked(&self, _id: &str) -> Result<UseToken, StorageError> {
         Err(StorageError::UseTokenNotFound(_id.to_string()))
+    }
+
+    // ==================== Approval Storage ====================
+
+    /// Store (create or replace) an approval request.
+    async fn store_approval(&self, _approval: &ApprovalRequest) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable(
+            "approvals not supported by this storage backend".to_string(),
+        ))
+    }
+
+    /// Get an approval request by id.
+    async fn get_approval(&self, _id: &str) -> Result<Option<ApprovalRequest>, StorageError> {
+        Ok(None)
+    }
+
+    /// List all approval requests.
+    async fn list_approvals(&self) -> Result<Vec<ApprovalRequest>, StorageError> {
+        Ok(vec![])
+    }
+
+    /// Update an existing approval request.
+    async fn update_approval(&self, _approval: &ApprovalRequest) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable(
+            "approvals not supported by this storage backend".to_string(),
+        ))
+    }
+
+    /// Refresh the execution-claim timestamp of an in-flight approval (a
+    /// liveness heartbeat). Keeps a slow-but-alive worker from having its claim
+    /// judged stale and re-taken by another process. No-op if the approval is no
+    /// longer executing.
+    async fn heartbeat_approval(&self, _id: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Atomically approve or deny a pending approval (read-modify-write under the
+    /// backend's lock), returning the updated request. Errors with
+    /// [`StorageError::Conflict`] if it is no longer pending.
+    async fn decide_approval(
+        &self,
+        _id: &str,
+        _approve: bool,
+        _by: &str,
+        _note: Option<String>,
+    ) -> Result<ApprovalRequest, StorageError> {
+        Err(StorageError::ApprovalNotFound(_id.to_string()))
+    }
+
+    /// Delete an approval request by id.
+    async fn delete_approval(&self, _id: &str) -> Result<(), StorageError> {
+        Err(StorageError::ApprovalNotFound(_id.to_string()))
+    }
+
+    /// Atomically claim an approved request for execution. Returns the request
+    /// (with `executing` set) only if it is `Approved` and not yet executing or
+    /// executed; otherwise returns `None`. This keeps two concurrent agent polls
+    /// from running the same approved action twice.
+    async fn claim_approval_for_execution(
+        &self,
+        _id: &str,
+    ) -> Result<Option<ApprovalRequest>, StorageError> {
+        Ok(None)
     }
 
     /// Reload data from underlying storage

@@ -2,7 +2,7 @@
 
 use askama::Template;
 use axum::{
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::HeaderMap,
     response::{Html, IntoResponse, Redirect, Response},
     Form,
@@ -50,6 +50,7 @@ fn get_client_ip(headers: &HeaderMap, socket_addr: &SocketAddr) -> IpAddr {
     socket_addr.ip()
 }
 
+use crate::approval::ApprovalStatus;
 use crate::auth::{NewUseToken, Permission, UseToken};
 use crate::plugins::PluginInstaller;
 use crate::{Credential, CredentialData, Secret};
@@ -58,6 +59,7 @@ use super::api::refresh_auth_data;
 use super::auth::{clear_session, get_or_create_csrf_token, regenerate_csrf_token, set_authenticated_session, validate_csrf_token, RequireAuth};
 use super::server::AppState;
 use super::templates::{
+    ApprovalConfirmTemplate, ApprovalDecidedTemplate, ApprovalDisplay, ApprovalsListTemplate,
     AuditLogTemplate, ApiKeyDisplay, CredentialDisplay, CredentialNewTemplate,
     CredentialsListTemplate, DashboardStats, DashboardTemplate, FlashKind, FlashMessage,
     KeyNewTemplate, KeysListTemplate, LoginTemplate, PluginCredentialType, RoleDisplay,
@@ -940,6 +942,7 @@ pub struct UseTokenForm {
     action_scope: Option<String>,
     max_uses: Option<String>,
     expires: Option<String>,
+    require_approval: Option<String>,
     csrf_token: String,
 }
 
@@ -990,11 +993,14 @@ pub async fn token_create(
         },
     };
 
+    let require_approval = matches!(form.require_approval.as_deref(), Some("true") | Some("on") | Some("1"));
+
     let params = NewUseToken {
         name,
         credential_scope,
         action_scope,
         max_uses,
+        require_approval,
         expires_in,
     };
     if let Err(e) = params.validate() {
@@ -1046,6 +1052,149 @@ pub async fn token_revoke(
     let _ = state.storage.set_use_token_revoked(&id).await;
     let _ = regenerate_csrf_token(&session).await;
     Redirect::to("/tokens").into_response()
+}
+
+// ============== Approvals ==============
+
+pub async fn approvals_list(
+    State(state): State<AppState>,
+    session: Session,
+    auth: RequireAuth,
+) -> impl IntoResponse {
+    let _ = state.storage.reload().await;
+    let mut approvals = state.storage.list_approvals().await.unwrap_or_default();
+    // Pending first, then most recent.
+    approvals.sort_by(|a, b| {
+        let pending = |s: &ApprovalStatus| *s == ApprovalStatus::Pending;
+        pending(&b.status)
+            .cmp(&pending(&a.status))
+            .then(b.created_at.cmp(&a.created_at))
+    });
+    let approval_displays: Vec<ApprovalDisplay> = approvals.iter().map(ApprovalDisplay::from).collect();
+    let csrf_token = get_or_create_csrf_token(&session).await.unwrap_or_default();
+
+    let template = ApprovalsListTemplate {
+        username: auth.session.username,
+        approvals: approval_displays,
+        flash: None,
+        csrf_token,
+    };
+    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+}
+
+pub async fn approval_approve(
+    State(state): State<AppState>,
+    session: Session,
+    _auth: RequireAuth,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteForm>,
+) -> impl IntoResponse {
+    if !validate_csrf_token(&session, &form.csrf_token).await {
+        return Redirect::to("/approvals").into_response();
+    }
+    // Atomic decision under the storage lock (no reload+get+update window).
+    let _ = state.storage.decide_approval(&id, true, "admin panel", None).await;
+    let _ = regenerate_csrf_token(&session).await;
+    Redirect::to("/approvals").into_response()
+}
+
+pub async fn approval_deny(
+    State(state): State<AppState>,
+    session: Session,
+    _auth: RequireAuth,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteForm>,
+) -> impl IntoResponse {
+    if !validate_csrf_token(&session, &form.csrf_token).await {
+        return Redirect::to("/approvals").into_response();
+    }
+    let _ = state.storage.decide_approval(&id, false, "admin panel", None).await;
+    let _ = regenerate_csrf_token(&session).await;
+    Redirect::to("/approvals").into_response()
+}
+
+/// Query/form parameters for an out-of-band decision link.
+#[derive(Deserialize)]
+pub struct DecideParams {
+    token: String,
+    decision: String,
+}
+
+fn render_decided(title: &str, message: &str, ok: bool) -> Response {
+    let template = ApprovalDecidedTemplate {
+        title: title.to_string(),
+        message: message.to_string(),
+        ok,
+    };
+    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e))).into_response()
+}
+
+/// GET handler for the Telegram/webhook/email approve|deny link. To prevent a
+/// link prefetch from silently deciding, this only renders a confirmation page
+/// with a POST button — the actual decision happens in [`approval_decide_submit`].
+pub async fn approval_decide_confirm(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<DecideParams>,
+) -> Response {
+    let _ = state.storage.reload().await;
+    let approval = match state.storage.get_approval(&id).await {
+        Ok(Some(a)) => a,
+        _ => return render_decided("Not found", "No such approval request.", false),
+    };
+    if !approval.verify_decision_token(&params.token) {
+        return render_decided("Invalid link", "This approval link is invalid or has been tampered with.", false);
+    }
+    if params.decision != "approve" && params.decision != "deny" {
+        return render_decided("Invalid decision", "Unknown decision.", false);
+    }
+
+    let template = ApprovalConfirmTemplate {
+        id,
+        token: params.token,
+        decision: params.decision.clone(),
+        decision_word: if params.decision == "approve" { "Approve".to_string() } else { "Deny".to_string() },
+        summary: approval.summary.clone(),
+    };
+    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e))).into_response()
+}
+
+/// POST handler that actually records the out-of-band decision, authorized by
+/// the capability token (no session required).
+pub async fn approval_decide_submit(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(params): Form<DecideParams>,
+) -> Response {
+    let _ = state.storage.reload().await;
+    let approval = match state.storage.get_approval(&id).await {
+        Ok(Some(a)) => a,
+        _ => return render_decided("Not found", "No such approval request.", false),
+    };
+    if !approval.verify_decision_token(&params.token) {
+        return render_decided("Invalid link", "This approval link is invalid or has been tampered with.", false);
+    }
+    let approve = match params.decision.as_str() {
+        "approve" => true,
+        "deny" => false,
+        _ => return render_decided("Invalid decision", "Unknown decision.", false),
+    };
+
+    // Record the decision atomically under the storage lock.
+    match state.storage.decide_approval(&id, approve, "out-of-band link", None).await {
+        Ok(_) => {
+            if approve {
+                render_decided(
+                    "Approved",
+                    "The action has been approved. The agent will run it on its next check and receive the result.",
+                    true,
+                )
+            } else {
+                render_decided("Denied", "The action has been denied and will not run.", true)
+            }
+        }
+        Err(e) => render_decided("Already decided", &format!("This request could not be updated: {}", e), false),
+    }
 }
 
 // ============== API Endpoints ==============

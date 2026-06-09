@@ -13,6 +13,7 @@ pub struct RawConfig {
     pub mcp: Option<RawMcpConfig>,
     #[serde(default)]
     pub policies: Vec<RawPolicy>,
+    pub approvals: Option<RawApprovalConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -160,6 +161,48 @@ impl From<RawMcpConfig> for McpConfig {
                 _ => McpTransport::Stdio,
             },
             socket_path: raw.socket_path.map(PathBuf::from),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RawApprovalConfig {
+    pub enabled: Option<bool>,
+    pub ttl_secs: Option<u64>,
+    pub public_base_url: Option<String>,
+    pub telegram: Option<RawTelegramConfig>,
+    pub webhook: Option<RawWebhookConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawTelegramConfig {
+    pub bot_token: String,
+    pub chat_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawWebhookConfig {
+    pub url: String,
+    pub auth_header: Option<String>,
+}
+
+impl From<RawApprovalConfig> for crate::approval::ApprovalConfig {
+    fn from(raw: RawApprovalConfig) -> Self {
+        // A telegram/webhook section being present implies approvals are enabled
+        // unless explicitly disabled.
+        let has_channel = raw.telegram.is_some() || raw.webhook.is_some();
+        Self {
+            enabled: raw.enabled.unwrap_or(has_channel),
+            ttl_secs: raw.ttl_secs.unwrap_or(3600),
+            public_base_url: raw.public_base_url,
+            telegram: raw.telegram.map(|t| crate::approval::TelegramConfig {
+                bot_token: t.bot_token,
+                chat_id: t.chat_id,
+            }),
+            webhook: raw.webhook.map(|w| crate::approval::WebhookConfig {
+                url: w.url,
+                auth_header: w.auth_header,
+            }),
         }
     }
 }

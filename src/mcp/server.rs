@@ -3,9 +3,10 @@
 //! Exposes Vultrino capabilities through the Model Context Protocol.
 
 use super::types::*;
+use crate::approval::ApprovalStatus;
 use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
 use crate::server::{ExecAuth, VultrinoServer};
-use crate::{CredentialMetadata, ExecuteRequest};
+use crate::{CredentialMetadata, ExecuteRequest, ExecutionOutcome};
 use glob::Pattern;
 use serde_json::json;
 use std::sync::Arc;
@@ -21,6 +22,14 @@ enum McpPrincipal {
 }
 
 impl McpPrincipal {
+    /// Stable id of the underlying principal (api key id or use token id).
+    fn id(&self) -> &str {
+        match self {
+            McpPrincipal::ApiKey(a) => &a.api_key.id,
+            McpPrincipal::UseToken { token, .. } => &token.id,
+        }
+    }
+
     /// The permission/scope source for this principal.
     fn auth(&self) -> &AuthResult {
         match self {
@@ -111,6 +120,37 @@ impl McpServer {
         }
     }
 
+    /// Resolve a secret to a principal for a **read-only** operation (polling an
+    /// approval). Unlike [`Self::resolve_principal`], a use token that has become
+    /// exhausted or expired is still accepted — polling is not an execution, and
+    /// a single-use token legitimately becomes exhausted exactly when its
+    /// approved action runs. A *revoked* token is still rejected.
+    async fn resolve_principal_for_read(&self, secret: &str) -> Result<McpPrincipal, String> {
+        if UseToken::looks_like_token(secret) {
+            let vultrino = self.vultrino.read().await;
+            let _ = vultrino.storage().reload().await;
+            let token = vultrino
+                .storage()
+                .get_use_token_by_hash(&UseToken::hash(secret))
+                .await
+                .map_err(|e| format!("Storage error: {}", e))?
+                .ok_or_else(|| "Invalid use token".to_string())?;
+            drop(vultrino);
+
+            if token.revoked {
+                return Err("Use token has been revoked".to_string());
+            }
+            let auth = AuthResult::for_use_token(&token);
+            Ok(McpPrincipal::UseToken {
+                auth,
+                token: Box::new(token),
+            })
+        } else {
+            let auth = self.validate_api_key(secret).await?;
+            Ok(McpPrincipal::ApiKey(auth))
+        }
+    }
+
     /// Build an [`ExecAuth`] for the given principal. A use token's credential
     /// and action scope is enforced authoritatively in the server
     /// (`execute_gated`), so this is a straight conversion.
@@ -119,6 +159,31 @@ impl McpServer {
             McpPrincipal::ApiKey(auth) => ExecAuth::from_api_key(auth.clone()),
             McpPrincipal::UseToken { token, .. } => ExecAuth::from_use_token((**token).clone()),
         }
+    }
+
+    /// Render the agent-facing message for an action that is now waiting on a
+    /// human approval. Clarity here is the whole point: the agent must
+    /// understand it is blocked and exactly how to retrieve the result later.
+    fn format_pending(approval: &crate::approval::ApprovalRequest) -> String {
+        format!(
+            "\u{23F3} APPROVAL REQUIRED — this action has NOT run yet.\n\n\
+             Your request ({summary}) needs a human to approve it before Vultrino will execute it. \
+             No result is available yet, and nothing has changed on the target system.\n\n\
+             approval_id: {id}\n\
+             status: pending\n\
+             expires: {expires}\n\n\
+             HOW TO PROCEED:\n\
+             1. Call the `check_approval` tool with approval_id \"{id}\", re-presenting the same \
+             credential (API key or use token) you made this request with — only that same \
+             principal may poll this approval.\n\
+             2. If it returns \"pending\", a human has not decided yet — wait about 10-30 seconds, \
+             then call `check_approval` again.\n\
+             3. Once approved, `check_approval` will run the action and return the real result.\n\
+             4. If denied or expired, `check_approval` will tell you, and you should not retry.",
+            summary = approval.summary,
+            id = approval.id,
+            expires = approval.expires_at.format("%Y-%m-%d %H:%M UTC"),
+        )
     }
 
     /// Run the MCP server over stdio
@@ -325,6 +390,32 @@ impl McpServer {
                     "required": ["api_key", "credential"]
                 }),
             },
+            Tool {
+                name: "check_approval".to_string(),
+                description: "Check the status of an action that is awaiting human approval. \
+                             When a tool call returns 'APPROVAL REQUIRED' with an approval_id, poll \
+                             this tool with that id. While the status is 'pending', a human has not \
+                             decided yet \u{2014} wait ~10-30 seconds and call again. Once approved, this \
+                             tool runs the original action and returns its real result. If denied or \
+                             expired, it says so and you should not retry. You can only poll \
+                             approvals created by the same principal (API key or use token) that \
+                             made the original request."
+                    .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "api_key": {
+                            "type": "string",
+                            "description": "The same Vultrino API key or use token you made the original request with"
+                        },
+                        "approval_id": {
+                            "type": "string",
+                            "description": "The approval_id returned by the gated tool call (starts with 'appr_')"
+                        }
+                    },
+                    "required": ["api_key", "approval_id"]
+                }),
+            },
         ];
 
         // Add tools from every live plugin in the registry (built-in + loaded
@@ -417,6 +508,7 @@ impl McpServer {
             "list_credentials" => self.tool_list_credentials(params.arguments).await,
             "http_request" => self.tool_http_request(params.arguments).await,
             "get_credential_info" => self.tool_get_credential_info(params.arguments).await,
+            "check_approval" => self.tool_check_approval(params.arguments).await,
             tool => {
                 // Check if it's a plugin tool (format: plugin_name_tool_name)
                 if let Some(result) = self.try_plugin_tool(tool, params.arguments).await {
@@ -511,7 +603,12 @@ impl McpServer {
 
             let vultrino = self.vultrino.read().await;
             let response = match vultrino.execute_gated(request, exec_auth).await {
-                Ok(resp) => resp,
+                Ok(ExecutionOutcome::Completed(resp)) => resp,
+                Ok(ExecutionOutcome::Pending(approval)) => {
+                    return Some(Ok(vec![ToolContent::Text {
+                        text: Self::format_pending(&approval),
+                    }]));
+                }
                 Err(e) => return Some(Err(format!("Plugin execution failed: {}", e))),
             };
 
@@ -640,12 +737,20 @@ impl McpServer {
             }),
         };
 
-        // Execute through Vultrino.
+        // Execute through Vultrino, gating on approval when required.
         let vultrino = self.vultrino.read().await;
-        let response = vultrino
+        let response = match vultrino
             .execute_gated(request, exec_auth)
             .await
-            .map_err(|e| format!("Request failed: {}", e))?;
+            .map_err(|e| format!("Request failed: {}", e))?
+        {
+            ExecutionOutcome::Completed(resp) => resp,
+            ExecutionOutcome::Pending(approval) => {
+                return Ok(vec![ToolContent::Text {
+                    text: Self::format_pending(&approval),
+                }]);
+            }
+        };
 
         // Format response
         let body_text = String::from_utf8_lossy(&response.body);
@@ -718,6 +823,92 @@ impl McpServer {
         }
     }
 
+    /// Tool: check_approval — poll a pending approval, and run the action once
+    /// it has been approved, returning the real result.
+    async fn tool_check_approval(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<Vec<ToolContent>, String> {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            api_key: String,
+            approval_id: String,
+        }
+        let args: Args = serde_json::from_value(args)
+            .map_err(|e| format!("Invalid arguments: {}. api_key and approval_id are required.", e))?;
+
+        // Authenticate the caller (API key or use token). Polling is a read, so
+        // an exhausted/expired use token is still allowed — only revoked is not.
+        let principal = self.resolve_principal_for_read(&args.api_key).await?;
+        let caller_id = principal.id().to_string();
+
+        // The ownership check is enforced inside check_and_resume_approval BEFORE
+        // any execution, so a non-owner can never trigger the approved action.
+        let vultrino = self.vultrino.read().await;
+        let approval = vultrino
+            .check_and_resume_approval(&args.approval_id, Some(&caller_id))
+            .await
+            .map_err(|e| e.to_string())?;
+        drop(vultrino);
+
+        let text = match approval.status {
+            ApprovalStatus::Pending => format!(
+                "\u{23F3} Approval {} is still PENDING. A human has not decided yet. Wait about \
+                 10-30 seconds, then call `check_approval` again with the same approval_id.\nExpires: {}",
+                approval.id,
+                approval.expires_at.format("%Y-%m-%d %H:%M UTC"),
+            ),
+            ApprovalStatus::Denied => format!(
+                "\u{274C} Approval {} was DENIED{}. The action did not run. Do not retry.",
+                approval.id,
+                approval
+                    .decision_note
+                    .as_deref()
+                    .map(|n| format!(" (reason: {})", n))
+                    .unwrap_or_default(),
+            ),
+            ApprovalStatus::Expired => format!(
+                "\u{23F0} Approval {} EXPIRED before a human decided. The action did not run. \
+                 Submit a fresh request if you still need it.",
+                approval.id,
+            ),
+            ApprovalStatus::Approved => {
+                if !approval.executed {
+                    // Approved, but the action hasn't finished running yet (another
+                    // worker holds the execution claim, or a transient start error).
+                    let note = approval
+                        .result_error
+                        .as_deref()
+                        .map(|e| format!(" ({})", e))
+                        .unwrap_or_default();
+                    format!(
+                        "\u{2705} Approval {} was APPROVED and the action is being executed now{}. \
+                         Wait about 10-30 seconds, then call `check_approval` again with the same \
+                         approval_id to get the result.",
+                        approval.id, note
+                    )
+                } else if let Some(err) = &approval.result_error {
+                    format!(
+                        "\u{2705} Approval {} was APPROVED, but the action then failed to execute:\n{}",
+                        approval.id, err
+                    )
+                } else {
+                    let status = approval.result_status.unwrap_or(0);
+                    let body = approval.result_body.clone().unwrap_or_default();
+                    let formatted = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|j| serde_json::to_string_pretty(&j).ok())
+                        .unwrap_or(body);
+                    format!(
+                        "\u{2705} Approval {} was APPROVED and the action has now run.\nStatus: {}\n\nResult:\n{}",
+                        approval.id, status, formatted
+                    )
+                }
+            }
+        };
+
+        Ok(vec![ToolContent::Text { text }])
+    }
 }
 
 #[cfg(test)]

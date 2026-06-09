@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Confirm {{ decision_word }} - Vultrino</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="decide-page">
+        <div class="decide-card">
+            <h1>Confirm: {{ decision_word }}</h1>
+            <p class="decide-summary">{{ summary }}</p>
+            <form method="post" action="/approvals/{{ id }}/decide">
+                <input type="hidden" name="token" value="{{ token }}">
+                <input type="hidden" name="decision" value="{{ decision }}">
+                <button type="submit" class="btn btn-primary">Confirm {{ decision_word }}</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
