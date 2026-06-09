@@ -585,10 +585,20 @@ impl McpServer {
             let full_action = format!("{}.{}", plugin_name, mcp_tool.action);
             let exec_auth = Self::build_exec_auth(&principal);
 
+            // Strip the caller's bearer secret out of the action params before
+            // forwarding them to the plugin. `args` contains the `api_key`
+            // (which may be an API key OR a use token) used to authenticate this
+            // call; it must never reach a plugin — and, when the action is
+            // approval-gated, must never be persisted into the approval record.
+            let mut params = args.clone();
+            if let Some(obj) = params.as_object_mut() {
+                obj.remove("api_key");
+            }
+
             let request = ExecuteRequest {
                 credential: credential.clone(),
                 action: full_action.clone(),
-                params: args.clone(),
+                params,
             };
 
             let vultrino = self.vultrino.read().await;
