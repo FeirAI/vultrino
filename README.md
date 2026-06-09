@@ -359,9 +359,15 @@ required to approve from Telegram/email.
   links are confidential, and avoid running the web server at `DEBUG` log level
   in production (request URIs, which carry the link's capability token, are
   logged at `DEBUG`).
-- An approval-gated single-use token can open more than one *pending* approval;
-  only the first approved one will execute (the rest fail closed at run time), so
-  review token-gated requests with that in mind.
+- A use token's *pending* approvals are **bounded**: `uses + outstanding pending
+  approvals` can never exceed `max_uses`, checked-and-inserted atomically under
+  the vault lock. So a single-use token can't flood the approval queue (or the
+  Telegram/webhook notifier) with requests it could never run.
+- Policy is **re-evaluated when the action finally runs**, so an explicit deny
+  rule (URL / method / time-window) still blocks even a human-approved action.
+  Rate limits are charged **once, at request time** — a human approval is never
+  re-charged against, nor re-denied by, the rate limiter at execution time. When
+  a deny does fire on resume, the use token is left unconsumed.
 
 ## Plugin System
 
@@ -390,6 +396,11 @@ vultrino plugin install ./plugins/pgp-signing
 # From git URL
 vultrino plugin install https://github.com/user/vultrino-plugin-example
 ```
+
+> The web / JSON-API server scans and loads plugins **once at startup** (for
+> per-request performance). After installing a plugin, **restart the web server**
+> so the API picks it up. The CLI and MCP entry points load plugins on launch, so
+> they see newly installed plugins on their next invocation.
 
 ### Example: PGP Signing Plugin
 

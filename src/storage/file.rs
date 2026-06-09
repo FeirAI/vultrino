@@ -569,6 +569,38 @@ impl StorageBackend for FileStorage {
             .await
     }
 
+    async fn store_approval_reserving(
+        &self,
+        approval: &ApprovalRequest,
+        token_id: &str,
+        max_uses: u32,
+    ) -> Result<(), StorageError> {
+        use crate::approval::ApprovalStatus;
+        // Count pending + read uses + insert, all under one fd-lock against the
+        // authoritative on-disk state — so two concurrent opens (web + MCP) for
+        // the same single-use token can't both slip past a stale count.
+        self.locked_mutate(|cache| {
+            let uses = cache.use_tokens.get(token_id).map(|t| t.uses).unwrap_or(0);
+            let pending = cache
+                .approvals
+                .values()
+                .filter(|a| {
+                    a.status == ApprovalStatus::Pending
+                        && !a.is_past_ttl()
+                        && a.use_token_id.as_deref() == Some(token_id)
+                })
+                .count() as u32;
+            if uses + pending >= max_uses {
+                return Err(StorageError::Conflict(
+                    "use token has no remaining capacity for a new pending approval".to_string(),
+                ));
+            }
+            cache.approvals.insert(approval.id.clone(), approval.clone());
+            Ok(())
+        })
+            .await
+    }
+
     async fn get_approval(&self, id: &str) -> Result<Option<ApprovalRequest>, StorageError> {
         let cache = self.cache.read();
         Ok(cache.approvals.get(id).cloned())

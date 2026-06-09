@@ -16,6 +16,14 @@ Include the Vultrino API key in the Authorization header:
 Authorization: Bearer vk_your_api_key_here
 ```
 
+### Use Token Authentication
+
+The execute and approval-polling endpoints also accept a **use token** in the same `Authorization: Bearer` header. Use tokens are recognized by their `vut_` prefix and carry their own credential/action scope and use limits — see [Use Tokens](../guides/use-tokens.md).
+
+```
+Authorization: Bearer vut_your_use_token_here
+```
+
 ### No Authentication (Local Mode)
 
 In local mode without RBAC, no authentication is required.
@@ -128,6 +136,72 @@ Content-Type: application/json
   "body": "{\"login\":\"username\",...}"
 }
 ```
+
+**Approval-gated response (`202 Accepted`):**
+
+If the credential, use token, or a policy requires human approval, the action does **not** run. Instead the endpoint returns the id to poll:
+
+```json
+{
+  "outcome": "pending_approval",
+  "approval_id": "appr_xxxxxxxx",
+  "message": "This action requires human approval before it runs. It has NOT executed. Poll GET /api/v1/approvals/{id} with your bearer token to retrieve the result once a human approves.",
+  "summary": "http.request on deploy-hook",
+  "expires_at": "2024-01-15T11:30:00Z"
+}
+```
+
+---
+
+## Action Approvals API
+
+### GET /api/v1/approvals/{id}
+
+Poll an approval and, once it has been approved, **run the action and return its result**. Execution is lazy and happens on this call. Authenticate with the **same** API key or use token that opened the approval — a caller may only poll its own approvals.
+
+**Request:**
+```http
+GET /api/v1/approvals/appr_xxxxxxxx HTTP/1.1
+Host: localhost:7879
+Authorization: Bearer vk_xxx
+```
+
+**Response (still pending):**
+```json
+{
+  "approval_id": "appr_xxxxxxxx",
+  "status": "Pending",
+  "summary": "http.request on deploy-hook",
+  "executed": false,
+  "message": "Awaiting human approval. The action has NOT run. Poll this endpoint again every ~10-30 seconds with your bearer token.",
+  "expires_at": "2024-01-15T11:30:00Z"
+}
+```
+
+**Response (approved and executed):**
+```json
+{
+  "approval_id": "appr_xxxxxxxx",
+  "status": "Approved",
+  "summary": "http.request on deploy-hook",
+  "executed": true,
+  "message": "Approved and executed.",
+  "result": {
+    "status": 200,
+    "body": "..."
+  }
+}
+```
+
+A `Denied` or `Expired` status returns a `message` telling the agent to stop and not retry. The action is run **at most once** across all polls.
+
+**Error Responses:**
+| Status | Code | Description |
+|--------|------|-------------|
+| 401 | `invalid_token` / `invalid_api_key` | Missing or invalid bearer token |
+| 403 | `not_authorized` | The approval belongs to a different principal |
+| 403 | `token_revoked` | The polling use token has been revoked |
+| 404 | `approval_not_found` | No such approval id |
 
 ---
 

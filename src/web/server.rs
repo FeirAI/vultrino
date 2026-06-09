@@ -47,6 +47,9 @@ pub struct AppState {
     pub admin_auth: Arc<AdminAuth>,
     pub config: Config,
     pub rate_limiter: LoginRateLimiter,
+    /// Shared execution server, built once with plugins loaded — reused by the
+    /// JSON API handlers instead of rebuilding + re-scanning plugins per request.
+    pub server: Arc<crate::server::VultrinoServer>,
 }
 
 impl FromRef<AppState> for Arc<dyn StorageBackend> {
@@ -74,13 +77,17 @@ pub struct WebServer {
 }
 
 impl WebServer {
-    /// Create a new web server
+    /// Create a new web server.
+    ///
+    /// `server` is the shared execution server (built once, plugins loaded) the
+    /// JSON API handlers reuse.
     pub fn new(
         config: WebConfig,
         vultrino_config: Config,
         storage: Arc<dyn StorageBackend>,
         auth_manager: AuthManager,
         admin_auth: AdminAuth,
+        server: Arc<crate::server::VultrinoServer>,
     ) -> Self {
         let app_state = AppState {
             storage,
@@ -88,6 +95,7 @@ impl WebServer {
             admin_auth: Arc::new(admin_auth),
             config: vultrino_config,
             rate_limiter: LoginRateLimiter::new(),
+            server,
         };
 
         Self { config, app_state }

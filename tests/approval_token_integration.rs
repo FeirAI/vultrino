@@ -57,6 +57,14 @@ impl Plugin for MockPlugin {
 /// Build a server backed by fresh encrypted storage, with the mock plugin
 /// registered and approvals enabled.
 async fn setup() -> (VultrinoServer, Arc<dyn StorageBackend>) {
+    setup_with_policies(vec![]).await
+}
+
+/// Like [`setup`] but installs the given policies on the server's policy engine
+/// (so rate-limit / deny rules can be exercised end-to-end).
+async fn setup_with_policies(
+    policies: Vec<vultrino::policy::Policy>,
+) -> (VultrinoServer, Arc<dyn StorageBackend>) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
     // Keep the tempdir alive for the duration of the process by leaking it; the
@@ -70,6 +78,7 @@ async fn setup() -> (VultrinoServer, Arc<dyn StorageBackend>) {
     let mut config = Config::default();
     config.approval.enabled = true;
     config.approval.ttl_secs = 3600;
+    config.policies = policies;
 
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
@@ -392,6 +401,177 @@ async fn test_token_force_approval_consumes_on_resume() {
     let after = storage.get_use_token(&token.id).await.unwrap().unwrap();
     assert_eq!(after.uses, 1);
     assert!(after.is_exhausted());
+}
+
+/// A single-use require_approval token may have at most one *pending* approval
+/// outstanding — a second open is refused, so it can't flood the approval queue.
+#[tokio::test]
+async fn test_single_use_token_pending_approval_bounded() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred", false).await;
+
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "one-pending".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: Some(1),
+        require_approval: true,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    // First open succeeds (one pending approval reserves the single use).
+    let first = server
+        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(first, ExecutionOutcome::Pending(_)));
+
+    // Second open is refused — no remaining capacity.
+    let err = server
+        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .await
+        .unwrap_err();
+    assert!(format!("{}", err).to_lowercase().contains("no remaining capacity"));
+}
+
+/// The bound is `uses + pending < max_uses`, so a `max_uses = 2` token may have
+/// exactly two pending approvals before the third is refused (off-by-one guard).
+#[tokio::test]
+async fn test_pending_bound_allows_up_to_max_uses() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred", false).await;
+
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "two-pending".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: Some(2),
+        require_approval: true,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    // Two opens succeed (two pending approvals reserve the two uses).
+    for _ in 0..2 {
+        let outcome = server
+            .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ExecutionOutcome::Pending(_)));
+    }
+
+    // The third open is refused — capacity is fully reserved.
+    let err = server
+        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .await
+        .unwrap_err();
+    assert!(format!("{}", err).to_lowercase().contains("no remaining capacity"));
+}
+
+/// Concurrency: two opens racing on a single-use token must not both slip past
+/// a stale pending count. The atomic `store_approval_reserving` guarantees at
+/// most one pending approval is created (the rest get a capacity error).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_pending_opens_are_bounded() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred", false).await;
+
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "race".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: Some(1),
+        require_approval: true,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    let server = Arc::new(server);
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let s = server.clone();
+        let t = token.clone();
+        handles.push(tokio::spawn(async move {
+            s.execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(t)).await
+        }));
+    }
+
+    let mut pending = 0;
+    let mut denied = 0;
+    for h in handles {
+        match h.await.unwrap() {
+            Ok(ExecutionOutcome::Pending(_)) => pending += 1,
+            Err(_) => denied += 1,
+            Ok(other) => panic!("unexpected outcome: {:?}", other),
+        }
+    }
+    assert_eq!(pending, 1, "exactly one pending approval may open for a single-use token");
+    assert_eq!(denied, 7);
+
+    // Storage agrees: precisely one pending approval is bound to the token.
+    let n = storage
+        .list_approvals()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.use_token_id.as_deref() == Some(token.id.as_str()))
+        .count();
+    assert_eq!(n, 1);
+}
+
+/// Regression for the resume-path policy re-eval: a human-approved action whose
+/// credential is also under a tight rate-limit policy must STILL execute. The
+/// request already consumed its rate-limit slot when it opened the approval, so
+/// the deferred (read-only) re-evaluation must not re-charge or re-fail it.
+#[tokio::test]
+async fn test_approved_action_executes_despite_rate_limit() {
+    use vultrino::policy::{Policy, PolicyAction, PolicyCondition, PolicyRule};
+
+    // Allow while within a budget of 1 request / hour; deny otherwise.
+    let policy = Policy {
+        id: "rl".to_string(),
+        name: "rate-limit".to_string(),
+        credential_pattern: "*".to_string(),
+        rules: vec![PolicyRule {
+            condition: PolicyCondition::RateLimit { max: 1, window_secs: 3600 },
+            action: PolicyAction::Allow,
+        }],
+        default_action: PolicyAction::Deny,
+    };
+    let (server, storage) = setup_with_policies(vec![policy]).await;
+    store_credential(&storage, "api-cred", false).await;
+
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "rl-token".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: Some(1),
+        require_approval: true,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    // Open the approval. This counts the single rate-limit unit at request time.
+    let approval = match server
+        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected pending, got {:?}", other),
+    };
+
+    // Human approves out of band.
+    let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    stored.approve("test", None).unwrap();
+    storage.update_approval(&stored).await.unwrap();
+
+    // Resume must NOT be denied by the now-exhausted rate budget — it executes.
+    let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    assert!(resumed.executed, "approved action should execute despite the rate limit");
+    assert_eq!(resumed.result_status, Some(200));
+    assert!(resumed.result_error.is_none());
 }
 
 #[tokio::test]

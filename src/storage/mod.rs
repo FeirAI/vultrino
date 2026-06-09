@@ -6,7 +6,7 @@ mod file;
 
 pub use file::FileStorage;
 
-use crate::approval::ApprovalRequest;
+use crate::approval::{ApprovalRequest, ApprovalStatus};
 use crate::auth::{ApiKey, Role, UseToken};
 use crate::{Credential, CredentialMetadata};
 use async_trait::async_trait;
@@ -174,6 +174,48 @@ pub trait StorageBackend: Send + Sync {
         Err(StorageError::Unavailable(
             "approvals not supported by this storage backend".to_string(),
         ))
+    }
+
+    /// Atomically store a new pending approval that *reserves capacity* on a use
+    /// token: it is persisted only if `token.uses + outstanding_pending(token) <
+    /// max_uses`, with the count and the insert performed under the backend's
+    /// lock. Returns [`StorageError::Conflict`] when there is no remaining
+    /// capacity. This closes the check-then-insert TOCTOU that a separate
+    /// `list_approvals` + `store_approval` would leave open across the web/MCP
+    /// process split.
+    ///
+    /// The default implementation is a non-atomic fallback for lock-free
+    /// backends; real backends (e.g. [`FileStorage`]) override it.
+    async fn store_approval_reserving(
+        &self,
+        approval: &ApprovalRequest,
+        token_id: &str,
+        max_uses: u32,
+    ) -> Result<(), StorageError> {
+        let pending = self
+            .list_approvals()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| {
+                a.status == ApprovalStatus::Pending
+                    && !a.is_past_ttl()
+                    && a.use_token_id.as_deref() == Some(token_id)
+            })
+            .count() as u32;
+        let uses = self
+            .get_use_token(token_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.uses)
+            .unwrap_or(0);
+        if uses + pending >= max_uses {
+            return Err(StorageError::Conflict(
+                "use token has no remaining capacity for a new pending approval".to_string(),
+            ));
+        }
+        self.store_approval(approval).await
     }
 
     /// Get an approval request by id.

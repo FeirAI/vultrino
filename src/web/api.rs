@@ -13,8 +13,7 @@ use std::collections::HashMap;
 
 use crate::approval::ApprovalStatus;
 use crate::auth::{AuthResult, Permission, UseToken};
-use crate::router::CredentialResolver;
-use crate::server::{ExecAuth, VultrinoServer};
+use crate::server::ExecAuth;
 use crate::{ExecuteRequest, ExecutionOutcome};
 
 use super::server::AppState;
@@ -188,17 +187,8 @@ pub async fn api_execute(
         }),
     };
 
-    // Create a VultrinoServer to execute the request
-    let resolver = CredentialResolver::new(state.storage.clone());
-    let server = VultrinoServer::new(state.config.clone(), state.storage.clone(), resolver);
-
-    // Load plugins
-    if let Err(e) = server.load_plugins().await {
-        tracing::warn!("Failed to load plugins: {}", e);
-    }
-
-    // Execute, gating on approval when required.
-    match server.execute_gated(execute_request, exec_auth).await {
+    // Execute on the shared server (plugins already loaded), gating on approval.
+    match state.server.execute_gated(execute_request, exec_auth).await {
         Ok(ExecutionOutcome::Completed(response)) => {
             let body_str = String::from_utf8_lossy(&response.body).to_string();
             let headers: HashMap<String, String> = response
@@ -260,15 +250,10 @@ pub async fn api_check_approval(
         Err(resp) => return resp,
     };
 
-    let resolver = CredentialResolver::new(state.storage.clone());
-    let server = VultrinoServer::new(state.config.clone(), state.storage.clone(), resolver);
-    if let Err(e) = server.load_plugins().await {
-        tracing::warn!("Failed to load plugins: {}", e);
-    }
-
     // Ownership is enforced inside check_and_resume_approval BEFORE any
     // execution, so a non-owner can never trigger another principal's action.
-    let approval = match server
+    let approval = match state
+        .server
         .check_and_resume_approval(&id, Some(&principal_id))
         .await
     {

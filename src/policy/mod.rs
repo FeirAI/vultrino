@@ -101,6 +101,32 @@ impl PolicyEngine {
         method: Option<&str>,
         _context: &RequestContext,
     ) -> PolicyDecision {
+        self.evaluate_inner(credential_alias, url, method, true)
+    }
+
+    /// Like [`Self::evaluate`] but with **no side effects**: a `RateLimit`
+    /// condition is treated as already-admitted (within limit) instead of being
+    /// counted. Used by the deferred post-approval path
+    /// ([`crate::server::VultrinoServer::resume_approved`]) to re-enforce hard
+    /// deny gates (url/method/time/explicit deny) at execution time without
+    /// re-charging — or re-failing against — the rate limiter that the original
+    /// request already accounted for.
+    pub fn evaluate_readonly(
+        &self,
+        credential_alias: &str,
+        url: Option<&str>,
+        method: Option<&str>,
+    ) -> PolicyDecision {
+        self.evaluate_inner(credential_alias, url, method, false)
+    }
+
+    fn evaluate_inner(
+        &self,
+        credential_alias: &str,
+        url: Option<&str>,
+        method: Option<&str>,
+        record_rate: bool,
+    ) -> PolicyDecision {
         let policies = self.policies.read();
 
         // Find policies that match this credential
@@ -118,7 +144,7 @@ impl PolicyEngine {
         for policy in matching_policies {
             // Check each rule in order
             for rule in &policy.rules {
-                if self.evaluate_condition(&rule.condition, url, method, credential_alias) {
+                if self.evaluate_condition(&rule.condition, url, method, credential_alias, record_rate) {
                     match rule.action {
                         PolicyAction::Allow => return PolicyDecision::Allow,
                         PolicyAction::Deny => {
@@ -155,6 +181,7 @@ impl PolicyEngine {
         url: Option<&str>,
         method: Option<&str>,
         credential_alias: &str,
+        record_rate: bool,
     ) -> bool {
         match condition {
             PolicyCondition::UrlMatch(pattern) => {
@@ -179,19 +206,29 @@ impl PolicyEngine {
             }
 
             PolicyCondition::RateLimit { max, window_secs } => {
-                self.check_rate_limit(credential_alias, *max, *window_secs)
+                if record_rate {
+                    self.check_rate_limit(credential_alias, *max, *window_secs)
+                } else {
+                    // Deferred (post-approval) evaluation: this request was
+                    // already admitted by the rate limiter when it first opened
+                    // the approval, so its slot is taken. Re-applying the limit
+                    // here would wrongly deny an already-approved action (and a
+                    // small `max` would deny it every time). Treat it as
+                    // within-limit; only hard rules (url/method/time/deny) gate.
+                    true
+                }
             }
 
             PolicyCondition::And(conditions) => conditions
                 .iter()
-                .all(|c| self.evaluate_condition(c, url, method, credential_alias)),
+                .all(|c| self.evaluate_condition(c, url, method, credential_alias, record_rate)),
 
             PolicyCondition::Or(conditions) => conditions
                 .iter()
-                .any(|c| self.evaluate_condition(c, url, method, credential_alias)),
+                .any(|c| self.evaluate_condition(c, url, method, credential_alias, record_rate)),
 
             PolicyCondition::Not(inner) => {
-                !self.evaluate_condition(inner, url, method, credential_alias)
+                !self.evaluate_condition(inner, url, method, credential_alias, record_rate)
             }
 
             PolicyCondition::Always => true,
@@ -385,5 +422,45 @@ mod tests {
         // 4th request should be denied (rate limit exceeded)
         let decision = engine.evaluate("test", Some("https://api.example.com"), Some("GET"), &make_context());
         assert!(matches!(decision, PolicyDecision::Deny(_)));
+    }
+
+    #[test]
+    fn test_evaluate_readonly_does_not_charge_rate_limit() {
+        let engine = PolicyEngine::new();
+        engine.add_policy(Policy {
+            id: "1".to_string(),
+            name: "rate-limit".to_string(),
+            credential_pattern: "*".to_string(),
+            rules: vec![PolicyRule {
+                condition: PolicyCondition::RateLimit {
+                    max: 1,
+                    window_secs: 60,
+                },
+                action: PolicyAction::Allow,
+            }],
+            default_action: PolicyAction::Deny,
+        });
+
+        // Read-only evaluation must neither consume the single unit of budget nor
+        // fail against it — it is the deferred post-approval check, and the
+        // request that opened the approval already holds the slot.
+        for _ in 0..5 {
+            assert_eq!(
+                engine.evaluate_readonly("test", Some("https://api.example.com"), Some("GET")),
+                PolicyDecision::Allow
+            );
+        }
+
+        // The one *real* request still goes through (budget was untouched)...
+        assert_eq!(
+            engine.evaluate("test", Some("https://api.example.com"), Some("GET"), &make_context()),
+            PolicyDecision::Allow
+        );
+        // ...and a read-only check after the budget is spent still passes,
+        // because the deferred path never re-applies the rate limit.
+        assert_eq!(
+            engine.evaluate_readonly("test", Some("https://api.example.com"), Some("GET")),
+            PolicyDecision::Allow
+        );
     }
 }

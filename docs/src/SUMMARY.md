@@ -27,6 +27,8 @@
 
 - [Managing Credentials](./guides/credentials.md)
 - [Roles & API Keys (RBAC)](./guides/rbac.md)
+- [Use Tokens](./guides/use-tokens.md)
+- [Action Approvals](./guides/action-approvals.md)
 - [Using with AI Agents](./guides/ai-agents.md)
 - [Policy Configuration](./guides/policies.md)
 

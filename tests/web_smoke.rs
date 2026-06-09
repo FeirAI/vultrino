@@ -28,6 +28,12 @@ async fn build_router() -> (axum::Router, Arc<dyn StorageBackend>) {
         Arc::new(FileStorage::new(&path, &password).await.unwrap());
 
     let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
     let server = WebServer::new(
         WebConfig {
             bind: "127.0.0.1:0".to_string(),
@@ -37,6 +43,7 @@ async fn build_router() -> (axum::Router, Arc<dyn StorageBackend>) {
         storage.clone(),
         AuthManager::new(),
         admin,
+        exec_server,
     );
     (server.into_router(), storage)
 }

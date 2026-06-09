@@ -56,9 +56,12 @@ vultrino --key vk_your_api_key request <alias> https://target-api.com/endpoint
 |------|---------|---------------------|
 | `list_credentials` | List available credentials | read |
 | `http_request` | Make authenticated request | execute |
+| `check_approval` | Retrieve the result of an action that required human approval | execute |
 | `get_credential_info` | Get credential metadata | read |
 
-**Important:** Every tool call requires an `api_key` parameter for authentication.
+**Important:** Every tool call requires an `api_key` parameter for authentication. This value may be a regular API key (`vk_…`) or a **use token** (`vut_…`) — a single-use or time-scoped grant restricted to one credential/action.
+
+**Approval gating:** If a request requires human approval, `http_request` returns an "APPROVAL REQUIRED" message with an `approval_id` and the action does **not** run. Poll `check_approval` with that id (re-sending your `api_key`) every ~10–30 seconds; once a human approves, it returns the real result. A denied/expired approval tells you to stop — do not retry.
 
 ### Common Credential Aliases
 

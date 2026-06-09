@@ -8,6 +8,9 @@ Vultrino exposes tools through MCP that allow AI agents to:
 - List available credentials
 - Make authenticated HTTP requests
 - Manage credentials (with appropriate permissions)
+- Poll for human approval of gated actions (`check_approval`)
+
+> **Authentication.** Every tool takes an `api_key` argument. It accepts a regular API key (`vk_…`) **or** a [use token](../guides/use-tokens.md) (`vut_…`). A use token additionally constrains which credential and action the call may use, and how many times. The `api_key` argument is consumed by Vultrino and is **never** forwarded to the target API or plugin.
 
 ## Tool Definitions
 
@@ -143,6 +146,57 @@ User: "Get my GitHub profile"
 Agent: [calls http_request with credential=github-api, url=https://api.github.com/user]
 Agent: "Your GitHub profile shows you're logged in as 'username' with 42 public repos"
 ```
+
+**Approval-gated response:**
+
+If the credential, use token, or a policy requires human approval, `http_request` returns an **"APPROVAL REQUIRED"** message with an `approval_id` instead of a result — the action has **not** run. The agent should then poll `check_approval` (below) with that id.
+
+---
+
+### check_approval
+
+Poll a previously-gated action. Once a human approves it, this tool **runs the action and returns the real result**. Until then it reports the current status and tells the agent to keep polling. An agent may only check approvals it originally requested (same `api_key`/use token).
+
+**Schema:**
+```json
+{
+  "name": "check_approval",
+  "description": "Check the status of an action that required human approval, and retrieve its result once approved.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "api_key": { "type": "string", "description": "API key or use token (same one that made the original request)" },
+      "approval_id": { "type": "string", "description": "The approval id returned by the gated tool call" }
+    },
+    "required": ["api_key", "approval_id"]
+  }
+}
+```
+
+**Output (still pending):**
+```json
+{
+  "approval_id": "appr_xxxxxxxx",
+  "status": "Pending",
+  "executed": false,
+  "message": "Awaiting human approval. The action has NOT run. Poll again every ~10-30 seconds."
+}
+```
+
+**Output (approved and executed):**
+```json
+{
+  "approval_id": "appr_xxxxxxxx",
+  "status": "Approved",
+  "executed": true,
+  "message": "Approved and executed.",
+  "result": { "status": 200, "body": "..." }
+}
+```
+
+A `Denied` or `Expired` status returns a `message` instructing the agent to stop and not retry. The action runs **at most once** no matter how many times it is polled.
+
+**Required Permission:** `execute` (same as the original request)
 
 ---
 
@@ -284,6 +338,7 @@ Remove a credential from storage.
 |------|---------------------|
 | `list_credentials` | `read` |
 | `http_request` | `execute` |
+| `check_approval` | `execute` |
 | `add_credential` | `write` |
 | `delete_credential` | `delete` |
 

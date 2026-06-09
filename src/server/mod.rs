@@ -360,7 +360,33 @@ impl VultrinoServer {
                 use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
                 ttl: self.approval_config.ttl(),
             });
-            self.storage.store_approval(&approval).await?;
+
+            // Bound the number of *pending* approvals a use token can open: each
+            // open reserves a future use, so outstanding pending approvals plus
+            // already-consumed uses must not exceed max_uses — otherwise a
+            // single-use token could spawn an unbounded approval/notifier flood
+            // (only execution is fail-closed otherwise). The count-and-insert is
+            // atomic under the storage lock, so two concurrent opens (web + MCP)
+            // can't both pass a stale count.
+            let reservation = exec_auth
+                .use_token
+                .as_ref()
+                .and_then(|t| t.max_uses.map(|max| (t.id.clone(), max)));
+            match reservation {
+                Some((token_id, max)) => {
+                    self.storage
+                        .store_approval_reserving(&approval, &token_id, max)
+                        .await
+                        .map_err(|e| match e {
+                            crate::storage::StorageError::Conflict(_) => VultrinoError::PolicyDenied(
+                                "This use token has no remaining capacity for a new pending approval"
+                                    .to_string(),
+                            ),
+                            other => other.into(),
+                        })?;
+                }
+                None => self.storage.store_approval(&approval).await?,
+            }
             self.dispatch_notifications(&approval, &decision_token).await;
 
             info!(
@@ -503,6 +529,23 @@ impl VultrinoServer {
         let (plugin_name, action_name) =
             parse_action(&approval.action).map_err(RunError::terminal)?;
         let context = RequestContext::new();
+
+        // Re-evaluate policy at execution time so the deferred path still
+        // enforces hard *deny* gates — a human approval is not a policy bypass.
+        // This is the READ-ONLY evaluation: rate limits were already counted when
+        // the request first opened the approval, so re-counting here would
+        // double-charge and could spuriously deny an already-approved action. A
+        // `Prompt` is already satisfied (the human approved), so only `Deny`
+        // blocks; the use token is left unconsumed when it does.
+        let url = approval.params.get("url").and_then(|v| v.as_str());
+        let method = approval.params.get("method").and_then(|v| v.as_str());
+        if let crate::policy::PolicyDecision::Deny(reason) =
+            self.policy_engine
+                .evaluate_readonly(&credential.alias, url, method)
+        {
+            return Err(RunError::terminal(VultrinoError::PolicyDenied(reason)));
+        }
+
         self.run_action(
             credential,
             plugin_name,
