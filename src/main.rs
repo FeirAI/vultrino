@@ -1365,14 +1365,14 @@ path = "~/.local/share/vultrino/credentials.enc"
 level = "info"
 # audit_file = "~/.local/share/vultrino/audit.log"
 
-# Policy enforcement default. With "deny" (recommended for shared / server /
-# govder deployments) a credential that matches NO policy is denied — the
-# secure, fail-closed posture. This generated config starts with "allow" so a
-# single-user local setup works immediately; before exposing vultrino to
-# untrusted agents, switch to "deny" and add explicit allow policies below.
-# NOTE: if this whole section is removed, the built-in default is "deny".
+# Policy enforcement default. "deny" (the secure, fail-closed default) means a
+# credential matching NO policy is denied — add allow policies (see the
+# commented [[policies]] examples below, or push them via the admin API) to
+# grant access. Set "allow" only for quick local use where every credential
+# should be usable without any policy (fail-open). If this whole section is
+# removed, the built-in default is still "deny".
 [enforcement]
-default_action = "allow"
+default_action = "deny"
 
 [mcp]
 enabled = true
@@ -1413,6 +1413,13 @@ transport = "stdio"
     tokio::fs::write(&config_path, default_config).await?;
 
     println!("Configuration initialized at {}", config_path.display());
+    println!(
+        "\nNOTE: enforcement is default-deny — credentials are DENIED until you add an allow\n      \
+         policy (see the commented [[policies]] examples in the config, or push policies via\n      \
+         the admin API). For quick local use without policies, set\n      \
+         [enforcement] default_action = \"allow\" in {}.",
+        config_path.display()
+    );
 
     // Setup admin credentials for web UI
     println!("\n--- Web UI Admin Setup ---");

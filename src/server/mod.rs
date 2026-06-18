@@ -161,22 +161,9 @@ impl VultrinoServer {
         // since either is almost always a misconfiguration that would otherwise
         // be discovered only via behavior (a flood of denials, or — worse —
         // silent fail-open).
-        if config.policies.is_empty() {
-            if default_deny {
-                warn!(
-                    "enforcement default_action is 'deny' but no policies are configured — \
-                     ALL credential use will be denied until an allow policy is added (via config \
-                     or the admin API). Set `[enforcement] default_action = \"allow\"` to opt into \
-                     the legacy fail-open behavior."
-                );
-            } else {
-                warn!(
-                    "enforcement default_action is 'allow' and no policies are configured — \
-                     FAIL-OPEN: every credential is usable by any principal with execute access, \
-                     with no per-credential restriction. Add allow/deny policies, or set \
-                     `[enforcement] default_action = \"deny\"` for the secure default."
-                );
-            }
+        if let Some(msg) = zero_policy_enforcement_warning(default_deny, !config.policies.is_empty())
+        {
+            warn!("{}", msg);
         }
 
         // By default, don't require auth in local mode
@@ -562,6 +549,12 @@ impl VultrinoServer {
 
         // Re-evaluate policy at execution time so the deferred path still
         // enforces hard *deny* gates — a human approval is not a policy bypass.
+        // NOTE (default-deny interaction): if the policy that originally matched
+        // this credential (yielding the `Prompt`) is removed between approval and
+        // resume, the credential is now un-policied and a fail-closed engine
+        // denies the resume with a `no_policy` reason. That is intentional: a
+        // policy revoked mid-flight should stop the pending action, not let an
+        // already-approved request slip through un-governed.
         // This is the READ-ONLY evaluation: rate limits were already counted when
         // the request first opened the approval, so re-counting here would
         // double-charge and could spuriously deny an already-approved action. A
@@ -777,6 +770,26 @@ fn cap_result_body(body: &[u8]) -> String {
     format!("{}\n…[truncated {} bytes]", &text[..end], text.len() - end)
 }
 
+/// The startup warning (if any) for a given enforcement posture and whether any
+/// policies are configured. Extracted as a pure function so the decision is
+/// unit-testable without capturing log output. Both zero-policy postures are
+/// dangerous misconfigurations worth surfacing loudly.
+fn zero_policy_enforcement_warning(default_deny: bool, has_policies: bool) -> Option<&'static str> {
+    if has_policies {
+        return None;
+    }
+    Some(if default_deny {
+        "enforcement default_action is 'deny' but no policies are configured — ALL credential \
+         use will be denied until an allow policy is added (via config or the admin API). Set \
+         `[enforcement] default_action = \"allow\"` to opt into the legacy fail-open behavior."
+    } else {
+        "enforcement default_action is 'allow' and no policies are configured — FAIL-OPEN: every \
+         credential is usable by any principal with execute access, with no per-credential \
+         restriction. Add allow/deny policies, or set `[enforcement] default_action = \"deny\"` \
+         for the secure default."
+    })
+}
+
 /// Parse action string into plugin name and action name
 /// Format: "plugin.action" or just "action" (defaults to http plugin)
 fn parse_action(action: &str) -> Result<(&str, &str), VultrinoError> {
@@ -806,5 +819,20 @@ mod tests {
         let (plugin, action) = parse_action("request").unwrap();
         assert_eq!(plugin, "http");
         assert_eq!(action, "request");
+    }
+
+    #[test]
+    fn test_zero_policy_enforcement_warning() {
+        // Deny + no policies → "everything denied" warning.
+        assert!(zero_policy_enforcement_warning(true, false)
+            .unwrap()
+            .contains("will be denied"));
+        // Allow + no policies → fail-open warning.
+        assert!(zero_policy_enforcement_warning(false, false)
+            .unwrap()
+            .contains("FAIL-OPEN"));
+        // With policies configured, no warning regardless of posture.
+        assert!(zero_policy_enforcement_warning(true, true).is_none());
+        assert!(zero_policy_enforcement_warning(false, true).is_none());
     }
 }

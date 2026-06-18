@@ -104,11 +104,27 @@ With `deny` (the default, and the recommended posture for shared/server
 deployments), an un-policied credential is denied with a distinct `no_policy`
 reason — closing the historical fail-open gap. Use `allow` for the legacy
 behavior where an un-policied credential is permitted. If the section is omitted
-the built-in default is `deny`; the config produced by `vultrino init` ships
-with `allow` so a fresh single-user setup works before any policies are written.
+the built-in default is `deny`. The config produced by `vultrino init` also
+ships with `deny` and prints a reminder that you must add an allow policy (or
+switch to `allow`) before credentials will work.
 
 > When `default_action = "deny"` and no policies are configured, **every**
-> credential is denied. Vultrino logs a loud warning at startup in this case.
+> credential is denied. Vultrino logs a loud warning at startup in this case
+> (and the symmetric `allow` + no-policies fail-open case is warned about too).
+
+#### Upgrading (breaking change)
+
+Before this change the engine was fail-**open**: a credential matching no policy
+was allowed. It is now fail-**closed** by default. A config that has **no**
+`[enforcement]` section will start denying un-policied credentials after upgrade.
+To preserve the pre-upgrade behavior, add:
+
+```toml
+[enforcement]
+default_action = "allow"
+```
+
+Otherwise, add allow policies for the credentials your agents legitimately use.
 
 ## Environment Variables
 
