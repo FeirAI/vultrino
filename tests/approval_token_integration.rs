@@ -2307,3 +2307,38 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
     assert!(polled.executed, "executes once both approvers signed off");
     assert_eq!(polled.result_status, Some(200));
 }
+
+#[tokio::test]
+async fn test_v12_dual_control_forces_gating_on_allow_path() {
+    // V12 (critical): a dual-control token must be gated through M-of-N approval
+    // EVEN when the policy allows the action and the credential does NOT require
+    // approval — dual control is not bypassable on the Allow path.
+    let (server, storage) = setup().await; // allow mode
+    store_credential(&storage, "pay-cred", false).await; // NOT require_approval
+
+    let (_full, mut token) = UseToken::create(NewUseToken {
+        name: "high-risk".to_string(),
+        credential_scope: "pay-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: false, // token doesn't request approval either
+        expires_in: None,
+    });
+    token.dual_control = true;
+    storage.store_use_token(&token).await.unwrap();
+
+    let auth = ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+    // Despite Allow + no require_approval, dual_control gates it.
+    let outcome = server.execute_gated(echo_request("pay-cred"), auth).await.unwrap();
+    let approval = match outcome {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("dual_control must gate even on Allow, got {other:?}"),
+    };
+    assert_eq!(approval.required_approvals, 2);
+    assert!(approval.status.is_open());
+}

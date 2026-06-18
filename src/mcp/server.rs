@@ -851,19 +851,33 @@ impl McpServer {
             .map_err(|e| e.to_string())?;
         drop(vultrino);
 
+        // V12: surface dual-control (M-of-N) progress so an MCP agent knows it's
+        // awaiting additional distinct approvers, not stalled.
+        let dual_control_note = if approval.effective_required_approvals() > 1 {
+            format!(
+                " Dual control: {} of {} distinct approvals so far ({} more needed).",
+                approval.signoffs.len(),
+                approval.effective_required_approvals(),
+                approval.approvals_remaining(),
+            )
+        } else {
+            String::new()
+        };
         let text = match approval.status {
             ApprovalStatus::Pending => format!(
-                "\u{23F3} Approval {} is still PENDING. A human has not decided yet. Wait about \
+                "\u{23F3} Approval {} is still PENDING. A human has not decided yet.{} Wait about \
                  10-30 seconds, then call `check_approval` again with the same approval_id.\nExpires: {}",
                 approval.id,
+                dual_control_note,
                 approval.expires_at.format("%Y-%m-%d %H:%M UTC"),
             ),
             // V5: escalated is still awaiting a decision — same agent contract.
             ApprovalStatus::Escalated => format!(
                 "\u{23F3} Approval {} is still PENDING (ESCALATED to a second reviewer window). \
-                 A human has not decided yet. Wait about 10-30 seconds, then call `check_approval` \
+                 A human has not decided yet.{} Wait about 10-30 seconds, then call `check_approval` \
                  again with the same approval_id.\nExpires: {}",
                 approval.id,
+                dual_control_note,
                 approval.expires_at.format("%Y-%m-%d %H:%M UTC"),
             ),
             ApprovalStatus::Denied => format!(

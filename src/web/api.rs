@@ -290,9 +290,11 @@ pub async fn api_check_approval(
         "executed": approval.executed,
     });
     // V12: surface dual-control (M-of-N) progress so the agent knows it's awaiting
-    // additional distinct approvers, not stalled.
-    if approval.required_approvals > 1 {
-        body["required_approvals"] = serde_json::json!(approval.required_approvals);
+    // additional distinct approvers, not stalled — only while still open (a denied
+    // or expired request isn't "awaiting" anyone).
+    let required = approval.effective_required_approvals();
+    if required > 1 && approval.status.is_open() {
+        body["required_approvals"] = serde_json::json!(required);
         body["approvals_received"] = serde_json::json!(approval.signoffs.len());
         body["approvals_remaining"] = serde_json::json!(approval.approvals_remaining());
     }
@@ -987,7 +989,7 @@ pub async fn api_metrics(_admin: AdminApiAuth, State(state): State<AppState>) ->
                 latencies_secs.push((decided - a.created_at).num_seconds().max(0));
             }
         }
-        if a.required_approvals > 1 && a.status.is_open() {
+        if a.effective_required_approvals() > 1 && a.status.is_open() {
             dual_control_awaiting += 1;
         }
     }

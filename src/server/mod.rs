@@ -399,7 +399,11 @@ impl VultrinoServer {
             spend: spend.as_ref(),
         });
 
-        let mut needs_approval = exec_auth.force_approval;
+        // V12: a dual-control token forces the action through the approval flow
+        // (M-of-N), even when policy would Allow it and the credential doesn't
+        // require approval — dual control must not be bypassable on the Allow path.
+        let dual_control = exec_auth.use_token.as_ref().map(|t| t.dual_control).unwrap_or(false);
+        let mut needs_approval = exec_auth.force_approval || dual_control;
         match decision {
             crate::policy::PolicyDecision::Allow => {}
             crate::policy::PolicyDecision::Deny(reason) => {
@@ -437,7 +441,6 @@ impl VultrinoServer {
                 .approval_config
                 .criticality_for(&credential.alias, &full_action);
             let sla = self.approval_config.sla_for(criticality);
-            let dual_control = exec_auth.use_token.as_ref().map(|t| t.dual_control).unwrap_or(false);
             let (approval, decision_token) = ApprovalRequest::open(NewApproval {
                 credential: credential.alias.clone(),
                 action: full_action.clone(),

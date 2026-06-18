@@ -97,7 +97,7 @@ dual_control_approvers = 2   # distinct approvers a dual-control request needs (
 
 ## Metrics read-back (V12)
 
-`GET /api/v1/metrics` (admin) returns a structured point-in-time read-back: `unauthorized_attempts` (tool-call attempts blocked by the policy engine), approval counts by state (`approvals.by_status`, plus `dual_control_awaiting`), and approval-decision latency percentiles (`approval_latency_secs.{count,avg,p50,p95,max}`). The durable event history is the signed [event outbox](../getting-started/configuration.md#event-outbox-v9).
+`GET /api/v1/metrics` (admin) returns a structured point-in-time read-back: `unauthorized_attempts` (tool-call attempts blocked by the policy engine — a **per-process** in-memory counter, like the rate-limit/spend ledgers, that resets on restart and counts only this process's denials), approval counts by state (`approvals.by_status`, plus `dual_control_awaiting`), and approval-decision latency percentiles (`approval_latency_secs.{count,avg,p50,p95,max}`). The durable, cross-process event history is the signed [event outbox](../getting-started/configuration.md#event-outbox-v9).
 
 ## Out-of-band decision links
 

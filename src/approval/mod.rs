@@ -489,7 +489,11 @@ impl ApprovalRequest {
             self.decided_at = Some(now);
             self.decided_by = Some(decision.channel);
             self.approver_identity = Some(identity);
-            self.sod_violation = self.sod_violation.or(sod);
+            // Sticky-true, consistent with the approval path.
+            self.sod_violation = match (self.sod_violation, sod) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (a, b) => a.or(b),
+            };
             self.decision_note = decision.note;
             return Ok(());
         }
@@ -521,8 +525,9 @@ impl ApprovalRequest {
             (Some(true), _) | (_, Some(true)) => Some(true),
             (a, b) => a.or(b),
         };
-        // Threshold met → grant; otherwise stay open awaiting more distinct approvers.
-        if self.signoffs.len() as u32 >= self.required_approvals {
+        // Threshold met → grant; otherwise stay open awaiting more distinct
+        // approvers. Use the authoritative threshold (dual_control forces >= 2).
+        if self.signoffs.len() as u32 >= self.effective_required_approvals() {
             self.status = ApprovalStatus::Approved;
             self.decided_at = Some(now);
             self.decided_by = Some(decision.channel);
@@ -531,10 +536,24 @@ impl ApprovalRequest {
         Ok(())
     }
 
+    /// The authoritative number of distinct approvers this request needs (V12).
+    /// `dual_control` is the source of truth: it forces at least 2 even if
+    /// `required_approvals` is stale (e.g. a pre-V12 record that serialized
+    /// `dual_control: true` before `required_approvals` existed and so defaults to
+    /// 1 — it must NOT be runnable on a single approval after upgrade).
+    pub fn effective_required_approvals(&self) -> u32 {
+        if self.dual_control {
+            self.required_approvals.max(2)
+        } else {
+            self.required_approvals.max(1)
+        }
+    }
+
     /// How many more distinct approvals this request needs before it is granted
     /// (V12). 0 once the threshold is met.
     pub fn approvals_remaining(&self) -> u32 {
-        self.required_approvals.saturating_sub(self.signoffs.len() as u32)
+        self.effective_required_approvals()
+            .saturating_sub(self.signoffs.len() as u32)
     }
 
     /// Separation-of-duty check (V5): whether the (final) approver collides with
@@ -1129,6 +1148,29 @@ mod tests {
         assert_eq!(a.status, ApprovalStatus::Approved);
         assert_eq!(a.signoffs.len(), 2);
         assert_eq!(a.approvals_remaining(), 0);
+    }
+
+    #[test]
+    fn test_pre_v12_dual_control_record_still_requires_two() {
+        // Upgrade path: a pre-V12 record serialized `dual_control: true` before
+        // `required_approvals` existed, so it deserializes with the field defaulting
+        // to 1. It must NOT be runnable on a single approval — dual_control is the
+        // authoritative source of the threshold.
+        let (mut a, _) = new_approval();
+        a.dual_control = true;
+        a.required_approvals = 2;
+        let mut v = serde_json::to_value(&a).unwrap();
+        v.as_object_mut().unwrap().remove("required_approvals"); // pre-V12: absent
+        let restored: ApprovalRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(restored.required_approvals, 1, "serde default for the absent field");
+        assert_eq!(restored.effective_required_approvals(), 2, "dual_control forces >= 2");
+
+        // A single approval does NOT grant it.
+        let mut r = restored;
+        r.approve(Decision::new("admin panel", "alice")).unwrap();
+        assert_eq!(r.status, ApprovalStatus::Pending, "single approval must not grant dual control");
+        r.approve(Decision::new("admin panel", "bob")).unwrap();
+        assert_eq!(r.status, ApprovalStatus::Approved);
     }
 
     #[test]
