@@ -1,7 +1,7 @@
 //! Raw configuration types for TOML parsing
 
 use super::*;
-use crate::policy::{Policy, PolicyAction, PolicyCondition, PolicyRule};
+use crate::policy::{Policy, PolicyAction, PolicyCondition, PolicyRule, SpendExtractor};
 use serde::Deserialize;
 
 /// Raw configuration as parsed from TOML
@@ -15,6 +15,34 @@ pub struct RawConfig {
     pub policies: Vec<RawPolicy>,
     pub approvals: Option<RawApprovalConfig>,
     pub enforcement: Option<RawEnforcementConfig>,
+    /// Amount-extraction rules for SpendCap policies (V3).
+    #[serde(default)]
+    pub spend_extractors: Vec<RawSpendExtractor>,
+}
+
+/// Raw amount-extraction rule (V3). Reads an amount (minor units, integer) from
+/// a JSON pointer into the request params, plus an asset (literal or pointer).
+#[derive(Debug, Deserialize)]
+pub struct RawSpendExtractor {
+    pub action_pattern: String,
+    pub credential_pattern: String,
+    pub amount_pointer: String,
+    #[serde(default)]
+    pub asset: Option<String>,
+    #[serde(default)]
+    pub asset_pointer: Option<String>,
+}
+
+impl From<RawSpendExtractor> for SpendExtractor {
+    fn from(raw: RawSpendExtractor) -> Self {
+        Self {
+            action_pattern: raw.action_pattern,
+            credential_pattern: raw.credential_pattern,
+            amount_pointer: raw.amount_pointer,
+            asset: raw.asset,
+            asset_pointer: raw.asset_pointer,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -237,6 +265,9 @@ impl From<RawApprovalConfig> for crate::approval::ApprovalConfig {
 pub struct RawPolicy {
     pub name: String,
     pub credential_pattern: String,
+    /// Optional glob over the presenting principal (V4).
+    #[serde(default)]
+    pub principal_pattern: Option<String>,
     #[serde(default)]
     pub rules: Vec<RawPolicyRule>,
     pub default_action: Option<String>,
@@ -268,6 +299,7 @@ impl TryFrom<RawPolicy> for Policy {
             id: uuid::Uuid::new_v4().to_string(),
             name: raw.name,
             credential_pattern: raw.credential_pattern,
+            principal_pattern: raw.principal_pattern,
             rules,
             default_action,
         })
@@ -313,6 +345,9 @@ pub enum RawPolicyCondition {
     RateLimit {
         rate_limit: RawRateLimit,
     },
+    SpendCap {
+        spend_cap: RawSpendCap,
+    },
     And {
         and: Vec<RawPolicyCondition>,
     },
@@ -324,6 +359,16 @@ pub enum RawPolicyCondition {
 #[derive(Debug, Deserialize)]
 pub struct RawRateLimit {
     pub max: u32,
+    pub window_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawSpendCap {
+    pub asset: String,
+    #[serde(default)]
+    pub per_action_max: Option<u64>,
+    #[serde(default)]
+    pub cumulative_max: Option<u64>,
     pub window_secs: u64,
 }
 
@@ -339,6 +384,12 @@ impl TryFrom<RawPolicyCondition> for PolicyCondition {
             RawPolicyCondition::RateLimit { rate_limit } => Ok(PolicyCondition::RateLimit {
                 max: rate_limit.max,
                 window_secs: rate_limit.window_secs,
+            }),
+            RawPolicyCondition::SpendCap { spend_cap } => Ok(PolicyCondition::SpendCap {
+                asset: spend_cap.asset,
+                per_action_max: spend_cap.per_action_max,
+                cumulative_max: spend_cap.cumulative_max,
+                window_secs: spend_cap.window_secs,
             }),
             RawPolicyCondition::And { and } => {
                 let conditions = and

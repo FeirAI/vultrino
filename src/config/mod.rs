@@ -45,6 +45,8 @@ pub struct Config {
     pub approval: crate::approval::ApprovalConfig,
     /// Engine-level enforcement defaults (V2: default-deny mode).
     pub enforcement: EnforcementConfig,
+    /// Amount-extraction rules for SpendCap policies (V3).
+    pub spend_extractors: Vec<crate::policy::SpendExtractor>,
 }
 
 /// Engine-level enforcement configuration.
@@ -112,6 +114,11 @@ impl Config {
             .map(EnforcementConfig::try_from)
             .transpose()?
             .unwrap_or_default();
+        let spend_extractors = raw
+            .spend_extractors
+            .into_iter()
+            .map(Into::into)
+            .collect();
 
         let policies = raw
             .policies
@@ -127,6 +134,7 @@ impl Config {
             mcp,
             approval,
             enforcement,
+            spend_extractors,
         })
     }
 
@@ -140,6 +148,7 @@ impl Config {
             mcp: McpConfig::default(),
             approval: crate::approval::ApprovalConfig::default(),
             enforcement: EnforcementConfig::default(),
+            spend_extractors: vec![],
         }
     }
 

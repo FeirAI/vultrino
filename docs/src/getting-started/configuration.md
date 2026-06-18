@@ -126,6 +126,26 @@ default_action = "allow"
 
 Otherwise, add allow policies for the credentials your agents legitimately use.
 
+### Spend Extractors
+
+For `SpendCap` policies (V3), Vultrino needs to know where the amount lives in
+the request body. Each extractor matches an action + credential and reads the
+amount (an integer in minor units, e.g. cents) from a JSON pointer, plus an
+asset (literal or a second pointer).
+
+```toml
+[[spend_extractors]]
+action_pattern = "http.request"     # glob over plugin.action
+credential_pattern = "stripe-*"     # glob over credential alias
+amount_pointer = "/body/amount"     # JSON pointer to the integer amount
+asset = "usd"                        # literal asset...
+# asset_pointer = "/body/currency"  # ...or read it from the body
+```
+
+If a `SpendCap` policy applies to a credential but no extractor yields an amount
+(missing extractor or unparseable body), the request is **denied** (fail-closed)
+and a `spend_unparseable` warning is logged.
+
 ## Environment Variables
 
 | Variable | Description |

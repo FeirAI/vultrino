@@ -258,6 +258,7 @@ impl AuthManager {
             expires_at,
             created_at: Utc::now(),
             last_used_at: None,
+            agent_label: None,
         };
 
         self.add_key_internal(api_key.clone());

@@ -52,8 +52,27 @@ action = "allow"
 |-------|------|-------------|
 | `name` | string | Unique policy name |
 | `credential_pattern` | string | Glob pattern for credentials this policy applies to |
+| `principal_pattern` | string (optional) | Glob over the presenting principal (key/token id or its `agent_label`). When set, the policy applies **only** to matching principals (V4). |
 | `default_action` | string | Action when no rules match: `allow`, `deny` |
 | `rules` | array | List of policy rules |
+
+### Per-agent policies (`principal_pattern`)
+
+A policy with `principal_pattern` applies only to requests from a matching
+principal — the presenting key/token id, or an `agent_label` bound to the token
+(via the admin API). This makes a **per-agent kill** expressible: push a Deny
+scoped to one agent without affecting other agents sharing the same credential.
+
+```toml
+[[policies]]
+name = "kill-refund-bot"
+credential_pattern = "payments-*"
+principal_pattern = "refund-bot"   # only this agent
+default_action = "deny"
+```
+
+A request that carries **no** principal never matches a policy that sets
+`principal_pattern`.
 
 ### Rule Definition
 
@@ -123,6 +142,23 @@ condition = { rate_limit = { max = 1000, window_secs = 3600 } }
 # 10 requests per second (burst protection)
 condition = { rate_limit = { max = 10, window_secs = 1 } }
 ```
+
+### Spend Cap
+
+Cap the value an agent can spend, in **minor units** (e.g. cents), per call and
+cumulatively over a rolling window (V3). The amount is read from the request
+body by a [spend extractor](../getting-started/configuration.md#enforcement-section);
+a missing/unparseable amount fails **closed** (deny).
+
+```toml
+# Refunds: at most $50.00 per call and $500.00 per hour, in USD.
+condition = { spend_cap = { asset = "usd", per_action_max = 5000, cumulative_max = 50000, window_secs = 3600 } }
+```
+
+Use it as the condition of an `allow` rule (with `default_action = "deny"`): the
+call is allowed only while within the caps. The cumulative ledger is keyed by
+the presenting principal (or the credential, if unauthenticated) and is in-memory
+per process (it resets on restart — like the rate limiter).
 
 ### Combined Conditions
 

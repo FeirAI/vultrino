@@ -329,13 +329,30 @@ impl VultrinoServer {
             }
         }
 
-        // Evaluate policy (URL / method / rate limits). A `Prompt` decision
-        // routes into the approval flow rather than failing.
+        // Evaluate policy (URL / method / rate limits / principal / spend). A
+        // `Prompt` decision routes into the approval flow rather than failing.
         let url = request.params.get("url").and_then(|v| v.as_str());
         let method = request.params.get("method").and_then(|v| v.as_str());
-        let decision = self
-            .policy_engine
-            .evaluate(&credential.alias, url, method, &context);
+        // V4: the resolved principal (key/token id + agent label) for
+        // principal_pattern matching.
+        let principal = exec_auth.auth.as_ref().map(|a| crate::policy::Principal {
+            id: a.api_key.id.clone(),
+            agent_label: a.api_key.agent_label.clone(),
+        });
+        // V3: the extracted spend attempt (amount + asset) for SpendCap.
+        let spend = crate::policy::extract_spend(
+            &self.config.spend_extractors,
+            &full_action,
+            &credential.alias,
+            &request.params,
+        );
+        let decision = self.policy_engine.evaluate_full(&crate::policy::EvalInput {
+            credential_alias: &credential.alias,
+            url,
+            method,
+            principal: principal.as_ref(),
+            spend: spend.as_ref(),
+        });
 
         let mut needs_approval = exec_auth.force_approval;
         match decision {
@@ -375,6 +392,7 @@ impl VultrinoServer {
                 params: request.params.clone(),
                 requester: exec_auth.requester.clone(),
                 use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
+                agent_label: principal.as_ref().and_then(|p| p.agent_label.clone()),
                 ttl: self.approval_config.ttl(),
             });
 
@@ -565,9 +583,26 @@ impl VultrinoServer {
         // blocks; the use token is left unconsumed when it does.
         let url = approval.params.get("url").and_then(|v| v.as_str());
         let method = approval.params.get("method").and_then(|v| v.as_str());
+        // Rebuild the principal (V4) and spend (V3) from the recorded approval so
+        // per-agent denies and spend caps are re-evaluated at resume. Spend is
+        // checked read-only here (it was charged when the approval was opened).
+        let principal = approval.requester.principal_id.as_ref().map(|id| {
+            crate::policy::Principal { id: id.clone(), agent_label: approval.agent_label.clone() }
+        });
+        let spend = crate::policy::extract_spend(
+            &self.config.spend_extractors,
+            &approval.action,
+            &credential.alias,
+            &approval.params,
+        );
         if let crate::policy::PolicyDecision::Deny(reason) =
-            self.policy_engine
-                .evaluate_readonly(&credential.alias, url, method)
+            self.policy_engine.evaluate_readonly_full(&crate::policy::EvalInput {
+                credential_alias: &credential.alias,
+                url,
+                method,
+                principal: principal.as_ref(),
+                spend: spend.as_ref(),
+            })
         {
             return Err(RunError::terminal(VultrinoError::PolicyDenied(reason)));
         }

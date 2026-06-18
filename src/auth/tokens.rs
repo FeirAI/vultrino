@@ -70,6 +70,11 @@ pub struct UseToken {
     /// Whether the token has been manually revoked.
     #[serde(default)]
     pub revoked: bool,
+    /// Optional agent identity (V4) the control plane bound this token to, so a
+    /// policy can target one agent (`principal_pattern`) without affecting other
+    /// agents sharing the same credential. Set via the admin API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
 }
 
 /// Why a use token is not currently usable.
@@ -154,6 +159,7 @@ impl UseToken {
             created_at: now,
             last_used_at: None,
             revoked: false,
+            agent_label: None,
         };
 
         (full_token, token)
@@ -231,6 +237,8 @@ pub struct UseTokenMetadata {
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
 }
 
 impl From<&UseToken> for UseTokenMetadata {
@@ -249,6 +257,7 @@ impl From<&UseToken> for UseTokenMetadata {
             created_at: t.created_at,
             last_used_at: t.last_used_at,
             revoked: t.revoked,
+            agent_label: t.agent_label.clone(),
         }
     }
 }

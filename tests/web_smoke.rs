@@ -478,6 +478,7 @@ async fn test_admin_delete_role_in_use_conflict() {
             expires_at: None,
             created_at: chrono::Utc::now(),
             last_used_at: None,
+            agent_label: None,
         })
         .await
         .unwrap();
@@ -569,6 +570,7 @@ async fn test_out_of_band_decide_flow() {
         params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
         requester: RequesterInfo::local(),
         use_token_id: None,
+        agent_label: None,
         ttl: chrono::Duration::hours(1),
     });
     storage.store_approval(&approval).await.unwrap();

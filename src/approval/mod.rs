@@ -110,6 +110,9 @@ pub struct NewApproval {
     pub params: serde_json::Value,
     pub requester: RequesterInfo,
     pub use_token_id: Option<String>,
+    /// Agent label of the requesting principal (V4), for per-agent policy
+    /// re-evaluation at resume.
+    pub agent_label: Option<String>,
     /// Time-to-live; after this the request auto-expires if undecided.
     pub ttl: chrono::Duration,
 }
@@ -134,6 +137,10 @@ pub struct ApprovalRequest {
     /// Use token to consume on execution, if the request was token-authorized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_token_id: Option<String>,
+    /// Agent label of the requesting principal (V4), recorded so a per-agent
+    /// policy is re-evaluated correctly when the approved action resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,6 +189,7 @@ impl ApprovalRequest {
             summary,
             requester: params.requester,
             use_token_id: params.use_token_id,
+            agent_label: params.agent_label,
             created_at: now,
             expires_at: now + params.ttl,
             decided_at: None,
@@ -549,6 +557,7 @@ mod tests {
                 role: Some("executor".to_string()),
             },
             use_token_id: None,
+            agent_label: None,
             ttl: chrono::Duration::hours(1),
         })
     }

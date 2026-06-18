@@ -64,6 +64,9 @@ impl AuthResult {
             expires_at: token.expires_at,
             created_at: token.created_at,
             last_used_at: token.last_used_at,
+            // Carry the token's agent label so the resolved principal can be
+            // matched by a policy's principal_pattern (V4).
+            agent_label: token.agent_label.clone(),
         };
         Self { api_key, role }
     }

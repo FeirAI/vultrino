@@ -613,6 +613,10 @@ where
 pub struct PolicyUpsertRequest {
     pub name: String,
     pub credential_pattern: String,
+    /// Optional principal glob (V4) — e.g. a per-agent Deny (kill-leg W3) is
+    /// `POST /policies` with `principal_pattern` set to the agent label.
+    #[serde(default)]
+    pub principal_pattern: Option<String>,
     #[serde(default)]
     pub rules: Vec<PolicyRule>,
     pub default_action: PolicyAction,
@@ -631,6 +635,7 @@ fn build_policy(req: PolicyUpsertRequest, forced_id: Option<String>) -> Result<P
     // Use the builder so new optional Policy fields get their defaults.
     let mut policy = Policy::deny_all(req.name, req.credential_pattern);
     policy.id = forced_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    policy.principal_pattern = req.principal_pattern;
     policy.default_action = req.default_action;
     policy.rules = req.rules;
     Ok(policy)
@@ -748,6 +753,10 @@ pub struct TokenCreateRequest {
     /// Lifetime in seconds from now (optional).
     #[serde(default)]
     pub expires_in_secs: Option<i64>,
+    /// Optional agent identity to bind this token to (V4), so a policy's
+    /// `principal_pattern` can target this one agent.
+    #[serde(default)]
+    pub agent_label: Option<String>,
 }
 
 /// `POST /api/v1/tokens` — mint a use token; the plaintext is returned once.
@@ -788,7 +797,10 @@ pub async fn api_create_token(
                 serde_json::json!({"code": "invalid_token", "error": e}),
             );
         }
-        let (full_token, token) = UseToken::create(params);
+        let (full_token, mut token) = UseToken::create(params);
+        // Bind the agent identity (V4) post-create; req.agent_label is not moved
+        // into `params` above, so it's still accessible after the partial move.
+        token.agent_label = req.agent_label;
         if let Err(e) = st.storage.store_use_token(&token).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

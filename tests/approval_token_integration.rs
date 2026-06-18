@@ -562,6 +562,7 @@ async fn test_approved_action_executes_despite_rate_limit() {
         id: "rl".to_string(),
         name: "rate-limit".to_string(),
         credential_pattern: "*".to_string(),
+        principal_pattern: None,
         rules: vec![PolicyRule {
             condition: PolicyCondition::RateLimit { max: 1, window_secs: 3600 },
             action: PolicyAction::Allow,
@@ -1058,4 +1059,114 @@ async fn test_default_deny_allows_with_explicit_policy() {
         .await
         .unwrap();
     assert!(matches!(outcome, ExecutionOutcome::Completed(_)));
+}
+
+#[tokio::test]
+async fn test_spend_cap_enforced_end_to_end() {
+    // V3 end-to-end: extractor reads /amount from params; a SpendCap policy caps
+    // per-action at 100 usd. Within → runs; over → denied; unparseable → denied.
+    use vultrino::policy::{Policy, PolicyAction, PolicyCondition, PolicyRule, SpendExtractor};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("pw");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let mut spend_pol = Policy::deny_all("pay-cap", "pay-*");
+    spend_pol.rules = vec![PolicyRule {
+        condition: PolicyCondition::SpendCap {
+            asset: "usd".to_string(),
+            per_action_max: Some(100),
+            cumulative_max: None,
+            window_secs: 3600,
+        },
+        action: PolicyAction::Allow,
+    }];
+
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.policies = vec![spend_pol];
+    config.spend_extractors = vec![SpendExtractor {
+        action_pattern: "mock.echo".to_string(),
+        credential_pattern: "pay-*".to_string(),
+        amount_pointer: "/amount".to_string(),
+        asset: Some("usd".to_string()),
+        asset_pointer: None,
+    }];
+
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    server.plugins().register(Arc::new(MockPlugin));
+    store_credential(&storage, "pay-cred", false).await;
+
+    let req = |amount: i64| ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "amount": amount }),
+    };
+
+    // Within per-action cap → runs.
+    assert!(matches!(
+        server.execute_gated(req(100), ExecAuth::default()).await.unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
+    // Over per-action cap → denied (action did not run).
+    assert!(matches!(
+        server.execute_gated(req(101), ExecAuth::default()).await.unwrap_err(),
+        vultrino::VultrinoError::PolicyDenied(_)
+    ));
+    // No extractable amount under a SpendCap policy → fail closed (denied).
+    let no_amt = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "hello": "world" }),
+    };
+    assert!(matches!(
+        server.execute_gated(no_amt, ExecAuth::default()).await.unwrap_err(),
+        vultrino::VultrinoError::PolicyDenied(_)
+    ));
+}
+
+#[tokio::test]
+async fn test_per_agent_deny_end_to_end() {
+    // V4 end-to-end (kill-leg W3): a Deny scoped to agent_label "refund-bot"
+    // blocks only that agent's token; another agent on the same credential runs.
+    use vultrino::policy::Policy;
+
+    let deny = Policy::deny_all("kill-refund-bot", "api-*").with_principal("refund-bot");
+    let (server, storage) = setup_with_policies(vec![deny]).await; // allow mode
+    store_credential(&storage, "api-cred", false).await;
+
+    let new_token = |name: &str| NewUseToken {
+        name: name.to_string(),
+        credential_scope: "api-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    };
+    let (_f1, mut bot_token) = UseToken::create(new_token("bot"));
+    bot_token.agent_label = Some("refund-bot".to_string());
+    storage.store_use_token(&bot_token).await.unwrap();
+    let (_f2, other_token) = UseToken::create(new_token("other"));
+    storage.store_use_token(&other_token).await.unwrap();
+
+    // The targeted agent is denied...
+    assert!(matches!(
+        server
+            .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(bot_token))
+            .await
+            .unwrap_err(),
+        vultrino::VultrinoError::PolicyDenied(_)
+    ));
+    // ...while another agent on the same credential is unaffected.
+    assert!(matches!(
+        server
+            .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(other_token))
+            .await
+            .unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
 }

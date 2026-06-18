@@ -199,6 +199,10 @@ pub struct ApiKey {
     /// When this key was last used
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<DateTime<Utc>>,
+    /// Optional agent identity (V4) bound to this key, for `principal_pattern`
+    /// matching (so a per-agent policy can target it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
 }
 
 impl ApiKey {
@@ -226,6 +230,8 @@ pub struct ApiKeyMetadata {
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
 }
 
 impl From<&ApiKey> for ApiKeyMetadata {
@@ -238,6 +244,7 @@ impl From<&ApiKey> for ApiKeyMetadata {
             expires_at: key.expires_at,
             created_at: key.created_at,
             last_used_at: key.last_used_at,
+            agent_label: key.agent_label.clone(),
         }
     }
 }
@@ -343,6 +350,7 @@ mod tests {
             expires_at: None,
             created_at: Utc::now(),
             last_used_at: None,
+            agent_label: None,
         };
         assert!(!key.is_expired());
 

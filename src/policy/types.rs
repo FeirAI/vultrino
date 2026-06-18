@@ -12,6 +12,13 @@ pub struct Policy {
     pub name: String,
     /// Pattern for matching credential aliases (glob-style: "github-*", "*")
     pub credential_pattern: String,
+    /// Optional glob over the presenting **principal** (V4): the `vk_`/`vut_`
+    /// id or an `agent_label` carried on the token. `None` applies to any
+    /// principal; `Some(pattern)` applies only to principals matching the glob
+    /// (so a per-agent Deny — kill-leg W3 — is expressible). A request with no
+    /// principal never matches a policy that has a `principal_pattern`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_pattern: Option<String>,
     /// Rules to evaluate in order
     pub rules: Vec<PolicyRule>,
     /// Action when no rules match
@@ -49,6 +56,25 @@ pub enum PolicyCondition {
         window_secs: u64,
     },
 
+    /// Spend cap (V3): the request's extracted amount (in minor units, e.g.
+    /// cents/micros) must be within `per_action_max` for this single call and
+    /// within `cumulative_max` summed over the rolling `window_secs`, for the
+    /// matching `asset`. Matches (true) only when the request carries a spend
+    /// attempt for this asset within the caps; a missing/unparseable amount or
+    /// mismatched asset fails **closed** (false → leads to deny).
+    SpendCap {
+        /// Asset this cap governs (e.g. "usd"). Must equal the attempt's asset.
+        asset: String,
+        /// Max for a single call (minor units). `None` = no per-call limit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        per_action_max: Option<u64>,
+        /// Max summed over `window_secs` (minor units). `None` = no cumulative limit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cumulative_max: Option<u64>,
+        /// Rolling window (seconds) for the cumulative cap.
+        window_secs: u64,
+    },
+
     /// All conditions must match
     And(Vec<PolicyCondition>),
 
@@ -81,6 +107,7 @@ impl Policy {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.into(),
             credential_pattern: credential_pattern.into(),
+            principal_pattern: None,
             rules: vec![],
             default_action: PolicyAction::Allow,
         }
@@ -92,6 +119,7 @@ impl Policy {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.into(),
             credential_pattern: credential_pattern.into(),
+            principal_pattern: None,
             rules: vec![],
             default_action: PolicyAction::Deny,
         }
@@ -100,6 +128,12 @@ impl Policy {
     /// Add a rule to the policy
     pub fn with_rule(mut self, condition: PolicyCondition, action: PolicyAction) -> Self {
         self.rules.push(PolicyRule { condition, action });
+        self
+    }
+
+    /// Scope this policy to principals matching the given glob (V4).
+    pub fn with_principal(mut self, pattern: impl Into<String>) -> Self {
+        self.principal_pattern = Some(pattern.into());
         self
     }
 }
@@ -177,6 +211,7 @@ mod tests {
             id: "test-id".to_string(),
             name: "test".to_string(),
             credential_pattern: "*".to_string(),
+            principal_pattern: None,
             rules: vec![PolicyRule {
                 condition: PolicyCondition::UrlMatch("https://*".to_string()),
                 action: PolicyAction::Allow,
