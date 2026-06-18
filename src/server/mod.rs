@@ -1149,12 +1149,14 @@ pub async fn deliver_outbox_once(
     // a later event's lease expire while earlier (slow) POSTs run, re-opening the
     // cross-process double-delivery window. The claim+lease is atomic under the fd
     // lock, so a second process (web vs MCP) can't also take the same event.
+    // Per-subject ordering still holds: a subject whose head is leased is skipped,
+    // so each claim returns a different subject's head (round-robin, FIFO per
+    // subject). Cost is one extra lock acquisition per event vs a batch — fine for
+    // an outbox where the network POST dominates.
     for _ in 0..OUTBOX_BATCH {
-        let Some(event) = storage
-            .claim_deliverable_events(1, OUTBOX_LEASE_SECS)
-            .await?
-            .pop()
-        else {
+        let mut claimed = storage.claim_deliverable_events(1, OUTBOX_LEASE_SECS).await?;
+        debug_assert!(claimed.len() <= 1, "claim(1) must return at most one event");
+        let Some(event) = claimed.pop() else {
             break;
         };
         let body = serde_json::to_vec(&event.delivery_body()).unwrap_or_default();

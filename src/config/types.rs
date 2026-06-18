@@ -762,6 +762,20 @@ action = "deny"
     }
 
     #[test]
+    fn test_raw_outbox_config_debug_redacts_secret() {
+        let raw = RawOutboxConfig {
+            enabled: Some(true),
+            url: Some("https://x".to_string()),
+            hmac_secret: Some("top-secret-key".to_string()),
+            max_attempts: Some(3),
+            retention_secs: Some(10),
+        };
+        let dbg = format!("{raw:?}");
+        assert!(!dbg.contains("top-secret-key"), "raw secret must not appear: {dbg}");
+        assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
     fn test_outbox_config_validation() {
         // A full outbox config parses and enables delivery.
         let cfg = Config::parse(

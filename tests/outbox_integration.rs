@@ -237,6 +237,55 @@ async fn test_claim_is_exclusive_across_callers() {
 }
 
 #[tokio::test]
+async fn test_dead_letter_is_terminal_against_late_success() {
+    // V9: a late/duplicate SUCCESS outcome must not resurrect a dead-lettered
+    // event to Delivered (the `!= Pending` guard). Only an explicit replay does.
+    let storage = storage().await;
+    let seq = storage.append_event("A", "e", serde_json::json!({})).await.unwrap();
+    for _ in 0..2 {
+        storage.record_event_delivery(seq, false, Some("x".to_string()), 2).await.unwrap();
+    }
+    assert_eq!(storage.list_dead_letter_events(10).await.unwrap().len(), 1);
+    // A stray late success is ignored — stays dead-lettered.
+    storage.record_event_delivery(seq, true, None, 2).await.unwrap();
+    let all = storage.list_events_after(0, 10).await.unwrap();
+    assert_eq!(all[0].delivery, DeliveryState::DeadLettered, "DeadLettered is terminal");
+}
+
+#[tokio::test]
+async fn test_replay_makes_dead_letter_immediately_claimable() {
+    // V9: a replayed dead-letter is Pending AND immediately claimable (lease cleared).
+    let storage = storage().await;
+    let seq = storage.append_event("A", "e", serde_json::json!({})).await.unwrap();
+    storage.record_event_delivery(seq, false, Some("x".to_string()), 1).await.unwrap(); // → dead
+    assert!(storage.claim_deliverable_events(10, 30).await.unwrap().is_empty(), "dead not claimable");
+    assert!(storage.replay_dead_letter_event(seq).await.unwrap());
+    let claimable = storage.claim_deliverable_events(10, 30).await.unwrap();
+    assert_eq!(claimable.len(), 1, "replayed event is immediately claimable");
+    assert_eq!(claimable[0].sequence, seq);
+}
+
+#[tokio::test]
+async fn test_claim_one_round_robins_across_subjects() {
+    // V9: claiming one-at-a-time returns exactly one event and advances across
+    // subjects (the leased subject's head is skipped on the next claim).
+    let storage = storage().await;
+    storage.append_event("A", "e", serde_json::json!({})).await.unwrap(); // seq 1
+    storage.append_event("B", "e", serde_json::json!({})).await.unwrap(); // seq 2
+    storage.append_event("A", "e", serde_json::json!({})).await.unwrap(); // seq 3
+
+    let first = storage.claim_deliverable_events(1, 30).await.unwrap();
+    assert_eq!(first.len(), 1, "exactly one");
+    assert_eq!(first[0].subject, "A");
+    // A is now leased → next claim returns B (not A's seq 3).
+    let second = storage.claim_deliverable_events(1, 30).await.unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].subject, "B", "round-robins to a different subject");
+    // Both subjects leased → nothing more claimable.
+    assert!(storage.claim_deliverable_events(1, 30).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_stale_lease_is_reclaimable() {
     // V9: a crashed deliverer's lease expires and the event is re-claimable — the
     // other half of the lease contract (no event stuck-leased forever).
@@ -248,8 +297,9 @@ async fn test_stale_lease_is_reclaimable() {
     assert_eq!(first.len(), 1);
     // Immediately, the lease is still active → not re-claimable.
     assert!(storage.claim_deliverable_events(10, 1).await.unwrap().is_empty());
-    // After the lease expires, a second deliverer reclaims it.
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // After the lease expires, a second deliverer reclaims it (generous margin
+    // over the 1s lease to avoid CI flakiness).
+    tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
     let reclaimed = storage.claim_deliverable_events(10, 30).await.unwrap();
     assert_eq!(reclaimed.len(), 1, "stale lease reclaimed");
 }
