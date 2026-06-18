@@ -118,6 +118,9 @@ impl NewUseToken {
         if self.max_uses == Some(0) {
             return Err("max uses must be at least 1".to_string());
         }
+        if matches!(self.expires_in, Some(d) if d <= Duration::zero()) {
+            return Err("expiry must be positive (a non-positive lifetime would mint an already-expired token)".to_string());
+        }
         glob::Pattern::new(&self.credential_scope).map_err(|e| {
             format!("invalid credential scope pattern '{}': {}", self.credential_scope, e)
         })?;

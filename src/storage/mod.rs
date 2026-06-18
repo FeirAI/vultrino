@@ -79,6 +79,10 @@ pub enum IdempotencyState {
     Pending,
     /// The operation already completed under this key — replay this response.
     Done { status: u16, body: String },
+    /// The key was already used with a *different* request body. The caller
+    /// must not perform the operation and should return HTTP 409 — replaying the
+    /// original response for a different request would be wrong.
+    Mismatch,
 }
 
 /// Trait for credential storage backends
@@ -322,12 +326,15 @@ pub trait StorageBackend: Send + Sync {
 
     // ==================== Idempotency (admin API, V1) ====================
 
-    /// Atomically check for / reserve an `Idempotency-Key`. See
+    /// Atomically check for / reserve an `Idempotency-Key`, binding it to a hash
+    /// of the request body so a key reused with a *different* body is rejected
+    /// (`Mismatch`) rather than silently replaying the wrong response. See
     /// [`IdempotencyState`]. The default impl is non-persistent and always
     /// returns `Fresh` (no idempotency), which is safe but not deduplicating.
     async fn idempotency_check_or_reserve(
         &self,
         _key: &str,
+        _body_hash: &str,
     ) -> Result<IdempotencyState, StorageError> {
         Ok(IdempotencyState::Fresh)
     }

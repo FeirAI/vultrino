@@ -19,11 +19,12 @@ use crate::{ExecuteRequest, ExecutionOutcome};
 use super::server::AppState;
 
 use crate::auth::ApiKey;
-use crate::auth::Role;
+use crate::auth::{Role, ROLE_ADMIN, ROLE_EXECUTOR, ROLE_READ_ONLY};
 use crate::policy::{Policy, PolicyAction, PolicyRule};
 use crate::storage::IdempotencyState;
 use crate::{Credential, CredentialData, CredentialMetadata};
 use chrono::Duration;
+use sha2::{Digest, Sha256};
 
 /// Extract API key from Authorization header
 fn extract_api_key(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -351,7 +352,8 @@ pub async fn api_list_credentials(
         }
     };
 
-    // Reload auth manager from storage to pick up any new keys
+    // Validate against the in-memory auth manager (refreshed from storage only
+    // after key/role mutations via refresh_auth_data, not on every read).
     let (key, role) = match validate_api_key(&state, &api_key).await {
         Ok((k, r)) => (k, r),
         Err(e) => {
@@ -487,10 +489,49 @@ fn replay_json(status: u16, body: String) -> Response {
         .into_response()
 }
 
-/// Run an admin mutation under optional `Idempotency-Key` dedup. On a repeated
-/// key it replays the stored 2xx response (or 409 if one is still in flight);
-/// non-success responses release the reservation so the client can retry.
-async fn idempotent<F, Fut>(state: &AppState, key: Option<String>, op: F) -> Response
+/// Stable hash of a request body, used to bind an `Idempotency-Key` to the
+/// exact request it was first used with.
+fn idempotency_body_hash<T: Serialize>(req: &T) -> String {
+    let bytes = serde_json::to_vec(req).unwrap_or_default();
+    hex::encode(Sha256::digest(&bytes))
+}
+
+/// The replay body persisted for an idempotent mint must never contain the
+/// plaintext token (the vault must not retain it). Strip a top-level `token`
+/// field, leaving a note; the live first response still returns the real token.
+fn redact_for_replay(body: &serde_json::Value) -> serde_json::Value {
+    let mut stored = body.clone();
+    if let Some(obj) = stored.as_object_mut() {
+        if obj.remove("token").is_some() {
+            obj.insert("token".to_string(), serde_json::Value::Null);
+            obj.insert(
+                "token_note".to_string(),
+                serde_json::json!(
+                    "The plaintext token is only returned on the original request and is not \
+                     retained. If you lost it, revoke this token and mint a new one."
+                ),
+            );
+        }
+    }
+    stored
+}
+
+/// Run an admin mutation under optional `Idempotency-Key` dedup, bound to
+/// `body_hash`. On a repeated key with the same body it replays the stored 2xx
+/// response (409 while in flight, 409 on a body mismatch); non-success responses
+/// release the reservation so the client can retry.
+///
+/// **Crash semantics:** the reserve → operate → complete sequence is three
+/// separate atomic storage writes, not one transaction. If the process crashes
+/// after the operation persists but before completion is recorded, a retry after
+/// the stale-reservation window re-runs the operation (at-least-once, not
+/// exactly-once). True exactly-once would require transactional storage.
+async fn idempotent<F, Fut>(
+    state: &AppState,
+    key: Option<String>,
+    body_hash: String,
+    op: F,
+) -> Response
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = (StatusCode, serde_json::Value)>,
@@ -499,13 +540,20 @@ where
         let (status, body) = op().await;
         return (status, Json(body)).into_response();
     };
-    match state.storage.idempotency_check_or_reserve(&key).await {
+    match state.storage.idempotency_check_or_reserve(&key, &body_hash).await {
         Ok(IdempotencyState::Done { status, body }) => return replay_json(status, body),
         Ok(IdempotencyState::Pending) => {
             return error_response(
                 StatusCode::CONFLICT,
                 "idempotency_in_progress",
                 "A request with this Idempotency-Key is already in progress",
+            )
+        }
+        Ok(IdempotencyState::Mismatch) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "idempotency_key_reused",
+                "This Idempotency-Key was already used with a different request body",
             )
         }
         Ok(IdempotencyState::Fresh) => {}
@@ -515,7 +563,7 @@ where
     }
     let (status, body) = op().await;
     if status.is_success() {
-        let body_str = serde_json::to_string(&body).unwrap_or_default();
+        let body_str = serde_json::to_string(&redact_for_replay(&body)).unwrap_or_default();
         let _ = state
             .storage
             .idempotency_complete(&key, status.as_u16(), &body_str)
@@ -529,12 +577,10 @@ where
 
 // -------- Policies --------
 
-/// Body for creating/replacing a policy. `id` is optional on create (generated)
-/// and ignored on PUT (the path id wins).
-#[derive(Deserialize)]
+/// Body for creating/replacing a policy. On `POST` the id is always
+/// server-generated (create); on `PUT` the path id is used (create-or-replace).
+#[derive(Serialize, Deserialize)]
 pub struct PolicyUpsertRequest {
-    #[serde(default)]
-    pub id: Option<String>,
     pub name: String,
     pub credential_pattern: String,
     #[serde(default)]
@@ -542,7 +588,8 @@ pub struct PolicyUpsertRequest {
     pub default_action: PolicyAction,
 }
 
-/// Build a validated `Policy` from a request, optionally forcing the id (PUT).
+/// Build a validated `Policy` from a request, forcing the id on PUT or
+/// generating a fresh one on POST.
 fn build_policy(req: PolicyUpsertRequest, forced_id: Option<String>) -> Result<Policy, String> {
     if req.name.trim().is_empty() {
         return Err("policy name must not be empty".to_string());
@@ -553,9 +600,7 @@ fn build_policy(req: PolicyUpsertRequest, forced_id: Option<String>) -> Result<P
         .map_err(|e| format!("invalid credential_pattern '{}': {}", req.credential_pattern, e))?;
     // Use the builder so new optional Policy fields get their defaults.
     let mut policy = Policy::deny_all(req.name, req.credential_pattern);
-    policy.id = forced_id
-        .or(req.id)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    policy.id = forced_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     policy.default_action = req.default_action;
     policy.rules = req.rules;
     Ok(policy)
@@ -587,8 +632,9 @@ pub async fn api_create_policy(
     Json(req): Json<PolicyUpsertRequest>,
 ) -> Response {
     let key = extract_idempotency_key(&headers);
+    let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
-    idempotent(&state, key, move || async move {
+    idempotent(&state, key, body_hash, move || async move {
         match build_policy(req, None) {
             Ok(policy) => store_and_reload_policy(&st, &policy, true).await,
             Err(e) => (
@@ -609,8 +655,9 @@ pub async fn api_put_policy(
     Json(req): Json<PolicyUpsertRequest>,
 ) -> Response {
     let key = extract_idempotency_key(&headers);
+    let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
-    idempotent(&state, key, move || async move {
+    idempotent(&state, key, body_hash, move || async move {
         match build_policy(req, Some(id)) {
             Ok(policy) => store_and_reload_policy(&st, &policy, false).await,
             Err(e) => (
@@ -644,7 +691,7 @@ pub async fn api_delete_policy(
 
 // -------- Use tokens --------
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TokenCreateRequest {
     pub name: String,
     pub credential_scope: String,
@@ -667,8 +714,9 @@ pub async fn api_create_token(
     Json(req): Json<TokenCreateRequest>,
 ) -> Response {
     let key = extract_idempotency_key(&headers);
+    let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
-    idempotent(&state, key, move || async move {
+    idempotent(&state, key, body_hash, move || async move {
         let params = NewUseToken {
             name: req.name,
             credential_scope: req.credential_scope,
@@ -723,7 +771,7 @@ pub async fn api_revoke_token(
 
 // -------- Roles --------
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct RoleCreateRequest {
     pub name: String,
     #[serde(default)]
@@ -742,8 +790,9 @@ pub async fn api_create_role(
     Json(req): Json<RoleCreateRequest>,
 ) -> Response {
     let key = extract_idempotency_key(&headers);
+    let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
-    idempotent(&state, key, move || async move {
+    idempotent(&state, key, body_hash, move || async move {
         if req.name.trim().is_empty() {
             return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_role","error":"role name must not be empty"}));
         }
@@ -782,6 +831,29 @@ pub async fn api_delete_role(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
+    // Never delete a predefined role (consistency with the web UI and CLI guards).
+    if matches!(id.as_str(), ROLE_ADMIN | ROLE_READ_ONLY | ROLE_EXECUTOR) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "predefined_role",
+            "Predefined roles (admin, read-only, executor) cannot be deleted",
+        );
+    }
+    // Referential integrity: refuse to orphan API keys that still reference it
+    // (a deleted role would make those keys fail validation).
+    match state.storage.list_api_keys().await {
+        Ok(keys) if keys.iter().any(|k| k.role_id == id) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "role_in_use",
+                "This role is still referenced by one or more API keys; revoke those keys first",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string())
+        }
+    }
     match state.storage.delete_role(&id).await {
         Ok(()) => {
             let _ = refresh_auth_data(&state).await;
@@ -796,7 +868,7 @@ pub async fn api_delete_role(
 
 // -------- Credentials (metadata; secret material is write-only) --------
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CredentialCreateRequest {
     pub alias: String,
     #[serde(default)]
@@ -815,8 +887,9 @@ pub async fn api_create_credential(
     Json(req): Json<CredentialCreateRequest>,
 ) -> Response {
     let key = extract_idempotency_key(&headers);
+    let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
-    idempotent(&state, key, move || async move {
+    idempotent(&state, key, body_hash, move || async move {
         if req.alias.trim().is_empty() {
             return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_credential","error":"alias must not be empty"}));
         }

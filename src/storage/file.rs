@@ -71,6 +71,10 @@ pub struct FileStorage {
 struct IdempotencyRecord {
     /// True once the operation finished and `status`/`response` are populated.
     done: bool,
+    /// Hash of the request body this key was first used with. A later request
+    /// reusing the key with a different body is a `Mismatch`, never a replay.
+    #[serde(default)]
+    body_hash: String,
     /// Stored HTTP status to replay on a repeated key.
     #[serde(default)]
     status: u16,
@@ -782,10 +786,17 @@ impl StorageBackend for FileStorage {
     async fn idempotency_check_or_reserve(
         &self,
         key: &str,
+        body_hash: &str,
     ) -> Result<IdempotencyState, StorageError> {
-        let key = key.to_string();
+        let (key, body_hash) = (key.to_string(), body_hash.to_string());
         self.locked_mutate(move |cache| {
             match cache.idempotency.get(&key) {
+                // Same key, different request body → never replay the original.
+                Some(rec)
+                    if !rec.body_hash.is_empty() && rec.body_hash != body_hash =>
+                {
+                    Ok(IdempotencyState::Mismatch)
+                }
                 // A completed record → replay the stored response verbatim.
                 Some(rec) if rec.done => Ok(IdempotencyState::Done {
                     status: rec.status,
@@ -807,6 +818,7 @@ impl StorageBackend for FileStorage {
                         key.clone(),
                         IdempotencyRecord {
                             done: false,
+                            body_hash: body_hash.clone(),
                             status: 0,
                             response: String::new(),
                             created_at: Utc::now(),
@@ -827,10 +839,17 @@ impl StorageBackend for FileStorage {
     ) -> Result<(), StorageError> {
         let (key, body) = (key.to_string(), body.to_string());
         self.locked_mutate(move |cache| {
+            // Preserve the body hash bound at reservation time.
+            let body_hash = cache
+                .idempotency
+                .get(&key)
+                .map(|r| r.body_hash.clone())
+                .unwrap_or_default();
             cache.idempotency.insert(
                 key.clone(),
                 IdempotencyRecord {
                     done: true,
+                    body_hash,
                     status,
                     response: body,
                     created_at: Utc::now(),
@@ -1087,38 +1106,48 @@ mod tests {
         let password = SecretString::from("test");
         let storage = FileStorage::new(&path, &password).await.unwrap();
 
-        // First reservation is Fresh; a concurrent second one is Pending.
+        // First reservation is Fresh; a concurrent second one (same body) Pending.
         assert_eq!(
-            storage.idempotency_check_or_reserve("k1").await.unwrap(),
+            storage.idempotency_check_or_reserve("k1", "hashA").await.unwrap(),
             IdempotencyState::Fresh
         );
         assert_eq!(
-            storage.idempotency_check_or_reserve("k1").await.unwrap(),
+            storage.idempotency_check_or_reserve("k1", "hashA").await.unwrap(),
             IdempotencyState::Pending
+        );
+        // Same key with a DIFFERENT body hash → Mismatch (never a wrong replay).
+        assert_eq!(
+            storage.idempotency_check_or_reserve("k1", "hashB").await.unwrap(),
+            IdempotencyState::Mismatch
         );
 
         // Completing the op stores the response; subsequent checks replay it.
         storage.idempotency_complete("k1", 201, "{\"ok\":true}").await.unwrap();
         assert_eq!(
-            storage.idempotency_check_or_reserve("k1").await.unwrap(),
+            storage.idempotency_check_or_reserve("k1", "hashA").await.unwrap(),
             IdempotencyState::Done { status: 201, body: "{\"ok\":true}".to_string() }
+        );
+        // A mismatched body still refuses to replay even after completion.
+        assert_eq!(
+            storage.idempotency_check_or_reserve("k1", "hashB").await.unwrap(),
+            IdempotencyState::Mismatch
         );
 
         // Release only drops a pending reservation, never a completed record.
         assert_eq!(
-            storage.idempotency_check_or_reserve("k2").await.unwrap(),
+            storage.idempotency_check_or_reserve("k2", "h").await.unwrap(),
             IdempotencyState::Fresh
         );
         storage.idempotency_release("k2").await.unwrap();
         assert_eq!(
-            storage.idempotency_check_or_reserve("k2").await.unwrap(),
+            storage.idempotency_check_or_reserve("k2", "h").await.unwrap(),
             IdempotencyState::Fresh,
             "released key should be re-reservable"
         );
         // Releasing a completed key is a no-op (still replays).
         storage.idempotency_release("k1").await.unwrap();
         assert!(matches!(
-            storage.idempotency_check_or_reserve("k1").await.unwrap(),
+            storage.idempotency_check_or_reserve("k1", "hashA").await.unwrap(),
             IdempotencyState::Done { .. }
         ));
     }

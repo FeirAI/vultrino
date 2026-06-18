@@ -260,11 +260,12 @@ async fn test_admin_token_mint_idempotent() {
     let token1 = v1["token"].as_str().unwrap().to_string();
     assert!(token1.starts_with("vut_"));
 
-    // Replay with the SAME idempotency key → identical response, no second token.
+    // Replay with the SAME idempotency key → no second token, and the plaintext
+    // is NOT re-exposed (it was only returned on the original request).
     let resp2 = router.clone().oneshot(mint("k1")).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::CREATED);
     let v2: serde_json::Value = serde_json::from_str(&body_string(resp2).await).unwrap();
-    assert_eq!(v2["token"].as_str().unwrap(), token1, "replay must return the same token");
+    assert!(v2["token"].is_null(), "replay must not re-expose the plaintext token");
     assert_eq!(storage.list_use_tokens().await.unwrap().len(), 1, "no duplicate token minted");
 
     // A different key mints a new, distinct token.
@@ -272,6 +273,46 @@ async fn test_admin_token_mint_idempotent() {
     let v3: serde_json::Value = serde_json::from_str(&body_string(resp3).await).unwrap();
     assert_ne!(v3["token"].as_str().unwrap(), token1);
     assert_eq!(storage.list_use_tokens().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_admin_cannot_delete_builtin_role() {
+    let (router, _storage, _server, key) = build_admin_router().await;
+    let resp = router
+        .oneshot(admin_req("DELETE", "/api/v1/roles/admin", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(body_string(resp).await.contains("predefined"));
+}
+
+#[tokio::test]
+async fn test_admin_idempotency_key_body_mismatch() {
+    let (router, _storage, _server, key) = build_admin_router().await;
+    let mint = |idem: &str, name: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/tokens")
+            .header("authorization", format!("Bearer {}", key))
+            .header("content-type", "application/json")
+            .header("idempotency-key", idem)
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({"name":name,"credential_scope":"*"})).unwrap(),
+            ))
+            .unwrap()
+    };
+    // First use of the key with body A → created.
+    let r1 = router.clone().oneshot(mint("m1", "alpha")).await.unwrap();
+    assert_eq!(r1.status(), StatusCode::CREATED);
+    // Reuse the SAME key with a DIFFERENT body → 409, never a wrong replay.
+    let r2 = router.clone().oneshot(mint("m1", "beta")).await.unwrap();
+    assert_eq!(r2.status(), StatusCode::CONFLICT);
+    assert!(body_string(r2).await.contains("idempotency_key_reused"));
+    // A replayed mint must not leak the plaintext token in the stored body.
+    let r3 = router.oneshot(mint("m1", "alpha")).await.unwrap();
+    let v3: serde_json::Value = serde_json::from_str(&body_string(r3).await).unwrap();
+    assert!(v3["token"].is_null(), "replay must not return the plaintext token");
+    assert!(v3.get("token_note").is_some());
 }
 
 #[tokio::test]

@@ -32,6 +32,17 @@ remembered for 24h.
 Idempotency-Key: 5f3c…unique-per-logical-request
 ```
 
+The key is bound to a hash of the request body: reusing a key with a *different*
+body returns `409` rather than replaying the original response. Minted token
+plaintext is **not** retained in the idempotency record — a replayed mint returns
+metadata plus a note (revoke and re-mint if you lost the original response).
+
+> **At-least-once on crash.** Reserve → operate → record-completion are three
+> separate atomic storage writes, not one transaction. If the process crashes
+> after the operation persists but before completion is recorded, a retry (after
+> the ~60s stale-reservation window) re-runs the operation. Idempotency is
+> exactly-once only absent a mid-operation crash.
+
 ## Endpoints
 
 ### Policies
@@ -82,6 +93,15 @@ any endpoint (the create response carries metadata only).
 `PUT /api/v1/config/webhooks` (govder approval-callback target + signing key) is
 delivered as part of the **signed webhook outbox** (see the events/outbox
 guide), which owns webhook configuration and ordered, replayable delivery.
+
+## Deployment note (vault format v4)
+
+The admin API stores policies and idempotency records, which bumped the vault
+format from v3 to v4. A v4-aware binary reads v3 vaults fine, but the **first
+admin write upgrades the on-disk vault to v4**, after which any still-running v3
+binary (a not-yet-upgraded MCP or CLI process sharing the same vault) is refused
+the vault entirely. **Upgrade all vultrino processes before issuing admin
+writes** to avoid breaking the un-upgraded enforcement plane.
 
 ## Example
 
