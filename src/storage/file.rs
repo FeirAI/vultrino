@@ -717,24 +717,59 @@ impl StorageBackend for FileStorage {
         approve: bool,
         channel: &str,
         approver_identity: &str,
+        enforce_sod: bool,
         note: Option<String>,
     ) -> Result<ApprovalRequest, StorageError> {
         use crate::approval::Decision;
+        let decided = self
+            .locked_mutate(|cache| {
+                let approval = cache
+                    .approvals
+                    .get_mut(id)
+                    .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
+                // Advance the SLA lifecycle first so a decision raced against the
+                // final deadline is rejected as expired, not silently accepted.
+                approval.advance_lifecycle();
+                let decision = Decision::new(channel, approver_identity)
+                    .with_note(note)
+                    .enforcing_sod(enforce_sod);
+                let result = if approve {
+                    approval.approve(decision)
+                } else {
+                    approval.deny(decision)
+                };
+                result.map_err(|e| StorageError::Conflict(e.to_string()))?;
+                Ok(approval.clone())
+            })
+            .await?;
+        // Surface a separation-of-duty violation (V5) even when not hard-enforced,
+        // so a self-approval is always observable.
+        if decided.sod_violation == Some(true) {
+            tracing::warn!(
+                approval_id = %decided.id,
+                approver = %approver_identity,
+                "separation-of-duty: approver is the requesting agent (self-approval)"
+            );
+        }
+        Ok(decided)
+    }
+
+    async fn poll_refresh_approval(&self, id: &str) -> Result<ApprovalRequest, StorageError> {
         self.locked_mutate(|cache| {
             let approval = cache
                 .approvals
                 .get_mut(id)
                 .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
-            // Advance the SLA lifecycle first so a decision raced against the
-            // final deadline is rejected as expired, not silently accepted.
+            // Escalate / expire as due.
             approval.advance_lifecycle();
-            let decision = Decision::new(channel, approver_identity).with_note(note);
-            let result = if approve {
-                approval.approve(decision)
-            } else {
-                approval.deny(decision)
-            };
-            result.map_err(|e| StorageError::Conflict(e.to_string()))?;
+            // A still-approved-but-unrun grant gone stale must be re-approved:
+            // flip it to expired so the agent resubmits rather than running on a
+            // decision nobody re-confirmed.
+            if approval.needs_reauth() {
+                approval.status = crate::approval::ApprovalStatus::Expired;
+                approval.decided_at = Some(Utc::now());
+                approval.decided_by = Some("system (reauth lapsed)".to_string());
+            }
             Ok(approval.clone())
         })
             .await
@@ -792,6 +827,10 @@ impl StorageBackend for FileStorage {
             if approval.status != ApprovalStatus::Approved
                 || approval.executed
                 || (approval.executing && !stale)
+                // Defense-in-depth (V5): never claim a grant whose continuous
+                // re-auth window lapsed — it must be re-approved, not run on a
+                // stale decision. The poll path expires it; this guards the race.
+                || approval.needs_reauth()
             {
                 Ok(None)
             } else {

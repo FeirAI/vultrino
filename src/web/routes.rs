@@ -1094,9 +1094,10 @@ pub async fn approval_approve(
     }
     // Atomic decision under the storage lock (no reload+get+update window). The
     // panel approver's identity is the authenticated session user (V5).
+    let enforce_sod = state.config.approval.enforce_separation_of_duty;
     let _ = state
         .storage
-        .decide_approval(&id, true, "admin panel", &auth.session.username, None)
+        .decide_approval(&id, true, "admin panel", &auth.session.username, enforce_sod, None)
         .await;
     let _ = regenerate_csrf_token(&session).await;
     Redirect::to("/approvals").into_response()
@@ -1112,9 +1113,12 @@ pub async fn approval_deny(
     if !validate_csrf_token(&session, &form.csrf_token).await {
         return Redirect::to("/approvals").into_response();
     }
+    // A denial is always allowed regardless of SoD (only approval self-grants are
+    // the concern), but pass the flag through for consistent attribution.
+    let enforce_sod = state.config.approval.enforce_separation_of_duty;
     let _ = state
         .storage
-        .decide_approval(&id, false, "admin panel", &auth.session.username, None)
+        .decide_approval(&id, false, "admin panel", &auth.session.username, enforce_sod, None)
         .await;
     let _ = regenerate_csrf_token(&session).await;
     Redirect::to("/approvals").into_response()
@@ -1189,11 +1193,17 @@ pub async fn approval_decide_submit(
 
     // Record the decision atomically under the storage lock. The OOB link is
     // bound to a named identity (V5) rather than an anonymous capability token,
-    // so the decision is attributable; fall back to a generic label if unset.
-    let approver_identity = approval.oob_identity.as_deref().unwrap_or("out-of-band");
+    // so the decision is attributable; fall back to a generic label if unset or
+    // blank (a configured-but-empty identity would otherwise fail-closed).
+    let approver_identity = approval
+        .oob_identity
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("out-of-band");
+    let enforce_sod = state.config.approval.enforce_separation_of_duty;
     match state
         .storage
-        .decide_approval(&id, approve, "out-of-band link", approver_identity, None)
+        .decide_approval(&id, approve, "out-of-band link", approver_identity, enforce_sod, None)
         .await
     {
         Ok(_) => {

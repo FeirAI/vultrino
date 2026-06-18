@@ -866,6 +866,8 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     let auth_manager = Arc::new(RwLock::new(AuthManager::from_data(stored_roles, stored_keys)));
 
     let config_policies = config.policies.clone();
+    // Capture the approval config before `config` moves into the server (V5).
+    let approval_cfg = config.approval.clone();
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage, resolver);
 
@@ -886,6 +888,18 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
         config_policies,
         std::time::Duration::from_secs(vultrino::server::POLICY_REFRESH_SECS),
     ));
+    // Also drive the approval SLA sweep here (V5), so an MCP-only deployment (no
+    // web process) still escalates/expires requests nobody is polling. Safe to
+    // run alongside the web process's sweep — the advance is atomic under the
+    // shared vault lock.
+    if approval_cfg.enabled {
+        tokio::spawn(vultrino::server::sweep_approvals_periodically(
+            server.storage().clone(),
+            vultrino::approval::build_notifiers(&approval_cfg),
+            approval_cfg.public_base_url.clone(),
+            std::time::Duration::from_secs(vultrino::server::APPROVAL_SWEEP_SECS),
+        ));
+    }
 
     let vultrino = Arc::new(RwLock::new(server));
     let mut mcp = McpServer::new(vultrino, auth_manager);
@@ -935,9 +949,11 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
         std::time::Duration::from_secs(vultrino::server::POLICY_REFRESH_SECS),
     ));
     // Drive approval escalation/expiry (V5) for requests nobody is polling.
-    if exec_server.approvals_enabled() {
+    if config.approval.enabled {
         tokio::spawn(vultrino::server::sweep_approvals_periodically(
-            exec_server.clone(),
+            exec_server.storage().clone(),
+            vultrino::approval::build_notifiers(&config.approval),
+            config.approval.public_base_url.clone(),
             std::time::Duration::from_secs(vultrino::server::APPROVAL_SWEEP_SECS),
         ));
     }
@@ -2162,9 +2178,11 @@ async fn decide_approval(
         .unwrap_or_else(|_| "cli".to_string());
 
     // Atomic read-modify-write under the storage lock (no separate reload+update
-    // window that a concurrent writer could clobber).
+    // window that a concurrent writer could clobber). The CLI runs as a trusted
+    // local admin with direct vault access, so its OS-user identity is advisory.
+    let enforce_sod = config.approval.enforce_separation_of_duty;
     storage
-        .decide_approval(&id, approve, "cli", &approver, None)
+        .decide_approval(&id, approve, "cli", &approver, enforce_sod, None)
         .await
         .map_err(|e| format!("Could not update approval: {}", e))?;
 

@@ -701,7 +701,7 @@ impl VultrinoServer {
         // Best-effort: pick up cross-process decisions.
         let _ = self.storage.reload().await;
 
-        let mut approval = self
+        let approval = self
             .storage
             .get_approval(id)
             .await?
@@ -719,29 +719,15 @@ impl VultrinoServer {
             }
         }
 
-        // Advance the SLA lifecycle on poll (V5): a pending request whose first
-        // window elapsed escalates; one past the final deadline expires. Persist
-        // and surface the new state to the polling agent either way.
-        match approval.advance_lifecycle() {
-            crate::approval::LifecycleChange::Expired => {
-                let _ = self.storage.update_approval(&approval).await;
-                return Ok(approval);
-            }
-            crate::approval::LifecycleChange::Escalated => {
-                let _ = self.storage.update_approval(&approval).await;
-                return Ok(approval);
-            }
-            crate::approval::LifecycleChange::None => {}
-        }
-
-        // Continuous re-authorization (V5): an approved grant that went stale
-        // before it ran must be re-approved. Flip it back to expired so the agent
-        // is told to resubmit rather than executing a grant nobody re-confirmed.
-        if approval.needs_reauth() {
-            approval.status = ApprovalStatus::Expired;
-            approval.decided_at = Some(chrono::Utc::now());
-            approval.decided_by = Some("system (reauth lapsed)".to_string());
-            let _ = self.storage.update_approval(&approval).await;
+        // Advance the SLA lifecycle on poll (V5) — atomically under the storage
+        // lock so we never overwrite a decision committed concurrently by another
+        // process with a stale local copy. This escalates a pending request past
+        // its first window, expires one past its final deadline, and expires an
+        // approved-but-unrun grant whose continuous-reauth window lapsed.
+        let mut approval = self.storage.poll_refresh_approval(id).await?;
+        // Surface the new state to the polling agent unless it's an executable
+        // (Approved + not yet run) grant, which we run below.
+        if approval.status != ApprovalStatus::Approved || approval.executed {
             return Ok(approval);
         }
 
@@ -843,45 +829,12 @@ impl VultrinoServer {
     pub async fn sweep_approvals_once(
         &self,
     ) -> Result<crate::storage::ApprovalSweep, crate::storage::StorageError> {
-        self.storage.reload().await?;
-        let sweep = self.storage.sweep_approval_lifecycle().await?;
-        for approval in &sweep.escalated {
-            self.notify_escalation(approval).await;
-        }
-        if !sweep.escalated.is_empty() || !sweep.expired.is_empty() {
-            info!(
-                escalated = sweep.escalated.len(),
-                expired = sweep.expired.len(),
-                "approval SLA sweep advanced lifecycle"
-            );
-        }
-        Ok(sweep)
-    }
-
-    /// Re-notify the configured channels that an approval escalated (V5). The
-    /// plaintext decision token is not stored, so an escalation re-ping carries
-    /// only the panel link — the approver decides in the panel. (A richer signed
-    /// `approval.escalated` event arrives with the V9 outbox.)
-    async fn notify_escalation(&self, approval: &ApprovalRequest) {
-        if self.notifiers.is_empty() {
-            return;
-        }
-        let base = self.approval_config.public_base_url.as_deref().unwrap_or("");
-        let links = ApprovalLinks {
-            approve_url: String::new(),
-            deny_url: String::new(),
-            panel_url: format!("{}/approvals", base.trim_end_matches('/')),
-        };
-        for notifier in &self.notifiers {
-            if let Err(e) = notifier.notify(approval, &links).await {
-                warn!(
-                    channel = notifier.channel(),
-                    approval_id = %approval.id,
-                    error = %e,
-                    "Failed to deliver escalation notification"
-                );
-            }
-        }
+        run_approval_sweep(
+            &self.storage,
+            &self.notifiers,
+            self.approval_config.public_base_url.as_deref(),
+        )
+        .await
     }
 
     /// Whether the approval subsystem is enabled.
@@ -956,15 +909,77 @@ pub const POLICY_REFRESH_SECS: u64 = 5;
 /// Default interval for the background approval SLA sweep (V5).
 pub const APPROVAL_SWEEP_SECS: u64 = 15;
 
+/// One iteration of the approval SLA sweep (V5): re-read the vault, advance every
+/// open request (escalate / expire) atomically, and re-ping the notifiers for
+/// those that newly escalated. Free-standing so either the web or MCP process can
+/// drive it over the shared, fd-locked vault.
+pub async fn run_approval_sweep(
+    storage: &Arc<dyn StorageBackend>,
+    notifiers: &[Arc<dyn ApprovalNotifier>],
+    public_base_url: Option<&str>,
+) -> Result<crate::storage::ApprovalSweep, crate::storage::StorageError> {
+    storage.reload().await?;
+    let sweep = storage.sweep_approval_lifecycle().await?;
+    for approval in &sweep.escalated {
+        notify_escalation(notifiers, public_base_url, approval).await;
+    }
+    if !sweep.escalated.is_empty() || !sweep.expired.is_empty() {
+        info!(
+            escalated = sweep.escalated.len(),
+            expired = sweep.expired.len(),
+            "approval SLA sweep advanced lifecycle"
+        );
+    }
+    Ok(sweep)
+}
+
+/// Re-notify the configured channels that an approval escalated (V5). The
+/// plaintext decision token is not stored, so an escalation re-ping carries only
+/// the panel link — the approver decides in the panel. The notifiers key their
+/// payload off the request's `Escalated` status (e.g. webhook emits
+/// `approval.escalated`), so this is not mislabelled as a fresh request.
+async fn notify_escalation(
+    notifiers: &[Arc<dyn ApprovalNotifier>],
+    public_base_url: Option<&str>,
+    approval: &ApprovalRequest,
+) {
+    if notifiers.is_empty() {
+        return;
+    }
+    let base = public_base_url.unwrap_or("");
+    let links = ApprovalLinks {
+        approve_url: String::new(),
+        deny_url: String::new(),
+        panel_url: format!("{}/approvals", base.trim_end_matches('/')),
+    };
+    for notifier in notifiers {
+        if let Err(e) = notifier.notify(approval, &links).await {
+            warn!(
+                channel = notifier.channel(),
+                approval_id = %approval.id,
+                error = %e,
+                "Failed to deliver escalation notification"
+            );
+        }
+    }
+}
+
 /// Background loop that periodically advances open approvals through their SLA
 /// lifecycle (V5): escalate those past their first window, expire those past
 /// their final deadline, and re-ping notifiers on escalation. Lazy advancement
 /// also happens on each agent poll, so this loop is what drives escalation/expiry
-/// for requests nobody is actively polling.
-pub async fn sweep_approvals_periodically(server: Arc<VultrinoServer>, interval: std::time::Duration) {
+/// for requests nobody is actively polling. Safe to run in more than one process
+/// over the shared vault: the lifecycle advance is atomic under the fd lock, so
+/// only the process that wins the escalation transition re-notifies.
+pub async fn sweep_approvals_periodically(
+    storage: Arc<dyn StorageBackend>,
+    notifiers: Vec<Arc<dyn ApprovalNotifier>>,
+    public_base_url: Option<String>,
+    interval: std::time::Duration,
+) {
     loop {
         tokio::time::sleep(interval).await;
-        if let Err(e) = server.sweep_approvals_once().await {
+        if let Err(e) = run_approval_sweep(&storage, &notifiers, public_base_url.as_deref()).await {
             warn!(error = %e, "periodic approval SLA sweep failed");
         }
     }

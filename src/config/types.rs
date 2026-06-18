@@ -310,6 +310,10 @@ pub struct RawApprovalConfig {
     /// Continuous re-authorization interval in seconds (V5).
     #[serde(default)]
     pub reauth_interval_secs: Option<u64>,
+    /// Hard-reject self-approvals (separation of duty) rather than only recording
+    /// them (V5).
+    #[serde(default)]
+    pub enforce_separation_of_duty: Option<bool>,
     /// Per-criticality SLA overrides (V5).
     #[serde(default)]
     pub sla: Vec<RawCriticalitySla>,
@@ -372,17 +376,32 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
         // unless explicitly disabled.
         let has_channel = raw.telegram.is_some() || raw.webhook.is_some();
 
-        // Per-class SLA overrides (last wins on a duplicated class).
+        // Per-class SLA overrides — reject zero windows (a 0s window auto-denies
+        // almost immediately) and duplicate classes (silent last-wins hides a typo).
         let mut sla_overrides = std::collections::HashMap::new();
         for s in raw.sla {
             let class = parse_criticality(&s.class)?;
-            sla_overrides.insert(
-                class,
-                crate::approval::CriticalitySla {
-                    escalate_after_secs: s.escalate_after_secs,
-                    escalate_window_secs: s.escalate_window_secs,
-                },
-            );
+            if s.escalate_after_secs == 0 || s.escalate_window_secs == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "approvals.sla for '{}': escalate_after_secs and escalate_window_secs must be > 0",
+                    s.class
+                )));
+            }
+            if sla_overrides
+                .insert(
+                    class,
+                    crate::approval::CriticalitySla {
+                        escalate_after_secs: s.escalate_after_secs,
+                        escalate_window_secs: s.escalate_window_secs,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "approvals.sla: duplicate class '{}'",
+                    s.class
+                )));
+            }
         }
 
         // Criticality rules — compile globs at load so an invalid pattern fails
@@ -415,8 +434,13 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
             }),
             sla_overrides,
             criticality_rules,
-            oob_approver_identity: raw.oob_approver_identity,
+            // Treat a blank identity as unset so the OOB decision path falls back
+            // to its generic label rather than failing the non-empty check.
+            oob_approver_identity: raw
+                .oob_approver_identity
+                .filter(|s| !s.trim().is_empty()),
             reauth_interval_secs: raw.reauth_interval_secs,
+            enforce_separation_of_duty: raw.enforce_separation_of_duty.unwrap_or(false),
         })
     }
 }
@@ -676,6 +700,42 @@ action = "deny"
         let shadow =
             format!("{}\n{}", label("a.b", "mock.echo"), label("c.d", "a.b"));
         assert!(Config::parse(&shadow).is_err());
+    }
+
+    #[test]
+    fn test_approval_sla_and_criticality_validation() {
+        // Valid SLA + rule parses.
+        assert!(Config::parse(
+            "[approvals]\n[[approvals.sla]]\nclass = \"high\"\nescalate_after_secs = 60\nescalate_window_secs = 60"
+        )
+        .is_ok());
+        // Zero windows are rejected (would auto-deny immediately).
+        assert!(Config::parse(
+            "[approvals]\n[[approvals.sla]]\nclass = \"high\"\nescalate_after_secs = 0\nescalate_window_secs = 60"
+        )
+        .is_err());
+        assert!(Config::parse(
+            "[approvals]\n[[approvals.sla]]\nclass = \"high\"\nescalate_after_secs = 60\nescalate_window_secs = 0"
+        )
+        .is_err());
+        // Unknown class is rejected.
+        assert!(Config::parse(
+            "[approvals]\n[[approvals.sla]]\nclass = \"urgent\"\nescalate_after_secs = 60\nescalate_window_secs = 60"
+        )
+        .is_err());
+        // Duplicate class is rejected (no silent last-wins).
+        let dup = "[approvals]\n\
+            [[approvals.sla]]\nclass = \"high\"\nescalate_after_secs = 60\nescalate_window_secs = 60\n\
+            [[approvals.sla]]\nclass = \"high\"\nescalate_after_secs = 10\nescalate_window_secs = 10";
+        assert!(Config::parse(dup).is_err());
+        // A bad criticality-rule glob fails at load.
+        assert!(Config::parse(
+            "[approvals]\n[[approvals.criticality_rules]]\ncredential_pattern = \"[bad\"\nclass = \"high\""
+        )
+        .is_err());
+        // A blank oob_approver_identity is normalized to None.
+        let cfg = Config::parse("[approvals]\noob_approver_identity = \"   \"").unwrap();
+        assert!(cfg.approval.oob_approver_identity.is_none());
     }
 
     #[test]

@@ -299,17 +299,31 @@ pub trait StorageBackend: Send + Sync {
     /// Atomically approve or deny an open approval (read-modify-write under the
     /// backend's lock), returning the updated request. `channel` is the decision
     /// channel and `approver_identity` the authenticated approver (V5; required —
-    /// a blank identity is rejected). Errors with [`StorageError::Conflict`] if it
-    /// is no longer open.
+    /// a blank identity is rejected). When `enforce_sod` is set, a self-approval
+    /// is rejected with [`StorageError::Conflict`]; either way the SoD outcome is
+    /// recorded on the request. Errors with [`StorageError::Conflict`] if it is no
+    /// longer open.
     async fn decide_approval(
         &self,
         _id: &str,
         _approve: bool,
         _channel: &str,
         _approver_identity: &str,
+        _enforce_sod: bool,
         _note: Option<String>,
     ) -> Result<ApprovalRequest, StorageError> {
         Err(StorageError::ApprovalNotFound(_id.to_string()))
+    }
+
+    /// Atomically advance one approval through its SLA lifecycle and apply a
+    /// continuous-reauth lapse, under the backend's lock, returning the updated
+    /// request (V5). Unlike a read-then-`update_approval`, this re-reads the
+    /// authoritative on-disk state and mutates in place, so it can never clobber
+    /// a decision committed concurrently by another process.
+    async fn poll_refresh_approval(&self, id: &str) -> Result<ApprovalRequest, StorageError> {
+        self.get_approval(id)
+            .await?
+            .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))
     }
 
     /// Advance every open approval through its SLA lifecycle (V5): escalate those

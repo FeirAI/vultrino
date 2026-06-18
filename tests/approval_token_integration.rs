@@ -693,7 +693,7 @@ async fn test_ownership_check_blocks_foreign_principal() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "test", "secops", None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "test", "secops", false, None).await.unwrap();
 
     // Foreign principal: rejected, and the action must NOT have run.
     let err = server
@@ -745,7 +745,7 @@ async fn test_preflight_failure_is_retryable_and_does_not_burn_token() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", false, None).await.unwrap();
 
     let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
     assert!(!resumed.executed, "preflight failure must remain retryable");
@@ -768,7 +768,7 @@ async fn test_stale_execution_claim_recovers() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", false, None).await.unwrap();
 
     // Simulate a crashed worker holding a stale claim.
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -798,7 +798,7 @@ async fn test_heartbeat_prevents_stale_reclaim() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", false, None).await.unwrap();
 
     // Worker A claims, then its claim ages past the stale window...
     let claimed = storage.claim_approval_for_execution(&approval.id).await.unwrap();
@@ -839,7 +839,7 @@ async fn test_resume_with_unusable_token_is_terminal() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", false, None).await.unwrap();
 
     // Token is revoked after approval but before the agent polls to execute.
     storage.set_use_token_revoked(&token.id).await.unwrap();
@@ -953,7 +953,7 @@ async fn test_deny_pushed_after_approval_blocks_resume() {
         ExecutionOutcome::Pending(a) => a.id,
         other => panic!("expected Pending, got {other:?}"),
     };
-    storage.decide_approval(&approval_id, true, "approver", "secops", None).await.unwrap();
+    storage.decide_approval(&approval_id, true, "approver", "secops", false, None).await.unwrap();
 
     // Emergency Deny pushed (evaluated after the allow policy, which defaults to
     // Allow → continue → the Deny policy denies).
@@ -1029,7 +1029,7 @@ async fn test_default_deny_approved_action_still_resumes() {
     };
 
     storage
-        .decide_approval(&approval_id, true, "test approver", "secops", None)
+        .decide_approval(&approval_id, true, "test approver", "secops", false, None)
         .await
         .unwrap();
 
@@ -1207,7 +1207,7 @@ async fn test_per_agent_deny_refires_at_resume() {
     // Push a per-agent Deny and approve; the resume must be blocked.
     storage.store_policy(&Policy::deny_all("kill-bot", "api-*").with_principal("refund-bot")).await.unwrap();
     server.reload_policies().await.unwrap();
-    storage.decide_approval(&approval_id, true, "approver", "secops", None).await.unwrap();
+    storage.decide_approval(&approval_id, true, "approver", "secops", false, None).await.unwrap();
 
     let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
     assert!(
@@ -1286,7 +1286,7 @@ async fn test_spend_capped_approval_resumes_without_recharge() {
         other => panic!("expected PolicyDenied, got {other:?}"),
     }
 
-    storage.decide_approval(&approval_id, true, "approver", "secops", None).await.unwrap();
+    storage.decide_approval(&approval_id, true, "approver", "secops", false, None).await.unwrap();
 
     // Resume must succeed (read-only spend check does not re-charge/deny).
     let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
@@ -1636,7 +1636,7 @@ async fn test_v5_approver_identity_recorded_and_sod_computable() {
 
     // A blank approver identity is rejected (every decision must be attributable).
     let err = storage
-        .decide_approval(&approval.id, true, "admin panel", "  ", None)
+        .decide_approval(&approval.id, true, "admin panel", "  ", false, None)
         .await
         .unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("approver identity"), "got: {err}");
@@ -1644,7 +1644,7 @@ async fn test_v5_approver_identity_recorded_and_sod_computable() {
     // Self-approval (approver == requester owner) records the identity and is a
     // computable SoD violation.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "agent-x", None)
+        .decide_approval(&approval.id, true, "admin panel", "agent-x", false, None)
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -1680,9 +1680,97 @@ async fn test_v5_distinct_approver_satisfies_sod() {
         other => panic!("expected Pending, got {other:?}"),
     };
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops-oncall", None)
+        .decide_approval(&approval.id, true, "admin panel", "secops-oncall", false, None)
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
     assert_eq!(a.violates_sod(), Some(false), "distinct approver satisfies SoD");
+}
+
+#[tokio::test]
+async fn test_v5_reauth_lapse_expires_on_poll() {
+    // V5: an approved-but-unrun grant whose continuous-reauth window lapsed is
+    // expired on the next poll (atomically), rather than executing on a stale
+    // decision — and the resume path returns Expired, not a result.
+    let (server, storage) = setup_v5(|a| {
+        a.reauth_interval_secs = Some(60);
+    })
+    .await;
+    store_credential(&storage, "pay-cred", true).await;
+
+    let req = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "x": 1 }),
+    };
+    let approval = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+
+    // Approve it, then back-date the decision so the reauth window has lapsed.
+    storage
+        .decide_approval(&approval.id, true, "admin panel", "secops", false, None)
+        .await
+        .unwrap();
+    let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    a.decided_at = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+    storage.update_approval(&a).await.unwrap();
+
+    // Poll: the stale grant is expired (re-auth lapsed), not executed.
+    let polled = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    assert_eq!(polled.status, ApprovalStatus::Expired);
+    assert!(!polled.executed, "a lapsed grant must not run");
+    assert_eq!(polled.decided_by.as_deref(), Some("system (reauth lapsed)"));
+}
+
+#[tokio::test]
+async fn test_v5_enforce_sod_rejects_self_approval_end_to_end() {
+    // V5: with enforce_separation_of_duty, a self-approval through the storage
+    // decide path is rejected and the request stays open.
+    let (server, storage) = setup_v5(|a| {
+        a.enforce_separation_of_duty = true;
+    })
+    .await;
+    store_credential(&storage, "pay-cred", true).await;
+
+    let requester = RequesterInfo {
+        principal_kind: "api_key".to_string(),
+        principal_id: Some("k1".to_string()),
+        principal_name: Some("agent-x".to_string()),
+        role: None,
+    };
+    let exec_auth = ExecAuth {
+        auth: None,
+        use_token: None,
+        force_approval: false,
+        requester,
+    };
+    let req = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "x": 1 }),
+    };
+    let approval = match server.execute_gated(req, exec_auth).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+
+    // Self-approval is rejected (SoD enforced).
+    let err = storage
+        .decide_approval(&approval.id, true, "admin panel", "agent-x", true, None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("separation of duty"), "got: {err}");
+    let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(a.status, ApprovalStatus::Pending, "must stay undecided");
+
+    // A distinct approver succeeds even with enforcement on.
+    storage
+        .decide_approval(&approval.id, true, "admin panel", "secops-oncall", true, None)
+        .await
+        .unwrap();
+    let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(a.status, ApprovalStatus::Approved);
+    assert_eq!(a.violates_sod(), Some(false));
 }

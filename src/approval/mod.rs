@@ -198,6 +198,9 @@ pub struct Decision {
     pub approver_identity: String,
     /// Optional free-text note.
     pub note: Option<String>,
+    /// When true, a self-approval (SoD violation) is **rejected** rather than
+    /// merely recorded (V5). Set from `enforce_separation_of_duty` config.
+    pub enforce_sod: bool,
 }
 
 impl Decision {
@@ -207,12 +210,19 @@ impl Decision {
             channel: channel.into(),
             approver_identity: approver_identity.into(),
             note: None,
+            enforce_sod: false,
         }
     }
 
     /// Attach a free-text note.
     pub fn with_note(mut self, note: Option<String>) -> Self {
         self.note = note;
+        self
+    }
+
+    /// Reject (rather than only record) a self-approval SoD violation.
+    pub fn enforcing_sod(mut self, enforce: bool) -> Self {
+        self.enforce_sod = enforce;
         self
     }
 }
@@ -283,6 +293,12 @@ pub struct ApprovalRequest {
     /// to. Required for a human decision; absent only for system expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approver_identity: Option<String>,
+    /// Separation-of-duty outcome recorded at decision time (V5): `Some(true)`
+    /// when the approver was the requesting agent itself (a self-approval),
+    /// `Some(false)` when distinct, `None` when not computable. Recorded on every
+    /// human decision so SoD is observable even when not hard-enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sod_violation: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_note: Option<String>,
     /// SHA-256 of the out-of-band decision token (plaintext is shown only in
@@ -341,6 +357,7 @@ impl ApprovalRequest {
             decided_at: None,
             decided_by: None,
             approver_identity: None,
+            sod_violation: None,
             decision_note: None,
             decision_token_hash,
             executing: false,
@@ -424,10 +441,21 @@ impl ApprovalRequest {
         if !self.status.is_open() {
             return Err(ApprovalError::AlreadyDecided(self.status));
         }
+        // Set the approver before computing SoD (which reads `approver_identity`).
+        self.approver_identity = Some(identity);
+        let sod_violation = self.violates_sod();
+        // Optionally hard-reject a self-*approval* (a self-denial is harmless, so
+        // only Approved is gated); either way the outcome is recorded so the
+        // violation is observable. On rejection, clear the approver we just set so
+        // the request stays cleanly undecided.
+        if decision.enforce_sod && to == ApprovalStatus::Approved && sod_violation == Some(true) {
+            self.approver_identity = None;
+            return Err(ApprovalError::SeparationOfDuty);
+        }
         self.status = to;
         self.decided_at = Some(Utc::now());
         self.decided_by = Some(decision.channel);
-        self.approver_identity = Some(identity);
+        self.sod_violation = sod_violation;
         self.decision_note = decision.note;
         Ok(())
     }
@@ -508,6 +536,8 @@ pub enum ApprovalError {
     InvalidToken,
     #[error("a decision requires an authenticated approver identity")]
     MissingApproverIdentity,
+    #[error("separation of duty: the approver may not be the requesting agent")]
+    SeparationOfDuty,
 }
 
 /// Links embedded in out-of-band notifications.
@@ -609,6 +639,9 @@ pub struct ApprovalConfig {
     /// Optional continuous re-authorization interval in seconds (V5): an approved
     /// grant not run within this window must be re-approved before it executes.
     pub reauth_interval_secs: Option<u64>,
+    /// When true, a self-approval (approver == requesting agent) is **rejected**
+    /// at decision time (V5); otherwise it is recorded + logged but allowed.
+    pub enforce_separation_of_duty: bool,
 }
 
 impl ApprovalConfig {
@@ -631,11 +664,15 @@ impl ApprovalConfig {
                 escalate_window_secs: 4 * 3600,
             },
             CriticalityClass::Medium => {
+                // Split the legacy total window across the two phases so existing
+                // configs keep their effective deadline. The duration accessors
+                // floor each phase at 1s, so the stored sum equals the total
+                // exactly (no `.max(1)` here, which would inflate tiny totals).
                 let total = if self.ttl_secs == 0 { 3600 } else { self.ttl_secs };
                 let half = (total / 2).max(1);
                 CriticalitySla {
                     escalate_after_secs: half,
-                    escalate_window_secs: total.saturating_sub(half).max(1),
+                    escalate_window_secs: total.saturating_sub(half),
                 }
             }
             CriticalityClass::High => CriticalitySla {
@@ -736,8 +773,15 @@ impl ApprovalNotifier for TelegramNotifier {
     async fn notify(&self, approval: &ApprovalRequest, links: &ApprovalLinks) -> Result<(), NotifyError> {
         let api = format!("https://api.telegram.org/bot{}/sendMessage", self.config.bot_token);
 
+        // V5: reflect escalation in the header so a re-ping reads as escalated.
+        let header = if approval.status == ApprovalStatus::Escalated {
+            "Vultrino approval ESCALATED - still needs a decision"
+        } else {
+            "Vultrino approval needed"
+        };
         let text = format!(
-            "\u{1F510} <b>Vultrino approval needed</b>\n\n{}\n\nRequested by: {}\nApproval ID: <code>{}</code>\nExpires: {}",
+            "\u{1F510} <b>{}</b>\n\n{}\n\nRequested by: {}\nApproval ID: <code>{}</code>\nExpires: {}",
+            header,
             html_escape(&approval.summary),
             html_escape(&approval.requester.describe()),
             html_escape(&approval.id),
@@ -808,18 +852,36 @@ impl ApprovalNotifier for WebhookNotifier {
     }
 
     async fn notify(&self, approval: &ApprovalRequest, links: &ApprovalLinks) -> Result<(), NotifyError> {
+        // The event reflects the request's current state so an escalation re-ping
+        // (status == Escalated) is not mislabelled as a fresh request (V5).
+        let event = match approval.status {
+            ApprovalStatus::Pending => "approval.requested",
+            ApprovalStatus::Escalated => "approval.escalated",
+            other => return Err(NotifyError::Config(format!(
+                "refusing to notify for non-open approval status {other}"
+            ))),
+        };
+        // Only include decision links when they're real (an escalation re-ping
+        // carries only a panel link — the one-time decision token isn't re-issued).
+        let mut links_json = serde_json::json!({ "panel_url": links.panel_url });
+        if links.approve_url.starts_with("http") {
+            links_json["approve_url"] = serde_json::json!(links.approve_url);
+            links_json["deny_url"] = serde_json::json!(links.deny_url);
+        }
         let payload = serde_json::json!({
-            "event": "approval.requested",
+            "event": event,
             "approval": {
                 "id": approval.id,
+                "status": approval.status.to_string(),
                 "summary": approval.summary,
                 "credential": approval.credential,
                 "action": approval.action,
+                "criticality": approval.criticality.to_string(),
                 "requested_by": approval.requester.describe(),
                 "created_at": approval.created_at,
                 "expires_at": approval.expires_at,
             },
-            "links": links,
+            "links": links_json,
         });
 
         let mut req = self.client.post(&self.config.url).json(&payload);
@@ -1005,6 +1067,36 @@ mod tests {
         let (mut b, _) = new_approval();
         b.deny(Decision::new("admin panel", "secops-oncall")).unwrap();
         assert_eq!(b.violates_sod(), Some(false));
+    }
+
+    #[test]
+    fn test_sod_recorded_always_and_enforced_when_configured() {
+        // Recorded but allowed by default.
+        let (mut a, _) = new_approval();
+        a.approve(Decision::new("admin panel", "agent")).unwrap();
+        assert_eq!(a.sod_violation, Some(true));
+        assert_eq!(a.status, ApprovalStatus::Approved, "allowed when not enforcing");
+
+        // Hard-reject a self-approval when enforcing; the request stays undecided
+        // and the approver is cleared.
+        let (mut b, _) = new_approval();
+        let err = b
+            .approve(Decision::new("admin panel", "AGENT").enforcing_sod(true))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::SeparationOfDuty));
+        assert_eq!(b.status, ApprovalStatus::Pending);
+        assert!(b.approver_identity.is_none());
+
+        // A distinct approver passes even when enforcing.
+        b.approve(Decision::new("admin panel", "secops").enforcing_sod(true)).unwrap();
+        assert_eq!(b.status, ApprovalStatus::Approved);
+        assert_eq!(b.sod_violation, Some(false));
+
+        // A self-*denial* is harmless and is never blocked, even when enforcing.
+        let (mut c, _) = new_approval();
+        c.deny(Decision::new("admin panel", "agent").enforcing_sod(true)).unwrap();
+        assert_eq!(c.status, ApprovalStatus::Denied);
+        assert_eq!(c.sod_violation, Some(true), "recorded even on deny");
     }
 
     #[test]
