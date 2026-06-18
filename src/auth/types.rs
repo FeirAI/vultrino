@@ -23,6 +23,11 @@ pub enum Permission {
     Delete,
     /// Use credentials to make authenticated requests
     Execute,
+    /// Administer the enforcement plane at runtime: create/update/delete
+    /// policies, mint/revoke tokens, manage roles and credential metadata via
+    /// the admin API (V1). This is strictly more powerful than the others and is
+    /// held only by the admin role (or roles an operator explicitly grants it).
+    Admin,
 }
 
 impl Permission {
@@ -34,6 +39,7 @@ impl Permission {
             Permission::Update,
             Permission::Delete,
             Permission::Execute,
+            Permission::Admin,
         ]
         .into_iter()
         .collect()
@@ -47,6 +53,7 @@ impl Permission {
             "update" => Some(Permission::Update),
             "delete" => Some(Permission::Delete),
             "execute" => Some(Permission::Execute),
+            "admin" => Some(Permission::Admin),
             _ => None,
         }
     }
@@ -80,6 +87,7 @@ impl std::fmt::Display for Permission {
             Permission::Update => write!(f, "update"),
             Permission::Delete => write!(f, "delete"),
             Permission::Execute => write!(f, "execute"),
+            Permission::Admin => write!(f, "admin"),
         }
     }
 }

@@ -736,6 +736,18 @@ impl VultrinoServer {
         &self.policy_engine
     }
 
+    /// Reload the policy engine from the **union** of the static config policies
+    /// and the admin-API-managed stored policies (V1). Called once at startup
+    /// and after every admin policy mutation so a runtime push takes effect
+    /// without a restart. Config policies remain declarative/code-managed; the
+    /// admin API only adds, edits, or removes *stored* policies (by id).
+    pub async fn reload_policies(&self) -> Result<(), VultrinoError> {
+        let mut all = self.config.policies.clone();
+        all.extend(self.storage.list_stored_policies().await?);
+        self.policy_engine.load_policies(all);
+        Ok(())
+    }
+
     /// Get the server configuration
     pub fn config(&self) -> &Config {
         &self.config

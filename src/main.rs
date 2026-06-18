@@ -840,6 +840,10 @@ async fn run_server(config: Config, bind: String) -> Result<(), Box<dyn std::err
     if let Err(e) = server.load_plugins().await {
         warn!("Failed to load plugins: {}", e);
     }
+    // Merge admin-API-managed policies into the engine (V1).
+    if let Err(e) = server.reload_policies().await {
+        warn!("Failed to load stored policies: {}", e);
+    }
 
     // TODO: Implement JSON API server
     // For now, just print info and wait
@@ -867,6 +871,11 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     // Load installed plugins
     if let Err(e) = server.load_plugins().await {
         eprintln!("Warning: Failed to load plugins: {}", e);
+    }
+    // Merge admin-API-managed policies into the engine (V1) so this process
+    // enforces the same policy set govder pushed to the web server.
+    if let Err(e) = server.reload_policies().await {
+        eprintln!("Warning: Failed to load stored policies: {}", e);
     }
 
     let vultrino = Arc::new(RwLock::new(server));
@@ -901,6 +910,10 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
     let exec_server = VultrinoServer::new(config.clone(), storage.clone(), resolver);
     if let Err(e) = exec_server.load_plugins().await {
         warn!("Failed to load plugins: {}", e);
+    }
+    // Merge admin-API-managed policies into the engine (V1).
+    if let Err(e) = exec_server.reload_policies().await {
+        warn!("Failed to load stored policies: {}", e);
     }
     let exec_server = Arc::new(exec_server);
 
@@ -2028,6 +2041,8 @@ async fn approval_status(
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage, resolver);
     server.load_plugins().await?;
+    // Apply admin-API-managed policies (V1) so the CLI enforces the same set.
+    server.reload_policies().await?;
 
     loop {
         // None = trusted local/admin caller (no principal ownership check).
@@ -2176,6 +2191,8 @@ async fn make_request(
 
     // Load installed plugins
     server.load_plugins().await?;
+    // Apply admin-API-managed policies (V1) so the CLI enforces the same set.
+    server.reload_policies().await?;
 
     // Build request
     let request = ExecuteRequest {
@@ -2324,6 +2341,8 @@ async fn execute_action(
 
     // Load installed plugins
     server.load_plugins().await?;
+    // Apply admin-API-managed policies (V1) so the CLI enforces the same set.
+    server.reload_policies().await?;
 
     // Parse params
     let params_json: serde_json::Value = if let Some(p) = params {

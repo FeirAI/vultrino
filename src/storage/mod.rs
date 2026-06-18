@@ -8,6 +8,7 @@ pub use file::FileStorage;
 
 use crate::approval::{ApprovalRequest, ApprovalStatus};
 use crate::auth::{ApiKey, Role, UseToken};
+use crate::policy::Policy;
 use crate::{Credential, CredentialMetadata};
 use async_trait::async_trait;
 use thiserror::Error;
@@ -39,6 +40,9 @@ pub enum StorageError {
     #[error("Approval request not found: {0}")]
     ApprovalNotFound(String),
 
+    #[error("Policy not found: {0}")]
+    PolicyNotFound(String),
+
     #[error("Conflict: {0}")]
     Conflict(String),
 
@@ -59,6 +63,22 @@ pub enum StorageError {
 
     #[error("Invalid storage configuration: {0}")]
     InvalidConfig(String),
+}
+
+/// Outcome of reserving an [`Idempotency-Key`](StorageBackend::idempotency_check_or_reserve)
+/// for an admin-API mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyState {
+    /// No prior record (or a stale, orphaned reservation) — the caller has now
+    /// reserved the key and should perform the operation, then call
+    /// [`StorageBackend::idempotency_complete`] (or `idempotency_release` on
+    /// failure).
+    Fresh,
+    /// A concurrent request holds a fresh reservation for this key; the caller
+    /// should not perform the operation (typically returns HTTP 409).
+    Pending,
+    /// The operation already completed under this key — replay this response.
+    Done { status: u16, body: String },
 }
 
 /// Trait for credential storage backends
@@ -270,6 +290,62 @@ pub trait StorageBackend: Send + Sync {
         _id: &str,
     ) -> Result<Option<ApprovalRequest>, StorageError> {
         Ok(None)
+    }
+
+    // ==================== Policy Storage (admin API, V1) ====================
+    //
+    // Policies pushed at runtime via the admin API. Distinct from the static
+    // config policies; the server merges both into the live engine. Default
+    // impls are no-ops/empty so non-file backends and test doubles still compile.
+
+    /// Store (create or replace) a policy by its id.
+    async fn store_policy(&self, _policy: &Policy) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable(
+            "policy storage not supported by this storage backend".to_string(),
+        ))
+    }
+
+    /// Get a stored policy by id.
+    async fn get_policy(&self, _id: &str) -> Result<Option<Policy>, StorageError> {
+        Ok(None)
+    }
+
+    /// List all admin-API-managed policies (not the static config policies).
+    async fn list_stored_policies(&self) -> Result<Vec<Policy>, StorageError> {
+        Ok(vec![])
+    }
+
+    /// Delete a stored policy by id.
+    async fn delete_policy(&self, id: &str) -> Result<(), StorageError> {
+        Err(StorageError::PolicyNotFound(id.to_string()))
+    }
+
+    // ==================== Idempotency (admin API, V1) ====================
+
+    /// Atomically check for / reserve an `Idempotency-Key`. See
+    /// [`IdempotencyState`]. The default impl is non-persistent and always
+    /// returns `Fresh` (no idempotency), which is safe but not deduplicating.
+    async fn idempotency_check_or_reserve(
+        &self,
+        _key: &str,
+    ) -> Result<IdempotencyState, StorageError> {
+        Ok(IdempotencyState::Fresh)
+    }
+
+    /// Record the completed response for a reserved key, to replay on repeats.
+    async fn idempotency_complete(
+        &self,
+        _key: &str,
+        _status: u16,
+        _body: &str,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Release a still-pending reservation (e.g. the operation failed) so the
+    /// key can be retried. Must not clobber an already-completed record.
+    async fn idempotency_release(&self, _key: &str) -> Result<(), StorageError> {
+        Ok(())
     }
 
     /// Reload data from underlying storage

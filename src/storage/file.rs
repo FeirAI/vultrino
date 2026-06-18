@@ -2,13 +2,14 @@
 //!
 //! Stores credentials in an encrypted JSON file on disk.
 
-use super::{StorageBackend, StorageError};
+use super::{IdempotencyState, StorageBackend, StorageError};
 use crate::approval::ApprovalRequest;
 use crate::auth::{ApiKey, Role, UseToken};
 use crate::crypto::{decrypt, derive_key, encrypt, generate_salt, EncryptedData, MasterKey};
+use crate::policy::Policy;
 use crate::{Credential, CredentialMetadata};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,21 @@ const STALE_EXECUTING_SECS: i64 = 120;
 /// recorded version is greater than this was written by a newer vultrino; we
 /// refuse to open it rather than silently round-trip (and drop) fields we don't
 /// know about.
-const STORAGE_VERSION: u32 = 3;
+///
+/// v4 (V1 admin API): adds the `policies` and `idempotency` maps. New fields use
+/// `#[serde(default)]`, so a v4 binary reads older vaults fine; an older binary
+/// is correctly refused a v4 vault by [`check_version`] rather than silently
+/// dropping admin-managed policies on its next write.
+const STORAGE_VERSION: u32 = 4;
+
+/// A reservation older than this (seconds) is assumed orphaned by a crashed
+/// request and may be re-reserved, so a single failed admin call can't block a
+/// given Idempotency-Key forever.
+const STALE_IDEMPOTENCY_RESERVATION_SECS: i64 = 60;
+
+/// Completed idempotency records older than this (seconds) are garbage-collected
+/// opportunistically so the map can't grow without bound.
+const IDEMPOTENCY_RETENTION_SECS: i64 = 24 * 60 * 60;
 
 /// Refuse to open a vault written by a newer binary.
 fn check_version(found: u32) -> Result<(), StorageError> {
@@ -50,6 +65,22 @@ pub struct FileStorage {
     salt: Vec<u8>,
 }
 
+/// A record of an idempotent admin-API mutation: a reservation taken under the
+/// storage lock, later completed with the response to replay on a repeated key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IdempotencyRecord {
+    /// True once the operation finished and `status`/`response` are populated.
+    done: bool,
+    /// Stored HTTP status to replay on a repeated key.
+    #[serde(default)]
+    status: u16,
+    /// Stored JSON body to replay on a repeated key.
+    #[serde(default)]
+    response: String,
+    /// When the key was first reserved (for stale-reservation recovery and GC).
+    created_at: DateTime<Utc>,
+}
+
 /// In-memory cache of all storage data
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StorageCache {
@@ -67,6 +98,13 @@ struct StorageCache {
     /// Approval requests by ID
     #[serde(default)]
     approvals: HashMap<String, ApprovalRequest>,
+    /// Policies pushed via the admin API (V1), keyed by policy id. The server
+    /// merges these with the static config policies into the live engine.
+    #[serde(default)]
+    policies: HashMap<String, Policy>,
+    /// Idempotency records for admin-API mutations, keyed by Idempotency-Key.
+    #[serde(default)]
+    idempotency: HashMap<String, IdempotencyRecord>,
 
     // Secondary indexes for O(1) lookups (not serialized, rebuilt on load)
     /// Index: credential alias -> credential ID
@@ -111,6 +149,16 @@ impl StorageCache {
         for (id, token) in &self.use_tokens {
             self.use_token_hash_index.insert(token.token_hash.clone(), id.clone());
         }
+    }
+
+    /// Drop completed idempotency records past their retention window so the
+    /// map can't grow without bound. In-flight (not-done) reservations are kept
+    /// unless they're stale (handled at reserve time).
+    fn gc_idempotency(&mut self) {
+        let now = Utc::now();
+        self.idempotency.retain(|_, rec| {
+            !rec.done || (now - rec.created_at).num_seconds() < IDEMPOTENCY_RETENTION_SECS
+        });
     }
 }
 
@@ -698,6 +746,114 @@ impl StorageBackend for FileStorage {
             .await
     }
 
+    // ==================== Policy Storage (admin API, V1) ====================
+
+    async fn store_policy(&self, policy: &Policy) -> Result<(), StorageError> {
+        let policy = policy.clone();
+        self.locked_mutate(move |cache| {
+            cache.policies.insert(policy.id.clone(), policy);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_policy(&self, id: &str) -> Result<Option<Policy>, StorageError> {
+        let cache = self.cache.read();
+        Ok(cache.policies.get(id).cloned())
+    }
+
+    async fn list_stored_policies(&self) -> Result<Vec<Policy>, StorageError> {
+        let cache = self.cache.read();
+        Ok(cache.policies.values().cloned().collect())
+    }
+
+    async fn delete_policy(&self, id: &str) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            if cache.policies.remove(id).is_none() {
+                return Err(StorageError::PolicyNotFound(id.to_string()));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    // ==================== Idempotency (admin API, V1) ====================
+
+    async fn idempotency_check_or_reserve(
+        &self,
+        key: &str,
+    ) -> Result<IdempotencyState, StorageError> {
+        let key = key.to_string();
+        self.locked_mutate(move |cache| {
+            match cache.idempotency.get(&key) {
+                // A completed record → replay the stored response verbatim.
+                Some(rec) if rec.done => Ok(IdempotencyState::Done {
+                    status: rec.status,
+                    body: rec.response.clone(),
+                }),
+                // A fresh, still-in-flight reservation held by a concurrent
+                // request → tell the caller to back off.
+                Some(rec)
+                    if (Utc::now() - rec.created_at).num_seconds()
+                        <= STALE_IDEMPOTENCY_RESERVATION_SECS =>
+                {
+                    Ok(IdempotencyState::Pending)
+                }
+                // Absent, or a stale (orphaned) reservation → (re)reserve it for
+                // this caller atomically under the lock.
+                _ => {
+                    cache.gc_idempotency();
+                    cache.idempotency.insert(
+                        key.clone(),
+                        IdempotencyRecord {
+                            done: false,
+                            status: 0,
+                            response: String::new(),
+                            created_at: Utc::now(),
+                        },
+                    );
+                    Ok(IdempotencyState::Fresh)
+                }
+            }
+        })
+        .await
+    }
+
+    async fn idempotency_complete(
+        &self,
+        key: &str,
+        status: u16,
+        body: &str,
+    ) -> Result<(), StorageError> {
+        let (key, body) = (key.to_string(), body.to_string());
+        self.locked_mutate(move |cache| {
+            cache.idempotency.insert(
+                key.clone(),
+                IdempotencyRecord {
+                    done: true,
+                    status,
+                    response: body,
+                    created_at: Utc::now(),
+                },
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    async fn idempotency_release(&self, key: &str) -> Result<(), StorageError> {
+        let key = key.to_string();
+        self.locked_mutate(move |cache| {
+            // Only drop a still-pending reservation; never clobber a completed
+            // record (a late release after another request completed it).
+            if matches!(cache.idempotency.get(&key), Some(rec) if !rec.done) {
+                cache.idempotency.remove(&key);
+            }
+            Ok(())
+        })
+        .await
+    }
+
     async fn reload(&self) -> Result<(), StorageError> {
         FileStorage::reload(self).await
     }
@@ -894,5 +1050,76 @@ mod tests {
         storage.update_api_key_last_used("key-1").await.unwrap();
         let updated = storage.get_api_key_by_hash("hash123").await.unwrap().unwrap();
         assert!(updated.last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_policy_storage_crud_and_persistence() {
+        use crate::policy::Policy;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.enc");
+        let password = SecretString::from("test");
+
+        let policy = Policy::allow_all("p1", "github-*");
+        let id = policy.id.clone();
+        {
+            let storage = FileStorage::new(&path, &password).await.unwrap();
+            storage.store_policy(&policy).await.unwrap();
+            assert_eq!(storage.list_stored_policies().await.unwrap().len(), 1);
+            assert_eq!(storage.get_policy(&id).await.unwrap().unwrap().name, "p1");
+        }
+        // Survives a reopen (persisted under v4).
+        {
+            let storage = FileStorage::new(&path, &password).await.unwrap();
+            assert_eq!(storage.get_policy(&id).await.unwrap().unwrap().credential_pattern, "github-*");
+            storage.delete_policy(&id).await.unwrap();
+            assert!(storage.get_policy(&id).await.unwrap().is_none());
+            assert!(matches!(
+                storage.delete_policy(&id).await,
+                Err(StorageError::PolicyNotFound(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_idempotency_reserve_complete_replay_release() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.enc");
+        let password = SecretString::from("test");
+        let storage = FileStorage::new(&path, &password).await.unwrap();
+
+        // First reservation is Fresh; a concurrent second one is Pending.
+        assert_eq!(
+            storage.idempotency_check_or_reserve("k1").await.unwrap(),
+            IdempotencyState::Fresh
+        );
+        assert_eq!(
+            storage.idempotency_check_or_reserve("k1").await.unwrap(),
+            IdempotencyState::Pending
+        );
+
+        // Completing the op stores the response; subsequent checks replay it.
+        storage.idempotency_complete("k1", 201, "{\"ok\":true}").await.unwrap();
+        assert_eq!(
+            storage.idempotency_check_or_reserve("k1").await.unwrap(),
+            IdempotencyState::Done { status: 201, body: "{\"ok\":true}".to_string() }
+        );
+
+        // Release only drops a pending reservation, never a completed record.
+        assert_eq!(
+            storage.idempotency_check_or_reserve("k2").await.unwrap(),
+            IdempotencyState::Fresh
+        );
+        storage.idempotency_release("k2").await.unwrap();
+        assert_eq!(
+            storage.idempotency_check_or_reserve("k2").await.unwrap(),
+            IdempotencyState::Fresh,
+            "released key should be re-reservable"
+        );
+        // Releasing a completed key is a no-op (still replays).
+        storage.idempotency_release("k1").await.unwrap();
+        assert!(matches!(
+            storage.idempotency_check_or_reserve("k1").await.unwrap(),
+            IdempotencyState::Done { .. }
+        ));
     }
 }

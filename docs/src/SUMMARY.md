@@ -44,6 +44,7 @@
 # API Reference
 
 - [HTTP API](./api/http.md)
+- [Admin API](./api/admin.md)
 - [MCP Tools](./api/mcp-tools.md)
 
 # LLM Reference

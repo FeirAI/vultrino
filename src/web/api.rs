@@ -4,15 +4,15 @@
 //! Vultrino using API keys instead of session-based authentication.
 
 use axum::{
-    extract::{Json, Path, State},
-    http::{header, StatusCode},
+    extract::{FromRequestParts, Json, Path, State},
+    http::{header, request::Parts, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::approval::ApprovalStatus;
-use crate::auth::{AuthResult, Permission, UseToken};
+use crate::auth::{AuthResult, NewUseToken, Permission, UseToken, UseTokenMetadata};
 use crate::server::ExecAuth;
 use crate::{ExecuteRequest, ExecutionOutcome};
 
@@ -20,6 +20,10 @@ use super::server::AppState;
 
 use crate::auth::ApiKey;
 use crate::auth::Role;
+use crate::policy::{Policy, PolicyAction, PolicyRule};
+use crate::storage::IdempotencyState;
+use crate::{Credential, CredentialData, CredentialMetadata};
+use chrono::Duration;
 
 /// Extract API key from Authorization header
 fn extract_api_key(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -400,6 +404,450 @@ pub async fn api_health() -> impl IntoResponse {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+// ============================================================================
+// Admin API (V1) — runtime config-write surface for the enforcement plane.
+//
+// All endpoints require an API key (vk_) whose role holds `Permission::Admin`;
+// use tokens are rejected outright. Mutations persist to storage and take effect
+// on the next request without a restart. Creates/mints honor an optional
+// `Idempotency-Key` header so a retried request never double-creates.
+// ============================================================================
+
+/// Extractor that authenticates an admin caller from request headers **before**
+/// the request body is read. Placing it ahead of the `Json<T>` body extractor
+/// ensures an unauthenticated request is rejected with 401/403 rather than a
+/// 422 body-parse error (which would otherwise leak that auth wasn't checked
+/// first and give inconsistent status codes).
+pub struct AdminApiAuth(#[allow(dead_code)] pub AuthResult);
+
+impl FromRequestParts<AppState> for AdminApiAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        require_admin(state, &parts.headers).await.map(AdminApiAuth)
+    }
+}
+
+/// Authenticate an admin caller: an API key with `Permission::Admin`. Use tokens
+/// can never reach the admin surface.
+async fn require_admin(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<AuthResult, Response> {
+    let secret = extract_api_key(headers).ok_or_else(|| {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "missing_api_key",
+            "Authorization header with Bearer API key required",
+        )
+    })?;
+    if UseToken::looks_like_token(&secret) {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "not_admin",
+            "Use tokens cannot access the admin API; an API key with 'admin' permission is required",
+        ));
+    }
+    let (key, role) = validate_api_key(state, &secret)
+        .await
+        .map_err(|e| error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", e))?;
+    let auth = AuthResult { api_key: key, role };
+    if !auth.has_permission(Permission::Admin) {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "API key does not have 'admin' permission",
+        ));
+    }
+    Ok(auth)
+}
+
+/// Read the optional `Idempotency-Key` request header.
+fn extract_idempotency_key(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Rebuild a stored JSON response (status + body) for an idempotent replay.
+fn replay_json(status: u16, body: String) -> Response {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+/// Run an admin mutation under optional `Idempotency-Key` dedup. On a repeated
+/// key it replays the stored 2xx response (or 409 if one is still in flight);
+/// non-success responses release the reservation so the client can retry.
+async fn idempotent<F, Fut>(state: &AppState, key: Option<String>, op: F) -> Response
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = (StatusCode, serde_json::Value)>,
+{
+    let Some(key) = key else {
+        let (status, body) = op().await;
+        return (status, Json(body)).into_response();
+    };
+    match state.storage.idempotency_check_or_reserve(&key).await {
+        Ok(IdempotencyState::Done { status, body }) => return replay_json(status, body),
+        Ok(IdempotencyState::Pending) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "idempotency_in_progress",
+                "A request with this Idempotency-Key is already in progress",
+            )
+        }
+        Ok(IdempotencyState::Fresh) => {}
+        Err(e) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string())
+        }
+    }
+    let (status, body) = op().await;
+    if status.is_success() {
+        let body_str = serde_json::to_string(&body).unwrap_or_default();
+        let _ = state
+            .storage
+            .idempotency_complete(&key, status.as_u16(), &body_str)
+            .await;
+    } else {
+        // Don't pin a failed attempt to the key — let the client retry it.
+        let _ = state.storage.idempotency_release(&key).await;
+    }
+    (status, Json(body)).into_response()
+}
+
+// -------- Policies --------
+
+/// Body for creating/replacing a policy. `id` is optional on create (generated)
+/// and ignored on PUT (the path id wins).
+#[derive(Deserialize)]
+pub struct PolicyUpsertRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub name: String,
+    pub credential_pattern: String,
+    #[serde(default)]
+    pub rules: Vec<PolicyRule>,
+    pub default_action: PolicyAction,
+}
+
+/// Build a validated `Policy` from a request, optionally forcing the id (PUT).
+fn build_policy(req: PolicyUpsertRequest, forced_id: Option<String>) -> Result<Policy, String> {
+    if req.name.trim().is_empty() {
+        return Err("policy name must not be empty".to_string());
+    }
+    // Fail loud on a credential_pattern that doesn't compile, rather than
+    // storing a policy whose glob silently degrades to never matching.
+    glob::Pattern::new(&req.credential_pattern)
+        .map_err(|e| format!("invalid credential_pattern '{}': {}", req.credential_pattern, e))?;
+    // Use the builder so new optional Policy fields get their defaults.
+    let mut policy = Policy::deny_all(req.name, req.credential_pattern);
+    policy.id = forced_id
+        .or(req.id)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    policy.default_action = req.default_action;
+    policy.rules = req.rules;
+    Ok(policy)
+}
+
+/// Persist a policy and hot-reload the engine, returning the canonical object.
+async fn store_and_reload_policy(state: &AppState, policy: &Policy, created: bool) -> (StatusCode, serde_json::Value) {
+    if let Err(e) = state.storage.store_policy(policy).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"code": "storage_error", "error": e.to_string()}),
+        );
+    }
+    if let Err(e) = state.server.reload_policies().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"code": "reload_error", "error": e.to_string()}),
+        );
+    }
+    let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+    (status, serde_json::to_value(policy).unwrap_or_default())
+}
+
+/// `POST /api/v1/policies` — create a policy (id generated if omitted).
+pub async fn api_create_policy(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<PolicyUpsertRequest>,
+) -> Response {
+    let key = extract_idempotency_key(&headers);
+    let st = state.clone();
+    idempotent(&state, key, move || async move {
+        match build_policy(req, None) {
+            Ok(policy) => store_and_reload_policy(&st, &policy, true).await,
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"code": "invalid_policy", "error": e}),
+            ),
+        }
+    })
+    .await
+}
+
+/// `PUT /api/v1/policies/{id}` — create or replace the policy with this id.
+pub async fn api_put_policy(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<PolicyUpsertRequest>,
+) -> Response {
+    let key = extract_idempotency_key(&headers);
+    let st = state.clone();
+    idempotent(&state, key, move || async move {
+        match build_policy(req, Some(id)) {
+            Ok(policy) => store_and_reload_policy(&st, &policy, false).await,
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"code": "invalid_policy", "error": e}),
+            ),
+        }
+    })
+    .await
+}
+
+/// `DELETE /api/v1/policies/{id}` — remove a stored (admin-managed) policy.
+pub async fn api_delete_policy(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.storage.delete_policy(&id).await {
+        Ok(()) => {
+            if let Err(e) = state.server.reload_policies().await {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "reload_error", e.to_string());
+            }
+            (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response()
+        }
+        Err(crate::storage::StorageError::PolicyNotFound(_)) => {
+            error_response(StatusCode::NOT_FOUND, "policy_not_found", format!("No stored policy with id '{}'", id))
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
+}
+
+// -------- Use tokens --------
+
+#[derive(Deserialize)]
+pub struct TokenCreateRequest {
+    pub name: String,
+    pub credential_scope: String,
+    #[serde(default)]
+    pub action_scope: Option<String>,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub require_approval: bool,
+    /// Lifetime in seconds from now (optional).
+    #[serde(default)]
+    pub expires_in_secs: Option<i64>,
+}
+
+/// `POST /api/v1/tokens` — mint a use token; the plaintext is returned once.
+pub async fn api_create_token(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<TokenCreateRequest>,
+) -> Response {
+    let key = extract_idempotency_key(&headers);
+    let st = state.clone();
+    idempotent(&state, key, move || async move {
+        let params = NewUseToken {
+            name: req.name,
+            credential_scope: req.credential_scope,
+            action_scope: req.action_scope,
+            max_uses: req.max_uses,
+            require_approval: req.require_approval,
+            expires_in: req.expires_in_secs.map(Duration::seconds),
+        };
+        if let Err(e) = params.validate() {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"code": "invalid_token", "error": e}),
+            );
+        }
+        let (full_token, token) = UseToken::create(params);
+        if let Err(e) = st.storage.store_use_token(&token).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"code": "storage_error", "error": e.to_string()}),
+            );
+        }
+        (
+            StatusCode::CREATED,
+            serde_json::json!({
+                "token": full_token,
+                "warning": "This is the only time the token is shown. Store it securely.",
+                "metadata": UseTokenMetadata::from(&token),
+            }),
+        )
+    })
+    .await
+}
+
+/// `POST /api/v1/tokens/{id}/revoke` — revoke a use token.
+pub async fn api_revoke_token(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.storage.set_use_token_revoked(&id).await {
+        Ok(token) => (StatusCode::OK, Json(serde_json::json!({
+            "revoked": true,
+            "metadata": UseTokenMetadata::from(&token),
+        })))
+            .into_response(),
+        Err(crate::storage::StorageError::UseTokenNotFound(_)) => {
+            error_response(StatusCode::NOT_FOUND, "token_not_found", format!("No use token with id '{}'", id))
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
+}
+
+// -------- Roles --------
+
+#[derive(Deserialize)]
+pub struct RoleCreateRequest {
+    pub name: String,
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    #[serde(default)]
+    pub credential_scopes: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// `POST /api/v1/roles` — create a role.
+pub async fn api_create_role(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<RoleCreateRequest>,
+) -> Response {
+    let key = extract_idempotency_key(&headers);
+    let st = state.clone();
+    idempotent(&state, key, move || async move {
+        if req.name.trim().is_empty() {
+            return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_role","error":"role name must not be empty"}));
+        }
+        let mut perms = std::collections::HashSet::new();
+        for p in &req.permissions {
+            match Permission::parse(p) {
+                Some(perm) => {
+                    perms.insert(perm);
+                }
+                None => {
+                    return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_permission","error":format!("unknown permission '{}'", p)}));
+                }
+            }
+        }
+        // Reject duplicate names so the role index stays unambiguous.
+        if matches!(st.storage.get_role_by_name(&req.name).await, Ok(Some(_))) {
+            return (StatusCode::CONFLICT, serde_json::json!({"code":"role_exists","error":format!("a role named '{}' already exists", req.name)}));
+        }
+        let mut role = Role::new(req.name, perms).with_scopes(req.credential_scopes);
+        if let Some(desc) = req.description {
+            role = role.with_description(desc);
+        }
+        if let Err(e) = st.storage.store_role(&role).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({"code":"storage_error","error":e.to_string()}));
+        }
+        // Make the new role visible to this process's auth manager immediately.
+        let _ = refresh_auth_data(&st).await;
+        (StatusCode::CREATED, serde_json::to_value(&role).unwrap_or_default())
+    })
+    .await
+}
+
+/// `DELETE /api/v1/roles/{id}` — delete a custom role.
+pub async fn api_delete_role(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.storage.delete_role(&id).await {
+        Ok(()) => {
+            let _ = refresh_auth_data(&state).await;
+            (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response()
+        }
+        Err(crate::storage::StorageError::RoleNotFound(_)) => {
+            error_response(StatusCode::NOT_FOUND, "role_not_found", format!("No role with id '{}'", id))
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
+}
+
+// -------- Credentials (metadata; secret material is write-only) --------
+
+#[derive(Deserialize)]
+pub struct CredentialCreateRequest {
+    pub alias: String,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+    /// Tagged credential data (e.g. {"type":"api_key","key":"...",...}). Stored
+    /// encrypted; never returned by any endpoint.
+    pub data: CredentialData,
+}
+
+/// `POST /api/v1/credentials` — store a credential. The response carries only
+/// metadata; the secret material is never echoed back.
+pub async fn api_create_credential(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CredentialCreateRequest>,
+) -> Response {
+    let key = extract_idempotency_key(&headers);
+    let st = state.clone();
+    idempotent(&state, key, move || async move {
+        if req.alias.trim().is_empty() {
+            return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_credential","error":"alias must not be empty"}));
+        }
+        let mut cred = Credential::new(req.alias, req.data);
+        cred.metadata = req.metadata;
+        if let Err(e) = st.storage.store(&cred).await {
+            // Duplicate alias is a client error, not a 500.
+            if let crate::storage::StorageError::AlreadyExists(_) = e {
+                return (StatusCode::CONFLICT, serde_json::json!({"code":"credential_exists","error":e.to_string()}));
+            }
+            return (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({"code":"storage_error","error":e.to_string()}));
+        }
+        // Return metadata only — never the secret.
+        (StatusCode::CREATED, serde_json::to_value(CredentialMetadata::from(&cred)).unwrap_or_default())
+    })
+    .await
+}
+
+/// `DELETE /api/v1/credentials/{id}` — delete a credential by id.
+pub async fn api_delete_credential(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.storage.delete(&id).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response(),
+        Err(crate::storage::StorageError::NotFound(_)) => {
+            error_response(StatusCode::NOT_FOUND, "credential_not_found", format!("No credential with id '{}'", id))
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
 }
 
 #[cfg(test)]

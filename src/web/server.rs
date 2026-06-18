@@ -6,7 +6,7 @@ use crate::storage::StorageBackend;
 use axum::{
     extract::FromRef,
     http::{header, HeaderValue},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use std::sync::Arc;
@@ -164,9 +164,23 @@ impl WebServer {
             .route("/api/stats", get(routes::api_stats))
             // JSON API endpoints (API key auth for CLI/external apps)
             .route("/api/v1/health", get(api::api_health))
-            .route("/api/v1/credentials", get(api::api_list_credentials))
+            .route(
+                "/api/v1/credentials",
+                get(api::api_list_credentials).post(api::api_create_credential),
+            )
+            .route("/api/v1/credentials/{id}", delete(api::api_delete_credential))
             .route("/api/v1/execute", post(api::api_execute))
             .route("/api/v1/approvals/{id}", get(api::api_check_approval))
+            // Admin API (V1): runtime config-write surface (Permission::Admin).
+            .route("/api/v1/policies", post(api::api_create_policy))
+            .route(
+                "/api/v1/policies/{id}",
+                put(api::api_put_policy).delete(api::api_delete_policy),
+            )
+            .route("/api/v1/tokens", post(api::api_create_token))
+            .route("/api/v1/tokens/{id}/revoke", post(api::api_revoke_token))
+            .route("/api/v1/roles", post(api::api_create_role))
+            .route("/api/v1/roles/{id}", delete(api::api_delete_role))
             // Static files
             .nest_service("/static", static_dir);
 
