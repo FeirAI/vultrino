@@ -1095,12 +1095,17 @@ pub async fn approval_approve(
     // Atomic decision under the storage lock (no reload+get+update window). The
     // panel approver's identity is the authenticated session user (V5).
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
-    let _ = state
+    let result = state
         .storage
         .decide_approval(&id, true, "admin panel", &auth.session.username, enforce_sod, None)
         .await;
     let _ = regenerate_csrf_token(&session).await;
-    Redirect::to("/approvals").into_response()
+    // Surface a rejected decision (e.g. a separation-of-duty self-approval, or an
+    // already-decided/expired request) rather than silently redirecting (V5).
+    match result {
+        Ok(_) => Redirect::to("/approvals").into_response(),
+        Err(e) => render_decided("Could not approve", &format!("The approval was not recorded: {}", e), false),
+    }
 }
 
 pub async fn approval_deny(
@@ -1116,12 +1121,15 @@ pub async fn approval_deny(
     // A denial is always allowed regardless of SoD (only approval self-grants are
     // the concern), but pass the flag through for consistent attribution.
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
-    let _ = state
+    let result = state
         .storage
         .decide_approval(&id, false, "admin panel", &auth.session.username, enforce_sod, None)
         .await;
     let _ = regenerate_csrf_token(&session).await;
-    Redirect::to("/approvals").into_response()
+    match result {
+        Ok(_) => Redirect::to("/approvals").into_response(),
+        Err(e) => render_decided("Could not deny", &format!("The denial was not recorded: {}", e), false),
+    }
 }
 
 /// Query/form parameters for an out-of-band decision link.

@@ -1774,3 +1774,76 @@ async fn test_v5_enforce_sod_rejects_self_approval_end_to_end() {
     assert_eq!(a.status, ApprovalStatus::Approved);
     assert_eq!(a.violates_sod(), Some(false));
 }
+
+#[tokio::test]
+async fn test_v5_decide_past_deadline_is_rejected() {
+    // V5: decide_approval advances the lifecycle first, so a decision raced
+    // against the final SLA deadline is rejected (expired), not accepted.
+    let (server, storage) = setup_v5(|_| {}).await;
+    store_credential(&storage, "pay-cred", true).await;
+
+    let req = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "x": 1 }),
+    };
+    let approval = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+
+    // Back-date the final deadline so the request is past expiry.
+    let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    a.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    storage.update_approval(&a).await.unwrap();
+
+    // The decision is refused (the request expired under the lock first); it is
+    // never approved. (The rejected transaction isn't persisted, so the record
+    // stays open until the next poll/sweep expires it — which we then confirm.)
+    let err = storage
+        .decide_approval(&approval.id, true, "admin panel", "secops", false, None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("expire"), "got: {err}");
+    let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_ne!(a.status, ApprovalStatus::Approved, "a past-deadline request must never approve");
+    // A subsequent atomic refresh expires it.
+    let refreshed = storage.poll_refresh_approval(&approval.id).await.unwrap();
+    assert_eq!(refreshed.status, ApprovalStatus::Expired);
+}
+
+#[tokio::test]
+async fn test_v5_poll_refresh_does_not_clobber_a_decision() {
+    // V5 (atomicity): the headline race fix — poll_refresh_approval re-reads the
+    // authoritative state under the lock, so a committed decision is never
+    // reverted to escalated/expired by a stale poll snapshot.
+    let (server, storage) = setup_v5(|_| {}).await;
+    store_credential(&storage, "pay-cred", true).await;
+
+    let req = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "x": 1 }),
+    };
+    let approval = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+
+    // Decide it (Approved).
+    storage
+        .decide_approval(&approval.id, true, "admin panel", "secops", false, None)
+        .await
+        .unwrap();
+
+    // A subsequent poll_refresh must NOT revert the decision (advance_lifecycle is
+    // a no-op on a decided request), even if its boundaries are now in the past.
+    let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    a.escalate_at = chrono::Utc::now() - chrono::Duration::seconds(10);
+    a.expires_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+    storage.update_approval(&a).await.unwrap();
+
+    let refreshed = storage.poll_refresh_approval(&approval.id).await.unwrap();
+    assert_eq!(refreshed.status, ApprovalStatus::Approved, "a decision must survive a poll");
+    assert_eq!(refreshed.approver_identity.as_deref(), Some("secops"));
+}

@@ -320,10 +320,22 @@ pub trait StorageBackend: Send + Sync {
     /// request (V5). Unlike a read-then-`update_approval`, this re-reads the
     /// authoritative on-disk state and mutates in place, so it can never clobber
     /// a decision committed concurrently by another process.
+    ///
+    /// The default advances the lifecycle on a fetched copy (so the returned
+    /// state is correct) without persisting — backends that support approvals
+    /// **must** override it with an atomic read-modify-write (as `FileStorage`
+    /// does). Note the default `claim_approval_for_execution` returns `None`, so a
+    /// backend on these defaults can never execute, hence cannot fail open.
     async fn poll_refresh_approval(&self, id: &str) -> Result<ApprovalRequest, StorageError> {
-        self.get_approval(id)
+        let mut approval = self
+            .get_approval(id)
             .await?
-            .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))
+            .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
+        approval.advance_lifecycle();
+        if approval.needs_reauth() {
+            approval.status = ApprovalStatus::Expired;
+        }
+        Ok(approval)
     }
 
     /// Advance every open approval through its SLA lifecycle (V5): escalate those

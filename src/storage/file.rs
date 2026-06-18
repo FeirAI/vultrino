@@ -755,6 +755,27 @@ impl StorageBackend for FileStorage {
     }
 
     async fn poll_refresh_approval(&self, id: &str) -> Result<ApprovalRequest, StorageError> {
+        // Cheap pre-check on the (freshly reloaded) in-memory cache: only take the
+        // lock + re-encrypt + write path when this request actually has a pending
+        // transition, so a steady-state poll doesn't rewrite the vault every tick.
+        // The authoritative re-check happens under the lock below.
+        {
+            let now = Utc::now();
+            let cache = self.cache.read();
+            match cache.approvals.get(id) {
+                None => return Err(StorageError::ApprovalNotFound(id.to_string())),
+                Some(a) => {
+                    let due = (a.status.is_open()
+                        && (now >= a.expires_at
+                            || (a.status == crate::approval::ApprovalStatus::Pending
+                                && now >= a.escalate_at)))
+                        || a.needs_reauth();
+                    if !due {
+                        return Ok(a.clone());
+                    }
+                }
+            }
+        }
         self.locked_mutate(|cache| {
             let approval = cache
                 .approvals
@@ -785,9 +806,10 @@ impl StorageBackend for FileStorage {
             let now = Utc::now();
             let cache = self.cache.read();
             cache.approvals.values().any(|a| {
-                a.status.is_open()
+                (a.status.is_open()
                     && (now >= a.expires_at
-                        || (a.status == ApprovalStatus::Pending && now >= a.escalate_at))
+                        || (a.status == ApprovalStatus::Pending && now >= a.escalate_at)))
+                    || a.needs_reauth()
             })
         };
         if !any_due {
@@ -799,7 +821,17 @@ impl StorageBackend for FileStorage {
                 match approval.advance_lifecycle() {
                     LifecycleChange::Escalated => sweep.escalated.push(approval.clone()),
                     LifecycleChange::Expired => sweep.expired.push(approval.id.clone()),
-                    LifecycleChange::None => {}
+                    LifecycleChange::None => {
+                        // Also expire an approved-but-unrun grant whose continuous
+                        // reauth window lapsed, so an abandoned stale grant doesn't
+                        // linger as `Approved` in the panel (it must be re-approved).
+                        if approval.needs_reauth() {
+                            approval.status = ApprovalStatus::Expired;
+                            approval.decided_at = Some(Utc::now());
+                            approval.decided_by = Some("system (reauth lapsed)".to_string());
+                            sweep.expired.push(approval.id.clone());
+                        }
+                    }
                 }
             }
             Ok(sweep)

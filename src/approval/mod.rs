@@ -665,10 +665,11 @@ impl ApprovalConfig {
             },
             CriticalityClass::Medium => {
                 // Split the legacy total window across the two phases so existing
-                // configs keep their effective deadline. The duration accessors
-                // floor each phase at 1s, so the stored sum equals the total
-                // exactly (no `.max(1)` here, which would inflate tiny totals).
-                let total = if self.ttl_secs == 0 { 3600 } else { self.ttl_secs };
+                // configs keep their effective deadline. Floor the total at 2s so
+                // each phase is a non-zero whole second (a 0s window is what the
+                // config validator rejects for explicit overrides — keep derived
+                // defaults to the same shape).
+                let total = if self.ttl_secs == 0 { 3600 } else { self.ttl_secs.max(2) };
                 let half = (total / 2).max(1);
                 CriticalitySla {
                     escalate_after_secs: half,
@@ -827,6 +828,47 @@ impl ApprovalNotifier for TelegramNotifier {
     }
 }
 
+/// Build the JSON body a [`WebhookNotifier`] POSTs for an approval (V5). The
+/// `event` reflects the request's current state so an escalation re-ping
+/// (`status == Escalated`) is not mislabelled as a fresh `approval.requested`,
+/// and empty decision links (carried by an escalation re-ping, which doesn't
+/// re-issue the one-time token) are omitted rather than serialized as `""`.
+/// Errors for a non-open status, which is never a live notify path.
+fn webhook_payload(
+    approval: &ApprovalRequest,
+    links: &ApprovalLinks,
+) -> Result<serde_json::Value, NotifyError> {
+    let event = match approval.status {
+        ApprovalStatus::Pending => "approval.requested",
+        ApprovalStatus::Escalated => "approval.escalated",
+        other => {
+            return Err(NotifyError::Config(format!(
+                "refusing to notify for non-open approval status {other}"
+            )))
+        }
+    };
+    let mut links_json = serde_json::json!({ "panel_url": links.panel_url });
+    if links.approve_url.starts_with("http") {
+        links_json["approve_url"] = serde_json::json!(links.approve_url);
+        links_json["deny_url"] = serde_json::json!(links.deny_url);
+    }
+    Ok(serde_json::json!({
+        "event": event,
+        "approval": {
+            "id": approval.id,
+            "status": approval.status.to_string(),
+            "summary": approval.summary,
+            "credential": approval.credential,
+            "action": approval.action,
+            "criticality": approval.criticality.to_string(),
+            "requested_by": approval.requester.describe(),
+            "created_at": approval.created_at,
+            "expires_at": approval.expires_at,
+        },
+        "links": links_json,
+    }))
+}
+
 /// Generic webhook notifier: POSTs the approval + links as JSON to a URL.
 ///
 /// Point it at an email-sending service, Slack, Zapier, or your own endpoint to
@@ -852,37 +894,7 @@ impl ApprovalNotifier for WebhookNotifier {
     }
 
     async fn notify(&self, approval: &ApprovalRequest, links: &ApprovalLinks) -> Result<(), NotifyError> {
-        // The event reflects the request's current state so an escalation re-ping
-        // (status == Escalated) is not mislabelled as a fresh request (V5).
-        let event = match approval.status {
-            ApprovalStatus::Pending => "approval.requested",
-            ApprovalStatus::Escalated => "approval.escalated",
-            other => return Err(NotifyError::Config(format!(
-                "refusing to notify for non-open approval status {other}"
-            ))),
-        };
-        // Only include decision links when they're real (an escalation re-ping
-        // carries only a panel link — the one-time decision token isn't re-issued).
-        let mut links_json = serde_json::json!({ "panel_url": links.panel_url });
-        if links.approve_url.starts_with("http") {
-            links_json["approve_url"] = serde_json::json!(links.approve_url);
-            links_json["deny_url"] = serde_json::json!(links.deny_url);
-        }
-        let payload = serde_json::json!({
-            "event": event,
-            "approval": {
-                "id": approval.id,
-                "status": approval.status.to_string(),
-                "summary": approval.summary,
-                "credential": approval.credential,
-                "action": approval.action,
-                "criticality": approval.criticality.to_string(),
-                "requested_by": approval.requester.describe(),
-                "created_at": approval.created_at,
-                "expires_at": approval.expires_at,
-            },
-            "links": links_json,
-        });
+        let payload = webhook_payload(approval, links)?;
 
         let mut req = self.client.post(&self.config.url).json(&payload);
         if let Some(auth) = &self.config.auth_header {
@@ -1114,6 +1126,34 @@ mod tests {
         // Once executed, it's spent → no reauth.
         a.executed = true;
         assert!(!a.needs_reauth());
+    }
+
+    #[test]
+    fn test_webhook_payload_event_and_links_by_status() {
+        let (mut a, token) = new_approval();
+        let links = a.links("https://vault.example.com", &token);
+
+        // Pending → approval.requested with real decision links.
+        let p = webhook_payload(&a, &links).unwrap();
+        assert_eq!(p["event"], "approval.requested");
+        assert!(p["links"]["approve_url"].is_string());
+        assert_eq!(p["approval"]["status"], "pending");
+
+        // Escalated → approval.escalated; a panel-only link set omits approve/deny.
+        a.status = ApprovalStatus::Escalated;
+        let panel_only = ApprovalLinks {
+            approve_url: String::new(),
+            deny_url: String::new(),
+            panel_url: "https://vault.example.com/approvals".to_string(),
+        };
+        let e = webhook_payload(&a, &panel_only).unwrap();
+        assert_eq!(e["event"], "approval.escalated");
+        assert!(e["links"].get("approve_url").is_none(), "blank links omitted");
+        assert!(e["links"]["panel_url"].is_string());
+
+        // A decided/closed status is not a live notify path → Config error.
+        a.status = ApprovalStatus::Approved;
+        assert!(matches!(webhook_payload(&a, &links), Err(NotifyError::Config(_))));
     }
 
     #[test]

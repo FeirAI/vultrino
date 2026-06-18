@@ -2179,10 +2179,13 @@ async fn decide_approval(
 
     // Atomic read-modify-write under the storage lock (no separate reload+update
     // window that a concurrent writer could clobber). The CLI runs as a trusted
-    // local admin with direct vault access, so its OS-user identity is advisory.
-    let enforce_sod = config.approval.enforce_separation_of_duty;
+    // local admin with direct vault access and an unauthenticated (advisory) OS
+    // user, so SoD is NOT hard-enforced here — doing so would both block a
+    // legitimate same-named operator and be trivially spoofable. The violation is
+    // still recorded + logged. SoD enforcement applies to the authenticated panel
+    // and the identity-bound out-of-band link.
     storage
-        .decide_approval(&id, approve, "cli", &approver, enforce_sod, None)
+        .decide_approval(&id, approve, "cli", &approver, false, None)
         .await
         .map_err(|e| format!("Could not update approval: {}", e))?;
 
