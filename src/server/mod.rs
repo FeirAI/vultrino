@@ -839,9 +839,23 @@ pub fn merge_policies(
     use std::collections::HashSet;
     let mut seen: HashSet<String> = HashSet::new();
     let mut all = Vec::with_capacity(config_policies.len() + stored.len());
-    for p in config_policies.iter().cloned().chain(stored) {
+    for p in config_policies {
+        if seen.insert(p.id.clone()) {
+            all.push(p.clone());
+        }
+    }
+    for p in stored {
         if seen.insert(p.id.clone()) {
             all.push(p);
+        } else {
+            // Defense-in-depth: never silently drop a stored policy (e.g. a
+            // Deny) on the astronomically-unlikely id collision with config.
+            warn!(
+                policy_id = %p.id,
+                policy_name = %p.name,
+                "stored policy dropped: id collides with a config policy (config precedence) — \
+                 a dropped Deny would not be enforced"
+            );
         }
     }
     all

@@ -845,9 +845,11 @@ impl StorageBackend for FileStorage {
                         // Orphaned reservation (crashed mid-op) → reclaim it for
                         // this caller regardless of the prior body.
                         reserve(cache)
-                    } else if !rec.body_hash.is_empty() && rec.body_hash != body_hash {
+                    } else if rec.body_hash != body_hash {
                         // Live record (completed or in-flight) for a *different*
-                        // body → never replay the wrong response.
+                        // body → never replay the wrong response. (All records
+                        // carry a non-empty hash: reserve and complete both set
+                        // it, so this also rejects any hashless legacy record.)
                         IdempotencyState::Mismatch
                     } else if rec.done {
                         IdempotencyState::Done { status: rec.status, body: rec.response.clone() }
@@ -865,19 +867,37 @@ impl StorageBackend for FileStorage {
     async fn idempotency_complete(
         &self,
         key: &str,
+        body_hash: &str,
         status: u16,
         body: &str,
     ) -> Result<(), StorageError> {
-        let (key, body) = (key.to_string(), body.to_string());
+        let (key, body_hash, body) = (key.to_string(), body_hash.to_string(), body.to_string());
         self.locked_mutate(move |cache| {
-            // Only complete an existing reservation, preserving its body_hash and
-            // original reservation time. If the reservation is gone (GC'd because
-            // the op outran the stale window), drop the completion rather than
-            // synthesize a body-hash-less record that would replay for any body.
-            if let Some(rec) = cache.idempotency.get_mut(&key) {
-                rec.done = true;
-                rec.status = status;
-                rec.response = body;
+            match cache.idempotency.get_mut(&key) {
+                Some(rec) => {
+                    // Complete the existing reservation, preserving its original
+                    // reservation time; pin the (matching) body hash defensively.
+                    rec.done = true;
+                    rec.body_hash = body_hash;
+                    rec.status = status;
+                    rec.response = body;
+                }
+                None => {
+                    // Reservation was GC'd because the op outran the stale window:
+                    // re-create a completed record WITH the body hash, so a
+                    // same-body retry replays (no duplicate side effect) and a
+                    // different body still mismatches.
+                    cache.idempotency.insert(
+                        key.clone(),
+                        IdempotencyRecord {
+                            done: true,
+                            body_hash,
+                            status,
+                            response: body,
+                            created_at: Utc::now(),
+                        },
+                    );
+                }
             }
             Ok(())
         })
@@ -1146,10 +1166,21 @@ mod tests {
         );
 
         // Completing the op stores the response; subsequent checks replay it.
-        storage.idempotency_complete("k1", 201, "{\"ok\":true}").await.unwrap();
+        storage.idempotency_complete("k1", "hashA", 201, "{\"ok\":true}").await.unwrap();
         assert_eq!(
             storage.idempotency_check_or_reserve("k1", "hashA").await.unwrap(),
             IdempotencyState::Done { status: 201, body: "{\"ok\":true}".to_string() }
+        );
+        // Completing a key whose reservation was GC'd re-creates a hash-bound
+        // record: same body replays, different body mismatches.
+        storage.idempotency_complete("gone", "hashG", 200, "{}").await.unwrap();
+        assert_eq!(
+            storage.idempotency_check_or_reserve("gone", "hashG").await.unwrap(),
+            IdempotencyState::Done { status: 200, body: "{}".to_string() }
+        );
+        assert_eq!(
+            storage.idempotency_check_or_reserve("gone", "different").await.unwrap(),
+            IdempotencyState::Mismatch
         );
         // A mismatched body still refuses to replay even after completion.
         assert_eq!(

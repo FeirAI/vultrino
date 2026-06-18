@@ -588,7 +588,7 @@ where
     let (status, body) = op().await;
     if status.is_success() {
         let body_str = serde_json::to_string(&redact_for_replay(&body)).unwrap_or_default();
-        if let Err(e) = state.storage.idempotency_complete(&key, status.as_u16(), &body_str).await {
+        if let Err(e) = state.storage.idempotency_complete(&key, &body_hash, status.as_u16(), &body_str).await {
             // Completion not recorded → a retry may re-run the op (at-least-once).
             tracing::warn!(error = %e, idempotency_key = %key, "failed to record idempotency completion");
         }

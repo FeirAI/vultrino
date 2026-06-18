@@ -925,6 +925,13 @@ async fn test_refresh_policies_once_picks_up_cross_process_write() {
         engine.evaluate("x-1", Some("https://x"), Some("GET"), &RequestContext::new()),
         PolicyDecision::Allow
     );
+
+    // With a non-empty config too, the refresh→merge→engine path surfaces both.
+    let cfg = Policy::allow_all("cfg-base", "c-*");
+    refresh_policies_once(&reader, &engine, std::slice::from_ref(&cfg)).await.unwrap();
+    let names: Vec<String> = engine.list_policies().into_iter().map(|p| p.name).collect();
+    assert!(names.contains(&"cfg-base".to_string()), "{names:?}");
+    assert!(names.contains(&"pushed".to_string()), "{names:?}");
     drop(dir);
 }
 

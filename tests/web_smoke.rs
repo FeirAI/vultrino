@@ -385,6 +385,49 @@ async fn test_admin_role_create_and_credential_delete_and_put_policy() {
 }
 
 #[tokio::test]
+async fn test_admin_put_policy_idempotency_bound_to_path() {
+    let (router, storage, _server, key) = build_admin_router().await;
+    let body = serde_json::json!({"name":"p","credential_pattern":"*","default_action":"allow"});
+    let put = |id: &str, idem: &str| {
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/api/v1/policies/{}", id))
+            .header("authorization", format!("Bearer {}", key))
+            .header("content-type", "application/json")
+            .header("idempotency-key", idem)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    // Same body + same Idempotency-Key, two different path ids. The hash is bound
+    // to the path, so the second is a key/body Mismatch (409) — NOT a verbatim
+    // replay of id1's response (which is what the bug would do). id2 is not
+    // created as a copy of id1.
+    assert_eq!(router.clone().oneshot(put("id1", "same")).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(router.oneshot(put("id2", "same")).await.unwrap().status(), StatusCode::CONFLICT);
+    assert!(storage.get_policy("id1").await.unwrap().is_some());
+    assert!(storage.get_policy("id2").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_admin_token_expiry_bounds() {
+    let (router, _storage, _server, key) = build_admin_router().await;
+    let mint = |secs: i64| {
+        admin_req(
+            "POST",
+            "/api/v1/tokens",
+            &key,
+            serde_json::json!({"name":"t","credential_scope":"*","expires_in_secs":secs}),
+        )
+    };
+    // Non-positive and absurdly-large (overflow-guard) lifetimes are rejected.
+    assert_eq!(router.clone().oneshot(mint(0)).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(router.clone().oneshot(mint(-5)).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(router.clone().oneshot(mint(i64::MAX)).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    // A sane lifetime succeeds.
+    assert_eq!(router.oneshot(mint(3600)).await.unwrap().status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn test_admin_credential_idempotency_deterministic_metadata() {
     let (router, storage, _server, key) = build_admin_router().await;
     // Multi-key metadata: the body hash must be deterministic across retries
