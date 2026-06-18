@@ -38,7 +38,7 @@ settings, so `direct` and `approve-at-checkpoint` differ on the wire:
 
 | Strictness | Compiles to |
 |------------|-------------|
-| `direct` | single-use (`max_uses = 1`) + `require_approval` + `dual_control` (recorded now; the second/M-of-N-approver *enforcement* lands in V12 — until then a single approval suffices) |
+| `direct` | single-use (`max_uses = 1`) + `require_approval` + `dual_control` — the gated action requires **two distinct approvers** (M-of-N, M configurable) before it runs; see [Action Approvals](./action-approvals.md#dual-control-m-of-n-v12) |
 | `checkpoint` | `require_approval`; does **not** force single-use — the caller's `--uses` is preserved (unlimited unless given), so one approval is required per gated action |
 
 `direct` overrides any `max_uses`/`require_approval` the caller passed.

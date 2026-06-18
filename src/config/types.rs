@@ -370,6 +370,9 @@ pub struct RawApprovalConfig {
     /// them (V5).
     #[serde(default)]
     pub enforce_separation_of_duty: Option<bool>,
+    /// Distinct approvers a dual-control request requires (V12 M-of-N; default 2).
+    #[serde(default)]
+    pub dual_control_approvers: Option<u32>,
     /// Per-criticality SLA overrides (V5).
     #[serde(default)]
     pub sla: Vec<RawCriticalitySla>,
@@ -497,6 +500,7 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
                 .filter(|s| !s.trim().is_empty()),
             reauth_interval_secs: raw.reauth_interval_secs,
             enforce_separation_of_duty: raw.enforce_separation_of_duty.unwrap_or(false),
+            dual_control_approvers: raw.dual_control_approvers.filter(|m| *m >= 2).unwrap_or(2),
         })
     }
 }

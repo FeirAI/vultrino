@@ -161,6 +161,9 @@ pub struct VultrinoServer {
     sessions: Arc<crate::session::SessionRegistry>,
     /// Registered harness abort callbacks, fired on halt (V6).
     halt_callbacks: parking_lot::RwLock<Vec<Arc<dyn crate::session::HaltCallback>>>,
+    /// Count of unauthorized (policy/scope-denied) tool-call attempts (V12 metrics).
+    /// Per-process, in-memory (resets on restart), like the rate/spend ledgers.
+    unauthorized_attempts: std::sync::atomic::AtomicU64,
 }
 
 impl VultrinoServer {
@@ -229,6 +232,7 @@ impl VultrinoServer {
             notifiers,
             sessions: Arc::new(crate::session::SessionRegistry::new()),
             halt_callbacks: parking_lot::RwLock::new(Vec::new()),
+            unauthorized_attempts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -399,6 +403,7 @@ impl VultrinoServer {
         match decision {
             crate::policy::PolicyDecision::Allow => {}
             crate::policy::PolicyDecision::Deny(reason) => {
+                self.record_unauthorized_attempt();
                 return Err(VultrinoError::PolicyDenied(reason));
             }
             crate::policy::PolicyDecision::Prompt => {
@@ -432,6 +437,7 @@ impl VultrinoServer {
                 .approval_config
                 .criticality_for(&credential.alias, &full_action);
             let sla = self.approval_config.sla_for(criticality);
+            let dual_control = exec_auth.use_token.as_ref().map(|t| t.dual_control).unwrap_or(false);
             let (approval, decision_token) = ApprovalRequest::open(NewApproval {
                 credential: credential.alias.clone(),
                 action: full_action.clone(),
@@ -441,12 +447,19 @@ impl VultrinoServer {
                 principal_id: principal.as_ref().map(|p| p.id.clone()),
                 agent_label: principal.as_ref().and_then(|p| p.agent_label.clone()),
                 action_label: action_label.clone(),
-                dual_control: exec_auth.use_token.as_ref().map(|t| t.dual_control).unwrap_or(false),
+                dual_control,
                 criticality,
                 escalate_after: sla.escalate_after(),
                 escalate_window: sla.escalate_window(),
                 oob_identity: self.approval_config.oob_approver_identity.clone(),
                 reauth_interval_secs: self.approval_config.reauth_interval_secs,
+                // V12: dual control requires a second distinct approver (M-of-N,
+                // M defaulting to 2). A single-approval request needs just one.
+                required_approvals: if dual_control {
+                    self.approval_config.dual_control_approvers.max(2)
+                } else {
+                    1
+                },
             });
 
             // Bound the number of *pending* approvals a use token can open: each
@@ -917,6 +930,19 @@ impl VultrinoServer {
     /// Get a reference to the in-flight session registry (V6).
     pub fn sessions(&self) -> &Arc<crate::session::SessionRegistry> {
         &self.sessions
+    }
+
+    /// Record an unauthorized tool-call attempt — one blocked by the policy
+    /// engine (V12 metrics).
+    fn record_unauthorized_attempt(&self) {
+        self.unauthorized_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Count of unauthorized (policy-denied) tool-call attempts since start (V12).
+    pub fn unauthorized_attempts(&self) -> u64 {
+        self.unauthorized_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Best-effort append of an event to the signed outbox (V9). Never fails the

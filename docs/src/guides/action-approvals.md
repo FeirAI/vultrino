@@ -33,6 +33,7 @@ public_base_url = "https://vultrino.example.com"  # base for approve/deny links
 oob_approver_identity = "oncall@example.com"      # identity OOB links are bound to (V5)
 reauth_interval_secs = 900                         # optional continuous re-auth (V5)
 enforce_separation_of_duty = false                 # hard-reject self-approvals (V5)
+dual_control_approvers = 2                          # distinct approvers for dual control (V12)
 
 [approvals.telegram]                              # inline Approve / Deny buttons
 bot_token = "123456:ABC-DEF..."
@@ -79,6 +80,24 @@ Every human decision records an **authenticated approver identity**, not just th
 - **CLI** — the local OS user (`cli:<user>`).
 
 A decision with a blank identity is rejected. Because both the requester's owner and the approver are recorded, **separation of duty** ("the approver must not be the requesting agent") is computed and **recorded on every decision** (and logged when violated) — an agent self-approving its own request is flagged. Set `enforce_separation_of_duty = true` to **hard-reject** a self-approval rather than only recording it (a self-*denial* is always allowed). The CLI decides as a trusted local admin, so its OS-user identity is advisory.
+
+## Dual control (M-of-N) (V12)
+
+A high-risk action can require **more than one** distinct approver before it runs. A use token minted with `strictness: direct` (or any token flagged `dual_control`) opens an approval that needs `[approvals] dual_control_approvers` distinct sign-offs (default **2**) — the action does not execute until the threshold is met:
+
+- Each approval records a **distinct** approver sign-off; the **same** identity can't satisfy two of the required slots (rejected as a duplicate).
+- The request stays `pending` (the poll response carries `approvals_received` / `approvals_remaining`) until enough distinct approvers sign off, then flips to `approved` and runs on the next poll.
+- A **single denial vetoes** the whole request regardless of how many approvals were gathered.
+- Separation of duty composes: with `enforce_separation_of_duty`, a self-approval by the requester is rejected and does not count toward the M-of-N threshold.
+
+```toml
+[approvals]
+dual_control_approvers = 2   # distinct approvers a dual-control request needs (default 2)
+```
+
+## Metrics read-back (V12)
+
+`GET /api/v1/metrics` (admin) returns a structured point-in-time read-back: `unauthorized_attempts` (tool-call attempts blocked by the policy engine), approval counts by state (`approvals.by_status`, plus `dual_control_awaiting`), and approval-decision latency percentiles (`approval_latency_secs.{count,avg,p50,p95,max}`). The durable event history is the signed [event outbox](../getting-started/configuration.md#event-outbox-v9).
 
 ## Out-of-band decision links
 

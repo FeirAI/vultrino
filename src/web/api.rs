@@ -289,6 +289,13 @@ pub async fn api_check_approval(
         "summary": approval.summary,
         "executed": approval.executed,
     });
+    // V12: surface dual-control (M-of-N) progress so the agent knows it's awaiting
+    // additional distinct approvers, not stalled.
+    if approval.required_approvals > 1 {
+        body["required_approvals"] = serde_json::json!(approval.required_approvals);
+        body["approvals_received"] = serde_json::json!(approval.signoffs.len());
+        body["approvals_remaining"] = serde_json::json!(approval.approvals_remaining());
+    }
     // Per-status guidance, mirroring the MCP `check_approval` tool so the two
     // transports present the same contract to an agent.
     match approval.status {
@@ -958,6 +965,65 @@ pub async fn api_list_sessions(_admin: AdminApiAuth, State(state): State<AppStat
         Json(serde_json::json!({ "sessions": sessions, "process_scope": true })),
     )
         .into_response()
+}
+
+// -------- Metrics read-back (V12) --------
+
+/// `GET /api/v1/metrics` — structured read-back of the metrics govder computes
+/// (V12): unauthorized-tool-call attempts, approval counts by state, and approval
+/// latency percentiles. Per-process, point-in-time (the event stream — the signed
+/// outbox — is the durable history).
+pub async fn api_metrics(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+    let approvals = state.storage.list_approvals().await.unwrap_or_default();
+
+    let mut by_status: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut latencies_secs: Vec<i64> = Vec::new();
+    let mut dual_control_awaiting = 0u64;
+    for a in &approvals {
+        *by_status.entry(a.status.to_string()).or_default() += 1;
+        // Decision latency for decided requests (approved or denied).
+        if let Some(decided) = a.decided_at {
+            if matches!(a.status, ApprovalStatus::Approved | ApprovalStatus::Denied) {
+                latencies_secs.push((decided - a.created_at).num_seconds().max(0));
+            }
+        }
+        if a.required_approvals > 1 && a.status.is_open() {
+            dual_control_awaiting += 1;
+        }
+    }
+    latencies_secs.sort_unstable();
+    let pct = |p: f64| -> Option<i64> {
+        if latencies_secs.is_empty() {
+            return None;
+        }
+        // Nearest-rank percentile.
+        let idx = (((p / 100.0) * latencies_secs.len() as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(latencies_secs.len() - 1);
+        Some(latencies_secs[idx])
+    };
+    let avg = if latencies_secs.is_empty() {
+        None
+    } else {
+        Some(latencies_secs.iter().sum::<i64>() / latencies_secs.len() as i64)
+    };
+
+    let body = serde_json::json!({
+        "unauthorized_attempts": state.server.unauthorized_attempts(),
+        "approvals": {
+            "total": approvals.len(),
+            "by_status": by_status,
+            "dual_control_awaiting": dual_control_awaiting,
+        },
+        "approval_latency_secs": {
+            "count": latencies_secs.len(),
+            "avg": avg,
+            "p50": pct(50.0),
+            "p95": pct(95.0),
+            "max": latencies_secs.last().copied(),
+        },
+    });
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 // -------- Event outbox replay (V9) --------

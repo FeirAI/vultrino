@@ -187,6 +187,8 @@ impl WebServer {
                 post(api::api_halt_agent).delete(api::api_unhalt_agent),
             )
             .route("/api/v1/sessions", get(api::api_list_sessions))
+            // Metrics read-back (V12).
+            .route("/api/v1/metrics", get(api::api_metrics))
             // Signed event outbox replay + DLQ (V9).
             .route("/api/v1/events", get(api::api_list_events))
             .route("/api/v1/events/dead", get(api::api_list_dead_letters))

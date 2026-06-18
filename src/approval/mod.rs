@@ -153,6 +153,11 @@ impl RequesterInfo {
     }
 }
 
+/// serde default for `required_approvals` (pre-V12 records were single-approval).
+fn one() -> u32 {
+    1
+}
+
 /// Parameters for opening a new approval request.
 #[derive(Debug, Clone)]
 pub struct NewApproval {
@@ -184,6 +189,22 @@ pub struct NewApproval {
     /// Optional continuous re-authorization interval (V5): an approved grant that
     /// has not run within this window must be re-approved before it executes.
     pub reauth_interval_secs: Option<u64>,
+    /// Number of **distinct** approvers required before the action runs (V12
+    /// dual-control / M-of-N). 1 = a single approval; 2+ = dual control. Derived
+    /// from the `dual_control` flag (and any configured M).
+    pub required_approvals: u32,
+}
+
+/// One approver's sign-off on a dual-control (M-of-N) approval (V12).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Signoff {
+    /// Authenticated identity of this approver.
+    pub approver_identity: String,
+    /// Channel the sign-off arrived on.
+    pub channel: String,
+    pub decided_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// A human decision on an approval request (V5). Carries the channel it arrived
@@ -260,10 +281,19 @@ pub struct ApprovalRequest {
     /// instead of the canonical `plugin.action` when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_label: Option<String>,
-    /// Whether this action requires dual control (V8 strictness `direct`);
-    /// enforced by the approval layer in V12.
+    /// Whether this action requires dual control (V8 strictness `direct`),
+    /// enforced via `required_approvals` (V12).
     #[serde(default)]
     pub dual_control: bool,
+    /// Distinct approvers required before the action runs (V12 M-of-N). 1 = single
+    /// approval; 2+ = dual control. Defaults to 1 for pre-V12 records.
+    #[serde(default = "one")]
+    pub required_approvals: u32,
+    /// Recorded approver sign-offs (V12). For a single-approval request this holds
+    /// the one decision; for dual control it accumulates distinct approvers until
+    /// `required_approvals` is met.
+    #[serde(default)]
+    pub signoffs: Vec<Signoff>,
     /// Criticality class (V5) — drives the escalation/expiry windows and is
     /// recorded for separation-of-duty / complacency analytics.
     #[serde(default)]
@@ -347,6 +377,8 @@ impl ApprovalRequest {
             agent_label: params.agent_label,
             action_label: params.action_label,
             dual_control: params.dual_control,
+            required_approvals: params.required_approvals.max(1),
+            signoffs: Vec::new(),
             criticality: params.criticality,
             created_at: now,
             escalate_at: now + params.escalate_after,
@@ -441,31 +473,80 @@ impl ApprovalRequest {
         if !self.status.is_open() {
             return Err(ApprovalError::AlreadyDecided(self.status));
         }
-        // Set the approver before computing SoD (which reads `approver_identity`).
-        self.approver_identity = Some(identity);
-        let sod_violation = self.violates_sod();
-        // Optionally hard-reject a self-*approval* (a self-denial is harmless, so
-        // only Approved is gated); either way the outcome is recorded so the
-        // violation is observable. On rejection, clear the approver we just set so
-        // the request stays cleanly undecided.
-        if decision.enforce_sod && to == ApprovalStatus::Approved && sod_violation == Some(true) {
-            self.approver_identity = None;
+        let now = Utc::now();
+        let sod = self.sod_for(&identity);
+
+        if to == ApprovalStatus::Denied {
+            // A single veto denies, regardless of how many approvals were gathered
+            // (M-of-N is for granting, not denying). A self-denial is harmless.
+            self.signoffs.push(Signoff {
+                approver_identity: identity.clone(),
+                channel: decision.channel.clone(),
+                decided_at: now,
+                note: decision.note.clone(),
+            });
+            self.status = ApprovalStatus::Denied;
+            self.decided_at = Some(now);
+            self.decided_by = Some(decision.channel);
+            self.approver_identity = Some(identity);
+            self.sod_violation = self.sod_violation.or(sod);
+            self.decision_note = decision.note;
+            return Ok(());
+        }
+
+        // Approval path (V12 dual-control / M-of-N).
+        // Optionally hard-reject a self-approval (don't record it; the request
+        // stays cleanly awaiting other approvers).
+        if decision.enforce_sod && sod == Some(true) {
             return Err(ApprovalError::SeparationOfDuty);
         }
-        self.status = to;
-        self.decided_at = Some(Utc::now());
-        self.decided_by = Some(decision.channel);
-        self.sod_violation = sod_violation;
-        self.decision_note = decision.note;
+        // Approvers must be DISTINCT — the same identity can't satisfy two of the
+        // required M sign-offs.
+        if self
+            .signoffs
+            .iter()
+            .any(|s| s.approver_identity.eq_ignore_ascii_case(&identity))
+        {
+            return Err(ApprovalError::DuplicateApprover);
+        }
+        self.signoffs.push(Signoff {
+            approver_identity: identity.clone(),
+            channel: decision.channel.clone(),
+            decided_at: now,
+            note: decision.note.clone(),
+        });
+        self.approver_identity = Some(identity);
+        // Sticky SoD: a violation by ANY of the M approvers flags the decision.
+        self.sod_violation = match (self.sod_violation, sod) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (a, b) => a.or(b),
+        };
+        // Threshold met → grant; otherwise stay open awaiting more distinct approvers.
+        if self.signoffs.len() as u32 >= self.required_approvals {
+            self.status = ApprovalStatus::Approved;
+            self.decided_at = Some(now);
+            self.decided_by = Some(decision.channel);
+            self.decision_note = decision.note;
+        }
         Ok(())
     }
 
-    /// Separation-of-duty check (V5): whether the approver's identity collides
-    /// with the requesting agent's own identity (approver == requester), i.e. an
-    /// agent self-approving. `None` when either identity is unknown (not
-    /// computable). A `Some(true)` is a SoD violation.
+    /// How many more distinct approvals this request needs before it is granted
+    /// (V12). 0 once the threshold is met.
+    pub fn approvals_remaining(&self) -> u32 {
+        self.required_approvals.saturating_sub(self.signoffs.len() as u32)
+    }
+
+    /// Separation-of-duty check (V5): whether the (final) approver collides with
+    /// the requesting agent's own identity. `None` when not computable.
     pub fn violates_sod(&self) -> Option<bool> {
-        let approver = self.approver_identity.as_deref()?.trim();
+        self.sod_for(self.approver_identity.as_deref()?)
+    }
+
+    /// Whether a candidate approver identity collides with the requesting agent's
+    /// own identity (a self-approval). `None` when either side is unknown.
+    fn sod_for(&self, candidate: &str) -> Option<bool> {
+        let approver = candidate.trim();
         // The requester's "owner" identity: prefer the human/agent label, then
         // the stable principal id.
         let owner = self
@@ -553,6 +634,8 @@ pub enum ApprovalError {
     MissingApproverIdentity,
     #[error("separation of duty: the approver may not be the requesting agent")]
     SeparationOfDuty,
+    #[error("dual control: this approver has already signed off on this request")]
+    DuplicateApprover,
 }
 
 /// Links embedded in out-of-band notifications.
@@ -657,6 +740,9 @@ pub struct ApprovalConfig {
     /// When true, a self-approval (approver == requesting agent) is **rejected**
     /// at decision time (V5); otherwise it is recorded + logged but allowed.
     pub enforce_separation_of_duty: bool,
+    /// Number of distinct approvers a dual-control request requires (V12 M-of-N).
+    /// Defaults to 2; only takes effect for requests flagged `dual_control`.
+    pub dual_control_approvers: u32,
 }
 
 impl ApprovalConfig {
@@ -961,6 +1047,7 @@ mod tests {
             escalate_window: chrono::Duration::minutes(30),
             oob_identity: None,
             reauth_interval_secs: None,
+            required_approvals: 1,
         })
     }
 
@@ -1020,6 +1107,57 @@ mod tests {
         let err = a.approve(Decision::new("admin panel", "alice")).unwrap_err();
         assert!(matches!(err, ApprovalError::Expired));
         assert_eq!(a.status, ApprovalStatus::Expired);
+    }
+
+    #[test]
+    fn test_dual_control_requires_distinct_approvers() {
+        // V12 M-of-N: a dual-control request needs 2 DISTINCT approvers.
+        let (mut a, _) = new_approval();
+        a.required_approvals = 2;
+        // First approver → recorded, still pending (1 of 2).
+        a.approve(Decision::new("admin panel", "alice")).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Pending, "1 of 2 → still pending");
+        assert_eq!(a.signoffs.len(), 1);
+        assert_eq!(a.approvals_remaining(), 1);
+        // The same approver can't satisfy the second sign-off (case-insensitive).
+        let err = a.approve(Decision::new("admin panel", "ALICE")).unwrap_err();
+        assert!(matches!(err, ApprovalError::DuplicateApprover));
+        assert_eq!(a.status, ApprovalStatus::Pending, "duplicate doesn't advance");
+        assert_eq!(a.signoffs.len(), 1);
+        // A second DISTINCT approver meets the threshold → Approved.
+        a.approve(Decision::new("admin panel", "bob")).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Approved);
+        assert_eq!(a.signoffs.len(), 2);
+        assert_eq!(a.approvals_remaining(), 0);
+    }
+
+    #[test]
+    fn test_dual_control_single_deny_vetoes() {
+        // One veto denies, regardless of how many approvals were gathered.
+        let (mut a, _) = new_approval();
+        a.required_approvals = 2;
+        a.approve(Decision::new("admin panel", "alice")).unwrap();
+        a.deny(Decision::new("admin panel", "carol")).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Denied);
+        // No further decision is accepted once denied.
+        assert!(a.approve(Decision::new("admin panel", "dave")).is_err());
+    }
+
+    #[test]
+    fn test_dual_control_enforce_sod_rejects_self_among_approvers() {
+        // With SoD enforced, a self-approval by the requester ('agent') is rejected
+        // and does NOT count toward the M-of-N threshold.
+        let (mut a, _) = new_approval(); // requester principal_name = "agent"
+        a.required_approvals = 2;
+        let err = a
+            .approve(Decision::new("admin panel", "agent").enforcing_sod(true))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::SeparationOfDuty));
+        assert_eq!(a.signoffs.len(), 0, "self-approval not recorded");
+        // Two distinct non-requester approvers still grant it.
+        a.approve(Decision::new("admin panel", "alice").enforcing_sod(true)).unwrap();
+        a.approve(Decision::new("admin panel", "bob").enforcing_sod(true)).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Approved);
     }
 
     #[test]

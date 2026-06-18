@@ -2242,3 +2242,68 @@ async fn test_v9_lifecycle_events_emitted_to_outbox() {
     sorted.dedup();
     assert_eq!(seqs, sorted, "monotonic, no dupes");
 }
+
+// ==================== V12: dual-control (M-of-N) approvals ====================
+
+#[tokio::test]
+async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
+    let (server, storage) = setup().await; // allow mode
+    store_credential(&storage, "pay-cred", true).await; // require_approval
+
+    let (_full, mut token) = UseToken::create(NewUseToken {
+        name: "high-risk".to_string(),
+        credential_scope: "pay-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.dual_control = true; // V8 strictness `direct` sets this
+    storage.store_use_token(&token).await.unwrap();
+
+    let auth = ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+    let approval = match server.execute_gated(echo_request("pay-cred"), auth).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    assert_eq!(approval.required_approvals, 2, "dual control needs 2 approvers");
+
+    // First approver → still pending (1 of 2), action must NOT run.
+    storage
+        .decide_approval(&approval.id, true, "admin panel", "alice", false, None)
+        .await
+        .unwrap();
+    let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(a.status, ApprovalStatus::Pending, "1 of 2 → still pending");
+    assert_eq!(a.signoffs.len(), 1);
+
+    // The same approver can't satisfy the second sign-off.
+    let err = storage
+        .decide_approval(&approval.id, true, "admin panel", "alice", false, None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("already signed off"), "got: {err}");
+
+    // A polling agent sees it's still pending (not executed).
+    let polled = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    assert_eq!(polled.status, ApprovalStatus::Pending);
+    assert!(!polled.executed);
+
+    // A second DISTINCT approver meets the threshold → Approved → runs on next poll.
+    storage
+        .decide_approval(&approval.id, true, "admin panel", "bob", false, None)
+        .await
+        .unwrap();
+    let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(a.status, ApprovalStatus::Approved);
+    assert_eq!(a.signoffs.len(), 2);
+
+    let polled = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    assert!(polled.executed, "executes once both approvers signed off");
+    assert_eq!(polled.result_status, Some(200));
+}

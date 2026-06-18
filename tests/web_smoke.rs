@@ -636,6 +636,7 @@ async fn test_out_of_band_decide_flow() {
         escalate_window: chrono::Duration::minutes(30),
         oob_identity: Some("oncall".to_string()),
         reauth_interval_secs: None,
+        required_approvals: 1,
     });
     storage.store_approval(&approval).await.unwrap();
 
@@ -814,6 +815,36 @@ async fn test_admin_event_replay_api() {
             Request::builder()
                 .method("GET")
                 .uri("/api/v1/events?after=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_admin_metrics_readback() {
+    // V12: the metrics endpoint returns the structured read-back, admin-only.
+    let (router, _storage, _server, key) = build_admin_router().await;
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", "/api/v1/metrics", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["unauthorized_attempts"], 0);
+    assert_eq!(body["approvals"]["total"], 0);
+    assert!(body["approval_latency_secs"]["count"].is_u64());
+
+    // Admin-only.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/metrics")
                 .body(Body::empty())
                 .unwrap(),
         )
