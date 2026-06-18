@@ -15,6 +15,7 @@ use crate::RequestContext;
 use glob::Pattern;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -56,15 +57,41 @@ pub struct PolicyEngine {
     policies: RwLock<Vec<Policy>>,
     /// Rate limit states per credential
     rate_limits: RwLock<HashMap<String, RateLimitState>>,
+    /// Engine-level decision when a credential matches **no** policy.
+    /// `true` = fail-closed (deny), `false` = fail-open (allow, legacy).
+    /// Read on the hot path, so it's a plain atomic rather than a lock.
+    default_deny: AtomicBool,
 }
 
 impl PolicyEngine {
-    /// Create a new policy engine
+    /// Create a new policy engine.
+    ///
+    /// The engine starts **fail-open** (an un-policied credential is allowed) to
+    /// preserve the historical default for direct constructors and tests. The
+    /// server flips this to fail-closed from `[enforcement] default_action`
+    /// (which itself defaults to `deny`) via [`Self::set_default_deny`].
     pub fn new() -> Self {
         Self {
             policies: RwLock::new(Vec::new()),
             rate_limits: RwLock::new(HashMap::new()),
+            default_deny: AtomicBool::new(false),
         }
+    }
+
+    /// Set the engine's behavior when a credential matches **no** policy.
+    ///
+    /// `true` = **fail-closed**: the credential is denied with a distinct
+    /// `no_policy` reason (the govder enforcement posture, V2). `false` = legacy
+    /// fail-open: the credential is allowed. Wired from `[enforcement]
+    /// default_action` at server start and togglable at runtime (e.g. by the
+    /// admin API).
+    pub fn set_default_deny(&self, deny: bool) {
+        self.default_deny.store(deny, Ordering::Relaxed);
+    }
+
+    /// Whether the engine denies credentials that match no policy.
+    pub fn default_deny(&self) -> bool {
+        self.default_deny.load(Ordering::Relaxed)
     }
 
     /// Add a policy
@@ -135,8 +162,18 @@ impl PolicyEngine {
             .filter(|p| credential_matches(&p.credential_pattern, credential_alias))
             .collect();
 
-        // If no policies match, allow by default
+        // If no policies match, fall back to the configured engine default.
+        // Fail-closed (default-deny) denies an un-policied credential with a
+        // distinct `no_policy` reason so callers (e.g. govder) can tell
+        // "denied by an explicit policy" from "denied: no policy covers this
+        // credential at all". Fail-open keeps the legacy allow behavior.
         if matching_policies.is_empty() {
+            if self.default_deny.load(Ordering::Relaxed) {
+                return PolicyDecision::Deny(format!(
+                    "no_policy: no policy matches credential '{}' (default-deny enforcement)",
+                    credential_alias
+                ));
+            }
             return PolicyDecision::Allow;
         }
 
@@ -324,6 +361,55 @@ mod tests {
         let engine = PolicyEngine::new();
         let decision = engine.evaluate("github-api", Some("https://api.github.com"), Some("GET"), &make_context());
         assert_eq!(decision, PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn test_default_deny_denies_unpolicied_credential() {
+        let engine = PolicyEngine::new();
+        engine.set_default_deny(true);
+        assert!(engine.default_deny());
+
+        // A credential with no matching policy is denied, with the distinct
+        // machine-greppable `no_policy` reason.
+        let decision =
+            engine.evaluate("unpolicied", Some("https://api.example.com"), Some("GET"), &make_context());
+        match decision {
+            PolicyDecision::Deny(reason) => assert!(
+                reason.starts_with("no_policy:"),
+                "expected a no_policy deny reason, got: {reason}"
+            ),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+
+        // An explicit allow policy still admits the request even in deny mode.
+        engine.add_policy(Policy::allow_all("allow-it", "unpolicied"));
+        assert_eq!(
+            engine.evaluate("unpolicied", Some("https://api.example.com"), Some("GET"), &make_context()),
+            PolicyDecision::Allow
+        );
+
+        // A credential matched by an explicit deny policy reports that policy's
+        // reason, not the no_policy fallback.
+        engine.add_policy(Policy::deny_all("block", "blocked-cred"));
+        match engine.evaluate("blocked-cred", Some("https://x"), Some("GET"), &make_context()) {
+            PolicyDecision::Deny(reason) => assert!(
+                !reason.starts_with("no_policy:"),
+                "an explicitly-denied credential should not use the no_policy reason: {reason}"
+            ),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_readonly_evaluation_respects_default_deny() {
+        // The deferred (post-approval) read-only path must also honor
+        // fail-closed: an un-policied credential is denied there too.
+        let engine = PolicyEngine::new();
+        engine.set_default_deny(true);
+        match engine.evaluate_readonly("unpolicied", Some("https://x"), Some("GET")) {
+            PolicyDecision::Deny(reason) => assert!(reason.starts_with("no_policy:")),
+            other => panic!("expected Deny, got {other:?}"),
+        }
     }
 
     #[test]

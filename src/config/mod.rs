@@ -43,6 +43,37 @@ pub struct Config {
     pub mcp: McpConfig,
     /// Action approval configuration
     pub approval: crate::approval::ApprovalConfig,
+    /// Engine-level enforcement defaults (V2: default-deny mode).
+    pub enforcement: EnforcementConfig,
+}
+
+/// Engine-level enforcement configuration.
+#[derive(Debug, Clone)]
+pub struct EnforcementConfig {
+    /// What the policy engine decides for a credential that matches **no**
+    /// policy. Defaults to [`EnforcementDefault::Deny`] (fail-closed).
+    pub default_action: EnforcementDefault,
+}
+
+impl Default for EnforcementConfig {
+    fn default() -> Self {
+        // Fail-closed by default: an un-policied credential is denied. This is
+        // the govder enforcement posture and closes the historical fail-open
+        // gap. Operators who want the legacy behavior opt in with
+        // `[enforcement] default_action = "allow"`.
+        Self {
+            default_action: EnforcementDefault::Deny,
+        }
+    }
+}
+
+/// Policy-engine decision for a credential that matches no policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnforcementDefault {
+    /// Allow un-policied credentials (legacy fail-open).
+    Allow,
+    /// Deny un-policied credentials (fail-closed; default).
+    Deny,
 }
 
 impl Config {
@@ -76,6 +107,11 @@ impl Config {
         let logging = raw.logging.unwrap_or_default().into();
         let mcp = raw.mcp.unwrap_or_default().into();
         let approval = raw.approvals.map(Into::into).unwrap_or_default();
+        let enforcement = raw
+            .enforcement
+            .map(EnforcementConfig::try_from)
+            .transpose()?
+            .unwrap_or_default();
 
         let policies = raw
             .policies
@@ -90,6 +126,7 @@ impl Config {
             policies,
             mcp,
             approval,
+            enforcement,
         })
     }
 
@@ -102,6 +139,7 @@ impl Config {
             policies: vec![],
             mcp: McpConfig::default(),
             approval: crate::approval::ApprovalConfig::default(),
+            enforcement: EnforcementConfig::default(),
         }
     }
 

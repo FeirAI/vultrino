@@ -149,6 +149,26 @@ impl VultrinoServer {
         // Load policies from config
         policy_engine.load_policies(config.policies.clone());
 
+        // Wire the engine-level default decision (V2): fail-closed unless the
+        // operator explicitly opts into legacy fail-open.
+        let default_deny = matches!(
+            config.enforcement.default_action,
+            crate::config::EnforcementDefault::Deny
+        );
+        policy_engine.set_default_deny(default_deny);
+
+        // A fail-closed engine with zero policies denies *every* credential —
+        // almost always a misconfiguration rather than an intentional lockout.
+        // Warn loudly so it isn't discovered only via a flood of denied calls.
+        if default_deny && config.policies.is_empty() {
+            warn!(
+                "enforcement default_action is 'deny' but no policies are configured — \
+                 ALL credential use will be denied until an allow policy is added (via config \
+                 or the admin API). Set `[enforcement] default_action = \"allow\"` to opt into \
+                 the legacy fail-open behavior."
+            );
+        }
+
         // By default, don't require auth in local mode
         let require_auth = config.server.mode == crate::config::ServerMode::Server;
 

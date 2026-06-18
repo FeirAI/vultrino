@@ -14,6 +14,32 @@ pub struct RawConfig {
     #[serde(default)]
     pub policies: Vec<RawPolicy>,
     pub approvals: Option<RawApprovalConfig>,
+    pub enforcement: Option<RawEnforcementConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RawEnforcementConfig {
+    /// Engine decision for a credential that matches no policy: `deny`
+    /// (fail-closed, default) or `allow` (fail-open, legacy).
+    pub default_action: Option<String>,
+}
+
+impl TryFrom<RawEnforcementConfig> for EnforcementConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawEnforcementConfig) -> Result<Self, Self::Error> {
+        let default_action = match raw.default_action.as_deref() {
+            Some("deny") | None => EnforcementDefault::Deny,
+            Some("allow") => EnforcementDefault::Allow,
+            Some(other) => {
+                return Err(ConfigError::Invalid(format!(
+                    "Unknown enforcement default_action: {} (expected 'deny' or 'allow')",
+                    other
+                )))
+            }
+        };
+        Ok(Self { default_action })
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

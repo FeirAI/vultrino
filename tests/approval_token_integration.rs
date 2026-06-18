@@ -79,6 +79,34 @@ async fn setup_with_policies(
     config.approval.enabled = true;
     config.approval.ttl_secs = 3600;
     config.policies = policies;
+    // These suites exercise tokens/approvals, not engine default-deny, so opt
+    // into legacy fail-open; default-deny is covered by its own test below.
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    server.plugins().register(Arc::new(MockPlugin));
+
+    (server, storage)
+}
+
+/// Build a server in **fail-closed** (default-deny) enforcement mode with the
+/// given policies, the mock plugin registered, and approvals enabled.
+async fn setup_deny_mode(
+    policies: Vec<vultrino::policy::Policy>,
+) -> (VultrinoServer, Arc<dyn StorageBackend>) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let mut config = Config::default();
+    config.approval.enabled = true;
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Deny;
+    config.policies = policies;
 
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
@@ -830,7 +858,10 @@ async fn test_approvals_disabled_denies_gated_action() {
     let storage: Arc<dyn StorageBackend> =
         Arc::new(FileStorage::new(&path, &password).await.unwrap());
 
-    let config = Config::default(); // approvals disabled by default
+    let mut config = Config::default(); // approvals disabled by default
+    // Opt into fail-open so the request reaches the approval gate (this test is
+    // about approvals-disabled, not engine default-deny).
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
@@ -842,4 +873,38 @@ async fn test_approvals_disabled_denies_gated_action() {
         .await
         .unwrap_err();
     assert!(format!("{}", err).to_lowercase().contains("approval"));
+}
+
+#[tokio::test]
+async fn test_default_deny_denies_unpolicied_credential() {
+    // V2: in fail-closed mode, a credential with no matching policy is denied
+    // with the distinct `no_policy` reason — the action never runs.
+    let (server, storage) = setup_deny_mode(vec![]).await;
+    store_credential(&storage, "api-cred", false).await;
+
+    let err = server
+        .execute_gated(echo_request("api-cred"), ExecAuth::default())
+        .await
+        .unwrap_err();
+    match err {
+        vultrino::VultrinoError::PolicyDenied(reason) => {
+            assert!(reason.contains("no_policy"), "expected no_policy reason, got: {reason}");
+        }
+        other => panic!("expected PolicyDenied, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_default_deny_allows_with_explicit_policy() {
+    // With an explicit allow policy covering the credential, the same fail-closed
+    // server admits and runs the action.
+    use vultrino::policy::Policy;
+    let (server, storage) = setup_deny_mode(vec![Policy::allow_all("allow-api", "api-*")]).await;
+    store_credential(&storage, "api-cred", false).await;
+
+    let outcome = server
+        .execute_gated(echo_request("api-cred"), ExecAuth::default())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, ExecutionOutcome::Completed(_)));
 }
