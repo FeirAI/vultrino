@@ -515,6 +515,10 @@ fn idempotency_body_hash<T: Serialize>(req: &T) -> String {
     let canonical = serde_json::to_value(req)
         .and_then(|v| serde_json::to_vec(&v))
         .unwrap_or_default();
+    // sha256 hex is always 64 chars, so this is never "" — even on the
+    // (unreachable here) serialization failure it is sha256(b""). Every record's
+    // body_hash is therefore non-empty, which the reserve/complete/mismatch
+    // logic relies on (a "" stored hash could never equal a real request hash).
     hex::encode(Sha256::digest(&canonical))
 }
 

@@ -363,7 +363,9 @@ pub trait StorageBackend: Send + Sync {
     /// Record the completed response for a reserved key (bound to `body_hash`),
     /// to replay on repeats. Re-creates the record with the hash even if the
     /// reservation was GC'd during a long op, so a same-body retry replays (no
-    /// duplicate execution) while a different body still mismatches.
+    /// duplicate execution) while a different body still mismatches. The default
+    /// impl is a no-op (this backend provides no idempotency); concrete backends
+    /// such as [`FileStorage`] override it.
     async fn idempotency_complete(
         &self,
         _key: &str,

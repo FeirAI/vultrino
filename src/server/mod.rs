@@ -829,35 +829,21 @@ pub async fn refresh_policies_once(
 }
 
 /// Merge static config policies with admin-managed stored policies into the
-/// engine's policy set, deduplicating by id. Config takes precedence on the
-/// (astronomically unlikely) id collision — config ids are random per parse.
-/// Order is preserved (config first), since policy evaluation is order-sensitive.
+/// engine's policy set: config first, then stored.
+///
+/// We deliberately do **not** dedup by id. Dropping a policy on an id collision
+/// could silently drop a stored `Deny` — fail-open in a default-deny system.
+/// The evaluator already handles multiple matching policies, so keeping both is
+/// safe; and the admin API manages stored policies by id independently (a config
+/// policy that coincidentally shares an id is config-managed and unaffected by
+/// an API delete/PUT). Order is preserved since evaluation is order-sensitive.
 pub fn merge_policies(
     config_policies: &[crate::policy::Policy],
     stored: Vec<crate::policy::Policy>,
 ) -> Vec<crate::policy::Policy> {
-    use std::collections::HashSet;
-    let mut seen: HashSet<String> = HashSet::new();
     let mut all = Vec::with_capacity(config_policies.len() + stored.len());
-    for p in config_policies {
-        if seen.insert(p.id.clone()) {
-            all.push(p.clone());
-        }
-    }
-    for p in stored {
-        if seen.insert(p.id.clone()) {
-            all.push(p);
-        } else {
-            // Defense-in-depth: never silently drop a stored policy (e.g. a
-            // Deny) on the astronomically-unlikely id collision with config.
-            warn!(
-                policy_id = %p.id,
-                policy_name = %p.name,
-                "stored policy dropped: id collides with a config policy (config precedence) — \
-                 a dropped Deny would not be enforced"
-            );
-        }
-    }
+    all.extend_from_slice(config_policies);
+    all.extend(stored);
     all
 }
 
@@ -913,20 +899,21 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_policies_dedups_by_id_config_first() {
+    fn test_merge_policies_keeps_both_never_drops_stored() {
         use crate::policy::Policy;
         let mut c = Policy::allow_all("cfg", "*");
         c.id = "shared".to_string();
         let mut s_dup = Policy::deny_all("stored-dup", "*");
-        s_dup.id = "shared".to_string(); // collides with config id
+        s_dup.id = "shared".to_string(); // same id as config — must NOT be dropped
         let s_new = Policy::deny_all("stored-new", "x-*");
 
         let merged = merge_policies(&[c], vec![s_dup, s_new]);
-        // Config wins the id collision; the distinct stored policy is kept.
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].name, "cfg"); // config first, order preserved
+        // Nothing is dropped on an id collision — a stored Deny is never silently
+        // lost (that would be fail-open). Config comes first; order preserved.
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].name, "cfg");
+        assert!(merged.iter().any(|p| p.name == "stored-dup"));
         assert!(merged.iter().any(|p| p.name == "stored-new"));
-        assert!(!merged.iter().any(|p| p.name == "stored-dup"));
     }
 
     #[test]

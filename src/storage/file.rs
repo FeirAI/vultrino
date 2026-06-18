@@ -874,19 +874,22 @@ impl StorageBackend for FileStorage {
         let (key, body_hash, body) = (key.to_string(), body_hash.to_string(), body.to_string());
         self.locked_mutate(move |cache| {
             match cache.idempotency.get_mut(&key) {
-                Some(rec) => {
-                    // Complete the existing reservation, preserving its original
-                    // reservation time; pin the (matching) body hash defensively.
+                // Our own reservation → complete it (keep its reservation time).
+                Some(rec) if rec.body_hash == body_hash => {
                     rec.done = true;
-                    rec.body_hash = body_hash;
                     rec.status = status;
                     rec.response = body;
                 }
+                // A *different* request re-reserved this key while our op ran
+                // (we are the stale one, our reservation was GC'd then re-taken).
+                // Drop our completion rather than clobber the live reservation.
+                Some(_) => {}
                 None => {
-                    // Reservation was GC'd because the op outran the stale window:
-                    // re-create a completed record WITH the body hash, so a
-                    // same-body retry replays (no duplicate side effect) and a
-                    // different body still mismatches.
+                    // Reservation was GC'd because the op outran the stale window
+                    // and nothing re-took the key: re-create a completed record
+                    // WITH the body hash, so a same-body retry replays (no
+                    // duplicate side effect) and a different body mismatches.
+                    // (created_at resets — the original reservation time is gone.)
                     cache.idempotency.insert(
                         key.clone(),
                         IdempotencyRecord {
@@ -1205,5 +1208,18 @@ mod tests {
             storage.idempotency_check_or_reserve("k1", "hashA").await.unwrap(),
             IdempotencyState::Done { .. }
         ));
+
+        // A stale completion (different body) must NOT clobber a live reservation
+        // that re-used the key for a different request (GC-race safety).
+        assert_eq!(
+            storage.idempotency_check_or_reserve("race", "live").await.unwrap(),
+            IdempotencyState::Fresh
+        );
+        storage.idempotency_complete("race", "stale", 200, "{}").await.unwrap();
+        assert_eq!(
+            storage.idempotency_check_or_reserve("race", "live").await.unwrap(),
+            IdempotencyState::Pending,
+            "a stale completion must not turn the live reservation into a Done replay"
+        );
     }
 }
