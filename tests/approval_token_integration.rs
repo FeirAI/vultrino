@@ -2347,3 +2347,126 @@ async fn test_v12_dual_control_forces_gating_on_allow_path() {
     assert_eq!(approval.effective_required_approvals(), 2, "dual control needs 2 approvers");
     assert!(approval.status.is_open());
 }
+
+// ==================== V11: multi-tenancy / per-team partition ====================
+
+async fn setup_tenants(
+    default_deny: bool,
+    tenants: Vec<(&str, vultrino::config::TenantMode)>,
+) -> (VultrinoServer, Arc<dyn StorageBackend>) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("pw");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let mut config = Config::default();
+    config.enforcement.default_action = if default_deny {
+        vultrino::config::EnforcementDefault::Deny
+    } else {
+        vultrino::config::EnforcementDefault::Allow
+    };
+    for (id, mode) in tenants {
+        config.tenants.insert(id.to_string(), mode);
+    }
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    server.plugins().register(Arc::new(MockPlugin));
+    (server, storage)
+}
+
+fn tenant_token(tenant: &str) -> UseToken {
+    let (_f, mut t) = UseToken::create(NewUseToken {
+        name: format!("tok-{tenant}"),
+        credential_scope: "*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    t.tenant = Some(tenant.to_string());
+    t
+}
+
+fn tenant_auth(token: &UseToken) -> ExecAuth {
+    ExecAuth {
+        auth: Some(AuthResult::for_use_token(token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    }
+}
+
+#[tokio::test]
+async fn test_v11_observe_mode_downgrades_deny_to_allow() {
+    // One team observe-only, another enforcing, on the same vultrino.
+    let (server, storage) =
+        setup_tenants(true, vec![("team-observe", vultrino::config::TenantMode::Observe)]).await;
+    store_credential(&storage, "api-cred", false).await; // un-policied → no_policy deny
+
+    // team-observe: the no_policy deny is downgraded — the action RUNS.
+    let tb = tenant_token("team-observe");
+    storage.store_use_token(&tb).await.unwrap();
+    let outcome = server.execute_gated(echo_request("api-cred"), tenant_auth(&tb)).await.unwrap();
+    assert!(matches!(outcome, ExecutionOutcome::Completed(_)), "observe tenant runs despite deny");
+
+    // An observed-denial event was emitted for visibility.
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == "policy.observed_denial" && e.subject == "team-observe"),
+        "observe-mode denial emitted to the outbox"
+    );
+
+    // team-enforce (default, not listed): the same deny BLOCKS.
+    let ta = tenant_token("team-enforce");
+    storage.store_use_token(&ta).await.unwrap();
+    let err = server.execute_gated(echo_request("api-cred"), tenant_auth(&ta)).await.unwrap_err();
+    assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)), "enforce tenant is blocked");
+}
+
+#[tokio::test]
+async fn test_v11_cross_tenant_credential_isolation() {
+    // allow mode → policy never denies; isolation is the only gate here.
+    let (server, storage) = setup_tenants(false, vec![]).await;
+
+    // A credential tagged to team-a.
+    let cred = Credential::new(
+        "team-a-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("secret"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    )
+    .with_metadata("tenant", "team-a");
+    storage.store(&cred).await.unwrap();
+    // A shared (untenanted) credential.
+    store_credential(&storage, "shared-cred", false).await;
+
+    let req = |alias: &str| ExecuteRequest {
+        credential: alias.to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({"x": 1}),
+    };
+
+    // team-b → denied access to team-a's credential (cross-tenant isolation).
+    let tb = tenant_token("team-b");
+    storage.store_use_token(&tb).await.unwrap();
+    let err = server.execute_gated(req("team-a-cred"), tenant_auth(&tb)).await.unwrap_err();
+    match err {
+        vultrino::VultrinoError::PolicyDenied(r) => assert!(r.contains("tenant"), "reason: {r}"),
+        other => panic!("expected cross-tenant denial, got {other:?}"),
+    }
+    // team-b → CAN use the shared (untenanted) credential.
+    assert!(matches!(
+        server.execute_gated(req("shared-cred"), tenant_auth(&tb)).await.unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
+    // team-a → CAN use its own credential.
+    let ta = tenant_token("team-a");
+    storage.store_use_token(&ta).await.unwrap();
+    assert!(matches!(
+        server.execute_gated(req("team-a-cred"), tenant_auth(&ta)).await.unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
+}

@@ -27,6 +27,17 @@ pub struct RawConfig {
     pub action_labels: Vec<RawActionLabel>,
     /// Signed event-outbox delivery config (V9).
     pub outbox: Option<RawOutboxConfig>,
+    /// Per-tenant enforcement mode (V11).
+    #[serde(default)]
+    pub tenants: Vec<RawTenant>,
+}
+
+/// TOML shape for `[[tenants]]` (V11): `id = "team-a"`, `mode = "enforce"|"observe"`.
+#[derive(Debug, Deserialize)]
+pub struct RawTenant {
+    pub id: String,
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// TOML shape for `[outbox]` (V9). `Debug` is hand-written to redact
@@ -777,6 +788,24 @@ action = "deny"
         let dbg = format!("{raw:?}");
         assert!(!dbg.contains("top-secret-key"), "raw secret must not appear: {dbg}");
         assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn test_tenant_config_validation() {
+        use crate::config::TenantMode;
+        let cfg = Config::parse(
+            "[[tenants]]\nid = \"team-a\"\nmode = \"observe\"\n[[tenants]]\nid = \"team-b\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.tenant_mode(Some("team-a")), TenantMode::Observe);
+        assert_eq!(cfg.tenant_mode(Some("team-b")), TenantMode::Enforce); // default
+        assert_eq!(cfg.tenant_mode(Some("unlisted")), TenantMode::Enforce);
+        assert_eq!(cfg.tenant_mode(None), TenantMode::Enforce); // untenanted fail-closed
+
+        // Unknown mode, empty id, and duplicate id are rejected at load.
+        assert!(Config::parse("[[tenants]]\nid = \"x\"\nmode = \"audit\"").is_err());
+        assert!(Config::parse("[[tenants]]\nid = \"\"\nmode = \"observe\"").is_err());
+        assert!(Config::parse("[[tenants]]\nid = \"d\"\n[[tenants]]\nid = \"d\"").is_err());
     }
 
     #[test]

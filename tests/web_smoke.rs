@@ -537,6 +537,7 @@ async fn test_admin_delete_role_in_use_conflict() {
             last_used_at: None,
             agent_label: None,
             owner_identity: None,
+            tenant: None,
         })
         .await
         .unwrap();

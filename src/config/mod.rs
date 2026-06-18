@@ -53,6 +53,32 @@ pub struct Config {
     pub action_labels: std::collections::HashMap<String, String>,
     /// Signed event-outbox delivery config (V9).
     pub outbox: crate::outbox::OutboxConfig,
+    /// Per-tenant enforcement mode (V11): a tenant absent here uses
+    /// [`TenantMode::Enforce`]. Lets one team run enforce while another observes.
+    pub tenants: std::collections::HashMap<String, TenantMode>,
+}
+
+/// How a tenant's policy denials are handled (V11 multi-tenancy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TenantMode {
+    /// A policy `Deny` blocks the action (the secure default).
+    #[default]
+    Enforce,
+    /// A policy `Deny` is **logged and emitted but not blocked** — the action
+    /// runs anyway. Lets a team onboard in observe-only mode while another team
+    /// on the same vultrino enforces.
+    Observe,
+}
+
+impl Config {
+    /// The enforcement mode for a principal's tenant (V11). Untenanted principals
+    /// and tenants not listed default to [`TenantMode::Enforce`] (fail-closed).
+    pub fn tenant_mode(&self, tenant: Option<&str>) -> TenantMode {
+        match tenant {
+            Some(t) => self.tenants.get(t).copied().unwrap_or_default(),
+            None => TenantMode::Enforce,
+        }
+    }
 }
 
 impl Config {
@@ -207,6 +233,27 @@ impl Config {
 
         let outbox = raw.outbox.map(TryInto::try_into).transpose()?.unwrap_or_default();
 
+        // Per-tenant enforcement mode (V11).
+        let mut tenants = std::collections::HashMap::new();
+        for t in raw.tenants {
+            let mode = match t.mode.as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+                Some("observe") => TenantMode::Observe,
+                Some("enforce") | None | Some("") => TenantMode::Enforce,
+                Some(other) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "tenant '{}': unknown mode '{}' (expected enforce|observe)",
+                        t.id, other
+                    )))
+                }
+            };
+            if t.id.trim().is_empty() {
+                return Err(ConfigError::Invalid("tenant id must not be empty".to_string()));
+            }
+            if tenants.insert(t.id.clone(), mode).is_some() {
+                return Err(ConfigError::Invalid(format!("duplicate tenant '{}'", t.id)));
+            }
+        }
+
         Ok(Self {
             server,
             storage,
@@ -219,6 +266,7 @@ impl Config {
             egress,
             action_labels,
             outbox,
+            tenants,
         })
     }
 
@@ -236,6 +284,7 @@ impl Config {
             egress: vec![],
             action_labels: std::collections::HashMap::new(),
             outbox: crate::outbox::OutboxConfig::default(),
+            tenants: std::collections::HashMap::new(),
         }
     }
 

@@ -260,6 +260,7 @@ impl AuthManager {
             last_used_at: None,
             agent_label: None,
             owner_identity: None,
+            tenant: None,
         };
 
         self.add_key_internal(api_key.clone());

@@ -69,6 +69,7 @@ impl AuthResult {
             agent_label: token.agent_label.clone(),
             // Carry the bound human owner (V10) for SoD + audit.
             owner_identity: token.owner_identity.clone(),
+            tenant: token.tenant.clone(),
         };
         Self { api_key, role }
     }

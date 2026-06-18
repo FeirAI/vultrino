@@ -1523,6 +1523,7 @@ mod tests {
             last_used_at: None,
             agent_label: None,
             owner_identity: None,
+            tenant: None,
         };
 
         storage.store_api_key(&key).await.unwrap();

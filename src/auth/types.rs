@@ -208,6 +208,11 @@ pub struct ApiKey {
     /// directory identity. Used for separation-of-duty and audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_identity: Option<String>,
+    /// Optional tenant/team this identity belongs to (V11). Scopes the principal
+    /// to its tenant's enforcement mode and isolates it from other tenants'
+    /// tenant-tagged credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 impl ApiKey {
@@ -357,6 +362,7 @@ mod tests {
             last_used_at: None,
             agent_label: None,
             owner_identity: None,
+            tenant: None,
         };
         assert!(!key.is_expired());
 

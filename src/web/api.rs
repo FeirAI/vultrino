@@ -815,6 +815,9 @@ pub struct TokenCreateRequest {
     /// separation-of-duty and audit.
     #[serde(default)]
     pub owner_identity: Option<String>,
+    /// Optional tenant/team this token belongs to (V11).
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 /// `POST /api/v1/tokens` — mint a use token; the plaintext is returned once.
@@ -885,6 +888,7 @@ pub async fn api_create_token(
         token.dual_control = dual_control;
         token.owner_identity =
             req.owner_identity.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        token.tenant = req.tenant.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         if let Err(e) = st.storage.store_use_token(&token).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

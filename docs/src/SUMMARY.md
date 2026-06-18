@@ -31,6 +31,7 @@
 - [Action Approvals](./guides/action-approvals.md)
 - [Kill Switches & Halt](./guides/kill-halt.md)
 - [Workload Identity & Owner Binding](./guides/identity.md)
+- [Multi-Tenancy & Per-Team Partition](./guides/multi-tenancy.md)
 - [Using with AI Agents](./guides/ai-agents.md)
 - [Policy Configuration](./guides/policies.md)
 

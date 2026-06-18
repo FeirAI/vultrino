@@ -376,6 +376,24 @@ impl VultrinoServer {
             }
         }
 
+        // V11 tenant isolation: a principal may only use credentials in its own
+        // tenant; an untenanted credential is shared. A credential is tenant-tagged
+        // via its `tenant` metadata. Cross-tenant access is denied regardless of
+        // the tenant's enforce/observe mode (isolation is not observable-away).
+        let principal_tenant = exec_auth
+            .auth
+            .as_ref()
+            .and_then(|a| a.api_key.tenant.clone());
+        if let Some(cred_tenant) = credential.metadata.get("tenant") {
+            if principal_tenant.as_deref() != Some(cred_tenant.as_str()) {
+                self.record_unauthorized_attempt();
+                return Err(VultrinoError::PolicyDenied(format!(
+                    "credential '{}' belongs to tenant '{}' and is not accessible to this principal",
+                    credential.alias, cred_tenant
+                )));
+            }
+        }
+
         // Evaluate policy (URL / method / rate limits / principal / spend). A
         // `Prompt` decision routes into the approval flow rather than failing.
         let url = request.params.get("url").and_then(|v| v.as_str());
@@ -412,7 +430,37 @@ impl VultrinoServer {
             crate::policy::PolicyDecision::Allow => {}
             crate::policy::PolicyDecision::Deny(reason) => {
                 self.record_unauthorized_attempt();
-                return Err(VultrinoError::PolicyDenied(reason));
+                // V11 observe mode: an observe-only tenant's denials are recorded
+                // and emitted but NOT blocked — the action runs anyway, so a team
+                // can onboard in observe-only while another enforces on the same
+                // vultrino. (Cross-tenant isolation above is NOT downgraded.)
+                if self.config.tenant_mode(principal_tenant.as_deref())
+                    == crate::config::TenantMode::Observe
+                {
+                    warn!(
+                        tenant = ?principal_tenant,
+                        credential = %credential.alias,
+                        action = %full_action,
+                        reason = %reason,
+                        "observe-mode: policy would DENY but tenant is observe-only — allowing"
+                    );
+                    self.emit_event(
+                        principal_tenant.as_deref().unwrap_or("-"),
+                        crate::outbox::EVENT_POLICY_OBSERVED_DENIAL,
+                        serde_json::json!({
+                            "tenant": principal_tenant,
+                            "credential": credential.alias,
+                            "action": full_action,
+                            "reason": reason,
+                            "would_have": "deny",
+                            "outcome": "allowed_observe_mode",
+                        }),
+                    )
+                    .await;
+                    // Fall through to Allow (do not return, do not gate).
+                } else {
+                    return Err(VultrinoError::PolicyDenied(reason));
+                }
             }
             crate::policy::PolicyDecision::Prompt => {
                 needs_approval = true;

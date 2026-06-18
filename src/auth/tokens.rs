@@ -85,6 +85,11 @@ pub struct UseToken {
     /// directory identity for separation-of-duty and audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_identity: Option<String>,
+    /// Optional tenant/team this token belongs to (V11). Scopes the principal to
+    /// its tenant's enforcement mode and isolates it from other tenants'
+    /// tenant-tagged credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 /// Why a use token is not currently usable.
@@ -172,6 +177,7 @@ impl UseToken {
             agent_label: None,
             dual_control: false,
             owner_identity: None,
+            tenant: None,
         };
 
         (full_token, token)
