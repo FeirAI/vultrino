@@ -126,6 +126,27 @@ pub trait StorageBackend: Send + Sync {
     /// Delete a role by ID
     async fn delete_role(&self, id: &str) -> Result<(), StorageError>;
 
+    /// Delete a role only if **no API key references it**, performing the
+    /// referential-integrity check and the delete atomically (so a key minted
+    /// concurrently can't be orphaned). Returns [`StorageError::Conflict`] if
+    /// referenced. The default impl is a non-atomic fallback; real backends
+    /// (e.g. [`FileStorage`]) override it under their lock.
+    async fn delete_role_if_unreferenced(&self, id: &str) -> Result<(), StorageError> {
+        if self
+            .list_api_keys()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|k| k.role_id == id)
+        {
+            return Err(StorageError::Conflict(format!(
+                "role '{}' is still referenced by an API key",
+                id
+            )));
+        }
+        self.delete_role(id).await
+    }
+
     /// Store an API key
     async fn store_api_key(&self, key: &ApiKey) -> Result<(), StorageError>;
 

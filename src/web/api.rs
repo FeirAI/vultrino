@@ -431,7 +431,17 @@ impl FromRequestParts<AppState> for AdminApiAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        require_admin(state, &parts.headers).await.map(AdminApiAuth)
+        let auth = require_admin(state, &parts.headers).await?;
+        // Audit every authorized admin request with the acting key id and the
+        // method/path, so admin mutations are traceable for forensics. (This is
+        // structured tracing, not yet the tamper-evident ledger of F1/V12.)
+        tracing::info!(
+            caller_key_id = %auth.api_key.id,
+            method = %parts.method,
+            path = %parts.uri.path(),
+            "admin API request authorized"
+        );
+        Ok(AdminApiAuth(auth))
     }
 }
 
@@ -455,9 +465,11 @@ async fn require_admin(
             "Use tokens cannot access the admin API; an API key with 'admin' permission is required",
         ));
     }
+    // Generic message — don't reveal whether the key was unknown vs. expired
+    // vs. role-missing (avoid an enumeration oracle on the admin surface).
     let (key, role) = validate_api_key(state, &secret)
         .await
-        .map_err(|e| error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", e))?;
+        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", "Invalid API key"))?;
     let auth = AuthResult { api_key: key, role };
     if !auth.has_permission(Permission::Admin) {
         return Err(error_response(
@@ -504,6 +516,8 @@ fn redact_for_replay(body: &serde_json::Value) -> serde_json::Value {
     if let Some(obj) = stored.as_object_mut() {
         if obj.remove("token").is_some() {
             obj.insert("token".to_string(), serde_json::Value::Null);
+            // The "shown only once" warning no longer applies to a replay.
+            obj.remove("warning");
             obj.insert(
                 "token_note".to_string(),
                 serde_json::json!(
@@ -564,13 +578,15 @@ where
     let (status, body) = op().await;
     if status.is_success() {
         let body_str = serde_json::to_string(&redact_for_replay(&body)).unwrap_or_default();
-        let _ = state
-            .storage
-            .idempotency_complete(&key, status.as_u16(), &body_str)
-            .await;
+        if let Err(e) = state.storage.idempotency_complete(&key, status.as_u16(), &body_str).await {
+            // Completion not recorded → a retry may re-run the op (at-least-once).
+            tracing::warn!(error = %e, idempotency_key = %key, "failed to record idempotency completion");
+        }
     } else {
         // Don't pin a failed attempt to the key — let the client retry it.
-        let _ = state.storage.idempotency_release(&key).await;
+        if let Err(e) = state.storage.idempotency_release(&key).await {
+            tracing::warn!(error = %e, idempotency_key = %key, "failed to release idempotency reservation");
+        }
     }
     (status, Json(body)).into_response()
 }
@@ -615,9 +631,21 @@ async fn store_and_reload_policy(state: &AppState, policy: &Policy, created: boo
         );
     }
     if let Err(e) = state.server.reload_policies().await {
+        // The policy persisted but the live engine didn't pick it up. For a deny
+        // policy this is a fail-open window, so keep storage and the engine
+        // consistent: roll back a fresh create; a replace can't restore the
+        // prior version, so surface that the change is stored-but-not-active.
+        tracing::error!(error = %e, policy_id = %policy.id, created, "policy stored but engine reload failed");
+        if created {
+            let _ = state.storage.delete_policy(&policy.id).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"code": "reload_error", "error": format!("engine reload failed; the new policy was rolled back: {}", e)}),
+            );
+        }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({"code": "reload_error", "error": e.to_string()}),
+            serde_json::json!({"code": "reload_error", "error": format!("policy stored but engine reload failed; restart to apply: {}", e)}),
         );
     }
     let status = if created { StatusCode::CREATED } else { StatusCode::OK };
@@ -807,16 +835,21 @@ pub async fn api_create_role(
                 }
             }
         }
-        // Reject duplicate names so the role index stays unambiguous.
-        if matches!(st.storage.get_role_by_name(&req.name).await, Ok(Some(_))) {
-            return (StatusCode::CONFLICT, serde_json::json!({"code":"role_exists","error":format!("a role named '{}' already exists", req.name)}));
-        }
         let mut role = Role::new(req.name, perms).with_scopes(req.credential_scopes);
         if let Some(desc) = req.description {
             role = role.with_description(desc);
         }
-        if let Err(e) = st.storage.store_role(&role).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({"code":"storage_error","error":e.to_string()}));
+        // store_role enforces name uniqueness atomically under the storage lock,
+        // so two concurrent creates with the same name can't both succeed (no
+        // TOCTOU): the loser gets RoleAlreadyExists → 409.
+        match st.storage.store_role(&role).await {
+            Ok(()) => {}
+            Err(crate::storage::StorageError::RoleAlreadyExists(_)) => {
+                return (StatusCode::CONFLICT, serde_json::json!({"code":"role_exists","error":format!("a role named '{}' already exists", role.name)}));
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({"code":"storage_error","error":e.to_string()}));
+            }
         }
         // Make the new role visible to this process's auth manager immediately.
         let _ = refresh_auth_data(&st).await;
@@ -839,25 +872,15 @@ pub async fn api_delete_role(
             "Predefined roles (admin, read-only, executor) cannot be deleted",
         );
     }
-    // Referential integrity: refuse to orphan API keys that still reference it
-    // (a deleted role would make those keys fail validation).
-    match state.storage.list_api_keys().await {
-        Ok(keys) if keys.iter().any(|k| k.role_id == id) => {
-            return error_response(
-                StatusCode::CONFLICT,
-                "role_in_use",
-                "This role is still referenced by one or more API keys; revoke those keys first",
-            );
-        }
-        Ok(_) => {}
-        Err(e) => {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string())
-        }
-    }
-    match state.storage.delete_role(&id).await {
+    // Referential integrity + delete in one atomic storage op, so a key minted
+    // concurrently referencing this role can't be orphaned.
+    match state.storage.delete_role_if_unreferenced(&id).await {
         Ok(()) => {
             let _ = refresh_auth_data(&state).await;
             (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response()
+        }
+        Err(crate::storage::StorageError::Conflict(msg)) => {
+            error_response(StatusCode::CONFLICT, "role_in_use", msg)
         }
         Err(crate::storage::StorageError::RoleNotFound(_)) => {
             error_response(StatusCode::NOT_FOUND, "role_not_found", format!("No role with id '{}'", id))

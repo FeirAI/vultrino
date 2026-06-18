@@ -896,6 +896,44 @@ async fn test_default_deny_denies_unpolicied_credential() {
 }
 
 #[tokio::test]
+async fn test_reload_policies_merges_config_and_stored() {
+    // The engine is the union of static config policies and admin-API-managed
+    // stored policies; reload_policies() (used at startup and by the periodic
+    // cross-process refresh) must surface both.
+    use vultrino::policy::Policy;
+    let config_policy = Policy::allow_all("from-config", "config-*");
+    let (server, storage) = setup_with_policies(vec![config_policy]).await;
+
+    // A policy pushed "via the admin API" (here: straight to storage).
+    let stored = Policy::deny_all("from-admin", "admin-*");
+    let stored_id = stored.id.clone();
+    storage.store_policy(&stored).await.unwrap();
+
+    server.reload_policies().await.unwrap();
+
+    let names: Vec<String> = server
+        .policy_engine()
+        .list_policies()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert!(names.contains(&"from-config".to_string()), "config policy missing: {names:?}");
+    assert!(names.contains(&"from-admin".to_string()), "stored policy missing: {names:?}");
+
+    // Deleting the stored policy and reloading drops it but keeps config.
+    storage.delete_policy(&stored_id).await.unwrap();
+    server.reload_policies().await.unwrap();
+    let names: Vec<String> = server
+        .policy_engine()
+        .list_policies()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert!(names.contains(&"from-config".to_string()));
+    assert!(!names.contains(&"from-admin".to_string()));
+}
+
+#[tokio::test]
 async fn test_default_deny_approved_action_still_resumes() {
     // The riskiest interaction: in deny mode, a credential matched by a Prompt
     // policy opens an approval. Once approved, resume re-evaluates policy

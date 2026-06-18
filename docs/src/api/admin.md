@@ -49,7 +49,15 @@ metadata plus a note (revoke and re-mint if you lost the original response).
 
 Policies pushed here are **merged with** the static `[[policies]]` from
 `config.toml` into the live engine (config policies stay declarative; the API
-manages dynamic ones by id). Each write hot-reloads the engine.
+manages dynamic ones by id). Each write hot-reloads the engine **on the web
+process** synchronously.
+
+> **Cross-process propagation.** Other long-running processes that share the
+> same vault (notably the MCP server) reload policies on a periodic refresh
+> (default 5s), so an admin push reaches them within that window — not
+> instantly. For an **immediate** kill, revoke the use token instead: token
+> revocation is storage-authoritative and re-checked under the lock on every
+> gated call, so it takes effect on the very next call in every process.
 
 | Method | Path | Body | Result |
 |--------|------|------|--------|

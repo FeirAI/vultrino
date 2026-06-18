@@ -865,6 +865,7 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     let stored_keys = storage.list_api_keys().await?;
     let auth_manager = Arc::new(RwLock::new(AuthManager::from_data(stored_roles, stored_keys)));
 
+    let config_policies = config.policies.clone();
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage, resolver);
 
@@ -877,6 +878,14 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     if let Err(e) = server.reload_policies().await {
         eprintln!("Warning: Failed to load stored policies: {}", e);
     }
+    // The admin API runs on the web process; refresh periodically so policies
+    // pushed there (e.g. an emergency Deny) propagate to this MCP process.
+    tokio::spawn(vultrino::server::refresh_policies_periodically(
+        server.storage().clone(),
+        server.policy_engine().clone(),
+        config_policies,
+        std::time::Duration::from_secs(vultrino::server::POLICY_REFRESH_SECS),
+    ));
 
     let vultrino = Arc::new(RwLock::new(server));
     let mut mcp = McpServer::new(vultrino, auth_manager);
@@ -916,6 +925,15 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
         warn!("Failed to load stored policies: {}", e);
     }
     let exec_server = Arc::new(exec_server);
+    // Refresh periodically so policies pushed by another writer (HA replica /
+    // external process) propagate here too. The process serving the admin API
+    // also reloads synchronously on each write, so it is never stale.
+    tokio::spawn(vultrino::server::refresh_policies_periodically(
+        exec_server.storage().clone(),
+        exec_server.policy_engine().clone(),
+        config.policies.clone(),
+        std::time::Duration::from_secs(vultrino::server::POLICY_REFRESH_SECS),
+    ));
 
     let web_config = WebConfig {
         bind,

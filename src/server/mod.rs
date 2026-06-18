@@ -549,12 +549,15 @@ impl VultrinoServer {
 
         // Re-evaluate policy at execution time so the deferred path still
         // enforces hard *deny* gates — a human approval is not a policy bypass.
-        // NOTE (default-deny interaction): if the policy that originally matched
-        // this credential (yielding the `Prompt`) is removed between approval and
-        // resume, the credential is now un-policied and a fail-closed engine
-        // denies the resume with a `no_policy` reason. That is intentional: a
-        // policy revoked mid-flight should stop the pending action, not let an
-        // already-approved request slip through un-governed.
+        // NOTE (policy-change interaction): policy is re-evaluated read-only at
+        // resume, so a policy change between approval and execution applies. If
+        // the matching policy is removed (un-policied → fail-closed `no_policy`)
+        // OR a new Deny is pushed for the credential/agent (e.g. an emergency
+        // kill via the admin API, propagated by the periodic refresh), the
+        // resume is denied. That is intentional: a policy revoked or a Deny
+        // pushed mid-flight must stop the pending action, not let an
+        // already-approved request slip through un-governed. Only `Deny` blocks
+        // here — a `Prompt` is already satisfied by the human's approval.
         // This is the READ-ONLY evaluation: rate limits were already counted when
         // the request first opened the approval, so re-counting here would
         // double-charge and could spuriously deny an already-approved action. A
@@ -780,6 +783,44 @@ fn cap_result_body(body: &[u8]) -> String {
         end -= 1;
     }
     format!("{}\n…[truncated {} bytes]", &text[..end], text.len() - end)
+}
+
+/// Default interval for the background policy refresh on long-running servers.
+pub const POLICY_REFRESH_SECS: u64 = 5;
+
+/// Background loop that periodically re-reads the vault from disk and reloads
+/// the policy engine from the union of config + stored policies.
+///
+/// This is how a long-running process that does **not** serve the admin API
+/// (notably the MCP server, and a second web replica) picks up policies pushed
+/// via the admin API on another process — bounded by `interval`, rather than
+/// only at restart. The web process that serves the admin API reloads
+/// synchronously on each write, so it is always current.
+///
+/// Note: this gives policy changes *bounded-staleness* propagation, not instant.
+/// For an **immediate** kill, revoke the use token — that is storage-
+/// authoritative and re-checked under the lock on every gated call.
+pub async fn refresh_policies_periodically(
+    storage: Arc<dyn StorageBackend>,
+    engine: Arc<PolicyEngine>,
+    config_policies: Vec<crate::policy::Policy>,
+    interval: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Err(e) = storage.reload().await {
+            warn!(error = %e, "policy refresh: storage reload failed");
+            continue;
+        }
+        match storage.list_stored_policies().await {
+            Ok(stored) => {
+                let mut all = config_policies.clone();
+                all.extend(stored);
+                engine.load_policies(all);
+            }
+            Err(e) => warn!(error = %e, "policy refresh: listing stored policies failed"),
+        }
+    }
 }
 
 /// The startup warning (if any) for a given enforcement posture and whether any

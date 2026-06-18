@@ -276,6 +276,115 @@ async fn test_admin_token_mint_idempotent() {
 }
 
 #[tokio::test]
+async fn test_admin_revoked_token_cannot_execute() {
+    let (router, storage, _server, key) = build_admin_router().await;
+
+    // Mint a token via the admin API.
+    let mint = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/tokens",
+            &key,
+            serde_json::json!({"name":"t","credential_scope":"*"}),
+        ))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(mint).await).unwrap();
+    let plaintext = v["token"].as_str().unwrap().to_string();
+    let token_id = v["metadata"]["id"].as_str().unwrap().to_string();
+
+    // Revoke it via the admin API.
+    let revoke = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/tokens/{}/revoke", token_id),
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::OK);
+    assert!(storage.get_use_token(&token_id).await.unwrap().unwrap().revoked);
+
+    // Using the revoked token on /execute is rejected at the auth seam (403),
+    // before any credential resolution or upstream call.
+    let exec = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/execute")
+                .header("authorization", format!("Bearer {}", plaintext))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "credential":"whatever","method":"GET","url":"https://example.com"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exec.status(), StatusCode::FORBIDDEN);
+    assert!(body_string(exec).await.to_lowercase().contains("revoked"));
+}
+
+#[tokio::test]
+async fn test_admin_role_create_and_credential_delete_and_put_policy() {
+    let (router, storage, _server, key) = build_admin_router().await;
+
+    // Role create happy path.
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/roles",
+            &key,
+            serde_json::json!({"name":"gh-exec","permissions":["read","execute"],"credential_scopes":["github-*"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    assert!(storage.get_role_by_name("gh-exec").await.unwrap().is_some());
+
+    // PUT a policy at a chosen id (create-via-PUT).
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "PUT",
+            "/api/v1/policies/my-fixed-id",
+            &key,
+            serde_json::json!({"name":"p","credential_pattern":"*","default_action":"allow"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(storage.get_policy("my-fixed-id").await.unwrap().is_some());
+
+    // Create then delete a credential.
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/credentials",
+            &key,
+            serde_json::json!({"alias":"c1","data":{"type":"api_key","key":"k","header_name":"Authorization","header_prefix":"Bearer "}}),
+        ))
+        .await
+        .unwrap();
+    let cred: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let cred_id = cred["id"].as_str().unwrap().to_string();
+    let r = router
+        .oneshot(admin_req("DELETE", &format!("/api/v1/credentials/{}", cred_id), &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(storage.get_by_alias("c1").await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn test_admin_cannot_delete_builtin_role() {
     let (router, _storage, _server, key) = build_admin_router().await;
     let resp = router

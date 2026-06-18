@@ -155,13 +155,19 @@ impl StorageCache {
         }
     }
 
-    /// Drop completed idempotency records past their retention window so the
-    /// map can't grow without bound. In-flight (not-done) reservations are kept
-    /// unless they're stale (handled at reserve time).
+    /// Drop idempotency records that can no longer be useful so the map can't
+    /// grow without bound: completed records past the retention window, and
+    /// orphaned in-flight reservations (a crash between reserve and complete)
+    /// past the stale-reservation window.
     fn gc_idempotency(&mut self) {
         let now = Utc::now();
         self.idempotency.retain(|_, rec| {
-            !rec.done || (now - rec.created_at).num_seconds() < IDEMPOTENCY_RETENTION_SECS
+            let age = (now - rec.created_at).num_seconds();
+            if rec.done {
+                age < IDEMPOTENCY_RETENTION_SECS
+            } else {
+                age < STALE_IDEMPOTENCY_RESERVATION_SECS
+            }
         });
     }
 }
@@ -487,6 +493,27 @@ impl StorageBackend for FileStorage {
             }
         })
             .await
+    }
+
+    async fn delete_role_if_unreferenced(&self, id: &str) -> Result<(), StorageError> {
+        let id = id.to_string();
+        self.locked_mutate(move |cache| {
+            // Referential-integrity check and delete in one locked section, so a
+            // key minted between a check and the delete can't be orphaned.
+            if cache.api_keys.values().any(|k| k.role_id == id) {
+                return Err(StorageError::Conflict(format!(
+                    "role '{}' is still referenced by an API key",
+                    id
+                )));
+            }
+            if let Some(role) = cache.roles.remove(&id) {
+                cache.role_name_index.remove(&role.name);
+                Ok(())
+            } else {
+                Err(StorageError::RoleNotFound(id.clone()))
+            }
+        })
+        .await
     }
 
     async fn store_api_key(&self, key: &ApiKey) -> Result<(), StorageError> {
@@ -839,12 +866,13 @@ impl StorageBackend for FileStorage {
     ) -> Result<(), StorageError> {
         let (key, body) = (key.to_string(), body.to_string());
         self.locked_mutate(move |cache| {
-            // Preserve the body hash bound at reservation time.
-            let body_hash = cache
+            // Preserve the body hash and original reservation time so the
+            // retention window is measured from reservation, not completion.
+            let (body_hash, created_at) = cache
                 .idempotency
                 .get(&key)
-                .map(|r| r.body_hash.clone())
-                .unwrap_or_default();
+                .map(|r| (r.body_hash.clone(), r.created_at))
+                .unwrap_or_else(|| (String::new(), Utc::now()));
             cache.idempotency.insert(
                 key.clone(),
                 IdempotencyRecord {
@@ -852,7 +880,7 @@ impl StorageBackend for FileStorage {
                     body_hash,
                     status,
                     response: body,
-                    created_at: Utc::now(),
+                    created_at,
                 },
             );
             Ok(())
