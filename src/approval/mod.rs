@@ -110,6 +110,8 @@ pub struct NewApproval {
     pub params: serde_json::Value,
     pub requester: RequesterInfo,
     pub use_token_id: Option<String>,
+    /// Resolved principal id (V4), for per-agent policy re-evaluation at resume.
+    pub principal_id: Option<String>,
     /// Agent label of the requesting principal (V4), for per-agent policy
     /// re-evaluation at resume.
     pub agent_label: Option<String>,
@@ -137,6 +139,11 @@ pub struct ApprovalRequest {
     /// Use token to consume on execution, if the request was token-authorized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_token_id: Option<String>,
+    /// Resolved principal id of the requester (V4), recorded explicitly (not
+    /// derived from `requester`) so per-agent policies re-evaluate correctly at
+    /// resume regardless of how the requester was constructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
     /// Agent label of the requesting principal (V4), recorded so a per-agent
     /// policy is re-evaluated correctly when the approved action resumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +196,7 @@ impl ApprovalRequest {
             summary,
             requester: params.requester,
             use_token_id: params.use_token_id,
+            principal_id: params.principal_id,
             agent_label: params.agent_label,
             created_at: now,
             expires_at: now + params.ttl,
@@ -557,6 +565,7 @@ mod tests {
                 role: Some("executor".to_string()),
             },
             use_token_id: None,
+            principal_id: Some("k1".to_string()),
             agent_label: None,
             ttl: chrono::Duration::hours(1),
         })

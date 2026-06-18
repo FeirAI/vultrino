@@ -1170,3 +1170,109 @@ async fn test_per_agent_deny_end_to_end() {
         ExecutionOutcome::Completed(_)
     ));
 }
+
+#[tokio::test]
+async fn test_per_agent_deny_refires_at_resume() {
+    // V4 resume re-enforcement: an approval opened under a labeled agent is
+    // BLOCKED at resume if a per-agent Deny is pushed before it runs (the
+    // principal id + agent_label are recorded on the approval at open time).
+    use vultrino::policy::Policy;
+    let (server, storage) = setup_with_policies(vec![]).await; // allow mode
+    store_credential(&storage, "api-cred", false).await;
+
+    let (_f, mut tok) = UseToken::create(NewUseToken {
+        name: "bot".to_string(),
+        credential_scope: "api-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: true, // force an approval so there's a resume to gate
+        expires_in: None,
+    });
+    tok.agent_label = Some("refund-bot".to_string());
+    storage.store_use_token(&tok).await.unwrap();
+
+    let approval_id = match server
+        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(tok.clone()))
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(a) => {
+            assert_eq!(a.agent_label.as_deref(), Some("refund-bot"));
+            assert_eq!(a.principal_id.as_deref(), Some(tok.id.as_str()));
+            a.id
+        }
+        other => panic!("expected Pending, got {other:?}"),
+    };
+
+    // Push a per-agent Deny and approve; the resume must be blocked.
+    storage.store_policy(&Policy::deny_all("kill-bot", "api-*").with_principal("refund-bot")).await.unwrap();
+    server.reload_policies().await.unwrap();
+    storage.decide_approval(&approval_id, true, "approver", None).await.unwrap();
+
+    let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
+    assert!(
+        resumed.result_error.is_some(),
+        "a per-agent Deny pushed before resume must block the approved action"
+    );
+}
+
+#[tokio::test]
+async fn test_spend_capped_approval_resumes_without_recharge() {
+    // V3 resume re-enforcement: a spend-capped, approval-gated action is charged
+    // when the approval OPENS and must still resume (the read-only resume path
+    // does not re-charge and must not spuriously deny).
+    use vultrino::policy::{Policy, PolicyAction, PolicyCondition, PolicyRule, SpendExtractor};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("pw");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let mut spend_pol = Policy::deny_all("pay-cap", "pay-*");
+    spend_pol.rules = vec![PolicyRule {
+        condition: PolicyCondition::SpendCap {
+            asset: "usd".to_string(),
+            per_action_max: None,
+            cumulative_max: Some(100),
+            window_secs: 3600,
+        },
+        action: PolicyAction::Allow,
+    }];
+
+    let mut config = Config::default();
+    config.approval.enabled = true;
+    config.approval.ttl_secs = 3600;
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.policies = vec![spend_pol];
+    config.spend_extractors = vec![SpendExtractor {
+        action_pattern: "mock.echo".to_string(),
+        credential_pattern: "pay-*".to_string(),
+        amount_pointer: "/amount".to_string(),
+        asset: Some("usd".to_string()),
+        asset_pointer: None,
+    }];
+
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    server.plugins().register(Arc::new(MockPlugin));
+    store_credential(&storage, "pay-cred", true).await; // require_approval
+
+    let req = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "amount": 60 }),
+    };
+    // Within cap (60 ≤ 100): charged at open, then gated on approval.
+    let approval_id = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a.id,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    storage.decide_approval(&approval_id, true, "approver", None).await.unwrap();
+
+    // Resume must succeed (read-only spend check does not re-charge/deny).
+    let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
+    assert!(resumed.executed);
+    assert!(resumed.result_error.is_none(), "spend-capped approval must resume: {:?}", resumed.result_error);
+}

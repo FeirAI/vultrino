@@ -181,10 +181,10 @@ impl PolicyEngine {
         method: Option<&str>,
         context: &RequestContext,
     ) -> PolicyDecision {
-        let principal = context
-            .api_key_id
-            .as_ref()
-            .map(|id| Principal { id: id.clone(), agent_label: None });
+        let principal = context.api_key_id.as_ref().map(|id| Principal {
+            id: id.clone(),
+            agent_label: context.agent_label.clone(),
+        });
         let input = EvalInput {
             credential_alias,
             url,
@@ -416,6 +416,10 @@ impl PolicyEngine {
         // Per-call cap (no ledger access needed).
         if matches!(per_action_max, Some(max) if spend.amount > max) {
             return false;
+        }
+        // Per-action-only cap: the ledger is irrelevant, so don't touch the lock.
+        if cumulative_max.is_none() {
+            return true;
         }
         // Cumulative check + charge atomically under one lock.
         let mut spends = self.spends.write();
@@ -1000,6 +1004,13 @@ mod tests {
             action: PolicyAction::Allow,
         }];
         assert!(nested.validate().is_err());
+
+        // Empty asset → rejected.
+        assert!(spend_policy("", Some(1), None, 60).validate().is_err());
+        // window_secs == 0 with a cumulative cap → rejected (window no-op).
+        assert!(spend_policy("usd", None, Some(100), 0).validate().is_err());
+        // window_secs == 0 is fine for a per-action-only cap (no window used).
+        assert!(spend_policy("usd", Some(100), None, 0).validate().is_ok());
     }
 
     #[test]

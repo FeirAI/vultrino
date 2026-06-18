@@ -409,6 +409,24 @@ async fn test_admin_put_policy_idempotency_bound_to_path() {
 }
 
 #[tokio::test]
+async fn test_admin_token_agent_label_validation() {
+    let (router, _storage, _server, key) = build_admin_router().await;
+    let mint = |label: &str| {
+        admin_req(
+            "POST",
+            "/api/v1/tokens",
+            &key,
+            serde_json::json!({"name":"t","credential_scope":"*","agent_label":label}),
+        )
+    };
+    // Glob metacharacters and the ':' key-prefix separator are rejected.
+    assert_eq!(router.clone().oneshot(mint("bot-*")).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(router.clone().oneshot(mint("cred:foo")).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    // A plain label is accepted.
+    assert_eq!(router.oneshot(mint("refund-bot")).await.unwrap().status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn test_admin_token_expiry_bounds() {
     let (router, _storage, _server, key) = build_admin_router().await;
     let mint = |secs: i64| {
@@ -570,6 +588,7 @@ async fn test_out_of_band_decide_flow() {
         params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
         requester: RequesterInfo::local(),
         use_token_id: None,
+        principal_id: None,
         agent_label: None,
         ttl: chrono::Duration::hours(1),
     });

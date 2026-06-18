@@ -151,15 +151,27 @@ impl Policy {
         let mut uses_spend_cap = false;
         for rule in &self.rules {
             if let PolicyCondition::SpendCap {
+                asset,
                 per_action_max,
                 cumulative_max,
-                ..
+                window_secs,
             } = &rule.condition
             {
                 uses_spend_cap = true;
                 if per_action_max.is_none() && cumulative_max.is_none() {
                     return Err(format!(
                         "policy '{}': SpendCap must set per_action_max and/or cumulative_max",
+                        self.name
+                    ));
+                }
+                if asset.trim().is_empty() {
+                    return Err(format!("policy '{}': SpendCap asset must not be empty", self.name));
+                }
+                // A zero window makes the cumulative cap a no-op (every charge is
+                // immediately pruned), silently failing open.
+                if cumulative_max.is_some() && *window_secs == 0 {
+                    return Err(format!(
+                        "policy '{}': SpendCap window_secs must be > 0 when cumulative_max is set",
                         self.name
                     ));
                 }

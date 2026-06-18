@@ -393,6 +393,10 @@ pub struct RequestContext {
     /// Role name (if authenticated)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role_name: Option<String>,
+    /// Agent label bound to the presenting key/token (V4), for principal_pattern
+    /// matching via the legacy `evaluate` path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
 }
 
 impl RequestContext {
@@ -406,6 +410,7 @@ impl RequestContext {
             api_key_id: None,
             api_key_name: None,
             role_name: None,
+            agent_label: None,
         }
     }
 
@@ -414,6 +419,7 @@ impl RequestContext {
         self.api_key_id = Some(auth.api_key.id.clone());
         self.api_key_name = Some(auth.api_key.name.clone());
         self.role_name = Some(auth.role.name.clone());
+        self.agent_label = auth.api_key.agent_label.clone();
         self
     }
 }

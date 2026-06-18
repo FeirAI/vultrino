@@ -156,9 +156,25 @@ condition = { spend_cap = { asset = "usd", per_action_max = 5000, cumulative_max
 ```
 
 Use it as the condition of an `allow` rule (with `default_action = "deny"`): the
-call is allowed only while within the caps. The cumulative ledger is keyed by
-the presenting principal (or the credential, if unauthenticated) and is in-memory
-per process (it resets on restart — like the rate limiter).
+call is allowed only while within the caps. A `SpendCap` must be a rule's
+**top-level** condition (not nested in `and`/`or`/`not`), and its policy must be
+fail-closed (`default_action = "deny"`) — both are enforced at load.
+
+The cumulative ledger keys by the **cap's scope**: a per-agent cap (the policy
+sets `principal_pattern`) keys by the agent label, so all of an agent's tokens
+share one budget; a credential-wide cap keys by the credential, so all
+principals share it. The ledger is in-memory per process (it resets on restart —
+like the rate limiter).
+
+Notes:
+
+- **Approval-gated spends are charged when the approval opens** (so the cap
+  binds), and a denied/expired approval is **not** refunded — the cap is
+  conservative (the rolling window bounds the effect).
+- **Multiple assets**: put per-asset caps as multiple *rules in a single
+  policy* (first match wins). Two *separate* per-asset policies would deny each
+  other's asset, because a non-matching asset falls through to that policy's
+  `deny` default.
 
 ### Combined Conditions
 

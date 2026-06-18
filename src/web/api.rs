@@ -799,6 +799,17 @@ pub async fn api_create_token(
                 serde_json::json!({"code": "invalid_token", "error": e}),
             );
         }
+        // Validate the agent label: it feeds principal_pattern glob matching and
+        // the spend-ledger key, so reject glob metacharacters and the ':' used as
+        // a spend-key prefix separator, to avoid unintended matches/collisions.
+        if let Some(label) = &req.agent_label {
+            if label.contains(['*', '?', '[', ']', ':']) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"code": "invalid_agent_label", "error": "agent_label must not contain glob metacharacters (* ? [ ]) or ':'"}),
+                );
+            }
+        }
         let (full_token, mut token) = UseToken::create(params);
         // Bind the agent identity (V4) post-create; req.agent_label is not moved
         // into `params` above, so it's still accessible after the partial move.
