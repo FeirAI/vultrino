@@ -326,9 +326,16 @@ impl VultrinoServer {
                 )));
             }
             if !token.allows_action(&request.action) && !token.allows_action(&full_action) {
+                // Surface both forms when the presented action was a label, so
+                // the diagnostic isn't confusing under a label-scoped token.
+                let shown = if action_label.is_some() {
+                    format!("'{}' (resolved to '{}')", request.action, full_action)
+                } else {
+                    format!("'{}'", full_action)
+                };
                 return Err(VultrinoError::PolicyDenied(format!(
-                    "Use token is not scoped to action '{}'",
-                    full_action
+                    "Use token is not scoped to action {}",
+                    shown
                 )));
             }
         }

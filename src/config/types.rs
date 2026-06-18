@@ -573,6 +573,30 @@ action = "deny"
     }
 
     #[test]
+    fn test_action_label_validation() {
+        let label = |l: &str, a: &str| {
+            format!("[[action_labels]]\nlabel = \"{l}\"\naction = \"{a}\"")
+        };
+        // Valid mapping parses.
+        assert!(Config::parse(&label("payments.refund", "http.request")).is_ok());
+        // Empty label or action is rejected.
+        assert!(Config::parse(&label("", "http.request")).is_err());
+        assert!(Config::parse(&label("payments.refund", "")).is_err());
+        // A malformed canonical target (not plugin.action) is rejected at load.
+        assert!(Config::parse(&label("payments.refund", "notdotted")).is_err());
+        assert!(Config::parse(&label("payments.refund", ".request")).is_err());
+        // A label equal to its own target is rejected.
+        assert!(Config::parse(&label("http.request", "http.request")).is_err());
+        // Duplicate labels are rejected (no silent last-wins).
+        let dup = format!("{}\n{}", label("pay.x", "http.request"), label("pay.x", "mock.echo"));
+        assert!(Config::parse(&dup).is_err());
+        // A label that is also another mapping's canonical target is rejected.
+        let shadow =
+            format!("{}\n{}", label("a.b", "mock.echo"), label("c.d", "a.b"));
+        assert!(Config::parse(&shadow).is_err());
+    }
+
+    #[test]
     fn test_egress_rule_validation() {
         // A no-op rule (neither blocks nor redacts) is rejected.
         assert!(Config::parse("[[egress]]\ncredential_pattern = \"x\"").is_err());

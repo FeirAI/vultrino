@@ -1397,9 +1397,8 @@ async fn test_action_label_token_scope_and_approval_summary() {
     // V8: a token scoped to a govder action label authorizes a request that
     // presents that label (resolved to the canonical plugin.action), and the
     // approver sees the business verb.
-    let dir = tempdir().unwrap();
+    let dir = tempdir().unwrap(); // kept for the test's lifetime, cleaned on drop
     let path = dir.path().join("store.enc");
-    std::mem::forget(dir);
     let password = SecretString::from("pw");
     let storage: Arc<dyn StorageBackend> =
         Arc::new(FileStorage::new(&path, &password).await.unwrap());
@@ -1442,4 +1441,86 @@ async fn test_action_label_token_scope_and_approval_summary() {
     assert_eq!(approval.action, "mock.echo");
     assert_eq!(approval.action_label.as_deref(), Some("payments.refund"));
     assert!(approval.summary.contains("payments.refund"), "summary: {}", approval.summary);
+}
+
+#[tokio::test]
+async fn test_action_label_scope_isolation() {
+    // V8 (negative cases — the security-critical direction): the EITHER-match
+    // scope check (presented label OR resolved canonical) must NOT widen a
+    // label-scoped token to (a) the raw canonical action, nor (b) a *different*
+    // label that resolves to the same canonical action. And a token scoped to
+    // the canonical action is intentionally broad (authorizes any label of it).
+    let dir = tempdir().unwrap(); // kept for the test's lifetime, cleaned on drop
+    let path = dir.path().join("store.enc");
+    let password = SecretString::from("pw");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    // Two distinct labels collapse to the same canonical action.
+    config.action_labels = std::collections::HashMap::from([
+        ("payments.refund".to_string(), "mock.echo".to_string()),
+        ("payments.charge".to_string(), "mock.echo".to_string()),
+    ]);
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    server.plugins().register(Arc::new(MockPlugin));
+    store_credential(&storage, "pay-cred", false).await;
+
+    let mint = |action_scope: &str| {
+        let (_f, token) = UseToken::create(NewUseToken {
+            name: "t".to_string(),
+            credential_scope: "pay-*".to_string(),
+            action_scope: Some(action_scope.to_string()),
+            max_uses: None,
+            require_approval: false,
+            expires_in: None,
+        });
+        token
+    };
+    let req = |action: &str| ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: action.to_string(),
+        params: serde_json::json!({ "amount": 10 }),
+    };
+
+    // (a) Label-scoped token, raw canonical action presented → DENIED: the
+    //     canonical form must not satisfy a label-only scope.
+    let label_tok = mint("payments.refund");
+    storage.store_use_token(&label_tok).await.unwrap();
+    let err = server
+        .execute_gated(req("mock.echo"), ExecAuth::from_use_token(label_tok))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, vultrino::VultrinoError::PolicyDenied(_)),
+        "canonical action must not satisfy a label-only scope, got {err:?}"
+    );
+
+    // (b) Label-scoped token, a *different* label (same canonical) presented →
+    //     DENIED: resolving to the same plugin.action must not cross labels.
+    let refund_tok = mint("payments.refund");
+    storage.store_use_token(&refund_tok).await.unwrap();
+    let err = server
+        .execute_gated(req("payments.charge"), ExecAuth::from_use_token(refund_tok))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, vultrino::VultrinoError::PolicyDenied(_)),
+        "a sibling label sharing a canonical action must not be authorized, got {err:?}"
+    );
+
+    // (c) Canonical-scoped token, label presented → ALLOWED (canonical scope is
+    //     intentionally the broader form).
+    let canon_tok = mint("mock.echo");
+    storage.store_use_token(&canon_tok).await.unwrap();
+    let outcome = server
+        .execute_gated(req("payments.refund"), ExecAuth::from_use_token(canon_tok))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, ExecutionOutcome::Completed(_)),
+        "canonical-scoped token should authorize any label of it, got {outcome:?}"
+    );
 }

@@ -187,7 +187,12 @@ pub async fn api_execute(
     // Build the execute request (action no longer hardcoded — V8).
     let execute_request = ExecuteRequest {
         credential: request.credential,
-        action: request.action.unwrap_or_else(|| "http.request".to_string()),
+        // An omitted *or* explicitly-empty action falls back to the default,
+        // rather than passing "" through to parse_action.
+        action: request
+            .action
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "http.request".to_string()),
         params: serde_json::json!({
             "method": request.method.to_uppercase(),
             "url": request.url,

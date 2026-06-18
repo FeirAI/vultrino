@@ -190,9 +190,11 @@ from the body (on top of the always-on redaction).
 
 ### Action Labels
 
-Map a govder **business verb** to a canonical `plugin.action` (V8), so policies,
-tokens, and the audit trail can speak in business terms while vultrino executes
-the underlying plugin action:
+Map a govder **business verb** to a canonical `plugin.action` (V8), so use-token
+scopes and the approval/audit trail can speak in business terms while vultrino
+executes the underlying plugin action. (Policy *rules* match on
+URL/method/credential/principal/spend — not on the action label — so the verb is
+a scoping and audit concept, not a policy-condition one.)
 
 ```toml
 [[action_labels]]

@@ -65,6 +65,13 @@ impl Config {
     }
 }
 
+/// Whether `s` is a well-formed canonical `plugin.action` — a non-empty plugin
+/// and a non-empty action separated by a `.`. Used to validate `action_labels`
+/// targets at config load so a typo can't silently route to a default plugin.
+fn is_well_formed_action(s: &str) -> bool {
+    matches!(s.split_once('.'), Some((plugin, action)) if !plugin.is_empty() && !action.is_empty())
+}
+
 /// Engine-level enforcement configuration.
 #[derive(Debug, Clone)]
 pub struct EnforcementConfig {
@@ -140,11 +147,51 @@ impl Config {
             .into_iter()
             .map(TryInto::try_into)
             .collect::<Result<Vec<_>, _>>()?;
-        let action_labels = raw
-            .action_labels
-            .into_iter()
-            .map(|a| (a.label, a.action))
-            .collect();
+        // Validate action-label mappings at load (fail-closed): a malformed or
+        // ambiguous mapping is an operator error we surface now, rather than a
+        // deferred footgun that only fails at request time.
+        let mut action_labels = std::collections::HashMap::new();
+        for a in raw.action_labels {
+            let label = a.label.trim().to_string();
+            let action = a.action.trim().to_string();
+            if label.is_empty() || action.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "action_labels: label and action must both be non-empty".to_string(),
+                ));
+            }
+            // The canonical target must be a well-formed `plugin.action`, so a
+            // typo can't silently route to the default `http` plugin later.
+            if !is_well_formed_action(&action) {
+                return Err(ConfigError::Invalid(format!(
+                    "action_labels: action '{}' for label '{}' is not a well-formed 'plugin.action'",
+                    action, label
+                )));
+            }
+            // A label that equals its own target, or shadows another label's
+            // target, would make resolution ambiguous/circular — reject it.
+            if label == action {
+                return Err(ConfigError::Invalid(format!(
+                    "action_labels: label '{}' must differ from its canonical action",
+                    label
+                )));
+            }
+            if action_labels.insert(label.clone(), action).is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "action_labels: duplicate label '{}'",
+                    label
+                )));
+            }
+        }
+        // A label must not shadow another mapping's canonical target (which would
+        // make `resolve_action` order-dependent on that target).
+        for canonical in action_labels.values() {
+            if action_labels.contains_key(canonical) {
+                return Err(ConfigError::Invalid(format!(
+                    "action_labels: '{}' is both a label and a canonical action target",
+                    canonical
+                )));
+            }
+        }
 
         let policies = raw
             .policies
