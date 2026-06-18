@@ -230,14 +230,21 @@ retention_secs = 604800                               # replay window, default 7
   `HMAC-SHA256(hmac_secret, body)`. A consumer recomputes it over the raw body
   to verify authenticity. Enabling the outbox **requires** both `url` and
   `hmac_secret` (an unsigned/undeliverable outbox is rejected at load).
+- **Exactly-once-ish delivery across processes.** Each event is atomically
+  *claimed* (leased) under the vault lock before it is POSTed, so the web and MCP
+  processes can't both deliver it; a failed delivery backs off (the lease holds it
+  off the retry queue) before re-attempting, and a crashed deliverer's lease is
+  reclaimed once stale.
 - **Replayable.** A consumer that drops offline replays from its last-seen
-  sequence: `GET /api/v1/events?after=<cursor>` returns the next events (same
-  envelope as a push), with no gaps and no dupes, within the retention window.
+  sequence: `GET /api/v1/events?after=<cursor>` returns the next events — each as
+  `{ "body": …, "signature": "sha256=…" }`, the same body a push carries plus its
+  signature — with no gaps and no dupes, within the retention window.
 - **Dead-letter queue.** An event that fails `max_attempts` deliveries is parked
   (`GET /api/v1/events/dead`) and re-queued with
   `POST /api/v1/events/{sequence}/replay` — it stops blocking its subject.
 - Events are appended even when push is unconfigured (still replayable via the
-  API); the log is bounded by `retention_secs`.
+  API). GC prunes the oldest contiguous prefix past `retention_secs` (keeping the
+  retained window gap-free); the window is the replay + dead-letter-resolution SLA.
 
 ## Environment Variables
 

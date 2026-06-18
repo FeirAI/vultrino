@@ -168,7 +168,7 @@ async fn test_signed_delivery_end_to_end_and_marks_delivered() {
 }
 
 #[tokio::test]
-async fn test_failed_delivery_retries_then_dead_letters() {
+async fn test_failed_delivery_is_recorded_and_backed_off() {
     let storage = storage().await;
     // Mock consumer that always 500s.
     let app = Router::new().route("/hook", post(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
@@ -188,12 +188,50 @@ async fn test_failed_delivery_retries_then_dead_letters() {
     let seq = storage.append_event("A", "e", serde_json::json!({})).await.unwrap();
 
     let client = reqwest::Client::new();
-    // Each pass delivers the one deliverable event once (a 500 → one failed attempt).
-    for _ in 0..config.max_attempts {
-        vultrino::server::deliver_outbox_once(&storage, &config, &client).await.unwrap();
+    // One pass: claims + POSTs once → a 500 records a failed attempt and a backoff
+    // lease, so it is NOT re-attempted on the next immediate pass (no hammering).
+    vultrino::server::deliver_outbox_once(&storage, &config, &client).await.unwrap();
+    let after = storage.list_events_after(0, 10).await.unwrap();
+    assert_eq!(after[0].sequence, seq);
+    assert_eq!(after[0].attempts, 1, "one failed attempt recorded");
+    assert_eq!(after[0].delivery, DeliveryState::Pending, "not yet dead-lettered");
+    assert!(after[0].last_error.is_some(), "failure recorded");
+    // The backoff lease withholds it from the next immediate claim.
+    assert!(storage.claim_deliverable_events(10, 30).await.unwrap().is_empty(), "backed off");
+}
+
+#[tokio::test]
+async fn test_dead_letters_after_max_via_record() {
+    // The DLQ transition is timing-independent at the storage layer (the e2e
+    // backoff makes a rapid-retry e2e nondeterministic).
+    let storage = storage().await;
+    let seq = storage.append_event("A", "e", serde_json::json!({})).await.unwrap();
+    for _ in 0..3 {
+        storage.record_event_delivery(seq, false, Some("500".to_string()), 3).await.unwrap();
     }
     let dead = storage.list_dead_letter_events(100).await.unwrap();
-    assert_eq!(dead.len(), 1, "dead-lettered after max attempts");
+    assert_eq!(dead.len(), 1);
     assert_eq!(dead[0].sequence, seq);
-    assert!(dead[0].last_error.is_some());
+}
+
+#[tokio::test]
+async fn test_claim_is_exclusive_across_callers() {
+    // V9: claiming leases the event, so a second concurrent caller (the other
+    // process's delivery pass) gets nothing — no double-delivery.
+    let storage = storage().await;
+    storage.append_event("A", "e", serde_json::json!({})).await.unwrap();
+
+    let first = storage.claim_deliverable_events(10, 30).await.unwrap();
+    assert_eq!(first.len(), 1, "first claimer takes it");
+    let second = storage.claim_deliverable_events(10, 30).await.unwrap();
+    assert!(second.is_empty(), "leased → second claimer gets nothing");
+
+    // After delivery succeeds it's terminal; a stale-lease reclaim won't resurrect it.
+    storage.record_event_delivery(first[0].sequence, true, None, 5).await.unwrap();
+    let all = storage.list_events_after(0, 10).await.unwrap();
+    assert_eq!(all[0].delivery, DeliveryState::Delivered);
+    // A late duplicate failure can't corrupt a Delivered event.
+    storage.record_event_delivery(first[0].sequence, false, Some("late".to_string()), 1).await.unwrap();
+    let all = storage.list_events_after(0, 10).await.unwrap();
+    assert_eq!(all[0].delivery, DeliveryState::Delivered, "Delivered is terminal");
 }

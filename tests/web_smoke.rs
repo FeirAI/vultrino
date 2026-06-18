@@ -783,7 +783,10 @@ async fn test_admin_event_replay_api() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let events = body["events"].as_array().unwrap();
-    assert!(events.iter().any(|e| e["event"] == "agent.halted" && e["subject"] == "bot-7"));
+    // Each replayed event is {body, signature?} — the body is what a push carries.
+    assert!(events
+        .iter()
+        .any(|e| e["body"]["event"] == "agent.halted" && e["body"]["subject"] == "bot-7"));
     let cursor = body["next_cursor"].as_u64().unwrap();
     assert!(cursor >= 1);
 

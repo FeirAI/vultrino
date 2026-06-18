@@ -394,13 +394,31 @@ pub trait StorageBackend: Send + Sync {
     /// The next deliverable pending events (V9): the earliest still-pending event
     /// per subject (so per-subject ordering is preserved — a later event for a
     /// subject is withheld until its earlier one is delivered), ascending by
-    /// sequence, up to `limit`.
+    /// sequence, up to `limit`. **Read-only peek** (does not claim) — for
+    /// inspection/tests; the delivery worker uses [`Self::claim_deliverable_events`].
     async fn deliverable_events(&self, _limit: usize) -> Result<Vec<OutboxEvent>, StorageError> {
         Ok(vec![])
     }
 
-    /// Record a delivery attempt's outcome (V9): on success mark `Delivered`; on
-    /// failure increment attempts and dead-letter once `>= max_attempts`.
+    /// Atomically **claim** the next deliverable events for delivery (V9): under
+    /// the lock, take the earliest still-pending, unleased (or stale-leased) event
+    /// per subject, stamp `leased_until = now + lease_secs`, and return them. This
+    /// makes delivery exclusive across the web+MCP processes — two workers can't
+    /// both POST the same event — and preserves per-subject ordering (a subject's
+    /// later event isn't claimable until the earlier one is delivered). A stale
+    /// lease (crashed owner) is reclaimable.
+    async fn claim_deliverable_events(
+        &self,
+        _limit: usize,
+        _lease_secs: u64,
+    ) -> Result<Vec<OutboxEvent>, StorageError> {
+        Ok(vec![])
+    }
+
+    /// Record a delivery attempt's outcome (V9). `Delivered` is terminal (a late
+    /// duplicate outcome can't corrupt it). On success → `Delivered`; on failure →
+    /// increment attempts, set a backoff lease (so it isn't immediately re-tried),
+    /// and dead-letter once `>= max_attempts`.
     async fn record_event_delivery(
         &self,
         _sequence: u64,
@@ -425,9 +443,13 @@ pub trait StorageBackend: Send + Sync {
         Ok(false)
     }
 
-    /// Garbage-collect **delivered** events older than `retention_secs` (V9).
-    /// Pending and dead-lettered events are retained until resolved. Returns the
-    /// number pruned.
+    /// Garbage-collect the outbox to the `retention_secs` window (V9). Prunes a
+    /// contiguous **prefix** by sequence (the oldest events past the window),
+    /// regardless of delivery state, so the retained suffix stays gap-free (the
+    /// replay no-gaps guarantee) and the log is bounded even when push is
+    /// disabled. The window is therefore the replay + dead-letter-resolution SLA;
+    /// dropping a not-yet-delivered event past the window is surfaced via a log
+    /// warning rather than failing silently. Returns the number pruned.
     async fn gc_outbox(&self, _retention_secs: u64) -> Result<usize, StorageError> {
         Ok(0)
     }

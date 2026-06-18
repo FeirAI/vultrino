@@ -65,6 +65,12 @@ pub struct OutboxEvent {
     pub delivery: DeliveryState,
     #[serde(default)]
     pub attempts: u32,
+    /// While set and in the future, this event is **claimed** for delivery by some
+    /// process (or is in a post-failure backoff) and won't be re-claimed (V9). A
+    /// lease in the past is stale (its owner likely crashed) and may be re-taken —
+    /// this is what makes delivery exclusive across the web+MCP processes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leased_until: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_attempt_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,8 +105,9 @@ pub fn sign_body(secret: &str, body: &[u8]) -> String {
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Configuration for the signed delivery outbox (V9).
-#[derive(Debug, Clone)]
+/// Configuration for the signed delivery outbox (V9). `Debug` is hand-written to
+/// **redact `hmac_secret`** so a config dump can never leak the signing key.
+#[derive(Clone)]
 pub struct OutboxConfig {
     /// Whether push delivery is enabled. When false, events are still appended to
     /// the log (and replayable via the API) but not actively pushed.
@@ -114,6 +121,19 @@ pub struct OutboxConfig {
     /// Retention for **delivered** events, in seconds (replay window). Pending and
     /// dead-lettered events are retained until resolved.
     pub retention_secs: u64,
+}
+
+impl std::fmt::Debug for OutboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutboxConfig")
+            .field("enabled", &self.enabled)
+            .field("url", &self.url)
+            // Never print the signing secret; only whether one is set.
+            .field("hmac_secret", &self.hmac_secret.as_ref().map(|_| "<redacted>"))
+            .field("max_attempts", &self.max_attempts)
+            .field("retention_secs", &self.retention_secs)
+            .finish()
+    }
 }
 
 impl Default for OutboxConfig {
@@ -159,6 +179,7 @@ mod tests {
             created_at: Utc::now(),
             delivery: DeliveryState::Pending,
             attempts: 0,
+            leased_until: None,
             last_attempt_at: None,
             last_error: None,
         };
@@ -167,5 +188,19 @@ mod tests {
         assert_eq!(body["subject"], "appr_1");
         assert_eq!(body["event"], "approval.approved");
         assert_eq!(body["payload"]["k"], "v");
+    }
+
+    #[test]
+    fn test_debug_redacts_hmac_secret() {
+        let cfg = OutboxConfig {
+            enabled: true,
+            url: Some("https://x".to_string()),
+            hmac_secret: Some("super-secret-signing-key".to_string()),
+            max_attempts: 3,
+            retention_secs: 10,
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("super-secret-signing-key"), "secret must not appear: {dbg}");
+        assert!(dbg.contains("redacted"));
     }
 }

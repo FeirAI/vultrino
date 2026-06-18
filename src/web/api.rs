@@ -987,8 +987,23 @@ pub async fn api_list_events(
             // `after` if none) — what the consumer persists for the next poll.
             let next = events.last().map(|e| e.sequence).unwrap_or(q.after);
             // Return the same envelope a pushed delivery carries (so a consumer
-            // processes replayed and pushed events identically).
-            let bodies: Vec<_> = events.iter().map(|e| e.delivery_body()).collect();
+            // processes replayed and pushed events identically), and — when a
+            // signing secret is configured — the matching `Govder-Signature` over
+            // each body, so a replayed event is verifiable exactly like a pushed one.
+            let secret = state.config.outbox.hmac_secret.as_deref();
+            let bodies: Vec<serde_json::Value> = events
+                .iter()
+                .map(|e| {
+                    let body = e.delivery_body();
+                    match secret {
+                        Some(s) => {
+                            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+                            serde_json::json!({ "body": body, "signature": crate::outbox::sign_body(s, &bytes) })
+                        }
+                        None => serde_json::json!({ "body": body }),
+                    }
+                })
+                .collect();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "events": bodies, "next_cursor": next })),

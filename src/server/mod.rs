@@ -1126,6 +1126,11 @@ const OUTBOX_GC_EVERY: u64 = 60;
 /// Max events delivered per pass (V9), to bound a single pass's work.
 const OUTBOX_BATCH: usize = 64;
 
+/// How long a claimed-for-delivery event is leased (V9) — comfortably longer
+/// than the per-request timeout, so a live deliverer's claim isn't judged stale,
+/// but short enough that a crashed deliverer's events are re-claimable promptly.
+const OUTBOX_LEASE_SECS: u64 = 30;
+
 /// One pass of outbox delivery (V9): deliver the next deliverable event per
 /// subject (per-subject ordering preserved), each signed with the shared HMAC
 /// secret, recording success / failure (→ retry → dead-letter). A no-op when no
@@ -1138,7 +1143,13 @@ pub async fn deliver_outbox_once(
     let (Some(url), Some(secret)) = (config.url.as_deref(), config.hmac_secret.as_deref()) else {
         return Ok(());
     };
-    for event in storage.deliverable_events(OUTBOX_BATCH).await? {
+    // Atomically claim (lease) the events this pass will deliver, so a second
+    // process (web vs MCP) can't also POST them — delivery is exclusive and
+    // per-subject-ordered across processes.
+    for event in storage
+        .claim_deliverable_events(OUTBOX_BATCH, OUTBOX_LEASE_SECS)
+        .await?
+    {
         let body = serde_json::to_vec(&event.delivery_body()).unwrap_or_default();
         let signature = crate::outbox::sign_body(secret, &body);
         let outcome = client
@@ -1154,9 +1165,14 @@ pub async fn deliver_outbox_once(
             // Strip the URL from the transport error so it never logs a secret.
             Err(e) => (false, Some(e.without_url().to_string())),
         };
-        storage
+        // A record failure must not abort the whole pass (the POST may have
+        // succeeded; bailing here would leave it leased and re-deliver later).
+        if let Err(e) = storage
             .record_event_delivery(event.sequence, success, error, config.max_attempts)
-            .await?;
+            .await
+        {
+            warn!(error = %e, sequence = event.sequence, "failed to record outbox delivery outcome");
+        }
     }
     Ok(())
 }
@@ -1171,7 +1187,12 @@ pub async fn deliver_outbox_periodically(
     config: crate::outbox::OutboxConfig,
     interval: std::time::Duration,
 ) {
-    let client = reqwest::Client::new();
+    // A per-request timeout so one slow consumer can't stall the whole pass; the
+    // lease (re-claimable once stale) covers an event whose POST times out.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
     let mut ticks: u64 = 0;
     loop {
         tokio::time::sleep(interval).await;

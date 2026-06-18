@@ -79,11 +79,47 @@ fn push_event(
             created_at: Utc::now(),
             delivery: crate::outbox::DeliveryState::Pending,
             attempts: 0,
+            leased_until: None,
             last_attempt_at: None,
             last_error: None,
         },
     );
     seq
+}
+
+/// The earliest still-pending event per subject (ascending by sequence), so
+/// per-subject ordering holds: a later event for a subject is withheld until its
+/// earlier one is delivered. A dead-lettered (non-Pending) event doesn't block —
+/// the DLQ is the head-of-line release valve. When `respect_lease` is set, an
+/// event whose `leased_until` is still in the future is skipped (claimed by
+/// another deliverer or in post-failure backoff).
+fn earliest_pending_per_subject(
+    outbox: &std::collections::BTreeMap<u64, crate::outbox::OutboxEvent>,
+    limit: usize,
+    respect_lease: bool,
+    now: DateTime<Utc>,
+) -> Vec<crate::outbox::OutboxEvent> {
+    use crate::outbox::DeliveryState;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for e in outbox.values() {
+        if e.delivery != DeliveryState::Pending {
+            continue;
+        }
+        // A subject is blocked by its earliest pending event regardless of lease,
+        // so a leased earlier event still withholds its later siblings (ordering).
+        if !seen.insert(e.subject.as_str()) {
+            continue;
+        }
+        if respect_lease && e.leased_until.is_some_and(|t| t > now) {
+            continue;
+        }
+        out.push(e.clone());
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
 }
 
 /// The agent-safe outbox payload for an approval decision/lifecycle event (V9).
@@ -1008,27 +1044,30 @@ impl StorageBackend for FileStorage {
         &self,
         limit: usize,
     ) -> Result<Vec<crate::outbox::OutboxEvent>, StorageError> {
-        use crate::outbox::DeliveryState;
         self.reload().await?;
         let cache = self.cache.read();
-        // The earliest still-pending event per subject (ascending by sequence), so
-        // per-subject ordering holds: a later event for a subject is withheld until
-        // its earlier one is delivered. A dead-lettered event is not Pending, so it
-        // doesn't block — the DLQ is the head-of-line release valve.
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for e in cache.outbox.values() {
-            if e.delivery != DeliveryState::Pending {
-                continue;
-            }
-            if seen.insert(e.subject.clone()) {
-                out.push(e.clone());
-                if out.len() >= limit {
-                    break;
+        Ok(earliest_pending_per_subject(&cache.outbox, limit, false, Utc::now()))
+    }
+
+    async fn claim_deliverable_events(
+        &self,
+        limit: usize,
+        lease_secs: u64,
+    ) -> Result<Vec<crate::outbox::OutboxEvent>, StorageError> {
+        let lease_until = Utc::now() + chrono::Duration::seconds(lease_secs.max(1) as i64);
+        self.locked_mutate(move |cache| {
+            let now = Utc::now();
+            // The earliest claimable (pending, not actively leased) event per
+            // subject — claiming leases it so another process can't also take it.
+            let claimed = earliest_pending_per_subject(&cache.outbox, limit, true, now);
+            for e in &claimed {
+                if let Some(stored) = cache.outbox.get_mut(&e.sequence) {
+                    stored.leased_until = Some(lease_until);
                 }
             }
-        }
-        Ok(out)
+            Ok(claimed)
+        })
+        .await
     }
 
     async fn record_event_delivery(
@@ -1041,15 +1080,27 @@ impl StorageBackend for FileStorage {
         use crate::outbox::DeliveryState;
         self.locked_mutate(move |cache| {
             if let Some(e) = cache.outbox.get_mut(&sequence) {
+                // `Delivered` is terminal: ignore a late/duplicate outcome so a
+                // racing failure can't un-deliver or wrongly dead-letter it.
+                if e.delivery == DeliveryState::Delivered {
+                    return Ok(());
+                }
                 e.attempts += 1;
                 e.last_attempt_at = Some(Utc::now());
                 if success {
                     e.delivery = DeliveryState::Delivered;
+                    e.leased_until = None;
                     e.last_error = None;
                 } else {
                     e.last_error = error;
                     if e.attempts >= max_attempts {
                         e.delivery = DeliveryState::DeadLettered;
+                        e.leased_until = None;
+                    } else {
+                        // Backoff: hold a lease into the future so the event isn't
+                        // immediately re-claimed (exponential-ish, capped at 5 min).
+                        let backoff = (10u64.saturating_mul(1 << e.attempts.min(5))).min(300);
+                        e.leased_until = Some(Utc::now() + chrono::Duration::seconds(backoff as i64));
                     }
                 }
             }
@@ -1091,17 +1142,47 @@ impl StorageBackend for FileStorage {
     }
 
     async fn gc_outbox(&self, retention_secs: u64) -> Result<usize, StorageError> {
-        let cutoff = Utc::now() - chrono::Duration::seconds(retention_secs as i64);
+        use crate::outbox::DeliveryState;
+        let secs = i64::try_from(retention_secs).unwrap_or(i64::MAX);
+        let cutoff = Utc::now() - chrono::Duration::seconds(secs);
         self.locked_mutate(move |cache| {
-            let before = cache.outbox.len();
-            // Prune every event older than the retention window, regardless of
-            // delivery state. Because sequence increases with time, this removes
-            // the oldest *prefix* — so the retained suffix stays gap-free (the
-            // replay no-gaps guarantee holds within the window) and the log can't
-            // grow without bound even when push delivery is disabled. A consumer
-            // (or a dead-letter) therefore has `retention_secs` to be replayed.
-            cache.outbox.retain(|_, e| e.created_at >= cutoff);
-            Ok(before - cache.outbox.len())
+            // Prune a contiguous *prefix* by sequence — the highest sequence whose
+            // event is older than the window — then drop everything at or below it.
+            // Pruning by sequence (not by `created_at` per element) guarantees the
+            // retained suffix is gap-free regardless of clock skew (the replay
+            // no-gaps guarantee holds within the window), and bounds the log even
+            // when push is disabled. A dropped event that wasn't yet Delivered is
+            // surfaced via a warning — the retention window is the replay /
+            // dead-letter-resolution SLA.
+            let prune_below = cache
+                .outbox
+                .iter()
+                .take_while(|(_, e)| e.created_at < cutoff)
+                .map(|(seq, _)| *seq)
+                .last();
+            let Some(prune_below) = prune_below else {
+                return Ok(0);
+            };
+            let mut pruned = 0usize;
+            let mut undelivered_dropped = 0usize;
+            cache.outbox.retain(|seq, e| {
+                if *seq <= prune_below {
+                    pruned += 1;
+                    if e.delivery != DeliveryState::Delivered {
+                        undelivered_dropped += 1;
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            if undelivered_dropped > 0 {
+                tracing::warn!(
+                    count = undelivered_dropped,
+                    "outbox GC dropped events that were never delivered (older than the retention window)"
+                );
+            }
+            Ok(pruned)
         })
         .await
     }
