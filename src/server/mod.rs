@@ -532,23 +532,26 @@ impl VultrinoServer {
         //    (read-back defense), and 2. apply operator egress classification
         //    (block / extra redaction) for secret-bearing endpoints.
         // Fail closed first if the body is still compressed (an encoding the
-        // client didn't decode) — it can't be scrubbed, so withhold it.
-        let blocked_compressed = crate::egress::block_if_compressed(&mut response);
-        let redacted = crate::egress::redact_secret_material(
-            &mut response,
-            &secret_material,
-            &credential_alias,
-        );
-        let classified = crate::egress::apply_egress(
-            &mut response,
-            &self.config.egress,
-            &credential_alias,
-            &full_action,
-        );
-        // Only when the body actually changed: a forwarded Content-Length /
-        // Transfer-Encoding would now be wrong (and leak the original length).
-        if blocked_compressed || redacted || classified {
-            crate::egress::strip_content_framing_headers(&mut response);
+        // client didn't decode) — it can't be scrubbed, so withhold it. When
+        // blocked, the body is an opaque placeholder, so skip the (now-pointless)
+        // scrub/classify and the framing strip (headers were already replaced).
+        if !crate::egress::block_if_compressed(&mut response) {
+            let redacted = crate::egress::redact_secret_material(
+                &mut response,
+                &secret_material,
+                &credential_alias,
+            );
+            let classified = crate::egress::apply_egress(
+                &mut response,
+                &self.config.egress,
+                &credential_alias,
+                &full_action,
+            );
+            // Only when the body actually changed: a forwarded Content-Length /
+            // Transfer-Encoding would now be wrong (and leak the original length).
+            if redacted || classified {
+                crate::egress::strip_content_framing_headers(&mut response);
+            }
         }
 
         // Persist any credential update (e.g. OAuth2 token refresh).

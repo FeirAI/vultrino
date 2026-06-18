@@ -96,16 +96,25 @@ fn json_escaped_inner(s: &str) -> Option<String> {
 /// **fail closed** by withholding it entirely. Returns whether it blocked. Call
 /// before redaction so a compressed reflected secret can never slip through.
 pub fn block_if_compressed(resp: &mut ExecuteResponse) -> bool {
+    // A Content-/Transfer-Encoding token that isn't `identity` or `chunked`
+    // (framing) means an undecoded compression the HTTP client didn't strip
+    // (reqwest removes Content-Encoding when it decompresses gzip/deflate/br),
+    // handling multi-value (`gzip, br`) and any case.
+    let is_compression = |value: &str| {
+        value.split(',').map(str::trim).any(|t| {
+            !t.is_empty() && !t.eq_ignore_ascii_case("identity") && !t.eq_ignore_ascii_case("chunked")
+        })
+    };
     let still_compressed = resp.headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("content-encoding")
-            && !v.trim().is_empty()
-            && !v.eq_ignore_ascii_case("identity")
+        (k.eq_ignore_ascii_case("content-encoding") || k.eq_ignore_ascii_case("transfer-encoding"))
+            && is_compression(v)
     });
     if still_compressed {
         resp.body =
             b"[vultrino: response withheld - a compressed body could not be scrubbed for secrets]"
                 .to_vec();
         resp.headers.clear();
+        resp.headers.insert("Content-Type".to_string(), "text/plain".to_string());
         return true;
     }
     false
@@ -155,8 +164,10 @@ pub fn apply_egress(
     if rule.block {
         resp.body =
             b"[vultrino: response body withheld by egress policy (secret-bearing endpoint)]".to_vec();
-        // Headers can also carry secrets (Set-Cookie, tokens) — drop them too.
+        // Headers can also carry secrets (Set-Cookie, tokens) — drop them too,
+        // then label the placeholder body.
         resp.headers.clear();
+        resp.headers.insert("Content-Type".to_string(), "text/plain".to_string());
         return true;
     }
     if rule.redact_patterns.is_empty() {
@@ -316,7 +327,9 @@ mod tests {
         r.headers.insert("Set-Cookie".to_string(), "session=zzz".to_string());
         assert!(apply_egress(&mut r, &[rule("sts-*", "*", true, &[])], "sts-prod", "http.request"));
         assert!(String::from_utf8_lossy(&r.body).contains("withheld by egress policy"));
-        assert!(r.headers.is_empty());
+        // The secret header is dropped; only a labelling Content-Type remains.
+        assert!(!r.headers.contains_key("Set-Cookie"));
+        assert_eq!(r.headers.get("Content-Type").map(String::as_str), Some("text/plain"));
     }
 
     #[test]
@@ -386,16 +399,34 @@ mod tests {
 
     #[test]
     fn test_block_if_compressed() {
-        // A residual non-identity Content-Encoding → body withheld.
+        // A residual non-identity Content-Encoding → body withheld; headers
+        // cleared except a labelling Content-Type.
         let mut r = resp("compressed-bytes-with-secret");
         r.headers.insert("Content-Encoding".to_string(), "zstd".to_string());
         assert!(block_if_compressed(&mut r));
         assert!(String::from_utf8_lossy(&r.body).contains("withheld"));
-        assert!(r.headers.is_empty());
-        // identity / absent → not blocked.
-        let mut r2 = resp("plain");
-        r2.headers.insert("content-encoding".to_string(), "identity".to_string());
-        assert!(!block_if_compressed(&mut r2));
+        assert_eq!(r.headers.get("Content-Type").map(String::as_str), Some("text/plain"));
+        assert!(!r.headers.keys().any(|k| k.eq_ignore_ascii_case("content-encoding")));
+
+        // Case-insensitive, multi-value, and Transfer-Encoding compression block.
+        for (hdr, val) in [
+            ("content-encoding", "GZIP"),
+            ("Content-Encoding", "gzip, br"),
+            ("transfer-encoding", "gzip"),
+            ("Transfer-Encoding", "chunked, gzip"),
+        ] {
+            let mut rr = resp("x");
+            rr.headers.insert(hdr.to_string(), val.to_string());
+            assert!(block_if_compressed(&mut rr), "expected block for {hdr}: {val}");
+        }
+
+        // identity / chunked-only / absent → not blocked.
+        for (hdr, val) in [("content-encoding", "identity"), ("transfer-encoding", "chunked")] {
+            let mut rr = resp("plain");
+            rr.headers.insert(hdr.to_string(), val.to_string());
+            assert!(!block_if_compressed(&mut rr), "must not block {hdr}: {val}");
+            assert_eq!(String::from_utf8_lossy(&rr.body), "plain");
+        }
         let mut r3 = resp("plain");
         assert!(!block_if_compressed(&mut r3));
         assert_eq!(String::from_utf8_lossy(&r3.body), "plain");
