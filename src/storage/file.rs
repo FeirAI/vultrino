@@ -45,7 +45,9 @@ const IDEMPOTENCY_RETENTION_SECS: i64 = 24 * 60 * 60;
 /// request past its final deadline (expire) or, when Pending, past its first
 /// window (escalate); or an approved-but-unrun grant whose reauth window lapsed.
 /// Shared by the `poll_refresh_approval` pre-check and the sweep's `any_due` gate
-/// so the two cheap pre-checks can't drift from the locked transition logic.
+/// so those two cheap fast-path pre-checks stay in lock-step with each other. The
+/// authoritative transition under the lock still uses `advance_lifecycle()` /
+/// `needs_reauth()`; this only gates whether to take that locked path.
 fn approval_is_due(a: &ApprovalRequest, now: DateTime<Utc>) -> bool {
     use crate::approval::ApprovalStatus;
     (a.status.is_open()

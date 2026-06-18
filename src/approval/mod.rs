@@ -1127,6 +1127,30 @@ mod tests {
     }
 
     #[test]
+    fn test_expire_reauth_lapsed_preserves_approver_attribution() {
+        // Approved with a note → reauth lapse keeps the approver and appends the
+        // lapse reason (the append arm), never overwriting with a system actor.
+        let (mut a, _) = new_approval();
+        a.approve(Decision::new("admin panel", "alice").with_note(Some("ok by me".to_string())))
+            .unwrap();
+        let decided_at = a.decided_at;
+        a.expire_reauth_lapsed();
+        assert_eq!(a.status, ApprovalStatus::Expired);
+        assert_eq!(a.decided_by.as_deref(), Some("admin panel"), "channel preserved");
+        assert_eq!(a.approver_identity.as_deref(), Some("alice"), "approver preserved");
+        assert_eq!(a.decided_at, decided_at, "decision time preserved");
+        let note = a.decision_note.as_deref().unwrap();
+        assert!(note.contains("ok by me"), "original note kept: {note}");
+        assert!(note.contains("re-authorization"), "lapse appended: {note}");
+
+        // No prior note → just the lapse reason (the default arm).
+        let (mut b, _) = new_approval();
+        b.approve(Decision::new("admin panel", "bob")).unwrap();
+        b.expire_reauth_lapsed();
+        assert_eq!(b.decision_note.as_deref(), Some("re-authorization window lapsed before execution"));
+    }
+
+    #[test]
     fn test_needs_reauth() {
         let (mut a, _) = new_approval();
         a.reauth_interval_secs = Some(60);
