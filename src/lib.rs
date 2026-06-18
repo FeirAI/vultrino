@@ -302,7 +302,7 @@ impl CredentialData {
         match self {
             CredentialData::ApiKey { key, .. } => vec![z(key.expose().to_string())],
             CredentialData::BasicAuth { username, password } => {
-                let raw = format!("{}:{}", username, password.expose());
+                let raw = Zeroizing::new(format!("{}:{}", username, password.expose()));
                 vec![z(password.expose().to_string()), z(STANDARD.encode(raw.as_bytes()))]
             }
             CredentialData::OAuth2 {
@@ -312,10 +312,11 @@ impl CredentialData {
                 access_token,
                 ..
             } => {
+                let basic = Zeroizing::new(format!("{}:{}", client_id, client_secret.expose()));
                 let mut v = vec![
                     z(client_secret.expose().to_string()),
                     // The Basic-auth form some token endpoints expect.
-                    z(STANDARD.encode(format!("{}:{}", client_id, client_secret.expose()))),
+                    z(STANDARD.encode(basic.as_bytes())),
                 ];
                 if let Some(t) = access_token {
                     v.push(z(t.expose().to_string()));
@@ -666,5 +667,36 @@ mod tests {
         } else {
             panic!("Wrong variant");
         }
+    }
+
+    #[test]
+    fn test_secret_material_oauth2_includes_basic_form() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let d = CredentialData::OAuth2 {
+            client_id: "cid".to_string(),
+            client_secret: Secret::new("csecret"),
+            refresh_token: Some(Secret::new("rtoken")),
+            access_token: Some(Secret::new("atoken")),
+            expires_at: None,
+            token_url: "https://x/token".to_string(),
+            scopes: vec![],
+        };
+        let mats: Vec<String> = d.secret_material().iter().map(|z| z.as_str().to_string()).collect();
+        assert!(mats.iter().any(|m| m == "csecret"));
+        assert!(mats.iter().any(|m| m == "atoken"));
+        assert!(mats.iter().any(|m| m == "rtoken"));
+        assert!(mats.iter().any(|m| m == &STANDARD.encode("cid:csecret")));
+    }
+
+    #[test]
+    fn test_secret_material_basic_auth_includes_base64() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let d = CredentialData::BasicAuth {
+            username: "user".to_string(),
+            password: Secret::new("p4ssword"),
+        };
+        let mats: Vec<String> = d.secret_material().iter().map(|z| z.as_str().to_string()).collect();
+        assert!(mats.iter().any(|m| m == "p4ssword"));
+        assert!(mats.iter().any(|m| m == &STANDARD.encode("user:p4ssword")));
     }
 }

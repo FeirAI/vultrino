@@ -326,6 +326,33 @@ mod tests {
     }
 
     #[test]
+    fn test_egress_redact_binary_body_still_scrubs_headers() {
+        // Body is binary (skipped), but a matching header is still redacted.
+        let mut r = ExecuteResponse {
+            status: 200,
+            headers: HashMap::new(),
+            body: vec![0xff, 0xfe, 0x00],
+            updated_credential: None,
+        };
+        r.headers.insert("Set-Cookie".to_string(), "t=DEADBEEFCAFE".to_string());
+        let before = r.body.clone();
+        let modified = apply_egress(&mut r, &[rule("*", "*", false, &["[A-F0-9]{8,}"])], "a", "http.request");
+        assert_eq!(r.body, before, "binary body must be untouched");
+        assert!(!r.headers.get("Set-Cookie").unwrap().contains("DEADBEEFCAFE"));
+        assert!(modified);
+    }
+
+    #[test]
+    fn test_redact_header_only_secret_reports_modified() {
+        // Secret only in a header (clean body) → still reports modified=true.
+        let mut r = resp("clean body");
+        r.headers.insert("X-Echo".to_string(), "Bearer sk-supersecret-123".to_string());
+        assert!(redact_secret_material(&mut r, &secrets(&["sk-supersecret-123"]), "x"));
+        assert!(r.headers.get("X-Echo").unwrap().contains("[REDACTED:x]"));
+        assert_eq!(String::from_utf8_lossy(&r.body), "clean body");
+    }
+
+    #[test]
     fn test_egress_first_matching_rule_wins() {
         let rules = vec![
             rule("pay-*", "*", true, &[]),                 // block

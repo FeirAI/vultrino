@@ -545,6 +545,19 @@ action = "deny"
     }
 
     #[test]
+    fn test_egress_rule_validation() {
+        // A no-op rule (neither blocks nor redacts) is rejected.
+        assert!(Config::parse("[[egress]]\ncredential_pattern = \"x\"").is_err());
+        // A malformed glob fails at load (no silent degrade to exact-match).
+        assert!(Config::parse("[[egress]]\ncredential_pattern = \"[unclosed\"\nblock = true").is_err());
+        assert!(Config::parse("[[egress]]\ncredential_pattern = \"sts-*\"\naction_pattern = \"[bad\"\nblock = true").is_err());
+        // A bad redact regex fails at load.
+        assert!(Config::parse("[[egress]]\ncredential_pattern = \"*\"\nredact_patterns = [\"(unclosed\"]").is_err());
+        // A valid block rule parses.
+        assert!(Config::parse("[[egress]]\ncredential_pattern = \"sts-*\"\nblock = true").is_ok());
+    }
+
+    #[test]
     fn test_enforcement_invalid_action_is_hard_error() {
         // Unknown value errors rather than silently falling back. Config enums
         // are lowercase-exact across vultrino, so wrong case also errors.
