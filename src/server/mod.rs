@@ -413,13 +413,14 @@ impl VultrinoServer {
             &credential.alias,
             &request.params,
         );
-        let decision = self.policy_engine.evaluate_full(&crate::policy::EvalInput {
+        let eval_input = crate::policy::EvalInput {
             credential_alias: &credential.alias,
             url,
             method,
             principal: principal.as_ref(),
             spend: spend.as_ref(),
-        });
+        };
+        let decision = self.policy_engine.evaluate_full(&eval_input);
 
         // V12: a dual-control token forces the action through the approval flow
         // (M-of-N), even when policy would Allow it and the credential doesn't
@@ -433,9 +434,13 @@ impl VultrinoServer {
                 // V11 observe mode: an observe-only tenant's denials are recorded
                 // and emitted but NOT blocked — the action runs anyway, so a team
                 // can onboard in observe-only while another enforces on the same
-                // vultrino. (Cross-tenant isolation above is NOT downgraded.)
+                // vultrino. (Cross-tenant isolation above is NOT downgraded.) A V6
+                // halt/kill switch is a security override, NOT a per-tenant policy,
+                // so it is NEVER downgraded — a halted agent stays blocked even in
+                // an observe tenant.
                 if self.config.tenant_mode(principal_tenant.as_deref())
                     == crate::config::TenantMode::Observe
+                    && !self.policy_engine.is_halted(&eval_input)
                 {
                     warn!(
                         tenant = ?principal_tenant,
@@ -744,6 +749,14 @@ impl VultrinoServer {
     /// Run a previously-approved action. Builds the request from the stored
     /// approval and executes it (consuming the use token, if any).
     async fn resume_approved(&self, approval: &ApprovalRequest) -> Result<ExecuteResponse, RunError> {
+        // V11 note: cross-tenant credential isolation is enforced at request time
+        // in `execute_gated` (before an approval is ever opened), so a cross-tenant
+        // request can't create an approval to resume. The resume re-evaluates
+        // policy but does NOT re-check tenant isolation — a credential whose
+        // `tenant` metadata is changed *between* approval and resume is not
+        // re-validated here (a narrow operator-action window; an emergency stop
+        // should push a Deny/halt, which the resume policy re-eval does honor).
+        //
         // A credential that has gone missing, or an unparseable action, won't
         // recover on retry → terminal.
         let credential = self

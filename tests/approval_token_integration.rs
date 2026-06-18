@@ -2470,3 +2470,37 @@ async fn test_v11_cross_tenant_credential_isolation() {
         ExecutionOutcome::Completed(_)
     ));
 }
+
+#[tokio::test]
+async fn test_v11_halt_is_not_downgraded_by_observe_mode() {
+    // V11 critical: a V6 halt/kill switch is a security override, NOT a per-tenant
+    // policy — observe mode must NOT downgrade it. A halted agent in an observe
+    // tenant stays blocked.
+    let (server, storage) =
+        setup_tenants(false, vec![("team-observe", vultrino::config::TenantMode::Observe)]).await;
+    store_credential(&storage, "api-cred", false).await;
+
+    let mut token = tenant_token("team-observe");
+    token.agent_label = Some("bot-x".to_string());
+    storage.store_use_token(&token).await.unwrap();
+
+    // Sanity: without a halt, the observe tenant runs (allow mode → Allow).
+    assert!(matches!(
+        server.execute_gated(echo_request("api-cred"), tenant_auth(&token)).await.unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
+
+    // Install a kill switch for bot-x; now the agent is HALTED.
+    server
+        .policy_engine()
+        .add_policy(vultrino::policy::Policy::kill_switch("halt:bot-x", "bot-x"));
+
+    // Even in an observe tenant, the halt is enforced — NOT observed-away.
+    let err = server.execute_gated(echo_request("api-cred"), tenant_auth(&token)).await.unwrap_err();
+    match err {
+        vultrino::VultrinoError::PolicyDenied(r) => {
+            assert!(r.contains("halt"), "halt must block in observe mode, got: {r}")
+        }
+        other => panic!("a halted agent must be blocked even in an observe tenant, got {other:?}"),
+    }
+}

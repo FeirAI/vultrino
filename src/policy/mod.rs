@@ -205,6 +205,19 @@ impl PolicyEngine {
         self.evaluate_inner(input, true)
     }
 
+    /// Whether an authoritative **kill switch** (V6) matches this input — i.e. the
+    /// `Deny` came from a halt, not an ordinary policy. Read-only / no side
+    /// effects. Used so a halt is never downgraded by V11 observe mode (a halt is
+    /// a security override, not a per-tenant policy that observe can wave away).
+    pub fn is_halted(&self, input: &EvalInput) -> bool {
+        let policies = self.policies.read();
+        policies.iter().any(|p| {
+            p.kill
+                && credential_matches(&p.credential_pattern, input.credential_alias)
+                && principal_matches(p.principal_pattern.as_deref(), input.principal)
+        })
+    }
+
     /// Like [`Self::evaluate`] but with **no side effects**: `RateLimit` and
     /// `SpendCap` are treated as already-admitted (within limit/charge) instead
     /// of being counted/charged. Used by the deferred post-approval path
