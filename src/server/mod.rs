@@ -567,6 +567,7 @@ impl VultrinoServer {
         let _session = self.sessions.begin(crate::session::SessionEntry {
             session_id: request_id.clone(),
             agent_label: context.agent_label.clone(),
+            principal_id: context.api_key_id.clone(),
             token_id: use_token_id.map(|s| s.to_string()),
             credential: credential_alias.clone(),
             action: full_action.clone(),
@@ -920,14 +921,17 @@ impl VultrinoServer {
         // `validate_agent_label` enforces the same `[A-Za-z0-9._-]`, non-empty,
         // ≤128 shape that labels and ids already satisfy, and rejects `*?[]`.
         crate::auth::validate_agent_label(label)
-            .map_err(|e| VultrinoError::InvalidRequest(format!("invalid agent label to halt: {e}")))?;
+            .map_err(|e| VultrinoError::InvalidRequest(format!("invalid agent label: {e}")))?;
 
-        // Leg 1: revoke every (still-active) use token bound to this agent.
+        // Leg 1: revoke every (still-active) use token of this target — matched by
+        // the token's agent label OR its id, so halting a label-less agent by its
+        // token id revokes that token (consistent with the kill policy, which
+        // matches the principal id too).
         let tokens = self.storage.list_use_tokens().await?;
         let mut revoked_tokens = Vec::new();
         for t in tokens
             .iter()
-            .filter(|t| t.agent_label.as_deref() == Some(label) && !t.revoked)
+            .filter(|t| !t.revoked && (t.agent_label.as_deref() == Some(label) || t.id == label))
         {
             self.storage.set_use_token_revoked(&t.id).await?;
             revoked_tokens.push(t.id.clone());
@@ -948,10 +952,13 @@ impl VultrinoServer {
             }
         };
 
-        // Leg 3: fire abort callbacks for what this process has in flight. Each is
-        // best-effort and time-bounded, so a hanging integration can't block the
-        // halt response — legs 1 & 2 have already taken effect by here.
-        let in_flight = self.sessions.for_agent(label);
+        // Leg 3: fire abort callbacks for what this process has in flight — matched
+        // by the same target as the kill policy (label OR principal/token id), so a
+        // by-id halt aborts a label-less agent's sessions too. Each callback is
+        // best-effort and time-bounded (so a hanging integration can't block the
+        // halt — legs 1 & 2 have already taken effect; with N callbacks the wait is
+        // bounded by N × the per-callback timeout).
+        let in_flight = self.sessions.for_halt_target(label);
         let callbacks = self.halt_callbacks.read().clone();
         for cb in &callbacks {
             if tokio::time::timeout(

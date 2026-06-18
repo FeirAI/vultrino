@@ -1955,6 +1955,7 @@ async fn test_v6_halt_revokes_tokens_installs_kill_and_fires_callback() {
     let _inflight = server.sessions().begin(SessionEntry {
         session_id: "sess-1".to_string(),
         agent_label: Some("bot-7".to_string()),
+        principal_id: Some(token.id.clone()),
         token_id: Some(token.id.clone()),
         credential: "api-cred".to_string(),
         action: "mock.echo".to_string(),
@@ -2082,17 +2083,51 @@ async fn test_v6_halt_by_principal_id_for_labelless_agent() {
         requester: RequesterInfo::default(),
     };
 
-    // Halt by the token's principal id.
-    server.halt_agent(&token.id).await.unwrap();
+    // Halt by the token's principal id → kill policy denies AND the token itself
+    // is revoked (leg 1 matches the token by id, not just by agent_label).
+    let outcome = server.halt_agent(&token.id).await.unwrap();
+    assert!(outcome.revoked_tokens.contains(&token.id), "by-id halt revokes that token");
+    assert!(storage.get_use_token(&token.id).await.unwrap().unwrap().revoked);
     let err = server.execute_gated(echo_request("api-cred"), auth()).await.unwrap_err();
     assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)), "labelless agent halted by id");
 }
 
+#[tokio::test(start_paused = true)]
+async fn test_v6_hanging_halt_callback_does_not_block() {
+    // V6: a hanging abort callback is time-bounded — the halt still completes, and
+    // a fast callback registered alongside it still runs. (start_paused virtualizes
+    // the timeout so the test doesn't actually wait the full timeout.)
+    struct SlowCallback;
+    #[async_trait]
+    impl vultrino::session::HaltCallback for SlowCallback {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        async fn on_halt(&self, _label: &str, _in_flight: &[vultrino::session::SessionEntry]) {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await; // hangs
+        }
+    }
+
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred", false).await;
+    let fast_hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    server.register_halt_callback(std::sync::Arc::new(SlowCallback));
+    server.register_halt_callback(std::sync::Arc::new(RecordingHaltCallback {
+        hits: fast_hits.clone(),
+    }));
+
+    let outcome = server.halt_agent("bot-7").await.unwrap();
+    assert_eq!(outcome.callbacks_fired, 2);
+    assert_eq!(fast_hits.lock().unwrap().len(), 1, "the fast callback still ran");
+}
+
 #[tokio::test]
 async fn test_v6_invalid_halt_label_rejected() {
-    // V6: a glob label is rejected so a halt can't accidentally deny a fleet.
+    // V6: a glob/invalid label is rejected so a halt can't accidentally deny a
+    // fleet, covering metachars, path separators, empty, and the length cap.
     let (server, _storage) = setup().await;
-    for bad in ["*", "bot-*", "a/b", ""] {
+    let too_long = "a".repeat(129);
+    for bad in ["*", "bot-*", "bot?x", "bot[x]", "a/b", "", &too_long] {
         let err = server.halt_agent(bad).await.unwrap_err();
         assert!(
             matches!(err, vultrino::VultrinoError::InvalidRequest(_)),

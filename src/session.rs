@@ -25,9 +25,13 @@ use std::sync::Arc;
 pub struct SessionEntry {
     /// Unique id for this execution (the request id).
     pub session_id: String,
-    /// Agent label of the principal, if any (the halt target).
+    /// Agent label of the principal, if any (a halt target).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
+    /// Resolved principal id (key/token id), if authenticated — the other halt
+    /// target, so a label-less agent halted by id is matched too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
     /// Use-token id the execution is spending, if token-authorized.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_id: Option<String>,
@@ -76,6 +80,22 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// In-flight sessions matching a **halt target** — the same target the kill
+    /// policy matches: the principal's agent label OR its principal/token id. So
+    /// a label-less agent halted by id has its sessions found here too.
+    pub fn for_halt_target(&self, target: &str) -> Vec<SessionEntry> {
+        self.sessions
+            .read()
+            .values()
+            .filter(|s| {
+                s.agent_label.as_deref() == Some(target)
+                    || s.principal_id.as_deref() == Some(target)
+                    || s.token_id.as_deref() == Some(target)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Number of in-flight sessions (test/observability helper).
     pub fn len(&self) -> usize {
         self.sessions.read().len()
@@ -120,6 +140,7 @@ mod tests {
         SessionEntry {
             session_id: id.to_string(),
             agent_label: label.map(str::to_string),
+            principal_id: None,
             token_id: None,
             credential: "cred".to_string(),
             action: "mock.echo".to_string(),
@@ -139,6 +160,21 @@ mod tests {
             assert_eq!(reg.for_agent("bot-7").len(), 1);
             assert_eq!(reg.for_agent("bot-7")[0].session_id, "s1");
             assert_eq!(reg.for_agent("absent").len(), 0);
+
+            // for_halt_target also matches by principal id / token id.
+            let by_id = reg.begin(SessionEntry {
+                session_id: "s4".to_string(),
+                agent_label: None,
+                principal_id: Some("vut_xyz".to_string()),
+                token_id: Some("vut_xyz".to_string()),
+                credential: "cred".to_string(),
+                action: "mock.echo".to_string(),
+                started_at: Utc::now(),
+            });
+            assert_eq!(reg.for_halt_target("vut_xyz").len(), 1, "matched by id");
+            assert_eq!(reg.for_halt_target("bot-7").len(), 1, "matched by label");
+            assert_eq!(reg.for_agent("vut_xyz").len(), 0, "for_agent is label-only");
+            drop(by_id);
         }
         // All guards dropped → registry is empty again.
         assert!(reg.is_empty(), "guards should deregister on drop");
