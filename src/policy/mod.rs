@@ -240,11 +240,11 @@ impl PolicyEngine {
         // — evaluated before any normal policy so an allow rule ordered first can
         // never let a halted agent through. (A kill policy matches a credential +
         // principal like any other, but its `kill` flag makes it unconditional.)
-        if let Some(p) = matching_policies.iter().find(|p| p.kill) {
-            return PolicyDecision::Deny(format!(
-                "halted: principal denied by kill switch '{}'",
-                p.name
-            ));
+        if matching_policies.iter().any(|p| p.kill) {
+            // Generic reason to the caller — don't leak the kill-policy name or
+            // label scheme to a (possibly compromised) agent. The specifics live
+            // in the halt audit log.
+            return PolicyDecision::Deny("denied: this principal has been halted".to_string());
         }
 
         // If no policies match, fall back to the configured engine default.

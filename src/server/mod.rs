@@ -23,6 +23,11 @@ use tracing::{info, warn};
 /// backend's stale-claim timeout.
 const EXECUTION_HEARTBEAT_SECS: u64 = 30;
 
+/// Upper bound on how long a single halt abort callback may run before the halt
+/// proceeds without waiting for it (V6) — a hanging integration can't stall the
+/// halt, whose token-revoke + kill-policy legs have already committed.
+const HALT_CALLBACK_TIMEOUT_SECS: u64 = 5;
+
 /// Result of halting an agent (V6) — a machine-readable summary of the three
 /// kill legs, returned by the halt admin endpoint.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -909,11 +914,13 @@ impl VultrinoServer {
     ///    registered callback can additionally preempt in-flight work.
     pub async fn halt_agent(&self, label: &str) -> Result<HaltOutcome, VultrinoError> {
         let label = label.trim();
-        if label.is_empty() {
-            return Err(VultrinoError::InvalidRequest(
-                "agent label must not be empty".to_string(),
-            ));
-        }
+        // The label must be a literal principal identifier (an agent label or a
+        // key/token id), NOT a glob — otherwise a halt of `*` or `bot-*` would
+        // silently deny an entire fleet, since `principal_pattern` is glob-matched.
+        // `validate_agent_label` enforces the same `[A-Za-z0-9._-]`, non-empty,
+        // ≤128 shape that labels and ids already satisfy, and rejects `*?[]`.
+        crate::auth::validate_agent_label(label)
+            .map_err(|e| VultrinoError::InvalidRequest(format!("invalid agent label to halt: {e}")))?;
 
         // Leg 1: revoke every (still-active) use token bound to this agent.
         let tokens = self.storage.list_use_tokens().await?;
@@ -941,11 +948,21 @@ impl VultrinoServer {
             }
         };
 
-        // Leg 3: fire abort callbacks for what this process has in flight.
+        // Leg 3: fire abort callbacks for what this process has in flight. Each is
+        // best-effort and time-bounded, so a hanging integration can't block the
+        // halt response — legs 1 & 2 have already taken effect by here.
         let in_flight = self.sessions.for_agent(label);
         let callbacks = self.halt_callbacks.read().clone();
         for cb in &callbacks {
-            cb.on_halt(label, &in_flight).await;
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(HALT_CALLBACK_TIMEOUT_SECS),
+                cb.on_halt(label, &in_flight),
+            )
+            .await
+            .is_err()
+            {
+                warn!(callback = cb.name(), agent = %label, "halt abort callback timed out");
+            }
         }
 
         info!(
@@ -972,16 +989,15 @@ impl VultrinoServer {
     /// fresh tokens to resume). Returns whether a kill policy was present.
     pub async fn unhalt_agent(&self, label: &str) -> Result<bool, VultrinoError> {
         let label = label.trim();
-        if label.is_empty() {
-            return Err(VultrinoError::InvalidRequest(
-                "agent label must not be empty".to_string(),
-            ));
-        }
-        let removed = self
-            .storage
-            .delete_policy(&format!("halt:{}", label))
-            .await
-            .is_ok();
+        crate::auth::validate_agent_label(label)
+            .map_err(|e| VultrinoError::InvalidRequest(format!("invalid agent label: {e}")))?;
+        // Distinguish "no halt was present" (Ok false) from a real storage failure
+        // (propagate) — the latter must not be reported as a successful no-op.
+        let removed = match self.storage.delete_policy(&format!("halt:{}", label)).await {
+            Ok(()) => true,
+            Err(crate::storage::StorageError::PolicyNotFound(_)) => false,
+            Err(e) => return Err(e.into()),
+        };
         self.reload_policies().await?;
         Ok(removed)
     }

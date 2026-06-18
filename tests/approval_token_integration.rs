@@ -2008,3 +2008,130 @@ async fn test_v6_halt_revokes_tokens_installs_kill_and_fires_callback() {
     let outcome = server.execute_gated(echo_request("api-cred"), auth2).await.unwrap();
     assert!(matches!(outcome, ExecutionOutcome::Completed(_)), "halt lifted → executes again");
 }
+
+#[tokio::test]
+async fn test_v6_halt_denies_approved_action_on_resume() {
+    // V6 + approvals: halting an agent mid-flight (after approval, before the
+    // agent polls to execute) must block the resume — a human approval is not a
+    // kill bypass. Exercises the real deferred-resume path, not just the engine.
+    let (server, storage) = setup().await; // allow mode
+    store_credential(&storage, "api-cred", true).await; // require_approval
+
+    let (_full, mut token) = UseToken::create(NewUseToken {
+        name: "bot".to_string(),
+        credential_scope: "api-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.agent_label = Some("bot-7".to_string());
+    storage.store_use_token(&token).await.unwrap();
+
+    let auth = ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+    let approval = match server.execute_gated(echo_request("api-cred"), auth).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    assert_eq!(approval.agent_label.as_deref(), Some("bot-7"));
+
+    // Approve it, then halt the agent before it polls to execute.
+    storage
+        .decide_approval(&approval.id, true, "admin panel", "secops", false, None)
+        .await
+        .unwrap();
+    server.halt_agent("bot-7").await.unwrap();
+
+    // The resume re-evaluates policy and is denied by the kill switch; the action
+    // does not run.
+    let polled = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    assert!(
+        polled.result_error.as_deref().unwrap_or("").to_lowercase().contains("halt"),
+        "resume should be denied by the halt, got: {:?}",
+        polled.result_error
+    );
+    assert!(polled.result_status.is_none(), "the action must not have produced a result");
+}
+
+#[tokio::test]
+async fn test_v6_halt_by_principal_id_for_labelless_agent() {
+    // V6: an agent with no agent_label is still halt-able — by its principal id
+    // (the kill policy's principal_pattern matches the principal id OR label).
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred", false).await;
+
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "labelless".to_string(),
+        credential_scope: "api-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    // No agent_label set.
+    storage.store_use_token(&token).await.unwrap();
+    let auth = || ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+
+    // Halt by the token's principal id.
+    server.halt_agent(&token.id).await.unwrap();
+    let err = server.execute_gated(echo_request("api-cred"), auth()).await.unwrap_err();
+    assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)), "labelless agent halted by id");
+}
+
+#[tokio::test]
+async fn test_v6_invalid_halt_label_rejected() {
+    // V6: a glob label is rejected so a halt can't accidentally deny a fleet.
+    let (server, _storage) = setup().await;
+    for bad in ["*", "bot-*", "a/b", ""] {
+        let err = server.halt_agent(bad).await.unwrap_err();
+        assert!(
+            matches!(err, vultrino::VultrinoError::InvalidRequest(_)),
+            "label {bad:?} must be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_v6_kill_policy_survives_cross_process_refresh() {
+    // V6: a stored kill policy reloaded by another process (the periodic refresh)
+    // retains kill=true and stays authoritative — guards against a serialization
+    // downgrade to a plain Deny that an allow rule could override.
+    use vultrino::policy::{EvalInput, PolicyDecision, PolicyEngine, Principal};
+
+    let (_server, storage) = setup().await;
+    storage
+        .store_policy(&vultrino::policy::Policy::kill_switch("halt:bot-7", "bot-7"))
+        .await
+        .unwrap();
+
+    // A fresh engine (as a separate process would have) picks it up via refresh.
+    let engine = PolicyEngine::new();
+    engine.set_default_deny(false);
+    let storage_dyn: Arc<dyn StorageBackend> = storage.clone();
+    vultrino::server::refresh_policies_once(&storage_dyn, &engine, &[])
+        .await
+        .unwrap();
+    assert!(
+        engine.list_policies().iter().any(|p| p.id == "halt:bot-7" && p.kill),
+        "kill flag must survive the storage round-trip"
+    );
+    let halted = Principal { id: "k1".to_string(), agent_label: Some("bot-7".to_string()) };
+    let decision = engine.evaluate_full(&EvalInput {
+        credential_alias: "anything",
+        url: None,
+        method: None,
+        principal: Some(&halted),
+        spend: None,
+    });
+    assert!(matches!(decision, PolicyDecision::Deny(_)), "reloaded kill is authoritative");
+}

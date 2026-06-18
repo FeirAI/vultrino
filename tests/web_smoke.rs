@@ -745,3 +745,18 @@ async fn test_admin_halt_agent_installs_kill_and_lists_sessions() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn test_admin_halt_rejects_glob_label() {
+    // V6: a glob halt label is rejected (400) so a halt can't deny a whole fleet.
+    let (router, _storage, server, key) = build_admin_router().await;
+    // "bot-*" is URL-safe as a path segment; the handler must reject it.
+    let resp = router
+        .clone()
+        .oneshot(admin_req("POST", "/api/v1/agents/bot-*/halt", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // No kill policy was installed.
+    assert!(!server.policy_engine().list_policies().iter().any(|p| p.kill));
+}
