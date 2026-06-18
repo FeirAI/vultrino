@@ -46,6 +46,29 @@ impl TryFrom<RawEgressRule> for EgressRule {
     type Error = ConfigError;
 
     fn try_from(raw: RawEgressRule) -> Result<Self, Self::Error> {
+        // A rule that neither blocks nor redacts is a no-op — almost certainly a
+        // mistake (an operator expecting it to do something).
+        if !raw.block && raw.redact_patterns.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "egress rule for '{}' does nothing: set block = true or add redact_patterns",
+                raw.credential_pattern
+            )));
+        }
+        // Compile globs at load so a malformed pattern fails fast rather than
+        // silently degrading to exact-match (a block rule that never matches
+        // would be fail-open).
+        let credential_pattern = glob::Pattern::new(&raw.credential_pattern).map_err(|e| {
+            ConfigError::Invalid(format!(
+                "invalid egress credential_pattern '{}': {}",
+                raw.credential_pattern, e
+            ))
+        })?;
+        let action_pattern = glob::Pattern::new(&raw.action_pattern).map_err(|e| {
+            ConfigError::Invalid(format!(
+                "invalid egress action_pattern '{}': {}",
+                raw.action_pattern, e
+            ))
+        })?;
         let redact_patterns = raw
             .redact_patterns
             .iter()
@@ -56,8 +79,8 @@ impl TryFrom<RawEgressRule> for EgressRule {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            credential_pattern: raw.credential_pattern,
-            action_pattern: raw.action_pattern,
+            credential_pattern,
+            action_pattern,
             block: raw.block,
             redact_patterns,
         })

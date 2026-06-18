@@ -1311,11 +1311,12 @@ impl Plugin for SecretReflectorPlugin {
     }
     async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
         let secrets = request.credential.data.secret_material();
-        let body = format!("reflected: {}", secrets.join(",")).into_bytes();
+        let strs: Vec<&str> = secrets.iter().map(|s| s.as_str()).collect();
+        let body = format!("reflected: {}", strs.join(",")).into_bytes();
         let mut headers = std::collections::HashMap::new();
         headers.insert(
             "X-Echoed-Auth".to_string(),
-            format!("Bearer {}", secrets.first().cloned().unwrap_or_default()),
+            format!("Bearer {}", strs.first().copied().unwrap_or_default()),
         );
         Ok(ExecuteResponse { status: 200, headers, body, updated_credential: None })
     }
@@ -1367,8 +1368,8 @@ async fn test_egress_block_withholds_response_end_to_end() {
     let mut config = Config::default();
     config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
     config.egress = vec![EgressRule {
-        credential_pattern: "sts-*".to_string(),
-        action_pattern: "*".to_string(),
+        credential_pattern: glob::Pattern::new("sts-*").unwrap(),
+        action_pattern: glob::Pattern::new("*").unwrap(),
         block: true,
         redact_patterns: vec![],
     }];

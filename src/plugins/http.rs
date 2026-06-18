@@ -456,6 +456,13 @@ impl HttpPlugin {
         let mut headers = params.headers;
         self.inject_credentials(&mut headers, &effective_cred)?;
 
+        // Request an identity (uncompressed) response unless the caller asked
+        // otherwise, so egress secret-redaction operates on plaintext bytes (a
+        // compressed body would hide a reflected secret from the scrubber).
+        if !headers.keys().any(|k| k.eq_ignore_ascii_case("accept-encoding")) {
+            headers.insert("Accept-Encoding".to_string(), "identity".to_string());
+        }
+
         // Build request using the validated URL
         let mut request = self.client.request(method, validated_url);
 

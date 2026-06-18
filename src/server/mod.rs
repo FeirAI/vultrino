@@ -525,11 +525,22 @@ impl VultrinoServer {
         // 1. scrub the credential's own secret if the endpoint reflected it back
         //    (read-back defense), and 2. apply operator egress classification
         //    (block / extra redaction) for secret-bearing endpoints.
-        crate::egress::redact_secret_material(&mut response, &secret_material, &credential_alias);
-        crate::egress::apply_egress(&mut response, &self.config.egress, &credential_alias, &full_action);
-        // Redaction changed the body length, so a forwarded Content-Length /
-        // Transfer-Encoding would be wrong (and leak the original length).
-        crate::egress::strip_content_framing_headers(&mut response);
+        let redacted = crate::egress::redact_secret_material(
+            &mut response,
+            &secret_material,
+            &credential_alias,
+        );
+        let classified = crate::egress::apply_egress(
+            &mut response,
+            &self.config.egress,
+            &credential_alias,
+            &full_action,
+        );
+        // Only when the body actually changed: a forwarded Content-Length /
+        // Transfer-Encoding would now be wrong (and leak the original length).
+        if redacted || classified {
+            crate::egress::strip_content_framing_headers(&mut response);
+        }
 
         // Persist any credential update (e.g. OAuth2 token refresh).
         if let Some(updated_data) = &response.updated_credential {

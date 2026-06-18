@@ -293,43 +293,53 @@ impl CredentialData {
     /// redaction** (V7): if a proxied endpoint reflects the credential's own
     /// secret back in its response, the server scrubs these before returning the
     /// body to the agent — the read-back defense (REVIEW H2/F2). Includes derived
-    /// forms (e.g. the base64 the http plugin sends for basic auth).
-    pub fn secret_material(&self) -> Vec<String> {
+    /// forms (e.g. the base64 the http plugin sends for basic auth). The strings
+    /// are [`Zeroizing`] so these exposed copies are wiped from memory on drop.
+    pub fn secret_material(&self) -> Vec<zeroize::Zeroizing<String>> {
         use base64::{engine::general_purpose::STANDARD, Engine};
+        use zeroize::Zeroizing;
+        let z = |s: String| Zeroizing::new(s);
         match self {
-            CredentialData::ApiKey { key, .. } => vec![key.expose().to_string()],
+            CredentialData::ApiKey { key, .. } => vec![z(key.expose().to_string())],
             CredentialData::BasicAuth { username, password } => {
                 let raw = format!("{}:{}", username, password.expose());
-                vec![password.expose().to_string(), STANDARD.encode(raw.as_bytes())]
+                vec![z(password.expose().to_string()), z(STANDARD.encode(raw.as_bytes()))]
             }
             CredentialData::OAuth2 {
+                client_id,
                 client_secret,
                 refresh_token,
                 access_token,
                 ..
             } => {
-                let mut v = vec![client_secret.expose().to_string()];
+                let mut v = vec![
+                    z(client_secret.expose().to_string()),
+                    // The Basic-auth form some token endpoints expect.
+                    z(STANDARD.encode(format!("{}:{}", client_id, client_secret.expose()))),
+                ];
                 if let Some(t) = access_token {
-                    v.push(t.expose().to_string());
+                    v.push(z(t.expose().to_string()));
                 }
                 if let Some(r) = refresh_token {
-                    v.push(r.expose().to_string());
+                    v.push(z(r.expose().to_string()));
                 }
                 v
             }
-            CredentialData::HmacApiKey { api_secret, .. } => vec![api_secret.expose().to_string()],
-            CredentialData::EcdsaKey { private_key, .. } => vec![private_key.expose().to_string()],
-            CredentialData::SshPassword { password, .. } => vec![password.expose().to_string()],
-            CredentialData::Postgres { password, .. } => vec![password.expose().to_string()],
+            CredentialData::HmacApiKey { api_secret, .. } => vec![z(api_secret.expose().to_string())],
+            CredentialData::EcdsaKey { private_key, .. } => vec![z(private_key.expose().to_string())],
+            CredentialData::SshPassword { password, .. } => vec![z(password.expose().to_string())],
+            CredentialData::Postgres { password, .. } => vec![z(password.expose().to_string())],
             CredentialData::PrivateKey { key_pem, passphrase } => {
-                let mut v = vec![key_pem.expose().to_string()];
+                let mut v = vec![z(key_pem.expose().to_string())];
                 if let Some(p) = passphrase {
-                    v.push(p.expose().to_string());
+                    v.push(z(p.expose().to_string()));
                 }
                 v
             }
-            CredentialData::Certificate { key_pem, .. } => vec![key_pem.expose().to_string()],
-            CredentialData::Custom(map) => map.values().map(|s| s.expose().to_string()).collect(),
+            CredentialData::Certificate { key_pem, .. } => vec![z(key_pem.expose().to_string())],
+            CredentialData::Custom(map) => {
+                map.values().map(|s| z(s.expose().to_string())).collect()
+            }
         }
     }
 

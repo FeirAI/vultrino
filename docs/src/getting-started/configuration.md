@@ -157,10 +157,12 @@ applied at the execution seam for **every** plugin:
    (percent-encoded, JSON-escaped) — is scrubbed from the body and headers and
    replaced with `[REDACTED:<alias>]` before the response is returned. This is
    not configurable. It is defense-in-depth, not absolute: an endpoint that
-   *transforms* the secret (base64, hashing, splitting it) can still leak it —
-   use a `block` rule for endpoints you don't trust. Secrets shorter than 5
-   bytes are not scrubbed (too little entropy to match safely); a warning is
-   logged when such a credential is created.
+   *transforms* the secret (base64, hashing, splitting it) — or returns a
+   **compressed** body (the http plugin requests `Accept-Encoding: identity`,
+   but a server may compress anyway) — can still leak it. Use a `block` rule for
+   endpoints you don't trust. Secrets shorter than 5 bytes are not scrubbed (too
+   little entropy to match safely); a warning is logged when such a credential
+   is created.
 2. **Egress classification.** For endpoints whose response is itself a secondary
    secret (an STS/login/secret-read endpoint), configure `[[egress]]` rules:
 
