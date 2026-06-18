@@ -86,6 +86,30 @@ transport = "stdio"  # "stdio" or "http"
 | `enabled` | Enable MCP server | `true` |
 | `transport` | Transport method | `stdio` |
 
+### Enforcement Section
+
+Controls what the policy engine decides for a credential that matches **no**
+policy at all.
+
+```toml
+[enforcement]
+default_action = "deny"  # "deny" (fail-closed, default) or "allow" (fail-open)
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `default_action` | Decision for a credential matched by no policy: `deny` or `allow` | `deny` |
+
+With `deny` (the default, and the recommended posture for shared/server
+deployments), an un-policied credential is denied with a distinct `no_policy`
+reason — closing the historical fail-open gap. Use `allow` for the legacy
+behavior where an un-policied credential is permitted. If the section is omitted
+the built-in default is `deny`; the config produced by `vultrino init` ships
+with `allow` so a fresh single-user setup works before any policies are written.
+
+> When `default_action = "deny"` and no policies are configured, **every**
+> credential is denied. Vultrino logs a loud warning at startup in this case.
+
 ## Environment Variables
 
 | Variable | Description |

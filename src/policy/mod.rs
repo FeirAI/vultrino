@@ -83,8 +83,9 @@ impl PolicyEngine {
     /// `true` = **fail-closed**: the credential is denied with a distinct
     /// `no_policy` reason (the govder enforcement posture, V2). `false` = legacy
     /// fail-open: the credential is allowed. Wired from `[enforcement]
-    /// default_action` at server start and togglable at runtime (e.g. by the
-    /// admin API).
+    /// default_action` at server start. It is stored as an atomic so a runtime
+    /// toggle (e.g. a future admin-API flip) needs no engine rebuild — though no
+    /// such runtime caller exists yet.
     pub fn set_default_deny(&self, deny: bool) {
         self.default_deny.store(deny, Ordering::Relaxed);
     }

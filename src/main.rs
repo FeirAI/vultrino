@@ -1365,6 +1365,15 @@ path = "~/.local/share/vultrino/credentials.enc"
 level = "info"
 # audit_file = "~/.local/share/vultrino/audit.log"
 
+# Policy enforcement default. With "deny" (recommended for shared / server /
+# govder deployments) a credential that matches NO policy is denied — the
+# secure, fail-closed posture. This generated config starts with "allow" so a
+# single-user local setup works immediately; before exposing vultrino to
+# untrusted agents, switch to "deny" and add explicit allow policies below.
+# NOTE: if this whole section is removed, the built-in default is "deny".
+[enforcement]
+default_action = "allow"
+
 [mcp]
 enabled = true
 transport = "stdio"

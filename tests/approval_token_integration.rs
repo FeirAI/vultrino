@@ -895,6 +895,47 @@ async fn test_default_deny_denies_unpolicied_credential() {
 }
 
 #[tokio::test]
+async fn test_default_deny_approved_action_still_resumes() {
+    // The riskiest interaction: in deny mode, a credential matched by a Prompt
+    // policy opens an approval. Once approved, resume re-evaluates policy
+    // read-only — it must NOT spuriously deny the (now legitimately approved)
+    // action with the no_policy fallback (the credential IS policied; it
+    // matched the Prompt policy), and the action must actually run.
+    use vultrino::policy::{Policy, PolicyAction};
+    let mut prompt_policy = Policy::deny_all("gate-it", "gated-*");
+    prompt_policy.default_action = PolicyAction::Prompt;
+
+    let (server, storage) = setup_deny_mode(vec![prompt_policy]).await;
+    store_credential(&storage, "gated-cred", false).await;
+
+    let outcome = server
+        .execute_gated(echo_request("gated-cred"), ExecAuth::default())
+        .await
+        .unwrap();
+    let approval_id = match outcome {
+        ExecutionOutcome::Pending(a) => a.id,
+        other => panic!("expected Pending under Prompt policy, got {other:?}"),
+    };
+
+    storage
+        .decide_approval(&approval_id, true, "test approver", None)
+        .await
+        .unwrap();
+
+    let resumed = server
+        .check_and_resume_approval(&approval_id, None)
+        .await
+        .unwrap();
+    assert_eq!(resumed.status, ApprovalStatus::Approved);
+    assert!(resumed.executed, "approved action must run in deny mode");
+    assert!(
+        resumed.result_error.is_none(),
+        "resume must not be denied by default-deny: {:?}",
+        resumed.result_error
+    );
+}
+
+#[tokio::test]
 async fn test_default_deny_allows_with_explicit_policy() {
     // With an explicit allow policy covering the credential, the same fail-closed
     // server admits and runs the action.

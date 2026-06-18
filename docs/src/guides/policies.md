@@ -12,6 +12,19 @@ Request → RBAC Check → Policy Check → Credential Injection → Forward
                             └─ Deny if policy fails
 ```
 
+### Default posture for un-policied credentials
+
+A policy's `default_action` only governs credentials its `credential_pattern`
+**matches**. What happens to a credential that matches *no* policy is set
+engine-wide by `[enforcement] default_action` (see
+[Configuration](../getting-started/configuration.md#enforcement-section)):
+
+- `deny` (default): a credential matched by no policy is denied with a distinct
+  `no_policy` reason — fail-closed. Grant access by adding a policy whose
+  `credential_pattern` matches it.
+- `allow`: a credential matched by no policy is permitted — the legacy
+  fail-open behavior.
+
 ## Policy Structure
 
 Policies are defined in the configuration file:
