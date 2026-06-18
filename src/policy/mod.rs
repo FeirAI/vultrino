@@ -66,15 +66,17 @@ pub struct PolicyEngine {
 impl PolicyEngine {
     /// Create a new policy engine.
     ///
-    /// The engine starts **fail-open** (an un-policied credential is allowed) to
-    /// preserve the historical default for direct constructors and tests. The
-    /// server flips this to fail-closed from `[enforcement] default_action`
-    /// (which itself defaults to `deny`) via [`Self::set_default_deny`].
+    /// The engine starts **fail-closed** (a credential matching no policy is
+    /// denied) — the secure default, so a constructor that forgets to wire
+    /// `[enforcement] default_action` cannot silently fail open. The server
+    /// still sets the mode explicitly from config via [`Self::set_default_deny`];
+    /// callers that want the legacy fail-open behavior opt in with
+    /// `set_default_deny(false)`.
     pub fn new() -> Self {
         Self {
             policies: RwLock::new(Vec::new()),
             rate_limits: RwLock::new(HashMap::new()),
-            default_deny: AtomicBool::new(false),
+            default_deny: AtomicBool::new(true),
         }
     }
 
@@ -87,12 +89,12 @@ impl PolicyEngine {
     /// toggle (e.g. a future admin-API flip) needs no engine rebuild — though no
     /// such runtime caller exists yet.
     pub fn set_default_deny(&self, deny: bool) {
-        self.default_deny.store(deny, Ordering::Relaxed);
+        self.default_deny.store(deny, Ordering::SeqCst);
     }
 
     /// Whether the engine denies credentials that match no policy.
     pub fn default_deny(&self) -> bool {
-        self.default_deny.load(Ordering::Relaxed)
+        self.default_deny.load(Ordering::SeqCst)
     }
 
     /// Add a policy
@@ -169,11 +171,17 @@ impl PolicyEngine {
         // "denied by an explicit policy" from "denied: no policy covers this
         // credential at all". Fail-open keeps the legacy allow behavior.
         if matching_policies.is_empty() {
-            if self.default_deny.load(Ordering::Relaxed) {
-                return PolicyDecision::Deny(format!(
-                    "no_policy: no policy matches credential '{}' (default-deny enforcement)",
-                    credential_alias
-                ));
+            if self.default_deny.load(Ordering::SeqCst) {
+                // Distinct, greppable `no_policy:` prefix (V2 acceptance) so
+                // logs/govder can tell "no policy covers this credential" from an
+                // explicit policy deny. The alias is deliberately NOT echoed in
+                // the agent-visible reason to avoid handing an agent policy-
+                // coverage recon; the credential is known to govder from the
+                // request/audit context, not this string.
+                return PolicyDecision::Deny(
+                    "no_policy: no policy matches this credential (default-deny enforcement)"
+                        .to_string(),
+                );
             }
             return PolicyDecision::Allow;
         }
@@ -358,10 +366,23 @@ mod tests {
     }
 
     #[test]
-    fn test_allow_when_no_policies() {
+    fn test_allow_when_no_policies_in_fail_open_mode() {
+        // new() is fail-closed by default now; opt into legacy fail-open here.
         let engine = PolicyEngine::new();
+        engine.set_default_deny(false);
         let decision = engine.evaluate("github-api", Some("https://api.github.com"), Some("GET"), &make_context());
         assert_eq!(decision, PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn test_new_engine_is_fail_closed_by_default() {
+        // The secure default: a bare engine denies an un-policied credential.
+        let engine = PolicyEngine::new();
+        assert!(engine.default_deny());
+        match engine.evaluate("x", Some("https://x"), Some("GET"), &make_context()) {
+            PolicyDecision::Deny(r) => assert!(r.starts_with("no_policy:")),
+            other => panic!("expected fail-closed Deny, got {other:?}"),
+        }
     }
 
     #[test]

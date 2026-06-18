@@ -407,4 +407,30 @@ action = "deny"
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.server.bind, "127.0.0.1:7878");
     }
+
+    #[test]
+    fn test_enforcement_default_is_deny_when_omitted() {
+        // Fail-closed is the built-in default when no [enforcement] section.
+        let config = Config::parse("").unwrap();
+        assert_eq!(config.enforcement.default_action, EnforcementDefault::Deny);
+    }
+
+    #[test]
+    fn test_enforcement_parses_allow_and_deny() {
+        let allow = Config::parse("[enforcement]\ndefault_action = \"allow\"").unwrap();
+        assert_eq!(allow.enforcement.default_action, EnforcementDefault::Allow);
+        let deny = Config::parse("[enforcement]\ndefault_action = \"deny\"").unwrap();
+        assert_eq!(deny.enforcement.default_action, EnforcementDefault::Deny);
+        // Section present but key omitted → deny.
+        let bare = Config::parse("[enforcement]").unwrap();
+        assert_eq!(bare.enforcement.default_action, EnforcementDefault::Deny);
+    }
+
+    #[test]
+    fn test_enforcement_invalid_action_is_hard_error() {
+        // Unknown value errors rather than silently falling back. Config enums
+        // are lowercase-exact across vultrino, so wrong case also errors.
+        assert!(Config::parse("[enforcement]\ndefault_action = \"permit\"").is_err());
+        assert!(Config::parse("[enforcement]\ndefault_action = \"Deny\"").is_err());
+    }
 }

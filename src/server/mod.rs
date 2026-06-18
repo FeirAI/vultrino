@@ -157,16 +157,26 @@ impl VultrinoServer {
         );
         policy_engine.set_default_deny(default_deny);
 
-        // A fail-closed engine with zero policies denies *every* credential —
-        // almost always a misconfiguration rather than an intentional lockout.
-        // Warn loudly so it isn't discovered only via a flood of denied calls.
-        if default_deny && config.policies.is_empty() {
-            warn!(
-                "enforcement default_action is 'deny' but no policies are configured — \
-                 ALL credential use will be denied until an allow policy is added (via config \
-                 or the admin API). Set `[enforcement] default_action = \"allow\"` to opt into \
-                 the legacy fail-open behavior."
-            );
+        // Surface the two dangerous zero-policy postures loudly at startup,
+        // since either is almost always a misconfiguration that would otherwise
+        // be discovered only via behavior (a flood of denials, or — worse —
+        // silent fail-open).
+        if config.policies.is_empty() {
+            if default_deny {
+                warn!(
+                    "enforcement default_action is 'deny' but no policies are configured — \
+                     ALL credential use will be denied until an allow policy is added (via config \
+                     or the admin API). Set `[enforcement] default_action = \"allow\"` to opt into \
+                     the legacy fail-open behavior."
+                );
+            } else {
+                warn!(
+                    "enforcement default_action is 'allow' and no policies are configured — \
+                     FAIL-OPEN: every credential is usable by any principal with execute access, \
+                     with no per-credential restriction. Add allow/deny policies, or set \
+                     `[enforcement] default_action = \"deny\"` for the secure default."
+                );
+            }
         }
 
         // By default, don't require auth in local mode

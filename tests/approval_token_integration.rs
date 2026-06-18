@@ -105,6 +105,7 @@ async fn setup_deny_mode(
 
     let mut config = Config::default();
     config.approval.enabled = true;
+    config.approval.ttl_secs = 3600;
     config.enforcement.default_action = vultrino::config::EnforcementDefault::Deny;
     config.policies = policies;
 
