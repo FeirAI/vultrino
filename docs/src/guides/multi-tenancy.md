@@ -31,7 +31,7 @@ mode = "observe"   # a policy Deny is recorded + emitted but NOT blocked
 - **`enforce`** (the default, and the mode for any untenanted or unlisted principal — fail-closed): a policy `Deny` blocks the action as usual.
 - **`observe`**: a policy `Deny` is **downgraded to allow** — the action runs, a warning is logged, and a `policy.observed_denial` event is emitted to the signed [outbox](../getting-started/configuration.md#event-outbox-v9) (carrying the credential, action, and what *would* have happened). This lets a team onboard and watch what *would* be blocked before flipping to `enforce`, while other teams enforce on the same vultrino. Note this also downgrades the engine's fail-closed `no_policy` default-deny, so in an observe tenant a credential lacking an explicit allow policy is *usable* (the point of observe-only onboarding) — size the blast radius accordingly.
 
-> Observe mode downgrades **policy denials only**. Cross-tenant isolation (below), use-token scope, RBAC, the dual-control gate, and — critically — a [halt / kill switch](./kill-halt.md) are **not** observable-away: a halted agent stays blocked even in an observe tenant.
+> Observe mode downgrades an **authorization-posture** denial only. The following are security/financial/abuse boundaries and are **not** observable-away — they hold even in an observe tenant: cross-tenant isolation (below), use-token scope, RBAC, the dual-control gate, **SpendCap / RateLimit resource guards** (a credential under a spend or rate cap is never downgraded — an over-cap call would otherwise run uncharged), and — critically — a [halt / kill switch](./kill-halt.md) (a halted agent stays blocked).
 
 ## Credential isolation
 

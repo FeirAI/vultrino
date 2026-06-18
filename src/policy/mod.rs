@@ -218,6 +218,32 @@ impl PolicyEngine {
         })
     }
 
+    /// Whether a matching policy carries a **resource guard** — a `SpendCap` or
+    /// `RateLimit` rule (V11). Read-only / no side effects. Used so V11 observe
+    /// mode does NOT downgrade a denial for a credential/principal under a spend
+    /// or rate cap: those are financial/abuse boundaries, not authorization
+    /// posture, so they must hold even in observe mode (a downgraded over-cap call
+    /// would run uncharged — the cumulative ledger only advances on an admitting
+    /// rule — and a downgraded over-limit call would defeat the rate limiter).
+    pub fn has_resource_guard(&self, input: &EvalInput) -> bool {
+        fn rule_guards(c: &PolicyCondition) -> bool {
+            match c {
+                PolicyCondition::SpendCap { .. } | PolicyCondition::RateLimit { .. } => true,
+                PolicyCondition::And(v) | PolicyCondition::Or(v) => v.iter().any(rule_guards),
+                PolicyCondition::Not(b) => rule_guards(b),
+                _ => false,
+            }
+        }
+        let policies = self.policies.read();
+        policies
+            .iter()
+            .filter(|p| {
+                credential_matches(&p.credential_pattern, input.credential_alias)
+                    && principal_matches(p.principal_pattern.as_deref(), input.principal)
+            })
+            .any(|p| p.rules.iter().any(|r| rule_guards(&r.condition)))
+    }
+
     /// Like [`Self::evaluate`] but with **no side effects**: `RateLimit` and
     /// `SpendCap` are treated as already-admitted (within limit/charge) instead
     /// of being counted/charged. Used by the deferred post-approval path

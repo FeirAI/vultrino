@@ -2504,3 +2504,82 @@ async fn test_v11_halt_is_not_downgraded_by_observe_mode() {
         other => panic!("a halted agent must be blocked even in an observe tenant, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn test_v11_halt_not_downgraded_for_api_key_principal() {
+    // V11 critical (the worst-case variant): an API-key-authed agent has no
+    // token-revocation leg, so the kill policy is its ONLY defense. Observe mode
+    // must not downgrade it.
+    use vultrino::auth::{ApiKey, AuthResult, Permission, Role};
+
+    let (server, storage) =
+        setup_tenants(false, vec![("team-observe", vultrino::config::TenantMode::Observe)]).await;
+    store_credential(&storage, "api-cred", false).await;
+
+    let role = Role::new("exec", [Permission::Read, Permission::Execute].into_iter().collect());
+    let api_key = ApiKey {
+        id: "vk_bot".to_string(),
+        key_prefix: "vk_bot".to_string(),
+        key_hash: "h".to_string(),
+        name: "bot".to_string(),
+        role_id: role.id.clone(),
+        expires_at: None,
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        agent_label: None,
+        owner_identity: None,
+        tenant: Some("team-observe".to_string()),
+    };
+    let auth = || ExecAuth {
+        auth: Some(AuthResult { api_key: api_key.clone(), role: role.clone() }),
+        use_token: None,
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+
+    // Without a halt, the observe tenant runs (allow mode).
+    assert!(matches!(
+        server.execute_gated(echo_request("api-cred"), auth()).await.unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
+
+    // Halt the API key by its id; observe must NOT downgrade it.
+    server
+        .policy_engine()
+        .add_policy(vultrino::policy::Policy::kill_switch("halt:vk_bot", "vk_bot"));
+    let err = server.execute_gated(echo_request("api-cred"), auth()).await.unwrap_err();
+    assert!(
+        matches!(err, vultrino::VultrinoError::PolicyDenied(_)),
+        "API-key agent halted by id must stay blocked in an observe tenant, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_v11_observe_does_not_downgrade_resource_guards() {
+    // V11: SpendCap / RateLimit are financial/abuse boundaries — observe mode must
+    // NOT downgrade a denial for a credential under such a guard.
+    use vultrino::policy::{Policy, PolicyAction, PolicyCondition};
+
+    let (server, storage) =
+        setup_tenants(false, vec![("team-observe", vultrino::config::TenantMode::Observe)]).await;
+    store_credential(&storage, "api-cred", false).await;
+    // A rate-limited policy: 1 request / hour, else deny (fail-closed default).
+    server.policy_engine().add_policy(
+        Policy::deny_all("rl", "*")
+            .with_rule(PolicyCondition::RateLimit { max: 1, window_secs: 3600 }, PolicyAction::Allow),
+    );
+
+    let token = tenant_token("team-observe");
+    storage.store_use_token(&token).await.unwrap();
+    // First call is within the rate limit → allowed.
+    assert!(matches!(
+        server.execute_gated(echo_request("api-cred"), tenant_auth(&token)).await.unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
+    // Second call exceeds the limit → DENIED even in observe (resource guard).
+    let err = server.execute_gated(echo_request("api-cred"), tenant_auth(&token)).await.unwrap_err();
+    assert!(
+        matches!(err, vultrino::VultrinoError::PolicyDenied(_)),
+        "a rate-limit denial must hold in observe mode, got {err:?}"
+    );
+}

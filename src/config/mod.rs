@@ -246,11 +246,14 @@ impl Config {
                     )))
                 }
             };
-            if t.id.trim().is_empty() {
+            // Trim the id so a padded `" team-a "` matches the (trimmed-at-mint)
+            // principal tenant rather than silently falling back to Enforce.
+            let id = t.id.trim().to_string();
+            if id.is_empty() {
                 return Err(ConfigError::Invalid("tenant id must not be empty".to_string()));
             }
-            if tenants.insert(t.id.clone(), mode).is_some() {
-                return Err(ConfigError::Invalid(format!("duplicate tenant '{}'", t.id)));
+            if tenants.insert(id.clone(), mode).is_some() {
+                return Err(ConfigError::Invalid(format!("duplicate tenant '{}'", id)));
             }
         }
 

@@ -384,8 +384,15 @@ impl VultrinoServer {
             .auth
             .as_ref()
             .and_then(|a| a.api_key.tenant.clone());
-        if let Some(cred_tenant) = credential.metadata.get("tenant") {
-            if principal_tenant.as_deref() != Some(cred_tenant.as_str()) {
+        // Trim the credential's tenant tag and treat blank as untenanted (shared),
+        // symmetric with the trimmed-at-mint principal tenant.
+        let cred_tenant = credential
+            .metadata
+            .get("tenant")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        if let Some(cred_tenant) = cred_tenant {
+            if principal_tenant.as_deref() != Some(cred_tenant) {
                 self.record_unauthorized_attempt();
                 return Err(VultrinoError::PolicyDenied(format!(
                     "credential '{}' belongs to tenant '{}' and is not accessible to this principal",
@@ -434,13 +441,13 @@ impl VultrinoServer {
                 // V11 observe mode: an observe-only tenant's denials are recorded
                 // and emitted but NOT blocked — the action runs anyway, so a team
                 // can onboard in observe-only while another enforces on the same
-                // vultrino. (Cross-tenant isolation above is NOT downgraded.) A V6
-                // halt/kill switch is a security override, NOT a per-tenant policy,
-                // so it is NEVER downgraded — a halted agent stays blocked even in
-                // an observe tenant.
+                // vultrino. NEVER downgraded (security/financial boundaries hold
+                // even in observe): cross-tenant isolation (above), a V6 halt/kill
+                // switch, and SpendCap/RateLimit resource guards.
                 if self.config.tenant_mode(principal_tenant.as_deref())
                     == crate::config::TenantMode::Observe
                     && !self.policy_engine.is_halted(&eval_input)
+                    && !self.policy_engine.has_resource_guard(&eval_input)
                 {
                     warn!(
                         tenant = ?principal_tenant,
@@ -756,6 +763,11 @@ impl VultrinoServer {
         // `tenant` metadata is changed *between* approval and resume is not
         // re-validated here (a narrow operator-action window; an emergency stop
         // should push a Deny/halt, which the resume policy re-eval does honor).
+        // Likewise the V11 *observe* downgrade is an open-time/live-path concept
+        // (the approval record doesn't carry the opener's tenant), so an
+        // observe-tenant action that is BOTH policy-denied AND approval-gated is
+        // enforced (fail-closed) on resume rather than observed-away — a safe
+        // over-block, not a bypass.
         //
         // A credential that has gone missing, or an unparseable action, won't
         // recover on retry → terminal.
