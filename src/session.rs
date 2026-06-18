@@ -161,19 +161,21 @@ mod tests {
             assert_eq!(reg.for_agent("bot-7")[0].session_id, "s1");
             assert_eq!(reg.for_agent("absent").len(), 0);
 
-            // for_halt_target also matches by principal id / token id.
+            // for_halt_target matches by principal id and token id independently
+            // (distinct values so each match arm is exercised on its own).
             let by_id = reg.begin(SessionEntry {
                 session_id: "s4".to_string(),
                 agent_label: None,
-                principal_id: Some("vut_xyz".to_string()),
-                token_id: Some("vut_xyz".to_string()),
+                principal_id: Some("vk_principal".to_string()),
+                token_id: Some("vut_token".to_string()),
                 credential: "cred".to_string(),
                 action: "mock.echo".to_string(),
                 started_at: Utc::now(),
             });
-            assert_eq!(reg.for_halt_target("vut_xyz").len(), 1, "matched by id");
+            assert_eq!(reg.for_halt_target("vk_principal").len(), 1, "matched by principal id");
+            assert_eq!(reg.for_halt_target("vut_token").len(), 1, "matched by token id");
             assert_eq!(reg.for_halt_target("bot-7").len(), 1, "matched by label");
-            assert_eq!(reg.for_agent("vut_xyz").len(), 0, "for_agent is label-only");
+            assert_eq!(reg.for_agent("vk_principal").len(), 0, "for_agent is label-only");
             drop(by_id);
         }
         // All guards dropped → registry is empty again.

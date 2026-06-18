@@ -926,7 +926,8 @@ impl VultrinoServer {
         // Leg 1: revoke every (still-active) use token of this target — matched by
         // the token's agent label OR its id, so halting a label-less agent by its
         // token id revokes that token (consistent with the kill policy, which
-        // matches the principal id too).
+        // matches the principal id too). Token ids are prefixed (`vut_…`) and
+        // agent labels are not, so `t.id == label` can't collide with a label.
         let tokens = self.storage.list_use_tokens().await?;
         let mut revoked_tokens = Vec::new();
         for t in tokens

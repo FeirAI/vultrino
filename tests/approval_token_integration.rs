@@ -2083,11 +2083,27 @@ async fn test_v6_halt_by_principal_id_for_labelless_agent() {
         requester: RequesterInfo::default(),
     };
 
-    // Halt by the token's principal id → kill policy denies AND the token itself
-    // is revoked (leg 1 matches the token by id, not just by agent_label).
+    // A registered callback + an in-flight session keyed only by id (no label).
+    let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    server.register_halt_callback(std::sync::Arc::new(RecordingHaltCallback { hits: hits.clone() }));
+    let _inflight = server.sessions().begin(vultrino::session::SessionEntry {
+        session_id: "by-id-sess".to_string(),
+        agent_label: None,
+        principal_id: Some(token.id.clone()),
+        token_id: Some(token.id.clone()),
+        credential: "api-cred".to_string(),
+        action: "mock.echo".to_string(),
+        started_at: chrono::Utc::now(),
+    });
+
+    // Halt by the token's principal id → kill policy denies (leg 2), the token
+    // itself is revoked (leg 1 matches by id), AND the by-id session is reported
+    // to the abort callback (leg 3 matches by id, not just label).
     let outcome = server.halt_agent(&token.id).await.unwrap();
     assert!(outcome.revoked_tokens.contains(&token.id), "by-id halt revokes that token");
     assert!(storage.get_use_token(&token.id).await.unwrap().unwrap().revoked);
+    assert_eq!(outcome.in_flight.len(), 1, "by-id session reported");
+    assert_eq!(hits.lock().unwrap().as_slice(), &[(token.id.clone(), 1)], "leg 3 fired for by-id");
     let err = server.execute_gated(echo_request("api-cred"), auth()).await.unwrap_err();
     assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)), "labelless agent halted by id");
 }
