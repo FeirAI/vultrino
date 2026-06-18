@@ -280,6 +280,9 @@ mod tests {
         assert!(r.resolve("spiffe://trusted.org/sa/x").is_ok());
         let err = r.resolve("spiffe://evil.org/sa/x").unwrap_err();
         assert_eq!(err, IdentityError::UntrustedDomain("evil.org".to_string()));
+        // Trust domains are DNS names → case-insensitive allowlist match.
+        assert!(r.resolve("spiffe://TRUSTED.ORG/sa/x").is_ok(), "case variant of a trusted domain");
+        assert!(r.resolve("spiffe://Evil.org/sa/x").is_err(), "case variant of an untrusted domain");
     }
 
     #[test]
@@ -307,6 +310,9 @@ mod tests {
         );
         // With no allowlist, an iss-less token is accepted (owner falls through).
         assert!(OidcResolver::default().resolve(r#"{"sub":"a"}"#).is_ok());
+        // An empty email claim is not a valid owner.
+        let id = OidcResolver::default().resolve(r#"{"sub":"x","email":""}"#).unwrap();
+        assert_eq!(id.owner, None, "empty email is not an owner");
     }
 
     #[test]
@@ -325,6 +331,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gcp.subject, "agent@proj.iam.gserviceaccount.com");
+        // A cloud workload is NOT its own human owner — even with an email claim,
+        // owner stays None (no false human accountability / trivial self-approval).
+        assert_eq!(gcp.owner, None, "cloud-IAM workload has no human owner");
 
         let entra = resolve_cloud_iam(
             IdentityKind::EntraWorkload,

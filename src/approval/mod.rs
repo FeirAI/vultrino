@@ -1316,6 +1316,13 @@ mod tests {
         c.requester.owner = Some("alice@example.com".to_string());
         c.approve(Decision::new("admin panel", "secops-oncall")).unwrap();
         assert_eq!(c.violates_sod(), Some(false), "distinct approver satisfies SoD");
+
+        // A blank owner must NOT poison the result to not-computable — SoD falls
+        // through to the agent's other identities (the old `.or()` chain bug).
+        let (mut d, _) = new_approval(); // principal_name "agent"
+        d.requester.owner = Some("   ".to_string());
+        d.approve(Decision::new("admin panel", "agent")).unwrap();
+        assert_eq!(d.violates_sod(), Some(true), "blank owner doesn't poison SoD to None");
     }
 
     #[test]

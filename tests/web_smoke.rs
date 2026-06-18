@@ -853,3 +853,27 @@ async fn test_admin_metrics_readback() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn test_admin_token_mint_trims_owner_identity() {
+    // V10: a padded owner_identity is trimmed at the mint (so SoD comparisons match).
+    let (router, storage, _server, key) = build_admin_router().await;
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/tokens",
+            &key,
+            serde_json::json!({
+                "name": "owned-bot",
+                "credential_scope": "pay-*",
+                "owner_identity": "  alice@example.com  "
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let tokens = storage.list_use_tokens().await.unwrap();
+    let t = tokens.iter().find(|t| t.name == "owned-bot").unwrap();
+    assert_eq!(t.owner_identity.as_deref(), Some("alice@example.com"), "owner trimmed");
+}
