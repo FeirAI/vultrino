@@ -96,15 +96,6 @@ fn json_escaped_inner(s: &str) -> Option<String> {
 /// **fail closed** by withholding it entirely. Returns whether it blocked. Call
 /// before redaction so a compressed reflected secret can never slip through.
 pub fn block_if_compressed(resp: &mut ExecuteResponse) -> bool {
-    // A Content-/Transfer-Encoding token that isn't `identity` or `chunked`
-    // (framing) means an undecoded compression the HTTP client didn't strip
-    // (reqwest removes Content-Encoding when it decompresses gzip/deflate/br),
-    // handling multi-value (`gzip, br`) and any case.
-    let is_compression = |value: &str| {
-        value.split(',').map(str::trim).any(|t| {
-            !t.is_empty() && !t.eq_ignore_ascii_case("identity") && !t.eq_ignore_ascii_case("chunked")
-        })
-    };
     let still_compressed = resp.headers.iter().any(|(k, v)| {
         (k.eq_ignore_ascii_case("content-encoding") || k.eq_ignore_ascii_case("transfer-encoding"))
             && is_compression(v)
@@ -118,6 +109,18 @@ pub fn block_if_compressed(resp: &mut ExecuteResponse) -> bool {
         return true;
     }
     false
+}
+
+/// Whether a `Content-Encoding`/`Transfer-Encoding` value names an actual
+/// content compression the HTTP client did not strip (reqwest removes
+/// `Content-Encoding` when it decompresses gzip/deflate/br). Any token other
+/// than `identity` or the `chunked` framing is treated as compression, handling
+/// multi-value lists (`gzip, br`) and case-insensitively — so unknown/legacy
+/// codecs (`x-gzip`, `zstd`) are caught fail-closed rather than waved through.
+fn is_compression(value: &str) -> bool {
+    value.split(',').map(str::trim).any(|t| {
+        !t.is_empty() && !t.eq_ignore_ascii_case("identity") && !t.eq_ignore_ascii_case("chunked")
+    })
 }
 
 /// Drop response framing headers that a redacted body invalidates. Redaction
@@ -204,6 +207,41 @@ pub fn apply_egress(
         }
     }
     modified
+}
+
+/// Run the full V7 egress pipeline over a freshly-executed response, in one
+/// place, before the body ever reaches the agent. Pure with respect to the
+/// rest of the system: it only mutates `resp` (and emits warning logs) — no
+/// audit / metrics / policy side effects live here, so the early return on a
+/// withheld compressed body loses nothing.
+///
+/// Order matters and is fail-closed:
+/// 1. If the body is still compressed (an encoding the client didn't decode) it
+///    can't be scrubbed, so withhold it and stop — the body is now an opaque
+///    placeholder and the headers have been replaced, so further scrub /
+///    classify / framing-strip would be pointless.
+/// 2. Otherwise scrub the credential's own reflected secret, then apply operator
+///    egress classification (block / extra redaction).
+/// 3. If either changed the body, drop framing headers a stale `Content-Length`
+///    would otherwise leak or corrupt.
+pub fn scrub_response(
+    resp: &mut ExecuteResponse,
+    secrets: &[Zeroizing<String>],
+    alias: &str,
+    rules: &[EgressRule],
+    action: &str,
+) {
+    if block_if_compressed(resp) {
+        // NOTE: this early return must stay side-effect-free. Any future audit /
+        // metric emission about the response belongs in the caller, not here, or
+        // the withheld-compressed path would silently skip it.
+        return;
+    }
+    let redacted = redact_secret_material(resp, secrets, alias);
+    let classified = apply_egress(resp, rules, alias, action);
+    if redacted || classified {
+        strip_content_framing_headers(resp);
+    }
 }
 
 /// Replace every non-overlapping occurrence of `needle`; returns the new bytes
@@ -430,6 +468,68 @@ mod tests {
         let mut r3 = resp("plain");
         assert!(!block_if_compressed(&mut r3));
         assert_eq!(String::from_utf8_lossy(&r3.body), "plain");
+
+        // A pre-existing Content-Type is replaced (not duplicated) by the label.
+        let mut r4 = resp("x");
+        r4.headers.insert("content-type".to_string(), "application/json".to_string());
+        r4.headers.insert("Content-Encoding".to_string(), "br".to_string());
+        assert!(block_if_compressed(&mut r4));
+        let cts: Vec<_> =
+            r4.headers.keys().filter(|k| k.eq_ignore_ascii_case("content-type")).collect();
+        assert_eq!(cts.len(), 1, "exactly one Content-Type after block");
+        assert_eq!(r4.headers.get("Content-Type").map(String::as_str), Some("text/plain"));
+    }
+
+    #[test]
+    fn test_is_compression_edge_tokens() {
+        // Real / legacy / unknown codecs are compression (fail-closed).
+        for v in ["gzip", "GZIP", "x-gzip", "zstd", "gzip, br", "identity, gzip", "deflate"] {
+            assert!(is_compression(v), "{v:?} should count as compression");
+        }
+        // Framing-only / empty values are not compression.
+        for v in ["", " ", "identity", "chunked", "IDENTITY", "chunked, identity", " , "] {
+            assert!(!is_compression(v), "{v:?} should NOT count as compression");
+        }
+    }
+
+    #[test]
+    fn test_scrub_response_orchestration() {
+        let secret = "supersecret-token-value";
+        let rules = vec![rule("sts-*", "*", true, &[])];
+
+        // (a) Compressed body → withheld, and the scrub/classify/strip steps are
+        //     skipped: a matching block rule does NOT overwrite the compression
+        //     placeholder, framing headers are gone, only the label remains.
+        let mut r = resp(secret);
+        r.headers.insert("Content-Encoding".to_string(), "gzip".to_string());
+        r.headers.insert("Content-Length".to_string(), "999".to_string());
+        scrub_response(&mut r, &secrets(&[secret]), "sts-prod", &rules, "http.request");
+        assert!(String::from_utf8_lossy(&r.body).contains("compressed body could not be scrubbed"));
+        assert!(!r.headers.keys().any(|k| k.eq_ignore_ascii_case("content-length")));
+        assert_eq!(r.headers.get("Content-Type").map(String::as_str), Some("text/plain"));
+
+        // (b) Reflected secret in an uncompressed body → scrubbed, and the stale
+        //     Content-Length (set before redaction) is stripped.
+        let mut r = resp(&format!("echo {secret} back"));
+        r.headers.insert("Content-Length".to_string(), "99".to_string());
+        scrub_response(&mut r, &secrets(&[secret]), "github-1", &[], "http.request");
+        assert!(!String::from_utf8_lossy(&r.body).contains(secret));
+        assert!(String::from_utf8_lossy(&r.body).contains("[REDACTED:github-1]"));
+        assert!(!r.headers.keys().any(|k| k.eq_ignore_ascii_case("content-length")));
+
+        // (c) Operator block rule on an uncompressed body → body+headers withheld.
+        let mut r = resp("downstream secret payload");
+        r.headers.insert("Set-Cookie".to_string(), "session=zzz".to_string());
+        scrub_response(&mut r, &[], "sts-prod", &rules, "http.request");
+        assert!(String::from_utf8_lossy(&r.body).contains("withheld by egress policy"));
+        assert!(!r.headers.contains_key("Set-Cookie"));
+
+        // (d) Clean body, no rules → untouched, framing preserved.
+        let mut r = resp("nothing to see");
+        r.headers.insert("Content-Length".to_string(), "14".to_string());
+        scrub_response(&mut r, &secrets(&["unrelated"]), "github-1", &[], "http.request");
+        assert_eq!(String::from_utf8_lossy(&r.body), "nothing to see");
+        assert_eq!(r.headers.get("Content-Length").map(String::as_str), Some("14"));
     }
 
     #[test]

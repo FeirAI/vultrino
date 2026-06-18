@@ -527,32 +527,17 @@ impl VultrinoServer {
             .await
             .map_err(|e| RunError::committed(e.into()))?;
 
-        // V7 egress controls (before the body ever reaches the agent):
-        // 1. scrub the credential's own secret if the endpoint reflected it back
-        //    (read-back defense), and 2. apply operator egress classification
-        //    (block / extra redaction) for secret-bearing endpoints.
-        // Fail closed first if the body is still compressed (an encoding the
-        // client didn't decode) — it can't be scrubbed, so withhold it. When
-        // blocked, the body is an opaque placeholder, so skip the (now-pointless)
-        // scrub/classify and the framing strip (headers were already replaced).
-        if !crate::egress::block_if_compressed(&mut response) {
-            let redacted = crate::egress::redact_secret_material(
-                &mut response,
-                &secret_material,
-                &credential_alias,
-            );
-            let classified = crate::egress::apply_egress(
-                &mut response,
-                &self.config.egress,
-                &credential_alias,
-                &full_action,
-            );
-            // Only when the body actually changed: a forwarded Content-Length /
-            // Transfer-Encoding would now be wrong (and leak the original length).
-            if redacted || classified {
-                crate::egress::strip_content_framing_headers(&mut response);
-            }
-        }
+        // V7 egress controls (before the body ever reaches the agent): fail
+        // closed on a still-compressed body, else scrub the credential's own
+        // reflected secret and apply operator egress classification, dropping
+        // stale framing if the body changed. See `egress::scrub_response`.
+        crate::egress::scrub_response(
+            &mut response,
+            &secret_material,
+            &credential_alias,
+            &self.config.egress,
+            &full_action,
+        );
 
         // Persist any credential update (e.g. OAuth2 token refresh).
         if let Some(updated_data) = &response.updated_credential {
