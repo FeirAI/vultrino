@@ -1277,10 +1277,14 @@ async fn test_spend_capped_approval_resumes_without_recharge() {
         action: "mock.echo".to_string(),
         params: serde_json::json!({ "amount": 60 }),
     };
-    assert!(matches!(
-        server.execute_gated(again, ExecAuth::default()).await.unwrap_err(),
-        vultrino::VultrinoError::PolicyDenied(_)
-    ));
+    match server.execute_gated(again, ExecAuth::default()).await.unwrap_err() {
+        vultrino::VultrinoError::PolicyDenied(reason) => {
+            // Denied by the spend-cap policy specifically (not a coincidental deny):
+            // both calls are principal-less, so the cred-keyed cap accumulated.
+            assert!(reason.contains("pay-cap"), "expected spend-cap deny, got: {reason}");
+        }
+        other => panic!("expected PolicyDenied, got {other:?}"),
+    }
 
     storage.decide_approval(&approval_id, true, "approver", None).await.unwrap();
 

@@ -291,8 +291,13 @@ fn hash_token(token: &str) -> String {
 /// safe allowlist to avoid unintended glob matches or key-prefix collisions.
 /// Centralized so every token-write path enforces the same rule.
 pub fn validate_agent_label(label: &str) -> Result<(), String> {
+    /// Bound the label so it can't bloat glob compilation or the ledger key.
+    const MAX_AGENT_LABEL_LEN: usize = 128;
     if label.is_empty() {
         return Err("agent_label must not be empty".to_string());
+    }
+    if label.len() > MAX_AGENT_LABEL_LEN {
+        return Err(format!("agent_label must be at most {MAX_AGENT_LABEL_LEN} bytes"));
     }
     if !label
         .chars()
@@ -417,5 +422,25 @@ mod tests {
     fn test_looks_like_token() {
         assert!(UseToken::looks_like_token("vut_abc123"));
         assert!(!UseToken::looks_like_token("vk_abc123"));
+    }
+
+    #[test]
+    fn test_validate_agent_label() {
+        // Valid labels.
+        assert!(validate_agent_label("my-bot.v2").is_ok());
+        assert!(validate_agent_label("refund_bot-3").is_ok());
+        // Empty rejected.
+        assert!(validate_agent_label("").is_err());
+        // Glob metacharacters and the ':' key-prefix separator rejected.
+        for bad in ["bot-*", "bot?", "a[b]", "cred:foo", "a:b"] {
+            assert!(validate_agent_label(bad).is_err(), "expected reject: {bad}");
+        }
+        // Other unsafe chars rejected (whitespace, slash, at, unicode).
+        for bad in ["a b", "a/b", "a@b", "café"] {
+            assert!(validate_agent_label(bad).is_err(), "expected reject: {bad}");
+        }
+        // Over-long rejected; at-bound accepted.
+        assert!(validate_agent_label(&"a".repeat(129)).is_err());
+        assert!(validate_agent_label(&"a".repeat(128)).is_ok());
     }
 }
