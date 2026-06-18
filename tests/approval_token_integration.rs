@@ -1391,3 +1391,55 @@ async fn test_egress_block_withholds_response_end_to_end() {
     assert!(!body.contains("abc123"), "blocked body leaked: {body}");
     assert!(body.contains("withheld by egress policy"));
 }
+
+#[tokio::test]
+async fn test_action_label_token_scope_and_approval_summary() {
+    // V8: a token scoped to a govder action label authorizes a request that
+    // presents that label (resolved to the canonical plugin.action), and the
+    // approver sees the business verb.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("pw");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let mut config = Config::default();
+    config.approval.enabled = true;
+    config.approval.ttl_secs = 3600;
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.action_labels =
+        std::collections::HashMap::from([("payments.refund".to_string(), "mock.echo".to_string())]);
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    server.plugins().register(Arc::new(MockPlugin));
+    store_credential(&storage, "pay-cred", true).await; // require_approval → gates
+
+    let (_f, token) = UseToken::create(NewUseToken {
+        name: "refund".to_string(),
+        credential_scope: "pay-*".to_string(),
+        action_scope: Some("payments.refund".to_string()), // scoped to the LABEL
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    let req = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "payments.refund".to_string(),
+        params: serde_json::json!({ "amount": 10 }),
+    };
+    let approval = match server
+        .execute_gated(req, ExecAuth::from_use_token(token))
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    // Canonical action recorded; the approver sees the govder business verb.
+    assert_eq!(approval.action, "mock.echo");
+    assert_eq!(approval.action_label.as_deref(), Some("payments.refund"));
+    assert!(approval.summary.contains("payments.refund"), "summary: {}", approval.summary);
+}

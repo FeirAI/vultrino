@@ -188,6 +188,24 @@ from the body (on top of the always-on redaction).
 > SVIDs) so a revoke maps to a real resource-side revoke. OAuth2 in-path token
 > rotation emits a `credential.rotated` event (delivered via the signed outbox).
 
+### Action Labels
+
+Map a govder **business verb** to a canonical `plugin.action` (V8), so policies,
+tokens, and the audit trail can speak in business terms while vultrino executes
+the underlying plugin action:
+
+```toml
+[[action_labels]]
+label = "payments.refund"   # what govder / a token scopes against
+action = "http.request"     # the canonical plugin.action vultrino runs
+```
+
+A request (or use-token `action_scope`) may then use the label `payments.refund`;
+it resolves to `http.request` for execution, the use-token scope is satisfied by
+either the label or the canonical action, and the approver sees the business
+verb in the approval. The typed `/api/v1/execute` endpoint also accepts an
+optional `action` field (default `http.request`) so it is no longer hardwired.
+
 ## Environment Variables
 
 | Variable | Description |

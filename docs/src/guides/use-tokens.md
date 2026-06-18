@@ -27,6 +27,22 @@ The plaintext token is shown **once** at creation. Vultrino stores only a hash, 
 
 Both scopes are enforced **authoritatively in the server** at execution time, not just at the edge — a token narrowed to `github-*` / `http.request` is rejected for any other credential or action even if a caller tries to use it directly.
 
+The `--action` scope may also be a govder **action label** (see
+[Action Labels](../getting-started/configuration.md#action-labels)); it is
+satisfied by either the label or the canonical action it resolves to.
+
+### Strictness (V8)
+
+When minting a token via the admin API, a `strictness` compiles to enforced
+settings, so `direct` and `approve-at-checkpoint` differ on the wire:
+
+| Strictness | Compiles to |
+|------------|-------------|
+| `direct` | single-use (`max_uses = 1`) + `require_approval` + `dual_control` (a second/M-of-N approver, enforced by the approval layer) |
+| `checkpoint` | `require_approval`, multi-use (one approval per gated action) |
+
+`direct` overrides any `max_uses`/`require_approval` the caller passed.
+
 ## Guarantees
 
 - **Fail-closed counting.** A use is spent the moment the action runs — *before* the side effect, and even if the downstream call then errors. A single-use token can never drive two executions.

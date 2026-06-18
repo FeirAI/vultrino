@@ -305,15 +305,19 @@ impl VultrinoServer {
             }
         }
 
-        // Resolve credential and normalize the action.
+        // Resolve credential and normalize the action. A govder action label
+        // (V8) resolves to the canonical `plugin.action`; the label (if any) is
+        // surfaced to the approver/audit.
         let credential = self.resolver.resolve(&request.credential).await?;
-        let (plugin_name, action_name) = parse_action(&request.action)?;
+        let (canonical_action, action_label) = self.config.resolve_action(&request.action);
+        let (plugin_name, action_name) = parse_action(&canonical_action)?;
         let full_action = format!("{}.{}", plugin_name, action_name);
 
         // Authoritative use-token scope enforcement at the seam where the token
         // is actually spent — both credential and action scope, so the token's
         // single-action restriction is defended in depth rather than only at the
-        // (MCP/HTTP) edge.
+        // (MCP/HTTP) edge. The action scope is satisfied by either the presented
+        // form (which may be a govder label) or the resolved canonical action.
         if let Some(token) = &exec_auth.use_token {
             if !token.allows_credential(&credential.alias) {
                 return Err(VultrinoError::PolicyDenied(format!(
@@ -321,7 +325,7 @@ impl VultrinoServer {
                     credential.alias
                 )));
             }
-            if !token.allows_action(&full_action) {
+            if !token.allows_action(&request.action) && !token.allows_action(&full_action) {
                 return Err(VultrinoError::PolicyDenied(format!(
                     "Use token is not scoped to action '{}'",
                     full_action
@@ -394,6 +398,8 @@ impl VultrinoServer {
                 use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
                 principal_id: principal.as_ref().map(|p| p.id.clone()),
                 agent_label: principal.as_ref().and_then(|p| p.agent_label.clone()),
+                action_label: action_label.clone(),
+                dual_control: exec_auth.use_token.as_ref().map(|t| t.dual_control).unwrap_or(false),
                 ttl: self.approval_config.ttl(),
             });
 

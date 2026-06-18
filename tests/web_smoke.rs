@@ -409,6 +409,45 @@ async fn test_admin_put_policy_idempotency_bound_to_path() {
 }
 
 #[tokio::test]
+async fn test_admin_token_strictness_compiles() {
+    let (router, storage, _server, key) = build_admin_router().await;
+    let mint = |body: serde_json::Value| admin_req("POST", "/api/v1/tokens", &key, body);
+
+    // direct → single-use + require_approval + dual_control (overrides max_uses).
+    let r = router
+        .clone()
+        .oneshot(mint(serde_json::json!({"name":"d","credential_scope":"*","max_uses":99,"strictness":"direct"})))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let id = v["metadata"]["id"].as_str().unwrap();
+    let tok = storage.get_use_token(id).await.unwrap().unwrap();
+    assert_eq!(tok.max_uses, Some(1));
+    assert!(tok.require_approval);
+    assert!(tok.dual_control);
+
+    // checkpoint → require_approval + multi-use + no dual_control.
+    let r = router
+        .clone()
+        .oneshot(mint(serde_json::json!({"name":"c","credential_scope":"*","max_uses":5,"strictness":"checkpoint"})))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let tok = storage.get_use_token(v["metadata"]["id"].as_str().unwrap()).await.unwrap().unwrap();
+    assert_eq!(tok.max_uses, Some(5));
+    assert!(tok.require_approval);
+    assert!(!tok.dual_control);
+
+    // Unknown strictness → 400.
+    let r = router
+        .oneshot(mint(serde_json::json!({"name":"x","credential_scope":"*","strictness":"loose"})))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_admin_token_agent_label_validation() {
     let (router, _storage, _server, key) = build_admin_router().await;
     let mint = |label: &str| {
@@ -590,6 +629,8 @@ async fn test_out_of_band_decide_flow() {
         use_token_id: None,
         principal_id: None,
         agent_label: None,
+        action_label: None,
+        dual_control: false,
         ttl: chrono::Duration::hours(1),
     });
     storage.store_approval(&approval).await.unwrap();

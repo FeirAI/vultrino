@@ -22,6 +22,17 @@ pub struct RawConfig {
     /// Egress classification rules (V7).
     #[serde(default)]
     pub egress: Vec<RawEgressRule>,
+    /// govder action-label → canonical plugin.action mappings (V8).
+    #[serde(default)]
+    pub action_labels: Vec<RawActionLabel>,
+}
+
+/// Raw action-label mapping (V8): a govder business verb (e.g. "payments.refund")
+/// that resolves to a canonical `plugin.action` (e.g. "http.request").
+#[derive(Debug, Deserialize)]
+pub struct RawActionLabel {
+    pub label: String,
+    pub action: String,
 }
 
 /// Raw egress classification rule (V7).
@@ -542,6 +553,23 @@ action = "deny"
         // Section present but key omitted → deny.
         let bare = Config::parse("[enforcement]").unwrap();
         assert_eq!(bare.enforcement.default_action, EnforcementDefault::Deny);
+    }
+
+    #[test]
+    fn test_action_label_resolution() {
+        let cfg = Config::parse(
+            "[[action_labels]]\nlabel = \"payments.refund\"\naction = \"http.request\"",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_action("payments.refund"),
+            ("http.request".to_string(), Some("payments.refund".to_string()))
+        );
+        // A canonical (non-label) action passes through unchanged.
+        assert_eq!(
+            cfg.resolve_action("postgres.run_sql"),
+            ("postgres.run_sql".to_string(), None)
+        );
     }
 
     #[test]

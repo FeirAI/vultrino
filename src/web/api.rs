@@ -86,6 +86,11 @@ fn error_response(status: StatusCode, code: &str, message: impl Into<String>) ->
 pub struct ExecuteApiRequest {
     /// Credential alias to use
     pub credential: String,
+    /// Action to perform (V8): a canonical `plugin.action` or a govder action
+    /// label. Defaults to `http.request` (the only action whose params this
+    /// typed endpoint shapes); other actions are typically driven via MCP.
+    #[serde(default)]
+    pub action: Option<String>,
     /// HTTP method
     pub method: String,
     /// Target URL
@@ -179,10 +184,10 @@ pub async fn api_execute(
         Err(resp) => return resp,
     };
 
-    // Build the execute request
+    // Build the execute request (action no longer hardcoded — V8).
     let execute_request = ExecuteRequest {
         credential: request.credential,
-        action: "http.request".to_string(),
+        action: request.action.unwrap_or_else(|| "http.request".to_string()),
         params: serde_json::json!({
             "method": request.method.to_uppercase(),
             "url": request.url,
@@ -759,6 +764,11 @@ pub struct TokenCreateRequest {
     /// `principal_pattern` can target this one agent.
     #[serde(default)]
     pub agent_label: Option<String>,
+    /// Optional strictness (V8) that compiles to enforced settings:
+    /// `direct` = single-use + require_approval + dual_control; `checkpoint` =
+    /// require_approval (multi-use). Overrides max_uses/require_approval.
+    #[serde(default)]
+    pub strictness: Option<String>,
 }
 
 /// `POST /api/v1/tokens` — mint a use token; the plaintext is returned once.
@@ -785,12 +795,25 @@ pub async fn api_create_token(
                 );
             }
         };
+        // Compile strictness (V8) into enforced settings. `direct` is single-use
+        // + approval + dual-control; `checkpoint` is approval + multi-use.
+        let (max_uses, require_approval, dual_control) = match req.strictness.as_deref() {
+            None => (req.max_uses, req.require_approval, false),
+            Some("direct") => (Some(1), true, true),
+            Some("checkpoint") => (req.max_uses, true, false),
+            Some(other) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"code": "invalid_strictness", "error": format!("unknown strictness '{}' (expected 'direct' or 'checkpoint')", other)}),
+                );
+            }
+        };
         let params = NewUseToken {
             name: req.name,
             credential_scope: req.credential_scope,
             action_scope: req.action_scope,
-            max_uses: req.max_uses,
-            require_approval: req.require_approval,
+            max_uses,
+            require_approval,
             expires_in,
         };
         if let Err(e) = params.validate() {
@@ -810,9 +833,10 @@ pub async fn api_create_token(
             }
         }
         let (full_token, mut token) = UseToken::create(params);
-        // Bind the agent identity (V4) post-create; req.agent_label is not moved
-        // into `params` above, so it's still accessible after the partial move.
+        // Bind the agent identity (V4) and dual-control flag (V8) post-create;
+        // these fields are not moved into `params` above.
         token.agent_label = req.agent_label;
+        token.dual_control = dual_control;
         if let Err(e) = st.storage.store_use_token(&token).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

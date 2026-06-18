@@ -75,6 +75,11 @@ pub struct UseToken {
     /// agents sharing the same credential. Set via the admin API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
+    /// Whether actions driven by this token require **dual control** (a second,
+    /// distinct approver / M-of-N) — set by `direct` strictness (V8). Enforced
+    /// by the approval layer in V12; recorded here and on the approval now.
+    #[serde(default)]
+    pub dual_control: bool,
 }
 
 /// Why a use token is not currently usable.
@@ -160,6 +165,7 @@ impl UseToken {
             last_used_at: None,
             revoked: false,
             agent_label: None,
+            dual_control: false,
         };
 
         (full_token, token)
@@ -239,6 +245,8 @@ pub struct UseTokenMetadata {
     pub revoked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
+    #[serde(default)]
+    pub dual_control: bool,
 }
 
 impl From<&UseToken> for UseTokenMetadata {
@@ -258,6 +266,7 @@ impl From<&UseToken> for UseTokenMetadata {
             last_used_at: t.last_used_at,
             revoked: t.revoked,
             agent_label: t.agent_label.clone(),
+            dual_control: t.dual_control,
         }
     }
 }

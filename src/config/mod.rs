@@ -49,6 +49,20 @@ pub struct Config {
     pub spend_extractors: Vec<crate::policy::SpendExtractor>,
     /// Egress classification rules (V7).
     pub egress: Vec<crate::egress::EgressRule>,
+    /// govder action-label → canonical plugin.action map (V8).
+    pub action_labels: std::collections::HashMap<String, String>,
+}
+
+impl Config {
+    /// Resolve a presented action: if it is a configured govder label, return
+    /// `(canonical_plugin_action, Some(label))`; otherwise it is already a
+    /// canonical `plugin.action`, so `(presented, None)` (V8).
+    pub fn resolve_action(&self, presented: &str) -> (String, Option<String>) {
+        match self.action_labels.get(presented) {
+            Some(canonical) => (canonical.clone(), Some(presented.to_string())),
+            None => (presented.to_string(), None),
+        }
+    }
 }
 
 /// Engine-level enforcement configuration.
@@ -126,6 +140,11 @@ impl Config {
             .into_iter()
             .map(TryInto::try_into)
             .collect::<Result<Vec<_>, _>>()?;
+        let action_labels = raw
+            .action_labels
+            .into_iter()
+            .map(|a| (a.label, a.action))
+            .collect();
 
         let policies = raw
             .policies
@@ -147,6 +166,7 @@ impl Config {
             enforcement,
             spend_extractors,
             egress,
+            action_labels,
         })
     }
 
@@ -162,6 +182,7 @@ impl Config {
             enforcement: EnforcementConfig::default(),
             spend_extractors: vec![],
             egress: vec![],
+            action_labels: std::collections::HashMap::new(),
         }
     }
 

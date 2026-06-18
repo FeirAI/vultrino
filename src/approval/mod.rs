@@ -115,6 +115,10 @@ pub struct NewApproval {
     /// Agent label of the requesting principal (V4), for per-agent policy
     /// re-evaluation at resume.
     pub agent_label: Option<String>,
+    /// govder business-verb label for the action (V8), for the approver summary.
+    pub action_label: Option<String>,
+    /// Whether the action requires dual control (V8 strictness).
+    pub dual_control: bool,
     /// Time-to-live; after this the request auto-expires if undecided.
     pub ttl: chrono::Duration,
 }
@@ -148,6 +152,14 @@ pub struct ApprovalRequest {
     /// policy is re-evaluated correctly when the approved action resumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
+    /// govder business-verb label for the action (V8), shown to the approver
+    /// instead of the canonical `plugin.action` when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_label: Option<String>,
+    /// Whether this action requires dual control (V8 strictness `direct`);
+    /// enforced by the approval layer in V12.
+    #[serde(default)]
+    pub dual_control: bool,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,7 +197,10 @@ impl ApprovalRequest {
     pub fn open(params: NewApproval) -> (ApprovalRequest, String) {
         let now = Utc::now();
         let (decision_token, decision_token_hash) = generate_decision_token();
-        let summary = summarize(&params.credential, &params.action, &params.params);
+        // Show the govder business verb to the approver when present, else the
+        // canonical plugin.action.
+        let display_action = params.action_label.as_deref().unwrap_or(&params.action);
+        let summary = summarize(&params.credential, display_action, &params.params);
 
         let request = ApprovalRequest {
             id: format!("appr_{}", uuid::Uuid::new_v4()),
@@ -198,6 +213,8 @@ impl ApprovalRequest {
             use_token_id: params.use_token_id,
             principal_id: params.principal_id,
             agent_label: params.agent_label,
+            action_label: params.action_label,
+            dual_control: params.dual_control,
             created_at: now,
             expires_at: now + params.ttl,
             decided_at: None,
@@ -567,6 +584,8 @@ mod tests {
             use_token_id: None,
             principal_id: Some("k1".to_string()),
             agent_label: None,
+            action_label: None,
+            dual_control: false,
             ttl: chrono::Duration::hours(1),
         })
     }
