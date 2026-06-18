@@ -13,8 +13,11 @@ categories = ["authentication", "network-programming"]
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
-# HTTP client for plugin requests
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# HTTP client for plugin requests.
+# gzip/deflate/brotli enable response auto-decompression so egress secret-
+# redaction always operates on plaintext (a compressed body would hide a
+# reflected secret); reqwest also strips Content-Encoding when it decompresses.
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip", "deflate", "brotli"], default-features = false }
 
 # Web UI server
 axum = { version = "0.8", features = ["macros"] }

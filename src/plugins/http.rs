@@ -456,13 +456,13 @@ impl HttpPlugin {
         let mut headers = params.headers;
         self.inject_credentials(&mut headers, &effective_cred)?;
 
-        // Force an identity (uncompressed) response, overriding any caller value:
-        // egress secret-redaction operates on plaintext bytes, so a compressed
-        // body would hide a reflected secret from the scrubber — and an agent
-        // could otherwise request `Accept-Encoding: gzip` to bypass the read-back
-        // defense. Safety wins over honoring a compression preference here.
-        headers.retain(|k, _| !k.eq_ignore_ascii_case("accept-encoding"));
-        headers.insert("Accept-Encoding".to_string(), "identity".to_string());
+        // Let the HTTP client negotiate and auto-decompress the response
+        // (gzip/deflate/brotli features) so egress secret-redaction always sees
+        // plaintext bytes. Strip any caller-supplied Accept-Encoding so the
+        // client controls it (an agent can't request a compressed body to evade
+        // the scrubber); a residual undecoded Content-Encoding is failed-closed
+        // at the egress seam.
+        force_client_managed_encoding(&mut headers);
 
         // Build request using the validated URL
         let mut request = self.client.request(method, validated_url);
@@ -513,6 +513,13 @@ impl HttpPlugin {
             updated_credential,
         })
     }
+}
+
+/// Remove any caller-supplied `Accept-Encoding` so the HTTP client negotiates
+/// and auto-decompresses the response itself — preventing an agent from
+/// requesting a compressed body to evade egress secret-redaction.
+fn force_client_managed_encoding(headers: &mut HashMap<String, String>) {
+    headers.retain(|k, _| !k.eq_ignore_ascii_case("accept-encoding"));
 }
 
 impl Default for HttpPlugin {
@@ -633,6 +640,20 @@ mod tests {
         });
 
         assert!(plugin.validate_params("request", &params).is_err());
+    }
+
+    #[test]
+    fn test_force_client_managed_encoding_strips_caller_value() {
+        // An agent-supplied Accept-Encoding (any case / q-values) is removed so
+        // the client controls compression and decompresses for the scrubber.
+        for hdr in ["Accept-Encoding", "accept-encoding", "ACCEPT-ENCODING"] {
+            let mut headers = HashMap::new();
+            headers.insert(hdr.to_string(), "gzip, identity;q=0.5".to_string());
+            headers.insert("X-Keep".to_string(), "1".to_string());
+            force_client_managed_encoding(&mut headers);
+            assert!(!headers.keys().any(|k| k.eq_ignore_ascii_case("accept-encoding")));
+            assert!(headers.contains_key("X-Keep"));
+        }
     }
 
     #[test]

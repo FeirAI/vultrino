@@ -91,6 +91,26 @@ fn json_escaped_inner(s: &str) -> Option<String> {
     json.get(1..json.len().checked_sub(1)?).map(|s| s.to_string())
 }
 
+/// If a response is still compressed (a `Content-Encoding` the HTTP client did
+/// not decompress, e.g. `zstd`), its body is opaque to the secret scrubber — so
+/// **fail closed** by withholding it entirely. Returns whether it blocked. Call
+/// before redaction so a compressed reflected secret can never slip through.
+pub fn block_if_compressed(resp: &mut ExecuteResponse) -> bool {
+    let still_compressed = resp.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("content-encoding")
+            && !v.trim().is_empty()
+            && !v.eq_ignore_ascii_case("identity")
+    });
+    if still_compressed {
+        resp.body =
+            b"[vultrino: response withheld - a compressed body could not be scrubbed for secrets]"
+                .to_vec();
+        resp.headers.clear();
+        return true;
+    }
+    false
+}
+
 /// Drop response framing headers that a redacted body invalidates. Redaction
 /// changes the body length, so a forwarded `Content-Length`/`Transfer-Encoding`
 /// would be wrong (and would leak the original length); the transport sets
@@ -362,6 +382,23 @@ mod tests {
         apply_egress(&mut r, &rules, "pay-1", "http.request");
         // The first (block) rule wins, not the second (redact).
         assert!(String::from_utf8_lossy(&r.body).contains("withheld by egress policy"));
+    }
+
+    #[test]
+    fn test_block_if_compressed() {
+        // A residual non-identity Content-Encoding → body withheld.
+        let mut r = resp("compressed-bytes-with-secret");
+        r.headers.insert("Content-Encoding".to_string(), "zstd".to_string());
+        assert!(block_if_compressed(&mut r));
+        assert!(String::from_utf8_lossy(&r.body).contains("withheld"));
+        assert!(r.headers.is_empty());
+        // identity / absent → not blocked.
+        let mut r2 = resp("plain");
+        r2.headers.insert("content-encoding".to_string(), "identity".to_string());
+        assert!(!block_if_compressed(&mut r2));
+        let mut r3 = resp("plain");
+        assert!(!block_if_compressed(&mut r3));
+        assert_eq!(String::from_utf8_lossy(&r3.body), "plain");
     }
 
     #[test]
