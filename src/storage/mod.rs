@@ -85,6 +85,14 @@ pub enum IdempotencyState {
     Mismatch,
 }
 
+/// The outcome of an SLA lifecycle sweep (V5): which open approvals newly
+/// escalated (the caller should re-notify) and which newly expired.
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalSweep {
+    pub escalated: Vec<ApprovalRequest>,
+    pub expired: Vec<String>,
+}
+
 /// Trait for credential storage backends
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
@@ -288,17 +296,28 @@ pub trait StorageBackend: Send + Sync {
         Ok(())
     }
 
-    /// Atomically approve or deny a pending approval (read-modify-write under the
-    /// backend's lock), returning the updated request. Errors with
-    /// [`StorageError::Conflict`] if it is no longer pending.
+    /// Atomically approve or deny an open approval (read-modify-write under the
+    /// backend's lock), returning the updated request. `channel` is the decision
+    /// channel and `approver_identity` the authenticated approver (V5; required —
+    /// a blank identity is rejected). Errors with [`StorageError::Conflict`] if it
+    /// is no longer open.
     async fn decide_approval(
         &self,
         _id: &str,
         _approve: bool,
-        _by: &str,
+        _channel: &str,
+        _approver_identity: &str,
         _note: Option<String>,
     ) -> Result<ApprovalRequest, StorageError> {
         Err(StorageError::ApprovalNotFound(_id.to_string()))
+    }
+
+    /// Advance every open approval through its SLA lifecycle (V5): escalate those
+    /// past their first window, expire those past their final deadline, under the
+    /// backend's lock. Returns the ids that newly escalated (so the caller can
+    /// re-notify) and those that newly expired. No-op backends return empty.
+    async fn sweep_approval_lifecycle(&self) -> Result<ApprovalSweep, StorageError> {
+        Ok(ApprovalSweep::default())
     }
 
     /// Delete an approval request by id.

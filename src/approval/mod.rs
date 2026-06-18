@@ -38,26 +38,77 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalStatus {
-    /// Awaiting a human decision.
+    /// Awaiting a human decision, within the first SLA window.
     Pending,
+    /// The first SLA window elapsed without a decision; re-notified and awaiting
+    /// a decision within a second, bounded window before it auto-denies (V5).
+    Escalated,
     /// A human approved it; the action may run.
     Approved,
     /// A human rejected it; the action will never run.
     Denied,
-    /// No decision was made before the request's TTL elapsed.
+    /// No decision was made before the request's final deadline elapsed.
     Expired,
+}
+
+impl ApprovalStatus {
+    /// Whether a decision can still be made (the request is awaiting a human).
+    pub fn is_open(&self) -> bool {
+        matches!(self, ApprovalStatus::Pending | ApprovalStatus::Escalated)
+    }
 }
 
 impl std::fmt::Display for ApprovalStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             ApprovalStatus::Pending => "pending",
+            ApprovalStatus::Escalated => "escalated",
             ApprovalStatus::Approved => "approved",
             ApprovalStatus::Denied => "denied",
             ApprovalStatus::Expired => "expired",
         };
         write!(f, "{}", s)
     }
+}
+
+/// Criticality class of a gated action (V5). Drives the SLA windows: higher
+/// criticality escalates and auto-denies faster. The per-class windows live in
+/// [`ApprovalConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CriticalityClass {
+    /// Low-risk: long windows.
+    Low,
+    /// Default class.
+    #[default]
+    Medium,
+    /// High-risk: short windows.
+    High,
+    /// Highest-risk: shortest windows.
+    Critical,
+}
+
+impl std::fmt::Display for CriticalityClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            CriticalityClass::Low => "low",
+            CriticalityClass::Medium => "medium",
+            CriticalityClass::High => "high",
+            CriticalityClass::Critical => "critical",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+/// The result of advancing an approval through its SLA lifecycle (V5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleChange {
+    /// No state change.
+    None,
+    /// Pending → Escalated (first window elapsed); the caller should re-notify.
+    Escalated,
+    /// Pending/Escalated → Expired (final deadline elapsed).
+    Expired,
 }
 
 /// Who/what requested the gated action (no secrets).
@@ -119,8 +170,51 @@ pub struct NewApproval {
     pub action_label: Option<String>,
     /// Whether the action requires dual control (V8 strictness).
     pub dual_control: bool,
-    /// Time-to-live; after this the request auto-expires if undecided.
-    pub ttl: chrono::Duration,
+    /// Criticality class of this action (V5), recorded for SLA/analytics.
+    pub criticality: CriticalityClass,
+    /// First SLA window: Pending → Escalated after this elapses (V5).
+    pub escalate_after: chrono::Duration,
+    /// Second SLA window: Escalated → Expired this long after escalation (V5).
+    /// The final deadline is `now + escalate_after + escalate_window`.
+    pub escalate_window: chrono::Duration,
+    /// Named identity an out-of-band decision link is bound to (V5). Recorded as
+    /// the approver identity when the decision arrives via the OOB link, so a
+    /// decision is never attributed to a bare anonymous capability token.
+    pub oob_identity: Option<String>,
+    /// Optional continuous re-authorization interval (V5): an approved grant that
+    /// has not run within this window must be re-approved before it executes.
+    pub reauth_interval_secs: Option<u64>,
+}
+
+/// A human decision on an approval request (V5). Carries the channel it arrived
+/// on plus the **authenticated approver identity** (panel session user, or the
+/// named identity an out-of-band link was bound to) so every decision is
+/// attributable and separation-of-duty is computable.
+#[derive(Debug, Clone)]
+pub struct Decision {
+    /// Channel the decision arrived on (`admin panel`, `out-of-band link`, ...).
+    pub channel: String,
+    /// Authenticated identity of the approver. Must be non-empty.
+    pub approver_identity: String,
+    /// Optional free-text note.
+    pub note: Option<String>,
+}
+
+impl Decision {
+    /// A decision made by an authenticated approver on a named channel.
+    pub fn new(channel: impl Into<String>, approver_identity: impl Into<String>) -> Self {
+        Self {
+            channel: channel.into(),
+            approver_identity: approver_identity.into(),
+            note: None,
+        }
+    }
+
+    /// Attach a free-text note.
+    pub fn with_note(mut self, note: Option<String>) -> Self {
+        self.note = note;
+        self
+    }
 }
 
 /// A request for a human to approve (or deny) a specific authenticated action.
@@ -160,13 +254,35 @@ pub struct ApprovalRequest {
     /// enforced by the approval layer in V12.
     #[serde(default)]
     pub dual_control: bool,
+    /// Criticality class (V5) — drives the escalation/expiry windows and is
+    /// recorded for separation-of-duty / complacency analytics.
+    #[serde(default)]
+    pub criticality: CriticalityClass,
     pub created_at: DateTime<Utc>,
+    /// First SLA boundary (V5): when Pending auto-escalates to Escalated.
+    #[serde(default)]
+    pub escalate_at: DateTime<Utc>,
+    /// When the request actually escalated (V5), if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalated_at: Option<DateTime<Utc>>,
+    /// Final deadline: when the request auto-expires (denies) if still undecided.
     pub expires_at: DateTime<Utc>,
+    /// Named identity an out-of-band decision link is bound to (V5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oob_identity: Option<String>,
+    /// Optional continuous re-authorization interval in seconds (V5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reauth_interval_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_at: Option<DateTime<Utc>>,
-    /// Channel/identity that decided it (`admin panel`, `telegram`, `webhook`...).
+    /// Channel that decided it (`admin panel`, `telegram`, `out-of-band link`...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_by: Option<String>,
+    /// Authenticated approver identity captured at decision time (V5): the IdP
+    /// subject / panel session user, or the named identity an OOB link was bound
+    /// to. Required for a human decision; absent only for system expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_note: Option<String>,
     /// SHA-256 of the out-of-band decision token (plaintext is shown only in
@@ -215,10 +331,16 @@ impl ApprovalRequest {
             agent_label: params.agent_label,
             action_label: params.action_label,
             dual_control: params.dual_control,
+            criticality: params.criticality,
             created_at: now,
-            expires_at: now + params.ttl,
+            escalate_at: now + params.escalate_after,
+            escalated_at: None,
+            expires_at: now + params.escalate_after + params.escalate_window,
+            oob_identity: params.oob_identity,
+            reauth_interval_secs: params.reauth_interval_secs,
             decided_at: None,
             decided_by: None,
+            approver_identity: None,
             decision_note: None,
             decision_token_hash,
             executing: false,
@@ -232,14 +354,40 @@ impl ApprovalRequest {
         (request, decision_token)
     }
 
-    /// Whether the TTL has elapsed (independent of stored status).
+    /// Whether the final deadline has elapsed (independent of stored status).
     pub fn is_past_ttl(&self) -> bool {
         Utc::now() >= self.expires_at
     }
 
-    /// If pending but past its TTL, flip to `Expired`. Returns true if changed.
+    /// Advance the request through its SLA lifecycle (V5): an open request first
+    /// escalates (after the first window) and then expires (after the second).
+    /// Returns what changed so the caller can persist + re-notify on escalation.
+    pub fn advance_lifecycle(&mut self) -> LifecycleChange {
+        if !self.status.is_open() {
+            return LifecycleChange::None;
+        }
+        let now = Utc::now();
+        // Final deadline takes priority: an open request past expiry is denied,
+        // whether or not it had escalated.
+        if now >= self.expires_at {
+            self.status = ApprovalStatus::Expired;
+            self.decided_at = Some(now);
+            self.decided_by = Some("system (expired)".to_string());
+            return LifecycleChange::Expired;
+        }
+        if self.status == ApprovalStatus::Pending && now >= self.escalate_at {
+            self.status = ApprovalStatus::Escalated;
+            self.escalated_at = Some(now);
+            return LifecycleChange::Escalated;
+        }
+        LifecycleChange::None
+    }
+
+    /// If past the final deadline, flip an open request to `Expired`. Returns
+    /// true if it became expired. (Convenience over [`Self::advance_lifecycle`]
+    /// for callers that only care about expiry.)
     pub fn expire_if_due(&mut self) -> bool {
-        if self.status == ApprovalStatus::Pending && self.is_past_ttl() {
+        if self.status.is_open() && self.is_past_ttl() {
             self.status = ApprovalStatus::Expired;
             self.decided_at = Some(Utc::now());
             self.decided_by = Some("system (expired)".to_string());
@@ -249,34 +397,78 @@ impl ApprovalRequest {
         }
     }
 
-    /// Mark approved. Errors if the request is no longer pending.
-    pub fn approve(&mut self, by: impl Into<String>, note: Option<String>) -> Result<(), ApprovalError> {
-        self.transition(ApprovalStatus::Approved, by, note)
+    /// Mark approved. Errors if the request is no longer open or the approver
+    /// identity is missing (V5: every decision must carry one).
+    pub fn approve(&mut self, decision: Decision) -> Result<(), ApprovalError> {
+        self.transition(ApprovalStatus::Approved, decision)
     }
 
-    /// Mark denied. Errors if the request is no longer pending.
-    pub fn deny(&mut self, by: impl Into<String>, note: Option<String>) -> Result<(), ApprovalError> {
-        self.transition(ApprovalStatus::Denied, by, note)
+    /// Mark denied. Errors if the request is no longer open or the approver
+    /// identity is missing (V5).
+    pub fn deny(&mut self, decision: Decision) -> Result<(), ApprovalError> {
+        self.transition(ApprovalStatus::Denied, decision)
     }
 
-    fn transition(
-        &mut self,
-        to: ApprovalStatus,
-        by: impl Into<String>,
-        note: Option<String>,
-    ) -> Result<(), ApprovalError> {
+    fn transition(&mut self, to: ApprovalStatus, decision: Decision) -> Result<(), ApprovalError> {
+        // V5: a human decision must carry an authenticated approver identity, so
+        // every decision is attributable and SoD is computable. Reject blanks.
+        let identity = decision.approver_identity.trim().to_string();
+        if identity.is_empty() {
+            return Err(ApprovalError::MissingApproverIdentity);
+        }
         if self.is_past_ttl() {
             self.expire_if_due();
             return Err(ApprovalError::Expired);
         }
-        if self.status != ApprovalStatus::Pending {
+        // A decision is valid in either open state (Pending or Escalated).
+        if !self.status.is_open() {
             return Err(ApprovalError::AlreadyDecided(self.status));
         }
         self.status = to;
         self.decided_at = Some(Utc::now());
-        self.decided_by = Some(by.into());
-        self.decision_note = note;
+        self.decided_by = Some(decision.channel);
+        self.approver_identity = Some(identity);
+        self.decision_note = decision.note;
         Ok(())
+    }
+
+    /// Separation-of-duty check (V5): whether the approver's identity collides
+    /// with the requesting agent's own identity (approver == requester), i.e. an
+    /// agent self-approving. `None` when either identity is unknown (not
+    /// computable). A `Some(true)` is a SoD violation.
+    pub fn violates_sod(&self) -> Option<bool> {
+        let approver = self.approver_identity.as_deref()?.trim();
+        // The requester's "owner" identity: prefer the human/agent label, then
+        // the stable principal id.
+        let owner = self
+            .requester
+            .principal_name
+            .as_deref()
+            .or(self.agent_label.as_deref())
+            .or(self.principal_id.as_deref())
+            .or(self.requester.principal_id.as_deref())?
+            .trim();
+        if approver.is_empty() || owner.is_empty() {
+            return None;
+        }
+        Some(approver.eq_ignore_ascii_case(owner))
+    }
+
+    /// Continuous re-authorization check (V5): whether an approved-but-not-yet-run
+    /// grant has gone stale — i.e. more than `reauth_interval_secs` elapsed since
+    /// the decision — and so must be re-approved before it may execute. `false`
+    /// when no interval is configured or the grant is fresh.
+    pub fn needs_reauth(&self) -> bool {
+        let Some(interval) = self.reauth_interval_secs else {
+            return false;
+        };
+        if self.status != ApprovalStatus::Approved || self.executed {
+            return false;
+        }
+        let Some(decided_at) = self.decided_at else {
+            return false;
+        };
+        (Utc::now() - decided_at).num_seconds() > interval as i64
     }
 
     /// Constant-time check of a presented out-of-band decision token.
@@ -314,6 +506,8 @@ pub enum ApprovalError {
     NotFound,
     #[error("invalid decision token")]
     InvalidToken,
+    #[error("a decision requires an authenticated approver identity")]
+    MissingApproverIdentity,
 }
 
 /// Links embedded in out-of-band notifications.
@@ -357,13 +551,44 @@ fn hash_decision_token(token: &str) -> String {
 
 // ==================== Configuration ====================
 
+/// Per-criticality SLA windows (V5): the first window is Pending → Escalated,
+/// the second is Escalated → Expired.
+#[derive(Debug, Clone, Copy)]
+pub struct CriticalitySla {
+    /// Seconds before an undecided Pending request escalates.
+    pub escalate_after_secs: u64,
+    /// Seconds after escalation before the request auto-expires (denies).
+    pub escalate_window_secs: u64,
+}
+
+impl CriticalitySla {
+    /// First window as a duration.
+    pub fn escalate_after(&self) -> chrono::Duration {
+        chrono::Duration::seconds(self.escalate_after_secs.max(1) as i64)
+    }
+    /// Second window as a duration.
+    pub fn escalate_window(&self) -> chrono::Duration {
+        chrono::Duration::seconds(self.escalate_window_secs.max(1) as i64)
+    }
+}
+
+/// A rule mapping a `(credential, action)` to a criticality class (V5). The
+/// first matching rule wins; an unmatched action gets [`CriticalityClass::Medium`].
+#[derive(Debug, Clone)]
+pub struct CriticalityRule {
+    pub credential_pattern: glob::Pattern,
+    pub action_pattern: glob::Pattern,
+    pub class: CriticalityClass,
+}
+
 /// Runtime configuration for the approval subsystem.
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalConfig {
     /// Whether approvals are enabled. When false, actions that would require
     /// approval are denied instead (fail-closed).
     pub enabled: bool,
-    /// Default time-to-live for a pending request, in seconds.
+    /// Default time-to-live for a pending request, in seconds. Retained as the
+    /// `Medium`-class total window when no per-class SLA override is set.
     pub ttl_secs: u64,
     /// Public base URL of the web server (e.g. `https://vault.example.com`),
     /// used to build approve/deny links for Telegram/webhook/email.
@@ -372,15 +597,71 @@ pub struct ApprovalConfig {
     pub telegram: Option<TelegramConfig>,
     /// Generic webhook notifier configuration.
     pub webhook: Option<WebhookConfig>,
+    /// Per-class SLA overrides (V5). A class absent here uses the built-in
+    /// default from [`ApprovalConfig::default_sla`].
+    pub sla_overrides: std::collections::HashMap<CriticalityClass, CriticalitySla>,
+    /// Rules assigning a criticality class to a `(credential, action)` (V5).
+    pub criticality_rules: Vec<CriticalityRule>,
+    /// Named identity an out-of-band decision link is bound to (V5). Recorded as
+    /// the approver when a decision arrives via the OOB link. Defaults to a
+    /// generic `out-of-band` label when unset.
+    pub oob_approver_identity: Option<String>,
+    /// Optional continuous re-authorization interval in seconds (V5): an approved
+    /// grant not run within this window must be re-approved before it executes.
+    pub reauth_interval_secs: Option<u64>,
 }
 
 impl ApprovalConfig {
-    /// Effective TTL as a `chrono::Duration`. `ttl_secs == 0` is treated as the
-    /// sentinel for "use the default of 1 hour" (an approval with a zero TTL
-    /// would be useless — it would expire before anyone could decide).
+    /// Effective default TTL as a `chrono::Duration`. `ttl_secs == 0` is treated
+    /// as the sentinel for "use the default of 1 hour" (a zero-TTL approval would
+    /// expire before anyone could decide).
     pub fn ttl(&self) -> chrono::Duration {
         let secs = if self.ttl_secs == 0 { 3600 } else { self.ttl_secs };
         chrono::Duration::seconds(secs as i64)
+    }
+
+    /// Built-in default SLA per class (V5): higher criticality escalates and
+    /// expires faster. The `Medium` class honors the legacy `ttl_secs` as its
+    /// total window (split evenly between the two phases) so existing configs
+    /// keep their effective deadline.
+    pub fn default_sla(&self, class: CriticalityClass) -> CriticalitySla {
+        match class {
+            CriticalityClass::Low => CriticalitySla {
+                escalate_after_secs: 4 * 3600,
+                escalate_window_secs: 4 * 3600,
+            },
+            CriticalityClass::Medium => {
+                let total = if self.ttl_secs == 0 { 3600 } else { self.ttl_secs };
+                let half = (total / 2).max(1);
+                CriticalitySla {
+                    escalate_after_secs: half,
+                    escalate_window_secs: total.saturating_sub(half).max(1),
+                }
+            }
+            CriticalityClass::High => CriticalitySla {
+                escalate_after_secs: 15 * 60,
+                escalate_window_secs: 15 * 60,
+            },
+            CriticalityClass::Critical => CriticalitySla {
+                escalate_after_secs: 5 * 60,
+                escalate_window_secs: 5 * 60,
+            },
+        }
+    }
+
+    /// Effective SLA for a class: the override if present, else the default.
+    pub fn sla_for(&self, class: CriticalityClass) -> CriticalitySla {
+        self.sla_overrides.get(&class).copied().unwrap_or_else(|| self.default_sla(class))
+    }
+
+    /// Criticality class for a `(credential, action)` — first matching rule, or
+    /// [`CriticalityClass::Medium`] (V5).
+    pub fn criticality_for(&self, credential: &str, action: &str) -> CriticalityClass {
+        self.criticality_rules
+            .iter()
+            .find(|r| r.credential_pattern.matches(credential) && r.action_pattern.matches(action))
+            .map(|r| r.class)
+            .unwrap_or_default()
     }
 }
 
@@ -586,7 +867,11 @@ mod tests {
             agent_label: None,
             action_label: None,
             dual_control: false,
-            ttl: chrono::Duration::hours(1),
+            criticality: CriticalityClass::Medium,
+            escalate_after: chrono::Duration::minutes(30),
+            escalate_window: chrono::Duration::minutes(30),
+            oob_identity: None,
+            reauth_interval_secs: None,
         })
     }
 
@@ -630,11 +915,12 @@ mod tests {
     #[test]
     fn test_approve_then_cannot_redecide() {
         let (mut a, _) = new_approval();
-        a.approve("admin panel", None).unwrap();
+        a.approve(Decision::new("admin panel", "alice")).unwrap();
         assert_eq!(a.status, ApprovalStatus::Approved);
         assert!(a.decided_at.is_some());
+        assert_eq!(a.approver_identity.as_deref(), Some("alice"));
 
-        let err = a.deny("admin panel", None).unwrap_err();
+        let err = a.deny(Decision::new("admin panel", "bob")).unwrap_err();
         assert!(matches!(err, ApprovalError::AlreadyDecided(ApprovalStatus::Approved)));
     }
 
@@ -642,9 +928,118 @@ mod tests {
     fn test_expired_cannot_be_approved() {
         let (mut a, _) = new_approval();
         a.expires_at = Utc::now() - chrono::Duration::minutes(1);
-        let err = a.approve("admin panel", None).unwrap_err();
+        let err = a.approve(Decision::new("admin panel", "alice")).unwrap_err();
         assert!(matches!(err, ApprovalError::Expired));
         assert_eq!(a.status, ApprovalStatus::Expired);
+    }
+
+    #[test]
+    fn test_decision_requires_approver_identity() {
+        // V5: a blank approver identity is rejected — every decision must be
+        // attributable.
+        let (mut a, _) = new_approval();
+        let err = a.approve(Decision::new("admin panel", "   ")).unwrap_err();
+        assert!(matches!(err, ApprovalError::MissingApproverIdentity));
+        assert_eq!(a.status, ApprovalStatus::Pending, "must remain undecided");
+        // A real identity succeeds and is trimmed/recorded.
+        a.deny(Decision::new("admin panel", " carol ")).unwrap();
+        assert_eq!(a.approver_identity.as_deref(), Some("carol"));
+    }
+
+    #[test]
+    fn test_lifecycle_escalates_then_expires() {
+        // V5: a high-criticality-style two-window lifecycle. Drive the clock by
+        // back-dating the boundaries.
+        let (mut a, _) = new_approval();
+        // Not yet at the first window → no change.
+        assert_eq!(a.advance_lifecycle(), LifecycleChange::None);
+        assert_eq!(a.status, ApprovalStatus::Pending);
+
+        // First window elapsed, still before the deadline → escalate.
+        a.escalate_at = Utc::now() - chrono::Duration::seconds(1);
+        assert_eq!(a.advance_lifecycle(), LifecycleChange::Escalated);
+        assert_eq!(a.status, ApprovalStatus::Escalated);
+        assert!(a.escalated_at.is_some());
+        // Idempotent: escalating again is a no-op while before the deadline.
+        assert_eq!(a.advance_lifecycle(), LifecycleChange::None);
+
+        // An escalated request can still be decided.
+        assert!(a.status.is_open());
+
+        // Final deadline elapsed → expire (deny).
+        a.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        assert_eq!(a.advance_lifecycle(), LifecycleChange::Expired);
+        assert_eq!(a.status, ApprovalStatus::Expired);
+        // A decided request is never advanced again.
+        assert_eq!(a.advance_lifecycle(), LifecycleChange::None);
+    }
+
+    #[test]
+    fn test_lifecycle_skips_escalation_when_past_deadline() {
+        // If both boundaries are already past, expiry wins (no spurious escalate).
+        let (mut a, _) = new_approval();
+        a.escalate_at = Utc::now() - chrono::Duration::minutes(2);
+        a.expires_at = Utc::now() - chrono::Duration::minutes(1);
+        assert_eq!(a.advance_lifecycle(), LifecycleChange::Expired);
+        assert_eq!(a.status, ApprovalStatus::Expired);
+    }
+
+    #[test]
+    fn test_escalated_request_can_be_approved() {
+        let (mut a, _) = new_approval();
+        a.escalate_at = Utc::now() - chrono::Duration::seconds(1);
+        assert_eq!(a.advance_lifecycle(), LifecycleChange::Escalated);
+        a.approve(Decision::new("admin panel", "alice")).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn test_sod_violation_computable() {
+        // requester principal_name = "agent"; approver "agent" → SoD violation.
+        let (mut a, _) = new_approval();
+        assert_eq!(a.violates_sod(), None, "no decision yet → not computable");
+        a.approve(Decision::new("admin panel", "AGENT")).unwrap();
+        assert_eq!(a.violates_sod(), Some(true), "approver == requester owner");
+
+        // A distinct approver satisfies SoD.
+        let (mut b, _) = new_approval();
+        b.deny(Decision::new("admin panel", "secops-oncall")).unwrap();
+        assert_eq!(b.violates_sod(), Some(false));
+    }
+
+    #[test]
+    fn test_needs_reauth() {
+        let (mut a, _) = new_approval();
+        a.reauth_interval_secs = Some(60);
+        // Not approved yet → no reauth.
+        assert!(!a.needs_reauth());
+        a.approve(Decision::new("admin panel", "alice")).unwrap();
+        // Fresh decision → no reauth.
+        assert!(!a.needs_reauth());
+        // Back-date the decision past the interval → stale → needs reauth.
+        a.decided_at = Some(Utc::now() - chrono::Duration::seconds(61));
+        assert!(a.needs_reauth());
+        // Once executed, it's spent → no reauth.
+        a.executed = true;
+        assert!(!a.needs_reauth());
+    }
+
+    #[test]
+    fn test_sla_windows_per_class() {
+        let mut cfg = ApprovalConfig { ttl_secs: 7200, ..Default::default() };
+        // Critical escalates faster than Low.
+        let crit = cfg.sla_for(CriticalityClass::Critical);
+        let low = cfg.sla_for(CriticalityClass::Low);
+        assert!(crit.escalate_after_secs < low.escalate_after_secs);
+        // Medium honors the legacy ttl_secs as its total window.
+        let med = cfg.sla_for(CriticalityClass::Medium);
+        assert_eq!(med.escalate_after_secs + med.escalate_window_secs, 7200);
+        // An override takes precedence.
+        cfg.sla_overrides.insert(
+            CriticalityClass::High,
+            CriticalitySla { escalate_after_secs: 1, escalate_window_secs: 2 },
+        );
+        assert_eq!(cfg.sla_for(CriticalityClass::High).escalate_after_secs, 1);
     }
 
     #[test]

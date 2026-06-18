@@ -377,6 +377,7 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalDisplay {
         use crate::approval::ApprovalStatus;
         let status_class = match a.status {
             ApprovalStatus::Pending => "badge-pending",
+            ApprovalStatus::Escalated => "badge-warning",
             ApprovalStatus::Approved => "badge-success",
             ApprovalStatus::Denied => "badge-danger",
             ApprovalStatus::Expired => "badge-muted",
@@ -401,8 +402,14 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalDisplay {
             requested_by: a.requester.describe(),
             created_at: a.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
             expires_at: a.expires_at.format("%Y-%m-%d %H:%M UTC").to_string(),
-            is_pending: a.status == ApprovalStatus::Pending && !a.is_past_ttl(),
-            decided_by: a.decided_by.clone().unwrap_or_default(),
+            // Open (Pending or Escalated) and not past deadline → still decidable.
+            is_pending: a.status.is_open() && !a.is_past_ttl(),
+            // Show the channel plus the authenticated approver identity (V5).
+            decided_by: match (&a.decided_by, &a.approver_identity) {
+                (Some(ch), Some(id)) => format!("{} ({})", ch, id),
+                (Some(ch), None) => ch.clone(),
+                _ => String::new(),
+            },
             result_summary,
             params_pretty,
         }

@@ -631,7 +631,11 @@ async fn test_out_of_band_decide_flow() {
         agent_label: None,
         action_label: None,
         dual_control: false,
-        ttl: chrono::Duration::hours(1),
+        criticality: vultrino::approval::CriticalityClass::Medium,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: Some("oncall".to_string()),
+        reauth_interval_secs: None,
     });
     storage.store_approval(&approval).await.unwrap();
 

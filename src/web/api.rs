@@ -299,6 +299,15 @@ pub async fn api_check_approval(
             );
             body["expires_at"] = serde_json::json!(approval.expires_at);
         }
+        ApprovalStatus::Escalated => {
+            // V5: still awaiting a decision, now in the second (escalated) SLA
+            // window. From the agent's side the contract is identical to Pending.
+            body["message"] = serde_json::json!(
+                "Still awaiting human approval (escalated to a second reviewer window). \
+                 The action has NOT run. Keep polling every ~10-30 seconds."
+            );
+            body["expires_at"] = serde_json::json!(approval.expires_at);
+        }
         ApprovalStatus::Denied => {
             body["message"] = serde_json::json!(
                 "This approval was denied; the action did not run. Do not retry."

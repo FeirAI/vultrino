@@ -11,7 +11,7 @@ use chrono::Duration;
 use secrecy::SecretString;
 use tempfile::tempdir;
 
-use vultrino::approval::{ApprovalStatus, RequesterInfo};
+use vultrino::approval::{ApprovalStatus, Decision, RequesterInfo};
 use vultrino::auth::{AuthResult, NewUseToken, UseToken};
 use vultrino::config::Config;
 use vultrino::plugins::{Plugin, PluginError, PluginRequest};
@@ -336,7 +336,7 @@ async fn test_credential_flag_gates_then_executes_on_approval() {
 
     // 2. A human approves (as the admin panel / CLI would).
     let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    stored.approve("test", None).unwrap();
+    stored.approve(Decision::new("admin panel", "secops")).unwrap();
     storage.update_approval(&stored).await.unwrap();
 
     // 3. The agent's next poll runs the action and returns the real result.
@@ -368,7 +368,7 @@ async fn test_denied_approval_never_executes() {
     };
 
     let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    stored.deny("test", Some("not allowed".to_string())).unwrap();
+    stored.deny(Decision::new("admin panel", "secops").with_note(Some("not allowed".to_string()))).unwrap();
     storage.update_approval(&stored).await.unwrap();
 
     let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
@@ -420,7 +420,7 @@ async fn test_token_force_approval_consumes_on_resume() {
 
     // Approve, then resume runs the action and consumes the token.
     let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    stored.approve("test", None).unwrap();
+    stored.approve(Decision::new("admin panel", "secops")).unwrap();
     storage.update_approval(&stored).await.unwrap();
 
     let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
@@ -594,7 +594,7 @@ async fn test_approved_action_executes_despite_rate_limit() {
 
     // Human approves out of band.
     let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    stored.approve("test", None).unwrap();
+    stored.approve(Decision::new("admin panel", "secops")).unwrap();
     storage.update_approval(&stored).await.unwrap();
 
     // Resume must NOT be denied by the now-exhausted rate budget — it executes.
@@ -693,7 +693,7 @@ async fn test_ownership_check_blocks_foreign_principal() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "test", None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "test", "secops", None).await.unwrap();
 
     // Foreign principal: rejected, and the action must NOT have run.
     let err = server
@@ -745,7 +745,7 @@ async fn test_preflight_failure_is_retryable_and_does_not_burn_token() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", None).await.unwrap();
 
     let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
     assert!(!resumed.executed, "preflight failure must remain retryable");
@@ -768,7 +768,7 @@ async fn test_stale_execution_claim_recovers() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", None).await.unwrap();
 
     // Simulate a crashed worker holding a stale claim.
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -798,7 +798,7 @@ async fn test_heartbeat_prevents_stale_reclaim() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", None).await.unwrap();
 
     // Worker A claims, then its claim ages past the stale window...
     let claimed = storage.claim_approval_for_execution(&approval.id).await.unwrap();
@@ -839,7 +839,7 @@ async fn test_resume_with_unusable_token_is_terminal() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", None).await.unwrap();
 
     // Token is revoked after approval but before the agent polls to execute.
     storage.set_use_token_revoked(&token.id).await.unwrap();
@@ -953,7 +953,7 @@ async fn test_deny_pushed_after_approval_blocks_resume() {
         ExecutionOutcome::Pending(a) => a.id,
         other => panic!("expected Pending, got {other:?}"),
     };
-    storage.decide_approval(&approval_id, true, "approver", None).await.unwrap();
+    storage.decide_approval(&approval_id, true, "approver", "secops", None).await.unwrap();
 
     // Emergency Deny pushed (evaluated after the allow policy, which defaults to
     // Allow → continue → the Deny policy denies).
@@ -1029,7 +1029,7 @@ async fn test_default_deny_approved_action_still_resumes() {
     };
 
     storage
-        .decide_approval(&approval_id, true, "test approver", None)
+        .decide_approval(&approval_id, true, "test approver", "secops", None)
         .await
         .unwrap();
 
@@ -1207,7 +1207,7 @@ async fn test_per_agent_deny_refires_at_resume() {
     // Push a per-agent Deny and approve; the resume must be blocked.
     storage.store_policy(&Policy::deny_all("kill-bot", "api-*").with_principal("refund-bot")).await.unwrap();
     server.reload_policies().await.unwrap();
-    storage.decide_approval(&approval_id, true, "approver", None).await.unwrap();
+    storage.decide_approval(&approval_id, true, "approver", "secops", None).await.unwrap();
 
     let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
     assert!(
@@ -1286,7 +1286,7 @@ async fn test_spend_capped_approval_resumes_without_recharge() {
         other => panic!("expected PolicyDenied, got {other:?}"),
     }
 
-    storage.decide_approval(&approval_id, true, "approver", None).await.unwrap();
+    storage.decide_approval(&approval_id, true, "approver", "secops", None).await.unwrap();
 
     // Resume must succeed (read-only spend check does not re-charge/deny).
     let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
@@ -1527,4 +1527,162 @@ async fn test_action_label_scope_isolation() {
         matches!(outcome, ExecutionOutcome::Completed(_)),
         "canonical-scoped token should authorize any label of it, got {outcome:?}"
     );
+}
+
+// ==================== V5: SLA escalation / approver identity / SoD ====================
+
+/// Build a server with approvals enabled, default-allow, the mock plugin, and
+/// the given approval config tweaks applied.
+async fn setup_v5(
+    tweak: impl FnOnce(&mut vultrino::approval::ApprovalConfig),
+) -> (VultrinoServer, Arc<dyn StorageBackend>) {
+    let dir = tempdir().unwrap(); // kept for the test's lifetime, cleaned on drop
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("pw");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let mut config = Config::default();
+    config.approval.enabled = true;
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    tweak(&mut config.approval);
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    server.plugins().register(Arc::new(MockPlugin));
+    (server, storage)
+}
+
+#[tokio::test]
+async fn test_v5_criticality_sla_escalation_then_expiry() {
+    use vultrino::approval::{CriticalityClass, CriticalityRule, CriticalitySla};
+
+    let (server, storage) = setup_v5(|a| {
+        // pay-* is Critical, with explicit 100s + 100s windows.
+        a.criticality_rules = vec![CriticalityRule {
+            credential_pattern: glob::Pattern::new("pay-*").unwrap(),
+            action_pattern: glob::Pattern::new("*").unwrap(),
+            class: CriticalityClass::Critical,
+        }];
+        a.sla_overrides = std::collections::HashMap::from([(
+            CriticalityClass::Critical,
+            CriticalitySla { escalate_after_secs: 100, escalate_window_secs: 100 },
+        )]);
+    })
+    .await;
+    store_credential(&storage, "pay-cred", true).await;
+
+    // A gated request opens a Pending approval carrying the Critical SLA.
+    let req = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "x": 1 }),
+    };
+    let approval = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    assert_eq!(approval.criticality, CriticalityClass::Critical);
+    assert_eq!((approval.escalate_at - approval.created_at).num_seconds(), 100);
+    assert_eq!((approval.expires_at - approval.created_at).num_seconds(), 200);
+
+    // Back-date the first window → the SLA sweep escalates it (window 1 elapsed).
+    let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    a.escalate_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    storage.update_approval(&a).await.unwrap();
+    let sweep = server.sweep_approvals_once().await.unwrap();
+    assert!(sweep.escalated.iter().any(|x| x.id == approval.id), "should escalate");
+    let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(a.status, ApprovalStatus::Escalated);
+    assert!(a.escalated_at.is_some());
+
+    // Back-date the final deadline → the next sweep expires (denies) it (window 2).
+    let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    a.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    storage.update_approval(&a).await.unwrap();
+    let sweep = server.sweep_approvals_once().await.unwrap();
+    assert!(sweep.expired.iter().any(|id| id == &approval.id), "should expire");
+    let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(a.status, ApprovalStatus::Expired);
+}
+
+#[tokio::test]
+async fn test_v5_approver_identity_recorded_and_sod_computable() {
+    let (server, storage) = setup_v5(|_| {}).await;
+    store_credential(&storage, "pay-cred", true).await;
+
+    // A request from an api-key principal named "agent-x".
+    let requester = RequesterInfo {
+        principal_kind: "api_key".to_string(),
+        principal_id: Some("k1".to_string()),
+        principal_name: Some("agent-x".to_string()),
+        role: Some("executor".to_string()),
+    };
+    let exec_auth = ExecAuth {
+        auth: None,
+        use_token: None,
+        force_approval: false,
+        requester: requester.clone(),
+    };
+    let req = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "x": 1 }),
+    };
+    let approval = match server.execute_gated(req, exec_auth).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+
+    // A blank approver identity is rejected (every decision must be attributable).
+    let err = storage
+        .decide_approval(&approval.id, true, "admin panel", "  ", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("approver identity"), "got: {err}");
+
+    // Self-approval (approver == requester owner) records the identity and is a
+    // computable SoD violation.
+    storage
+        .decide_approval(&approval.id, true, "admin panel", "agent-x", None)
+        .await
+        .unwrap();
+    let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(a.approver_identity.as_deref(), Some("agent-x"));
+    assert_eq!(a.decided_by.as_deref(), Some("admin panel"));
+    assert_eq!(a.violates_sod(), Some(true), "approver == requester → SoD violation");
+}
+
+#[tokio::test]
+async fn test_v5_distinct_approver_satisfies_sod() {
+    let (server, storage) = setup_v5(|_| {}).await;
+    store_credential(&storage, "pay-cred", true).await;
+
+    let requester = RequesterInfo {
+        principal_kind: "api_key".to_string(),
+        principal_id: Some("k1".to_string()),
+        principal_name: Some("agent-x".to_string()),
+        role: None,
+    };
+    let exec_auth = ExecAuth {
+        auth: None,
+        use_token: None,
+        force_approval: false,
+        requester,
+    };
+    let req = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "x": 1 }),
+    };
+    let approval = match server.execute_gated(req, exec_auth).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    storage
+        .decide_approval(&approval.id, true, "admin panel", "secops-oncall", None)
+        .await
+        .unwrap();
+    let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(a.violates_sod(), Some(false), "distinct approver satisfies SoD");
 }

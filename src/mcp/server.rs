@@ -858,6 +858,14 @@ impl McpServer {
                 approval.id,
                 approval.expires_at.format("%Y-%m-%d %H:%M UTC"),
             ),
+            // V5: escalated is still awaiting a decision — same agent contract.
+            ApprovalStatus::Escalated => format!(
+                "\u{23F3} Approval {} is still PENDING (ESCALATED to a second reviewer window). \
+                 A human has not decided yet. Wait about 10-30 seconds, then call `check_approval` \
+                 again with the same approval_id.\nExpires: {}",
+                approval.id,
+                approval.expires_at.format("%Y-%m-%d %H:%M UTC"),
+            ),
             ApprovalStatus::Denied => format!(
                 "\u{274C} Approval {} was DENIED{}. The action did not run. Do not retry.",
                 approval.id,

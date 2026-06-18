@@ -131,7 +131,7 @@ impl Config {
         let storage = raw.storage.unwrap_or_default().try_into()?;
         let logging = raw.logging.unwrap_or_default().into();
         let mcp = raw.mcp.unwrap_or_default().into();
-        let approval = raw.approvals.map(Into::into).unwrap_or_default();
+        let approval = raw.approvals.map(TryInto::try_into).transpose()?.unwrap_or_default();
         let enforcement = raw
             .enforcement
             .map(EnforcementConfig::try_from)

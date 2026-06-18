@@ -715,21 +715,59 @@ impl StorageBackend for FileStorage {
         &self,
         id: &str,
         approve: bool,
-        by: &str,
+        channel: &str,
+        approver_identity: &str,
         note: Option<String>,
     ) -> Result<ApprovalRequest, StorageError> {
+        use crate::approval::Decision;
         self.locked_mutate(|cache| {
             let approval = cache
                 .approvals
                 .get_mut(id)
                 .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
+            // Advance the SLA lifecycle first so a decision raced against the
+            // final deadline is rejected as expired, not silently accepted.
+            approval.advance_lifecycle();
+            let decision = Decision::new(channel, approver_identity).with_note(note);
             let result = if approve {
-                approval.approve(by, note)
+                approval.approve(decision)
             } else {
-                approval.deny(by, note)
+                approval.deny(decision)
             };
             result.map_err(|e| StorageError::Conflict(e.to_string()))?;
             Ok(approval.clone())
+        })
+            .await
+    }
+
+    async fn sweep_approval_lifecycle(&self) -> Result<crate::storage::ApprovalSweep, StorageError> {
+        use crate::approval::{ApprovalStatus, LifecycleChange};
+        // Cheap pre-check on the (freshly reloaded) in-memory cache: if nothing
+        // is due, skip the lock + re-encrypt + disk write entirely so an idle
+        // sweep doesn't churn the vault every tick. The authoritative re-check
+        // happens under the lock below.
+        let any_due = {
+            let now = Utc::now();
+            let cache = self.cache.read();
+            cache.approvals.values().any(|a| {
+                a.status.is_open()
+                    && (now >= a.expires_at
+                        || (a.status == ApprovalStatus::Pending && now >= a.escalate_at))
+            })
+        };
+        if !any_due {
+            return Ok(crate::storage::ApprovalSweep::default());
+        }
+        self.locked_mutate(|cache| {
+            let mut sweep = crate::storage::ApprovalSweep::default();
+            for approval in cache.approvals.values_mut() {
+                match approval.advance_lifecycle() {
+                    LifecycleChange::Escalated => sweep.escalated.push(approval.clone()),
+                    LifecycleChange::Expired => sweep.expired.push(approval.id.clone()),
+                    LifecycleChange::None => {}
+                }
+            }
+            Ok(sweep)
         })
             .await
     }

@@ -1085,15 +1085,19 @@ pub async fn approvals_list(
 pub async fn approval_approve(
     State(state): State<AppState>,
     session: Session,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     Path(id): Path<String>,
     Form(form): Form<DeleteForm>,
 ) -> impl IntoResponse {
     if !validate_csrf_token(&session, &form.csrf_token).await {
         return Redirect::to("/approvals").into_response();
     }
-    // Atomic decision under the storage lock (no reload+get+update window).
-    let _ = state.storage.decide_approval(&id, true, "admin panel", None).await;
+    // Atomic decision under the storage lock (no reload+get+update window). The
+    // panel approver's identity is the authenticated session user (V5).
+    let _ = state
+        .storage
+        .decide_approval(&id, true, "admin panel", &auth.session.username, None)
+        .await;
     let _ = regenerate_csrf_token(&session).await;
     Redirect::to("/approvals").into_response()
 }
@@ -1101,14 +1105,17 @@ pub async fn approval_approve(
 pub async fn approval_deny(
     State(state): State<AppState>,
     session: Session,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     Path(id): Path<String>,
     Form(form): Form<DeleteForm>,
 ) -> impl IntoResponse {
     if !validate_csrf_token(&session, &form.csrf_token).await {
         return Redirect::to("/approvals").into_response();
     }
-    let _ = state.storage.decide_approval(&id, false, "admin panel", None).await;
+    let _ = state
+        .storage
+        .decide_approval(&id, false, "admin panel", &auth.session.username, None)
+        .await;
     let _ = regenerate_csrf_token(&session).await;
     Redirect::to("/approvals").into_response()
 }
@@ -1180,8 +1187,15 @@ pub async fn approval_decide_submit(
         _ => return render_decided("Invalid decision", "Unknown decision.", false),
     };
 
-    // Record the decision atomically under the storage lock.
-    match state.storage.decide_approval(&id, approve, "out-of-band link", None).await {
+    // Record the decision atomically under the storage lock. The OOB link is
+    // bound to a named identity (V5) rather than an anonymous capability token,
+    // so the decision is attributable; fall back to a generic label if unset.
+    let approver_identity = approval.oob_identity.as_deref().unwrap_or("out-of-band");
+    match state
+        .storage
+        .decide_approval(&id, approve, "out-of-band link", approver_identity, None)
+        .await
+    {
         Ok(_) => {
             if approve {
                 render_decided(

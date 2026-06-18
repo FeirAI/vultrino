@@ -304,6 +304,18 @@ pub struct RawApprovalConfig {
     pub public_base_url: Option<String>,
     pub telegram: Option<RawTelegramConfig>,
     pub webhook: Option<RawWebhookConfig>,
+    /// Named identity an out-of-band decision link is bound to (V5).
+    #[serde(default)]
+    pub oob_approver_identity: Option<String>,
+    /// Continuous re-authorization interval in seconds (V5).
+    #[serde(default)]
+    pub reauth_interval_secs: Option<u64>,
+    /// Per-criticality SLA overrides (V5).
+    #[serde(default)]
+    pub sla: Vec<RawCriticalitySla>,
+    /// Rules assigning a criticality class to a `(credential, action)` (V5).
+    #[serde(default)]
+    pub criticality_rules: Vec<RawCriticalityRule>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -318,12 +330,78 @@ pub struct RawWebhookConfig {
     pub auth_header: Option<String>,
 }
 
-impl From<RawApprovalConfig> for crate::approval::ApprovalConfig {
-    fn from(raw: RawApprovalConfig) -> Self {
+#[derive(Debug, Deserialize)]
+pub struct RawCriticalitySla {
+    pub class: String,
+    pub escalate_after_secs: u64,
+    pub escalate_window_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawCriticalityRule {
+    pub credential_pattern: String,
+    #[serde(default = "default_glob_star")]
+    pub action_pattern: String,
+    pub class: String,
+}
+
+fn default_glob_star() -> String {
+    "*".to_string()
+}
+
+/// Parse a criticality class name (V5).
+fn parse_criticality(s: &str) -> Result<crate::approval::CriticalityClass, ConfigError> {
+    use crate::approval::CriticalityClass::*;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "low" => Ok(Low),
+        "medium" => Ok(Medium),
+        "high" => Ok(High),
+        "critical" => Ok(Critical),
+        other => Err(ConfigError::Invalid(format!(
+            "unknown criticality class '{}' (expected low|medium|high|critical)",
+            other
+        ))),
+    }
+}
+
+impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawApprovalConfig) -> Result<Self, Self::Error> {
         // A telegram/webhook section being present implies approvals are enabled
         // unless explicitly disabled.
         let has_channel = raw.telegram.is_some() || raw.webhook.is_some();
-        Self {
+
+        // Per-class SLA overrides (last wins on a duplicated class).
+        let mut sla_overrides = std::collections::HashMap::new();
+        for s in raw.sla {
+            let class = parse_criticality(&s.class)?;
+            sla_overrides.insert(
+                class,
+                crate::approval::CriticalitySla {
+                    escalate_after_secs: s.escalate_after_secs,
+                    escalate_window_secs: s.escalate_window_secs,
+                },
+            );
+        }
+
+        // Criticality rules — compile globs at load so an invalid pattern fails
+        // fast rather than silently never matching.
+        let criticality_rules = raw
+            .criticality_rules
+            .into_iter()
+            .map(|r| {
+                Ok(crate::approval::CriticalityRule {
+                    credential_pattern: glob::Pattern::new(&r.credential_pattern)
+                        .map_err(|e| ConfigError::Invalid(format!("criticality_rules credential_pattern '{}': {}", r.credential_pattern, e)))?,
+                    action_pattern: glob::Pattern::new(&r.action_pattern)
+                        .map_err(|e| ConfigError::Invalid(format!("criticality_rules action_pattern '{}': {}", r.action_pattern, e)))?,
+                    class: parse_criticality(&r.class)?,
+                })
+            })
+            .collect::<Result<Vec<_>, ConfigError>>()?;
+
+        Ok(Self {
             enabled: raw.enabled.unwrap_or(has_channel),
             ttl_secs: raw.ttl_secs.unwrap_or(3600),
             public_base_url: raw.public_base_url,
@@ -335,7 +413,11 @@ impl From<RawApprovalConfig> for crate::approval::ApprovalConfig {
                 url: w.url,
                 auth_header: w.auth_header,
             }),
-        }
+            sla_overrides,
+            criticality_rules,
+            oob_approver_identity: raw.oob_approver_identity,
+            reauth_interval_secs: raw.reauth_interval_secs,
+        })
     }
 }
 

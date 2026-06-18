@@ -3,7 +3,7 @@
 //! Provides JSON API mode for execute requests.
 
 use crate::approval::{
-    ApprovalNotifier, ApprovalRequest, ApprovalStatus, NewApproval, RequesterInfo,
+    ApprovalLinks, ApprovalNotifier, ApprovalRequest, ApprovalStatus, NewApproval, RequesterInfo,
 };
 use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
 use crate::config::Config;
@@ -396,7 +396,12 @@ impl VultrinoServer {
             }
 
             // Open an approval request. The use token is NOT consumed yet — it is
-            // reserved when the approved action actually runs.
+            // reserved when the approved action actually runs. The criticality
+            // class (V5) drives the escalation/expiry SLA windows.
+            let criticality = self
+                .approval_config
+                .criticality_for(&credential.alias, &full_action);
+            let sla = self.approval_config.sla_for(criticality);
             let (approval, decision_token) = ApprovalRequest::open(NewApproval {
                 credential: credential.alias.clone(),
                 action: full_action.clone(),
@@ -407,7 +412,11 @@ impl VultrinoServer {
                 agent_label: principal.as_ref().and_then(|p| p.agent_label.clone()),
                 action_label: action_label.clone(),
                 dual_control: exec_auth.use_token.as_ref().map(|t| t.dual_control).unwrap_or(false),
-                ttl: self.approval_config.ttl(),
+                criticality,
+                escalate_after: sla.escalate_after(),
+                escalate_window: sla.escalate_window(),
+                oob_identity: self.approval_config.oob_approver_identity.clone(),
+                reauth_interval_secs: self.approval_config.reauth_interval_secs,
             });
 
             // Bound the number of *pending* approvals a use token can open: each
@@ -710,8 +719,28 @@ impl VultrinoServer {
             }
         }
 
-        // Auto-expire stale pending requests.
-        if approval.expire_if_due() {
+        // Advance the SLA lifecycle on poll (V5): a pending request whose first
+        // window elapsed escalates; one past the final deadline expires. Persist
+        // and surface the new state to the polling agent either way.
+        match approval.advance_lifecycle() {
+            crate::approval::LifecycleChange::Expired => {
+                let _ = self.storage.update_approval(&approval).await;
+                return Ok(approval);
+            }
+            crate::approval::LifecycleChange::Escalated => {
+                let _ = self.storage.update_approval(&approval).await;
+                return Ok(approval);
+            }
+            crate::approval::LifecycleChange::None => {}
+        }
+
+        // Continuous re-authorization (V5): an approved grant that went stale
+        // before it ran must be re-approved. Flip it back to expired so the agent
+        // is told to resubmit rather than executing a grant nobody re-confirmed.
+        if approval.needs_reauth() {
+            approval.status = ApprovalStatus::Expired;
+            approval.decided_at = Some(chrono::Utc::now());
+            approval.decided_by = Some("system (reauth lapsed)".to_string());
             let _ = self.storage.update_approval(&approval).await;
             return Ok(approval);
         }
@@ -808,6 +837,53 @@ impl VultrinoServer {
         }
     }
 
+    /// One iteration of the approval SLA sweep (V5): re-read the vault, advance
+    /// every open request through its lifecycle (escalate / expire), and re-ping
+    /// the notifiers for those that escalated. Returns the sweep result.
+    pub async fn sweep_approvals_once(
+        &self,
+    ) -> Result<crate::storage::ApprovalSweep, crate::storage::StorageError> {
+        self.storage.reload().await?;
+        let sweep = self.storage.sweep_approval_lifecycle().await?;
+        for approval in &sweep.escalated {
+            self.notify_escalation(approval).await;
+        }
+        if !sweep.escalated.is_empty() || !sweep.expired.is_empty() {
+            info!(
+                escalated = sweep.escalated.len(),
+                expired = sweep.expired.len(),
+                "approval SLA sweep advanced lifecycle"
+            );
+        }
+        Ok(sweep)
+    }
+
+    /// Re-notify the configured channels that an approval escalated (V5). The
+    /// plaintext decision token is not stored, so an escalation re-ping carries
+    /// only the panel link — the approver decides in the panel. (A richer signed
+    /// `approval.escalated` event arrives with the V9 outbox.)
+    async fn notify_escalation(&self, approval: &ApprovalRequest) {
+        if self.notifiers.is_empty() {
+            return;
+        }
+        let base = self.approval_config.public_base_url.as_deref().unwrap_or("");
+        let links = ApprovalLinks {
+            approve_url: String::new(),
+            deny_url: String::new(),
+            panel_url: format!("{}/approvals", base.trim_end_matches('/')),
+        };
+        for notifier in &self.notifiers {
+            if let Err(e) = notifier.notify(approval, &links).await {
+                warn!(
+                    channel = notifier.channel(),
+                    approval_id = %approval.id,
+                    error = %e,
+                    "Failed to deliver escalation notification"
+                );
+            }
+        }
+    }
+
     /// Whether the approval subsystem is enabled.
     pub fn approvals_enabled(&self) -> bool {
         self.approval_config.enabled
@@ -876,6 +952,23 @@ fn cap_result_body(body: &[u8]) -> String {
 
 /// Default interval for the background policy refresh on long-running servers.
 pub const POLICY_REFRESH_SECS: u64 = 5;
+
+/// Default interval for the background approval SLA sweep (V5).
+pub const APPROVAL_SWEEP_SECS: u64 = 15;
+
+/// Background loop that periodically advances open approvals through their SLA
+/// lifecycle (V5): escalate those past their first window, expire those past
+/// their final deadline, and re-ping notifiers on escalation. Lazy advancement
+/// also happens on each agent poll, so this loop is what drives escalation/expiry
+/// for requests nobody is actively polling.
+pub async fn sweep_approvals_periodically(server: Arc<VultrinoServer>, interval: std::time::Duration) {
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Err(e) = server.sweep_approvals_once().await {
+            warn!(error = %e, "periodic approval SLA sweep failed");
+        }
+    }
+}
 
 /// Background loop that periodically re-reads the vault from disk and reloads
 /// the policy engine from the union of config + stored policies.

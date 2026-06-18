@@ -28,8 +28,10 @@ Enable approvals and configure out-of-band notifiers under `[approvals]` in `con
 ```toml
 [approvals]
 enabled = true
-ttl_secs = 3600                                   # auto-expire undecided requests
+ttl_secs = 3600                                   # default Medium-class total window
 public_base_url = "https://vultrino.example.com"  # base for approve/deny links
+oob_approver_identity = "oncall@example.com"      # identity OOB links are bound to (V5)
+reauth_interval_secs = 900                         # optional continuous re-auth (V5)
 
 [approvals.telegram]                              # inline Approve / Deny buttons
 bot_token = "123456:ABC-DEF..."
@@ -38,9 +40,44 @@ chat_id = "987654321"
 [approvals.webhook]                               # POST to any URL (email / Slack / ...)
 url = "https://hooks.example.com/vultrino-approvals"
 auth_header = "Bearer your-webhook-secret"
+
+# Per-criticality SLA windows (V5): window 1 = Pending→Escalated, window 2 =
+# Escalated→Expired. Omitted classes use built-in defaults.
+[[approvals.sla]]
+class = "critical"
+escalate_after_secs = 300
+escalate_window_secs = 300
+
+# Assign a criticality class to a (credential, action). First match wins;
+# unmatched actions are "medium".
+[[approvals.criticality_rules]]
+credential_pattern = "pay-*"
+action_pattern = "*"
+class = "critical"
 ```
 
 If approvals are enabled but no notifier is configured, decisions can still be made from the admin panel; Vultrino logs a warning that out-of-band approval is unavailable.
+
+## SLA, escalation, and continuous re-authorization (V5)
+
+Every request is assigned a **criticality class** (`low` | `medium` | `high` | `critical`) from the first matching `[[approvals.criticality_rules]]` rule, defaulting to `medium`. The class drives a two-phase SLA:
+
+1. **First window** — while undecided, the request is `pending`. When the first window elapses it moves to `escalated` and the configured notifiers are re-pinged (with a panel link; the original one-time decision token is not re-issued).
+2. **Second window** — an `escalated` request that is still undecided when the final deadline passes auto-**expires** (a fail-closed deny). A high/critical request therefore escalates fast and then denies, rather than lingering open indefinitely.
+
+Higher criticality uses shorter windows (built-in defaults: `critical` 5m+5m, `high` 15m+15m, `low` 4h+4h; `medium` splits the legacy `ttl_secs` across both phases). Override any class with `[[approvals.sla]]`. Lifecycle advancement happens both on each agent poll and via a background sweep, so a request nobody is polling still escalates and expires on time. From the agent's side `escalated` behaves exactly like `pending` — keep polling.
+
+Set `reauth_interval_secs` to require **continuous re-authorization**: an approved grant that has not yet run within that window is treated as lapsed and must be re-approved before it can execute, rather than running on a stale decision.
+
+## Approver identity and separation of duty (V5)
+
+Every human decision records an **authenticated approver identity**, not just the channel:
+
+- **Admin panel** — the logged-in session user.
+- **Out-of-band link** — the named `oob_approver_identity` the link is bound to (rather than an anonymous capability token); falls back to a generic `out-of-band` label if unset.
+- **CLI** — the local OS user (`cli:<user>`).
+
+A decision with a blank identity is rejected. Because both the requester's owner and the approver are recorded, **separation of duty** ("the approver must not be the requesting agent") is computable per decision — an agent self-approving its own request is flagged as a SoD violation.
 
 ## Out-of-band decision links
 

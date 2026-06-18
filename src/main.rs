@@ -934,6 +934,13 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
         config.policies.clone(),
         std::time::Duration::from_secs(vultrino::server::POLICY_REFRESH_SECS),
     ));
+    // Drive approval escalation/expiry (V5) for requests nobody is polling.
+    if exec_server.approvals_enabled() {
+        tokio::spawn(vultrino::server::sweep_approvals_periodically(
+            exec_server.clone(),
+            std::time::Duration::from_secs(vultrino::server::APPROVAL_SWEEP_SECS),
+        ));
+    }
 
     let web_config = WebConfig {
         bind,
@@ -2067,14 +2074,19 @@ async fn approval_status(
         let approval = server.check_and_resume_approval(&id, None).await?;
 
         match approval.status {
-            ApprovalStatus::Pending => {
+            ApprovalStatus::Pending | ApprovalStatus::Escalated => {
                 if wait {
                     eprint!(".");
                     io::stderr().flush()?;
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
                 }
-                println!("Status:  PENDING");
+                let label = if approval.status == ApprovalStatus::Escalated {
+                    "ESCALATED (awaiting decision)"
+                } else {
+                    "PENDING"
+                };
+                println!("Status:  {}", label);
                 println!("Summary: {}", approval.summary);
                 println!("Expires: {}", approval.expires_at.format("%Y-%m-%d %H:%M UTC"));
                 println!("\nWaiting on a human decision. Approve in the admin panel, or run:");
@@ -2142,10 +2154,17 @@ async fn decide_approval(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
 
+    // The CLI approver's identity is the local OS user (V5: every decision must
+    // carry an authenticated approver identity); fall back to `cli` if unknown.
+    let approver = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .map(|u| format!("cli:{}", u))
+        .unwrap_or_else(|_| "cli".to_string());
+
     // Atomic read-modify-write under the storage lock (no separate reload+update
     // window that a concurrent writer could clobber).
     storage
-        .decide_approval(&id, approve, "cli", None)
+        .decide_approval(&id, approve, "cli", &approver, None)
         .await
         .map_err(|e| format!("Could not update approval: {}", e))?;
 
