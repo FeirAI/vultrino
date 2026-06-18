@@ -2583,3 +2583,70 @@ async fn test_v11_observe_does_not_downgrade_resource_guards() {
         "a rate-limit denial must hold in observe mode, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn test_v11_observe_does_not_downgrade_spend_cap() {
+    // V11 (the original HIGH's core case): a SpendCap over-limit denial must hold
+    // in an observe tenant — otherwise the over-cap call runs and, because the cap
+    // only charges on an admitting rule, the cumulative ledger never advances.
+    use vultrino::policy::{Policy, PolicyAction, PolicyCondition, PolicyRule, SpendExtractor};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("pw");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let mut spend_pol = Policy::deny_all("pay-cap", "pay-*");
+    spend_pol.rules = vec![PolicyRule {
+        condition: PolicyCondition::SpendCap {
+            asset: "usd".to_string(),
+            per_action_max: Some(100),
+            cumulative_max: None,
+            window_secs: 3600,
+        },
+        action: PolicyAction::Allow,
+    }];
+
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.policies = vec![spend_pol];
+    config.spend_extractors = vec![SpendExtractor {
+        action_pattern: "mock.echo".to_string(),
+        credential_pattern: "pay-*".to_string(),
+        amount_pointer: "/amount".to_string(),
+        asset: Some("usd".to_string()),
+        asset_pointer: None,
+    }];
+    config.tenants.insert("team-observe".to_string(), vultrino::config::TenantMode::Observe);
+
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    server.plugins().register(Arc::new(MockPlugin));
+    store_credential(&storage, "pay-cred", false).await;
+
+    let token = {
+        let mut t = tenant_token("team-observe");
+        t.credential_scope = "pay-*".to_string();
+        t
+    };
+    storage.store_use_token(&token).await.unwrap();
+    let req = |amount: i64| ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "amount": amount }),
+    };
+
+    // Within cap → runs.
+    assert!(matches!(
+        server.execute_gated(req(100), tenant_auth(&token)).await.unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
+    // Over the per-action cap → DENIED even in observe (resource guard, not posture).
+    let err = server.execute_gated(req(500), tenant_auth(&token)).await.unwrap_err();
+    assert!(
+        matches!(err, vultrino::VultrinoError::PolicyDenied(_)),
+        "an over-cap spend denial must hold in observe mode, got {err:?}"
+    );
+}

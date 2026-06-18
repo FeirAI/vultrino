@@ -754,6 +754,61 @@ mod tests {
     }
 
     #[test]
+    fn test_has_resource_guard_detects_spend_rate_and_nested() {
+        let input = EvalInput {
+            credential_alias: "c",
+            url: None,
+            method: None,
+            principal: None,
+            spend: None,
+        };
+        // No policies → no guard.
+        let engine = PolicyEngine::new();
+        assert!(!engine.has_resource_guard(&input));
+
+        // A RateLimit rule (action Allow — the common admit-within-limit pattern)
+        // is still detected as a guard.
+        let e_rl = PolicyEngine::new();
+        e_rl.add_policy(
+            Policy::deny_all("rl", "*")
+                .with_rule(PolicyCondition::RateLimit { max: 1, window_secs: 60 }, PolicyAction::Allow),
+        );
+        assert!(e_rl.has_resource_guard(&input));
+
+        // A SpendCap nested inside And[...] is detected (recursion).
+        let e_sc = PolicyEngine::new();
+        e_sc.add_policy(Policy::deny_all("sc", "*").with_rule(
+            PolicyCondition::And(vec![
+                PolicyCondition::UrlMatch("*".to_string()),
+                PolicyCondition::SpendCap {
+                    asset: "usd".to_string(),
+                    per_action_max: Some(100),
+                    cumulative_max: None,
+                    window_secs: 60,
+                },
+            ]),
+            PolicyAction::Allow,
+        ));
+        assert!(e_sc.has_resource_guard(&input));
+
+        // A non-guard policy (URL only) is NOT a resource guard.
+        let e_url = PolicyEngine::new();
+        e_url.add_policy(
+            Policy::allow_all("u", "*")
+                .with_rule(PolicyCondition::UrlMatch("*".to_string()), PolicyAction::Allow),
+        );
+        assert!(!e_url.has_resource_guard(&input));
+
+        // A guard scoped to a different credential does NOT match this input.
+        let e_other = PolicyEngine::new();
+        e_other.add_policy(
+            Policy::deny_all("rl", "other-*")
+                .with_rule(PolicyCondition::RateLimit { max: 1, window_secs: 60 }, PolicyAction::Allow),
+        );
+        assert!(!e_other.has_resource_guard(&input));
+    }
+
+    #[test]
     fn test_kill_policy_overrides_allow_rule() {
         // V6: a kill policy is authoritative — it denies a matching principal even
         // when an allow policy with a matching allow RULE is ordered first (which
