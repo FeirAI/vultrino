@@ -385,6 +385,70 @@ async fn test_admin_role_create_and_credential_delete_and_put_policy() {
 }
 
 #[tokio::test]
+async fn test_admin_credential_idempotency_deterministic_metadata() {
+    let (router, storage, _server, key) = build_admin_router().await;
+    // Multi-key metadata: the body hash must be deterministic across retries
+    // (HashMap iteration order must not leak into the hash), so a replay is a
+    // replay — not a spurious 409 Mismatch.
+    let body = serde_json::json!({
+        "alias":"multi",
+        "metadata":{"z":"1","a":"2","m":"3","q":"4","b":"5"},
+        "data":{"type":"api_key","key":"k","header_name":"Authorization","header_prefix":"Bearer "}
+    });
+    let make = |idem: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/credentials")
+            .header("authorization", format!("Bearer {}", key))
+            .header("content-type", "application/json")
+            .header("idempotency-key", idem)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let r1 = router.clone().oneshot(make("c-idem")).await.unwrap();
+    assert_eq!(r1.status(), StatusCode::CREATED);
+    let r2 = router.oneshot(make("c-idem")).await.unwrap();
+    assert_eq!(r2.status(), StatusCode::CREATED, "multi-key metadata must replay, not 409");
+    assert_eq!(storage.list().await.unwrap().len(), 1, "no duplicate credential");
+}
+
+#[tokio::test]
+async fn test_admin_delete_role_in_use_conflict() {
+    let (router, storage, _server, key) = build_admin_router().await;
+    // Create a custom role via the admin API.
+    let r = router
+        .clone()
+        .oneshot(admin_req("POST", "/api/v1/roles", &key, serde_json::json!({"name":"temp","permissions":["read"]})))
+        .await
+        .unwrap();
+    let role: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let role_id = role["id"].as_str().unwrap().to_string();
+
+    // Mint an API key referencing it (directly via storage).
+    storage
+        .store_api_key(&vultrino::auth::ApiKey {
+            id: "k-ref".to_string(),
+            key_prefix: "vk_ref".to_string(),
+            key_hash: "h-ref".to_string(),
+            name: "refkey".to_string(),
+            role_id: role_id.clone(),
+            expires_at: None,
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    // Deleting the in-use role is refused atomically with 409.
+    let r = router
+        .oneshot(admin_req("DELETE", &format!("/api/v1/roles/{}", role_id), &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    assert!(body_string(r).await.contains("role_in_use"));
+}
+
+#[tokio::test]
 async fn test_admin_cannot_delete_builtin_role() {
     let (router, _storage, _server, key) = build_admin_router().await;
     let resp = router

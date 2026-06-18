@@ -745,9 +745,9 @@ impl VultrinoServer {
     /// without a restart. Config policies remain declarative/code-managed; the
     /// admin API only adds, edits, or removes *stored* policies (by id).
     pub async fn reload_policies(&self) -> Result<(), VultrinoError> {
-        let mut all = self.config.policies.clone();
-        all.extend(self.storage.list_stored_policies().await?);
-        self.policy_engine.load_policies(all);
+        let stored = self.storage.list_stored_policies().await?;
+        self.policy_engine
+            .load_policies(merge_policies(&self.config.policies, stored));
         Ok(())
     }
 
@@ -808,19 +808,43 @@ pub async fn refresh_policies_periodically(
 ) {
     loop {
         tokio::time::sleep(interval).await;
-        if let Err(e) = storage.reload().await {
-            warn!(error = %e, "policy refresh: storage reload failed");
-            continue;
-        }
-        match storage.list_stored_policies().await {
-            Ok(stored) => {
-                let mut all = config_policies.clone();
-                all.extend(stored);
-                engine.load_policies(all);
-            }
-            Err(e) => warn!(error = %e, "policy refresh: listing stored policies failed"),
+        if let Err(e) = refresh_policies_once(&storage, &engine, &config_policies).await {
+            warn!(error = %e, "periodic policy refresh failed");
         }
     }
+}
+
+/// One iteration of the cross-process policy refresh: re-read the vault from
+/// disk and reload the engine from the config+stored union. Separated from the
+/// loop for testability.
+pub async fn refresh_policies_once(
+    storage: &Arc<dyn StorageBackend>,
+    engine: &PolicyEngine,
+    config_policies: &[crate::policy::Policy],
+) -> Result<(), crate::storage::StorageError> {
+    storage.reload().await?;
+    let stored = storage.list_stored_policies().await?;
+    engine.load_policies(merge_policies(config_policies, stored));
+    Ok(())
+}
+
+/// Merge static config policies with admin-managed stored policies into the
+/// engine's policy set, deduplicating by id. Config takes precedence on the
+/// (astronomically unlikely) id collision — config ids are random per parse.
+/// Order is preserved (config first), since policy evaluation is order-sensitive.
+pub fn merge_policies(
+    config_policies: &[crate::policy::Policy],
+    stored: Vec<crate::policy::Policy>,
+) -> Vec<crate::policy::Policy> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut all = Vec::with_capacity(config_policies.len() + stored.len());
+    for p in config_policies.iter().cloned().chain(stored) {
+        if seen.insert(p.id.clone()) {
+            all.push(p);
+        }
+    }
+    all
 }
 
 /// The startup warning (if any) for a given enforcement posture and whether any
@@ -872,6 +896,23 @@ mod tests {
         let (plugin, action) = parse_action("request").unwrap();
         assert_eq!(plugin, "http");
         assert_eq!(action, "request");
+    }
+
+    #[test]
+    fn test_merge_policies_dedups_by_id_config_first() {
+        use crate::policy::Policy;
+        let mut c = Policy::allow_all("cfg", "*");
+        c.id = "shared".to_string();
+        let mut s_dup = Policy::deny_all("stored-dup", "*");
+        s_dup.id = "shared".to_string(); // collides with config id
+        let s_new = Policy::deny_all("stored-new", "x-*");
+
+        let merged = merge_policies(&[c], vec![s_dup, s_new]);
+        // Config wins the id collision; the distinct stored policy is kept.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name, "cfg"); // config first, order preserved
+        assert!(merged.iter().any(|p| p.name == "stored-new"));
+        assert!(!merged.iter().any(|p| p.name == "stored-dup"));
     }
 
     #[test]

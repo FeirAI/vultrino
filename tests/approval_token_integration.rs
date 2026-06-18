@@ -896,6 +896,70 @@ async fn test_default_deny_denies_unpolicied_credential() {
 }
 
 #[tokio::test]
+async fn test_refresh_policies_once_picks_up_cross_process_write() {
+    // Simulate the web writer and the MCP reader as two processes sharing one
+    // vault file: a policy written by one is picked up by the other's engine on
+    // a single refresh iteration (the loop the MCP server spawns).
+    use vultrino::policy::{Policy, PolicyDecision, PolicyEngine};
+    use vultrino::server::refresh_policies_once;
+    use vultrino::RequestContext;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    let password = SecretString::from("pw");
+    let writer: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let reader: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let engine = PolicyEngine::new();
+    engine.set_default_deny(true);
+
+    writer.store_policy(&Policy::allow_all("pushed", "x-*")).await.unwrap();
+    // The reader's in-memory cache is still stale (it loaded before the write).
+    assert!(reader.list_stored_policies().await.unwrap().is_empty());
+
+    refresh_policies_once(&reader, &engine, &[]).await.unwrap();
+    assert!(engine.list_policies().iter().any(|p| p.name == "pushed"));
+    assert_eq!(
+        engine.evaluate("x-1", Some("https://x"), Some("GET"), &RequestContext::new()),
+        PolicyDecision::Allow
+    );
+    drop(dir);
+}
+
+#[tokio::test]
+async fn test_deny_pushed_after_approval_blocks_resume() {
+    // An allow policy + a require_approval credential opens an approval; once
+    // approved, an emergency Deny is pushed and the engine reloaded (as the
+    // periodic refresh would). The deferred resume re-evaluates and is blocked.
+    use vultrino::policy::Policy;
+    let (server, storage) = setup_deny_mode(vec![Policy::allow_all("base", "gated-*")]).await;
+    store_credential(&storage, "gated-cred", true).await; // require_approval metadata
+
+    let approval_id = match server
+        .execute_gated(echo_request("gated-cred"), ExecAuth::default())
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(a) => a.id,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    storage.decide_approval(&approval_id, true, "approver", None).await.unwrap();
+
+    // Emergency Deny pushed (evaluated after the allow policy, which defaults to
+    // Allow → continue → the Deny policy denies).
+    storage.store_policy(&Policy::deny_all("kill", "gated-*")).await.unwrap();
+    server.reload_policies().await.unwrap();
+
+    let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
+    assert!(
+        resumed.result_error.is_some(),
+        "a Deny pushed between approval and resume must block the approved action"
+    );
+}
+
+#[tokio::test]
 async fn test_reload_policies_merges_config_and_stored() {
     // The engine is the union of static config policies and admin-API-managed
     // stored policies; reload_policies() (used at startup and by the periodic

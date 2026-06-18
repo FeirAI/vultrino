@@ -481,6 +481,10 @@ async fn require_admin(
     Ok(auth)
 }
 
+/// Upper bound on a use-token lifetime accepted by the admin API (~10 years),
+/// guarding `chrono::Duration::seconds` from an overflowing input.
+const MAX_TOKEN_LIFETIME_SECS: i64 = 10 * 365 * 24 * 60 * 60;
+
 /// Read the optional `Idempotency-Key` request header.
 fn extract_idempotency_key(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
@@ -502,10 +506,16 @@ fn replay_json(status: u16, body: String) -> Response {
 }
 
 /// Stable hash of a request body, used to bind an `Idempotency-Key` to the
-/// exact request it was first used with.
+/// exact request it was first used with. Canonicalizes via `serde_json::Value`
+/// first: its object map is a `BTreeMap` (default features), so keys serialize
+/// in sorted order — a `HashMap` field (e.g. credential metadata) therefore
+/// hashes deterministically across retries regardless of iteration order.
+/// (These request types always serialize; the fallback is unreachable.)
 fn idempotency_body_hash<T: Serialize>(req: &T) -> String {
-    let bytes = serde_json::to_vec(req).unwrap_or_default();
-    hex::encode(Sha256::digest(&bytes))
+    let canonical = serde_json::to_value(req)
+        .and_then(|v| serde_json::to_vec(&v))
+        .unwrap_or_default();
+    hex::encode(Sha256::digest(&canonical))
 }
 
 /// The replay body persisted for an idempotent mint must never contain the
@@ -645,7 +655,7 @@ async fn store_and_reload_policy(state: &AppState, policy: &Policy, created: boo
         }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({"code": "reload_error", "error": format!("policy stored but engine reload failed; restart to apply: {}", e)}),
+            serde_json::json!({"code": "reload_error", "error": format!("policy stored but the immediate engine reload failed; it will be applied within the policy refresh window (~{}s): {}", crate::server::POLICY_REFRESH_SECS, e)}),
         );
     }
     let status = if created { StatusCode::CREATED } else { StatusCode::OK };
@@ -683,7 +693,9 @@ pub async fn api_put_policy(
     Json(req): Json<PolicyUpsertRequest>,
 ) -> Response {
     let key = extract_idempotency_key(&headers);
-    let body_hash = idempotency_body_hash(&req);
+    // Bind the hash to the path id, so the same body PUT to a *different* id
+    // under the same Idempotency-Key isn't replayed as the first id's result.
+    let body_hash = idempotency_body_hash(&(id.as_str(), &req));
     let st = state.clone();
     idempotent(&state, key, body_hash, move || async move {
         match build_policy(req, Some(id)) {
@@ -745,13 +757,26 @@ pub async fn api_create_token(
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
     idempotent(&state, key, body_hash, move || async move {
+        // Bound the raw seconds before converting, so a huge value can't panic
+        // chrono's Duration::seconds (admin-triggerable). NewUseToken::validate
+        // also rejects a non-positive lifetime as a second guard.
+        let expires_in = match req.expires_in_secs {
+            None => None,
+            Some(v) if (1..=MAX_TOKEN_LIFETIME_SECS).contains(&v) => Some(Duration::seconds(v)),
+            Some(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"code": "invalid_token", "error": "expires_in_secs must be between 1 and ~10 years"}),
+                );
+            }
+        };
         let params = NewUseToken {
             name: req.name,
             credential_scope: req.credential_scope,
             action_scope: req.action_scope,
             max_uses: req.max_uses,
             require_approval: req.require_approval,
-            expires_in: req.expires_in_secs.map(Duration::seconds),
+            expires_in,
         };
         if let Err(e) = params.validate() {
             return (

@@ -817,43 +817,47 @@ impl StorageBackend for FileStorage {
     ) -> Result<IdempotencyState, StorageError> {
         let (key, body_hash) = (key.to_string(), body_hash.to_string());
         self.locked_mutate(move |cache| {
-            match cache.idempotency.get(&key) {
-                // Same key, different request body → never replay the original.
-                Some(rec)
-                    if !rec.body_hash.is_empty() && rec.body_hash != body_hash =>
-                {
-                    Ok(IdempotencyState::Mismatch)
+            let now = Utc::now();
+            // Clone the small record so we can mutate the map below without a
+            // borrow conflict.
+            let existing = cache.idempotency.get(&key).cloned();
+            let reserve = |cache: &mut StorageCache| {
+                cache.gc_idempotency();
+                cache.idempotency.insert(
+                    key.clone(),
+                    IdempotencyRecord {
+                        done: false,
+                        body_hash: body_hash.clone(),
+                        status: 0,
+                        response: String::new(),
+                        created_at: now,
+                    },
+                );
+                IdempotencyState::Fresh
+            };
+            let state = match existing {
+                None => reserve(cache),
+                Some(rec) => {
+                    let stale = !rec.done
+                        && (now - rec.created_at).num_seconds()
+                            > STALE_IDEMPOTENCY_RESERVATION_SECS;
+                    if stale {
+                        // Orphaned reservation (crashed mid-op) → reclaim it for
+                        // this caller regardless of the prior body.
+                        reserve(cache)
+                    } else if !rec.body_hash.is_empty() && rec.body_hash != body_hash {
+                        // Live record (completed or in-flight) for a *different*
+                        // body → never replay the wrong response.
+                        IdempotencyState::Mismatch
+                    } else if rec.done {
+                        IdempotencyState::Done { status: rec.status, body: rec.response.clone() }
+                    } else {
+                        // In-flight, same body, not yet stale → back off.
+                        IdempotencyState::Pending
+                    }
                 }
-                // A completed record → replay the stored response verbatim.
-                Some(rec) if rec.done => Ok(IdempotencyState::Done {
-                    status: rec.status,
-                    body: rec.response.clone(),
-                }),
-                // A fresh, still-in-flight reservation held by a concurrent
-                // request → tell the caller to back off.
-                Some(rec)
-                    if (Utc::now() - rec.created_at).num_seconds()
-                        <= STALE_IDEMPOTENCY_RESERVATION_SECS =>
-                {
-                    Ok(IdempotencyState::Pending)
-                }
-                // Absent, or a stale (orphaned) reservation → (re)reserve it for
-                // this caller atomically under the lock.
-                _ => {
-                    cache.gc_idempotency();
-                    cache.idempotency.insert(
-                        key.clone(),
-                        IdempotencyRecord {
-                            done: false,
-                            body_hash: body_hash.clone(),
-                            status: 0,
-                            response: String::new(),
-                            created_at: Utc::now(),
-                        },
-                    );
-                    Ok(IdempotencyState::Fresh)
-                }
-            }
+            };
+            Ok(state)
         })
         .await
     }
@@ -866,23 +870,15 @@ impl StorageBackend for FileStorage {
     ) -> Result<(), StorageError> {
         let (key, body) = (key.to_string(), body.to_string());
         self.locked_mutate(move |cache| {
-            // Preserve the body hash and original reservation time so the
-            // retention window is measured from reservation, not completion.
-            let (body_hash, created_at) = cache
-                .idempotency
-                .get(&key)
-                .map(|r| (r.body_hash.clone(), r.created_at))
-                .unwrap_or_else(|| (String::new(), Utc::now()));
-            cache.idempotency.insert(
-                key.clone(),
-                IdempotencyRecord {
-                    done: true,
-                    body_hash,
-                    status,
-                    response: body,
-                    created_at,
-                },
-            );
+            // Only complete an existing reservation, preserving its body_hash and
+            // original reservation time. If the reservation is gone (GC'd because
+            // the op outran the stale window), drop the completion rather than
+            // synthesize a body-hash-less record that would replay for any body.
+            if let Some(rec) = cache.idempotency.get_mut(&key) {
+                rec.done = true;
+                rec.status = status;
+                rec.response = body;
+            }
             Ok(())
         })
         .await
