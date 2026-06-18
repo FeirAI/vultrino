@@ -691,3 +691,57 @@ async fn test_out_of_band_decide_flow() {
     assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
     assert_eq!(stored.decided_by.as_deref(), Some("out-of-band link"));
 }
+
+#[tokio::test]
+async fn test_admin_halt_agent_installs_kill_and_lists_sessions() {
+    let (router, storage, server, key) = build_admin_router().await;
+
+    // POST halt for an agent → 200 with a machine-readable outcome.
+    let resp = router
+        .clone()
+        .oneshot(admin_req("POST", "/api/v1/agents/bot-7/halt", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let out: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(out["agent_label"], "bot-7");
+    assert_eq!(out["deny_policy_id"], "halt:bot-7");
+
+    // The authoritative kill policy landed in the live engine and storage.
+    assert!(server.policy_engine().list_policies().iter().any(|p| p.id == "halt:bot-7" && p.kill));
+    assert!(storage.get_policy("halt:bot-7").await.unwrap().is_some());
+
+    // GET /sessions → 200, per-process scope, empty here (nothing in flight).
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", "/api/v1/sessions", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["process_scope"], true);
+    assert!(body["sessions"].as_array().unwrap().is_empty());
+
+    // DELETE halt → lifts it; the kill policy is gone from the engine.
+    let resp = router
+        .clone()
+        .oneshot(admin_req("DELETE", "/api/v1/agents/bot-7/halt", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!server.policy_engine().list_policies().iter().any(|p| p.id == "halt:bot-7"));
+
+    // Unauthenticated halt → 401 (admin-only).
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/agents/bot-7/halt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

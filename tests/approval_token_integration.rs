@@ -568,6 +568,7 @@ async fn test_approved_action_executes_despite_rate_limit() {
             action: PolicyAction::Allow,
         }],
         default_action: PolicyAction::Deny,
+        kill: false,
     };
     let (server, storage) = setup_with_policies(vec![policy]).await;
     store_credential(&storage, "api-cred", false).await;
@@ -1898,4 +1899,112 @@ async fn test_v5_sweep_expires_reauth_lapsed_grant_preserving_approver() {
         "lapse should be recorded in the note, got: {:?}",
         a.decision_note
     );
+}
+
+// ==================== V6: kill/halt + session registry ====================
+
+/// A HaltCallback that records the (label, in_flight_count) it was fired with.
+struct RecordingHaltCallback {
+    hits: std::sync::Arc<std::sync::Mutex<Vec<(String, usize)>>>,
+}
+
+#[async_trait]
+impl vultrino::session::HaltCallback for RecordingHaltCallback {
+    fn name(&self) -> &str {
+        "recording"
+    }
+    async fn on_halt(&self, agent_label: &str, in_flight: &[vultrino::session::SessionEntry]) {
+        self.hits.lock().unwrap().push((agent_label.to_string(), in_flight.len()));
+    }
+}
+
+#[tokio::test]
+async fn test_v6_halt_revokes_tokens_installs_kill_and_fires_callback() {
+    use vultrino::session::SessionEntry;
+
+    let (server, storage) = setup().await; // allow mode
+    store_credential(&storage, "api-cred", false).await;
+
+    // A token bound to agent "bot-7".
+    let (_full, mut token) = UseToken::create(NewUseToken {
+        name: "bot-token".to_string(),
+        credential_scope: "api-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.agent_label = Some("bot-7".to_string());
+    storage.store_use_token(&token).await.unwrap();
+
+    let auth = || ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+
+    // Before halt: the agent can execute.
+    let outcome = server.execute_gated(echo_request("api-cred"), auth()).await.unwrap();
+    assert!(matches!(outcome, ExecutionOutcome::Completed(_)));
+
+    // Register a recording callback and pin an in-flight session for bot-7 so the
+    // halt has something to report/abort.
+    let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    server.register_halt_callback(std::sync::Arc::new(RecordingHaltCallback { hits: hits.clone() }));
+    let _inflight = server.sessions().begin(SessionEntry {
+        session_id: "sess-1".to_string(),
+        agent_label: Some("bot-7".to_string()),
+        token_id: Some(token.id.clone()),
+        credential: "api-cred".to_string(),
+        action: "mock.echo".to_string(),
+        started_at: chrono::Utc::now(),
+    });
+
+    // Halt the agent.
+    let outcome = server.halt_agent("bot-7").await.unwrap();
+    assert_eq!(outcome.agent_label, "bot-7");
+    assert!(outcome.revoked_tokens.contains(&token.id), "agent's token revoked");
+    assert_eq!(outcome.deny_policy_id, "halt:bot-7");
+    assert!(outcome.policy_active, "kill policy active in the live engine");
+    assert_eq!(outcome.callbacks_fired, 1);
+    assert_eq!(outcome.in_flight.len(), 1, "the in-flight session is reported");
+
+    // The callback was fired with the agent + its one in-flight session.
+    let recorded = hits.lock().unwrap().clone();
+    assert_eq!(recorded, vec![("bot-7".to_string(), 1)]);
+
+    // The token is now revoked in storage.
+    let revoked = storage.get_use_token(&token.id).await.unwrap().unwrap();
+    assert!(revoked.revoked);
+
+    // After halt: the agent's next gated call is DENIED by the kill policy, even
+    // though the credential is otherwise allowed (allow mode).
+    let err = server.execute_gated(echo_request("api-cred"), auth()).await.unwrap_err();
+    match err {
+        vultrino::VultrinoError::PolicyDenied(r) => assert!(r.contains("halt"), "reason: {r}"),
+        other => panic!("expected PolicyDenied by kill switch, got {other:?}"),
+    }
+
+    // A different agent is unaffected: lift the halt and confirm bot-7 works again
+    // (with a fresh, non-revoked token — revocation is permanent).
+    assert!(server.unhalt_agent("bot-7").await.unwrap());
+    let (_f2, mut t2) = UseToken::create(NewUseToken {
+        name: "bot-token-2".to_string(),
+        credential_scope: "api-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    t2.agent_label = Some("bot-7".to_string());
+    storage.store_use_token(&t2).await.unwrap();
+    let auth2 = ExecAuth {
+        auth: Some(AuthResult::for_use_token(&t2)),
+        use_token: Some(t2.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+    let outcome = server.execute_gated(echo_request("api-cred"), auth2).await.unwrap();
+    assert!(matches!(outcome, ExecutionOutcome::Completed(_)), "halt lifted → executes again");
 }

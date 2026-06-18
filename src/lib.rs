@@ -14,6 +14,7 @@ pub mod plugins;
 pub mod policy;
 pub mod router;
 pub mod server;
+pub mod session;
 pub mod storage;
 pub mod web;
 

@@ -181,6 +181,12 @@ impl WebServer {
             .route("/api/v1/tokens/{id}/revoke", post(api::api_revoke_token))
             .route("/api/v1/roles", post(api::api_create_role))
             .route("/api/v1/roles/{id}", delete(api::api_delete_role))
+            // Kill/halt + session registry (V6).
+            .route(
+                "/api/v1/agents/{label}/halt",
+                post(api::api_halt_agent).delete(api::api_unhalt_agent),
+            )
+            .route("/api/v1/sessions", get(api::api_list_sessions))
             // Static files
             .nest_service("/static", static_dir);
 

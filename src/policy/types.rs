@@ -23,6 +23,14 @@ pub struct Policy {
     pub rules: Vec<PolicyRule>,
     /// Action when no rules match
     pub default_action: PolicyAction,
+    /// **Kill switch** (V6): when true, this policy is an *authoritative*
+    /// unconditional Deny for every principal+credential it matches, evaluated
+    /// **before** all non-kill policies — so a halt can't be overridden by an
+    /// allow rule that happens to be ordered first. Used by the per-agent halt
+    /// (`POST /api/v1/agents/{label}/halt`), which installs one with
+    /// `principal_pattern` = the agent label.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kill: bool,
 }
 
 /// A single policy rule
@@ -110,6 +118,7 @@ impl Policy {
             principal_pattern: None,
             rules: vec![],
             default_action: PolicyAction::Allow,
+            kill: false,
         }
     }
 
@@ -122,6 +131,23 @@ impl Policy {
             principal_pattern: None,
             rules: vec![],
             default_action: PolicyAction::Deny,
+            kill: false,
+        }
+    }
+
+    /// Create an authoritative per-principal **kill** policy (V6): denies every
+    /// request from principals matching `principal_pattern`, on any credential,
+    /// ahead of all non-kill policies. `id` is fixed so re-halting is idempotent.
+    pub fn kill_switch(id: impl Into<String>, principal_pattern: impl Into<String>) -> Self {
+        let pattern = principal_pattern.into();
+        Self {
+            id: id.into(),
+            name: format!("halt {}", pattern),
+            credential_pattern: "*".to_string(),
+            principal_pattern: Some(pattern),
+            rules: vec![],
+            default_action: PolicyAction::Deny,
+            kill: true,
         }
     }
 
@@ -290,6 +316,7 @@ mod tests {
                 action: PolicyAction::Allow,
             }],
             default_action: PolicyAction::Deny,
+            kill: false,
         };
 
         let json = serde_json::to_string(&policy).unwrap();

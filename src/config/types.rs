@@ -486,6 +486,9 @@ impl TryFrom<RawPolicy> for Policy {
             principal_pattern: raw.principal_pattern,
             rules,
             default_action,
+            // Kill policies are installed only at runtime via the halt endpoint,
+            // never from static config.
+            kill: false,
         })
     }
 }

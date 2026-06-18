@@ -1,0 +1,159 @@
+//! In-flight execution session registry and halt callbacks (V6).
+//!
+//! A [`SessionRegistry`] records the gated executions currently running in this
+//! process, keyed by a per-execution id, so a halt can see what an agent is
+//! doing right now and fire any registered abort callback. It is **in-memory and
+//! per-process** — the same model and limitations as the policy engine's
+//! rate-limit / spend ledgers: it resets on restart, and in a web+MCP deployment
+//! each process only sees the executions it is running.
+//!
+//! Halt has two cross-process, storage-authoritative legs (revoke the agent's
+//! use tokens; install an authoritative per-agent kill policy) plus this
+//! per-process leg (fire abort callbacks for what's in flight here). Without a
+//! harness abort primitive the achievable semantics is "deny the next gated
+//! call"; with a registered [`HaltCallback`] an in-flight execution can be
+//! actively preempted.
+
+use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// A record of one in-flight gated execution (V6). Carries no secrets.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionEntry {
+    /// Unique id for this execution (the request id).
+    pub session_id: String,
+    /// Agent label of the principal, if any (the halt target).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
+    /// Use-token id the execution is spending, if token-authorized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
+    /// Credential alias being used.
+    pub credential: String,
+    /// Fully-qualified action (`plugin.action`).
+    pub action: String,
+    /// When the execution started.
+    pub started_at: DateTime<Utc>,
+}
+
+/// Per-process registry of in-flight executions (V6).
+#[derive(Default)]
+pub struct SessionRegistry {
+    sessions: RwLock<HashMap<String, SessionEntry>>,
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register an in-flight execution; returns an RAII [`SessionGuard`] that
+    /// deregisters it on drop, so an early return or panic still clears it.
+    pub fn begin(self: &Arc<Self>, entry: SessionEntry) -> SessionGuard {
+        let session_id = entry.session_id.clone();
+        self.sessions.write().insert(session_id.clone(), entry);
+        SessionGuard {
+            registry: Arc::clone(self),
+            session_id,
+        }
+    }
+
+    /// A snapshot of all in-flight sessions.
+    pub fn list(&self) -> Vec<SessionEntry> {
+        self.sessions.read().values().cloned().collect()
+    }
+
+    /// In-flight sessions for a given agent label.
+    pub fn for_agent(&self, label: &str) -> Vec<SessionEntry> {
+        self.sessions
+            .read()
+            .values()
+            .filter(|s| s.agent_label.as_deref() == Some(label))
+            .cloned()
+            .collect()
+    }
+
+    /// Number of in-flight sessions (test/observability helper).
+    pub fn len(&self) -> usize {
+        self.sessions.read().len()
+    }
+
+    /// Whether there are no in-flight sessions.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.read().is_empty()
+    }
+}
+
+/// RAII guard returned by [`SessionRegistry::begin`]: deregisters its session on
+/// drop so the registry reflects only genuinely in-flight executions.
+pub struct SessionGuard {
+    registry: Arc<SessionRegistry>,
+    session_id: String,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.registry.sessions.write().remove(&self.session_id);
+    }
+}
+
+/// A harness abort callback (V6). On halt, this is fired (best-effort) for an
+/// agent's in-flight sessions. Where a harness exposes an abort/pause primitive,
+/// register one to actively preempt in-flight work; without one, halt still
+/// denies the agent's next gated call via the kill policy + token revocation.
+#[async_trait::async_trait]
+pub trait HaltCallback: Send + Sync {
+    /// Channel/integration name, for logging.
+    fn name(&self) -> &str;
+    /// Fired when `agent_label` is halted, with its in-flight sessions.
+    async fn on_halt(&self, agent_label: &str, in_flight: &[SessionEntry]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, label: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            session_id: id.to_string(),
+            agent_label: label.map(str::to_string),
+            token_id: None,
+            credential: "cred".to_string(),
+            action: "mock.echo".to_string(),
+            started_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_registry_begin_list_and_guard_drop() {
+        let reg = Arc::new(SessionRegistry::new());
+        assert!(reg.is_empty());
+        {
+            let _g1 = reg.begin(entry("s1", Some("bot-7")));
+            let _g2 = reg.begin(entry("s2", Some("bot-9")));
+            let _g3 = reg.begin(entry("s3", None));
+            assert_eq!(reg.len(), 3);
+            assert_eq!(reg.for_agent("bot-7").len(), 1);
+            assert_eq!(reg.for_agent("bot-7")[0].session_id, "s1");
+            assert_eq!(reg.for_agent("absent").len(), 0);
+        }
+        // All guards dropped → registry is empty again.
+        assert!(reg.is_empty(), "guards should deregister on drop");
+    }
+
+    #[test]
+    fn test_guard_drop_is_scoped_per_session() {
+        let reg = Arc::new(SessionRegistry::new());
+        let g1 = reg.begin(entry("s1", Some("bot-7")));
+        {
+            let _g2 = reg.begin(entry("s2", Some("bot-7")));
+            assert_eq!(reg.for_agent("bot-7").len(), 2);
+        }
+        assert_eq!(reg.for_agent("bot-7").len(), 1, "only s2 removed");
+        drop(g1);
+        assert!(reg.is_empty());
+    }
+}

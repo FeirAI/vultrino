@@ -892,6 +892,60 @@ pub async fn api_revoke_token(
     }
 }
 
+// -------- Agent halt / sessions (V6) --------
+
+/// `POST /api/v1/agents/{label}/halt` — kill switch for an agent: revoke its use
+/// tokens, install an authoritative per-agent kill policy, and fire abort
+/// callbacks for its in-flight sessions. Idempotent under the storage lock.
+pub async fn api_halt_agent(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(label): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let key = extract_idempotency_key(&headers);
+    let body_hash = idempotency_body_hash(&label);
+    let st = state.clone();
+    idempotent(&state, key, body_hash, move || async move {
+        match st.server.halt_agent(&label).await {
+            Ok(outcome) => (StatusCode::OK, serde_json::to_value(outcome).unwrap_or_default()),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"code": "halt_failed", "error": e.to_string()}),
+            ),
+        }
+    })
+    .await
+}
+
+/// `DELETE /api/v1/agents/{label}/halt` — lift a halt (remove the kill policy).
+/// Already-revoked tokens stay revoked.
+pub async fn api_unhalt_agent(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(label): Path<String>,
+) -> Response {
+    match state.server.unhalt_agent(&label).await {
+        Ok(removed) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "agent_label": label, "halt_lifted": removed })),
+        )
+            .into_response(),
+        Err(e) => error_response(StatusCode::BAD_REQUEST, "unhalt_failed", e.to_string()),
+    }
+}
+
+/// `GET /api/v1/sessions` — the in-flight execution registry for **this process**
+/// (per-process and in-memory, like the rate-limit/spend ledgers).
+pub async fn api_list_sessions(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+    let sessions = state.server.sessions().list();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "sessions": sessions, "process_scope": true })),
+    )
+        .into_response()
+}
+
 // -------- Roles --------
 
 #[derive(Serialize, Deserialize)]

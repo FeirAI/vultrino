@@ -236,6 +236,17 @@ impl PolicyEngine {
             })
             .collect();
 
+        // V6 kill switch: an authoritative per-principal halt overrides everything
+        // — evaluated before any normal policy so an allow rule ordered first can
+        // never let a halted agent through. (A kill policy matches a credential +
+        // principal like any other, but its `kill` flag makes it unconditional.)
+        if let Some(p) = matching_policies.iter().find(|p| p.kill) {
+            return PolicyDecision::Deny(format!(
+                "halted: principal denied by kill switch '{}'",
+                p.name
+            ));
+        }
+
         // If no policies match, fall back to the configured engine default.
         if matching_policies.is_empty() {
             if self.default_deny.load(Ordering::SeqCst) {
@@ -700,6 +711,56 @@ mod tests {
     }
 
     #[test]
+    fn test_kill_policy_overrides_allow_rule() {
+        // V6: a kill policy is authoritative — it denies a matching principal even
+        // when an allow policy with a matching allow RULE is ordered first (which
+        // would otherwise short-circuit to Allow).
+        let engine = PolicyEngine::new();
+        engine.set_default_deny(false);
+        // Ordered FIRST: a broad allow with an explicit allow rule.
+        engine.add_policy(
+            Policy::allow_all("allow-all", "*")
+                .with_rule(PolicyCondition::UrlMatch("*".to_string()), PolicyAction::Allow),
+        );
+        // Then a kill policy scoped to agent "bot-7".
+        engine.add_policy(Policy::kill_switch("halt:bot-7", "bot-7"));
+
+        let halted = Principal { id: "k1".to_string(), agent_label: Some("bot-7".to_string()) };
+        let decision = engine.evaluate_full(&EvalInput {
+            credential_alias: "github-prod",
+            url: Some("https://api.github.com/x"),
+            method: Some("GET"),
+            principal: Some(&halted),
+            spend: None,
+        });
+        match decision {
+            PolicyDecision::Deny(r) => assert!(r.contains("halted"), "reason: {r}"),
+            other => panic!("kill must override the allow rule, got {other:?}"),
+        }
+
+        // A different agent is unaffected → the allow rule applies.
+        let other = Principal { id: "k2".to_string(), agent_label: Some("bot-9".to_string()) };
+        let decision = engine.evaluate_full(&EvalInput {
+            credential_alias: "github-prod",
+            url: Some("https://api.github.com/x"),
+            method: Some("GET"),
+            principal: Some(&other),
+            spend: None,
+        });
+        assert_eq!(decision, PolicyDecision::Allow, "non-halted agent still allowed");
+
+        // The kill is also authoritative on the read-only resume path.
+        let resume = engine.evaluate_readonly_full(&EvalInput {
+            credential_alias: "github-prod",
+            url: Some("https://api.github.com/x"),
+            method: Some("GET"),
+            principal: Some(&halted),
+            spend: None,
+        });
+        assert!(matches!(resume, PolicyDecision::Deny(_)), "kill applies on resume too");
+    }
+
+    #[test]
     fn test_url_pattern_matching() {
         let engine = PolicyEngine::new();
         engine.add_policy(Policy {
@@ -714,6 +775,7 @@ mod tests {
                 },
             ],
             default_action: PolicyAction::Deny,
+            kill: false,
         });
 
         // Should allow GitHub API
@@ -750,6 +812,7 @@ mod tests {
                 },
             ],
             default_action: PolicyAction::Deny,
+            kill: false,
         });
 
         let decision = engine.evaluate("any", Some("https://api.example.com"), Some("GET"), &make_context());
@@ -787,6 +850,7 @@ mod tests {
                 },
             ],
             default_action: PolicyAction::Deny,
+            kill: false,
         });
 
         // First 3 requests should succeed
@@ -816,6 +880,7 @@ mod tests {
                 action: PolicyAction::Allow,
             }],
             default_action: PolicyAction::Deny,
+            kill: false,
         });
 
         // Read-only evaluation must neither consume the single unit of budget nor

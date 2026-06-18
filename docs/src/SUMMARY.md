@@ -29,6 +29,7 @@
 - [Roles & API Keys (RBAC)](./guides/rbac.md)
 - [Use Tokens](./guides/use-tokens.md)
 - [Action Approvals](./guides/action-approvals.md)
+- [Kill Switches & Halt](./guides/kill-halt.md)
 - [Using with AI Agents](./guides/ai-agents.md)
 - [Policy Configuration](./guides/policies.md)
 

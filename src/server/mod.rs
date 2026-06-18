@@ -23,6 +23,25 @@ use tracing::{info, warn};
 /// backend's stale-claim timeout.
 const EXECUTION_HEARTBEAT_SECS: u64 = 30;
 
+/// Result of halting an agent (V6) — a machine-readable summary of the three
+/// kill legs, returned by the halt admin endpoint.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HaltOutcome {
+    /// The agent label that was halted.
+    pub agent_label: String,
+    /// Ids of the use tokens revoked by the halt.
+    pub revoked_tokens: Vec<String>,
+    /// Id of the installed per-agent kill policy.
+    pub deny_policy_id: String,
+    /// Whether the kill policy is active in the live engine now (true), or only
+    /// persisted and pending the next refresh on this process (false).
+    pub policy_active: bool,
+    /// In-flight sessions for the agent in this process at halt time.
+    pub in_flight: Vec<crate::session::SessionEntry>,
+    /// How many abort callbacks were fired.
+    pub callbacks_fired: usize,
+}
+
 /// Authentication context for a (possibly approval-gated) execution.
 ///
 /// Carries the permission/scope source (`auth`) and, when a use token is driving
@@ -133,6 +152,10 @@ pub struct VultrinoServer {
     approval_config: crate::approval::ApprovalConfig,
     /// Out-of-band approval notifiers (Telegram, webhook, ...)
     notifiers: Vec<Arc<dyn ApprovalNotifier>>,
+    /// In-flight execution registry (V6).
+    sessions: Arc<crate::session::SessionRegistry>,
+    /// Registered harness abort callbacks, fired on halt (V6).
+    halt_callbacks: parking_lot::RwLock<Vec<Arc<dyn crate::session::HaltCallback>>>,
 }
 
 impl VultrinoServer {
@@ -199,6 +222,8 @@ impl VultrinoServer {
             require_auth,
             approval_config,
             notifiers,
+            sessions: Arc::new(crate::session::SessionRegistry::new()),
+            halt_callbacks: parking_lot::RwLock::new(Vec::new()),
         }
     }
 
@@ -530,6 +555,19 @@ impl VultrinoServer {
         let secret_material = credential.data.secret_material();
         let full_action = format!("{}.{}", plugin_name, action_name);
 
+        // V6: record this execution as in-flight for the duration of the action
+        // (and egress). The RAII guard deregisters on drop — including on error
+        // or panic — so the registry reflects only genuinely running work, and a
+        // halt can see what an agent is doing and fire its abort callbacks.
+        let _session = self.sessions.begin(crate::session::SessionEntry {
+            session_id: request_id.clone(),
+            agent_label: context.agent_label.clone(),
+            token_id: use_token_id.map(|s| s.to_string()),
+            credential: credential_alias.clone(),
+            action: full_action.clone(),
+            started_at: chrono::Utc::now(),
+        });
+
         let plugin_request = crate::plugins::PluginRequest {
             credential,
             action: action_name.to_string(),
@@ -845,6 +883,107 @@ impl VultrinoServer {
     /// Get a reference to the storage backend
     pub fn storage(&self) -> &Arc<dyn StorageBackend> {
         &self.storage
+    }
+
+    /// Get a reference to the in-flight session registry (V6).
+    pub fn sessions(&self) -> &Arc<crate::session::SessionRegistry> {
+        &self.sessions
+    }
+
+    /// Register a harness abort callback fired on halt (V6).
+    pub fn register_halt_callback(&self, cb: Arc<dyn crate::session::HaltCallback>) {
+        self.halt_callbacks.write().push(cb);
+    }
+
+    /// Halt an agent (V6 kill switch). Three legs:
+    /// 1. **Revoke the agent's use tokens** — storage-authoritative and re-checked
+    ///    under the vault lock on every gated call, so it takes effect immediately
+    ///    across processes.
+    /// 2. **Install an authoritative per-agent kill policy** (`principal_pattern`
+    ///    = the label) — covers API-key-authed agents that carry no token. As a
+    ///    `kill` policy it overrides any allow rule (it can't be ordered around),
+    ///    and it propagates to other processes via the policy refresh.
+    /// 3. **Fire registered abort callbacks** for the agent's in-flight sessions
+    ///    in *this* process (the registry is per-process). Without a harness abort
+    ///    primitive the achievable guarantee is "deny the next gated call"; a
+    ///    registered callback can additionally preempt in-flight work.
+    pub async fn halt_agent(&self, label: &str) -> Result<HaltOutcome, VultrinoError> {
+        let label = label.trim();
+        if label.is_empty() {
+            return Err(VultrinoError::InvalidRequest(
+                "agent label must not be empty".to_string(),
+            ));
+        }
+
+        // Leg 1: revoke every (still-active) use token bound to this agent.
+        let tokens = self.storage.list_use_tokens().await?;
+        let mut revoked_tokens = Vec::new();
+        for t in tokens
+            .iter()
+            .filter(|t| t.agent_label.as_deref() == Some(label) && !t.revoked)
+        {
+            self.storage.set_use_token_revoked(&t.id).await?;
+            revoked_tokens.push(t.id.clone());
+        }
+
+        // Leg 2: install the authoritative kill policy (fixed id → idempotent).
+        let deny_policy_id = format!("halt:{}", label);
+        let policy = crate::policy::Policy::kill_switch(deny_policy_id.clone(), label);
+        self.storage.store_policy(&policy).await?;
+        let policy_active = match self.reload_policies().await {
+            Ok(()) => true,
+            Err(e) => {
+                // The kill policy persisted but the live engine didn't reload; it
+                // will apply within the refresh window. Surface it but don't fail
+                // the halt — the token revocation (leg 1) already took effect.
+                warn!(error = %e, agent = %label, "halt kill policy stored but engine reload failed");
+                false
+            }
+        };
+
+        // Leg 3: fire abort callbacks for what this process has in flight.
+        let in_flight = self.sessions.for_agent(label);
+        let callbacks = self.halt_callbacks.read().clone();
+        for cb in &callbacks {
+            cb.on_halt(label, &in_flight).await;
+        }
+
+        info!(
+            agent = %label,
+            revoked_tokens = revoked_tokens.len(),
+            in_flight = in_flight.len(),
+            callbacks = callbacks.len(),
+            policy_active,
+            "agent halted"
+        );
+
+        Ok(HaltOutcome {
+            agent_label: label.to_string(),
+            revoked_tokens,
+            deny_policy_id,
+            policy_active,
+            in_flight,
+            callbacks_fired: callbacks.len(),
+        })
+    }
+
+    /// Lift a previously-installed halt (V6): remove the per-agent kill policy and
+    /// reload. Already-revoked tokens stay revoked (revocation is permanent — mint
+    /// fresh tokens to resume). Returns whether a kill policy was present.
+    pub async fn unhalt_agent(&self, label: &str) -> Result<bool, VultrinoError> {
+        let label = label.trim();
+        if label.is_empty() {
+            return Err(VultrinoError::InvalidRequest(
+                "agent label must not be empty".to_string(),
+            ));
+        }
+        let removed = self
+            .storage
+            .delete_policy(&format!("halt:{}", label))
+            .await
+            .is_ok();
+        self.reload_policies().await?;
+        Ok(removed)
     }
 
     /// Get a reference to the plugin registry
