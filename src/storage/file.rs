@@ -41,6 +41,19 @@ const STALE_IDEMPOTENCY_RESERVATION_SECS: i64 = 60;
 /// opportunistically so the map can't grow without bound.
 const IDEMPOTENCY_RETENTION_SECS: i64 = 24 * 60 * 60;
 
+/// Whether an approval has a pending SLA/reauth transition at `now` (V5): an open
+/// request past its final deadline (expire) or, when Pending, past its first
+/// window (escalate); or an approved-but-unrun grant whose reauth window lapsed.
+/// Shared by the `poll_refresh_approval` pre-check and the sweep's `any_due` gate
+/// so the two cheap pre-checks can't drift from the locked transition logic.
+fn approval_is_due(a: &ApprovalRequest, now: DateTime<Utc>) -> bool {
+    use crate::approval::ApprovalStatus;
+    (a.status.is_open()
+        && (now >= a.expires_at
+            || (a.status == ApprovalStatus::Pending && now >= a.escalate_at)))
+        || a.needs_reauth()
+}
+
 /// Refuse to open a vault written by a newer binary.
 fn check_version(found: u32) -> Result<(), StorageError> {
     if found > STORAGE_VERSION {
@@ -755,25 +768,18 @@ impl StorageBackend for FileStorage {
     }
 
     async fn poll_refresh_approval(&self, id: &str) -> Result<ApprovalRequest, StorageError> {
-        // Cheap pre-check on the (freshly reloaded) in-memory cache: only take the
+        // Cheap pre-check on the (caller-reloaded) in-memory cache: only take the
         // lock + re-encrypt + write path when this request actually has a pending
         // transition, so a steady-state poll doesn't rewrite the vault every tick.
-        // The authoritative re-check happens under the lock below.
+        // The authoritative re-check happens under the lock below. (The cache is
+        // always complete for FileStorage, so a miss is a genuine not-found.)
         {
             let now = Utc::now();
             let cache = self.cache.read();
             match cache.approvals.get(id) {
                 None => return Err(StorageError::ApprovalNotFound(id.to_string())),
-                Some(a) => {
-                    let due = (a.status.is_open()
-                        && (now >= a.expires_at
-                            || (a.status == crate::approval::ApprovalStatus::Pending
-                                && now >= a.escalate_at)))
-                        || a.needs_reauth();
-                    if !due {
-                        return Ok(a.clone());
-                    }
-                }
+                Some(a) if !approval_is_due(a, now) => return Ok(a.clone()),
+                Some(_) => {}
             }
         }
         self.locked_mutate(|cache| {
@@ -784,12 +790,10 @@ impl StorageBackend for FileStorage {
             // Escalate / expire as due.
             approval.advance_lifecycle();
             // A still-approved-but-unrun grant gone stale must be re-approved:
-            // flip it to expired so the agent resubmits rather than running on a
-            // decision nobody re-confirmed.
+            // flip it to expired (preserving the original approver) so the agent
+            // resubmits rather than running on a decision nobody re-confirmed.
             if approval.needs_reauth() {
-                approval.status = crate::approval::ApprovalStatus::Expired;
-                approval.decided_at = Some(Utc::now());
-                approval.decided_by = Some("system (reauth lapsed)".to_string());
+                approval.expire_reauth_lapsed();
             }
             Ok(approval.clone())
         })
@@ -797,7 +801,7 @@ impl StorageBackend for FileStorage {
     }
 
     async fn sweep_approval_lifecycle(&self) -> Result<crate::storage::ApprovalSweep, StorageError> {
-        use crate::approval::{ApprovalStatus, LifecycleChange};
+        use crate::approval::LifecycleChange;
         // Cheap pre-check on the (freshly reloaded) in-memory cache: if nothing
         // is due, skip the lock + re-encrypt + disk write entirely so an idle
         // sweep doesn't churn the vault every tick. The authoritative re-check
@@ -805,12 +809,7 @@ impl StorageBackend for FileStorage {
         let any_due = {
             let now = Utc::now();
             let cache = self.cache.read();
-            cache.approvals.values().any(|a| {
-                (a.status.is_open()
-                    && (now >= a.expires_at
-                        || (a.status == ApprovalStatus::Pending && now >= a.escalate_at)))
-                    || a.needs_reauth()
-            })
+            cache.approvals.values().any(|a| approval_is_due(a, now))
         };
         if !any_due {
             return Ok(crate::storage::ApprovalSweep::default());
@@ -825,10 +824,9 @@ impl StorageBackend for FileStorage {
                         // Also expire an approved-but-unrun grant whose continuous
                         // reauth window lapsed, so an abandoned stale grant doesn't
                         // linger as `Approved` in the panel (it must be re-approved).
+                        // Preserves the original approver attribution.
                         if approval.needs_reauth() {
-                            approval.status = ApprovalStatus::Expired;
-                            approval.decided_at = Some(Utc::now());
-                            approval.decided_by = Some("system (reauth lapsed)".to_string());
+                            approval.expire_reauth_lapsed();
                             sweep.expired.push(approval.id.clone());
                         }
                     }

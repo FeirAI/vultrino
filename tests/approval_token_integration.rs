@@ -1717,11 +1717,17 @@ async fn test_v5_reauth_lapse_expires_on_poll() {
     a.decided_at = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
     storage.update_approval(&a).await.unwrap();
 
-    // Poll: the stale grant is expired (re-auth lapsed), not executed.
+    // Poll: the stale grant is expired (re-auth lapsed), not executed; the
+    // original approver attribution is preserved and the lapse is noted.
     let polled = server.check_and_resume_approval(&approval.id, None).await.unwrap();
     assert_eq!(polled.status, ApprovalStatus::Expired);
     assert!(!polled.executed, "a lapsed grant must not run");
-    assert_eq!(polled.decided_by.as_deref(), Some("system (reauth lapsed)"));
+    assert_eq!(polled.approver_identity.as_deref(), Some("secops"), "approver preserved");
+    assert!(
+        polled.decision_note.as_deref().unwrap_or("").contains("re-authorization"),
+        "lapse recorded in note, got: {:?}",
+        polled.decision_note
+    );
 }
 
 #[tokio::test]
@@ -1846,4 +1852,50 @@ async fn test_v5_poll_refresh_does_not_clobber_a_decision() {
     let refreshed = storage.poll_refresh_approval(&approval.id).await.unwrap();
     assert_eq!(refreshed.status, ApprovalStatus::Approved, "a decision must survive a poll");
     assert_eq!(refreshed.approver_identity.as_deref(), Some("secops"));
+}
+
+#[tokio::test]
+async fn test_v5_sweep_expires_reauth_lapsed_grant_preserving_approver() {
+    // V5: an approved-but-unrun grant whose continuous-reauth window lapsed and
+    // that nobody polls is expired by the background sweep — and the original
+    // approver attribution is preserved in the audit record (the lapse is noted,
+    // not overwritten with a system actor).
+    let (server, storage) = setup_v5(|a| {
+        a.reauth_interval_secs = Some(60);
+    })
+    .await;
+    store_credential(&storage, "pay-cred", true).await;
+
+    let req = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "x": 1 }),
+    };
+    let approval = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+
+    // Approve as alice, then back-date the decision past the reauth window.
+    storage
+        .decide_approval(&approval.id, true, "admin panel", "alice", false, None)
+        .await
+        .unwrap();
+    let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    a.decided_at = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+    storage.update_approval(&a).await.unwrap();
+
+    // The sweep (not a poll) expires it.
+    let sweep = server.sweep_approvals_once().await.unwrap();
+    assert!(sweep.expired.iter().any(|id| id == &approval.id), "sweep should expire it");
+    let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(a.status, ApprovalStatus::Expired);
+    // Approver attribution preserved; lapse recorded in the note.
+    assert_eq!(a.decided_by.as_deref(), Some("admin panel"), "original channel kept");
+    assert_eq!(a.approver_identity.as_deref(), Some("alice"), "original approver kept");
+    assert!(
+        a.decision_note.as_deref().unwrap_or("").contains("re-authorization"),
+        "lapse should be recorded in the note, got: {:?}",
+        a.decision_note
+    );
 }

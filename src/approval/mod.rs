@@ -482,6 +482,21 @@ impl ApprovalRequest {
         Some(approver.eq_ignore_ascii_case(owner))
     }
 
+    /// Expire an approved-but-unrun grant whose continuous-reauth window lapsed
+    /// (V5), **preserving** the original approver attribution (`decided_by` /
+    /// `approver_identity` / `decided_at` / `sod_violation`) and recording the
+    /// lapse in the decision note — so the audit trail still shows who approved
+    /// the grant before it went stale, rather than overwriting it with a system
+    /// actor. Use this (not a raw `status = Expired`) for the reauth path.
+    pub fn expire_reauth_lapsed(&mut self) {
+        self.status = ApprovalStatus::Expired;
+        let lapse = "re-authorization window lapsed before execution";
+        self.decision_note = Some(match self.decision_note.take() {
+            Some(note) if !note.is_empty() => format!("{note} | {lapse}"),
+            _ => lapse.to_string(),
+        });
+    }
+
     /// Continuous re-authorization check (V5): whether an approved-but-not-yet-run
     /// grant has gone stale — i.e. more than `reauth_interval_secs` elapsed since
     /// the decision — and so must be re-approved before it may execute. `false`

@@ -333,7 +333,7 @@ pub trait StorageBackend: Send + Sync {
             .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
         approval.advance_lifecycle();
         if approval.needs_reauth() {
-            approval.status = ApprovalStatus::Expired;
+            approval.expire_reauth_lapsed();
         }
         Ok(approval)
     }
