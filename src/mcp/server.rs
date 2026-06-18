@@ -852,8 +852,9 @@ impl McpServer {
         drop(vultrino);
 
         // V12: surface dual-control (M-of-N) progress so an MCP agent knows it's
-        // awaiting additional distinct approvers, not stalled.
-        let dual_control_note = if approval.effective_required_approvals() > 1 {
+        // awaiting additional distinct approvers, not stalled (only meaningful
+        // while the request is still open — it's only used by the open arms below).
+        let dual_control_note = if approval.status.is_open() && approval.effective_required_approvals() > 1 {
             format!(
                 " Dual control: {} of {} distinct approvals so far ({} more needed).",
                 approval.signoffs.len(),

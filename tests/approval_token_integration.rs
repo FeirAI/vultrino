@@ -2339,6 +2339,6 @@ async fn test_v12_dual_control_forces_gating_on_allow_path() {
         ExecutionOutcome::Pending(a) => a,
         other => panic!("dual_control must gate even on Allow, got {other:?}"),
     };
-    assert_eq!(approval.required_approvals, 2);
+    assert_eq!(approval.effective_required_approvals(), 2, "dual control needs 2 approvers");
     assert!(approval.status.is_open());
 }

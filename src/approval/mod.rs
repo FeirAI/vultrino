@@ -1174,6 +1174,19 @@ mod tests {
     }
 
     #[test]
+    fn test_deny_path_sod_is_sticky_true() {
+        // V12: the deny path records SoD sticky-true (a later violating decision
+        // must not be lost under a prior Some(false) — the bug the `.or()` had).
+        let (mut a, _) = new_approval(); // requester owner = "agent"
+        a.required_approvals = 2;
+        a.approve(Decision::new("admin panel", "alice")).unwrap(); // alice != agent → false
+        assert_eq!(a.sod_violation, Some(false));
+        a.deny(Decision::new("admin panel", "agent")).unwrap(); // self-deny → violation
+        assert_eq!(a.status, ApprovalStatus::Denied);
+        assert_eq!(a.sod_violation, Some(true), "deny SoD must be sticky-true over a prior false");
+    }
+
+    #[test]
     fn test_dual_control_single_deny_vetoes() {
         // One veto denies, regardless of how many approvals were gathered.
         let (mut a, _) = new_approval();
