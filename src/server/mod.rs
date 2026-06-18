@@ -1143,13 +1143,20 @@ pub async fn deliver_outbox_once(
     let (Some(url), Some(secret)) = (config.url.as_deref(), config.hmac_secret.as_deref()) else {
         return Ok(());
     };
-    // Atomically claim (lease) the events this pass will deliver, so a second
-    // process (web vs MCP) can't also POST them — delivery is exclusive and
-    // per-subject-ordered across processes.
-    for event in storage
-        .claim_deliverable_events(OUTBOX_BATCH, OUTBOX_LEASE_SECS)
-        .await?
-    {
+    // Claim and deliver ONE event at a time (up to a per-pass bound): each event
+    // is leased immediately before its single POST, so its lease (>> the request
+    // timeout) always covers that POST. Claiming a whole batch up front would let
+    // a later event's lease expire while earlier (slow) POSTs run, re-opening the
+    // cross-process double-delivery window. The claim+lease is atomic under the fd
+    // lock, so a second process (web vs MCP) can't also take the same event.
+    for _ in 0..OUTBOX_BATCH {
+        let Some(event) = storage
+            .claim_deliverable_events(1, OUTBOX_LEASE_SECS)
+            .await?
+            .pop()
+        else {
+            break;
+        };
         let body = serde_json::to_vec(&event.delivery_body()).unwrap_or_default();
         let signature = crate::outbox::sign_body(secret, &body);
         let outcome = client

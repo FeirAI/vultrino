@@ -29,14 +29,27 @@ pub struct RawConfig {
     pub outbox: Option<RawOutboxConfig>,
 }
 
-/// TOML shape for `[outbox]` (V9).
-#[derive(Debug, Deserialize, Default)]
+/// TOML shape for `[outbox]` (V9). `Debug` is hand-written to redact
+/// `hmac_secret` so a `{:?}` of the parsed `RawConfig` can't leak the key.
+#[derive(Deserialize, Default)]
 pub struct RawOutboxConfig {
     pub enabled: Option<bool>,
     pub url: Option<String>,
     pub hmac_secret: Option<String>,
     pub max_attempts: Option<u32>,
     pub retention_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for RawOutboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawOutboxConfig")
+            .field("enabled", &self.enabled)
+            .field("url", &self.url)
+            .field("hmac_secret", &self.hmac_secret.as_ref().map(|_| "<redacted>"))
+            .field("max_attempts", &self.max_attempts)
+            .field("retention_secs", &self.retention_secs)
+            .finish()
+    }
 }
 
 impl TryFrom<RawOutboxConfig> for crate::outbox::OutboxConfig {

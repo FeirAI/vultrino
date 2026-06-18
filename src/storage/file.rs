@@ -1054,7 +1054,8 @@ impl StorageBackend for FileStorage {
         limit: usize,
         lease_secs: u64,
     ) -> Result<Vec<crate::outbox::OutboxEvent>, StorageError> {
-        let lease_until = Utc::now() + chrono::Duration::seconds(lease_secs.max(1) as i64);
+        let lease_until =
+            Utc::now() + chrono::Duration::seconds(i64::try_from(lease_secs.max(1)).unwrap_or(i64::MAX));
         self.locked_mutate(move |cache| {
             let now = Utc::now();
             // The earliest claimable (pending, not actively leased) event per
@@ -1080,9 +1081,12 @@ impl StorageBackend for FileStorage {
         use crate::outbox::DeliveryState;
         self.locked_mutate(move |cache| {
             if let Some(e) = cache.outbox.get_mut(&sequence) {
-                // `Delivered` is terminal: ignore a late/duplicate outcome so a
-                // racing failure can't un-deliver or wrongly dead-letter it.
-                if e.delivery == DeliveryState::Delivered {
+                // Only a Pending (currently-claimed) event accepts an outcome.
+                // `Delivered` and `DeadLettered` are terminal — a late/duplicate
+                // outcome can't un-deliver, resurrect, or re-dead-letter them; a
+                // dead-lettered event re-enters delivery only via explicit replay
+                // (which flips it back to Pending).
+                if e.delivery != DeliveryState::Pending {
                     return Ok(());
                 }
                 e.attempts += 1;
@@ -1133,6 +1137,9 @@ impl StorageBackend for FileStorage {
                     e.delivery = DeliveryState::Pending;
                     e.attempts = 0;
                     e.last_error = None;
+                    // Clear any lease so the re-queued event is immediately
+                    // claimable (defensive — dead-lettered events already have none).
+                    e.leased_until = None;
                     Ok(true)
                 }
                 _ => Ok(false),

@@ -235,3 +235,21 @@ async fn test_claim_is_exclusive_across_callers() {
     let all = storage.list_events_after(0, 10).await.unwrap();
     assert_eq!(all[0].delivery, DeliveryState::Delivered, "Delivered is terminal");
 }
+
+#[tokio::test]
+async fn test_stale_lease_is_reclaimable() {
+    // V9: a crashed deliverer's lease expires and the event is re-claimable — the
+    // other half of the lease contract (no event stuck-leased forever).
+    let storage = storage().await;
+    storage.append_event("A", "e", serde_json::json!({})).await.unwrap();
+
+    // Claim with a 1s lease, then don't deliver (simulate a crash).
+    let first = storage.claim_deliverable_events(10, 1).await.unwrap();
+    assert_eq!(first.len(), 1);
+    // Immediately, the lease is still active → not re-claimable.
+    assert!(storage.claim_deliverable_events(10, 1).await.unwrap().is_empty());
+    // After the lease expires, a second deliverer reclaims it.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let reclaimed = storage.claim_deliverable_events(10, 30).await.unwrap();
+    assert_eq!(reclaimed.len(), 1, "stale lease reclaimed");
+}
