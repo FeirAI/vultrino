@@ -743,7 +743,7 @@ mod tests {
         }
 
         // A different agent is unaffected → the allow rule applies.
-        let other = Principal { id: "k2".to_string(), agent_label: Some("bot-9".to_string()) , owner: None };
+        let other = Principal { id: "k2".to_string(), agent_label: Some("bot-9".to_string()), owner: None };
         let decision = engine.evaluate_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
@@ -937,8 +937,8 @@ mod tests {
         // Per-agent Deny for "refund-bot" only (kill-leg W3).
         engine.add_policy(Policy::deny_all("kill-refund-bot", "pay-*").with_principal("refund-bot"));
 
-        let bot = Principal { id: "tok1".to_string(), agent_label: Some("refund-bot".to_string()) , owner: None };
-        let other = Principal { id: "tok2".to_string(), agent_label: Some("other-bot".to_string()) , owner: None };
+        let bot = Principal { id: "tok1".to_string(), agent_label: Some("refund-bot".to_string()), owner: None };
+        let other = Principal { id: "tok2".to_string(), agent_label: Some("other-bot".to_string()), owner: None };
         let bot_in = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&bot), spend: None };
         let other_in = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&other), spend: None };
         let none_in = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: None, spend: None };
@@ -975,7 +975,7 @@ mod tests {
         let engine = PolicyEngine::new();
         engine.set_default_deny(false);
         engine.add_policy(Policy::deny_all("kill-by-id", "*").with_principal("tok-*"));
-        let p = Principal { id: "tok-abc".to_string(), agent_label: None , owner: None };
+        let p = Principal { id: "tok-abc".to_string(), agent_label: None, owner: None };
         assert!(matches!(
             engine.evaluate_full(&EvalInput { credential_alias: "any", url: None, method: None, principal: Some(&p), spend: None }),
             PolicyDecision::Deny(_)
@@ -1133,8 +1133,8 @@ mod tests {
         }];
         engine.add_policy(pol);
 
-        let tok1 = Principal { id: "tok1".to_string(), agent_label: Some("bot".to_string()) , owner: None };
-        let tok2 = Principal { id: "tok2".to_string(), agent_label: Some("bot".to_string()) , owner: None };
+        let tok1 = Principal { id: "tok1".to_string(), agent_label: Some("bot".to_string()), owner: None };
+        let tok2 = Principal { id: "tok2".to_string(), agent_label: Some("bot".to_string()), owner: None };
         let sixty = SpendAttempt { asset: "usd".to_string(), amount: 60 };
         let in1 = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&tok1), spend: Some(&sixty) };
         let in2 = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&tok2), spend: Some(&sixty) };
@@ -1149,8 +1149,8 @@ mod tests {
         // so distinct principals share one budget.
         let engine = PolicyEngine::new();
         engine.add_policy(spend_policy("usd", None, Some(100), 3600));
-        let p1 = Principal { id: "tokA".to_string(), agent_label: None , owner: None };
-        let p2 = Principal { id: "tokB".to_string(), agent_label: None , owner: None };
+        let p1 = Principal { id: "tokA".to_string(), agent_label: None, owner: None };
+        let p2 = Principal { id: "tokB".to_string(), agent_label: None, owner: None };
         let sixty = SpendAttempt { asset: "usd".to_string(), amount: 60 };
         let in1 = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&p1), spend: Some(&sixty) };
         let in2 = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&p2), spend: Some(&sixty) };

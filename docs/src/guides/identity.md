@@ -20,7 +20,7 @@ The resolved `subject` is what a policy `principal_pattern` matches — so a pol
 
 ## Owner binding
 
-An API key or use token can be bound to a **human/directory owner** — the OIDC `sub` / SCIM id of the person accountable for the NHI:
+A use token can be bound to a **human/directory owner** — the OIDC `sub` / SCIM id of the person accountable for the NHI. (The same `owner_identity` field exists on API keys for when the key-mint path is extended; today it is settable on use tokens via the admin token-mint.)
 
 ```bash
 # Mint a use token bound to a directory owner (admin API).

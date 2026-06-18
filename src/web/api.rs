@@ -883,7 +883,8 @@ pub async fn api_create_token(
         // (V10) post-create; these fields are not moved into `params` above.
         token.agent_label = req.agent_label;
         token.dual_control = dual_control;
-        token.owner_identity = req.owner_identity.filter(|s| !s.trim().is_empty());
+        token.owner_identity =
+            req.owner_identity.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         if let Err(e) = st.storage.store_use_token(&token).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

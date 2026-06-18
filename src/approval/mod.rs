@@ -572,21 +572,32 @@ impl ApprovalRequest {
     /// own identity (a self-approval). `None` when either side is unknown.
     fn sod_for(&self, candidate: &str) -> Option<bool> {
         let approver = candidate.trim();
-        // The requester's "owner" identity: prefer the IdP-resolvable directory
-        // owner (V10), then the human/agent label, then the stable principal id.
-        let owner = self
-            .requester
-            .owner
-            .as_deref()
-            .or(self.requester.principal_name.as_deref())
-            .or(self.agent_label.as_deref())
-            .or(self.principal_id.as_deref())
-            .or(self.requester.principal_id.as_deref())?
-            .trim();
-        if approver.is_empty() || owner.is_empty() {
+        if approver.is_empty() {
             return None;
         }
-        Some(approver.eq_ignore_ascii_case(owner))
+        // Compare the approver against EVERY known identity of the requesting
+        // agent — the IdP-resolvable directory owner (V10), the human/agent label,
+        // and the stable principal id — so a self-approval under ANY of them is a
+        // violation (not just the highest-precedence one). A blank identity is
+        // skipped rather than treated as "the owner" (so it can't poison the result
+        // to not-computable).
+        let identities = [
+            self.requester.owner.as_deref(),
+            self.requester.principal_name.as_deref(),
+            self.agent_label.as_deref(),
+            self.principal_id.as_deref(),
+            self.requester.principal_id.as_deref(),
+        ];
+        let known: Vec<&str> = identities
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if known.is_empty() {
+            return None; // not computable
+        }
+        Some(known.iter().any(|id| id.eq_ignore_ascii_case(approver)))
     }
 
     /// Expire an approved-but-unrun grant whose continuous-reauth window lapsed
@@ -1293,12 +1304,18 @@ mod tests {
         a.approve(Decision::new("admin panel", "ALICE@example.com")).unwrap();
         assert_eq!(a.violates_sod(), Some(true), "approver == bound owner → SoD violation");
 
-        // Approving as the agent label (not the owner) is NOT a violation now that
-        // the owner is the authoritative comparison.
-        let (mut b, _) = new_approval();
+        // SoD checks ALL the agent's identities: approving under the agent's own
+        // name (not the owner) is still a self-approval.
+        let (mut b, _) = new_approval(); // principal_name "agent"
         b.requester.owner = Some("alice@example.com".to_string());
-        b.deny(Decision::new("admin panel", "agent")).unwrap();
-        assert_eq!(b.violates_sod(), Some(false), "owner takes precedence over agent label");
+        b.approve(Decision::new("admin panel", "agent")).unwrap();
+        assert_eq!(b.violates_sod(), Some(true), "self-approval under any identity is flagged");
+
+        // A genuinely distinct approver (neither the owner nor the agent) is clean.
+        let (mut c, _) = new_approval();
+        c.requester.owner = Some("alice@example.com".to_string());
+        c.approve(Decision::new("admin panel", "secops-oncall")).unwrap();
+        assert_eq!(c.violates_sod(), Some(false), "distinct approver satisfies SoD");
     }
 
     #[test]

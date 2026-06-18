@@ -37,7 +37,7 @@ pub enum IdentityKind {
 }
 
 /// A resolved workload identity (V10): the principal a request authenticated as.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadIdentity {
     pub kind: IdentityKind,
     /// The principal identifier — matched by a policy `principal_pattern`.
@@ -113,8 +113,10 @@ impl IdentityResolver for SpiffeResolver {
 
     fn resolve(&self, document: &str) -> Result<WorkloadIdentity, IdentityError> {
         let (trust_domain, _path) = Self::parse_spiffe_id(document.trim())?;
+        // Trust domains are DNS names — compare case-insensitively so a
+        // case-variant can't slip past the allowlist.
         if !self.allowed_trust_domains.is_empty()
-            && !self.allowed_trust_domains.iter().any(|d| d == &trust_domain)
+            && !self.allowed_trust_domains.iter().any(|d| d.eq_ignore_ascii_case(&trust_domain))
         {
             return Err(IdentityError::UntrustedDomain(trust_domain));
         }
@@ -164,18 +166,26 @@ impl IdentityResolver for OidcResolver {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| IdentityError::MissingClaim("sub".to_string()))?;
         let iss = claims.get("iss").and_then(|v| v.as_str()).map(str::to_string);
-        if let Some(issuer) = &iss {
-            if !self.allowed_issuers.is_empty() && !self.allowed_issuers.iter().any(|i| i == issuer)
-            {
-                return Err(IdentityError::UntrustedDomain(issuer.clone()));
+        // Enforce the issuer allowlist unconditionally: a token with NO `iss` must
+        // NOT bypass the allowlist (fail-closed — the allowlist is the resolver's
+        // only trust boundary).
+        if !self.allowed_issuers.is_empty() {
+            let issuer = iss
+                .as_deref()
+                .ok_or_else(|| IdentityError::MissingClaim("iss".to_string()))?;
+            if !self.allowed_issuers.iter().any(|i| i == issuer) {
+                return Err(IdentityError::UntrustedDomain(issuer.to_string()));
             }
         }
+        // The owner is a HUMAN/directory identity — only set it from a human claim
+        // (email / preferred_username). Do NOT fall back to `sub` (which for a
+        // machine token is the workload itself, giving no human accountability).
         let owner = claims
             .get("email")
             .or_else(|| claims.get("preferred_username"))
             .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .or_else(|| Some(sub.to_string()));
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         Ok(WorkloadIdentity {
             kind: IdentityKind::Oidc,
             subject: sub.to_string(),
@@ -234,7 +244,10 @@ pub fn resolve_cloud_iam(
         kind,
         subject,
         trust_domain,
-        owner: claims.get("email").and_then(|v| v.as_str()).map(str::to_string),
+        // Cloud-IAM tokens identify a *workload*, not a human — there is no human
+        // owner claim to bind here (owner binding is set out-of-band on the
+        // vk_/vut_). Leave it None rather than aliasing the machine as its owner.
+        owner: None,
     })
 }
 
@@ -279,14 +292,21 @@ mod tests {
         assert_eq!(id.trust_domain.as_deref(), Some("https://idp.example.com"));
         assert_eq!(id.owner.as_deref(), Some("alice@example.com"));
 
-        // Missing sub → error; owner falls back to sub when no email.
+        // Missing sub → error; a machine token (no human claim) has NO owner.
         assert!(r.resolve(r#"{"iss":"x"}"#).is_err());
         let id = r.resolve(r#"{"sub":"svc-1"}"#).unwrap();
-        assert_eq!(id.owner.as_deref(), Some("svc-1"));
+        assert_eq!(id.owner, None, "no email/preferred_username → no human owner");
 
-        // Issuer allowlist enforced.
+        // Issuer allowlist enforced — and a token with NO iss must NOT bypass it.
         let r = OidcResolver::new(vec!["https://good".to_string()]);
         assert!(r.resolve(r#"{"sub":"a","iss":"https://bad"}"#).is_err());
+        assert_eq!(
+            r.resolve(r#"{"sub":"a"}"#),
+            Err(IdentityError::MissingClaim("iss".to_string())),
+            "an iss-less token cannot bypass a non-empty issuer allowlist"
+        );
+        // With no allowlist, an iss-less token is accepted (owner falls through).
+        assert!(OidcResolver::default().resolve(r#"{"sub":"a"}"#).is_ok());
     }
 
     #[test]
