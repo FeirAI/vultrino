@@ -136,6 +136,67 @@ impl Policy {
         self.principal_pattern = Some(pattern.into());
         self
     }
+
+    /// Validate structural invariants for the spend-cap feature (V3), so a
+    /// misconfigured cap can't silently fail open. Enforced at config load and
+    /// by the admin API:
+    /// - a `SpendCap` must be a rule's **top-level** condition (not nested in
+    ///   and/or/not) — the engine charges exactly the firing cap, and a nested
+    ///   cap would gate without charging (fail-open for the cumulative window);
+    /// - a `SpendCap` must set at least one of `per_action_max`/`cumulative_max`;
+    /// - a policy that uses a `SpendCap` rule must be fail-closed
+    ///   (`default_action = deny`), so an over-cap or unparseable request falls
+    ///   through to deny rather than being allowed.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut uses_spend_cap = false;
+        for rule in &self.rules {
+            if let PolicyCondition::SpendCap {
+                per_action_max,
+                cumulative_max,
+                ..
+            } = &rule.condition
+            {
+                uses_spend_cap = true;
+                if per_action_max.is_none() && cumulative_max.is_none() {
+                    return Err(format!(
+                        "policy '{}': SpendCap must set per_action_max and/or cumulative_max",
+                        self.name
+                    ));
+                }
+            } else if condition_nests_spend_cap(&rule.condition) {
+                return Err(format!(
+                    "policy '{}': SpendCap must be a rule's top-level condition, not nested in and/or/not",
+                    self.name
+                ));
+            }
+        }
+        if uses_spend_cap && self.default_action != PolicyAction::Deny {
+            return Err(format!(
+                "policy '{}': a policy with a SpendCap rule must use default_action = \"deny\" (fail-closed)",
+                self.name
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether a condition tree nests a `SpendCap` inside and/or/not (which is
+/// rejected — SpendCap must be a rule's top-level condition).
+fn condition_nests_spend_cap(c: &PolicyCondition) -> bool {
+    match c {
+        PolicyCondition::And(cs) | PolicyCondition::Or(cs) => cs.iter().any(contains_spend_cap),
+        PolicyCondition::Not(inner) => contains_spend_cap(inner),
+        _ => false,
+    }
+}
+
+fn contains_spend_cap(c: &PolicyCondition) -> bool {
+    match c {
+        PolicyCondition::SpendCap { .. } => true,
+        PolicyCondition::And(cs) | PolicyCondition::Or(cs) => cs.iter().any(contains_spend_cap),
+        PolicyCondition::Not(inner) => contains_spend_cap(inner),
+        _ => false,
+    }
 }
 
 impl PolicyCondition {

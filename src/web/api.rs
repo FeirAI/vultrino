@@ -638,6 +638,8 @@ fn build_policy(req: PolicyUpsertRequest, forced_id: Option<String>) -> Result<P
     policy.principal_pattern = req.principal_pattern;
     policy.default_action = req.default_action;
     policy.rules = req.rules;
+    // Reject misconfigured spend caps (nested / no caps / not fail-closed).
+    policy.validate()?;
     Ok(policy)
 }
 

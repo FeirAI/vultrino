@@ -124,7 +124,11 @@ impl Config {
             .policies
             .into_iter()
             .map(|p| p.try_into())
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<Policy>, _>>()?;
+        // Validate spend-cap structural invariants (fail-closed, no nesting).
+        for p in &policies {
+            p.validate().map_err(ConfigError::Invalid)?;
+        }
 
         Ok(Self {
             server,

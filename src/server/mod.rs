@@ -586,6 +586,10 @@ impl VultrinoServer {
         // Rebuild the principal (V4) and spend (V3) from the recorded approval so
         // per-agent denies and spend caps are re-evaluated at resume. Spend is
         // checked read-only here (it was charged when the approval was opened).
+        // NOTE: the agent_label is point-in-time (snapshotted at open); a per-
+        // agent Deny created by binding a *new* label to the token after the
+        // approval opened won't re-fire at resume — deny by token id or by the
+        // credential to stop an in-flight approval regardless.
         let principal = approval.requester.principal_id.as_ref().map(|id| {
             crate::policy::Principal { id: id.clone(), agent_label: approval.agent_label.clone() }
         });
