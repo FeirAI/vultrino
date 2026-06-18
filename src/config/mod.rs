@@ -47,6 +47,8 @@ pub struct Config {
     pub enforcement: EnforcementConfig,
     /// Amount-extraction rules for SpendCap policies (V3).
     pub spend_extractors: Vec<crate::policy::SpendExtractor>,
+    /// Egress classification rules (V7).
+    pub egress: Vec<crate::egress::EgressRule>,
 }
 
 /// Engine-level enforcement configuration.
@@ -119,6 +121,11 @@ impl Config {
             .into_iter()
             .map(Into::into)
             .collect();
+        let egress = raw
+            .egress
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let policies = raw
             .policies
@@ -139,6 +146,7 @@ impl Config {
             approval,
             enforcement,
             spend_extractors,
+            egress,
         })
     }
 
@@ -153,6 +161,7 @@ impl Config {
             approval: crate::approval::ApprovalConfig::default(),
             enforcement: EnforcementConfig::default(),
             spend_extractors: vec![],
+            egress: vec![],
         }
     }
 

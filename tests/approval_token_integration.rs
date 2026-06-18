@@ -1293,3 +1293,100 @@ async fn test_spend_capped_approval_resumes_without_recharge() {
     assert!(resumed.executed);
     assert!(resumed.result_error.is_none(), "spend-capped approval must resume: {:?}", resumed.result_error);
 }
+
+/// A plugin that reflects the injected credential's secret back in its response
+/// (simulating a header-echoing endpoint) — to exercise V7 egress redaction.
+struct SecretReflectorPlugin;
+
+#[async_trait]
+impl Plugin for SecretReflectorPlugin {
+    fn name(&self) -> &str {
+        "reflect"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["echo_secret"]
+    }
+    async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        let secrets = request.credential.data.secret_material();
+        let body = format!("reflected: {}", secrets.join(",")).into_bytes();
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "X-Echoed-Auth".to_string(),
+            format!("Bearer {}", secrets.first().cloned().unwrap_or_default()),
+        );
+        Ok(ExecuteResponse { status: 200, headers, body, updated_credential: None })
+    }
+    fn validate_params(&self, _a: &str, _p: &serde_json::Value) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_egress_redacts_reflected_secret_end_to_end() {
+    let (server, storage) = setup().await; // allow mode
+    server.plugins().register(Arc::new(SecretReflectorPlugin));
+    let cred = Credential::new(
+        "api-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("super-secret-value"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    );
+    storage.store(&cred).await.unwrap();
+
+    let req = ExecuteRequest {
+        credential: "api-cred".to_string(),
+        action: "reflect.echo_secret".to_string(),
+        params: serde_json::json!({}),
+    };
+    let resp = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+        ExecutionOutcome::Completed(r) => r,
+        other => panic!("expected Completed, got {other:?}"),
+    };
+    let body = String::from_utf8_lossy(&resp.body);
+    assert!(!body.contains("super-secret-value"), "secret leaked in body: {body}");
+    assert!(body.contains("[REDACTED:api-cred]"));
+    // Header reflection is scrubbed too.
+    assert!(!resp.headers.get("X-Echoed-Auth").unwrap().contains("super-secret-value"));
+}
+
+#[tokio::test]
+async fn test_egress_block_withholds_response_end_to_end() {
+    use vultrino::egress::EgressRule;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("pw");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.egress = vec![EgressRule {
+        credential_pattern: "sts-*".to_string(),
+        action_pattern: "*".to_string(),
+        block: true,
+        redact_patterns: vec![],
+    }];
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    server.plugins().register(Arc::new(MockPlugin));
+    store_credential(&storage, "sts-cred", false).await;
+
+    let req = ExecuteRequest {
+        credential: "sts-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({"downstream_token": "abc123"}),
+    };
+    let resp = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+        ExecutionOutcome::Completed(r) => r,
+        other => panic!("expected Completed, got {other:?}"),
+    };
+    let body = String::from_utf8_lossy(&resp.body);
+    assert!(!body.contains("abc123"), "blocked body leaked: {body}");
+    assert!(body.contains("withheld by egress policy"));
+}

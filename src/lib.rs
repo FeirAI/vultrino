@@ -8,6 +8,7 @@ pub mod approval;
 pub mod auth;
 pub mod config;
 pub mod crypto;
+pub mod egress;
 pub mod mcp;
 pub mod plugins;
 pub mod policy;
@@ -288,6 +289,50 @@ fn default_postgres_sslmode() -> String {
 }
 
 impl CredentialData {
+    /// The exposed secret strings this credential injects or uses, for **egress
+    /// redaction** (V7): if a proxied endpoint reflects the credential's own
+    /// secret back in its response, the server scrubs these before returning the
+    /// body to the agent — the read-back defense (REVIEW H2/F2). Includes derived
+    /// forms (e.g. the base64 the http plugin sends for basic auth).
+    pub fn secret_material(&self) -> Vec<String> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        match self {
+            CredentialData::ApiKey { key, .. } => vec![key.expose().to_string()],
+            CredentialData::BasicAuth { username, password } => {
+                let raw = format!("{}:{}", username, password.expose());
+                vec![password.expose().to_string(), STANDARD.encode(raw.as_bytes())]
+            }
+            CredentialData::OAuth2 {
+                client_secret,
+                refresh_token,
+                access_token,
+                ..
+            } => {
+                let mut v = vec![client_secret.expose().to_string()];
+                if let Some(t) = access_token {
+                    v.push(t.expose().to_string());
+                }
+                if let Some(r) = refresh_token {
+                    v.push(r.expose().to_string());
+                }
+                v
+            }
+            CredentialData::HmacApiKey { api_secret, .. } => vec![api_secret.expose().to_string()],
+            CredentialData::EcdsaKey { private_key, .. } => vec![private_key.expose().to_string()],
+            CredentialData::SshPassword { password, .. } => vec![password.expose().to_string()],
+            CredentialData::Postgres { password, .. } => vec![password.expose().to_string()],
+            CredentialData::PrivateKey { key_pem, passphrase } => {
+                let mut v = vec![key_pem.expose().to_string()];
+                if let Some(p) = passphrase {
+                    v.push(p.expose().to_string());
+                }
+                v
+            }
+            CredentialData::Certificate { key_pem, .. } => vec![key_pem.expose().to_string()],
+            CredentialData::Custom(map) => map.values().map(|s| s.expose().to_string()).collect(),
+        }
+    }
+
     /// Get the credential type for this data
     pub fn credential_type(&self) -> CredentialType {
         match self {

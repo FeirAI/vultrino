@@ -146,6 +146,41 @@ If a `SpendCap` policy applies to a credential but no extractor yields an amount
 (missing extractor or unparseable body), the request is **denied** (fail-closed)
 and a `spend_unparseable` warning is logged.
 
+### Egress Controls
+
+Vultrino keeps proxied responses from carrying secrets back to the agent (V7),
+applied at the execution seam for **every** plugin:
+
+1. **Always-on secret-material redaction.** If an endpoint reflects the
+   credential's own injected secret in its response (a header-echoing reflector,
+   an open redirect, etc.), the secret is scrubbed from the body and headers and
+   replaced with `[REDACTED:<alias>]` before the response is returned. This is
+   not configurable — it's the core "agents never see secrets" invariant.
+2. **Egress classification.** For endpoints whose response is itself a secondary
+   secret (an STS/login/secret-read endpoint), configure `[[egress]]` rules:
+
+```toml
+[[egress]]
+credential_pattern = "sts-*"        # glob over credential alias
+action_pattern = "http.request"     # glob over plugin.action (default "*")
+block = true                         # withhold the body + headers entirely
+
+[[egress]]
+credential_pattern = "secrets-api-*"
+redact_patterns = ['"token":\s*"[^"]+"', "AKIA[0-9A-Z]{16}"]  # extra regexes to redact
+```
+
+The first matching rule applies. `block = true` replaces the body with a marker
+and drops the headers; otherwise any `redact_patterns` (regexes) are scrubbed
+from the body (on top of the always-on redaction).
+
+> **Downstream credentials.** Blocking/redacting prevents an agent from reading
+> a downstream secret out of a response, but a `vut_` revoke does **not** revoke
+> a secret the downstream already issued. Prefer credential types that mint
+> short-lived, revocable downstream credentials (OAuth2 client-credentials, STS,
+> SVIDs) so a revoke maps to a real resource-side revoke. OAuth2 in-path token
+> rotation emits a `credential.rotated` event (delivered via the signed outbox).
+
 ## Environment Variables
 
 | Variable | Description |

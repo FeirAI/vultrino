@@ -503,6 +503,10 @@ impl VultrinoServer {
         let credential_alias = credential.alias.clone();
         let credential_metadata = credential.metadata.clone();
         let credential_created_at = credential.created_at;
+        // Capture the credential's secret material before it moves into the
+        // plugin request, so we can scrub it from the response (V7 egress).
+        let secret_material = credential.data.secret_material();
+        let full_action = format!("{}.{}", plugin_name, action_name);
 
         let plugin_request = crate::plugins::PluginRequest {
             credential,
@@ -512,10 +516,17 @@ impl VultrinoServer {
         };
 
         // Point of no return: the action may now have side effects.
-        let response = plugin
+        let mut response = plugin
             .execute(plugin_request)
             .await
             .map_err(|e| RunError::committed(e.into()))?;
+
+        // V7 egress controls (before the body ever reaches the agent):
+        // 1. scrub the credential's own secret if the endpoint reflected it back
+        //    (read-back defense), and 2. apply operator egress classification
+        //    (block / extra redaction) for secret-bearing endpoints.
+        crate::egress::redact_secret_material(&mut response, &secret_material, &credential_alias);
+        crate::egress::apply_egress(&mut response, &self.config.egress, &credential_alias, &full_action);
 
         // Persist any credential update (e.g. OAuth2 token refresh).
         if let Some(updated_data) = &response.updated_credential {
@@ -536,6 +547,15 @@ impl VultrinoServer {
                     "Failed to persist updated credential (token refresh)"
                 );
             }
+            // V7: emit an observable rotation event. govder subscription is wired
+            // through the signed outbox in V9; this is the emit side.
+            info!(
+                event = "credential.rotated",
+                credential = %credential_alias,
+                credential_type = %updated_data.credential_type(),
+                request_id = %request_id,
+                "credential rotated in-path (e.g. OAuth2 token refresh)"
+            );
         }
 
         // Record for rate limiting.

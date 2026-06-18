@@ -1,6 +1,7 @@
 //! Raw configuration types for TOML parsing
 
 use super::*;
+use crate::egress::EgressRule;
 use crate::policy::{Policy, PolicyAction, PolicyCondition, PolicyRule, SpendExtractor};
 use serde::Deserialize;
 
@@ -18,6 +19,49 @@ pub struct RawConfig {
     /// Amount-extraction rules for SpendCap policies (V3).
     #[serde(default)]
     pub spend_extractors: Vec<RawSpendExtractor>,
+    /// Egress classification rules (V7).
+    #[serde(default)]
+    pub egress: Vec<RawEgressRule>,
+}
+
+/// Raw egress classification rule (V7).
+#[derive(Debug, Deserialize)]
+pub struct RawEgressRule {
+    pub credential_pattern: String,
+    #[serde(default = "default_action_pattern")]
+    pub action_pattern: String,
+    /// Withhold the response body+headers entirely (secret-bearing endpoint).
+    #[serde(default)]
+    pub block: bool,
+    /// Extra regexes to redact from the body when not blocked.
+    #[serde(default)]
+    pub redact_patterns: Vec<String>,
+}
+
+fn default_action_pattern() -> String {
+    "*".to_string()
+}
+
+impl TryFrom<RawEgressRule> for EgressRule {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawEgressRule) -> Result<Self, Self::Error> {
+        let redact_patterns = raw
+            .redact_patterns
+            .iter()
+            .map(|p| {
+                regex::Regex::new(p).map_err(|e| {
+                    ConfigError::Invalid(format!("invalid egress redact_pattern '{}': {}", p, e))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            credential_pattern: raw.credential_pattern,
+            action_pattern: raw.action_pattern,
+            block: raw.block,
+            redact_patterns,
+        })
+    }
 }
 
 /// Raw amount-extraction rule (V3). Reads an amount (minor units, integer) from
