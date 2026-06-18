@@ -1506,10 +1506,14 @@ async fn test_action_label_scope_isolation() {
         .execute_gated(req("payments.charge"), ExecAuth::from_use_token(refund_tok))
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, vultrino::VultrinoError::PolicyDenied(_)),
-        "a sibling label sharing a canonical action must not be authorized, got {err:?}"
-    );
+    match &err {
+        vultrino::VultrinoError::PolicyDenied(reason) => {
+            // The diagnostic surfaces both the presented label and its canonical.
+            assert!(reason.contains("payments.charge"), "reason: {reason}");
+            assert!(reason.contains("resolved to"), "reason should show both forms: {reason}");
+        }
+        other => panic!("expected PolicyDenied, got {other:?}"),
+    }
 
     // (c) Canonical-scoped token, label presented → ALLOWED (canonical scope is
     //     intentionally the broader form).

@@ -82,6 +82,15 @@ fn error_response(status: StatusCode, code: &str, message: impl Into<String>) ->
 
 // ============== Execute Request ==============
 
+/// Resolve the `action` for a typed `/api/v1/execute` request (V8): an omitted
+/// *or* explicitly blank action falls back to the default `http.request`, rather
+/// than passing `""`/whitespace through to `parse_action`.
+fn resolve_execute_action(action: Option<String>) -> String {
+    action
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "http.request".to_string())
+}
+
 #[derive(Deserialize)]
 pub struct ExecuteApiRequest {
     /// Credential alias to use
@@ -187,12 +196,7 @@ pub async fn api_execute(
     // Build the execute request (action no longer hardcoded — V8).
     let execute_request = ExecuteRequest {
         credential: request.credential,
-        // An omitted *or* explicitly-empty action falls back to the default,
-        // rather than passing "" through to parse_action.
-        action: request
-            .action
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "http.request".to_string()),
+        action: resolve_execute_action(request.action),
         params: serde_json::json!({
             "method": request.method.to_uppercase(),
             "url": request.url,
@@ -1040,6 +1044,17 @@ pub async fn api_delete_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_execute_action_defaults() {
+        // Omitted, empty, and whitespace-only all fall back to the default.
+        assert_eq!(resolve_execute_action(None), "http.request");
+        assert_eq!(resolve_execute_action(Some(String::new())), "http.request");
+        assert_eq!(resolve_execute_action(Some("   ".to_string())), "http.request");
+        // A real action (canonical or label) is preserved verbatim.
+        assert_eq!(resolve_execute_action(Some("postgres.run_sql".to_string())), "postgres.run_sql");
+        assert_eq!(resolve_execute_action(Some("payments.refund".to_string())), "payments.refund");
+    }
 
     #[test]
     fn test_extract_api_key_valid() {
