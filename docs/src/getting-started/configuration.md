@@ -208,6 +208,37 @@ either the label or the canonical action, and the approver sees the business
 verb in the approval. The typed `/api/v1/execute` endpoint also accepts an
 optional `action` field (default `http.request`) so it is no longer hardwired.
 
+### Event Outbox (V9)
+
+Vultrino records security-relevant events to a durable, ordered, replayable,
+**signed** outbox: approval requested/approved/denied/escalated/expired,
+`agent.halted`, `policy.changed`, and `credential.rotated`. Configure push
+delivery with `[outbox]`:
+
+```toml
+[outbox]
+url = "https://govder.example.com/vultrino/events"  # delivery endpoint
+hmac_secret = "shared-signing-secret"                # required to push (deliveries are signed)
+max_attempts = 8                                      # retries before dead-lettering (default 8)
+retention_secs = 604800                               # replay window, default 7 days
+```
+
+- **Ordered + monotonic.** Every event gets a process-global, gap-free
+  `sequence`. Events for the same `subject` (e.g. an approval id) are delivered
+  in order.
+- **Signed.** Each delivery carries `Govder-Signature: sha256=<hex>` =
+  `HMAC-SHA256(hmac_secret, body)`. A consumer recomputes it over the raw body
+  to verify authenticity. Enabling the outbox **requires** both `url` and
+  `hmac_secret` (an unsigned/undeliverable outbox is rejected at load).
+- **Replayable.** A consumer that drops offline replays from its last-seen
+  sequence: `GET /api/v1/events?after=<cursor>` returns the next events (same
+  envelope as a push), with no gaps and no dupes, within the retention window.
+- **Dead-letter queue.** An event that fails `max_attempts` deliveries is parked
+  (`GET /api/v1/events/dead`) and re-queued with
+  `POST /api/v1/events/{sequence}/replay` — it stops blocking its subject.
+- Events are appended even when push is unconfigured (still replayable via the
+  API); the log is bounded by `retention_secs`.
+
 ## Environment Variables
 
 | Variable | Description |

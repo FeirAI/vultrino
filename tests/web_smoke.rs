@@ -760,3 +760,61 @@ async fn test_admin_halt_rejects_glob_label() {
     // No kill policy was installed.
     assert!(!server.policy_engine().list_policies().iter().any(|p| p.kill));
 }
+
+#[tokio::test]
+async fn test_admin_event_replay_api() {
+    // V9: events emitted by admin actions are replayable from a cursor.
+    let (router, _storage, _server, key) = build_admin_router().await;
+
+    // A halt emits an agent.halted event.
+    let resp = router
+        .clone()
+        .oneshot(admin_req("POST", "/api/v1/agents/bot-7/halt", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // GET /api/v1/events?after=0 → the event + a next_cursor.
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", "/api/v1/events?after=0", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let events = body["events"].as_array().unwrap();
+    assert!(events.iter().any(|e| e["event"] == "agent.halted" && e["subject"] == "bot-7"));
+    let cursor = body["next_cursor"].as_u64().unwrap();
+    assert!(cursor >= 1);
+
+    // Replaying after the cursor → no more events (no gaps, no dupes).
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", &format!("/api/v1/events?after={cursor}"), &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(body["events"].as_array().unwrap().is_empty());
+
+    // The DLQ endpoint works (empty here).
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", "/api/v1/events/dead", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Replay is admin-only.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/events?after=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

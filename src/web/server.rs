@@ -187,6 +187,10 @@ impl WebServer {
                 post(api::api_halt_agent).delete(api::api_unhalt_agent),
             )
             .route("/api/v1/sessions", get(api::api_list_sessions))
+            // Signed event outbox replay + DLQ (V9).
+            .route("/api/v1/events", get(api::api_list_events))
+            .route("/api/v1/events/dead", get(api::api_list_dead_letters))
+            .route("/api/v1/events/{sequence}/replay", post(api::api_replay_dead_letter))
             // Static files
             .nest_service("/static", static_dir);
 

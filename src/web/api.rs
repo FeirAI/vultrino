@@ -4,7 +4,7 @@
 //! Vultrino using API keys instead of session-based authentication.
 
 use axum::{
-    extract::{FromRequestParts, Json, Path, State},
+    extract::{FromRequestParts, Json, Path, Query, State},
     http::{header, request::Parts, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -692,6 +692,20 @@ async fn store_and_reload_policy(state: &AppState, policy: &Policy, created: boo
             serde_json::json!({"code": "reload_error", "error": format!("policy stored but the immediate engine reload failed; it will be applied within the policy refresh window (~{}s): {}", crate::server::POLICY_REFRESH_SECS, e)}),
         );
     }
+    // V9: emit a policy-change event to the signed outbox.
+    state
+        .server
+        .emit_event(
+            &policy.id,
+            crate::outbox::EVENT_POLICY_CHANGED,
+            serde_json::json!({
+                "policy_id": policy.id,
+                "name": policy.name,
+                "credential_pattern": policy.credential_pattern,
+                "change": if created { "created" } else { "replaced" },
+            }),
+        )
+        .await;
     let status = if created { StatusCode::CREATED } else { StatusCode::OK };
     (status, serde_json::to_value(policy).unwrap_or_default())
 }
@@ -944,6 +958,72 @@ pub async fn api_list_sessions(_admin: AdminApiAuth, State(state): State<AppStat
         Json(serde_json::json!({ "sessions": sessions, "process_scope": true })),
     )
         .into_response()
+}
+
+// -------- Event outbox replay (V9) --------
+
+/// Query for the event replay cursor.
+#[derive(Deserialize)]
+pub struct EventsQuery {
+    /// Return events with `sequence > after` (the consumer's last-seen cursor).
+    #[serde(default)]
+    pub after: u64,
+    /// Max events to return (default 100, capped at 1000).
+    pub limit: Option<usize>,
+}
+
+/// `GET /api/v1/events?after=N&limit=M` — replay events strictly after a cursor,
+/// in monotonic sequence order, gap-free (V9). A consumer that dropped offline
+/// resumes from its last-seen `sequence` with no gaps and no dupes.
+pub async fn api_list_events(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Query(q): Query<EventsQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(100).min(1000);
+    match state.storage.list_events_after(q.after, limit).await {
+        Ok(events) => {
+            // The next cursor is the highest sequence returned (or the request's
+            // `after` if none) — what the consumer persists for the next poll.
+            let next = events.last().map(|e| e.sequence).unwrap_or(q.after);
+            // Return the same envelope a pushed delivery carries (so a consumer
+            // processes replayed and pushed events identically).
+            let bodies: Vec<_> = events.iter().map(|e| e.delivery_body()).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "events": bodies, "next_cursor": next })),
+            )
+                .into_response()
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
+}
+
+/// `GET /api/v1/events/dead` — the dead-letter queue (events that exhausted their
+/// delivery retries) (V9).
+pub async fn api_list_dead_letters(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+    match state.storage.list_dead_letter_events(1000).await {
+        Ok(events) => (StatusCode::OK, Json(serde_json::json!({ "dead_letters": events }))).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
+}
+
+/// `POST /api/v1/events/{sequence}/replay` — requeue a dead-lettered event for
+/// re-delivery (V9).
+pub async fn api_replay_dead_letter(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(sequence): Path<u64>,
+) -> Response {
+    match state.storage.replay_dead_letter_event(sequence).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "requeued": true, "sequence": sequence }))).into_response(),
+        Ok(false) => error_response(
+            StatusCode::NOT_FOUND,
+            "not_dead_lettered",
+            format!("no dead-lettered event with sequence {sequence}"),
+        ),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
 }
 
 // -------- Roles --------

@@ -30,7 +30,7 @@ const STALE_EXECUTING_SECS: i64 = 120;
 /// `#[serde(default)]`, so a v4 binary reads older vaults fine; an older binary
 /// is correctly refused a v4 vault by [`check_version`] rather than silently
 /// dropping admin-managed policies on its next write.
-const STORAGE_VERSION: u32 = 4;
+const STORAGE_VERSION: u32 = 5;
 
 /// A reservation older than this (seconds) is assumed orphaned by a crashed
 /// request and may be re-reserved, so a single failed admin call can't block a
@@ -54,6 +54,49 @@ fn approval_is_due(a: &ApprovalRequest, now: DateTime<Utc>) -> bool {
         && (now >= a.expires_at
             || (a.status == ApprovalStatus::Pending && now >= a.escalate_at)))
         || a.needs_reauth()
+}
+
+/// Append an outbox event into a cache under the lock (V9), assigning the next
+/// monotonic sequence. Used both by the public `append_event` and by the
+/// state-change methods (decide/expire/escalate) so an event is emitted
+/// **atomically** with the state transition it describes — no lost or duplicated
+/// events on a crash between the two.
+fn push_event(
+    cache: &mut StorageCache,
+    subject: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) -> u64 {
+    cache.outbox_seq += 1;
+    let seq = cache.outbox_seq;
+    cache.outbox.insert(
+        seq,
+        crate::outbox::OutboxEvent {
+            sequence: seq,
+            subject: subject.to_string(),
+            event_type: event_type.to_string(),
+            payload,
+            created_at: Utc::now(),
+            delivery: crate::outbox::DeliveryState::Pending,
+            attempts: 0,
+            last_attempt_at: None,
+            last_error: None,
+        },
+    );
+    seq
+}
+
+/// The agent-safe outbox payload for an approval decision/lifecycle event (V9).
+fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
+    serde_json::json!({
+        "approval_id": a.id,
+        "status": a.status.to_string(),
+        "credential": a.credential,
+        "action": a.action,
+        "summary": a.summary,
+        "decided_by": a.decided_by,
+        "approver_identity": a.approver_identity,
+    })
 }
 
 /// Refuse to open a vault written by a newer binary.
@@ -124,6 +167,13 @@ struct StorageCache {
     /// Idempotency records for admin-API mutations, keyed by Idempotency-Key.
     #[serde(default)]
     idempotency: HashMap<String, IdempotencyRecord>,
+    /// Signed event outbox (V9), keyed by monotonic sequence. `BTreeMap` keeps it
+    /// ordered for gap-free cursor replay.
+    #[serde(default)]
+    outbox: std::collections::BTreeMap<u64, crate::outbox::OutboxEvent>,
+    /// Monotonic sequence counter for the outbox (V9): the last assigned sequence.
+    #[serde(default)]
+    outbox_seq: u64,
 
     // Secondary indexes for O(1) lookups (not serialized, rebuilt on load)
     /// Index: credential alias -> credential ID
@@ -754,7 +804,15 @@ impl StorageBackend for FileStorage {
                     approval.deny(decision)
                 };
                 result.map_err(|e| StorageError::Conflict(e.to_string()))?;
-                Ok(approval.clone())
+                let decided = approval.clone();
+                // V9: emit the decision event atomically with the decision.
+                let event_type = if approve {
+                    crate::outbox::EVENT_APPROVAL_APPROVED
+                } else {
+                    crate::outbox::EVENT_APPROVAL_DENIED
+                };
+                push_event(cache, &decided.id, event_type, approval_event_payload(&decided));
+                Ok(decided)
             })
             .await?;
         // Surface a separation-of-duty violation (V5) even when not hard-enforced,
@@ -785,19 +843,33 @@ impl StorageBackend for FileStorage {
             }
         }
         self.locked_mutate(|cache| {
-            let approval = cache
-                .approvals
-                .get_mut(id)
-                .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
-            // Escalate / expire as due.
-            approval.advance_lifecycle();
-            // A still-approved-but-unrun grant gone stale must be re-approved:
-            // flip it to expired (preserving the original approver) so the agent
-            // resubmits rather than running on a decision nobody re-confirmed.
-            if approval.needs_reauth() {
-                approval.expire_reauth_lapsed();
+            use crate::approval::LifecycleChange;
+            let (clone, event) = {
+                let approval = cache
+                    .approvals
+                    .get_mut(id)
+                    .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
+                // Escalate / expire as due.
+                let mut event = match approval.advance_lifecycle() {
+                    LifecycleChange::Escalated => Some(crate::outbox::EVENT_APPROVAL_ESCALATED),
+                    LifecycleChange::Expired => Some(crate::outbox::EVENT_APPROVAL_EXPIRED),
+                    LifecycleChange::None => None,
+                };
+                // A still-approved-but-unrun grant gone stale must be re-approved:
+                // flip it to expired (preserving the original approver) so the agent
+                // resubmits rather than running on a decision nobody re-confirmed.
+                if event.is_none() && approval.needs_reauth() {
+                    approval.expire_reauth_lapsed();
+                    event = Some(crate::outbox::EVENT_APPROVAL_EXPIRED);
+                }
+                let event = event.map(|et| (approval.id.clone(), et, approval_event_payload(approval)));
+                (approval.clone(), event)
+            };
+            // V9: emit the lifecycle event atomically with the transition.
+            if let Some((subj, et, payload)) = event {
+                push_event(cache, &subj, et, payload);
             }
-            Ok(approval.clone())
+            Ok(clone)
         })
             .await
     }
@@ -818,10 +890,19 @@ impl StorageBackend for FileStorage {
         }
         self.locked_mutate(|cache| {
             let mut sweep = crate::storage::ApprovalSweep::default();
+            // Collect events during the &mut iteration; push them after (can't
+            // borrow `cache` again while iterating its approvals).
+            let mut events: Vec<(String, &'static str, serde_json::Value)> = Vec::new();
             for approval in cache.approvals.values_mut() {
                 match approval.advance_lifecycle() {
-                    LifecycleChange::Escalated => sweep.escalated.push(approval.clone()),
-                    LifecycleChange::Expired => sweep.expired.push(approval.id.clone()),
+                    LifecycleChange::Escalated => {
+                        sweep.escalated.push(approval.clone());
+                        events.push((approval.id.clone(), crate::outbox::EVENT_APPROVAL_ESCALATED, approval_event_payload(approval)));
+                    }
+                    LifecycleChange::Expired => {
+                        sweep.expired.push(approval.id.clone());
+                        events.push((approval.id.clone(), crate::outbox::EVENT_APPROVAL_EXPIRED, approval_event_payload(approval)));
+                    }
                     LifecycleChange::None => {
                         // Also expire an approved-but-unrun grant whose continuous
                         // reauth window lapsed, so an abandoned stale grant doesn't
@@ -830,9 +911,14 @@ impl StorageBackend for FileStorage {
                         if approval.needs_reauth() {
                             approval.expire_reauth_lapsed();
                             sweep.expired.push(approval.id.clone());
+                            events.push((approval.id.clone(), crate::outbox::EVENT_APPROVAL_EXPIRED, approval_event_payload(approval)));
                         }
                     }
                 }
+            }
+            // V9: emit lifecycle events atomically with the sweep's transitions.
+            for (subj, et, payload) in events {
+                push_event(cache, &subj, et, payload);
             }
             Ok(sweep)
         })
@@ -884,6 +970,140 @@ impl StorageBackend for FileStorage {
             Ok(())
         })
             .await
+    }
+
+    // ==================== Event outbox (V9) ====================
+
+    async fn append_event(
+        &self,
+        subject: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<u64, StorageError> {
+        let subject = subject.to_string();
+        let event_type = event_type.to_string();
+        // The next monotonic sequence is assigned under the lock — authoritative
+        // and gap-free even across the web+MCP processes sharing the vault.
+        self.locked_mutate(move |cache| Ok(push_event(cache, &subject, &event_type, payload)))
+            .await
+    }
+
+    async fn list_events_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::outbox::OutboxEvent>, StorageError> {
+        // Authoritative read: pick up events appended by the other process.
+        self.reload().await?;
+        let cache = self.cache.read();
+        Ok(cache
+            .outbox
+            .range((after + 1)..)
+            .take(limit)
+            .map(|(_, e)| e.clone())
+            .collect())
+    }
+
+    async fn deliverable_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::outbox::OutboxEvent>, StorageError> {
+        use crate::outbox::DeliveryState;
+        self.reload().await?;
+        let cache = self.cache.read();
+        // The earliest still-pending event per subject (ascending by sequence), so
+        // per-subject ordering holds: a later event for a subject is withheld until
+        // its earlier one is delivered. A dead-lettered event is not Pending, so it
+        // doesn't block — the DLQ is the head-of-line release valve.
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for e in cache.outbox.values() {
+            if e.delivery != DeliveryState::Pending {
+                continue;
+            }
+            if seen.insert(e.subject.clone()) {
+                out.push(e.clone());
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn record_event_delivery(
+        &self,
+        sequence: u64,
+        success: bool,
+        error: Option<String>,
+        max_attempts: u32,
+    ) -> Result<(), StorageError> {
+        use crate::outbox::DeliveryState;
+        self.locked_mutate(move |cache| {
+            if let Some(e) = cache.outbox.get_mut(&sequence) {
+                e.attempts += 1;
+                e.last_attempt_at = Some(Utc::now());
+                if success {
+                    e.delivery = DeliveryState::Delivered;
+                    e.last_error = None;
+                } else {
+                    e.last_error = error;
+                    if e.attempts >= max_attempts {
+                        e.delivery = DeliveryState::DeadLettered;
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_dead_letter_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::outbox::OutboxEvent>, StorageError> {
+        use crate::outbox::DeliveryState;
+        self.reload().await?;
+        let cache = self.cache.read();
+        Ok(cache
+            .outbox
+            .values()
+            .filter(|e| e.delivery == DeliveryState::DeadLettered)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn replay_dead_letter_event(&self, sequence: u64) -> Result<bool, StorageError> {
+        use crate::outbox::DeliveryState;
+        self.locked_mutate(move |cache| {
+            match cache.outbox.get_mut(&sequence) {
+                Some(e) if e.delivery == DeliveryState::DeadLettered => {
+                    e.delivery = DeliveryState::Pending;
+                    e.attempts = 0;
+                    e.last_error = None;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        })
+        .await
+    }
+
+    async fn gc_outbox(&self, retention_secs: u64) -> Result<usize, StorageError> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(retention_secs as i64);
+        self.locked_mutate(move |cache| {
+            let before = cache.outbox.len();
+            // Prune every event older than the retention window, regardless of
+            // delivery state. Because sequence increases with time, this removes
+            // the oldest *prefix* — so the retained suffix stays gap-free (the
+            // replay no-gaps guarantee holds within the window) and the log can't
+            // grow without bound even when push delivery is disabled. A consumer
+            // (or a dead-letter) therefore has `retention_secs` to be replayed.
+            cache.outbox.retain(|_, e| e.created_at >= cutoff);
+            Ok(before - cache.outbox.len())
+        })
+        .await
     }
 
     // ==================== Policy Storage (admin API, V1) ====================

@@ -866,8 +866,9 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     let auth_manager = Arc::new(RwLock::new(AuthManager::from_data(stored_roles, stored_keys)));
 
     let config_policies = config.policies.clone();
-    // Capture the approval config before `config` moves into the server (V5).
+    // Capture the approval + outbox config before `config` moves into the server.
     let approval_cfg = config.approval.clone();
+    let outbox_cfg = config.outbox.clone();
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage, resolver);
 
@@ -900,6 +901,12 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
             std::time::Duration::from_secs(vultrino::server::APPROVAL_SWEEP_SECS),
         ));
     }
+    // Deliver + GC the signed event outbox (V9).
+    tokio::spawn(vultrino::server::deliver_outbox_periodically(
+        server.storage().clone(),
+        outbox_cfg.clone(),
+        std::time::Duration::from_secs(vultrino::server::OUTBOX_DELIVERY_SECS),
+    ));
 
     let vultrino = Arc::new(RwLock::new(server));
     let mut mcp = McpServer::new(vultrino, auth_manager);
@@ -957,6 +964,12 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
             std::time::Duration::from_secs(vultrino::server::APPROVAL_SWEEP_SECS),
         ));
     }
+    // Deliver + GC the signed event outbox (V9).
+    tokio::spawn(vultrino::server::deliver_outbox_periodically(
+        exec_server.storage().clone(),
+        config.outbox.clone(),
+        std::time::Duration::from_secs(vultrino::server::OUTBOX_DELIVERY_SECS),
+    ));
 
     let web_config = WebConfig {
         bind,

@@ -25,6 +25,49 @@ pub struct RawConfig {
     /// govder action-label → canonical plugin.action mappings (V8).
     #[serde(default)]
     pub action_labels: Vec<RawActionLabel>,
+    /// Signed event-outbox delivery config (V9).
+    pub outbox: Option<RawOutboxConfig>,
+}
+
+/// TOML shape for `[outbox]` (V9).
+#[derive(Debug, Deserialize, Default)]
+pub struct RawOutboxConfig {
+    pub enabled: Option<bool>,
+    pub url: Option<String>,
+    pub hmac_secret: Option<String>,
+    pub max_attempts: Option<u32>,
+    pub retention_secs: Option<u64>,
+}
+
+impl TryFrom<RawOutboxConfig> for crate::outbox::OutboxConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawOutboxConfig) -> Result<Self, Self::Error> {
+        // A url present implies push delivery is enabled unless explicitly off.
+        let enabled = raw.enabled.unwrap_or_else(|| raw.url.is_some());
+        if enabled {
+            // Pushing without a destination or signing secret is a fail-loud
+            // misconfiguration (an unsigned/undeliverable outbox is useless).
+            if raw.url.as_deref().unwrap_or("").trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "outbox: `url` is required when delivery is enabled".to_string(),
+                ));
+            }
+            if raw.hmac_secret.as_deref().unwrap_or("").trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "outbox: `hmac_secret` is required when delivery is enabled (deliveries are signed)".to_string(),
+                ));
+            }
+        }
+        let defaults = crate::outbox::OutboxConfig::default();
+        Ok(Self {
+            enabled,
+            url: raw.url.filter(|s| !s.trim().is_empty()),
+            hmac_secret: raw.hmac_secret.filter(|s| !s.trim().is_empty()),
+            max_attempts: raw.max_attempts.filter(|m| *m > 0).unwrap_or(defaults.max_attempts),
+            retention_secs: raw.retention_secs.filter(|r| *r > 0).unwrap_or(defaults.retention_secs),
+        })
+    }
 }
 
 /// Raw action-label mapping (V8): a govder business verb (e.g. "payments.refund")
@@ -703,6 +746,29 @@ action = "deny"
         let shadow =
             format!("{}\n{}", label("a.b", "mock.echo"), label("c.d", "a.b"));
         assert!(Config::parse(&shadow).is_err());
+    }
+
+    #[test]
+    fn test_outbox_config_validation() {
+        // A full outbox config parses and enables delivery.
+        let cfg = Config::parse(
+            "[outbox]\nurl = \"https://hooks.example.com/v\"\nhmac_secret = \"s3cr3t\"\nmax_attempts = 4",
+        )
+        .unwrap();
+        assert!(cfg.outbox.enabled);
+        assert_eq!(cfg.outbox.url.as_deref(), Some("https://hooks.example.com/v"));
+        assert_eq!(cfg.outbox.max_attempts, 4);
+
+        // Enabled (a url present) without a signing secret is rejected — deliveries
+        // must be signed.
+        assert!(Config::parse("[outbox]\nurl = \"https://hooks.example.com/v\"").is_err());
+        // Explicitly enabled without a url is rejected.
+        assert!(Config::parse("[outbox]\nenabled = true\nhmac_secret = \"s\"").is_err());
+        // No [outbox] section → disabled default.
+        assert!(!Config::parse("").unwrap().outbox.enabled);
+        // enabled = false explicitly → disabled even with a url.
+        let off = Config::parse("[outbox]\nenabled = false\nurl = \"https://x\"\nhmac_secret = \"s\"").unwrap();
+        assert!(!off.outbox.enabled);
     }
 
     #[test]

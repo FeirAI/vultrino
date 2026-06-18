@@ -7,6 +7,7 @@ mod file;
 pub use file::FileStorage;
 
 use crate::approval::{ApprovalRequest, ApprovalStatus};
+use crate::outbox::OutboxEvent;
 use crate::auth::{ApiKey, Role, UseToken};
 use crate::policy::Policy;
 use crate::{Credential, CredentialMetadata};
@@ -360,6 +361,75 @@ pub trait StorageBackend: Send + Sync {
         _id: &str,
     ) -> Result<Option<ApprovalRequest>, StorageError> {
         Ok(None)
+    }
+
+    // ==================== Event outbox (V9) ====================
+    //
+    // A durable, ordered, replayable, signed event log. Default impls are no-ops
+    // so non-file backends compile (and simply don't persist events).
+
+    /// Append an event to the outbox, assigning the next monotonic sequence
+    /// atomically under the lock, and return that sequence (V9). The default is a
+    /// no-op returning 0 (backends without outbox support don't persist events).
+    async fn append_event(
+        &self,
+        _subject: &str,
+        _event_type: &str,
+        _payload: serde_json::Value,
+    ) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+
+    /// Events with `sequence > after`, ascending, up to `limit` — the gap-free
+    /// replay cursor (V9). Includes all delivery states so a consumer replaying
+    /// from its cursor sees every event exactly once.
+    async fn list_events_after(
+        &self,
+        _after: u64,
+        _limit: usize,
+    ) -> Result<Vec<OutboxEvent>, StorageError> {
+        Ok(vec![])
+    }
+
+    /// The next deliverable pending events (V9): the earliest still-pending event
+    /// per subject (so per-subject ordering is preserved — a later event for a
+    /// subject is withheld until its earlier one is delivered), ascending by
+    /// sequence, up to `limit`.
+    async fn deliverable_events(&self, _limit: usize) -> Result<Vec<OutboxEvent>, StorageError> {
+        Ok(vec![])
+    }
+
+    /// Record a delivery attempt's outcome (V9): on success mark `Delivered`; on
+    /// failure increment attempts and dead-letter once `>= max_attempts`.
+    async fn record_event_delivery(
+        &self,
+        _sequence: u64,
+        _success: bool,
+        _error: Option<String>,
+        _max_attempts: u32,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Dead-lettered events (V9), ascending by sequence, up to `limit`.
+    async fn list_dead_letter_events(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<OutboxEvent>, StorageError> {
+        Ok(vec![])
+    }
+
+    /// Reset a dead-lettered event to pending for re-delivery (V9). Returns
+    /// whether it was found and reset.
+    async fn replay_dead_letter_event(&self, _sequence: u64) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Garbage-collect **delivered** events older than `retention_secs` (V9).
+    /// Pending and dead-lettered events are retained until resolved. Returns the
+    /// number pruned.
+    async fn gc_outbox(&self, _retention_secs: u64) -> Result<usize, StorageError> {
+        Ok(0)
     }
 
     // ==================== Policy Storage (admin API, V1) ====================

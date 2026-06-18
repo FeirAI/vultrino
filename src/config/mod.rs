@@ -51,6 +51,8 @@ pub struct Config {
     pub egress: Vec<crate::egress::EgressRule>,
     /// govder action-label → canonical plugin.action map (V8).
     pub action_labels: std::collections::HashMap<String, String>,
+    /// Signed event-outbox delivery config (V9).
+    pub outbox: crate::outbox::OutboxConfig,
 }
 
 impl Config {
@@ -203,6 +205,8 @@ impl Config {
             p.validate().map_err(ConfigError::Invalid)?;
         }
 
+        let outbox = raw.outbox.map(TryInto::try_into).transpose()?.unwrap_or_default();
+
         Ok(Self {
             server,
             storage,
@@ -214,6 +218,7 @@ impl Config {
             spend_extractors,
             egress,
             action_labels,
+            outbox,
         })
     }
 
@@ -230,6 +235,7 @@ impl Config {
             spend_extractors: vec![],
             egress: vec![],
             action_labels: std::collections::HashMap::new(),
+            outbox: crate::outbox::OutboxConfig::default(),
         }
     }
 

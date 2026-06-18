@@ -476,6 +476,20 @@ impl VultrinoServer {
                 None => self.storage.store_approval(&approval).await?,
             }
             self.dispatch_notifications(&approval, &decision_token).await;
+            // V9: emit the requested event to the signed outbox.
+            self.emit_event(
+                &approval.id,
+                crate::outbox::EVENT_APPROVAL_REQUESTED,
+                serde_json::json!({
+                    "approval_id": approval.id,
+                    "credential": approval.credential,
+                    "action": approval.action,
+                    "summary": approval.summary,
+                    "requested_by": approval.requester.describe(),
+                    "criticality": approval.criticality.to_string(),
+                }),
+            )
+            .await;
 
             info!(
                 approval_id = %approval.id,
@@ -618,8 +632,8 @@ impl VultrinoServer {
                     "Failed to persist updated credential (token refresh)"
                 );
             }
-            // V7: emit an observable rotation event. govder subscription is wired
-            // through the signed outbox in V9; this is the emit side.
+            // V7/V9: emit an observable rotation event to the signed outbox so a
+            // govder subscriber sees in-path token rotation.
             info!(
                 event = "credential.rotated",
                 credential = %credential_alias,
@@ -627,6 +641,15 @@ impl VultrinoServer {
                 request_id = %request_id,
                 "credential rotated in-path (e.g. OAuth2 token refresh)"
             );
+            self.emit_event(
+                &credential_alias,
+                crate::outbox::EVENT_CREDENTIAL_ROTATED,
+                serde_json::json!({
+                    "credential": credential_alias,
+                    "credential_type": updated_data.credential_type().to_string(),
+                }),
+            )
+            .await;
         }
 
         // Record for rate limiting.
@@ -896,6 +919,15 @@ impl VultrinoServer {
         &self.sessions
     }
 
+    /// Best-effort append of an event to the signed outbox (V9). Never fails the
+    /// calling operation — an event-log problem must not block the action it
+    /// describes (the action's own success is the source of truth).
+    pub async fn emit_event(&self, subject: &str, event_type: &str, payload: serde_json::Value) {
+        if let Err(e) = self.storage.append_event(subject, event_type, payload).await {
+            warn!(error = %e, event_type, "failed to append outbox event");
+        }
+    }
+
     /// Register a harness abort callback fired on halt (V6).
     pub fn register_halt_callback(&self, cb: Arc<dyn crate::session::HaltCallback>) {
         self.halt_callbacks.write().push(cb);
@@ -972,6 +1004,19 @@ impl VultrinoServer {
                 warn!(callback = cb.name(), agent = %label, "halt abort callback timed out");
             }
         }
+
+        // V9: emit the halt event to the signed outbox.
+        self.emit_event(
+            label,
+            crate::outbox::EVENT_AGENT_HALTED,
+            serde_json::json!({
+                "agent_label": label,
+                "revoked_tokens": revoked_tokens.len(),
+                "deny_policy_id": deny_policy_id,
+                "in_flight": in_flight.len(),
+            }),
+        )
+        .await;
 
         info!(
             agent = %label,
@@ -1071,6 +1116,76 @@ pub const POLICY_REFRESH_SECS: u64 = 5;
 
 /// Default interval for the background approval SLA sweep (V5).
 pub const APPROVAL_SWEEP_SECS: u64 = 15;
+
+/// Default interval for the background event-outbox delivery pass (V9).
+pub const OUTBOX_DELIVERY_SECS: u64 = 5;
+
+/// Run GC on this many delivery passes (so it isn't on the hot delivery path).
+const OUTBOX_GC_EVERY: u64 = 60;
+
+/// Max events delivered per pass (V9), to bound a single pass's work.
+const OUTBOX_BATCH: usize = 64;
+
+/// One pass of outbox delivery (V9): deliver the next deliverable event per
+/// subject (per-subject ordering preserved), each signed with the shared HMAC
+/// secret, recording success / failure (→ retry → dead-letter). A no-op when no
+/// URL/secret is configured (events are still appended + replayable via the API).
+pub async fn deliver_outbox_once(
+    storage: &Arc<dyn StorageBackend>,
+    config: &crate::outbox::OutboxConfig,
+    client: &reqwest::Client,
+) -> Result<(), crate::storage::StorageError> {
+    let (Some(url), Some(secret)) = (config.url.as_deref(), config.hmac_secret.as_deref()) else {
+        return Ok(());
+    };
+    for event in storage.deliverable_events(OUTBOX_BATCH).await? {
+        let body = serde_json::to_vec(&event.delivery_body()).unwrap_or_default();
+        let signature = crate::outbox::sign_body(secret, &body);
+        let outcome = client
+            .post(url)
+            .header("Govder-Signature", signature)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await;
+        let (success, error) = match outcome {
+            Ok(resp) if resp.status().is_success() => (true, None),
+            Ok(resp) => (false, Some(format!("delivery returned {}", resp.status()))),
+            // Strip the URL from the transport error so it never logs a secret.
+            Err(e) => (false, Some(e.without_url().to_string())),
+        };
+        storage
+            .record_event_delivery(event.sequence, success, error, config.max_attempts)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Background loop driving outbox delivery + periodic GC (V9). Always runs (when
+/// the feature is wired) so the always-on event log is bounded by retention even
+/// if push delivery is unconfigured; it pushes only when a URL + secret are set.
+/// Safe to run in more than one process over the shared vault — per-subject
+/// delivery and the monotonic sequence are atomic under the fd lock.
+pub async fn deliver_outbox_periodically(
+    storage: Arc<dyn StorageBackend>,
+    config: crate::outbox::OutboxConfig,
+    interval: std::time::Duration,
+) {
+    let client = reqwest::Client::new();
+    let mut ticks: u64 = 0;
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Err(e) = deliver_outbox_once(&storage, &config, &client).await {
+            warn!(error = %e, "outbox delivery pass failed");
+        }
+        ticks = ticks.wrapping_add(1);
+        if ticks.is_multiple_of(OUTBOX_GC_EVERY) {
+            if let Err(e) = storage.gc_outbox(config.retention_secs).await {
+                warn!(error = %e, "outbox GC failed");
+            }
+        }
+    }
+}
 
 /// One iteration of the approval SLA sweep (V5): re-read the vault, advance every
 /// open request (escalate / expire) atomically, and re-ping the notifiers for

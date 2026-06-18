@@ -2186,3 +2186,59 @@ async fn test_v6_kill_policy_survives_cross_process_refresh() {
     });
     assert!(matches!(decision, PolicyDecision::Deny(_)), "reloaded kill is authoritative");
 }
+
+#[tokio::test]
+async fn test_v9_lifecycle_events_emitted_to_outbox() {
+    // V9: the approval lifecycle + halt emit ordered events to the signed outbox.
+    let (server, storage) = setup().await; // allow mode
+    store_credential(&storage, "pay-cred", true).await; // require_approval
+
+    let (_full, mut token) = UseToken::create(NewUseToken {
+        name: "bot".to_string(),
+        credential_scope: "pay-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.agent_label = Some("bot-7".to_string());
+    storage.store_use_token(&token).await.unwrap();
+
+    let auth = ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+    let approval = match server.execute_gated(echo_request("pay-cred"), auth).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+
+    // approval.requested emitted, keyed by the approval id.
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == "approval.requested" && e.subject == approval.id),
+        "approval.requested emitted"
+    );
+
+    // Decide → approval.approved emitted atomically with the decision.
+    storage
+        .decide_approval(&approval.id, true, "admin panel", "secops", false, None)
+        .await
+        .unwrap();
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    assert!(events.iter().any(|e| e.event_type == "approval.approved" && e.subject == approval.id));
+
+    // Halt → agent.halted emitted, keyed by the agent label.
+    server.halt_agent("bot-7").await.unwrap();
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    assert!(events.iter().any(|e| e.event_type == "agent.halted" && e.subject == "bot-7"));
+
+    // Sequences are strictly increasing and unique across all emitted events.
+    let seqs: Vec<u64> = events.iter().map(|e| e.sequence).collect();
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(seqs, sorted, "monotonic, no dupes");
+}

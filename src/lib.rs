@@ -10,6 +10,7 @@ pub mod config;
 pub mod crypto;
 pub mod egress;
 pub mod mcp;
+pub mod outbox;
 pub mod plugins;
 pub mod policy;
 pub mod router;
