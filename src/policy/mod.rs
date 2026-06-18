@@ -880,6 +880,28 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_evaluate_matches_per_agent_via_context() {
+        // The legacy 4-arg evaluate derives the full principal (id + agent_label)
+        // from RequestContext, so per-agent policies match through it too.
+        let engine = PolicyEngine::new();
+        engine.set_default_deny(false);
+        engine.add_policy(Policy::deny_all("kill", "api-*").with_principal("bot"));
+        let mut ctx = make_context();
+        ctx.api_key_id = Some("tok1".to_string());
+        ctx.agent_label = Some("bot".to_string());
+        assert!(matches!(
+            engine.evaluate("api-1", Some("https://x"), Some("GET"), &ctx),
+            PolicyDecision::Deny(_)
+        ));
+        // Without the label the per-agent deny doesn't match (fail-open allow).
+        ctx.agent_label = None;
+        assert_eq!(
+            engine.evaluate("api-1", Some("https://x"), Some("GET"), &ctx),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
     fn test_principal_pattern_matches_id_too() {
         let engine = PolicyEngine::new();
         engine.set_default_deny(false);

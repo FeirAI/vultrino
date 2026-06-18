@@ -1269,6 +1269,19 @@ async fn test_spend_capped_approval_resumes_without_recharge() {
         ExecutionOutcome::Pending(a) => a.id,
         other => panic!("expected Pending, got {other:?}"),
     };
+
+    // Prove the 60 was actually charged at OPEN: a second 60 (=120) now exceeds
+    // the 100 cumulative cap and is denied before it can even open an approval.
+    let again = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({ "amount": 60 }),
+    };
+    assert!(matches!(
+        server.execute_gated(again, ExecAuth::default()).await.unwrap_err(),
+        vultrino::VultrinoError::PolicyDenied(_)
+    ));
+
     storage.decide_approval(&approval_id, true, "approver", None).await.unwrap();
 
     // Resume must succeed (read-only spend check does not re-charge/deny).

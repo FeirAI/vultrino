@@ -286,6 +286,25 @@ fn hash_token(token: &str) -> String {
     STANDARD.encode(hasher.finalize())
 }
 
+/// Validate an agent label (V4). The label feeds `principal_pattern` glob
+/// matching and the spend-ledger key (`agent:<label>`), so restrict it to a
+/// safe allowlist to avoid unintended glob matches or key-prefix collisions.
+/// Centralized so every token-write path enforces the same rule.
+pub fn validate_agent_label(label: &str) -> Result<(), String> {
+    if label.is_empty() {
+        return Err("agent_label must not be empty".to_string());
+    }
+    if !label
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(
+            "agent_label may only contain ASCII letters, digits, '.', '_' or '-'".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Glob-style match used for both credential and action scopes.
 fn pattern_matches(pattern: &str, value: &str) -> bool {
     if pattern == "*" {

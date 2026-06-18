@@ -593,13 +593,21 @@ impl VultrinoServer {
         // credential to stop an in-flight approval regardless. The principal id
         // is taken from the explicit `approval.principal_id` (set at open), not
         // derived from the requester, so per-agent denies re-evaluate reliably.
-        let principal = approval.principal_id.as_ref().map(|id| crate::policy::Principal {
-            id: id.clone(),
+        // Fall back to the requester's principal id for approvals persisted
+        // before `principal_id` existed.
+        let principal_id = approval
+            .principal_id
+            .clone()
+            .or_else(|| approval.requester.principal_id.clone());
+        let principal = principal_id.map(|id| crate::policy::Principal {
+            id,
             agent_label: approval.agent_label.clone(),
         });
         // Spend was checked AND charged when the approval opened; the read-only
         // resume re-enforces only hard deny gates and does not re-charge, so no
-        // spend attempt is needed here.
+        // spend attempt is needed. NOTE: a spend cap *changed* after the approval
+        // opened therefore does not re-bind to this in-flight action (its spend
+        // was already accounted at open) — push a Deny to stop it regardless.
         if let crate::policy::PolicyDecision::Deny(reason) =
             self.policy_engine.evaluate_readonly_full(&crate::policy::EvalInput {
                 credential_alias: &credential.alias,

@@ -799,14 +799,13 @@ pub async fn api_create_token(
                 serde_json::json!({"code": "invalid_token", "error": e}),
             );
         }
-        // Validate the agent label: it feeds principal_pattern glob matching and
-        // the spend-ledger key, so reject glob metacharacters and the ':' used as
-        // a spend-key prefix separator, to avoid unintended matches/collisions.
+        // Validate the agent label against the centralized allowlist (feeds
+        // principal_pattern glob matching and the spend-ledger key).
         if let Some(label) = &req.agent_label {
-            if label.contains(['*', '?', '[', ']', ':']) {
+            if let Err(e) = crate::auth::validate_agent_label(label) {
                 return (
                     StatusCode::BAD_REQUEST,
-                    serde_json::json!({"code": "invalid_agent_label", "error": "agent_label must not contain glob metacharacters (* ? [ ]) or ':'"}),
+                    serde_json::json!({"code": "invalid_agent_label", "error": e}),
                 );
             }
         }
