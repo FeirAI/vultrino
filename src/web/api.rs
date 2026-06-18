@@ -810,6 +810,11 @@ pub struct TokenCreateRequest {
     /// require_approval (multi-use). Overrides max_uses/require_approval.
     #[serde(default)]
     pub strictness: Option<String>,
+    /// Optional human/directory owner of this NHI (V10): the IdP-resolvable owner
+    /// (OIDC `sub` / SCIM id), so this `vut_` maps to a directory identity for
+    /// separation-of-duty and audit.
+    #[serde(default)]
+    pub owner_identity: Option<String>,
 }
 
 /// `POST /api/v1/tokens` — mint a use token; the plaintext is returned once.
@@ -874,10 +879,11 @@ pub async fn api_create_token(
             }
         }
         let (full_token, mut token) = UseToken::create(params);
-        // Bind the agent identity (V4) and dual-control flag (V8) post-create;
-        // these fields are not moved into `params` above.
+        // Bind the agent identity (V4), dual-control flag (V8), and human owner
+        // (V10) post-create; these fields are not moved into `params` above.
         token.agent_label = req.agent_label;
         token.dual_control = dual_control;
+        token.owner_identity = req.owner_identity.filter(|s| !s.trim().is_empty());
         if let Err(e) = st.storage.store_use_token(&token).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

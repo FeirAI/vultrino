@@ -259,6 +259,7 @@ impl AuthManager {
             created_at: Utc::now(),
             last_used_at: None,
             agent_label: None,
+            owner_identity: None,
         };
 
         self.add_key_internal(api_key.clone());

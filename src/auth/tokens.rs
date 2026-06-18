@@ -80,6 +80,11 @@ pub struct UseToken {
     /// by the approval layer in V12; recorded here and on the approval now.
     #[serde(default)]
     pub dual_control: bool,
+    /// Optional human/directory owner of this non-human identity (V10): the
+    /// IdP-resolvable owner binding (OIDC `sub` / SCIM id), so a `vut_` maps to a
+    /// directory identity for separation-of-duty and audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_identity: Option<String>,
 }
 
 /// Why a use token is not currently usable.
@@ -166,6 +171,7 @@ impl UseToken {
             revoked: false,
             agent_label: None,
             dual_control: false,
+            owner_identity: None,
         };
 
         (full_token, token)

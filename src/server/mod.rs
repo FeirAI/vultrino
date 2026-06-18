@@ -75,6 +75,7 @@ impl ExecAuth {
             principal_id: Some(auth.api_key.id.clone()),
             principal_name: Some(auth.api_key.name.clone()),
             role: Some(auth.role.name.clone()),
+            owner: auth.api_key.owner_identity.clone(),
         };
         Self {
             auth: Some(auth),
@@ -93,6 +94,7 @@ impl ExecAuth {
             principal_id: Some(token.id.clone()),
             principal_name: Some(token.name.clone()),
             role: None,
+            owner: token.owner_identity.clone(),
         };
         Self {
             auth: Some(AuthResult::for_use_token(&token)),
@@ -383,6 +385,8 @@ impl VultrinoServer {
         let principal = exec_auth.auth.as_ref().map(|a| crate::policy::Principal {
             id: a.api_key.id.clone(),
             agent_label: a.api_key.agent_label.clone(),
+            // V10: the IdP-resolvable human owner of this NHI, when bound.
+            owner: a.api_key.owner_identity.clone(),
         });
         // V3: the extracted spend attempt (amount + asset) for SpendCap.
         let spend = crate::policy::extract_spend(
@@ -441,11 +445,18 @@ impl VultrinoServer {
                 .approval_config
                 .criticality_for(&credential.alias, &full_action);
             let sla = self.approval_config.sla_for(criticality);
+            // V10: record the requester's IdP-resolvable owner (if bound) on the
+            // approval so separation-of-duty compares the approver against the
+            // directory owner, not just the agent label.
+            let mut requester = exec_auth.requester.clone();
+            if requester.owner.is_none() {
+                requester.owner = principal.as_ref().and_then(|p| p.owner.clone());
+            }
             let (approval, decision_token) = ApprovalRequest::open(NewApproval {
                 credential: credential.alias.clone(),
                 action: full_action.clone(),
                 params: request.params.clone(),
-                requester: exec_auth.requester.clone(),
+                requester,
                 use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
                 principal_id: principal.as_ref().map(|p| p.id.clone()),
                 agent_label: principal.as_ref().and_then(|p| p.agent_label.clone()),
@@ -734,6 +745,9 @@ impl VultrinoServer {
         let principal = principal_id.map(|id| crate::policy::Principal {
             id,
             agent_label: approval.agent_label.clone(),
+            // Owner doesn't affect policy matching (only SoD, computed at decide
+            // time on the requester record), so it isn't needed for the resume gate.
+            owner: None,
         });
         // Spend was checked AND charged when the approval opened; the read-only
         // resume re-enforces only hard deny gates and does not re-charge, so no

@@ -67,6 +67,8 @@ impl AuthResult {
             // Carry the token's agent label so the resolved principal can be
             // matched by a policy's principal_pattern (V4).
             agent_label: token.agent_label.clone(),
+            // Carry the bound human owner (V10) for SoD + audit.
+            owner_identity: token.owner_identity.clone(),
         };
         Self { api_key, role }
     }

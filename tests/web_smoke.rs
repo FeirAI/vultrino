@@ -536,6 +536,7 @@ async fn test_admin_delete_role_in_use_conflict() {
             created_at: chrono::Utc::now(),
             last_used_at: None,
             agent_label: None,
+            owner_identity: None,
         })
         .await
         .unwrap();

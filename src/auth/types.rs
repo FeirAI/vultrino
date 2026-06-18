@@ -203,6 +203,11 @@ pub struct ApiKey {
     /// matching (so a per-agent policy can target it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
+    /// Optional human/directory owner of this non-human identity (V10): the
+    /// IdP-resolvable owner binding (OIDC `sub` / SCIM id) so a `vk_` maps to a
+    /// directory identity. Used for separation-of-duty and audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_identity: Option<String>,
 }
 
 impl ApiKey {
@@ -351,6 +356,7 @@ mod tests {
             created_at: Utc::now(),
             last_used_at: None,
             agent_label: None,
+            owner_identity: None,
         };
         assert!(!key.is_expired());
 

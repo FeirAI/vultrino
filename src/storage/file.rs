@@ -1522,6 +1522,7 @@ mod tests {
             created_at: Utc::now(),
             last_used_at: None,
             agent_label: None,
+            owner_identity: None,
         };
 
         storage.store_api_key(&key).await.unwrap();

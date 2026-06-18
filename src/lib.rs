@@ -9,6 +9,7 @@ pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod egress;
+pub mod identity;
 pub mod mcp;
 pub mod outbox;
 pub mod plugins;

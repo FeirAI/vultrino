@@ -402,6 +402,7 @@ async fn test_token_force_approval_consumes_on_resume() {
             principal_id: Some(token.id.clone()),
             principal_name: Some(token.name.clone()),
             role: None,
+            owner: None,
         },
     };
 
@@ -684,6 +685,7 @@ async fn test_ownership_check_blocks_foreign_principal() {
             principal_id: Some("owner".to_string()),
             principal_name: Some("owner-key".to_string()),
             role: None,
+            owner: None,
         },
     };
     let approval = match server
@@ -1618,6 +1620,7 @@ async fn test_v5_approver_identity_recorded_and_sod_computable() {
         principal_id: Some("k1".to_string()),
         principal_name: Some("agent-x".to_string()),
         role: Some("executor".to_string()),
+        owner: None,
     };
     let exec_auth = ExecAuth {
         auth: None,
@@ -1664,6 +1667,7 @@ async fn test_v5_distinct_approver_satisfies_sod() {
         principal_id: Some("k1".to_string()),
         principal_name: Some("agent-x".to_string()),
         role: None,
+        owner: None,
     };
     let exec_auth = ExecAuth {
         auth: None,
@@ -1746,6 +1750,7 @@ async fn test_v5_enforce_sod_rejects_self_approval_end_to_end() {
         principal_id: Some("k1".to_string()),
         principal_name: Some("agent-x".to_string()),
         role: None,
+        owner: None,
     };
     let exec_auth = ExecAuth {
         auth: None,
@@ -2176,7 +2181,7 @@ async fn test_v6_kill_policy_survives_cross_process_refresh() {
         engine.list_policies().iter().any(|p| p.id == "halt:bot-7" && p.kill),
         "kill flag must survive the storage round-trip"
     );
-    let halted = Principal { id: "k1".to_string(), agent_label: Some("bot-7".to_string()) };
+    let halted = Principal { id: "k1".to_string(), agent_label: Some("bot-7".to_string()) , owner: None };
     let decision = engine.evaluate_full(&EvalInput {
         credential_alias: "anything",
         url: None,

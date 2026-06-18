@@ -125,6 +125,11 @@ pub struct RequesterInfo {
     /// Role name, if the principal was an API key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Human/directory owner bound to the requesting NHI (V10): the IdP-resolvable
+    /// owner (OIDC `sub` / SCIM id). The most precise "requester's owner" for
+    /// separation-of-duty when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 impl Default for RequesterInfo {
@@ -141,6 +146,7 @@ impl RequesterInfo {
             principal_id: None,
             principal_name: None,
             role: None,
+            owner: None,
         }
     }
 
@@ -566,12 +572,13 @@ impl ApprovalRequest {
     /// own identity (a self-approval). `None` when either side is unknown.
     fn sod_for(&self, candidate: &str) -> Option<bool> {
         let approver = candidate.trim();
-        // The requester's "owner" identity: prefer the human/agent label, then
-        // the stable principal id.
+        // The requester's "owner" identity: prefer the IdP-resolvable directory
+        // owner (V10), then the human/agent label, then the stable principal id.
         let owner = self
             .requester
-            .principal_name
+            .owner
             .as_deref()
+            .or(self.requester.principal_name.as_deref())
             .or(self.agent_label.as_deref())
             .or(self.principal_id.as_deref())
             .or(self.requester.principal_id.as_deref())?
@@ -1055,6 +1062,7 @@ mod tests {
                 principal_id: Some("k1".to_string()),
                 principal_name: Some("agent".to_string()),
                 role: Some("executor".to_string()),
+                owner: None,
             },
             use_token_id: None,
             principal_id: Some("k1".to_string()),
@@ -1273,6 +1281,24 @@ mod tests {
         assert_eq!(a.advance_lifecycle(), LifecycleChange::Escalated);
         a.approve(Decision::new("admin panel", "alice")).unwrap();
         assert_eq!(a.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn test_sod_uses_directory_owner_when_present() {
+        // V10: when the requesting NHI has a bound directory owner, SoD compares
+        // the approver to that owner (the most precise "requester's owner"), not
+        // just the agent label.
+        let (mut a, _) = new_approval(); // principal_name "agent"
+        a.requester.owner = Some("alice@example.com".to_string());
+        a.approve(Decision::new("admin panel", "ALICE@example.com")).unwrap();
+        assert_eq!(a.violates_sod(), Some(true), "approver == bound owner → SoD violation");
+
+        // Approving as the agent label (not the owner) is NOT a violation now that
+        // the owner is the authoritative comparison.
+        let (mut b, _) = new_approval();
+        b.requester.owner = Some("alice@example.com".to_string());
+        b.deny(Decision::new("admin panel", "agent")).unwrap();
+        assert_eq!(b.violates_sod(), Some(false), "owner takes precedence over agent label");
     }
 
     #[test]
