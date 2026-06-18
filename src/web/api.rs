@@ -971,6 +971,15 @@ pub async fn api_create_credential(
         }
         let mut cred = Credential::new(req.alias, req.data);
         cred.metadata = req.metadata;
+        // Warn if a secret is below the egress redaction floor: its reflection
+        // would not be auto-scrubbed (use an egress `block` rule for it).
+        if crate::egress::has_unredactable_secret(&cred.data.secret_material()) {
+            tracing::warn!(
+                credential = %cred.alias,
+                "credential has a secret shorter than the egress redaction floor; a reflected \
+                 copy would not be auto-redacted — consider an [[egress]] block rule"
+            );
+        }
         if let Err(e) = st.storage.store(&cred).await {
             // Duplicate alias is a client error, not a 500.
             if let crate::storage::StorageError::AlreadyExists(_) = e {

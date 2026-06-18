@@ -153,9 +153,14 @@ applied at the execution seam for **every** plugin:
 
 1. **Always-on secret-material redaction.** If an endpoint reflects the
    credential's own injected secret in its response (a header-echoing reflector,
-   an open redirect, etc.), the secret is scrubbed from the body and headers and
+   an open redirect, etc.), the secret — and its common re-encoded forms
+   (percent-encoded, JSON-escaped) — is scrubbed from the body and headers and
    replaced with `[REDACTED:<alias>]` before the response is returned. This is
-   not configurable — it's the core "agents never see secrets" invariant.
+   not configurable. It is defense-in-depth, not absolute: an endpoint that
+   *transforms* the secret (base64, hashing, splitting it) can still leak it —
+   use a `block` rule for endpoints you don't trust. Secrets shorter than 5
+   bytes are not scrubbed (too little entropy to match safely); a warning is
+   logged when such a credential is created.
 2. **Egress classification.** For endpoints whose response is itself a secondary
    secret (an STS/login/secret-read endpoint), configure `[[egress]]` rules:
 
