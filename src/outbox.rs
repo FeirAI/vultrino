@@ -36,6 +36,10 @@ pub const EVENT_POLICY_CHANGED: &str = "policy.changed";
 pub const EVENT_CREDENTIAL_ROTATED: &str = "credential.rotated";
 /// A policy denial that an observe-only tenant did NOT enforce (V11).
 pub const EVENT_POLICY_OBSERVED_DENIAL: &str = "policy.observed_denial";
+/// An enforce-mode denial — a DETECT signal (R3/V12a). Its `created_at` is the
+/// per-incident `detected_at`, to pair with a later [`EVENT_AGENT_HALTED`]
+/// `contained_at` (same subject) for an MTTD/MTTC measurement.
+pub const EVENT_POLICY_DENIED: &str = "policy.denied";
 
 /// Delivery state of an outbox event (V9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -2107,6 +2107,63 @@ async fn test_v6_halt_by_principal_id_for_labelless_agent() {
     assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)), "labelless agent halted by id");
 }
 
+#[tokio::test]
+async fn test_v12a_enforce_denial_emits_timestamped_detect_event() {
+    // R3 (V12a): an enforce-mode denial emits a durable, signed, timestamped
+    // DETECT event (policy.denied) whose created_at is a per-incident detected_at,
+    // and it pairs (same subject = agent label) with the agent.halted contained_at
+    // so MTTD/MTTC is computable.
+    let (server, storage) = setup_deny_mode(vec![]).await; // fail-closed: no policy → deny
+    store_credential(&storage, "api-cred", false).await;
+
+    let (_full, mut token) = UseToken::create(NewUseToken {
+        name: "bot-token".to_string(),
+        credential_scope: "api-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.agent_label = Some("bot-9".to_string());
+    storage.store_use_token(&token).await.unwrap();
+    let auth = ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+
+    // An unauthorized (default-deny) call is DENIED in enforce mode.
+    let err = server.execute_gated(echo_request("api-cred"), auth).await.unwrap_err();
+    assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)));
+
+    // A timestamped policy.denied DETECT event was emitted, subject = agent label.
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    let detect = events
+        .iter()
+        .find(|e| e.event_type == vultrino::outbox::EVENT_POLICY_DENIED)
+        .expect("an enforce-mode denial must emit a policy.denied detect event");
+    assert_eq!(detect.subject, "bot-9");
+    assert_eq!(detect.payload["agent_label"], "bot-9");
+    assert_eq!(detect.payload["kind"], "policy");
+    assert_eq!(detect.payload["outcome"], "denied");
+    assert_eq!(detect.payload["credential"], "api-cred");
+    let detected_at = detect.created_at;
+
+    // Contain: halting the agent emits agent.halted with the SAME subject.
+    server.halt_agent("bot-9").await.unwrap();
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    let contain = events
+        .iter()
+        .find(|e| e.event_type == vultrino::outbox::EVENT_AGENT_HALTED && e.subject == "bot-9")
+        .expect("halt must emit agent.halted for the same subject");
+    let contained_at = contain.created_at;
+
+    // detect↔contain pair on subject, and detection precedes containment (MTTD/MTTC).
+    assert_eq!(detect.subject, contain.subject);
+    assert!(detected_at <= contained_at, "detected_at must not be after contained_at");
+}
+
 #[tokio::test(start_paused = true)]
 async fn test_v6_hanging_halt_callback_does_not_block() {
     // V6: a hanging abort callback is time-bounded — the halt still completes, and

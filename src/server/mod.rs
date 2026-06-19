@@ -394,10 +394,24 @@ impl VultrinoServer {
         if let Some(cred_tenant) = cred_tenant {
             if principal_tenant.as_deref() != Some(cred_tenant) {
                 self.record_unauthorized_attempt();
-                return Err(VultrinoError::PolicyDenied(format!(
+                let reason = format!(
                     "credential '{}' belongs to tenant '{}' and is not accessible to this principal",
                     credential.alias, cred_tenant
-                )));
+                );
+                // R3: emit a timestamped DETECT event (see below) for this
+                // cross-tenant isolation denial too.
+                let ak = exec_auth.auth.as_ref().map(|a| &a.api_key);
+                self.emit_policy_denied(
+                    ak.and_then(|k| k.agent_label.as_deref()),
+                    ak.map(|k| k.id.as_str()),
+                    &credential.alias,
+                    &full_action,
+                    principal_tenant.as_deref(),
+                    &reason,
+                    "cross_tenant_isolation",
+                )
+                .await;
+                return Err(VultrinoError::PolicyDenied(reason));
             }
         }
 
@@ -471,6 +485,20 @@ impl VultrinoServer {
                     .await;
                     // Fall through to Allow (do not return, do not gate).
                 } else {
+                    // R3 (V12a): emit a timestamped DETECT event for the enforce-mode
+                    // denial — the headline path that previously only bumped a
+                    // counter. Its created_at is a per-incident detected_at, paired
+                    // (same subject) with a later agent.halted contained_at for MTTD.
+                    self.emit_policy_denied(
+                        principal.as_ref().and_then(|p| p.agent_label.as_deref()),
+                        principal.as_ref().map(|p| p.id.as_str()),
+                        &credential.alias,
+                        &full_action,
+                        principal_tenant.as_deref(),
+                        &reason,
+                        "policy",
+                    )
+                    .await;
                     return Err(VultrinoError::PolicyDenied(reason));
                 }
             }
@@ -1042,6 +1070,43 @@ impl VultrinoServer {
         if let Err(e) = self.storage.append_event(subject, event_type, payload).await {
             warn!(error = %e, event_type, "failed to append outbox event");
         }
+    }
+
+    /// Emit a timestamped DETECT event for an enforce-mode denial (R3/V12a).
+    ///
+    /// The event's `created_at` (stamped by the outbox under the lock) is the
+    /// per-incident **`detected_at`**. The subject is the offending agent label
+    /// (falling back to the principal id, then the credential) — the **same**
+    /// subject [`Self::halt_agent`] uses for [`crate::outbox::EVENT_AGENT_HALTED`]
+    /// — so a detect (`policy.denied`) and the subsequent contain (`agent.halted`)
+    /// pair on their subject for an MTTD/MTTC measurement.
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_policy_denied(
+        &self,
+        agent_label: Option<&str>,
+        principal_id: Option<&str>,
+        credential_alias: &str,
+        full_action: &str,
+        tenant: Option<&str>,
+        reason: &str,
+        kind: &str,
+    ) {
+        let subject = agent_label.or(principal_id).unwrap_or(credential_alias);
+        self.emit_event(
+            subject,
+            crate::outbox::EVENT_POLICY_DENIED,
+            serde_json::json!({
+                "credential": credential_alias,
+                "action": full_action,
+                "tenant": tenant,
+                "agent_label": agent_label,
+                "principal_id": principal_id,
+                "reason": reason,
+                "kind": kind,
+                "outcome": "denied",
+            }),
+        )
+        .await;
     }
 
     /// Register a harness abort callback fired on halt (V6).

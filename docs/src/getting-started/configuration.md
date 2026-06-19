@@ -212,8 +212,12 @@ optional `action` field (default `http.request`) so it is no longer hardwired.
 
 Vultrino records security-relevant events to a durable, ordered, replayable,
 **signed** outbox: approval requested/approved/denied/escalated/expired,
-`agent.halted`, `policy.changed`, and `credential.rotated`. Configure push
-delivery with `[outbox]`:
+`agent.halted`, `policy.changed`, `credential.rotated`, `policy.observed_denial`
+(an observe-only tenant's un-enforced denial), and `policy.denied` (an
+enforce-mode denial — a **DETECT** signal whose `created_at` is a per-incident
+`detected_at` that pairs, on the same subject, with the `agent.halted`
+`contained_at` for an MTTD/MTTC measurement). Configure push delivery with
+`[outbox]`:
 
 ```toml
 [outbox]
