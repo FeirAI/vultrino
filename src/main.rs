@@ -1277,15 +1277,14 @@ async fn list_credentials(config: Config, format: String) -> Result<(), Box<dyn 
 async fn remove_credential(config: Config, alias: String) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
 
-    // Try to find by alias first
-    let credential = storage.get_by_alias(&alias).await?;
-
-    let id = if let Some(cred) = &credential {
-        cred.id.clone()
-    } else {
-        // Assume it's an ID
-        alias.clone()
+    // Resolve by alias OR by id — so revoke-propagation fires regardless of which
+    // form the operator passed (the exact gap R5 closes: a by-id delete must still
+    // propagate the downstream revoke).
+    let credential = match storage.get_by_alias(&alias).await? {
+        Some(c) => Some(c),
+        None => storage.get(&alias).await?,
     };
+    let id = credential.as_ref().map(|c| c.id.clone()).unwrap_or_else(|| alias.clone());
 
     // R5/V7: propagate a downstream revoke (OAuth2/STS revocation endpoint) before
     // deleting, so an already-issued token is actively revoked, not left to expire.

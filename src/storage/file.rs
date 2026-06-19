@@ -1524,6 +1524,7 @@ mod tests {
             agent_label: None,
             owner_identity: None,
             tenant: None,
+            workload_id: None,
         };
 
         storage.store_api_key(&key).await.unwrap();

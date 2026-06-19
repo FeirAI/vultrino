@@ -67,8 +67,11 @@ impl HttpPlugin {
         Self { client }
     }
 
-    /// Validate token URL for SSRF protection - requires HTTPS
-    fn validate_token_url_ssrf(url_str: &str) -> Result<url::Url, PluginError> {
+    /// Validate token URL for SSRF protection - requires HTTPS. `pub(crate)` so
+    /// other secret-bearing outbound paths (e.g. OAuth2 revoke-propagation, R5)
+    /// reuse the same HTTPS + IP-literal + DNS private-range guard rather than
+    /// re-implementing it inconsistently.
+    pub(crate) fn validate_token_url_ssrf(url_str: &str) -> Result<url::Url, PluginError> {
         let url = url::Url::parse(url_str)
             .map_err(|e| PluginError::InvalidParams(format!("Invalid token URL: {}", e)))?;
 

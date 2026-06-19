@@ -261,6 +261,7 @@ impl AuthManager {
             agent_label: None,
             owner_identity: None,
             tenant: None,
+            workload_id: None,
         };
 
         self.add_key_internal(api_key.clone());

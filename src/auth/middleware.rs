@@ -70,6 +70,9 @@ impl AuthResult {
             // Carry the bound human owner (V10) for SoD + audit.
             owner_identity: token.owner_identity.clone(),
             tenant: token.tenant.clone(),
+            // Resolved per request from an inbound SVID/OIDC document (R6), not
+            // from the stored token.
+            workload_id: None,
         };
         Self { api_key, role }
     }

@@ -213,6 +213,12 @@ pub struct ApiKey {
     /// tenant-tagged credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// Optional resolved workload-identity subject (V10/R6): a SPIFFE/OIDC subject
+    /// resolved from an inbound document for this request, carried into the policy
+    /// [`crate::policy::Principal`] as an **additional** match dimension (never
+    /// replacing `id`). Request-scoped — not meaningful on a persisted key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_id: Option<String>,
 }
 
 impl ApiKey {
@@ -363,6 +369,7 @@ mod tests {
             agent_label: None,
             owner_identity: None,
             tenant: None,
+            workload_id: None,
         };
         assert!(!key.is_expired());
 

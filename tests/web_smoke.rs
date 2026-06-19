@@ -538,6 +538,7 @@ async fn test_admin_delete_role_in_use_conflict() {
             agent_label: None,
             owner_identity: None,
             tenant: None,
+            workload_id: None,
         })
         .await
         .unwrap();
@@ -632,6 +633,7 @@ async fn test_out_of_band_decide_flow() {
         principal_id: None,
         agent_label: None,
         tenant: None,
+        workload_id: None,
         action_label: None,
         dual_control: false,
         criticality: vultrino::approval::CriticalityClass::Medium,
@@ -711,6 +713,7 @@ async fn test_out_of_band_decide_without_named_identity_is_refused() {
         principal_id: None,
         agent_label: None,
         tenant: None,
+        workload_id: None,
         action_label: None,
         dual_control: false,
         criticality: vultrino::approval::CriticalityClass::Medium,

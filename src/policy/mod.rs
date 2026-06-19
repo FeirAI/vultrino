@@ -49,13 +49,21 @@ pub enum PolicyDecision {
 /// sharing the same credential.
 #[derive(Debug, Clone, Default)]
 pub struct Principal {
-    /// Stable id of the presenting principal (`vk_`/`vut_` id).
+    /// Stable id of the presenting principal (`vk_`/`vut_` id). This is the
+    /// **halt/ownership anchor** — it is never replaced by a resolved workload
+    /// identity, so a halt keyed on this id always holds (R6).
     pub id: String,
     /// Optional agent label carried on the token, bound by the control plane.
     pub agent_label: Option<String>,
     /// Optional human/directory owner of this non-human identity (V10): the
     /// IdP-resolvable owner binding (OIDC `sub` / SCIM id).
     pub owner: Option<String>,
+    /// Optional resolved workload identity subject (V10/R6): a SPIFFE/OIDC subject
+    /// resolved from an inbound document. An **additional** `principal_pattern`
+    /// match dimension — it refines policy targeting without erasing `id`, so a
+    /// resolved identity can never make the principal escape a halt keyed on its
+    /// credential id/label.
+    pub workload_id: Option<String>,
 }
 
 /// An extracted spend attempt for a request (V3): an amount in minor units
@@ -176,6 +184,7 @@ impl PolicyEngine {
             id: id.clone(),
             agent_label: context.agent_label.clone(),
             owner: None, // legacy path: owner is used for SoD, not policy matching
+            workload_id: None, // legacy 4-arg path has no resolved workload identity
         });
         let input = EvalInput {
             credential_alias,
@@ -211,8 +220,8 @@ impl PolicyEngine {
     /// mode does NOT downgrade a denial for a credential/principal under a spend
     /// or rate cap: those are financial/abuse boundaries, not authorization
     /// posture, so they must hold even in observe mode (a downgraded over-cap call
-    /// would run uncharged — the cumulative ledger only advances on an admitting
-    /// rule — and a downgraded over-limit call would defeat the rate limiter).
+    /// would exceed the per-action spend cap, and a downgraded over-limit call
+    /// would defeat the rate limiter).
     pub fn has_resource_guard(&self, input: &EvalInput) -> bool {
         fn rule_guards(c: &PolicyCondition) -> bool {
             match c {
@@ -232,13 +241,13 @@ impl PolicyEngine {
             .any(|p| p.rules.iter().any(|r| rule_guards(&r.condition)))
     }
 
-    /// Like [`Self::evaluate`] but with **no side effects**: `RateLimit` and
-    /// `SpendCap` are treated as already-admitted (within limit/charge) instead
-    /// of being counted/charged. Used by the deferred post-approval path
-    /// ([`crate::server::VultrinoServer::resume_approved`]) to re-enforce hard
-    /// deny gates (url/method/time/principal/explicit deny) at execution time
-    /// without re-charging the rate limiter or spend ledger that the original
-    /// request already accounted for when it opened the approval.
+    /// Like [`Self::evaluate`] but with **no side effects**: `RateLimit` is
+    /// treated as already-admitted (the slot was taken at open) and `SpendCap` as
+    /// already-checked (per-action, stateless — no ledger after R1). Used by the
+    /// deferred post-approval path
+    /// ([`crate::server::VultrinoServer::resume_approved`]) to re-enforce hard deny
+    /// gates (url/method/time/principal/explicit deny) at execution time without
+    /// re-charging the rate limiter the original request already accounted for.
     pub fn evaluate_readonly(
         &self,
         credential_alias: &str,
@@ -506,6 +515,7 @@ fn principal_matches(pattern: Option<&str>, principal: Option<&Principal>) -> bo
             Some(p) => {
                 glob_matches(pat, &p.id)
                     || p.agent_label.as_deref().is_some_and(|l| glob_matches(pat, l))
+                    || p.workload_id.as_deref().is_some_and(|w| glob_matches(pat, w))
             }
         },
     }
@@ -721,7 +731,7 @@ mod tests {
         // Then a kill policy scoped to agent "bot-7".
         engine.add_policy(Policy::kill_switch("halt:bot-7", "bot-7"));
 
-        let halted = Principal { id: "k1".to_string(), agent_label: Some("bot-7".to_string()), owner: None };
+        let halted = Principal { id: "k1".to_string(), agent_label: Some("bot-7".to_string()), owner: None, workload_id: None };
         let decision = engine.evaluate_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
@@ -735,7 +745,7 @@ mod tests {
         }
 
         // A different agent is unaffected → the allow rule applies.
-        let other = Principal { id: "k2".to_string(), agent_label: Some("bot-9".to_string()), owner: None };
+        let other = Principal { id: "k2".to_string(), agent_label: Some("bot-9".to_string()), owner: None, workload_id: None };
         let decision = engine.evaluate_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
@@ -754,6 +764,53 @@ mod tests {
             spend: None,
         });
         assert!(matches!(resume, PolicyDecision::Deny(_)), "kill applies on resume too");
+    }
+
+    #[test]
+    fn test_workload_id_additive_does_not_bypass_id_halt() {
+        // R6 regression: a resolved workload identity (workload_id) is an ADDITIONAL
+        // match dimension and must NOT let a principal escape a halt keyed on its
+        // credential id. (Pre-fix, the override replaced id with the SVID subject,
+        // so a kill policy on the credential id missed → halt bypass.)
+        let engine = PolicyEngine::new();
+        engine.set_default_deny(false); // isolate: unmatched → allow
+        engine.add_policy(Policy::kill_switch("halt:vk_key1", "vk_key1"));
+        let p = Principal {
+            id: "vk_key1".to_string(),
+            agent_label: None,
+            owner: None,
+            workload_id: Some("spiffe://example.org/ns/prod/sa/agent".to_string()),
+        };
+        let input = EvalInput {
+            credential_alias: "any",
+            url: None,
+            method: None,
+            principal: Some(&p),
+            spend: None,
+        };
+        assert!(engine.is_halted(&input), "halt on the credential id holds despite a workload identity");
+        assert!(matches!(engine.evaluate_full(&input), PolicyDecision::Deny(_)));
+    }
+
+    #[test]
+    fn test_workload_id_is_a_principal_match_dimension() {
+        // R6: a policy (or halt) CAN target the resolved SVID/OIDC subject via
+        // workload_id; a request that doesn't present it isn't caught by that policy.
+        let engine = PolicyEngine::new();
+        engine.set_default_deny(false);
+        engine.add_policy(Policy::deny_all("block-svid", "*").with_principal("spiffe://example.org/*"));
+        let with_svid = Principal {
+            id: "vk_keyX".to_string(),
+            agent_label: None,
+            owner: None,
+            workload_id: Some("spiffe://example.org/ns/prod/sa/agent".to_string()),
+        };
+        let input = EvalInput { credential_alias: "any", url: None, method: None, principal: Some(&with_svid), spend: None };
+        assert!(matches!(engine.evaluate_full(&input), PolicyDecision::Deny(_)), "policy targets the resolved SVID");
+        // The same credential WITHOUT presenting the SVID is not caught by the SVID policy.
+        let without = Principal { id: "vk_keyX".to_string(), agent_label: None, owner: None, workload_id: None };
+        let input2 = EvalInput { credential_alias: "any", url: None, method: None, principal: Some(&without), spend: None };
+        assert_eq!(engine.evaluate_full(&input2), PolicyDecision::Allow);
     }
 
     #[test]
@@ -924,8 +981,8 @@ mod tests {
         // Per-agent Deny for "refund-bot" only (kill-leg W3).
         engine.add_policy(Policy::deny_all("kill-refund-bot", "pay-*").with_principal("refund-bot"));
 
-        let bot = Principal { id: "tok1".to_string(), agent_label: Some("refund-bot".to_string()), owner: None };
-        let other = Principal { id: "tok2".to_string(), agent_label: Some("other-bot".to_string()), owner: None };
+        let bot = Principal { id: "tok1".to_string(), agent_label: Some("refund-bot".to_string()), owner: None, workload_id: None };
+        let other = Principal { id: "tok2".to_string(), agent_label: Some("other-bot".to_string()), owner: None, workload_id: None };
         let bot_in = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&bot), spend: None };
         let other_in = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&other), spend: None };
         let none_in = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: None, spend: None };
@@ -962,7 +1019,7 @@ mod tests {
         let engine = PolicyEngine::new();
         engine.set_default_deny(false);
         engine.add_policy(Policy::deny_all("kill-by-id", "*").with_principal("tok-*"));
-        let p = Principal { id: "tok-abc".to_string(), agent_label: None, owner: None };
+        let p = Principal { id: "tok-abc".to_string(), agent_label: None, owner: None, workload_id: None };
         assert!(matches!(
             engine.evaluate_full(&EvalInput { credential_alias: "any", url: None, method: None, principal: Some(&p), spend: None }),
             PolicyDecision::Deny(_)

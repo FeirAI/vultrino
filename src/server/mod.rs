@@ -473,6 +473,10 @@ impl VultrinoServer {
             agent_label: a.api_key.agent_label.clone(),
             // V10: the IdP-resolvable human owner of this NHI, when bound.
             owner: a.api_key.owner_identity.clone(),
+            // V10/R6: a resolved inbound SVID/OIDC subject, as an ADDITIONAL match
+            // dimension — it never replaces `id`, so a halt keyed on the credential
+            // id/label still holds when a workload identity is presented.
+            workload_id: a.api_key.workload_id.clone(),
         });
         // V3: the extracted spend attempt (amount + asset) for SpendCap.
         let spend = crate::policy::extract_spend(
@@ -597,6 +601,8 @@ impl VultrinoServer {
                 agent_label: principal.as_ref().and_then(|p| p.agent_label.clone()),
                 // R4: partition approval visibility/decision by the opener's tenant.
                 tenant: principal_tenant.clone(),
+                // R6: snapshot the resolved workload identity for resume re-eval.
+                workload_id: principal.as_ref().and_then(|p| p.workload_id.clone()),
                 action_label: action_label.clone(),
                 dual_control,
                 criticality,
@@ -877,7 +883,8 @@ impl VultrinoServer {
         let method = approval.params.get("method").and_then(|v| v.as_str());
         // Rebuild the principal (V4) and spend (V3) from the recorded approval so
         // per-agent denies and spend caps are re-evaluated at resume. Spend is
-        // checked read-only here (it was charged when the approval was opened).
+        // checked read-only here (per-action, stateless — it was already checked at
+        // open; there is no ledger to re-charge after R1).
         // NOTE: the agent_label is point-in-time (snapshotted at open); a per-
         // agent Deny created by binding a *new* label to the token after the
         // approval opened won't re-fire at resume — deny by token id or by the
@@ -898,13 +905,17 @@ impl VultrinoServer {
             // Owner doesn't affect policy matching (only SoD, computed at decide
             // time on the requester record), so it isn't needed for the resume gate.
             owner: None,
+            // V10/R6: re-thread the resolved workload identity snapshotted at open,
+            // so a principal_pattern Deny targeting an SVID/OIDC subject re-fires on
+            // resume too.
+            workload_id: approval.workload_id.clone(),
         });
-        // Spend was checked AND charged when the approval opened; the read-only
-        // resume re-enforces only hard deny gates and does not re-charge, so no
-        // spend attempt is needed. A spend cap *changed* after the approval opened
-        // therefore does not re-bind to this in-flight action (its spend was
-        // already accounted at open); an operator who needs to stop such an
-        // in-flight approval should push an explicit Deny policy.
+        // Spend was checked read-only at resume; it was checked (per-action,
+        // stateless — there is no ledger after R1) when the approval opened. The
+        // read-only resume re-enforces only hard deny gates and never re-charges,
+        // so no spend attempt is needed. A spend cap *changed* after the approval
+        // opened therefore does not re-bind to this in-flight action; an operator
+        // who needs to stop such an in-flight approval should push an explicit Deny.
         if let crate::policy::PolicyDecision::Deny(reason) =
             self.policy_engine.evaluate_readonly_full(&crate::policy::EvalInput {
                 credential_alias: &credential.alias,

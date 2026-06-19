@@ -210,11 +210,15 @@ pub async fn api_execute(
     };
 
     // V10/R6: if a verified workload-identity document was presented inbound,
-    // resolve it and use it as the principal evaluated by policy (subject -> id,
-    // owner -> owner), refining the static vk_/vut_ identity.
+    // resolve it and refine the principal evaluated by policy — the subject is
+    // carried as an ADDITIONAL match dimension (workload_id), and the owner binds
+    // for SoD. The static vk_/vut_ id is deliberately preserved as the halt /
+    // ownership anchor, so a halt keyed on it can never be escaped by presenting a
+    // workload identity (and a policy/halt can still target the SVID via the
+    // resolved subject).
     if let Some(identity) = resolve_inbound_principal(&state, &headers) {
         if let Some(auth) = exec_auth.auth.as_mut() {
-            auth.api_key.id = identity.subject;
+            auth.api_key.workload_id = Some(identity.subject);
             if identity.owner.is_some() {
                 auth.api_key.owner_identity = identity.owner;
             }
@@ -292,16 +296,14 @@ pub async fn api_check_approval(
         }
     };
 
-    let mut principal_id = match resolve_caller_id(&state, &secret).await {
+    let principal_id = match resolve_caller_id(&state, &secret).await {
         Ok(id) => id,
         Err(resp) => return resp,
     };
-    // V10/R6: resolve the inbound workload identity the same way as on /execute,
-    // so an approval opened under a resolved SVID principal is polled/resumed by
-    // that same principal (ownership stays consistent across the two endpoints).
-    if let Some(identity) = resolve_inbound_principal(&state, &headers) {
-        principal_id = identity.subject;
-    }
+    // R6: ownership keys on the credential id (the halt/ownership anchor), NOT the
+    // resolved workload identity — so the open and poll sides agree regardless of
+    // whether the SVID header is re-presented on the poll. The resolved identity
+    // only refines policy matching (snapshotted on the approval for resume re-eval).
 
     // Ownership is enforced inside check_and_resume_approval BEFORE any
     // execution, so a non-owner can never trigger another principal's action.

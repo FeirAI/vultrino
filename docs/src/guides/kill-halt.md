@@ -46,7 +46,7 @@ Vultrino records in-flight gated executions so a halt can report — and a callb
 curl https://vultrino.example.com/api/v1/sessions -H "Authorization: Bearer vk_admin_..."
 ```
 
-> The registry is **in-memory and per-process** (the same model as the rate-limit and spend ledgers): it resets on restart, and in a web+MCP deployment each process only sees the executions *it* is running. The cross-process kill legs (token revoke + kill policy) are not subject to this limitation.
+> The registry is **in-memory and per-process** (the same model as the rate-limit counters): it resets on restart, and in a web+MCP deployment each process only sees the executions *it* is running. The cross-process kill legs (token revoke + kill policy) are not subject to this limitation.
 
 ## Abort callbacks
 

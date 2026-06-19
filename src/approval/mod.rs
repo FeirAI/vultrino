@@ -203,6 +203,9 @@ pub struct NewApproval {
     /// visibility and decision are partitioned by tenant. `None` = untenanted
     /// (shared — visible to every admin, like an untenanted credential).
     pub tenant: Option<String>,
+    /// Resolved workload-identity subject of the opener (V10/R6), snapshotted so a
+    /// `principal_pattern` Deny targeting an SVID/OIDC subject re-fires on resume.
+    pub workload_id: Option<String>,
 }
 
 /// One approver's sign-off on a dual-control (M-of-N) approval (V12).
@@ -292,6 +295,11 @@ pub struct ApprovalRequest {
     /// admin). Snapshotted at open from the requesting principal's tenant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// Resolved workload-identity subject of the opener (V10/R6), recorded so a
+    /// `principal_pattern` Deny on an SVID/OIDC subject re-fires when the action
+    /// resumes (the resume principal carries it as a match dimension).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_id: Option<String>,
     /// govder business-verb label for the action (V8), shown to the approver
     /// instead of the canonical `plugin.action` when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -391,6 +399,7 @@ impl ApprovalRequest {
             principal_id: params.principal_id,
             agent_label: params.agent_label,
             tenant: params.tenant,
+            workload_id: params.workload_id,
             action_label: params.action_label,
             dual_control: params.dual_control,
             required_approvals: params.required_approvals.max(1),
@@ -796,8 +805,10 @@ pub struct ApprovalConfig {
     /// Rules assigning a criticality class to a `(credential, action)` (V5).
     pub criticality_rules: Vec<CriticalityRule>,
     /// Named identity an out-of-band decision link is bound to (V5). Recorded as
-    /// the approver when a decision arrives via the OOB link. Defaults to a
-    /// generic `out-of-band` label when unset.
+    /// the approver when a decision arrives via the OOB link. **Required when a
+    /// notifier is configured** (R2): config load rejects an unset value with a
+    /// notifier present, and the OOB route refuses a decision rather than recording
+    /// an anonymous `out-of-band` label — so a verdict is never unattributable.
     pub oob_approver_identity: Option<String>,
     /// Optional continuous re-authorization interval in seconds (V5): an approved
     /// grant not run within this window must be re-approved before it executes.
@@ -1107,6 +1118,7 @@ mod tests {
             principal_id: Some("k1".to_string()),
             agent_label: None,
             tenant: None,
+            workload_id: None,
             action_label: None,
             dual_control: false,
             criticality: CriticalityClass::Medium,

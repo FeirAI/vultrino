@@ -7,9 +7,11 @@
 //! (OAuth2 / STS, RFC 7009), deleting the credential actively revokes its issued
 //! access/refresh token at the provider.
 //!
-//! The revocation HTTP call goes through a [`RevocationClient`] trait so it is
-//! testable past the http plugin's SSRF guard (the default [`HttpRevocationClient`]
-//! still requires an HTTPS endpoint).
+//! The revocation HTTP call goes through a [`RevocationClient`] trait so the
+//! propagation logic is unit-testable with a recording mock. The default
+//! [`HttpRevocationClient`] applies the **same** HTTPS + SSRF private-range guard
+//! as every other secret-bearing outbound call (it reuses
+//! [`crate::plugins::HttpPlugin::validate_token_url_ssrf`]).
 
 use crate::storage::StorageBackend;
 use crate::{Credential, CredentialData};
@@ -60,11 +62,12 @@ impl RevocationClient for HttpRevocationClient {
         client_secret: &str,
     ) -> Result<(), String> {
         // The revocation endpoint is operator-configured (credential metadata),
-        // not agent-controlled, but require HTTPS so the token isn't sent in clear.
-        let url = url::Url::parse(revocation_url).map_err(|e| format!("invalid revocation_url: {e}"))?;
-        if url.scheme() != "https" {
-            return Err("revocation_url must be https".to_string());
-        }
+        // not agent-controlled — but it carries the long-lived client_secret +
+        // refresh token, so apply the SAME SSRF guard as every other secret-bearing
+        // outbound call: HTTPS + reject IP literals / hosts resolving into a
+        // private/internal range (incl. the 169.254.169.254 cloud-metadata endpoint).
+        let url = crate::plugins::HttpPlugin::validate_token_url_ssrf(revocation_url)
+            .map_err(|e| e.to_string())?;
         let resp = self
             .client
             .post(url)
@@ -148,5 +151,24 @@ pub async fn propagate_revoke(
         {
             tracing::warn!(error = %e, "failed to append credential.revoked event");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_revocation_client_applies_ssrf_guard() {
+        // R5: the revocation call carries the client_secret + refresh token, so it
+        // must honor the same HTTPS + SSRF private-range guard as every other
+        // secret-bearing egress (not just an https scheme check).
+        let c = HttpRevocationClient::new();
+        // Non-HTTPS is rejected.
+        assert!(c.revoke("http://idp.example.com/revoke", "t", "access_token", "id", "sec").await.is_err());
+        // Private / internal IP literals are rejected (incl. cloud metadata).
+        assert!(c.revoke("https://127.0.0.1/revoke", "t", "access_token", "id", "sec").await.is_err());
+        assert!(c.revoke("https://10.0.0.5/revoke", "t", "access_token", "id", "sec").await.is_err());
+        assert!(c.revoke("https://169.254.169.254/revoke", "t", "access_token", "id", "sec").await.is_err());
     }
 }

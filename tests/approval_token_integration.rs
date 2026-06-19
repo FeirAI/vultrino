@@ -2164,6 +2164,48 @@ async fn test_v12a_enforce_denial_emits_timestamped_detect_event() {
     assert!(detected_at <= contained_at, "detected_at must not be after contained_at");
 }
 
+#[tokio::test]
+async fn test_v12a_cross_tenant_isolation_emits_detect_event() {
+    // R3: the cross-tenant isolation deny site also emits a timestamped detect
+    // event (kind = cross_tenant_isolation), not just the policy-Deny site.
+    let (server, storage) = setup_tenants(false, vec![]).await; // allow mode; tenants default Enforce
+    // A credential tagged to team-a.
+    let cred = Credential::new(
+        "pay-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("secret"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    )
+    .with_metadata("tenant", "team-a");
+    storage.store(&cred).await.unwrap();
+
+    // A token in team-b attempting to use the team-a credential.
+    let token = {
+        let mut t = tenant_token("team-b");
+        t.credential_scope = "*".to_string();
+        t
+    };
+    storage.store_use_token(&token).await.unwrap();
+    let req = ExecuteRequest {
+        credential: "pay-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({}),
+    };
+    let err = server.execute_gated(req, tenant_auth(&token)).await.unwrap_err();
+    assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)));
+
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    let detect = events
+        .iter()
+        .find(|e| e.event_type == vultrino::outbox::EVENT_POLICY_DENIED
+            && e.payload["kind"] == "cross_tenant_isolation")
+        .expect("cross-tenant isolation must emit a policy.denied detect event");
+    assert_eq!(detect.payload["credential"], "pay-cred");
+    assert_eq!(detect.payload["tenant"], "team-b");
+}
+
 #[tokio::test(start_paused = true)]
 async fn test_v6_hanging_halt_callback_does_not_block() {
     // V6: a hanging abort callback is time-bounded — the halt still completes, and
@@ -2232,7 +2274,7 @@ async fn test_v6_kill_policy_survives_cross_process_refresh() {
         engine.list_policies().iter().any(|p| p.id == "halt:bot-7" && p.kill),
         "kill flag must survive the storage round-trip"
     );
-    let halted = Principal { id: "k1".to_string(), agent_label: Some("bot-7".to_string()) , owner: None };
+    let halted = Principal { id: "k1".to_string(), agent_label: Some("bot-7".to_string()) , owner: None, workload_id: None };
     let decision = engine.evaluate_full(&EvalInput {
         credential_alias: "anything",
         url: None,
@@ -2580,6 +2622,7 @@ async fn test_v11_halt_not_downgraded_for_api_key_principal() {
         agent_label: None,
         owner_identity: None,
         tenant: Some("team-observe".to_string()),
+        workload_id: None,
     };
     let auth = || ExecAuth {
         auth: Some(AuthResult { api_key: api_key.clone(), role: role.clone() }),
