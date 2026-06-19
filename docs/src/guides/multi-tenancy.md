@@ -42,3 +42,12 @@ vultrino meta set team-a-secret tenant team-a
 ```
 
 A principal may only use credentials in **its own** tenant; an **untenanted credential is shared** (usable by any tenant). A principal in `team-b` attempting to use a `team-a`-tagged credential is denied — regardless of `team-b`'s enforce/observe mode (isolation is a hard boundary, not a policy that observe mode can downgrade).
+
+## Approval partitioning
+
+When a gated action opens an [approval](./action-approvals.md), the approval is **tagged with the opening principal's tenant**. Approval **visibility and decision** are then partitioned the same way credentials are:
+
+- A **global** admin (an admin API key with no `tenant`) sees and can decide **every** tenant's approvals — the super-admin console.
+- A **tenant-scoped** admin (an admin API key carrying a `tenant`) sees and can decide **only** its own tenant's approvals, plus **untenanted** (shared) ones. An admin in `team-a` can never see or decide a `team-b` approval — a cross-tenant decision is refused (fail-closed, indistinguishable from not-found).
+
+The admin metrics read-back (`GET /api/v1/metrics`) scopes its approval counts to the calling key's tenant accordingly (and echoes the `tenant_scope` it applied). The web admin panel is a global console, so it lists every tenant's approvals.

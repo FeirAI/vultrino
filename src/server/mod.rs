@@ -548,6 +548,8 @@ impl VultrinoServer {
                 use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
                 principal_id: principal.as_ref().map(|p| p.id.clone()),
                 agent_label: principal.as_ref().and_then(|p| p.agent_label.clone()),
+                // R4: partition approval visibility/decision by the opener's tenant.
+                tenant: principal_tenant.clone(),
                 action_label: action_label.clone(),
                 dual_control,
                 criticality,
@@ -1107,6 +1109,49 @@ impl VultrinoServer {
             }),
         )
         .await;
+    }
+
+    /// List approvals visible to an admin acting in tenant `acting` (V11/R4).
+    /// `acting == None` is a global admin (sees all); a tenant-scoped admin sees
+    /// only its own tenant's approvals plus untenanted (shared) ones. See
+    /// [`ApprovalRequest::visible_to_tenant`].
+    pub async fn list_approvals_for_tenant(
+        &self,
+        acting: Option<&str>,
+    ) -> Result<Vec<ApprovalRequest>, VultrinoError> {
+        let mut approvals = self.storage.list_approvals().await?;
+        approvals.retain(|a| a.visible_to_tenant(acting));
+        Ok(approvals)
+    }
+
+    /// Decide an approval, **scoped to the acting admin's tenant** (V11/R4): an
+    /// admin in tenant A can never decide tenant B's approval. A cross-tenant
+    /// attempt is refused (and looks like a not-found, so it doesn't even confirm
+    /// the approval exists to the wrong tenant). A global admin (`acting == None`)
+    /// may decide any approval.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn decide_approval_scoped(
+        &self,
+        id: &str,
+        approve: bool,
+        channel: &str,
+        approver_identity: &str,
+        enforce_sod: bool,
+        note: Option<String>,
+        acting: Option<&str>,
+    ) -> Result<(), VultrinoError> {
+        let approval = self
+            .storage
+            .get_approval(id)
+            .await?
+            .filter(|a| a.visible_to_tenant(acting))
+            .ok_or_else(|| {
+                VultrinoError::PolicyDenied(format!("no such approval '{id}' in this tenant"))
+            })?;
+        self.storage
+            .decide_approval(&approval.id, approve, channel, approver_identity, enforce_sod, note)
+            .await?;
+        Ok(())
     }
 
     /// Register a harness abort callback fired on halt (V6).

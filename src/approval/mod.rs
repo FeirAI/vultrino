@@ -199,6 +199,10 @@ pub struct NewApproval {
     /// dual-control / M-of-N). 1 = a single approval; 2+ = dual control. Derived
     /// from the `dual_control` flag (and any configured M).
     pub required_approvals: u32,
+    /// Tenant of the opening principal (V11/R4), snapshotted so approval
+    /// visibility and decision are partitioned by tenant. `None` = untenanted
+    /// (shared — visible to every admin, like an untenanted credential).
+    pub tenant: Option<String>,
 }
 
 /// One approver's sign-off on a dual-control (M-of-N) approval (V12).
@@ -283,6 +287,11 @@ pub struct ApprovalRequest {
     /// policy is re-evaluated correctly when the approved action resumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
+    /// Tenant of the opening principal (V11/R4): approval visibility and decision
+    /// are partitioned by it. `None` = untenanted (shared — visible to every
+    /// admin). Snapshotted at open from the requesting principal's tenant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
     /// govder business-verb label for the action (V8), shown to the approver
     /// instead of the canonical `plugin.action` when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -381,6 +390,7 @@ impl ApprovalRequest {
             use_token_id: params.use_token_id,
             principal_id: params.principal_id,
             agent_label: params.agent_label,
+            tenant: params.tenant,
             action_label: params.action_label,
             dual_control: params.dual_control,
             required_approvals: params.required_approvals.max(1),
@@ -407,6 +417,24 @@ impl ApprovalRequest {
         };
 
         (request, decision_token)
+    }
+
+    /// Whether this approval is visible to (and decidable by) an admin acting in
+    /// tenant `acting` (V11/R4). Partitioning rules, paralleling credential
+    /// isolation:
+    /// - a **global** admin (`acting == None`) sees every approval;
+    /// - an **untenanted** approval (`self.tenant == None`) is shared — visible to
+    ///   every admin (like an untenanted credential);
+    /// - otherwise the acting tenant must match the approval's tenant, so an admin
+    ///   in tenant A can never see or decide tenant B's approval.
+    pub fn visible_to_tenant(&self, acting: Option<&str>) -> bool {
+        match acting {
+            None => true,
+            Some(a) => match self.tenant.as_deref() {
+                None => true,
+                Some(t) => t == a,
+            },
+        }
     }
 
     /// Whether the final deadline has elapsed (independent of stored status).
@@ -1078,6 +1106,7 @@ mod tests {
             use_token_id: None,
             principal_id: Some("k1".to_string()),
             agent_label: None,
+            tenant: None,
             action_label: None,
             dual_control: false,
             criticality: CriticalityClass::Medium,

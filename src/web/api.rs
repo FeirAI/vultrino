@@ -986,8 +986,17 @@ pub async fn api_list_sessions(_admin: AdminApiAuth, State(state): State<AppStat
 /// (V12): unauthorized-tool-call attempts, approval counts by state, and approval
 /// latency percentiles. Per-process, point-in-time (the event stream — the signed
 /// outbox — is the durable history).
-pub async fn api_metrics(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
-    let approvals = state.storage.list_approvals().await.unwrap_or_default();
+pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+    // R4: approval counts are scoped to the acting admin's tenant — a tenant
+    // admin sees only its own (+ untenanted/shared) approvals; a global admin
+    // (no tenant) sees all. (`unauthorized_attempts` stays a global per-process
+    // counter — it is not partitioned by tenant.)
+    let acting_tenant = admin.0.api_key.tenant.clone();
+    let approvals = state
+        .server
+        .list_approvals_for_tenant(acting_tenant.as_deref())
+        .await
+        .unwrap_or_default();
 
     let mut by_status: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut latencies_secs: Vec<i64> = Vec::new();
@@ -1023,6 +1032,7 @@ pub async fn api_metrics(_admin: AdminApiAuth, State(state): State<AppState>) ->
 
     let body = serde_json::json!({
         "unauthorized_attempts": state.server.unauthorized_attempts(),
+        "tenant_scope": acting_tenant,
         "approvals": {
             "total": approvals.len(),
             "by_status": by_status,

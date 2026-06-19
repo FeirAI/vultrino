@@ -2699,3 +2699,76 @@ async fn test_v11_observe_does_not_downgrade_spend_cap() {
         "an over-cap spend denial must hold in observe mode, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn test_v11_approvals_are_tenant_scoped() {
+    // R4: an approval is tagged with the opening principal's tenant; visibility
+    // and decision are partitioned — a tenant-A admin can never see or decide a
+    // tenant-B approval, while a global admin (None) sees/decides all. Parallels
+    // the credential-isolation guarantee, at the approval layer.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("pw");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let mut config = Config::default();
+    config.approval.enabled = true;
+    config.approval.ttl_secs = 3600;
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    server.plugins().register(Arc::new(MockPlugin));
+    store_credential(&storage, "api-cred", true).await; // require_approval
+
+    let ta = tenant_token("team-a");
+    let tb = tenant_token("team-b");
+    storage.store_use_token(&ta).await.unwrap();
+    storage.store_use_token(&tb).await.unwrap();
+
+    let a_id = match server.execute_gated(echo_request("api-cred"), tenant_auth(&ta)).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a.id,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    let b_id = match server.execute_gated(echo_request("api-cred"), tenant_auth(&tb)).await.unwrap() {
+        ExecutionOutcome::Pending(a) => a.id,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+
+    // Each approval is tagged with its opener's tenant.
+    assert_eq!(storage.get_approval(&a_id).await.unwrap().unwrap().tenant.as_deref(), Some("team-a"));
+    assert_eq!(storage.get_approval(&b_id).await.unwrap().unwrap().tenant.as_deref(), Some("team-b"));
+
+    // Visibility: each tenant sees only its own; a global admin sees both.
+    let a_view = server.list_approvals_for_tenant(Some("team-a")).await.unwrap();
+    assert_eq!(a_view.len(), 1, "team-a sees only its own approval");
+    assert_eq!(a_view[0].id, a_id);
+    let b_view = server.list_approvals_for_tenant(Some("team-b")).await.unwrap();
+    assert_eq!(b_view.len(), 1, "team-b sees only its own approval");
+    assert_eq!(b_view[0].id, b_id);
+    assert_eq!(server.list_approvals_for_tenant(None).await.unwrap().len(), 2, "global admin sees both");
+
+    // Decision: team-a CANNOT decide team-b's approval (refused, fail-closed).
+    let cross = server
+        .decide_approval_scoped(&b_id, true, "admin panel", "alice", false, None, Some("team-a"))
+        .await;
+    assert!(
+        matches!(cross, Err(vultrino::VultrinoError::PolicyDenied(_))),
+        "a cross-tenant decision must be refused, got {cross:?}"
+    );
+    // team-b's approval is untouched.
+    assert_eq!(
+        storage.get_approval(&b_id).await.unwrap().unwrap().status,
+        vultrino::approval::ApprovalStatus::Pending
+    );
+
+    // team-a CAN decide its own approval.
+    server
+        .decide_approval_scoped(&a_id, true, "admin panel", "alice", false, None, Some("team-a"))
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.get_approval(&a_id).await.unwrap().unwrap().status,
+        vultrino::approval::ApprovalStatus::Approved
+    );
+}

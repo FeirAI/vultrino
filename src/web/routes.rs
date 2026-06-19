@@ -1062,7 +1062,10 @@ pub async fn approvals_list(
     auth: RequireAuth,
 ) -> impl IntoResponse {
     let _ = state.storage.reload().await;
-    let mut approvals = state.storage.list_approvals().await.unwrap_or_default();
+    // R4: the panel admin is a global console (no tenant) so it lists every
+    // tenant's approvals; routing through the scoped method keeps the partition
+    // mechanism uniform (a future tenant-scoped session would pass its tenant).
+    let mut approvals = state.server.list_approvals_for_tenant(None).await.unwrap_or_default();
     // Pending first, then most recent.
     approvals.sort_by(|a, b| {
         let pending = |s: &ApprovalStatus| *s == ApprovalStatus::Pending;
@@ -1095,9 +1098,10 @@ pub async fn approval_approve(
     // Atomic decision under the storage lock (no reload+get+update window). The
     // panel approver's identity is the authenticated session user (V5).
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
+    // R4: decide through the tenant-scoped guard (global panel admin = None).
     let result = state
-        .storage
-        .decide_approval(&id, true, "admin panel", &auth.session.username, enforce_sod, None)
+        .server
+        .decide_approval_scoped(&id, true, "admin panel", &auth.session.username, enforce_sod, None, None)
         .await;
     let _ = regenerate_csrf_token(&session).await;
     // Surface a rejected decision (e.g. a separation-of-duty self-approval, or an
@@ -1121,9 +1125,10 @@ pub async fn approval_deny(
     // A denial is always allowed regardless of SoD (only approval self-grants are
     // the concern), but pass the flag through for consistent attribution.
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
+    // R4: decide through the tenant-scoped guard (global panel admin = None).
     let result = state
-        .storage
-        .decide_approval(&id, false, "admin panel", &auth.session.username, enforce_sod, None)
+        .server
+        .decide_approval_scoped(&id, false, "admin panel", &auth.session.username, enforce_sod, None, None)
         .await;
     let _ = regenerate_csrf_token(&session).await;
     match result {
