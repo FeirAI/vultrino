@@ -1124,3 +1124,357 @@ async fn test_v10_inbound_oidc_resolves_subject_and_binds_owner() {
     assert_eq!(a.workload_id.as_deref(), Some("user-7"), "OIDC subject -> workload_id");
     assert_eq!(a.requester.owner.as_deref(), Some("alice@example.com"), "OIDC email -> owner binding");
 }
+
+/// Regression (V13a): an admin-installed per-agent Deny installed via `PUT
+/// /api/v1/policies/{id}` must bite on the VERY NEXT `/execute` and on EVERY
+/// call across multiple periodic-refresh cycles — never flickering out.
+///
+/// The bug: the background refresh (`refresh_policies_once` → `storage.reload()`)
+/// re-read the vault from disk WITHOUT the cross-process lock, then overwrote the
+/// in-memory cache. Interleaved with `store_policy` (which holds the lock to
+/// read-disk → rename-new-file → update-cache), `reload` could read the OLD
+/// snapshot but assign the cache AFTER the store committed — clobbering the
+/// just-stored Deny out of the in-memory cache (still durable on disk) until the
+/// next mutation/reload. `list_stored_policies` reads that cache, so the engine
+/// dropped the Deny for a window → `/execute` flickered to allowed.
+///
+/// This test runs the REAL refresh loop at a tight interval against the shared
+/// storage+engine and hammers `/execute` past several refresh cycles, asserting
+/// every call is denied by *that* policy (its name in the body), with no flicker.
+/// Outbox is disabled (no URL/secret in `Config::default()`, no delivery loop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_admin_deny_does_not_flicker_under_periodic_refresh() {
+    use std::time::{Duration, Instant};
+    use vultrino::auth::{NewUseToken, UseToken};
+    use vultrino::policy::{EvalInput, Principal};
+    use vultrino::{Credential, CredentialData, Secret};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    // default_action = Allow so that, ABSENT our Deny, the agent's call proceeds
+    // PAST policy (and fails later on SSRF) rather than being denied by the
+    // engine default — making a flicker (deny → allow) cleanly observable.
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    assert!(config.outbox.url.is_none() && config.outbox.hmac_secret.is_none(),
+        "this regression must run with the outbox disabled");
+
+    // Mint an admin key so the admin PUT is accepted.
+    let auth_manager = AuthManager::new();
+    let (admin_key, api_key) = auth_manager.create_api_key("admin-key", "admin", None).unwrap();
+    storage.store_api_key(&api_key).await.unwrap();
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        config.clone(),
+        storage.clone(),
+        resolver,
+    ));
+    let web = WebServer::new(
+        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        config.clone(),
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server.clone(),
+    );
+    let router = web.into_router();
+
+    // A credential + a use token carrying the agent label the Deny targets.
+    let cred = Credential::new(
+        "api-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("secret"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    );
+    storage.store(&cred).await.unwrap();
+    let (secret, mut token) = UseToken::create(NewUseToken {
+        name: "halt-bot".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.agent_label = Some("halt-bot".to_string());
+    storage.store_use_token(&token).await.unwrap();
+
+    // Spawn the REAL cross-process refresh against the SAME storage + engine —
+    // `refresh_policies_once` (storage.reload() then engine.load_policies(union)),
+    // the exact path that clobbered the cache. One loop runs at the production-like
+    // 2ms tick to set the cadence; several additional zero-delay loops maximize the
+    // chance a reload lands inside the store_and_reload_policy commit→list window
+    // (the flicker window), so the regression is hit reliably in-process rather
+    // than depending on a single lucky interleaving. A shutdown flag lets the loops
+    // exit cleanly before the runtime tears down.
+    let refresh_interval = Duration::from_millis(2);
+    let refresh_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut refreshers = Vec::new();
+    for tight in [false, true, true, true] {
+        let storage = storage.clone();
+        let engine = Arc::clone(exec_server.policy_engine());
+        let config_policies = config.policies.clone();
+        let stop = refresh_stop.clone();
+        refreshers.push(tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = vultrino::server::refresh_policies_once(&storage, &engine, &config_policies)
+                    .await;
+                if tight {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(refresh_interval).await;
+                }
+            }
+        }));
+    }
+
+    // Install a per-agent Deny via the admin API (PUT /api/v1/policies/{id}).
+    let deny_id = "deny-halt-bot";
+    let put = router
+        .clone()
+        .oneshot(admin_req(
+            "PUT",
+            &format!("/api/v1/policies/{}", deny_id),
+            &admin_key,
+            serde_json::json!({
+                "name": "block-halt-bot",
+                "credential_pattern": "*",
+                "principal_pattern": "halt-bot",
+                "default_action": "deny"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK, "admin PUT Deny must succeed");
+
+    // Drive CONCURRENT admin policy writes (each a locked_mutate store/delete of
+    // an UNRELATED policy) so the refresh loop's reload() interleaves with stores.
+    // That interleaving is precisely what clobbered a just-stored policy in the
+    // buggy lock-free reload: reload reads the pre-store disk snapshot, the store
+    // commits (disk + cache), then reload overwrites the cache with its stale
+    // snapshot — dropping the admin Deny from the in-memory cache that
+    // list_stored_policies feeds the engine. The Deny is durable on disk, so it
+    // flickers back on the next clean reload. Without this churn there is no
+    // concurrent store to lose, and the race never fires.
+    let churn_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn = {
+        let storage = storage.clone();
+        let stop = churn_stop.clone();
+        tokio::spawn(async move {
+            use vultrino::policy::Policy;
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let p = Policy::deny_all(format!("churn-{n}"), "nonmatch-*");
+                let id = p.id.clone();
+                let _ = storage.store_policy(&p).await;
+                let _ = storage.delete_policy(&id).await;
+                n += 1;
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    let exec_req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/execute")
+            .header("authorization", format!("Bearer {}", secret))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "credential": "api-cred",
+                    "method": "GET",
+                    "url": "http://example.com/x"
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+
+    // The agent's EvalInput, as the engine sees it for this principal/credential.
+    let principal = Principal {
+        id: token.id.clone(),
+        agent_label: Some("halt-bot".to_string()),
+        owner: None,
+        workload_id: None,
+    };
+    let eval = || EvalInput {
+        credential_alias: "api-cred",
+        url: Some("http://example.com/x"),
+        method: Some("GET"),
+        principal: Some(&principal),
+        spend: None,
+    };
+
+    // Hammer /execute across well over 2 refresh cycles. EVERY call must be denied
+    // by *our* policy (name in body) — never flickering to allowed, and never the
+    // engine-default deny. Also probe the engine directly each iteration so a
+    // single in-memory clobber is caught even if the HTTP path happened to miss it.
+    // Iteration-driven (not wall-clock) so the call count is deterministic; the
+    // per-iter sleep + the 2ms refresh interval guarantee we span many cycles.
+    const ITERATIONS: u32 = 60;
+    let start = Instant::now();
+    let mut calls = 0u32;
+    let mut crossed_cycles = 0u32;
+    let mut last = Instant::now();
+    for i in 0..ITERATIONS {
+        // Re-PUT the per-agent Deny through the REAL admin path every iteration.
+        // This is the load-bearing part of the reproduction: store_and_reload_policy
+        // does store_policy (commit) -> reload_policies -> list_stored_policies (reads
+        // the in-memory cache). A concurrent refresh reload() that read the pre-store
+        // disk snapshot but assigns the cache inside this window clobbers the
+        // just-stored Deny out of the cache -> the engine loads a policy set WITHOUT
+        // it -> the deny flickers off until the next clean reload. The very next
+        // assertions (engine + /execute) must STILL see the Deny: it took effect on
+        // the very next call, deterministically.
+        let put = router
+            .clone()
+            .oneshot(admin_req(
+                "PUT",
+                &format!("/api/v1/policies/{}", deny_id),
+                &admin_key,
+                serde_json::json!({
+                    "name": "block-halt-bot",
+                    "credential_pattern": "*",
+                    "principal_pattern": "halt-bot",
+                    "default_action": "deny"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK, "re-PUT #{i} of the Deny must succeed");
+
+        // Engine truth: the per-agent Deny must be present immediately after the PUT.
+        match exec_server.policy_engine().evaluate_full(&eval()) {
+            vultrino::policy::PolicyDecision::Deny(reason) => {
+                assert!(
+                    reason.contains("block-halt-bot"),
+                    "iter {i}: engine denied but not by the admin policy: {reason}"
+                );
+            }
+            other => panic!("iter {i}: engine flickered — per-agent Deny vanished -> {other:?}"),
+        }
+        // HTTP truth: /execute denied by our policy (BAD_REQUEST + policy name).
+        let resp = router.clone().oneshot(exec_req()).await.unwrap();
+        let status = resp.status();
+        let body = body_string(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "iter {i}: /execute flickered: expected policy deny, got {status} body={body}"
+        );
+        assert!(
+            body.contains("block-halt-bot"),
+            "iter {i}: /execute denied by the wrong reason (flicker/default): {body}"
+        );
+        calls += 1;
+        if last.elapsed() >= refresh_interval {
+            crossed_cycles += 1;
+            last = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    churn_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = churn.await;
+    refresh_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for r in refreshers {
+        let _ = r.await;
+    }
+
+    assert_eq!(calls, ITERATIONS, "expected to hammer every iteration");
+    // The fixed iteration count plus per-iter sleep spans far more than 2 refresh
+    // cycles; assert it explicitly (both by counter and elapsed time) so the
+    // "across >2 refresh cycles" acceptance criterion is enforced, not assumed.
+    assert!(
+        crossed_cycles > 2 && start.elapsed() > refresh_interval * 3,
+        "test must span more than 2 refresh cycles, spanned ~{crossed_cycles} in {:?}",
+        start.elapsed()
+    );
+
+    // After all the refresh churn, the Deny is still durable in storage AND live
+    // in the engine — proving it was never lost, just consistently enforced.
+    assert!(
+        storage.get_policy(deny_id).await.unwrap().is_some(),
+        "the admin Deny must remain persisted after the refresh churn"
+    );
+    assert!(
+        exec_server.policy_engine().list_policies().iter().any(|p| p.id == deny_id),
+        "the admin Deny must remain in the live engine after the refresh churn"
+    );
+}
+
+/// Regression (V13a), deterministic core: the periodic refresh's `storage.reload()`
+/// must NOT lose a policy that `store_policy` just committed.
+///
+/// This pins the exact mechanism behind the intermittent admin-Deny flicker. The
+/// admin write path does `store_policy` (commit under the cross-process lock) then
+/// `list_stored_policies` (reads the in-memory cache) to load the engine — the same
+/// cache the periodic refresh overwrites. Before the fix, `reload()` re-read the
+/// vault from disk WITHOUT the lock: it could read the pre-`store_policy` snapshot
+/// and then assign that stale snapshot to the cache AFTER the store committed,
+/// dropping the just-stored policy from the cache (it stays durable on disk) until
+/// the next reload. `store_policy` is followed here by an immediate
+/// `list_stored_policies` — exactly what `store_and_reload_policy` does — and any
+/// miss is a lost update. With `reload()` taking the same lock, read-disk +
+/// assign-cache is atomic w.r.t. the store, so a committed policy is never lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_reload_never_loses_a_just_stored_policy() {
+    use vultrino::policy::Policy;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    // Background reloaders hammer storage.reload() (the refresh loop's first step),
+    // racing the stores below. Multiple loops widen the lost-update window.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut reloaders = Vec::new();
+    for _ in 0..3 {
+        let storage = storage.clone();
+        let stop = stop.clone();
+        reloaders.push(tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = storage.reload().await;
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    // Repeatedly store a fresh Deny and assert it's visible in the cache on the
+    // VERY NEXT read — the lost-update the flicker came from. Delete after each so
+    // the disk genuinely oscillates (each store's pre-state lacks that id), which
+    // is what lets a stale clobber drop it.
+    let mut lost = 0u32;
+    for i in 0..3000 {
+        let p = Policy::deny_all(format!("deny-{i}"), "*");
+        let id = p.id.clone();
+        storage.store_policy(&p).await.unwrap();
+        // store_and_reload_policy reads the cache here (list_stored_policies) to
+        // load the engine; a missing id means the engine would load WITHOUT the Deny.
+        if !storage.list_stored_policies().await.unwrap().iter().any(|x| x.id == id) {
+            lost += 1;
+        }
+        let _ = storage.delete_policy(&id).await;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for r in reloaders {
+        let _ = r.await;
+    }
+
+    assert_eq!(
+        lost, 0,
+        "store_policy was clobbered by a concurrent reload() {lost} times — \
+         the admin Deny would flicker out under the periodic refresh"
+    );
+}

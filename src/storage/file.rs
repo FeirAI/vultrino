@@ -425,13 +425,12 @@ impl FileStorage {
         }
     }
 
-    /// The blocking read-modify-write body of [`Self::locked_mutate`]. Holds the
-    /// advisory file lock for the whole cycle; must only be called off the async
-    /// reactor (via `block_in_place` or a current-thread runtime).
-    fn locked_mutate_blocking<T>(
-        &self,
-        f: impl FnOnce(&mut StorageCache) -> Result<T, StorageError>,
-    ) -> Result<T, StorageError> {
+    /// Acquire the exclusive cross-process advisory lock on the sidecar `.lock`
+    /// file (blocking). Returned guard releases the lock on drop. Shared by the
+    /// read-modify-write path ([`Self::locked_mutate_blocking`]) and the
+    /// read-into-cache reload path ([`Self::reload_blocking`]) so the two are
+    /// serialized against each other.
+    fn lock_file_exclusive(&self) -> Result<fd_lock::RwLock<std::fs::File>, StorageError> {
         let lock_path = self.path.with_extension("lock");
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
@@ -439,7 +438,17 @@ impl FileStorage {
             .write(true)
             .truncate(false)
             .open(&lock_path)?;
-        let mut flock = fd_lock::RwLock::new(lock_file);
+        Ok(fd_lock::RwLock::new(lock_file))
+    }
+
+    /// The blocking read-modify-write body of [`Self::locked_mutate`]. Holds the
+    /// advisory file lock for the whole cycle; must only be called off the async
+    /// reactor (via `block_in_place` or a current-thread runtime).
+    fn locked_mutate_blocking<T>(
+        &self,
+        f: impl FnOnce(&mut StorageCache) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let mut flock = self.lock_file_exclusive()?;
         // Blocks until no other process/thread holds the lock.
         let _guard = flock.write().map_err(StorageError::Io)?;
 
@@ -452,16 +461,43 @@ impl FileStorage {
         // `_guard` dropped here releases the lock.
     }
 
-    /// Reload data from disk (for picking up external changes)
-    pub async fn reload(&self) -> Result<(), StorageError> {
-        let content = fs::read_to_string(&self.path).await?;
-        let storage_file: StorageFile = serde_json::from_str(&content)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        check_version(storage_file.version)?;
-        let decrypted = decrypt(&storage_file.data, &self.master_key)?;
-        let cache = Self::parse_cache(&decrypted)?;
+    /// The blocking body of [`Self::reload`]: read the authoritative on-disk
+    /// state into the in-memory cache.
+    ///
+    /// This takes the **same** exclusive advisory lock as
+    /// [`Self::locked_mutate_blocking`]. That serialization is load-bearing, not
+    /// incidental: without it, `reload`'s lock-free read-disk-then-assign-cache
+    /// could lose a concurrent mutation's update. Concretely — `reload` reads the
+    /// OLD disk snapshot, a `store_policy` (under the lock) then atomically
+    /// renames the new file into place and updates `self.cache`, and finally
+    /// `reload` overwrites `self.cache` with its stale snapshot. The just-stored
+    /// policy vanishes from the in-memory cache (it's still durable on disk) until
+    /// the next mutation or reload re-reads disk — exactly the "admin Deny bites
+    /// only intermittently" flicker under the periodic policy refresh. Holding the
+    /// lock makes the read-disk + assign-cache atomic w.r.t. any mutation, so a
+    /// committed write is never reverted.
+    fn reload_blocking(&self) -> Result<(), StorageError> {
+        let mut flock = self.lock_file_exclusive()?;
+        let _guard = flock.write().map_err(StorageError::Io)?;
+        let cache = self.read_cache_from_disk_sync()?;
         *self.cache.write() = cache;
         Ok(())
+        // `_guard` dropped here releases the lock.
+    }
+
+    /// Reload data from disk (for picking up external changes).
+    ///
+    /// Takes the cross-process advisory lock for the read so a committed
+    /// mutation's in-memory update can't be clobbered by a stale snapshot — see
+    /// [`Self::reload_blocking`]. Like [`Self::locked_mutate`], the lock + I/O are
+    /// blocking, so we run them under `block_in_place` on a multi-thread runtime
+    /// (web/MCP servers) and inline on a current-thread runtime (unit tests).
+    pub async fn reload(&self) -> Result<(), StorageError> {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        match Handle::current().runtime_flavor() {
+            RuntimeFlavor::CurrentThread => self.reload_blocking(),
+            _ => tokio::task::block_in_place(|| self.reload_blocking()),
+        }
     }
 }
 
