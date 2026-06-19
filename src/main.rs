@@ -1280,12 +1280,23 @@ async fn remove_credential(config: Config, alias: String) -> Result<(), Box<dyn 
     // Try to find by alias first
     let credential = storage.get_by_alias(&alias).await?;
 
-    let id = if let Some(cred) = credential {
-        cred.id
+    let id = if let Some(cred) = &credential {
+        cred.id.clone()
     } else {
         // Assume it's an ID
         alias.clone()
     };
+
+    // R5/V7: propagate a downstream revoke (OAuth2/STS revocation endpoint) before
+    // deleting, so an already-issued token is actively revoked, not left to expire.
+    if let Some(cred) = &credential {
+        vultrino::revocation::propagate_revoke(
+            &vultrino::revocation::HttpRevocationClient::new(),
+            &*storage,
+            cred,
+        )
+        .await;
+    }
 
     storage.delete(&id).await?;
     println!("Credential '{}' removed", alias);

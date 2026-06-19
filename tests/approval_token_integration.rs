@@ -2772,3 +2772,201 @@ async fn test_v11_approvals_are_tenant_scoped() {
         vultrino::approval::ApprovalStatus::Approved
     );
 }
+
+// ==================== V7: OAuth rotation event + revoke-propagation ============
+
+/// A plugin that simulates the http plugin's OAuth2 refresh: it returns an
+/// `updated_credential` (a fresh token) iff the presented OAuth2 token is
+/// absent/expired — exactly the condition under which the real plugin rotates —
+/// so the server's persist+emit-on-rotation seam can be exercised in-process
+/// (the real refresh hits an HTTPS token endpoint blocked by the SSRF guard).
+struct RotatingMockPlugin;
+
+#[async_trait]
+impl Plugin for RotatingMockPlugin {
+    fn name(&self) -> &str {
+        "oauthmock"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::OAuth2]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["refresh"]
+    }
+    async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        let updated = match &request.credential.data {
+            CredentialData::OAuth2 {
+                client_id,
+                client_secret,
+                refresh_token,
+                access_token,
+                expires_at,
+                token_url,
+                scopes,
+            } => {
+                let needs_refresh = access_token.is_none()
+                    || expires_at.map(|e| e <= chrono::Utc::now()).unwrap_or(false);
+                needs_refresh.then(|| CredentialData::OAuth2 {
+                    client_id: client_id.clone(),
+                    client_secret: client_secret.clone(),
+                    refresh_token: refresh_token.clone(),
+                    access_token: Some(Secret::new("fresh-access-token".to_string())),
+                    expires_at: Some(chrono::Utc::now() + Duration::hours(1)),
+                    token_url: token_url.clone(),
+                    scopes: scopes.clone(),
+                })
+            }
+            _ => None,
+        };
+        Ok(ExecuteResponse {
+            status: 200,
+            headers: std::collections::HashMap::new(),
+            body: b"ok".to_vec(),
+            updated_credential: updated,
+        })
+    }
+    fn validate_params(&self, _a: &str, _p: &serde_json::Value) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+fn oauth_credential(alias: &str, expires_at: Option<chrono::DateTime<chrono::Utc>>) -> Credential {
+    Credential::new(
+        alias.to_string(),
+        CredentialData::OAuth2 {
+            client_id: "client".to_string(),
+            client_secret: Secret::new("client-secret".to_string()),
+            refresh_token: Some(Secret::new("refresh".to_string())),
+            access_token: Some(Secret::new("stale-access".to_string())),
+            expires_at,
+            token_url: "https://idp.example.com/token".to_string(),
+            scopes: vec![],
+        },
+    )
+}
+
+#[tokio::test]
+async fn test_v7_oauth_rotation_emits_credential_rotated_event() {
+    // R5(a): when the plugin refreshes an OAuth2 token, the server persists the
+    // updated credential AND emits a credential.rotated event; a still-valid token
+    // triggers no refresh and emits nothing.
+    let (server, storage) = setup().await; // allow mode
+    server.plugins().register(Arc::new(RotatingMockPlugin));
+
+    // An expired token → the plugin rotates → credential.rotated emitted.
+    let past = chrono::Utc::now() - Duration::hours(1);
+    storage.store(&oauth_credential("oauth-cred", Some(past))).await.unwrap();
+    let req = ExecuteRequest {
+        credential: "oauth-cred".to_string(),
+        action: "oauthmock.refresh".to_string(),
+        params: serde_json::json!({}),
+    };
+    let outcome = server.execute_gated(req, ExecAuth::default()).await.unwrap();
+    assert!(matches!(outcome, ExecutionOutcome::Completed(_)));
+
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    let rotated: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == vultrino::outbox::EVENT_CREDENTIAL_ROTATED)
+        .collect();
+    assert_eq!(rotated.len(), 1, "exactly one rotation event");
+    assert_eq!(rotated[0].subject, "oauth-cred");
+    assert_eq!(rotated[0].payload["credential"], "oauth-cred");
+    // The fresh token was persisted.
+    let stored = storage.get_by_alias("oauth-cred").await.unwrap().unwrap();
+    match stored.data {
+        CredentialData::OAuth2 { access_token, .. } => {
+            assert_eq!(access_token.unwrap().expose(), "fresh-access-token");
+        }
+        _ => panic!("expected OAuth2"),
+    }
+
+    // A still-valid token → no refresh → no new rotation event.
+    let future = chrono::Utc::now() + Duration::hours(2);
+    storage.store(&oauth_credential("oauth-valid", Some(future))).await.unwrap();
+    let req2 = ExecuteRequest {
+        credential: "oauth-valid".to_string(),
+        action: "oauthmock.refresh".to_string(),
+        params: serde_json::json!({}),
+    };
+    server.execute_gated(req2, ExecAuth::default()).await.unwrap();
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    assert!(
+        !events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_CREDENTIAL_ROTATED
+            && e.subject == "oauth-valid"),
+        "a still-valid token must not emit a rotation event"
+    );
+}
+
+/// A RevocationClient that records every revoke call instead of hitting network.
+struct RecordingRevoker {
+    calls: std::sync::Mutex<Vec<(String, String, String)>>, // (url, token, hint)
+}
+
+#[async_trait]
+impl vultrino::revocation::RevocationClient for RecordingRevoker {
+    async fn revoke(
+        &self,
+        revocation_url: &str,
+        token: &str,
+        token_type_hint: &str,
+        _client_id: &str,
+        _client_secret: &str,
+    ) -> Result<(), String> {
+        self.calls.lock().unwrap().push((
+            revocation_url.to_string(),
+            token.to_string(),
+            token_type_hint.to_string(),
+        ));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_v7_revoke_propagation_calls_endpoint_and_emits_event() {
+    // R5(b): deleting an OAuth2 credential that carries a revocation_url metadata
+    // key propagates a revoke to the resource side (access + refresh tokens) and
+    // emits a credential.revoked event. A credential without the endpoint does not.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("pw");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let revoker = RecordingRevoker { calls: std::sync::Mutex::new(Vec::new()) };
+
+    // A credential WITH a revocation endpoint → both tokens propagated + event.
+    let cred = oauth_credential("oauth-prod", Some(chrono::Utc::now()))
+        .with_metadata("revocation_url", "https://idp.example.com/revoke");
+    storage.store(&cred).await.unwrap();
+    vultrino::revocation::propagate_revoke(&revoker, &*storage, &cred).await;
+
+    let calls = revoker.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2, "both access and refresh tokens revoked");
+    assert!(calls.iter().all(|(url, _, _)| url == "https://idp.example.com/revoke"));
+    let hints: Vec<&str> = calls.iter().map(|(_, _, h)| h.as_str()).collect();
+    assert!(hints.contains(&"access_token") && hints.contains(&"refresh_token"));
+    assert!(calls.iter().any(|(_, tok, _)| tok == "stale-access"));
+
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    let revoked: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == vultrino::outbox::EVENT_CREDENTIAL_REVOKED)
+        .collect();
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0].subject, "oauth-prod");
+
+    // A credential WITHOUT a revocation endpoint → nothing propagated, no event.
+    let revoker2 = RecordingRevoker { calls: std::sync::Mutex::new(Vec::new()) };
+    let plain = oauth_credential("oauth-noendpoint", Some(chrono::Utc::now()));
+    storage.store(&plain).await.unwrap();
+    vultrino::revocation::propagate_revoke(&revoker2, &*storage, &plain).await;
+    assert!(revoker2.calls.lock().unwrap().is_empty(), "no endpoint → no revoke call");
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    assert!(
+        !events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_CREDENTIAL_REVOKED
+            && e.subject == "oauth-noendpoint"),
+        "no endpoint → no credential.revoked event"
+    );
+}

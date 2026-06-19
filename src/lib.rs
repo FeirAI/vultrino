@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod outbox;
 pub mod plugins;
 pub mod policy;
+pub mod revocation;
 pub mod router;
 pub mod server;
 pub mod session;

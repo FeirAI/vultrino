@@ -34,6 +34,10 @@ pub const EVENT_APPROVAL_EXPIRED: &str = "approval.expired";
 pub const EVENT_AGENT_HALTED: &str = "agent.halted";
 pub const EVENT_POLICY_CHANGED: &str = "policy.changed";
 pub const EVENT_CREDENTIAL_ROTATED: &str = "credential.rotated";
+/// A credential revoke that was **propagated** to the resource side (R5/V7): an
+/// OAuth2 credential's access/refresh token was revoked at its RFC 7009
+/// revocation endpoint on delete, not just left to expire.
+pub const EVENT_CREDENTIAL_REVOKED: &str = "credential.revoked";
 /// A policy denial that an observe-only tenant did NOT enforce (V11).
 pub const EVENT_POLICY_OBSERVED_DENIAL: &str = "policy.observed_denial";
 /// An enforce-mode denial — a DETECT signal (R3/V12a). Its `created_at` is the

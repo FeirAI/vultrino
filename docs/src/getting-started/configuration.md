@@ -182,11 +182,17 @@ and drops the headers; otherwise any `redact_patterns` (regexes) are scrubbed
 from the body (on top of the always-on redaction).
 
 > **Downstream credentials.** Blocking/redacting prevents an agent from reading
-> a downstream secret out of a response, but a `vut_` revoke does **not** revoke
-> a secret the downstream already issued. Prefer credential types that mint
-> short-lived, revocable downstream credentials (OAuth2 client-credentials, STS,
-> SVIDs) so a revoke maps to a real resource-side revoke. OAuth2 in-path token
-> rotation emits a `credential.rotated` event (delivered via the signed outbox).
+> a downstream secret out of a response. Deleting an OAuth2 credential that
+> carries a **`revocation_url`** metadata key now **propagates the revoke to the
+> provider** (R5/V7): Vultrino calls the RFC 7009 revocation endpoint for the
+> credential's issued access **and** refresh tokens before removing it locally,
+> so an already-issued downstream secret is actively revoked rather than left to
+> expire, and a `credential.revoked` event is emitted to the signed outbox. Set
+> it with `vultrino meta set <oauth-cred> revocation_url https://idp/oauth/revoke`
+> (HTTPS required). Prefer credential types that mint short-lived, revocable
+> downstream credentials (OAuth2 client-credentials, STS, SVIDs) so a revoke maps
+> to a real resource-side revoke. OAuth2 in-path token rotation also emits a
+> `credential.rotated` event.
 
 ### Action Labels
 
@@ -212,7 +218,8 @@ optional `action` field (default `http.request`) so it is no longer hardwired.
 
 Vultrino records security-relevant events to a durable, ordered, replayable,
 **signed** outbox: approval requested/approved/denied/escalated/expired,
-`agent.halted`, `policy.changed`, `credential.rotated`, `policy.observed_denial`
+`agent.halted`, `policy.changed`, `credential.rotated`, `credential.revoked` (a
+downstream revoke propagated to the provider on delete), `policy.observed_denial`
 (an observe-only tenant's un-enforced denial), and `policy.denied` (an
 enforce-mode denial — a **DETECT** signal whose `created_at` is a per-incident
 `detected_at` that pairs, on the same subject, with the `agent.halted`

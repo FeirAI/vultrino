@@ -1279,6 +1279,17 @@ pub async fn api_delete_credential(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
+    // R5/V7: propagate a downstream revoke before deleting an OAuth2 credential
+    // that exposes a revocation endpoint, so an already-issued token is actively
+    // revoked at the provider rather than left to expire. Best-effort.
+    if let Ok(Some(cred)) = state.storage.get(&id).await {
+        crate::revocation::propagate_revoke(
+            &crate::revocation::HttpRevocationClient::new(),
+            &*state.storage,
+            &cred,
+        )
+        .await;
+    }
     match state.storage.delete(&id).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response(),
         Err(crate::storage::StorageError::NotFound(_)) => {
