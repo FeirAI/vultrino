@@ -688,6 +688,16 @@ pub struct PolicyUpsertRequest {
     #[serde(default)]
     pub rules: Vec<PolicyRule>,
     pub default_action: PolicyAction,
+    /// **Kill switch** (V6): when true, this policy is an *authoritative*
+    /// unconditional Deny for every principal+credential it matches, evaluated
+    /// **before** all non-kill policies — so a halt can't be overridden by an
+    /// allow rule ordered first. This makes the kill-triad's W3 leg a true
+    /// independent containment leg: govder authors a `kill=true` per-agent Deny
+    /// and the evaluator short-circuits it ahead of any matching allow rule.
+    /// Defaults to `false` (omitted) — ordinary policy POSTs keep parsing
+    /// unchanged. Admin-gated: the policy routes already require an admin key.
+    #[serde(default)]
+    pub kill: bool,
 }
 
 /// Build a validated `Policy` from a request, forcing the id on PUT or
@@ -706,6 +716,12 @@ fn build_policy(req: PolicyUpsertRequest, forced_id: Option<String>) -> Result<P
     policy.principal_pattern = req.principal_pattern;
     policy.default_action = req.default_action;
     policy.rules = req.rules;
+    // V6: an admin may author an authoritative kill policy. A kill policy with
+    // default_action = deny + a principal_pattern is the expected shape (the
+    // kill-triad W3 leg); it is NOT rejected here — validate only guards spend
+    // caps. The kill flag makes the evaluator short-circuit this policy ahead of
+    // any matching allow rule (src/policy/mod.rs ~283).
+    policy.kill = req.kill;
     // Reject misconfigured spend caps (nested / no caps / not fail-closed).
     policy.validate()?;
     Ok(policy)
@@ -1343,6 +1359,95 @@ pub async fn api_delete_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_policy_kill_defaults_false_when_omitted() {
+        // Back-compat: a body WITHOUT a `kill` field (every pre-V13 admin POST)
+        // still parses and yields a non-kill policy. `#[serde(default)]` on the
+        // new field guarantees existing callers are unaffected.
+        let json = r#"{
+            "name": "github-readonly",
+            "credential_pattern": "github-*",
+            "rules": [],
+            "default_action": "deny"
+        }"#;
+        let req: PolicyUpsertRequest = serde_json::from_str(json).unwrap();
+        assert!(!req.kill, "kill must default to false when omitted");
+        let policy = build_policy(req, Some("p1".to_string())).unwrap();
+        assert!(!policy.kill, "a normal compiled policy must not be a kill policy");
+        assert_eq!(policy.default_action, PolicyAction::Deny);
+    }
+
+    #[test]
+    fn test_build_policy_kill_true_overrides_allow_rule() {
+        // The kill-triad W3 leg: an admin authors a per-agent Deny with
+        // `kill:true` via the API path (build_policy). The constructed Policy must
+        // carry kill=true so vultrino's evaluator short-circuits it AHEAD of any
+        // matching allow rule — even one ordered first. This is the fix that makes
+        // W3 a true independent containment leg (previously an ordinary kill=false
+        // deny could be skipped when an allow rule matched first).
+        use crate::policy::{EvalInput, PolicyCondition, PolicyDecision, PolicyEngine, Principal};
+
+        // The W3 body govder pushes: default-deny, principal-scoped, kill=true.
+        let json = r#"{
+            "name": "kill-bot-7-k1",
+            "credential_pattern": "*",
+            "principal_pattern": "bot-7",
+            "rules": [],
+            "default_action": "deny",
+            "kill": true
+        }"#;
+        let req: PolicyUpsertRequest = serde_json::from_str(json).unwrap();
+        assert!(req.kill, "kill:true must parse off the wire");
+        let kill_policy = build_policy(req, Some("kill-bot-7".to_string())).unwrap();
+        assert!(kill_policy.kill, "build_policy must propagate kill=true to the Policy");
+
+        let engine = PolicyEngine::new();
+        engine.set_default_deny(false);
+        // Ordered FIRST: a broad allow whose allow RULE matches the request. Pre-fix
+        // an ordinary deny added after this would never be reached for the agent.
+        engine.add_policy(
+            Policy::allow_all("allow-all", "*")
+                .with_rule(PolicyCondition::UrlMatch("*".to_string()), PolicyAction::Allow),
+        );
+        // Then the admin-authored kill policy (added AFTER the allow on purpose).
+        engine.add_policy(kill_policy);
+
+        let halted = Principal {
+            id: "k1".to_string(),
+            agent_label: Some("bot-7".to_string()),
+            owner: None,
+            workload_id: None,
+        };
+        let decision = engine.evaluate_full(&EvalInput {
+            credential_alias: "github-prod",
+            url: Some("https://api.github.com/x"),
+            method: Some("GET"),
+            principal: Some(&halted),
+            spend: None,
+        });
+        match decision {
+            PolicyDecision::Deny(r) => assert!(r.contains("halted"), "reason: {r}"),
+            other => panic!("an admin-authored kill policy must override the allow rule, got {other:?}"),
+        }
+
+        // A different agent is unaffected → the allow rule still applies (the kill
+        // is principal-scoped, not a blanket halt).
+        let other = Principal {
+            id: "k2".to_string(),
+            agent_label: Some("bot-9".to_string()),
+            owner: None,
+            workload_id: None,
+        };
+        let decision = engine.evaluate_full(&EvalInput {
+            credential_alias: "github-prod",
+            url: Some("https://api.github.com/x"),
+            method: Some("GET"),
+            principal: Some(&other),
+            spend: None,
+        });
+        assert_eq!(decision, PolicyDecision::Allow, "non-halted agent still allowed");
+    }
 
     #[test]
     fn test_resolve_execute_action_defaults() {
