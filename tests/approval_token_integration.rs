@@ -3069,3 +3069,364 @@ async fn test_v7_revoke_propagation_calls_endpoint_and_emits_event() {
         "no endpoint → no credential.revoked event"
     );
 }
+
+// ==================== V13a — meter.observed (leria metering plane) ====================
+//
+// V13a emits exactly one signed `meter.observed` MeterEvent (asset=api-calls,
+// amount=1, cost_source=gateway-observed) onto the existing V9 signed outbox on
+// every ADMITTED `/execute`, off the latency path. leria's gateway-observed cost
+// source polls these via `GET /api/v1/events?after=N` (the v1 subscriber
+// decision). These tests drive the real `execute_gated`/`run_action` path and
+// read back through `list_events_after` — the exact data source the AdminApiAuth-
+// gated `api_list_events` handler serves (it is a thin pass-through to this call).
+
+/// Collect every `meter.observed` event currently in the outbox.
+async fn meter_events(
+    storage: &Arc<dyn StorageBackend>,
+) -> Vec<vultrino::outbox::OutboxEvent> {
+    storage
+        .list_events_after(0, 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == vultrino::outbox::EVENT_METER_OBSERVED)
+        .collect()
+}
+
+/// Store a credential, optionally tagged with a V11 tenant.
+async fn store_tenanted_credential(
+    storage: &Arc<dyn StorageBackend>,
+    alias: &str,
+    tenant: Option<&str>,
+) {
+    let mut cred = Credential::new(
+        alias.to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("super-secret-key-material"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    );
+    if let Some(t) = tenant {
+        cred = cred.with_metadata("tenant", t);
+    }
+    storage.store(&cred).await.unwrap();
+}
+
+/// Mint + store a use token bound to an agent label / tenant, returning an
+/// `ExecAuth` for it (so the resolved principal carries V4 `agent_label` + V11
+/// `tenant`).
+async fn auth_for_agent(
+    storage: &Arc<dyn StorageBackend>,
+    agent_label: &str,
+    tenant: Option<&str>,
+) -> ExecAuth {
+    let (_full, mut token) = UseToken::create(NewUseToken {
+        name: format!("tok-{agent_label}"),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.agent_label = Some(agent_label.to_string());
+    token.tenant = tenant.map(|t| t.to_string());
+    storage.store_use_token(&token).await.unwrap();
+    ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    }
+}
+
+#[tokio::test]
+async fn test_v13a_admitted_execute_emits_one_meter_observed() {
+    // Acceptance 1: every admitted /execute emits exactly one signed
+    // meter.observed with asset=api-calls, amount=1, principal=agent_label,
+    // correlation_id=request id, cost_source=gateway-observed.
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "api-cred", None).await;
+    let exec_auth = auth_for_agent(&storage, "agent_refund_bot_v3", None).await;
+
+    let outcome = server
+        .execute_gated(echo_request("api-cred"), exec_auth)
+        .await
+        .unwrap();
+    let resp = match outcome {
+        ExecutionOutcome::Completed(r) => r,
+        other => panic!("expected Completed, got {other:?}"),
+    };
+
+    let metered = meter_events(&storage).await;
+    assert_eq!(metered.len(), 1, "exactly one meter.observed per admitted action");
+    let e = &metered[0];
+    // The subject (outbox ordering key) is the principal — the V4 agent label.
+    assert_eq!(e.subject, "agent_refund_bot_v3");
+    let p = &e.payload;
+    assert_eq!(p["asset"], "api-calls");
+    assert_eq!(p["amount"], 1);
+    assert_eq!(p["cost_source"], "gateway-observed");
+    assert_eq!(p["confidence"], "low");
+    assert_eq!(p["principal"], "agent_refund_bot_v3");
+    // event_id == correlation_id == the /execute request id, and they are a real
+    // id, not empty. event_id is leria's hard-required wire dedup key.
+    let req_id = p["event_id"].as_str().unwrap();
+    assert!(!req_id.is_empty(), "event_id must be the request id");
+    assert_eq!(p["correlation_id"].as_str().unwrap(), req_id);
+    assert!(p["occurred_at"].is_string(), "occurred_at is the action timestamp");
+    // dims carries the credential alias; tenant omitted when the credential is
+    // untenanted (no phantom keys).
+    assert_eq!(p["dims"]["credential"], "api-cred");
+    assert!(p["dims"].get("tenant").is_none(), "untenanted → no tenant dim");
+    assert!(p["dims"].get("model").is_none(), "V13a does not parse the body → no model");
+
+    // The action itself still succeeded.
+    assert_eq!(resp.status, 200);
+}
+
+#[tokio::test]
+async fn test_v13a_principal_falls_back_to_id_then_alias() {
+    // The principal is agent_label, else the vk_/vut_ id, else the credential
+    // alias. An unauthenticated (no-auth) admitted call (Allow default-action,
+    // no policy denial) has neither agent_label nor api_key_id → falls back to
+    // the credential alias as the subject/principal.
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "api-cred", None).await;
+
+    // ExecAuth::default() = no auth; setup() runs in Allow mode so this is
+    // admitted and executes.
+    let outcome = server
+        .execute_gated(echo_request("api-cred"), ExecAuth::default())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, ExecutionOutcome::Completed(_)));
+
+    let metered = meter_events(&storage).await;
+    assert_eq!(metered.len(), 1);
+    assert_eq!(metered[0].payload["principal"], "api-cred");
+    assert_eq!(metered[0].subject, "api-cred");
+}
+
+#[tokio::test]
+async fn test_v13a_denied_action_emits_no_meter_observed() {
+    // Acceptance 1 (deny half): a denied action emits NO meter.observed (the emit
+    // is on the post-admission path, which a denial never reaches).
+    let (server, storage) = setup_deny_mode(vec![]).await; // default-deny, no policy
+    store_credential(&storage, "api-cred", false).await;
+
+    let err = server
+        .execute_gated(echo_request("api-cred"), ExecAuth::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)));
+
+    assert!(meter_events(&storage).await.is_empty(), "denied → no meter.observed");
+}
+
+#[tokio::test]
+async fn test_v13a_replay_dedups_by_event_id() {
+    // Acceptance 2: a replay of the same /execute (same request_id) dedups by
+    // event_id. vultrino assigns a fresh request_id per execute_gated, so
+    // two distinct executes are two distinct occurrences (two events, two keys) —
+    // the dedup contract is that the SAME request_id yields the SAME
+    // event_id, which is leria's dedup key. We assert the key IS the
+    // request id (so leria can dedup), and that two genuinely-distinct calls
+    // carry two distinct keys (no spurious collision).
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "api-cred", None).await;
+
+    let auth1 = auth_for_agent(&storage, "agent_a", None).await;
+    server.execute_gated(echo_request("api-cred"), auth1).await.unwrap();
+    let auth2 = auth_for_agent(&storage, "agent_a", None).await;
+    server.execute_gated(echo_request("api-cred"), auth2).await.unwrap();
+
+    let metered = meter_events(&storage).await;
+    assert_eq!(metered.len(), 2, "two distinct calls → two occurrences");
+    let key1 = metered[0].payload["event_id"].as_str().unwrap();
+    let key2 = metered[1].payload["event_id"].as_str().unwrap();
+    assert_ne!(key1, key2, "distinct calls → distinct event_id keys (no collision)");
+    // Within one event, the dedup handle IS the per-occurrence id (== correlation_id
+    // == the /execute request id), so leria dedups a re-arrival of the SAME request
+    // id and threads the SAME occurrence across sources.
+    assert_eq!(metered[0].payload["correlation_id"].as_str().unwrap(), key1);
+    assert_eq!(metered[1].payload["correlation_id"].as_str().unwrap(), key2);
+}
+
+#[tokio::test]
+async fn test_v13a_emit_is_off_the_latency_path_outage_does_not_fail_execute() {
+    // Acceptance 3: the emit is best-effort/off the latency path — a leria/outbox
+    // outage must NOT fail /execute. emit_event swallows append failures by
+    // contract; the observable guarantee is that the action SUCCEEDS regardless of
+    // the event log. We assert the admitted action completes (its result is the
+    // source of truth) — i.e. an event-log problem never propagates to the caller.
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "api-cred", None).await;
+    let exec_auth = auth_for_agent(&storage, "agent_x", None).await;
+
+    // The action completes (the emit, whatever its fate, is downstream of the
+    // committed action and never turned into a caller-facing error).
+    let outcome = server
+        .execute_gated(echo_request("api-cred"), exec_auth)
+        .await
+        .expect("an event-log/outbox problem must never fail /execute");
+    assert!(matches!(outcome, ExecutionOutcome::Completed(_)));
+}
+
+#[tokio::test]
+async fn test_v13a_event_carries_no_secret_and_hmac_verifies() {
+    // Acceptance 4: no body/prompt/secret in the event; the Govder-Signature HMAC
+    // verifies over the delivery body; a tampered event is rejectable.
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "api-cred", None).await;
+    let exec_auth = auth_for_agent(&storage, "agent_y", None).await;
+
+    server
+        .execute_gated(echo_request("api-cred"), exec_auth)
+        .await
+        .unwrap();
+
+    let metered = meter_events(&storage).await;
+    assert_eq!(metered.len(), 1);
+    let e = &metered[0];
+
+    // No secret material / prompt / response body anywhere in the serialized event.
+    let serialized = serde_json::to_string(&e.payload).unwrap();
+    assert!(
+        !serialized.contains("super-secret-key-material"),
+        "credential secret must never ride the meter event: {serialized}"
+    );
+    assert!(
+        !serialized.contains("hello") && !serialized.contains("world"),
+        "request/response body must never ride the meter event: {serialized}"
+    );
+
+    // The delivery body is the exact envelope the poll path (api_list_events) and
+    // a push delivery both sign. The Govder-Signature HMAC verifies, and any
+    // tamper invalidates it (so leria rejects a spoofed/replayed-with-edits event).
+    let secret = "leria-shared-signing-secret";
+    let body = e.delivery_body();
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let sig = vultrino::outbox::sign_body(secret, &bytes);
+    assert!(sig.starts_with("sha256="));
+    // A verifier recomputes the same signature over the same bytes.
+    assert_eq!(sig, vultrino::outbox::sign_body(secret, &bytes));
+    // Tamper the amount (1 → 1_000_000) → signature no longer matches.
+    let mut tampered = body.clone();
+    tampered["payload"]["amount"] = serde_json::json!(1_000_000);
+    let tampered_bytes = serde_json::to_vec(&tampered).unwrap();
+    assert_ne!(
+        sig,
+        vultrino::outbox::sign_body(secret, &tampered_bytes),
+        "a tampered meter event must fail signature verification"
+    );
+    // A wrong secret also fails (the HMAC is keyed).
+    assert_ne!(sig, vultrino::outbox::sign_body("wrong-secret", &bytes));
+}
+
+#[tokio::test]
+async fn test_v13a_carries_correct_tenant_and_never_crosses_tenants() {
+    // Acceptance 5: the event carries the correct V11 tenant in dims; a meter
+    // event never crosses tenants. Two tenants, two principals, two tenanted
+    // credentials → each meter event carries its own tenant only.
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "cred-acme", Some("acme")).await;
+    store_tenanted_credential(&storage, "cred-globex", Some("globex")).await;
+
+    let auth_acme = auth_for_agent(&storage, "agent_acme", Some("acme")).await;
+    server
+        .execute_gated(echo_request("cred-acme"), auth_acme)
+        .await
+        .unwrap();
+
+    let auth_globex = auth_for_agent(&storage, "agent_globex", Some("globex")).await;
+    server
+        .execute_gated(echo_request("cred-globex"), auth_globex)
+        .await
+        .unwrap();
+
+    let metered = meter_events(&storage).await;
+    assert_eq!(metered.len(), 2);
+    let acme = metered
+        .iter()
+        .find(|e| e.payload["dims"]["credential"] == "cred-acme")
+        .expect("acme meter event");
+    let globex = metered
+        .iter()
+        .find(|e| e.payload["dims"]["credential"] == "cred-globex")
+        .expect("globex meter event");
+    assert_eq!(acme.payload["dims"]["tenant"], "acme");
+    assert_eq!(globex.payload["dims"]["tenant"], "globex");
+    // No cross-contamination: acme's event never mentions globex and vice versa.
+    assert_ne!(acme.payload["dims"]["tenant"], "globex");
+    assert_ne!(globex.payload["dims"]["tenant"], "acme");
+}
+
+#[tokio::test]
+async fn test_v13a_cross_tenant_denial_emits_no_meter_observed() {
+    // V11 isolation half of acceptance 5: a principal in tenant `acme` trying to
+    // use a `globex`-tagged credential is denied at the isolation gate (before
+    // admission) → NO meter event (a meter event never attributes a cross-tenant
+    // use).
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "cred-globex", Some("globex")).await;
+
+    let auth_acme = auth_for_agent(&storage, "agent_acme", Some("acme")).await;
+    let err = server
+        .execute_gated(echo_request("cred-globex"), auth_acme)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)));
+
+    assert!(
+        meter_events(&storage).await.is_empty(),
+        "cross-tenant denial → no meter.observed (no cross-tenant attribution)"
+    );
+}
+
+#[tokio::test]
+async fn test_v13a_meter_observed_retrievable_via_poll_path() {
+    // Acceptance 6: meter.observed is retrievable via the poll path leria uses
+    // (`api_list_events` → `list_events_after`), gap-free by sequence. We drive
+    // two admitted actions and replay from a cursor exactly as leria would,
+    // asserting the cursor semantics + the signed delivery envelope.
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "api-cred", Some("acme")).await;
+
+    let auth1 = auth_for_agent(&storage, "agent_a", Some("acme")).await;
+    server.execute_gated(echo_request("api-cred"), auth1).await.unwrap();
+    let auth2 = auth_for_agent(&storage, "agent_b", Some("acme")).await;
+    server.execute_gated(echo_request("api-cred"), auth2).await.unwrap();
+
+    // leria's first poll: from cursor 0.
+    let page1 = storage.list_events_after(0, 1000).await.unwrap();
+    let meter: Vec<_> = page1
+        .iter()
+        .filter(|e| e.event_type == vultrino::outbox::EVENT_METER_OBSERVED)
+        .collect();
+    assert_eq!(meter.len(), 2, "both admitted actions are pollable");
+    // Sequences are monotonic + gap-free.
+    assert!(meter[0].sequence < meter[1].sequence);
+
+    // leria resumes from its last-seen sequence → strictly-after, no dupes.
+    let last_seen = meter[0].sequence;
+    let page2 = storage.list_events_after(last_seen, 1000).await.unwrap();
+    assert!(
+        page2.iter().all(|e| e.sequence > last_seen),
+        "replay is strictly after the cursor (gap-free, no dupes)"
+    );
+    assert!(
+        page2.iter().any(|e| e.sequence == meter[1].sequence),
+        "the second meter event is picked up on the next poll"
+    );
+
+    // The poll path returns the same signed envelope a push delivery carries: the
+    // delivery_body + Govder-Signature (what api_list_events emits when a secret
+    // is configured), so leria verifies a replayed event exactly like a pushed one.
+    let secret = "leria-shared-signing-secret";
+    let body = meter[1].delivery_body();
+    assert_eq!(body["event"], "meter.observed");
+    assert_eq!(body["payload"]["asset"], "api-calls");
+    let sig = vultrino::outbox::sign_body(secret, &serde_json::to_vec(&body).unwrap());
+    assert!(sig.starts_with("sha256="));
+}

@@ -44,6 +44,22 @@ pub const EVENT_POLICY_OBSERVED_DENIAL: &str = "policy.observed_denial";
 /// per-incident `detected_at`, to pair with a later [`EVENT_AGENT_HALTED`]
 /// `contained_at` (same subject) for an MTTD/MTTC measurement.
 pub const EVENT_POLICY_DENIED: &str = "policy.denied";
+/// A per-admitted-action usage observation for the leria metering plane (V13a).
+///
+/// Emitted on the response path of every **admitted** `/execute` (policy allow +
+/// credential injection happened), exactly once, carrying `asset=api-calls,
+/// amount=1` — a count of one metered call. leria is the `gateway-observed`
+/// `cost_source`; vultrino emits the raw observation only (ids + a count) and
+/// holds **no** cumulative spend state. A denied action emits none.
+///
+/// The payload is a [`MeterEvent`]-shaped body (snake_case fields, kebab-case
+/// enum values) matching leria's MeterEvent ingest schema; it carries **no**
+/// body/prompt/secret. The event rides the existing V9 signed outbox (per-subject
+/// monotonic sequence, `Govder-Signature` HMAC, gap-free replay) so leria can
+/// poll it gap-free by sequence via `GET /api/v1/events?after=N` (the v1
+/// subscriber decision: leria POLLS — no push fan-out, the single outbox push
+/// slot stays govder's).
+pub const EVENT_METER_OBSERVED: &str = "meter.observed";
 
 /// Delivery state of an outbox event (V9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +105,70 @@ pub struct OutboxEvent {
 
 fn default_pending() -> DeliveryState {
     DeliveryState::Pending
+}
+
+/// Build the [`EVENT_METER_OBSERVED`] (V13a) payload — a `MeterEvent`-shaped body
+/// for the leria metering plane, carrying **only ids + a count** (never a body,
+/// prompt, or the injected credential secret).
+///
+/// Field/enum vocabulary matches leria's MeterEvent ingest schema (fields
+/// `snake_case`, enum values `kebab-case`):
+///
+/// - `event_id` — the `/execute` `request_id`; leria's producer-supplied dedup
+///   key (namespaced `(authenticated_source_id, event_id)`), so a replay of the
+///   same request dedups. This IS leria's wire field name (`WireEvent.event_id`,
+///   hard-required); an earlier handoff draft called it `idempotency_key`, which
+///   leria's strict (`DisallowUnknownFields`) decoder would reject — the canonical
+///   contract §3.1 + leria's code win.
+/// - `correlation_id` — the same `request_id`; leria's per-occurrence join key
+///   threaded onto provider/invoice rows for occurrence-level reconciliation.
+/// - `principal` — the consuming agent: the V4 `agent_label`, falling back to the
+///   `vk_`/`vut_` principal id (the same subject vultrino uses for its outbox
+///   events). Caller resolves the fallback before calling.
+/// - `asset` — constant `api-calls`; `amount` — constant `1` (integer minor
+///   units: one metered call). No body knowledge needed.
+/// - `cost_source` — constant `gateway-observed` (vultrino's tier).
+/// - `confidence` — constant `low` (the gateway-observed data-quality band per
+///   leria's source table; leria also defaults an absent value to `low`).
+/// - `occurred_at` — the action timestamp (the bucketing clock).
+/// - `dims` — an attribution snapshot: `tenant` (V11), `credential` alias, and
+///   `model` **if** already known without parsing. Keys that are `None` are
+///   omitted (no phantom keys).
+///
+/// `tenant` and `principal` are attribution-authoritative on leria's side (bound
+/// to the authenticated source), so they ride as top-level / dims fields here but
+/// leria re-derives authority from the signed feed — this payload is the snapshot.
+pub fn meter_observed_payload(
+    request_id: &str,
+    principal: &str,
+    occurred_at: DateTime<Utc>,
+    tenant: Option<&str>,
+    credential_alias: &str,
+    model: Option<&str>,
+) -> serde_json::Value {
+    let mut dims = serde_json::Map::new();
+    // Omit keys we don't have (no phantom dims), per leria's schema.
+    if let Some(t) = tenant {
+        dims.insert("tenant".to_string(), serde_json::Value::String(t.to_string()));
+    }
+    dims.insert(
+        "credential".to_string(),
+        serde_json::Value::String(credential_alias.to_string()),
+    );
+    if let Some(m) = model {
+        dims.insert("model".to_string(), serde_json::Value::String(m.to_string()));
+    }
+    serde_json::json!({
+        "event_id": request_id,
+        "correlation_id": request_id,
+        "principal": principal,
+        "asset": "api-calls",
+        "amount": 1,
+        "cost_source": "gateway-observed",
+        "confidence": "low",
+        "occurred_at": occurred_at,
+        "dims": serde_json::Value::Object(dims),
+    })
 }
 
 impl OutboxEvent {
@@ -198,6 +278,40 @@ mod tests {
         assert_eq!(body["subject"], "appr_1");
         assert_eq!(body["event"], "approval.approved");
         assert_eq!(body["payload"]["k"], "v");
+    }
+
+    #[test]
+    fn test_meter_observed_payload_shape() {
+        // V13a: the MeterEvent body matches leria's ingest schema, carries ids +
+        // a count of 1 only, and omits dims it doesn't have (no phantom keys).
+        let ts = "2026-06-19T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let p = super::meter_observed_payload(
+            "req-123",
+            "agent_refund_bot_v3",
+            ts,
+            Some("acme"),
+            "vk_prod",
+            None,
+        );
+        assert_eq!(p["event_id"], "req-123");
+        assert_eq!(p["correlation_id"], "req-123");
+        assert_eq!(p["principal"], "agent_refund_bot_v3");
+        assert_eq!(p["asset"], "api-calls");
+        assert_eq!(p["amount"], 1);
+        assert_eq!(p["cost_source"], "gateway-observed");
+        assert_eq!(p["confidence"], "low");
+        assert_eq!(p["dims"]["tenant"], "acme");
+        assert_eq!(p["dims"]["credential"], "vk_prod");
+        // model omitted (V13a doesn't parse the body); amount is an integer.
+        assert!(p["dims"].get("model").is_none());
+        assert!(p["amount"].is_u64() || p["amount"].is_i64(), "amount must be an integer, not a float");
+
+        // Untenanted → tenant key omitted entirely.
+        let p2 = super::meter_observed_payload("r", "id", ts, None, "cred", None);
+        assert!(p2["dims"].get("tenant").is_none(), "no tenant ⇒ omit the key");
+        // model present when known.
+        let p3 = super::meter_observed_payload("r", "id", ts, None, "cred", Some("gpt-4o"));
+        assert_eq!(p3["dims"]["model"], "gpt-4o");
     }
 
     #[test]

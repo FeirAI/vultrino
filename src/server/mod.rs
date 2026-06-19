@@ -747,6 +747,23 @@ impl VultrinoServer {
         let credential_alias = credential.alias.clone();
         let credential_metadata = credential.metadata.clone();
         let credential_created_at = credential.created_at;
+        // V13a: capture the metering attribution before `context`/`credential`
+        // move into the plugin request. `principal` is the V4 agent_label falling
+        // back to the vk_/vut_ id, then the credential alias as a last resort
+        // (the same subject the outbox uses). `occurred_at` is the action's
+        // request timestamp (leria's bucketing clock). `meter_tenant` is the
+        // credential's V11 tenant tag (which, when set, must match the principal's
+        // tenant — enforced above — so it is the action's tenant).
+        let meter_principal = context
+            .agent_label
+            .clone()
+            .or_else(|| context.api_key_id.clone())
+            .unwrap_or_else(|| credential_alias.clone());
+        let meter_occurred_at = context.timestamp;
+        let meter_tenant = credential_metadata
+            .get("tenant")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         // Capture the credential's secret material before it moves into the
         // plugin request, so we can scrub it from the response (V7 egress).
         let secret_material = credential.data.secret_material();
@@ -829,6 +846,39 @@ impl VultrinoServer {
             )
             .await;
         }
+
+        // V13a (leria metering): this action was ADMITTED (policy allow +
+        // credential injection happened) and has executed. Emit exactly one
+        // `meter.observed` MeterEvent (`asset=api-calls, amount=1`) onto the V9
+        // signed outbox so leria's `gateway-observed` cost source sees the call.
+        //
+        // Placement: post-`scrub_response`, on the same best-effort hook the
+        // `credential.rotated` emit (above) uses. V13a reads NO body bytes (a
+        // count of 1), so the scrub-order hazard that gates V13b's token read does
+        // NOT apply here — emitting after scrub is safe. The emit is best-effort
+        // (`emit_event` swallows append failures): a leria/outbox outage must NOT
+        // block or fail `/execute`. (leria compensates for a silently-dropped
+        // event with a monotonic-`sequence` gap detector on its poll feed — the
+        // v1 subscriber decision: leria POLLS `GET /api/v1/events?after=N`; we add
+        // no push fan-out, the single outbox push slot stays govder's.)
+        //
+        // No body/prompt/secret rides the event — ids + a count of 1 only.
+        // (`meter_principal`/`meter_occurred_at`/`meter_tenant` were captured
+        // above, before `context`/`credential` moved into the plugin request.)
+        // `model` is omitted: V13a does not parse the body.
+        self.emit_event(
+            &meter_principal,
+            crate::outbox::EVENT_METER_OBSERVED,
+            crate::outbox::meter_observed_payload(
+                &request_id,
+                &meter_principal,
+                meter_occurred_at,
+                meter_tenant.as_deref(),
+                &credential_alias,
+                None,
+            ),
+        )
+        .await;
 
         // Record for rate limiting.
         self.policy_engine.record_request(&credential_alias);
