@@ -928,3 +928,107 @@ async fn test_admin_token_mint_trims_owner_identity() {
     let t = tokens.iter().find(|t| t.name == "owned-bot").unwrap();
     assert_eq!(t.owner_identity.as_deref(), Some("alice@example.com"), "owner trimmed");
 }
+
+#[tokio::test]
+async fn test_v10_inbound_svid_resolves_into_evaluated_principal() {
+    // R6: a SPIFFE SVID presented inbound (an already transport-verified document
+    // in the configured header) is resolved into the principal evaluated by policy
+    // — proven by a principal_pattern Deny that only fires when the SVID, not the
+    // static vut_ id, is the principal.
+    use vultrino::auth::{NewUseToken, UseToken};
+    use vultrino::config::{IdentityConfig, IdentityResolverKind};
+    use vultrino::policy::Policy;
+    use vultrino::{Credential, CredentialData, Secret};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    // Config: a SPIFFE resolver on `x-spiffe-verified`, plus a Deny scoped to the
+    // SVID's trust domain. Allow mode so a non-matching principal isn't denied.
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.identity = Some(IdentityConfig {
+        kind: IdentityResolverKind::Spiffe,
+        header: "x-spiffe-verified".to_string(),
+        allowed: vec!["example.org".to_string()],
+    });
+    config.policies = vec![Policy::deny_all("block-svid", "*").with_principal("spiffe://example.org/*")];
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        config.clone(),
+        storage.clone(),
+        resolver,
+    ));
+    let web = WebServer::new(
+        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        config,
+        storage.clone(),
+        AuthManager::new(),
+        admin,
+        exec_server,
+    );
+    let router = web.into_router();
+
+    // A credential + a use token to authenticate the /execute call.
+    let cred = Credential::new(
+        "api-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("secret"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    );
+    storage.store(&cred).await.unwrap();
+    let (secret, token) = UseToken::create(NewUseToken {
+        name: "svid-bot".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    // 127.0.0.1 fails SSRF fast, so the no-SVID control errors on the plugin, not
+    // the policy — keeping the two outcomes cleanly distinguishable.
+    let body = serde_json::json!({
+        "credential": "api-cred",
+        "method": "GET",
+        "url": "http://127.0.0.1/x"
+    });
+    let exec_req = |with_svid: bool| {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/api/v1/execute")
+            .header("authorization", format!("Bearer {}", secret))
+            .header("content-type", "application/json");
+        if with_svid {
+            b = b.header("x-spiffe-verified", "spiffe://example.org/ns/prod/sa/agent");
+        }
+        b.body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()
+    };
+
+    // WITH the SVID: the resolved principal matches the trust-domain Deny → blocked
+    // by that policy specifically (proves the SVID is the evaluated principal).
+    let resp = router.clone().oneshot(exec_req(true)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_string(resp).await.contains("block-svid"),
+        "the inbound SVID must be the evaluated principal (denied by its policy)"
+    );
+
+    // WITHOUT the SVID: the principal is the vut_ id, which the SVID policy does
+    // NOT match → it proceeds past policy and fails later (SSRF), not by block-svid.
+    let resp = router.clone().oneshot(exec_req(false)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !body_string(resp).await.contains("block-svid"),
+        "without the SVID the trust-domain policy must not fire"
+    );
+}

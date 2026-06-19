@@ -56,6 +56,34 @@ pub struct Config {
     /// Per-tenant enforcement mode (V11): a tenant absent here uses
     /// [`TenantMode::Enforce`]. Lets one team run enforce while another observes.
     pub tenants: std::collections::HashMap<String, TenantMode>,
+    /// Inbound workload-identity resolution (V10/R6): resolve an SVID/OIDC
+    /// document presented on a request into the principal evaluated by policy.
+    /// `None` = no resolver wired (principal stays the `vk_`/`vut_` id).
+    pub identity: Option<IdentityConfig>,
+}
+
+/// Inbound workload-identity resolution config (V10/R6). A request carrying the
+/// configured `header` (an **already transport-verified** SVID or OIDC claims
+/// document) has its principal resolved from that document before policy
+/// evaluation. The header is trusted: a deployment must terminate mTLS / verify
+/// the token at the edge and pass the verified document in this header.
+#[derive(Debug, Clone)]
+pub struct IdentityConfig {
+    /// Which resolver maps the inbound document to a principal.
+    pub kind: IdentityResolverKind,
+    /// Inbound header carrying the verified document (lower-cased for matching).
+    pub header: String,
+    /// Allowlist: SPIFFE trust domains, or OIDC issuers (empty = accept any).
+    pub allowed: Vec<String>,
+}
+
+/// The inbound resolver kind wired into the request path (V10/R6). Only the two
+/// complete, pure resolvers are wireable inbound; the cloud-IAM claim adapters
+/// need per-cloud verification and stay integration-time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityResolverKind {
+    Spiffe,
+    Oidc,
 }
 
 /// How a tenant's policy denials are handled (V11 multi-tenancy).
@@ -257,6 +285,30 @@ impl Config {
             }
         }
 
+        // Inbound workload-identity resolver (V10/R6).
+        let identity = raw
+            .identity
+            .map(|ri| {
+                let kind = match ri.kind.trim().to_ascii_lowercase().as_str() {
+                    "spiffe" => IdentityResolverKind::Spiffe,
+                    "oidc" => IdentityResolverKind::Oidc,
+                    other => {
+                        return Err(ConfigError::Invalid(format!(
+                            "identity.kind '{}' is not wireable inbound (expected spiffe|oidc)",
+                            other
+                        )))
+                    }
+                };
+                let header = ri.header.trim().to_ascii_lowercase();
+                if header.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "identity.header must not be empty".to_string(),
+                    ));
+                }
+                Ok(IdentityConfig { kind, header, allowed: ri.allowed })
+            })
+            .transpose()?;
+
         Ok(Self {
             server,
             storage,
@@ -270,6 +322,7 @@ impl Config {
             action_labels,
             outbox,
             tenants,
+            identity,
         })
     }
 
@@ -288,6 +341,7 @@ impl Config {
             action_labels: std::collections::HashMap::new(),
             outbox: crate::outbox::OutboxConfig::default(),
             tenants: std::collections::HashMap::new(),
+            identity: None,
         }
     }
 

@@ -146,6 +146,22 @@ async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, R
     }
 }
 
+/// V10/R6: resolve an inbound workload identity from the request, if a resolver
+/// is wired and the request carries its configured header (an already
+/// transport-verified SVID/OIDC document). The deployment is responsible for
+/// terminating mTLS / verifying the token at the edge and passing the verified
+/// document in that header. Returns `None` when not configured/present/valid, in
+/// which case the caller keeps its static `vk_`/`vut_` principal (fail-safe — a
+/// bad document can only fail to refine the principal, never elevate it).
+fn resolve_inbound_principal(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Option<crate::identity::WorkloadIdentity> {
+    let header_name = state.server.identity_header()?;
+    let value = headers.get(header_name)?.to_str().ok()?;
+    state.server.resolve_identity(value)
+}
+
 /// Authenticate a caller and return its principal id (without action scoping),
 /// for read-only operations like polling an approval.
 async fn resolve_caller_id(state: &AppState, secret: &str) -> Result<String, Response> {
@@ -188,10 +204,22 @@ pub async fn api_execute(
         }
     };
 
-    let exec_auth = match resolve_exec_auth(&state, &secret).await {
+    let mut exec_auth = match resolve_exec_auth(&state, &secret).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
+
+    // V10/R6: if a verified workload-identity document was presented inbound,
+    // resolve it and use it as the principal evaluated by policy (subject -> id,
+    // owner -> owner), refining the static vk_/vut_ identity.
+    if let Some(identity) = resolve_inbound_principal(&state, &headers) {
+        if let Some(auth) = exec_auth.auth.as_mut() {
+            auth.api_key.id = identity.subject;
+            if identity.owner.is_some() {
+                auth.api_key.owner_identity = identity.owner;
+            }
+        }
+    }
 
     // Build the execute request (action no longer hardcoded — V8).
     let execute_request = ExecuteRequest {
@@ -264,10 +292,16 @@ pub async fn api_check_approval(
         }
     };
 
-    let principal_id = match resolve_caller_id(&state, &secret).await {
+    let mut principal_id = match resolve_caller_id(&state, &secret).await {
         Ok(id) => id,
         Err(resp) => return resp,
     };
+    // V10/R6: resolve the inbound workload identity the same way as on /execute,
+    // so an approval opened under a resolved SVID principal is polled/resumed by
+    // that same principal (ownership stays consistent across the two endpoints).
+    if let Some(identity) = resolve_inbound_principal(&state, &headers) {
+        principal_id = identity.subject;
+    }
 
     // Ownership is enforced inside check_and_resume_approval BEFORE any
     // execution, so a non-owner can never trigger another principal's action.

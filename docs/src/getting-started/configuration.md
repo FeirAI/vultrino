@@ -257,6 +257,26 @@ retention_secs = 604800                               # replay window, default 7
   API). GC prunes the oldest contiguous prefix past `retention_secs` (keeping the
   retained window gap-free); the window is the replay + dead-letter-resolution SLA.
 
+### Inbound Workload Identity (V10)
+
+Resolve the principal vultrino evaluates from an inbound SPIFFE SVID or OIDC
+claims document instead of only the static `vk_`/`vut_` id. A request carrying
+the configured `header` (an **already transport-verified** document — terminate
+mTLS / verify the token at the edge) has its principal resolved before policy
+evaluation.
+
+```toml
+[identity]
+kind = "spiffe"                 # spiffe | oidc (the wireable resolvers)
+header = "x-spiffe-verified"    # inbound header carrying the verified document
+allowed = ["example.org"]       # SPIFFE trust domains (or OIDC issuers); empty = any
+```
+
+The resolved `subject` becomes the `Principal.id` a policy `principal_pattern`
+matches (and the SoD owner from an OIDC `email`/`preferred_username`). A
+malformed/untrusted document is ignored (the static principal stands). See
+[Workload Identity](../guides/identity.md#wiring-it-inbound-r6).
+
 ## Environment Variables
 
 | Variable | Description |

@@ -30,6 +30,18 @@ pub struct RawConfig {
     /// Per-tenant enforcement mode (V11).
     #[serde(default)]
     pub tenants: Vec<RawTenant>,
+    /// Inbound workload-identity resolver (V10/R6).
+    pub identity: Option<RawIdentityConfig>,
+}
+
+/// TOML shape for `[identity]` (V10/R6): `kind = "spiffe"|"oidc"`,
+/// `header = "x-spiffe-verified"`, `allowed = [...]` (trust domains / issuers).
+#[derive(Debug, Deserialize)]
+pub struct RawIdentityConfig {
+    pub kind: String,
+    pub header: String,
+    #[serde(default)]
+    pub allowed: Vec<String>,
 }
 
 /// TOML shape for `[[tenants]]` (V11): `id = "team-a"`, `mode = "enforce"|"observe"`.
@@ -875,6 +887,30 @@ action = "deny"
         // A blank oob_approver_identity is normalized to None.
         let cfg = Config::parse("[approvals]\noob_approver_identity = \"   \"").unwrap();
         assert!(cfg.approval.oob_approver_identity.is_none());
+    }
+
+    #[test]
+    fn test_identity_resolver_config() {
+        // R6: a SPIFFE/OIDC inbound resolver parses; header is lower-cased.
+        let cfg = Config::parse(
+            "[identity]\nkind = \"spiffe\"\nheader = \"X-SPIFFE-Verified\"\nallowed = [\"example.org\"]",
+        )
+        .unwrap();
+        let id = cfg.identity.unwrap();
+        assert_eq!(id.kind, crate::config::IdentityResolverKind::Spiffe);
+        assert_eq!(id.header, "x-spiffe-verified");
+        assert_eq!(id.allowed, vec!["example.org".to_string()]);
+
+        // OIDC is also wireable.
+        let cfg = Config::parse("[identity]\nkind = \"oidc\"\nheader = \"x-oidc-claims\"").unwrap();
+        assert_eq!(cfg.identity.unwrap().kind, crate::config::IdentityResolverKind::Oidc);
+
+        // A non-wireable kind (cloud-IAM claim adapter) is rejected.
+        assert!(Config::parse("[identity]\nkind = \"aws_iam\"\nheader = \"x-aws\"").is_err());
+        // A blank header is rejected (fail-fast, not a silently-never-matching one).
+        assert!(Config::parse("[identity]\nkind = \"spiffe\"\nheader = \"  \"").is_err());
+        // No [identity] → no resolver wired.
+        assert!(Config::parse("[approvals]\nenabled = true").unwrap().identity.is_none());
     }
 
     #[test]

@@ -7,15 +7,19 @@
 //! whose `subject` is the principal id a policy's `principal_pattern` matches and
 //! whose `trust_domain` scopes it.
 //!
-//! **Scope note (scaffolding).** The SPIFFE and OIDC resolvers here are complete
-//! and pure (parse + validate an already-verified document). The cloud-IAM
-//! resolvers are *claim adapters*: they map an already-verified token's claims to
-//! a principal, but **do not** perform the cloud-specific cryptographic
-//! verification (that requires the respective cloud SDK / JWKS fetch and is wired
-//! at deployment). Signature/issuer verification MUST happen before `resolve` —
-//! these adapters trust the document they are handed. This is the deliberate
-//! V10 boundary: the principal-mapping contract is real and tested; the
-//! transport-verification half is integration-time.
+//! **Wiring (R6).** The SPIFFE and OIDC resolvers are wired into the request path:
+//! configure `[identity]` with a `kind` (`spiffe`/`oidc`) and a `header`, and an
+//! inbound request carrying that header has its principal resolved from the
+//! document before policy evaluation (`subject` → `Principal.id`, `owner` →
+//! `Principal.owner`). See [`crate::server::VultrinoServer::resolve_identity`].
+//!
+//! **Trust boundary.** These resolvers parse + validate an **already-verified**
+//! document — signature/issuer verification MUST happen before `resolve` (the
+//! deployment terminates mTLS / verifies the token at the edge and passes the
+//! verified document in the configured header). The cloud-IAM resolvers are
+//! *claim adapters*: they map verified claims to a principal but do **not** do the
+//! cloud-specific cryptographic verification (cloud SDK / JWKS), so they stay
+//! integration-time and are not auto-wired inbound.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

@@ -166,6 +166,19 @@ pub struct VultrinoServer {
     /// Count of unauthorized (policy/scope-denied) tool-call attempts (V12 metrics).
     /// Per-process, in-memory (resets on restart), like the rate/spend ledgers.
     unauthorized_attempts: std::sync::atomic::AtomicU64,
+    /// Inbound workload-identity resolver (V10/R6): resolves an SVID/OIDC document
+    /// presented in a configured request header into the principal evaluated by
+    /// policy. `None` = no resolver wired.
+    inbound_identity: Option<InboundIdentity>,
+}
+
+/// A wired inbound workload-identity resolver (V10/R6): the request header to
+/// read the (already transport-verified) document from, plus the resolver that
+/// maps it to a [`crate::identity::WorkloadIdentity`].
+struct InboundIdentity {
+    /// Lower-cased header name carrying the verified document/claims.
+    header: String,
+    resolver: Arc<dyn crate::identity::IdentityResolver>,
 }
 
 impl VultrinoServer {
@@ -222,6 +235,17 @@ impl VultrinoServer {
             }
         }
 
+        // V10/R6: build the inbound workload-identity resolver from config.
+        let inbound_identity = config.identity.as_ref().map(|ic| {
+            use crate::config::IdentityResolverKind;
+            use crate::identity::{IdentityResolver, OidcResolver, SpiffeResolver};
+            let resolver: Arc<dyn IdentityResolver> = match ic.kind {
+                IdentityResolverKind::Spiffe => Arc::new(SpiffeResolver::new(ic.allowed.clone())),
+                IdentityResolverKind::Oidc => Arc::new(OidcResolver::new(ic.allowed.clone())),
+            };
+            InboundIdentity { header: ic.header.clone(), resolver }
+        });
+
         Self {
             config,
             resolver,
@@ -235,6 +259,29 @@ impl VultrinoServer {
             sessions: Arc::new(crate::session::SessionRegistry::new()),
             halt_callbacks: parking_lot::RwLock::new(Vec::new()),
             unauthorized_attempts: std::sync::atomic::AtomicU64::new(0),
+            inbound_identity,
+        }
+    }
+
+    /// The inbound header to read a verified workload-identity document from, if a
+    /// resolver is wired (V10/R6). Lower-cased for case-insensitive matching.
+    pub fn identity_header(&self) -> Option<&str> {
+        self.inbound_identity.as_ref().map(|i| i.header.as_str())
+    }
+
+    /// Resolve an inbound (already transport-verified) identity document into a
+    /// [`crate::identity::WorkloadIdentity`] (V10/R6). Returns `None` when no
+    /// resolver is wired or the document is malformed / untrusted (logged) — the
+    /// caller then falls back to the static `vk_`/`vut_` principal (fail-safe: a
+    /// bad document can't elevate, only fail to refine).
+    pub fn resolve_identity(&self, document: &str) -> Option<crate::identity::WorkloadIdentity> {
+        let inbound = self.inbound_identity.as_ref()?;
+        match inbound.resolver.resolve(document) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                warn!(error = %e, "inbound workload-identity resolution failed — using static principal");
+                None
+            }
         }
     }
 

@@ -2,7 +2,20 @@
 
 Vultrino's principal — the thing a policy's `principal_pattern` matches and an approval's separation-of-duty is computed against — can be a **workload identity** resolved from an external identity document, and a `vk_`/`vut_` can carry an **IdP-resolvable owner** so a non-human identity (NHI) maps to a directory identity.
 
-> **Scope (scaffolding).** The SPIFFE and OIDC resolvers are complete and pure: they parse and validate an **already-verified** document. The cloud-IAM resolvers are *claim adapters* — they map a verified token's claims to a principal but do **not** perform the cloud-specific cryptographic verification (JWKS fetch / cloud SDK), which is wired at deployment. **Signature/issuer verification must happen before resolution** — these adapters trust the document they are handed. This is the deliberate V10 boundary: the principal-mapping contract is real and tested; the transport-verification half is integration-time.
+> **Trust boundary.** The SPIFFE and OIDC resolvers parse and validate an **already-verified** document. The cloud-IAM resolvers are *claim adapters* — they map a verified token's claims to a principal but do **not** perform the cloud-specific cryptographic verification (JWKS fetch / cloud SDK), which is wired at deployment. **Signature/issuer verification must happen before resolution** — these resolvers trust the document they are handed, so the deployment must terminate mTLS / verify the token at the edge and pass the *verified* document inbound. The cloud-IAM adapters stay integration-time and are not auto-wired inbound.
+
+## Wiring it inbound (R6)
+
+Enable inbound resolution with `[identity]`: a request carrying the configured `header` (the already transport-verified SVID or OIDC claims) has its principal resolved from that document **before policy evaluation** — `subject` becomes the `Principal.id` a `principal_pattern` matches, and `owner` the SoD owner.
+
+```toml
+[identity]
+kind = "spiffe"                 # spiffe | oidc (the two wireable resolvers)
+header = "x-spiffe-verified"    # inbound header carrying the verified document
+allowed = ["example.org"]       # SPIFFE trust domains (or OIDC issuers); empty = any
+```
+
+So a `principal_pattern` Deny on `spiffe://example.org/*` blocks any request whose presented SVID is in that trust domain, regardless of which `vk_`/`vut_` carried it. A malformed or untrusted document is logged and **ignored** (the request falls back to its static `vk_`/`vut_` principal) — a bad document can only fail to refine the principal, never elevate it.
 
 ## Resolving a workload identity
 
