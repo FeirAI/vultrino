@@ -11,7 +11,7 @@ use chrono::Duration;
 use secrecy::SecretString;
 use tempfile::tempdir;
 
-use vultrino::approval::{ApprovalStatus, Decision, RequesterInfo};
+use vultrino::approval::{ApprovalRequest, ApprovalStatus, Decision, NewApproval, RequesterInfo};
 use vultrino::auth::{AuthResult, NewUseToken, UseToken};
 use vultrino::config::Config;
 use vultrino::plugins::{Plugin, PluginError, PluginRequest};
@@ -967,6 +967,16 @@ async fn test_deny_pushed_after_approval_blocks_resume() {
     assert!(
         resumed.result_error.is_some(),
         "a Deny pushed between approval and resume must block the approved action"
+    );
+
+    // R3: the resume-path enforce denial is a DETECT event too (kind=policy_resume)
+    // — an incident first caught at resume must not be invisible to MTTD.
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_POLICY_DENIED
+            && e.payload["kind"] == "policy_resume"
+            && e.payload["credential"] == "gated-cred"),
+        "a Deny re-fired at resume must emit a policy.denied detect event"
     );
 }
 
@@ -2206,6 +2216,44 @@ async fn test_v12a_cross_tenant_isolation_emits_detect_event() {
     assert_eq!(detect.payload["tenant"], "team-b");
 }
 
+#[tokio::test]
+async fn test_v12a_detect_events_coalesced_per_subject() {
+    // R3 (perf/DoS): a denial storm must not become one signed-outbox vault write
+    // per blocked call. The always-on counter still counts every attempt, but the
+    // durable detect event is coalesced to one per subject per window.
+    let (server, storage) = setup_deny_mode(vec![]).await; // fail-closed: no policy → deny
+    store_credential(&storage, "api-cred", false).await;
+    let (_full, mut token) = UseToken::create(NewUseToken {
+        name: "storm-bot".to_string(),
+        credential_scope: "api-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.agent_label = Some("bot-storm".to_string());
+    storage.store_use_token(&token).await.unwrap();
+    let auth = || ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+
+    for _ in 0..4 {
+        let _ = server.execute_gated(echo_request("api-cred"), auth()).await;
+    }
+    // Every attempt is counted (the metric is not coalesced)...
+    assert_eq!(server.unauthorized_attempts(), 4);
+    // ...but the durable detect event is coalesced to one per subject this window.
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    let n = events
+        .iter()
+        .filter(|e| e.event_type == vultrino::outbox::EVENT_POLICY_DENIED && e.subject == "bot-storm")
+        .count();
+    assert_eq!(n, 1, "detect events must coalesce per subject within the window");
+}
+
 #[tokio::test(start_paused = true)]
 async fn test_v6_hanging_halt_callback_does_not_block() {
     // V6: a hanging abort callback is time-bounded — the halt still completes, and
@@ -2791,29 +2839,37 @@ async fn test_v11_approvals_are_tenant_scoped() {
     assert_eq!(b_view[0].id, b_id);
     assert_eq!(server.list_approvals_for_tenant(None).await.unwrap().len(), 2, "global admin sees both");
 
-    // Decision: team-a CANNOT decide team-b's approval (refused, fail-closed).
-    let cross = server
-        .decide_approval_scoped(&b_id, true, "admin panel", "alice", false, None, Some("team-a"))
-        .await;
-    assert!(
-        matches!(cross, Err(vultrino::VultrinoError::PolicyDenied(_))),
-        "a cross-tenant decision must be refused, got {cross:?}"
-    );
-    // team-b's approval is untouched.
-    assert_eq!(
-        storage.get_approval(&b_id).await.unwrap().unwrap().status,
-        vultrino::approval::ApprovalStatus::Pending
-    );
-
-    // team-a CAN decide its own approval.
-    server
-        .decide_approval_scoped(&a_id, true, "admin panel", "alice", false, None, Some("team-a"))
-        .await
-        .unwrap();
-    assert_eq!(
-        storage.get_approval(&a_id).await.unwrap().unwrap().status,
-        vultrino::approval::ApprovalStatus::Approved
-    );
+    // Decision scoping rests on the visible_to_tenant primitive (the gate a
+    // tenant-scoped admin surface uses): team-a can act on its own approval but not
+    // team-b's, and a global admin (None) can act on either.
+    let a = storage.get_approval(&a_id).await.unwrap().unwrap();
+    let b = storage.get_approval(&b_id).await.unwrap().unwrap();
+    assert!(a.visible_to_tenant(Some("team-a")), "team-a sees its own");
+    assert!(!b.visible_to_tenant(Some("team-a")), "team-a must NOT see team-b's approval");
+    assert!(!a.visible_to_tenant(Some("team-b")), "team-b must NOT see team-a's approval");
+    assert!(a.visible_to_tenant(None) && b.visible_to_tenant(None), "global admin sees both");
+    // An untenanted (shared) approval is visible to every admin.
+    let shared = ApprovalRequest::open(NewApproval {
+        credential: "api-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({}),
+        requester: RequesterInfo::default(),
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: None,
+        workload_id: None,
+        action_label: None,
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::Medium,
+        escalate_after: Duration::minutes(30),
+        escalate_window: Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+    })
+    .0;
+    assert!(shared.visible_to_tenant(Some("team-a")) && shared.visible_to_tenant(Some("team-b")));
 }
 
 // ==================== V7: OAuth rotation event + revoke-propagation ============

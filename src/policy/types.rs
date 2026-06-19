@@ -77,7 +77,13 @@ pub enum PolicyCondition {
     SpendCap {
         /// Asset this cap governs (e.g. "usd"). Must equal the attempt's asset.
         asset: String,
-        /// Max for a single call (minor units).
+        /// Max for a single call (minor units). `#[serde(default)]` for forward-
+        /// compatible vault loads: a policy persisted under the pre-R1 schema as a
+        /// cumulative-only cap (no `per_action_max`) deserializes to `0` — a
+        /// fail-closed deny-all-spend, surfacing the stale policy for the operator
+        /// to fix — rather than failing the whole encrypted-vault load. Extra legacy
+        /// keys (`cumulative_max`/`window_secs`) are ignored.
+        #[serde(default)]
         per_action_max: u64,
     },
 

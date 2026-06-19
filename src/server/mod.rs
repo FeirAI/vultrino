@@ -170,6 +170,13 @@ pub struct VultrinoServer {
     /// presented in a configured request header into the principal evaluated by
     /// policy. `None` = no resolver wired.
     inbound_identity: Option<InboundIdentity>,
+    /// Coalescing gate for the R3 `policy.denied` DETECT event: `subject -> last
+    /// emit time`. A denial *storm* (e.g. a compromised agent hammering blocked
+    /// calls) would otherwise turn every denial into a signed-outbox vault write
+    /// under the cross-process lock; this bounds it to one durable detect event per
+    /// subject per window. The always-on atomic counter still counts every attempt,
+    /// and MTTD only needs the first detection in the window.
+    detect_emit_gate: parking_lot::RwLock<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 /// A wired inbound workload-identity resolver (V10/R6): the request header to
@@ -260,6 +267,7 @@ impl VultrinoServer {
             halt_callbacks: parking_lot::RwLock::new(Vec::new()),
             unauthorized_attempts: std::sync::atomic::AtomicU64::new(0),
             inbound_identity,
+            detect_emit_gate: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -925,6 +933,22 @@ impl VultrinoServer {
                 spend: None,
             })
         {
+            // R3: a Deny/kill pushed between approval-open and resume re-fires here —
+            // one of the more security-relevant enforce-mode denials (operator
+            // stopped an in-flight action). Emit the same timestamped DETECT event
+            // and bump the counter as the live deny sites, so an incident first
+            // caught at resume isn't invisible to MTTD/the unauthorized-attempts metric.
+            self.record_unauthorized_attempt();
+            self.emit_policy_denied(
+                principal.as_ref().and_then(|p| p.agent_label.as_deref()),
+                principal.as_ref().map(|p| p.id.as_str()),
+                &credential.alias,
+                &approval.action,
+                approval.tenant.as_deref(),
+                &reason,
+                "policy_resume",
+            )
+            .await;
             return Err(RunError::terminal(VultrinoError::PolicyDenied(reason)));
         }
 
@@ -1136,10 +1160,17 @@ impl VultrinoServer {
     ///
     /// The event's `created_at` (stamped by the outbox under the lock) is the
     /// per-incident **`detected_at`**. The subject is the offending agent label
-    /// (falling back to the principal id, then the credential) — the **same**
-    /// subject [`Self::halt_agent`] uses for [`crate::outbox::EVENT_AGENT_HALTED`]
-    /// — so a detect (`policy.denied`) and the subsequent contain (`agent.halted`)
-    /// pair on their subject for an MTTD/MTTC measurement.
+    /// (falling back to the principal id, then the credential). It is **best-effort
+    /// paired** with [`crate::outbox::EVENT_AGENT_HALTED`]: when an agent is halted
+    /// by the same label/id its detect (`policy.denied`) and contain (`agent.halted`)
+    /// events share a subject, giving an MTTD/MTTC measurement. (A halt targeting a
+    /// different key than the denial's subject won't share a subject — the pairing
+    /// is a convenience, not a guarantee.)
+    ///
+    /// Emission is **coalesced** per subject (see `detect_emit_gate`): a denial
+    /// storm produces one durable event per subject per window, not one vault write
+    /// per blocked call. The caller bumps the always-on atomic counter regardless,
+    /// so no attempt is undercounted.
     #[allow(clippy::too_many_arguments)]
     async fn emit_policy_denied(
         &self,
@@ -1152,6 +1183,18 @@ impl VultrinoServer {
         kind: &str,
     ) {
         let subject = agent_label.or(principal_id).unwrap_or(credential_alias);
+        // Coalesce: at most one detect event per subject per window. Prune stale
+        // entries on the way so the gate is bounded by distinct subjects in-window.
+        const DETECT_EMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+        {
+            let now = std::time::Instant::now();
+            let mut gate = self.detect_emit_gate.write();
+            gate.retain(|_, t| now.duration_since(*t) < DETECT_EMIT_WINDOW);
+            if gate.contains_key(subject) {
+                return; // already emitted a detect event for this subject this window
+            }
+            gate.insert(subject.to_string(), now);
+        }
         self.emit_event(
             subject,
             crate::outbox::EVENT_POLICY_DENIED,
@@ -1171,8 +1214,10 @@ impl VultrinoServer {
 
     /// List approvals visible to an admin acting in tenant `acting` (V11/R4).
     /// `acting == None` is a global admin (sees all); a tenant-scoped admin sees
-    /// only its own tenant's approvals plus untenanted (shared) ones. See
-    /// [`ApprovalRequest::visible_to_tenant`].
+    /// only its own tenant's approvals plus untenanted (shared) ones. Used by the
+    /// tenant-scoped admin metrics read-back; the primitive is
+    /// [`ApprovalRequest::visible_to_tenant`], which any future tenant-scoped
+    /// decision surface gates on (the web panel is a global console).
     pub async fn list_approvals_for_tenant(
         &self,
         acting: Option<&str>,
@@ -1180,36 +1225,6 @@ impl VultrinoServer {
         let mut approvals = self.storage.list_approvals().await?;
         approvals.retain(|a| a.visible_to_tenant(acting));
         Ok(approvals)
-    }
-
-    /// Decide an approval, **scoped to the acting admin's tenant** (V11/R4): an
-    /// admin in tenant A can never decide tenant B's approval. A cross-tenant
-    /// attempt is refused (and looks like a not-found, so it doesn't even confirm
-    /// the approval exists to the wrong tenant). A global admin (`acting == None`)
-    /// may decide any approval.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn decide_approval_scoped(
-        &self,
-        id: &str,
-        approve: bool,
-        channel: &str,
-        approver_identity: &str,
-        enforce_sod: bool,
-        note: Option<String>,
-        acting: Option<&str>,
-    ) -> Result<(), VultrinoError> {
-        let approval = self
-            .storage
-            .get_approval(id)
-            .await?
-            .filter(|a| a.visible_to_tenant(acting))
-            .ok_or_else(|| {
-                VultrinoError::PolicyDenied(format!("no such approval '{id}' in this tenant"))
-            })?;
-        self.storage
-            .decide_approval(&approval.id, approve, channel, approver_identity, enforce_sod, note)
-            .await?;
-        Ok(())
     }
 
     /// Register a harness abort callback fired on halt (V6).

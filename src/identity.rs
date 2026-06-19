@@ -10,8 +10,11 @@
 //! **Wiring (R6).** The SPIFFE and OIDC resolvers are wired into the request path:
 //! configure `[identity]` with a `kind` (`spiffe`/`oidc`) and a `header`, and an
 //! inbound request carrying that header has its principal resolved from the
-//! document before policy evaluation (`subject` → `Principal.id`, `owner` →
-//! `Principal.owner`). See [`crate::server::VultrinoServer::resolve_identity`].
+//! document before policy evaluation. The resolved `subject` becomes
+//! `Principal.workload_id` — an **additional** `principal_pattern` match dimension,
+//! never replacing `Principal.id` (the credential id stays the halt/ownership
+//! anchor) — and `owner` becomes `Principal.owner`. See
+//! [`crate::server::VultrinoServer::resolve_identity`].
 //!
 //! **Trust boundary.** These resolvers parse + validate an **already-verified**
 //! document — signature/issuer verification MUST happen before `resolve` (the
@@ -137,9 +140,10 @@ impl IdentityResolver for SpiffeResolver {
 // ==================== Generic OIDC ====================
 
 /// Generic OIDC adapter (V10): maps **already-verified** OIDC claims (JSON) to a
-/// principal — `sub` as the subject, `iss` as the trust domain. An IdP-resolvable
-/// owner binding (`email`/`preferred_username`, else `sub`) maps the identity to a
-/// directory identity.
+/// principal — `sub` as the subject, `iss` as the trust domain. The owner binding
+/// is taken from a **human** claim (`email`/`preferred_username`) only — there is
+/// **no `sub` fallback**, since a machine token's `sub` is the workload itself and
+/// would give false human accountability.
 #[derive(Debug, Clone, Default)]
 pub struct OidcResolver {
     /// Allowed issuers; empty = accept any.

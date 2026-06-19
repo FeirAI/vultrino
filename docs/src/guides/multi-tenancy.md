@@ -45,9 +45,13 @@ A principal may only use credentials in **its own** tenant; an **untenanted cred
 
 ## Approval partitioning
 
-When a gated action opens an [approval](./action-approvals.md), the approval is **tagged with the opening principal's tenant**. Approval **visibility and decision** are then partitioned the same way credentials are:
+When a gated action opens an [approval](./action-approvals.md), the approval is **tagged with the opening principal's tenant** — so it can be partitioned the same way credentials are. The partition rule is the `visible_to_tenant` predicate:
 
-- A **global** admin (an admin API key with no `tenant`) sees and can decide **every** tenant's approvals — the super-admin console.
-- A **tenant-scoped** admin (an admin API key carrying a `tenant`) sees and can decide **only** its own tenant's approvals, plus **untenanted** (shared) ones. An admin in `team-a` can never see or decide a `team-b` approval — a cross-tenant decision is refused (fail-closed, indistinguishable from not-found).
+- A **global** view (no acting `tenant`) sees **every** tenant's approval.
+- An **untenanted** (shared) approval is visible to **every** tenant (like an untenanted credential).
+- Otherwise a tenant only sees its **own** approvals — `team-a` can never see a `team-b` approval.
 
-The admin metrics read-back (`GET /api/v1/metrics`) scopes its approval counts to the calling key's tenant accordingly (and echoes the `tenant_scope` it applied). The web admin panel is a global console, so it lists every tenant's approvals.
+Where this is wired today:
+
+- **Admin metrics** (`GET /api/v1/metrics`) scopes its approval counts to the **calling admin key's `tenant`** (and echoes the `tenant_scope` it applied) — so a tenant-scoped admin key sees only its own (+ shared) approvals in the read-back.
+- **The web admin panel is a global console** (the session admin carries no tenant): it lists and decides across all tenants. Per-tenant *decision* scoping is therefore an API concern — the `visible_to_tenant` primitive is the gate a tenant-scoped decision endpoint uses; the panel itself is intentionally global.

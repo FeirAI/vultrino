@@ -1362,6 +1362,13 @@ async fn metadata_set(
         value
     };
 
+    // R5/V7: validate a revocation endpoint up front (HTTPS + non-private host),
+    // so a misconfigured URL fails loudly here rather than silently no-op'ing the
+    // downstream revoke at delete time (where it can only warn-and-skip).
+    if key == vultrino::revocation::REVOCATION_URL_META {
+        vultrino::revocation::validate_revocation_url(&resolved_value)?;
+    }
+
     credential
         .metadata
         .insert(key.clone(), resolved_value.clone());

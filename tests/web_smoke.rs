@@ -1035,3 +1035,92 @@ async fn test_v10_inbound_svid_resolves_into_evaluated_principal() {
         "without the SVID the trust-domain policy must not fire"
     );
 }
+
+#[tokio::test]
+async fn test_v10_inbound_oidc_resolves_subject_and_binds_owner() {
+    // R6: the OIDC resolver path (incl. the owner-binding branch, which SPIFFE
+    // never exercises since SPIFFE owner is always None) — an inbound OIDC claims
+    // doc resolves subject -> Principal.workload_id and a human claim -> owner,
+    // observable on the approval it opens.
+    use vultrino::auth::{NewUseToken, UseToken};
+    use vultrino::config::{IdentityConfig, IdentityResolverKind};
+    use vultrino::{Credential, CredentialData, Secret};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.approval.enabled = true;
+    config.approval.ttl_secs = 3600;
+    config.identity = Some(IdentityConfig {
+        kind: IdentityResolverKind::Oidc,
+        header: "x-oidc-claims".to_string(),
+        allowed: vec!["https://idp.example.com".to_string()],
+    });
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        config.clone(),
+        storage.clone(),
+        resolver,
+    ));
+    let web = WebServer::new(
+        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        config,
+        storage.clone(),
+        AuthManager::new(),
+        admin,
+        exec_server,
+    );
+    let router = web.into_router();
+
+    // A require_approval credential so the call opens an approval we can inspect.
+    let cred = Credential::new(
+        "api-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("secret"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    )
+    .with_metadata("require_approval", "true");
+    storage.store(&cred).await.unwrap();
+    let (secret, token) = UseToken::create(NewUseToken {
+        name: "oidc-bot".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    let body = serde_json::json!({ "credential": "api-cred", "method": "GET", "url": "https://api.example.com/x" });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/execute")
+        .header("authorization", format!("Bearer {}", secret))
+        .header("content-type", "application/json")
+        .header(
+            "x-oidc-claims",
+            r#"{"sub":"user-7","iss":"https://idp.example.com","email":"alice@example.com"}"#,
+        )
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED, "require_approval opens an approval");
+
+    // The opened approval carries the resolved OIDC subject (workload_id) and the
+    // human owner (email) bound from the claims — proving both branches fired.
+    let approvals = storage.list_approvals().await.unwrap();
+    assert_eq!(approvals.len(), 1);
+    let a = &approvals[0];
+    assert_eq!(a.workload_id.as_deref(), Some("user-7"), "OIDC subject -> workload_id");
+    assert_eq!(a.requester.owner.as_deref(), Some("alice@example.com"), "OIDC email -> owner binding");
+}

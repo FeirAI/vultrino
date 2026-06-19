@@ -91,6 +91,16 @@ impl RevocationClient for HttpRevocationClient {
 /// Metadata key holding a credential's resource-side token revocation endpoint.
 pub const REVOCATION_URL_META: &str = "revocation_url";
 
+/// Validate a `revocation_url` value (HTTPS + non-private host) at config time, so
+/// a misconfiguration fails loudly when the operator sets it rather than silently
+/// warn-and-skipping the downstream revoke at delete time. Same guard the default
+/// [`HttpRevocationClient`] applies before sending.
+pub fn validate_revocation_url(url: &str) -> Result<(), String> {
+    crate::plugins::HttpPlugin::validate_token_url_ssrf(url)
+        .map(|_| ())
+        .map_err(|e| format!("invalid revocation_url: {e} (must be an HTTPS URL to a public host)"))
+}
+
 /// Propagate a credential revoke to the resource side (R5/V7). For an OAuth2
 /// credential carrying a non-empty `revocation_url` metadata key, call the
 /// revocation endpoint for each issued token (access then refresh), then emit a

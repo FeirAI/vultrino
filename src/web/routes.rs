@@ -530,6 +530,21 @@ pub async fn credential_delete(
     if !validate_csrf_token(&session, &form.csrf_token).await {
         return Redirect::to("/credentials").into_response();
     }
+    // R5/V7: propagate a downstream revoke before deleting (same as the CLI and the
+    // JSON API delete) so an OAuth2 credential with a revocation_url has its issued
+    // token actively revoked rather than left to expire.
+    match state.storage.get(&id).await {
+        Ok(Some(cred)) => {
+            crate::revocation::propagate_revoke(
+                &crate::revocation::HttpRevocationClient::new(),
+                &*state.storage,
+                &cred,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, credential_id = %id, "could not load credential for revoke-propagation before delete"),
+    }
     let _ = state.storage.delete(&id).await;
     // Regenerate CSRF token after successful action
     let _ = regenerate_csrf_token(&session).await;
@@ -1098,10 +1113,13 @@ pub async fn approval_approve(
     // Atomic decision under the storage lock (no reload+get+update window). The
     // panel approver's identity is the authenticated session user (V5).
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
-    // R4: decide through the tenant-scoped guard (global panel admin = None).
+    // The admin panel is a global console (the session admin has no tenant), so the
+    // decision goes straight to the atomic storage verb. Per-tenant decision scoping
+    // (R4) is an API concern — see ApprovalRequest::visible_to_tenant, which a
+    // tenant-scoped admin surface gates on (metrics already scopes by the key tenant).
     let result = state
-        .server
-        .decide_approval_scoped(&id, true, "admin panel", &auth.session.username, enforce_sod, None, None)
+        .storage
+        .decide_approval(&id, true, "admin panel", &auth.session.username, enforce_sod, None)
         .await;
     let _ = regenerate_csrf_token(&session).await;
     // Surface a rejected decision (e.g. a separation-of-duty self-approval, or an
@@ -1125,10 +1143,11 @@ pub async fn approval_deny(
     // A denial is always allowed regardless of SoD (only approval self-grants are
     // the concern), but pass the flag through for consistent attribution.
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
-    // R4: decide through the tenant-scoped guard (global panel admin = None).
+    // Global panel console — decide atomically (see approval_approve for the
+    // tenant-scoping rationale).
     let result = state
-        .server
-        .decide_approval_scoped(&id, false, "admin panel", &auth.session.username, enforce_sod, None, None)
+        .storage
+        .decide_approval(&id, false, "admin panel", &auth.session.username, enforce_sod, None)
         .await;
     let _ = regenerate_csrf_token(&session).await;
     match result {

@@ -911,6 +911,14 @@ action = "deny"
         assert!(Config::parse("[identity]\nkind = \"spiffe\"\nheader = \"  \"").is_err());
         // No [identity] → no resolver wired.
         assert!(Config::parse("[approvals]\nenabled = true").unwrap().identity.is_none());
+        // allowed entries are trimmed + blanks dropped (exact match would otherwise miss).
+        let cfg = Config::parse(
+            "[identity]\nkind = \"spiffe\"\nheader = \"x-id\"\nallowed = [\" a.org \", \"\", \"b.org\"]",
+        )
+        .unwrap();
+        assert_eq!(cfg.identity.unwrap().allowed, vec!["a.org".to_string(), "b.org".to_string()]);
+        // An allowlist of only blanks is a misconfiguration → rejected (not silently any).
+        assert!(Config::parse("[identity]\nkind = \"spiffe\"\nheader = \"x-id\"\nallowed = [\"  \"]").is_err());
     }
 
     #[test]

@@ -305,7 +305,24 @@ impl Config {
                         "identity.header must not be empty".to_string(),
                     ));
                 }
-                Ok(IdentityConfig { kind, header, allowed: ri.allowed })
+                // Trim allowlist entries and drop blanks — the resolvers match
+                // exactly, so a stray-whitespace or empty trust-domain/issuer would
+                // silently never match. A list that's non-empty in TOML but empties
+                // after trimming is a misconfigured allowlist → reject.
+                let raw_allowed_len = ri.allowed.len();
+                let allowed: Vec<String> = ri
+                    .allowed
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if raw_allowed_len > 0 && allowed.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "identity.allowed has only blank entries — remove it to accept any, \
+                         or list real trust domains/issuers".to_string(),
+                    ));
+                }
+                Ok(IdentityConfig { kind, header, allowed })
             })
             .transpose()?;
 
