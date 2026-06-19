@@ -696,6 +696,54 @@ async fn test_out_of_band_decide_flow() {
 }
 
 #[tokio::test]
+async fn test_out_of_band_decide_without_named_identity_is_refused() {
+    // R2: an OOB decision link with no named approver identity bound is refused
+    // (fail closed) rather than recording an unattributable "out-of-band" verdict.
+    let (router, storage) = build_router().await;
+
+    let (approval, token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo::local(),
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        action_label: None,
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::Medium,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None, // no named identity bound
+        reauth_interval_secs: None,
+        required_approvals: 1,
+    });
+    storage.store_approval(&approval).await.unwrap();
+
+    // POST with the valid token still refuses — there is no attributable approver.
+    let form = format!("token={}&decision=approve", urlencoding::encode(&token));
+    let submit = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/approvals/{}/decide", approval.id))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::OK);
+    assert!(body_string(submit).await.contains("Not available"));
+
+    // The approval was NOT decided.
+    let stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert!(stored.decided_by.is_none());
+}
+
+#[tokio::test]
 async fn test_admin_halt_agent_installs_kill_and_lists_sessions() {
     let (router, storage, server, key) = build_admin_router().await;
 

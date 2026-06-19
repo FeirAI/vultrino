@@ -1199,15 +1199,28 @@ pub async fn approval_decide_submit(
         _ => return render_decided("Invalid decision", "Unknown decision.", false),
     };
 
-    // Record the decision atomically under the storage lock. The OOB link is
-    // bound to a named identity (V5) rather than an anonymous capability token,
-    // so the decision is attributable; fall back to a generic label if unset or
-    // blank (a configured-but-empty identity would otherwise fail-closed).
-    let approver_identity = approval
+    // The OOB link must be bound to a NAMED approver identity (V5/R2) so the
+    // verdict is attributable — separation of duty is meaningless against an
+    // anonymous channel label. With no named identity bound at open time, refuse
+    // rather than record an unattributable "out-of-band" verdict; config load also
+    // rejects a notifier without `oob_approver_identity`, so a correctly-configured
+    // deployment never reaches this fail-closed branch.
+    let approver_identity = match approval
         .oob_identity
         .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("out-of-band");
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => id,
+        None => {
+            return render_decided(
+                "Not available",
+                "This approval has no named out-of-band approver identity, so it can \
+                 only be decided in the admin panel.",
+                false,
+            )
+        }
+    };
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
     match state
         .storage

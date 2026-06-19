@@ -445,6 +445,26 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
         // A telegram/webhook section being present implies approvals are enabled
         // unless explicitly disabled.
         let has_channel = raw.telegram.is_some() || raw.webhook.is_some();
+        let enabled = raw.enabled.unwrap_or(has_channel);
+        // Treat a blank identity as unset so the OOB decision path falls back to
+        // fail-closed rather than recording an empty approver.
+        let oob_approver_identity = raw.oob_approver_identity.filter(|s| !s.trim().is_empty());
+
+        // R2 (V5 / separation-of-duty integrity): an out-of-band notifier delivers
+        // decision links whose verdicts would otherwise be attributed to the
+        // literal channel label "out-of-band" — an unattributable approver that
+        // makes SoD meaningless (every OOB approver collapses to one string).
+        // Require a named identity at config load so every OOB verdict carries a
+        // real approver; fail closed otherwise.
+        if enabled && has_channel && oob_approver_identity.is_none() {
+            return Err(ConfigError::Invalid(
+                "approvals: a Telegram/webhook notifier is configured but \
+                 oob_approver_identity is unset (or blank) — set the named identity \
+                 that out-of-band decision links are attributed to (separation of \
+                 duty requires an attributable approver)"
+                    .to_string(),
+            ));
+        }
 
         // Per-class SLA overrides — reject zero windows (a 0s window auto-denies
         // almost immediately) and duplicate classes (silent last-wins hides a typo).
@@ -491,7 +511,7 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
             .collect::<Result<Vec<_>, ConfigError>>()?;
 
         Ok(Self {
-            enabled: raw.enabled.unwrap_or(has_channel),
+            enabled,
             ttl_secs: raw.ttl_secs.unwrap_or(3600),
             public_base_url: raw.public_base_url,
             telegram: raw.telegram.map(|t| crate::approval::TelegramConfig {
@@ -504,11 +524,7 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
             }),
             sla_overrides,
             criticality_rules,
-            // Treat a blank identity as unset so the OOB decision path falls back
-            // to its generic label rather than failing the non-empty check.
-            oob_approver_identity: raw
-                .oob_approver_identity
-                .filter(|s| !s.trim().is_empty()),
+            oob_approver_identity,
             reauth_interval_secs: raw.reauth_interval_secs,
             enforce_separation_of_duty: raw.enforce_separation_of_duty.unwrap_or(false),
             dual_control_approvers: raw.dual_control_approvers.filter(|m| *m >= 2).unwrap_or(2),
@@ -859,6 +875,30 @@ action = "deny"
         // A blank oob_approver_identity is normalized to None.
         let cfg = Config::parse("[approvals]\noob_approver_identity = \"   \"").unwrap();
         assert!(cfg.approval.oob_approver_identity.is_none());
+    }
+
+    #[test]
+    fn test_oob_notifier_requires_named_identity() {
+        // R2: a Telegram/webhook notifier without a named oob_approver_identity is
+        // rejected at load — an OOB verdict would otherwise be unattributable.
+        let tg = "[approvals.telegram]\nbot_token = \"t\"\nchat_id = \"c\"";
+        // Notifier present, no identity → rejected.
+        assert!(Config::parse(tg).is_err());
+        // Notifier present, blank identity → rejected (blank normalizes to unset).
+        assert!(Config::parse(&format!("[approvals]\noob_approver_identity = \"  \"\n{tg}")).is_err());
+        // Notifier present, named identity → ok.
+        let ok = Config::parse(&format!(
+            "[approvals]\noob_approver_identity = \"oncall@example.com\"\n{tg}"
+        ))
+        .unwrap();
+        assert_eq!(ok.approval.oob_approver_identity.as_deref(), Some("oncall@example.com"));
+        // A webhook notifier is gated identically.
+        let wh = "[approvals.webhook]\nurl = \"https://h.example/x\"";
+        assert!(Config::parse(wh).is_err());
+        // Notifier present but approvals explicitly disabled → no OOB links, allowed.
+        assert!(Config::parse(&format!("[approvals]\nenabled = false\n{tg}")).is_ok());
+        // No notifier at all → identity not required.
+        assert!(Config::parse("[approvals]\nenabled = true").is_ok());
     }
 
     #[test]

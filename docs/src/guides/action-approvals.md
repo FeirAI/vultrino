@@ -30,7 +30,7 @@ Enable approvals and configure out-of-band notifiers under `[approvals]` in `con
 enabled = true
 ttl_secs = 3600                                   # default Medium-class total window
 public_base_url = "https://vultrino.example.com"  # base for approve/deny links
-oob_approver_identity = "oncall@example.com"      # identity OOB links are bound to (V5)
+oob_approver_identity = "oncall@example.com"      # REQUIRED with a notifier (V5): identity OOB links are bound to
 reauth_interval_secs = 900                         # optional continuous re-auth (V5)
 enforce_separation_of_duty = false                 # hard-reject self-approvals (V5)
 dual_control_approvers = 2                          # distinct approvers for dual control (V12)
@@ -76,7 +76,7 @@ Set `reauth_interval_secs` to require **continuous re-authorization**: an approv
 Every human decision records an **authenticated approver identity**, not just the channel:
 
 - **Admin panel** — the logged-in session user.
-- **Out-of-band link** — the named `oob_approver_identity` the link is bound to (rather than an anonymous capability token); falls back to a generic `out-of-band` label if unset.
+- **Out-of-band link** — the named `oob_approver_identity` the link is bound to (rather than an anonymous capability token). This is **required when a notifier is configured** (enforced at config load); an OOB verdict can never be recorded as the anonymous literal `out-of-band` — a link with no named identity bound is refused and the action must be decided in the admin panel.
 - **CLI** — the local OS user (`cli:<user>`).
 
 A decision with a blank identity is rejected. Because both the requester's owner and the approver are recorded, **separation of duty** ("the approver must not be the requesting agent") is computed and **recorded on every decision** (and logged when violated) — an agent self-approving its own request is flagged. Set `enforce_separation_of_duty = true` to **hard-reject** a self-approval rather than only recording it (a self-*denial* is always allowed). The CLI decides as a trusted local admin, so its OS-user identity is advisory.

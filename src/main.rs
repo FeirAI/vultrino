@@ -1453,6 +1453,9 @@ transport = "stdio"
 # enabled = true
 # ttl_secs = 3600
 # public_base_url = "https://vultrino.example.com"  # used in approve/deny links
+# oob_approver_identity = "oncall@example.com"  # REQUIRED when a notifier is set:
+#                                               # the named approver OOB links are
+#                                               # attributed to (separation of duty)
 #
 # [approvals.telegram]
 # bot_token = "123456:ABC-DEF..."
