@@ -1081,9 +1081,7 @@ async fn test_spend_cap_enforced_end_to_end() {
     spend_pol.rules = vec![PolicyRule {
         condition: PolicyCondition::SpendCap {
             asset: "usd".to_string(),
-            per_action_max: Some(100),
-            cumulative_max: None,
-            window_secs: 3600,
+            per_action_max: 100,
         },
         action: PolicyAction::Allow,
     }];
@@ -1220,10 +1218,11 @@ async fn test_per_agent_deny_refires_at_resume() {
 }
 
 #[tokio::test]
-async fn test_spend_capped_approval_resumes_without_recharge() {
-    // V3 resume re-enforcement: a spend-capped, approval-gated action is charged
-    // when the approval OPENS and must still resume (the read-only resume path
-    // does not re-charge and must not spuriously deny).
+async fn test_spend_capped_approval_resumes_without_recheck() {
+    // V3 resume re-enforcement: a spend-capped, approval-gated action is checked
+    // when the approval OPENS and must still resume — the read-only resume path
+    // treats the per-action spend as already-admitted and must not spuriously deny
+    // (it has no spend amount threaded through, which would otherwise fail closed).
     use vultrino::policy::{Policy, PolicyAction, PolicyCondition, PolicyRule, SpendExtractor};
 
     let dir = tempdir().unwrap();
@@ -1237,9 +1236,7 @@ async fn test_spend_capped_approval_resumes_without_recharge() {
     spend_pol.rules = vec![PolicyRule {
         condition: PolicyCondition::SpendCap {
             asset: "usd".to_string(),
-            per_action_max: None,
-            cumulative_max: Some(100),
-            window_secs: 3600,
+            per_action_max: 100,
         },
         action: PolicyAction::Allow,
     }];
@@ -1262,28 +1259,25 @@ async fn test_spend_capped_approval_resumes_without_recharge() {
     server.plugins().register(Arc::new(MockPlugin));
     store_credential(&storage, "pay-cred", true).await; // require_approval
 
+    // Within cap (60 ≤ 100): checked at open, then gated on approval.
     let req = ExecuteRequest {
         credential: "pay-cred".to_string(),
         action: "mock.echo".to_string(),
         params: serde_json::json!({ "amount": 60 }),
     };
-    // Within cap (60 ≤ 100): charged at open, then gated on approval.
     let approval_id = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
         ExecutionOutcome::Pending(a) => a.id,
         other => panic!("expected Pending, got {other:?}"),
     };
 
-    // Prove the 60 was actually charged at OPEN: a second 60 (=120) now exceeds
-    // the 100 cumulative cap and is denied before it can even open an approval.
-    let again = ExecuteRequest {
+    // An over-cap request is denied at open (proving the per-action cap is live).
+    let over = ExecuteRequest {
         credential: "pay-cred".to_string(),
         action: "mock.echo".to_string(),
-        params: serde_json::json!({ "amount": 60 }),
+        params: serde_json::json!({ "amount": 101 }),
     };
-    match server.execute_gated(again, ExecAuth::default()).await.unwrap_err() {
+    match server.execute_gated(over, ExecAuth::default()).await.unwrap_err() {
         vultrino::VultrinoError::PolicyDenied(reason) => {
-            // Denied by the spend-cap policy specifically (not a coincidental deny):
-            // both calls are principal-less, so the cred-keyed cap accumulated.
             assert!(reason.contains("pay-cap"), "expected spend-cap deny, got: {reason}");
         }
         other => panic!("expected PolicyDenied, got {other:?}"),
@@ -1291,7 +1285,7 @@ async fn test_spend_capped_approval_resumes_without_recharge() {
 
     storage.decide_approval(&approval_id, true, "approver", "secops", false, None).await.unwrap();
 
-    // Resume must succeed (read-only spend check does not re-charge/deny).
+    // Resume must succeed (read-only spend check treats it as already-admitted).
     let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
     assert!(resumed.executed);
     assert!(resumed.result_error.is_none(), "spend-capped approval must resume: {:?}", resumed.result_error);
@@ -2587,8 +2581,8 @@ async fn test_v11_observe_does_not_downgrade_resource_guards() {
 #[tokio::test]
 async fn test_v11_observe_does_not_downgrade_spend_cap() {
     // V11 (the original HIGH's core case): a SpendCap over-limit denial must hold
-    // in an observe tenant — otherwise the over-cap call runs and, because the cap
-    // only charges on an admitting rule, the cumulative ledger never advances.
+    // in an observe tenant — a per-action spend cap is a financial boundary, not
+    // an authorization posture observe mode may wave away.
     use vultrino::policy::{Policy, PolicyAction, PolicyCondition, PolicyRule, SpendExtractor};
 
     let dir = tempdir().unwrap();
@@ -2602,9 +2596,7 @@ async fn test_v11_observe_does_not_downgrade_spend_cap() {
     spend_pol.rules = vec![PolicyRule {
         condition: PolicyCondition::SpendCap {
             asset: "usd".to_string(),
-            per_action_max: Some(100),
-            cumulative_max: None,
-            window_secs: 3600,
+            per_action_max: 100,
         },
         action: PolicyAction::Allow,
     }];

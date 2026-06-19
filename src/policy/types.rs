@@ -65,22 +65,20 @@ pub enum PolicyCondition {
     },
 
     /// Spend cap (V3): the request's extracted amount (in minor units, e.g.
-    /// cents/micros) must be within `per_action_max` for this single call and
-    /// within `cumulative_max` summed over the rolling `window_secs`, for the
+    /// cents/micros) must be within `per_action_max` for this single call, for the
     /// matching `asset`. Matches (true) only when the request carries a spend
-    /// attempt for this asset within the caps; a missing/unparseable amount or
+    /// attempt for this asset within the cap; a missing/unparseable amount or
     /// mismatched asset fails **closed** (false → leads to deny).
+    ///
+    /// **Per-action only — vultrino's spend check is stateless.** There is no
+    /// cumulative/windowed ledger here: cumulative/budget enforcement is the
+    /// book-of-record's plane (govder decision D4), and arrives as a `Deny` policy
+    /// pushed through the V1/V4 write API when a budget is exhausted.
     SpendCap {
         /// Asset this cap governs (e.g. "usd"). Must equal the attempt's asset.
         asset: String,
-        /// Max for a single call (minor units). `None` = no per-call limit.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        per_action_max: Option<u64>,
-        /// Max summed over `window_secs` (minor units). `None` = no cumulative limit.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cumulative_max: Option<u64>,
-        /// Rolling window (seconds) for the cumulative cap.
-        window_secs: u64,
+        /// Max for a single call (minor units).
+        per_action_max: u64,
     },
 
     /// All conditions must match
@@ -167,39 +165,19 @@ impl Policy {
     /// misconfigured cap can't silently fail open. Enforced at config load and
     /// by the admin API:
     /// - a `SpendCap` must be a rule's **top-level** condition (not nested in
-    ///   and/or/not) — the engine charges exactly the firing cap, and a nested
-    ///   cap would gate without charging (fail-open for the cumulative window);
-    /// - a `SpendCap` must set at least one of `per_action_max`/`cumulative_max`;
+    ///   and/or/not) — the engine evaluates exactly the firing cap, and a nested
+    ///   cap would gate ambiguously;
+    /// - a `SpendCap`'s `asset` must be non-empty;
     /// - a policy that uses a `SpendCap` rule must be fail-closed
     ///   (`default_action = deny`), so an over-cap or unparseable request falls
     ///   through to deny rather than being allowed.
     pub fn validate(&self) -> Result<(), String> {
         let mut uses_spend_cap = false;
         for rule in &self.rules {
-            if let PolicyCondition::SpendCap {
-                asset,
-                per_action_max,
-                cumulative_max,
-                window_secs,
-            } = &rule.condition
-            {
+            if let PolicyCondition::SpendCap { asset, .. } = &rule.condition {
                 uses_spend_cap = true;
-                if per_action_max.is_none() && cumulative_max.is_none() {
-                    return Err(format!(
-                        "policy '{}': SpendCap must set per_action_max and/or cumulative_max",
-                        self.name
-                    ));
-                }
                 if asset.trim().is_empty() {
                     return Err(format!("policy '{}': SpendCap asset must not be empty", self.name));
-                }
-                // A zero window makes the cumulative cap a no-op (every charge is
-                // immediately pruned), silently failing open.
-                if cumulative_max.is_some() && *window_secs == 0 {
-                    return Err(format!(
-                        "policy '{}': SpendCap window_secs must be > 0 when cumulative_max is set",
-                        self.name
-                    ));
                 }
             } else if condition_nests_spend_cap(&rule.condition) {
                 return Err(format!(

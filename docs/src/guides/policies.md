@@ -145,32 +145,34 @@ condition = { rate_limit = { max = 10, window_secs = 1 } }
 
 ### Spend Cap
 
-Cap the value an agent can spend, in **minor units** (e.g. cents), per call and
-cumulatively over a rolling window (V3). The amount is read from the request
-body by a [spend extractor](../getting-started/configuration.md#enforcement-section);
-a missing/unparseable amount fails **closed** (deny).
+Cap the value an agent can spend in a **single call**, in **minor units** (e.g.
+cents) (V3). The amount is read from the request body by a [spend
+extractor](../getting-started/configuration.md#enforcement-section); a
+missing/unparseable amount fails **closed** (deny).
 
 ```toml
-# Refunds: at most $50.00 per call and $500.00 per hour, in USD.
-condition = { spend_cap = { asset = "usd", per_action_max = 5000, cumulative_max = 50000, window_secs = 3600 } }
+# Refunds: at most $50.00 per call, in USD.
+condition = { spend_cap = { asset = "usd", per_action_max = 5000 } }
 ```
 
 Use it as the condition of an `allow` rule (with `default_action = "deny"`): the
-call is allowed only while within the caps. A `SpendCap` must be a rule's
+call is allowed only while within the per-call cap. A `SpendCap` must be a rule's
 **top-level** condition (not nested in `and`/`or`/`not`), and its policy must be
 fail-closed (`default_action = "deny"`) — both are enforced at load.
 
-The cumulative ledger keys by the **cap's scope**: a per-agent cap (the policy
-sets `principal_pattern`) keys by the agent label, so all of an agent's tokens
-share one budget; a credential-wide cap keys by the credential, so all
-principals share it. The ledger is in-memory per process (it resets on restart —
-like the rate limiter).
+> **Per-action only — the spend check is stateless.** Vultrino does *not* keep a
+> cumulative/windowed ledger: a single call is the unit it bounds. **Cumulative
+> or budget enforcement is the book-of-record's plane** (e.g. a spend ledger
+> service) — it arrives as a per-agent/credential `Deny` policy pushed through
+> the [admin write API](./policies.md) when a budget is exhausted, not as engine
+> state inside vultrino. This keeps the proxy's decision stateless and the same
+> across the web and MCP processes.
 
 Notes:
 
-- **Approval-gated spends are charged when the approval opens** (so the cap
-  binds), and a denied/expired approval is **not** refunded — the cap is
-  conservative (the rolling window bounds the effect).
+- **Approval-gated spends** are re-checked when the approval finally executes
+  via the read-only resume path, which treats the already-checked per-action
+  amount as admitted (it does not re-deny on resume).
 - **Multiple assets**: put per-asset caps as multiple *rules in a single
   policy* (first match wins). Two *separate* per-asset policies would deny each
   other's asset, because a non-matching asset falls through to that policy's

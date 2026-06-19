@@ -89,12 +89,6 @@ struct RateLimitState {
     window_start: Instant,
 }
 
-/// A timestamped charge in the in-memory spend log for `(spend_key, asset)`.
-struct SpendCharge {
-    at: Instant,
-    amount: u64,
-}
-
 /// Policy engine that evaluates access decisions
 pub struct PolicyEngine {
     /// Registered policies
@@ -105,11 +99,6 @@ pub struct PolicyEngine {
     /// `true` = fail-closed (deny), `false` = fail-open (allow, legacy).
     /// Read on the hot path, so it's a plain atomic rather than a lock.
     default_deny: AtomicBool,
-    /// Cumulative-spend log keyed by `(spend_key, asset)` → timestamped charges
-    /// (V3). In-memory and per-process — same model and limitations as the rate
-    /// limiter (resets on restart; a cap shared across the web+MCP processes is
-    /// approximate, each process tracks its own). Pruned lazily on access.
-    spends: RwLock<HashMap<(String, String), Vec<SpendCharge>>>,
 }
 
 impl PolicyEngine {
@@ -126,7 +115,6 @@ impl PolicyEngine {
             policies: RwLock::new(Vec::new()),
             rate_limits: RwLock::new(HashMap::new()),
             default_deny: AtomicBool::new(true),
-            spends: RwLock::new(HashMap::new()),
         }
     }
 
@@ -303,29 +291,16 @@ impl PolicyEngine {
 
         for policy in matching_policies {
             for rule in &policy.rules {
-                // A top-level SpendCap is evaluated (and, when its rule admits the
-                // request, charged) here — NOT as a side effect of the recursive
-                // boolean walk — so budget is consumed only for the firing cap,
-                // exactly once, and never for a denied or non-firing rule. Nested
+                // A top-level SpendCap is evaluated here (per-action, stateless) —
+                // NOT as a side effect of the recursive boolean walk. Nested
                 // SpendCap is rejected by Policy::validate at config/admin load.
                 let matched = match &rule.condition {
-                    PolicyCondition::SpendCap {
-                        asset,
-                        per_action_max,
-                        cumulative_max,
-                        window_secs,
-                    } => {
-                        let admits = matches!(rule.action, PolicyAction::Allow | PolicyAction::Prompt);
-                        let key = spend_key_for(policy, input);
+                    PolicyCondition::SpendCap { asset, per_action_max } => {
                         self.spend_within_cap(
-                            &key,
                             input.spend,
                             asset,
                             *per_action_max,
-                            *cumulative_max,
-                            *window_secs,
-                            record,           // check the cap on the live path; skip on resume
-                            record && admits, // charge only a firing, admitting rule
+                            record, // check the cap on the live path; skip on resume
                         )
                     }
                     other => self.evaluate_condition(other, input, record),
@@ -392,26 +367,12 @@ impl PolicyEngine {
                 }
             }
 
-            PolicyCondition::SpendCap {
-                asset,
-                per_action_max,
-                cumulative_max,
-                window_secs,
-            } => {
+            PolicyCondition::SpendCap { asset, per_action_max } => {
                 // Reached only if a SpendCap is (mis)nested inside and/or/not,
-                // which Policy::validate rejects at load. Evaluate it purely
-                // (never charge here) as a safety net — the authoritative charge
-                // only happens for a top-level SpendCap rule in evaluate_inner.
-                self.spend_within_cap(
-                    &spend_key_default(input),
-                    input.spend,
-                    asset,
-                    *per_action_max,
-                    *cumulative_max,
-                    *window_secs,
-                    record,
-                    false,
-                )
+                // which Policy::validate rejects at load. Evaluate it purely as a
+                // safety net — the authoritative check is a top-level SpendCap rule
+                // in evaluate_inner.
+                self.spend_within_cap(input.spend, asset, *per_action_max, record)
             }
 
             PolicyCondition::And(conditions) => conditions
@@ -428,29 +389,21 @@ impl PolicyEngine {
         }
     }
 
-    /// Whether a spend attempt is within a `SpendCap`, and (optionally) charge it.
+    /// Whether a spend attempt is within a `SpendCap` (per-action, stateless).
     ///
-    /// - `check=false` (the deferred resume path): the attempt was already
-    ///   checked and charged when the approval opened, so return `true` (within)
-    ///   without re-checking or re-charging.
+    /// - `check=false` (the deferred resume path): the attempt was already checked
+    ///   when the approval opened, so return `true` (within) without re-checking.
     /// - A missing/unparseable amount or a mismatched asset fails **closed**
     ///   (false → leads to deny).
-    /// - `charge=true` (a firing, admitting rule on the live path) appends the
-    ///   amount to the ledger — atomically with the cumulative check, under one
-    ///   lock, so concurrent calls can't both pass and then exceed the cap. The
-    ///   charge is only retained when a `cumulative_max` exists (per-action-only
-    ///   caps need no ledger).
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// There is no cumulative ledger: cumulative/windowed spend is the
+    /// book-of-record's plane, pushed back as a `Deny` policy via the write API.
     fn spend_within_cap(
         &self,
-        key: &str,
         spend: Option<&SpendAttempt>,
         asset: &str,
-        per_action_max: Option<u64>,
-        cumulative_max: Option<u64>,
-        window_secs: u64,
+        per_action_max: u64,
         check: bool,
-        charge: bool,
     ) -> bool {
         if !check {
             return true;
@@ -467,34 +420,8 @@ impl PolicyEngine {
         if spend.asset != asset {
             return false;
         }
-        // Per-call cap (no ledger access needed).
-        if matches!(per_action_max, Some(max) if spend.amount > max) {
-            return false;
-        }
-        // Per-action-only cap: the ledger is irrelevant, so don't touch the lock.
-        if cumulative_max.is_none() {
-            return true;
-        }
-        // Cumulative check + charge atomically under one lock.
-        let mut spends = self.spends.write();
-        let now = Instant::now();
-        let window = Duration::from_secs(window_secs);
-        let map_key = (key.to_string(), asset.to_string());
-        // Windowed sum of existing charges (pruning expired ones). Use get_mut so
-        // a pure check never creates an empty ledger entry.
-        let accumulated: u64 = if let Some(log) = spends.get_mut(&map_key) {
-            log.retain(|c| now.duration_since(c.at) < window);
-            log.iter().map(|c| c.amount).fold(0u64, |a, b| a.saturating_add(b))
-        } else {
-            0
-        };
-        if matches!(cumulative_max, Some(max) if accumulated.saturating_add(spend.amount) > max) {
-            return false;
-        }
-        if charge && cumulative_max.is_some() {
-            spends.entry(map_key).or_default().push(SpendCharge { at: now, amount: spend.amount });
-        }
-        true
+        // Per-call cap.
+        spend.amount <= per_action_max
     }
 
     /// Check and update rate limit
@@ -582,33 +509,6 @@ fn principal_matches(pattern: Option<&str>, principal: Option<&Principal>) -> bo
             }
         },
     }
-}
-
-/// Accounting key for a SpendCap, derived from the **cap's scope** (not just the
-/// presenting principal) so the cap can't be multiplied:
-/// - a per-agent cap (the policy sets `principal_pattern`) keys by the agent
-///   label, so *all* of one agent's tokens share a single budget (falling back
-///   to the principal id when matched by id, or the credential when there is no
-///   principal);
-/// - a credential-wide cap (no `principal_pattern`) keys by the credential
-///   alias, so every principal shares one budget.
-fn spend_key_for(policy: &Policy, input: &EvalInput) -> String {
-    if policy.principal_pattern.is_some() {
-        match input.principal {
-            Some(p) => match &p.agent_label {
-                Some(label) => format!("agent:{label}"),
-                None => format!("principal:{}", p.id),
-            },
-            None => format!("cred:{}", input.credential_alias),
-        }
-    } else {
-        format!("cred:{}", input.credential_alias)
-    }
-}
-
-/// Fallback key for a (validation-rejected) nested SpendCap safety path.
-fn spend_key_default(input: &EvalInput) -> String {
-    format!("cred:{}", input.credential_alias)
 }
 
 /// Extracts a [`SpendAttempt`] from a request's params for `SpendCap` evaluation
@@ -782,9 +682,7 @@ mod tests {
                 PolicyCondition::UrlMatch("*".to_string()),
                 PolicyCondition::SpendCap {
                     asset: "usd".to_string(),
-                    per_action_max: Some(100),
-                    cumulative_max: None,
-                    window_secs: 60,
+                    per_action_max: 100,
                 },
             ]),
             PolicyAction::Allow,
@@ -1010,15 +908,10 @@ mod tests {
         EvalInput { credential_alias: alias, url: None, method: None, principal: None, spend: Some(spend) }
     }
 
-    fn spend_policy(asset: &str, per: Option<u64>, cum: Option<u64>, window: u64) -> Policy {
+    fn spend_policy(asset: &str, per_action_max: u64) -> Policy {
         let mut p = Policy::deny_all("spend", "pay-*");
         p.rules = vec![PolicyRule {
-            condition: PolicyCondition::SpendCap {
-                asset: asset.to_string(),
-                per_action_max: per,
-                cumulative_max: cum,
-                window_secs: window,
-            },
+            condition: PolicyCondition::SpendCap { asset: asset.to_string(), per_action_max },
             action: PolicyAction::Allow,
         }];
         p
@@ -1081,7 +974,7 @@ mod tests {
     #[test]
     fn test_spend_cap_per_action() {
         let engine = PolicyEngine::new();
-        engine.add_policy(spend_policy("usd", Some(5000), None, 3600));
+        engine.add_policy(spend_policy("usd", 5000));
         let within = SpendAttempt { asset: "usd".to_string(), amount: 5000 };
         let over = SpendAttempt { asset: "usd".to_string(), amount: 5001 };
         assert_eq!(engine.evaluate_full(&input_spend("pay-1", &within)), PolicyDecision::Allow);
@@ -1089,23 +982,9 @@ mod tests {
     }
 
     #[test]
-    fn test_spend_cap_cumulative_window() {
-        let engine = PolicyEngine::new();
-        engine.add_policy(spend_policy("usd", None, Some(100), 3600));
-        let sixty = SpendAttempt { asset: "usd".to_string(), amount: 60 };
-        // 0+60 ≤ 100 → allow (charges 60).
-        assert_eq!(engine.evaluate_full(&input_spend("pay-1", &sixty)), PolicyDecision::Allow);
-        // 60+60 = 120 > 100 → deny (not charged).
-        assert!(matches!(engine.evaluate_full(&input_spend("pay-1", &sixty)), PolicyDecision::Deny(_)));
-        // 60+40 = 100 ≤ 100 → allow.
-        let forty = SpendAttempt { asset: "usd".to_string(), amount: 40 };
-        assert_eq!(engine.evaluate_full(&input_spend("pay-1", &forty)), PolicyDecision::Allow);
-    }
-
-    #[test]
     fn test_spend_cap_unparseable_fails_closed() {
         let engine = PolicyEngine::new();
-        engine.add_policy(spend_policy("usd", Some(100), None, 3600));
+        engine.add_policy(spend_policy("usd", 100));
         // No spend attempt extracted → SpendCap false → default Deny.
         let no_spend = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: None, spend: None };
         assert!(matches!(engine.evaluate_full(&no_spend), PolicyDecision::Deny(_)));
@@ -1115,18 +994,20 @@ mod tests {
     }
 
     #[test]
-    fn test_spend_readonly_does_not_charge() {
+    fn test_spend_check_is_stateless() {
+        // Per-action only: the check has no ledger, so an in-cap amount passes
+        // every time, on both the recording and read-only paths, and a prior
+        // over-cap denial leaves no residue that affects a later in-cap call.
         let engine = PolicyEngine::new();
-        engine.add_policy(spend_policy("usd", None, Some(100), 3600));
+        engine.add_policy(spend_policy("usd", 100));
         let eighty = SpendAttempt { asset: "usd".to_string(), amount: 80 };
-        // Read-only checks pass repeatedly without charging.
+        let over = SpendAttempt { asset: "usd".to_string(), amount: 101 };
         for _ in 0..5 {
+            assert_eq!(engine.evaluate_full(&input_spend("pay-1", &eighty)), PolicyDecision::Allow);
             assert_eq!(engine.evaluate_readonly_full(&input_spend("pay-1", &eighty)), PolicyDecision::Allow);
         }
-        // The recording path still has the full budget (nothing was charged)...
+        assert!(matches!(engine.evaluate_full(&input_spend("pay-1", &over)), PolicyDecision::Deny(_)));
         assert_eq!(engine.evaluate_full(&input_spend("pay-1", &eighty)), PolicyDecision::Allow);
-        // ...now 80 is charged, so another 80 (=160) exceeds 100 → deny.
-        assert!(matches!(engine.evaluate_full(&input_spend("pay-1", &eighty)), PolicyDecision::Deny(_)));
     }
 
     #[test]
@@ -1165,90 +1046,26 @@ mod tests {
 
     #[test]
     fn test_spend_cap_validation() {
-        // Valid: top-level SpendCap, a cap set, default_action deny.
-        assert!(spend_policy("usd", Some(100), None, 3600).validate().is_ok());
+        // Valid: top-level SpendCap, default_action deny.
+        assert!(spend_policy("usd", 100).validate().is_ok());
 
-        // No caps set → rejected.
-        let mut no_caps = spend_policy("usd", None, None, 3600);
-        assert!(no_caps.validate().is_err());
-        // Patch to have a cap but flip default to allow → rejected (not fail-closed).
-        no_caps.rules[0] = PolicyRule {
-            condition: PolicyCondition::SpendCap { asset: "usd".into(), per_action_max: Some(1), cumulative_max: None, window_secs: 60 },
-            action: PolicyAction::Allow,
-        };
-        no_caps.default_action = PolicyAction::Allow;
-        assert!(no_caps.validate().is_err());
+        // A cap but default action allow → rejected (not fail-closed).
+        let mut not_closed = spend_policy("usd", 1);
+        not_closed.default_action = PolicyAction::Allow;
+        assert!(not_closed.validate().is_err());
 
         // Nested SpendCap (inside And) → rejected.
         let mut nested = Policy::deny_all("nested", "pay-*");
         nested.rules = vec![PolicyRule {
             condition: PolicyCondition::And(vec![
                 PolicyCondition::url("https://x/*"),
-                PolicyCondition::SpendCap { asset: "usd".into(), per_action_max: Some(1), cumulative_max: None, window_secs: 60 },
+                PolicyCondition::SpendCap { asset: "usd".into(), per_action_max: 1 },
             ]),
             action: PolicyAction::Allow,
         }];
         assert!(nested.validate().is_err());
 
         // Empty asset → rejected.
-        assert!(spend_policy("", Some(1), None, 60).validate().is_err());
-        // window_secs == 0 with a cumulative cap → rejected (window no-op).
-        assert!(spend_policy("usd", None, Some(100), 0).validate().is_err());
-        // window_secs == 0 is fine for a per-action-only cap (no window used).
-        assert!(spend_policy("usd", Some(100), None, 0).validate().is_ok());
-    }
-
-    #[test]
-    fn test_spend_denied_call_is_not_charged() {
-        // A request denied by the per-action cap must NOT consume cumulative
-        // budget — charging happens only for a firing admitting rule.
-        let engine = PolicyEngine::new();
-        engine.add_policy(spend_policy("usd", Some(50), Some(100), 3600));
-        let over = SpendAttempt { asset: "usd".to_string(), amount: 80 }; // > per_action 50
-        let ok = SpendAttempt { asset: "usd".to_string(), amount: 50 };
-        // Over per-action → denied, no charge.
-        assert!(matches!(engine.evaluate_full(&input_spend("pay-1", &over)), PolicyDecision::Deny(_)));
-        // Cumulative budget is untouched: two 50s succeed (=100), the third denies.
-        assert_eq!(engine.evaluate_full(&input_spend("pay-1", &ok)), PolicyDecision::Allow);
-        assert_eq!(engine.evaluate_full(&input_spend("pay-1", &ok)), PolicyDecision::Allow);
-        assert!(matches!(engine.evaluate_full(&input_spend("pay-1", &ok)), PolicyDecision::Deny(_)));
-    }
-
-    #[test]
-    fn test_per_agent_cap_shared_across_tokens() {
-        // A per-agent cumulative cap is keyed by agent label, so two tokens of
-        // the same agent share one budget (can't multiply the cap).
-        let engine = PolicyEngine::new();
-        engine.set_default_deny(false);
-        let mut pol = Policy::deny_all("agent-cap", "pay-*").with_principal("bot");
-        pol.rules = vec![PolicyRule {
-            condition: PolicyCondition::SpendCap { asset: "usd".into(), per_action_max: None, cumulative_max: Some(100), window_secs: 3600 },
-            action: PolicyAction::Allow,
-        }];
-        engine.add_policy(pol);
-
-        let tok1 = Principal { id: "tok1".to_string(), agent_label: Some("bot".to_string()), owner: None };
-        let tok2 = Principal { id: "tok2".to_string(), agent_label: Some("bot".to_string()), owner: None };
-        let sixty = SpendAttempt { asset: "usd".to_string(), amount: 60 };
-        let in1 = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&tok1), spend: Some(&sixty) };
-        let in2 = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&tok2), spend: Some(&sixty) };
-        // tok1 spends 60 (ok); tok2 (same agent) spends 60 → 120 > 100 → deny.
-        assert_eq!(engine.evaluate_full(&in1), PolicyDecision::Allow);
-        assert!(matches!(engine.evaluate_full(&in2), PolicyDecision::Deny(_)));
-    }
-
-    #[test]
-    fn test_credential_wide_cap_shared_across_principals() {
-        // A credential-wide cap (no principal_pattern) is keyed by the credential,
-        // so distinct principals share one budget.
-        let engine = PolicyEngine::new();
-        engine.add_policy(spend_policy("usd", None, Some(100), 3600));
-        let p1 = Principal { id: "tokA".to_string(), agent_label: None, owner: None };
-        let p2 = Principal { id: "tokB".to_string(), agent_label: None, owner: None };
-        let sixty = SpendAttempt { asset: "usd".to_string(), amount: 60 };
-        let in1 = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&p1), spend: Some(&sixty) };
-        let in2 = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&p2), spend: Some(&sixty) };
-        assert_eq!(engine.evaluate_full(&in1), PolicyDecision::Allow);
-        assert!(matches!(engine.evaluate_full(&in2), PolicyDecision::Deny(_)));
+        assert!(spend_policy("", 1).validate().is_err());
     }
 }

@@ -623,11 +623,7 @@ pub struct RawRateLimit {
 #[derive(Debug, Deserialize)]
 pub struct RawSpendCap {
     pub asset: String,
-    #[serde(default)]
-    pub per_action_max: Option<u64>,
-    #[serde(default)]
-    pub cumulative_max: Option<u64>,
-    pub window_secs: u64,
+    pub per_action_max: u64,
 }
 
 impl TryFrom<RawPolicyCondition> for PolicyCondition {
@@ -646,8 +642,6 @@ impl TryFrom<RawPolicyCondition> for PolicyCondition {
             RawPolicyCondition::SpendCap { spend_cap } => Ok(PolicyCondition::SpendCap {
                 asset: spend_cap.asset,
                 per_action_max: spend_cap.per_action_max,
-                cumulative_max: spend_cap.cumulative_max,
-                window_secs: spend_cap.window_secs,
             }),
             RawPolicyCondition::And { and } => {
                 let conditions = and
