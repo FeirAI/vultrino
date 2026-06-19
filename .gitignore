@@ -36,3 +36,7 @@ credentials.enc
 
 # Plugin build artifacts
 /plugins/*/target/
+
+# Local review/handoff working docs (not part of the codebase)
+/REVIEW.md
+/expansion-integration.md
