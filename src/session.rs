@@ -4,7 +4,7 @@
 //! process, keyed by a per-execution id, so a halt can see what an agent is
 //! doing right now and fire any registered abort callback. It is **in-memory and
 //! per-process** — the same model and limitations as the policy engine's
-//! rate-limit / spend ledgers: it resets on restart, and in a web+MCP deployment
+//! rate-limit counters: it resets on restart, and in a web+MCP deployment
 //! each process only sees the executions it is running.
 //!
 //! Halt has two cross-process, storage-authoritative legs (revoke the agent's

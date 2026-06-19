@@ -308,11 +308,10 @@ fn hash_token(token: &str) -> String {
 }
 
 /// Validate an agent label (V4). The label feeds `principal_pattern` glob
-/// matching and the spend-ledger key (`agent:<label>`), so restrict it to a
-/// safe allowlist to avoid unintended glob matches or key-prefix collisions.
-/// Centralized so every token-write path enforces the same rule.
+/// matching, so restrict it to a safe allowlist to avoid unintended glob
+/// matches. Centralized so every token-write path enforces the same rule.
 pub fn validate_agent_label(label: &str) -> Result<(), String> {
-    /// Bound the label so it can't bloat glob compilation or the ledger key.
+    /// Bound the label so it can't bloat glob compilation.
     const MAX_AGENT_LABEL_LEN: usize = 128;
     if label.is_empty() {
         return Err("agent_label must not be empty".to_string());

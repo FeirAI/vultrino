@@ -164,7 +164,7 @@ pub struct VultrinoServer {
     /// Registered harness abort callbacks, fired on halt (V6).
     halt_callbacks: parking_lot::RwLock<Vec<Arc<dyn crate::session::HaltCallback>>>,
     /// Count of unauthorized (policy/scope-denied) tool-call attempts (V12 metrics).
-    /// Per-process, in-memory (resets on restart), like the rate/spend ledgers.
+    /// Per-process, in-memory (resets on restart), like the rate-limit counters.
     unauthorized_attempts: std::sync::atomic::AtomicU64,
     /// Inbound workload-identity resolver (V10/R6): resolves an SVID/OIDC document
     /// presented in a configured request header into the principal evaluated by

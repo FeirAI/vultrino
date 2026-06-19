@@ -908,7 +908,7 @@ pub async fn api_create_token(
             );
         }
         // Validate the agent label against the centralized allowlist (feeds
-        // principal_pattern glob matching and the spend-ledger key).
+        // principal_pattern glob matching).
         if let Some(label) = &req.agent_label {
             if let Err(e) = crate::auth::validate_agent_label(label) {
                 return (
@@ -1006,7 +1006,7 @@ pub async fn api_unhalt_agent(
 }
 
 /// `GET /api/v1/sessions` — the in-flight execution registry for **this process**
-/// (per-process and in-memory, like the rate-limit/spend ledgers).
+/// (per-process and in-memory, like the rate-limit counters).
 pub async fn api_list_sessions(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
     let sessions = state.server.sessions().list();
     (

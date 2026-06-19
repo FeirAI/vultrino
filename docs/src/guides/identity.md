@@ -17,6 +17,8 @@ allowed = ["example.org"]       # SPIFFE trust domains (or OIDC issuers); empty 
 
 So a `principal_pattern` Deny on `spiffe://example.org/*` blocks any request whose presented SVID is in that trust domain, regardless of which `vk_`/`vut_` carried it. A malformed or untrusted document is logged and **ignored** (the request falls back to its static `vk_`/`vut_` principal) — a bad document can only fail to refine the principal, never elevate it.
 
+> **The resolved subject is an _additional_ match dimension, never a replacement.** The principal's stable `vk_`/`vut_` id remains the **halt / ownership anchor**, so a [halt](./kill-halt.md) keyed on the credential always holds even when a workload identity is presented (it can't be escaped by waving an SVID). To **halt by a resolved workload identity** itself, push a kill/Deny policy with `principal_pattern = <the SVID/OIDC subject>` through the [admin write API](./policies.md) — `vultrino agent halt` targets agent labels / credential ids (which exclude the `:`/`/` in SVID strings), whereas a policy `principal_pattern` matches the resolved subject directly.
+
 ## Resolving a workload identity
 
 The `vultrino::identity` module turns an identity document into a `WorkloadIdentity { kind, subject, trust_domain, owner }`:
