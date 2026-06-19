@@ -77,12 +77,16 @@ pub enum PolicyCondition {
     SpendCap {
         /// Asset this cap governs (e.g. "usd"). Must equal the attempt's asset.
         asset: String,
-        /// Max for a single call (minor units). `#[serde(default)]` for forward-
-        /// compatible vault loads: a policy persisted under the pre-R1 schema as a
-        /// cumulative-only cap (no `per_action_max`) deserializes to `0` — a
-        /// fail-closed deny-all-spend, surfacing the stale policy for the operator
-        /// to fix — rather than failing the whole encrypted-vault load. Extra legacy
-        /// keys (`cumulative_max`/`window_secs`) are ignored.
+        /// Max for a single call (minor units). Must be `> 0` (enforced by
+        /// [`Policy::validate`] on create). `#[serde(default)]` is purely for
+        /// forward-compatible *vault loads*: a policy persisted under the pre-R1
+        /// schema as a cumulative-only cap (no `per_action_max`) deserializes to `0`
+        /// — fail-closed against every positive spend, surfacing the stale policy
+        /// for the operator to fix — rather than failing the whole encrypted-vault
+        /// load. validate does not run on stored policies, so the 0 is tolerated
+        /// only there; a freshly-created cap (config/admin API) with `0` or a
+        /// missing value is rejected. Extra legacy keys (`cumulative_max`/
+        /// `window_secs`) are ignored on load.
         #[serde(default)]
         per_action_max: u64,
     },
@@ -174,16 +178,28 @@ impl Policy {
     ///   and/or/not) — the engine evaluates exactly the firing cap, and a nested
     ///   cap would gate ambiguously;
     /// - a `SpendCap`'s `asset` must be non-empty;
+    /// - a `SpendCap`'s `per_action_max` must be `> 0` — a 0 cap admits only a
+    ///   zero-amount spend (express "no spend" as a `Deny` instead). This also
+    ///   closes the admin-API edge where a missing `per_action_max` would
+    ///   `#[serde(default)]` to 0 (validate runs on create, so a fresh cap can't be
+    ///   0; only a pre-R1 cumulative-only policy *loaded from the vault* — where
+    ///   validate does not run — defaults to a fail-closed 0 cap, by design);
     /// - a policy that uses a `SpendCap` rule must be fail-closed
     ///   (`default_action = deny`), so an over-cap or unparseable request falls
     ///   through to deny rather than being allowed.
     pub fn validate(&self) -> Result<(), String> {
         let mut uses_spend_cap = false;
         for rule in &self.rules {
-            if let PolicyCondition::SpendCap { asset, .. } = &rule.condition {
+            if let PolicyCondition::SpendCap { asset, per_action_max } = &rule.condition {
                 uses_spend_cap = true;
                 if asset.trim().is_empty() {
                     return Err(format!("policy '{}': SpendCap asset must not be empty", self.name));
+                }
+                if *per_action_max == 0 {
+                    return Err(format!(
+                        "policy '{}': SpendCap per_action_max must be > 0 (use a Deny rule to forbid spend)",
+                        self.name
+                    ));
                 }
             } else if condition_nests_spend_cap(&rule.condition) {
                 return Err(format!(

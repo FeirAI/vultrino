@@ -1124,5 +1124,10 @@ mod tests {
 
         // Empty asset → rejected.
         assert!(spend_policy("", 1).validate().is_err());
+
+        // per_action_max == 0 → rejected. This also closes the admin-API edge where
+        // a missing per_action_max would #[serde(default)] to 0: validate runs on
+        // create, so a fresh 0 cap (explicit or defaulted) can't be stored.
+        assert!(spend_policy("usd", 0).validate().is_err());
     }
 }
