@@ -764,6 +764,14 @@ impl VultrinoServer {
             .get("tenant")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        // V13b: capture the request-side `model` (if any) before `params` moves
+        // into the plugin request. The model selects leria's rate card; we prefer
+        // the model the provider echoes in the RESPONSE (parsed below, pre-scrub),
+        // falling back to this request-side value.
+        let meter_request_model = params
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string);
         // Capture the credential's secret material before it moves into the
         // plugin request, so we can scrub it from the response (V7 egress).
         let secret_material = credential.data.secret_material();
@@ -795,6 +803,23 @@ impl VultrinoServer {
             .execute(plugin_request)
             .await
             .map_err(|e| RunError::committed(e.into()))?;
+
+        // V13b (leria metering, token counts): read the provider usage block from
+        // the RAW response body NOW — BEFORE `scrub_response` (below) redacts /
+        // withholds / replaces it. Reading post-scrub would see redacted bytes and
+        // UNDER-COUNT, and under-counting is the dangerous direction (a low count
+        // keeps leria's cumulative ceiling below its limit → budgets never fire →
+        // unbounded spend). The *emit* still happens post-scrub at the V13a hook;
+        // only this *read* must precede scrub. Best-effort, counts + model only —
+        // no prompt/body/secret retained. v1 limitation: non-streamed responses
+        // only (a streamed response without a usage trailer yields None → only the
+        // V13a api-calls=1 event fires for that call). A non-LLM action (no `usage`
+        // block) likewise yields None.
+        let meter_token_usage = crate::outbox::parse_token_usage(&response.body);
+        let meter_model = meter_token_usage.and_then(|_| {
+            crate::outbox::extract_model(&response.body, &serde_json::Value::Null)
+                .or_else(|| meter_request_model.clone())
+        });
 
         // V7 egress controls (before the body ever reaches the agent): fail
         // closed on a still-compressed body, else scrub the credential's own
@@ -879,6 +904,35 @@ impl VultrinoServer {
             ),
         )
         .await;
+
+        // V13b (leria metering, token counts): when the RAW response (read above,
+        // pre-scrub) carried a parseable provider usage block, emit a SECOND
+        // `meter.observed` event for the same call — `asset=usd` + a `tokens`
+        // {input,output} split + `dims.model_ref`, with the SAME
+        // event_id/correlation_id/principal/dims as the V13a event. vultrino sends
+        // COUNTS, not dollars: leria mints usd from the tokens via its RateCard and
+        // pins the rate_card_version (no pricing logic enters vultrino — the V3
+        // boundary). Emitted post-scrub on the same best-effort hook (the read,
+        // not the emit, is the scrub-order-sensitive step). No usage block (a
+        // streamed response without a usage trailer, or a non-LLM action) ⇒ no
+        // token event, only the V13a api-calls=1 above (the stated non-streaming-
+        // only v1 limitation). Counts + ids only — no prompt/body/secret.
+        if let Some(usage) = meter_token_usage {
+            self.emit_event(
+                &meter_principal,
+                crate::outbox::EVENT_METER_OBSERVED,
+                crate::outbox::meter_tokens_payload(
+                    &request_id,
+                    &meter_principal,
+                    meter_occurred_at,
+                    meter_tenant.as_deref(),
+                    &credential_alias,
+                    meter_model.as_deref(),
+                    usage,
+                ),
+            )
+            .await;
+        }
 
         // Record for rate limiting.
         self.policy_engine.record_request(&credential_alias);

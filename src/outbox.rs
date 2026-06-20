@@ -171,6 +171,163 @@ pub fn meter_observed_payload(
     })
 }
 
+/// A provider-reported token usage split parsed from an LLM response body (V13b).
+///
+/// vultrino emits the raw **counts** only — never dollars. leria's rate card mints
+/// the usd amount from `(input, output)` + `dims.model_ref`; vultrino holds no
+/// pricing logic and no cumulative state (the V3 boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Prompt / input tokens (OpenAI `prompt_tokens`, Anthropic `input_tokens`).
+    pub input_tokens: u64,
+    /// Completion / output tokens (OpenAI `completion_tokens`, Anthropic
+    /// `output_tokens`).
+    pub output_tokens: u64,
+}
+
+/// Parse a provider `usage` block from a **non-streamed** LLM response body
+/// (V13b). Best-effort: returns `None` for any body that isn't a JSON object
+/// carrying a recognized `usage` shape (a streamed response without a usage
+/// trailer, or a non-LLM action) — the caller then emits only the V13a
+/// `api-calls=1` event.
+///
+/// Two provider shapes are recognized (both nested under top-level `usage`):
+///
+/// - **OpenAI-style:** `{"usage": {"prompt_tokens": N, "completion_tokens": M,
+///   "total_tokens": …}}` — input = `prompt_tokens`, output = `completion_tokens`.
+/// - **Anthropic-style:** `{"usage": {"input_tokens": N, "output_tokens": M}}` —
+///   input = `input_tokens`, output = `output_tokens`.
+///
+/// # The raw-body contract (V13b Gate 2)
+///
+/// This MUST be called on the **raw** response body, **before**
+/// [`crate::egress::scrub_response`]. Scrub redacts / withholds / replaces the
+/// body, so a usage read placed after it would see redacted bytes and
+/// **under-count** — and under-counting is the dangerous direction (a low token
+/// count keeps leria's cumulative ceiling below its limit, so budgets never fire →
+/// unbounded spend). Reading pre-scrub yields the correct count regardless of what
+/// egress later does to the bytes the agent receives.
+///
+/// # v1 limitation — non-streamed responses only
+///
+/// vultrino buffers response bodies whole and has no SSE/streaming awareness, and
+/// OpenAI omits the `usage` object from a streamed completion unless the client
+/// sets `stream_options.include_usage`. So for a streamed LLM call this returns
+/// `None` and the call falls back to the V13a `api-calls=1` event; leria treats
+/// token-level confidence for that call as non-streaming-only.
+///
+/// Counts only — no prompt/body text is retained.
+pub fn parse_token_usage(raw_body: &[u8]) -> Option<TokenUsage> {
+    let json: serde_json::Value = serde_json::from_slice(raw_body).ok()?;
+    let usage = json.get("usage")?.as_object()?;
+
+    // A JSON number can exceed u64 or be negative/float; clamp non-negative
+    // integers only (a count is a whole, non-negative quantity). `as_u64` already
+    // returns None for negatives and non-integers.
+    let read = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
+
+    // OpenAI-style first (prompt/completion), then Anthropic-style (input/output).
+    // A response that carries neither pair has no parseable token usage.
+    if let (Some(input), Some(output)) = (read("prompt_tokens"), read("completion_tokens")) {
+        return Some(TokenUsage { input_tokens: input, output_tokens: output });
+    }
+    if let (Some(input), Some(output)) = (read("input_tokens"), read("output_tokens")) {
+        return Some(TokenUsage { input_tokens: input, output_tokens: output });
+    }
+    None
+}
+
+/// Extract the model identifier for a metered LLM call (V13b): prefer the model
+/// echoed in the **response** body (the model the provider actually served),
+/// falling back to a `model` field in the **request** params. Returns `None` if
+/// neither carries a string `model` — the token event still emits, just without
+/// `dims.model_ref` (leria then fails the usd pricing closed for that call and the
+/// caller may re-post against a known model). Counts only; no body text retained.
+pub fn extract_model(raw_body: &[u8], request_params: &serde_json::Value) -> Option<String> {
+    let from_response = serde_json::from_slice::<serde_json::Value>(raw_body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
+    from_response.or_else(|| {
+        request_params
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+    })
+}
+
+/// Build the V13b token meter event payload — a second `MeterEvent`-shaped body
+/// emitted for a non-streamed LLM call alongside the V13a `api-calls=1` event for
+/// the **same** call (same `event_id`/`correlation_id`/`principal`/`dims`).
+///
+/// **Shape leria PRICES (verified against `internal/ingest/pipeline.go`
+/// `WireEvent` + `internal/ratecard/ratecard.go`):** vultrino sends token
+/// **counts**, NOT dollars. leria mints usd from the counts via its RateCard, so:
+///
+/// - `asset` — constant `usd`. (leria's `resolveAmount` only prices a
+///   `gateway-observed` event whose `asset == usd` and that carries a `tokens`
+///   split; `asset:tokens` would NOT trigger pricing.)
+/// - `tokens` — `{input_tokens, output_tokens}` as **integers**. This is the
+///   priced input; leria converts `(input,output) → usd-micros` and pins the
+///   `rate_card_version`.
+/// - **No `amount`** — a priced token event must NOT also carry an amount
+///   (leria rejects `ambiguous_amount` otherwise); leria mints the amount from the
+///   tokens. The `amount` key is omitted entirely (its absence decodes to 0).
+/// - `dims.model_ref` — selects the rate card. (leria also accepts the `model`
+///   dim spelling, but `model_ref` is the canonical selector.)
+/// - `event_id` / `correlation_id` — the SAME `request_id` as the V13a event, so
+///   leria threads both observations onto the same occurrence. (The token event's
+///   own dedup is namespaced `(source, event_id)`; pairing it with the api-calls
+///   event is via `correlation_id`.)
+/// - `cost_source` — `gateway-observed`; `confidence` — `low` (the gateway band).
+/// - `dims` — `tenant` (V11) + `credential` alias + `model_ref`, omitting absent
+///   keys (no phantom dims).
+///
+/// No currency field is set: leria's v1 is single-base-currency (usd) and rejects
+/// a non-usd currency; an empty currency is the usd default. Counts + ids only —
+/// no prompt/body/secret rides the event.
+pub fn meter_tokens_payload(
+    request_id: &str,
+    principal: &str,
+    occurred_at: DateTime<Utc>,
+    tenant: Option<&str>,
+    credential_alias: &str,
+    model: Option<&str>,
+    usage: TokenUsage,
+) -> serde_json::Value {
+    let mut dims = serde_json::Map::new();
+    if let Some(t) = tenant {
+        dims.insert("tenant".to_string(), serde_json::Value::String(t.to_string()));
+    }
+    dims.insert(
+        "credential".to_string(),
+        serde_json::Value::String(credential_alias.to_string()),
+    );
+    // leria selects the rate card by `dims.model_ref` (it also accepts `model`);
+    // emit the canonical `model_ref`. Omitted when unknown (no phantom dim).
+    if let Some(m) = model {
+        dims.insert(
+            "model_ref".to_string(),
+            serde_json::Value::String(m.to_string()),
+        );
+    }
+    serde_json::json!({
+        "event_id": request_id,
+        "correlation_id": request_id,
+        "principal": principal,
+        // asset=usd + a tokens split ⇒ leria prices via the rate card; NO amount
+        // (a priced token event must not carry one — leria mints it).
+        "asset": "usd",
+        "tokens": {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+        },
+        "cost_source": "gateway-observed",
+        "confidence": "low",
+        "occurred_at": occurred_at,
+        "dims": serde_json::Value::Object(dims),
+    })
+}
+
 impl OutboxEvent {
     /// The JSON body delivered to a consumer (and the bytes the signature covers).
     pub fn delivery_body(&self) -> serde_json::Value {
@@ -312,6 +469,114 @@ mod tests {
         // model present when known.
         let p3 = super::meter_observed_payload("r", "id", ts, None, "cred", Some("gpt-4o"));
         assert_eq!(p3["dims"]["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn test_parse_token_usage_openai_style() {
+        // OpenAI-style: usage.{prompt_tokens, completion_tokens, total_tokens}.
+        let body = br#"{"id":"cmpl-1","model":"gpt-4o","choices":[{"text":"hi"}],
+            "usage":{"prompt_tokens":120,"completion_tokens":34,"total_tokens":154}}"#;
+        let u = super::parse_token_usage(body).expect("openai usage parses");
+        assert_eq!(u.input_tokens, 120);
+        assert_eq!(u.output_tokens, 34);
+    }
+
+    #[test]
+    fn test_parse_token_usage_anthropic_style() {
+        // Anthropic-style: usage.{input_tokens, output_tokens} (no total).
+        let body = br#"{"id":"msg_1","model":"claude-opus-4","content":[{"type":"text","text":"hi"}],
+            "usage":{"input_tokens":2048,"output_tokens":512}}"#;
+        let u = super::parse_token_usage(body).expect("anthropic usage parses");
+        assert_eq!(u.input_tokens, 2048);
+        assert_eq!(u.output_tokens, 512);
+    }
+
+    #[test]
+    fn test_parse_token_usage_none_for_no_usage_block() {
+        // No usage block (streamed response without a usage trailer, or a non-LLM
+        // action) → None → caller emits only the V13a api-calls=1 event.
+        assert!(super::parse_token_usage(br#"{"hello":"world"}"#).is_none());
+        // A streamed-style SSE body is not a JSON object → None.
+        assert!(super::parse_token_usage(b"data: {\"delta\":\"hi\"}\n\n").is_none());
+        // Empty / non-JSON body → None (never panics).
+        assert!(super::parse_token_usage(b"").is_none());
+        assert!(super::parse_token_usage(b"not json").is_none());
+        // A usage block missing a recognized count pair → None (no half-counts).
+        assert!(super::parse_token_usage(br#"{"usage":{"total_tokens":10}}"#).is_none());
+        // Negative / float counts are rejected by as_u64 → None.
+        assert!(super::parse_token_usage(br#"{"usage":{"prompt_tokens":-1,"completion_tokens":2}}"#).is_none());
+        assert!(super::parse_token_usage(br#"{"usage":{"prompt_tokens":1.5,"completion_tokens":2}}"#).is_none());
+    }
+
+    #[test]
+    fn test_parse_token_usage_prefers_openai_pair_when_both_keys_present() {
+        // A body carrying both spellings (unusual) takes the OpenAI pair first;
+        // the result is deterministic and still a valid (input,output) split.
+        let body = br#"{"usage":{"prompt_tokens":10,"completion_tokens":20,
+            "input_tokens":999,"output_tokens":888}}"#;
+        let u = super::parse_token_usage(body).unwrap();
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 20);
+    }
+
+    #[test]
+    fn test_extract_model_prefers_response_then_request() {
+        let resp = br#"{"model":"gpt-4o-2024","usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let req = serde_json::json!({"model": "gpt-4o-alias"});
+        // Response model wins (the model the provider actually served).
+        assert_eq!(super::extract_model(resp, &req).as_deref(), Some("gpt-4o-2024"));
+        // No response model → fall back to the request model.
+        let resp_no_model = br#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        assert_eq!(super::extract_model(resp_no_model, &req).as_deref(), Some("gpt-4o-alias"));
+        // Neither → None (token event still emits, just without model_ref).
+        assert!(super::extract_model(resp_no_model, &serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn test_meter_tokens_payload_shape_is_what_leria_prices() {
+        // V13b: the token meter event is the shape leria PRICES — asset=usd + a
+        // tokens{input,output} split + dims.model_ref, NO amount (leria mints usd
+        // from the tokens via the rate card), same event_id/correlation_id as V13a.
+        let ts = "2026-06-19T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let p = super::meter_tokens_payload(
+            "req-123",
+            "agent_refund_bot_v3",
+            ts,
+            Some("acme"),
+            "vk_prod",
+            Some("gpt-4o"),
+            super::TokenUsage { input_tokens: 120, output_tokens: 34 },
+        );
+        assert_eq!(p["event_id"], "req-123");
+        assert_eq!(p["correlation_id"], "req-123", "same correlation_id as the V13a event");
+        assert_eq!(p["principal"], "agent_refund_bot_v3");
+        // The pricing trigger: asset=usd + a tokens split (NOT asset=tokens).
+        assert_eq!(p["asset"], "usd");
+        assert_eq!(p["tokens"]["input_tokens"], 120);
+        assert_eq!(p["tokens"]["output_tokens"], 34);
+        // No amount: leria rejects ambiguous_amount on a priced token event.
+        assert!(p.get("amount").is_none(), "a priced token event must NOT carry an amount");
+        // Token counts are integers, never floats on the wire.
+        assert!(p["tokens"]["input_tokens"].is_u64() || p["tokens"]["input_tokens"].is_i64());
+        assert!(p["tokens"]["output_tokens"].is_u64() || p["tokens"]["output_tokens"].is_i64());
+        assert_eq!(p["cost_source"], "gateway-observed");
+        assert_eq!(p["confidence"], "low");
+        // dims.model_ref selects the rate card; tenant + credential present.
+        assert_eq!(p["dims"]["model_ref"], "gpt-4o");
+        assert_eq!(p["dims"]["tenant"], "acme");
+        assert_eq!(p["dims"]["credential"], "vk_prod");
+        // No currency field (usd is the single-base default; a non-usd value would
+        // be rejected by leria).
+        assert!(p.get("currency").is_none());
+
+        // Unknown model → model_ref omitted (no phantom dim); event still emits.
+        let p2 = super::meter_tokens_payload(
+            "r", "id", ts, None, "cred", None,
+            super::TokenUsage { input_tokens: 1, output_tokens: 2 },
+        );
+        assert!(p2["dims"].get("model_ref").is_none(), "no model ⇒ omit model_ref");
+        assert!(p2["dims"].get("tenant").is_none(), "no tenant ⇒ omit the key");
+        assert_eq!(p2["tokens"]["input_tokens"], 1);
     }
 
     #[test]

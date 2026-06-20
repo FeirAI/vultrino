@@ -115,4 +115,74 @@ V13a is the only must. The R3/R4/V11/V12 residual work (`emit_policy_denied` det
 `ApprovalRequest::visible_to_tenant`, `EVENT_CREDENTIAL_REVOKED` + `propagate_revoke`, V10 inbound SVID/OIDC
 resolvers) was **already landed** on `fix/policy-engine` before this branch and remains green; V13a needed no further
 residual work because the V11 tenant tag is reachable at the emit site (the credential's `tenant` metadata) and the
-V4 principal (`agent_label`/id) is on the `RequestContext`. **V13b is untouched (still gated).**
+V4 principal (`agent_label`/id) is on the `RequestContext`.
+
+---
+
+## V13b — LANDED (non-streaming-only v1) — branch `feat/v13a-leria-metering`
+
+**What shipped.** For an **admitted, non-streamed** `/execute` whose response carries a parseable provider usage
+block, `run_action` now emits a **second** `meter.observed` event — the token-count observation leria prices into
+usd — alongside the V13a `api-calls=1` event for the same call. A response with **no** parseable usage block (a
+streamed response without a usage trailer, or any non-LLM action) emits **only** the V13a event.
+
+### The shape — what leria PRICES (not the handoff's literal `asset=tokens`)
+
+Reconciled against leria's **actual code**, not prose:
+
+- `internal/ingest/pipeline.go` `WireEvent`: `Tokens *TokenSplit` "when present on a gateway-observed event with
+  **asset=usd**, requests rate-card pricing; **dims.model_ref** selects the card."
+- `internal/ingest/pipeline.go` `resolveAmount`: a `Tokens`-bearing event must have `asset == usd`, must **not**
+  carry an `amount` (else `ambiguous_amount` rejection), and is priced via the rate card (leria mints the usd-micros
+  + pins `rate_card_version`).
+- `internal/ratecard/ratecard.go` `TokenUsage{InputTokens, OutputTokens}` is the priced input.
+
+So vultrino emits the token event as (`crate::outbox::meter_tokens_payload`):
+
+- `asset = "usd"` (the pricing trigger — **NOT** `tokens`; `asset:tokens` would skip pricing),
+- `tokens = { input_tokens, output_tokens }` as **integers** (the counts; vultrino sends counts, NOT dollars),
+- **no `amount`** key (a priced token event must not carry one; leria mints it),
+- `dims.model_ref = <model>` (selects the rate card),
+- the **same** `event_id` + `correlation_id` (the `/execute` `request_id`) as the V13a event, so leria threads both
+  observations onto the same occurrence,
+- `cost_source = "gateway-observed"`, `confidence = "low"`, `dims.tenant` (V11) + `dims.credential`,
+- **no `currency`** (usd is leria's single-base default; a non-usd value is rejected).
+
+leria converts `(input,output) → usd-micros` via its `RateCard` and pins the version; **no pricing logic enters
+vultrino** (the V3 boundary — vultrino holds no cumulative/usd state).
+
+### Parsing — RAW body, BEFORE scrub (Gate 2)
+
+The usage read (`crate::outbox::parse_token_usage`) runs in `run_action` **immediately after `plugin.execute`** and
+**before `crate::egress::scrub_response`**, on the **raw** `response.body`. Scrub redacts / withholds / replaces the
+body; reading post-scrub would see redacted bytes and **under-count** — the dangerous direction (a low count keeps
+leria's cumulative ceiling below its limit → budgets never fire → unbounded spend). The **emit** still happens
+post-scrub at the existing V13a hook; only the *read* is moved earlier. Two provider shapes are recognized, both
+nested under top-level `usage`:
+
+- **OpenAI-style:** `usage.{prompt_tokens, completion_tokens, total_tokens}` → input=`prompt_tokens`,
+  output=`completion_tokens`.
+- **Anthropic-style:** `usage.{input_tokens, output_tokens}` → input/output direct.
+
+`model` is taken from the response body (`model`, the model the provider actually served), falling back to a `model`
+field in the request params; if neither is present the token event still emits, just without `dims.model_ref` (leria
+then fails the usd pricing closed for that call). Best-effort, off the latency path, **counts + model only** — no
+prompt/body/secret is read or retained.
+
+### v1 LIMITATION — non-streaming-only (stated)
+
+vultrino buffers response bodies whole and has **no SSE/streaming awareness** (Gate 1), and OpenAI omits the `usage`
+object from a *streamed* completion unless the client sets `stream_options.include_usage` — which vultrino neither
+requires nor injects. So **token-level gateway-observed confidence is non-streaming-only**: a streamed LLM call
+emits only the V13a `api-calls=1` event, and leria must fall back to a lower-confidence source
+(provider-usage-api / invoice) for that call's token count. Gates 1a (SSE handling) and 1b (the
+`stream_options.include_usage` injection decision) remain open and are the prerequisites for streamed-token support;
+they are **out of scope** for this v1.
+
+**Acceptance — all met** (`tests/approval_token_integration.rs`, `test_v13b_*`; plus `src/outbox.rs` unit tests
+`test_parse_token_usage_*`, `test_extract_model_*`, `test_meter_tokens_payload_*`): OpenAI-style usage emits a 2nd
+`meter.observed` with `asset=usd` + `tokens{input,output}` + `dims.model_ref` + `correlation_id` == the V13a event;
+Anthropic-style usage parsed; no usage block → only the V13a event; the token read is from the **raw** body (an
+egress redact rule that rewrites the agent-visible digits still yields the correct count — the pre-scrub read);
+denied action → no events; and the emitted shape decodes into a strict mirror of leria's `WireEvent` token path
+(`asset=usd`, `amount=0`, `tokens` split, `dims.model_ref`).

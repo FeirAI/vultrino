@@ -3430,3 +3430,300 @@ async fn test_v13a_meter_observed_retrievable_via_poll_path() {
     let sig = vultrino::outbox::sign_body(secret, &serde_json::to_vec(&body).unwrap());
     assert!(sig.starts_with("sha256="));
 }
+
+// ==================== V13b — token meter.observed (leria pricing input) ========
+//
+// V13b emits a SECOND `meter.observed` event for a non-streamed LLM response that
+// carries a provider usage block: `asset=usd` + a `tokens{input,output}` split +
+// `dims.model_ref`, SAME correlation_id as the V13a `api-calls=1` event. vultrino
+// sends COUNTS, not dollars — leria mints usd from the tokens via its RateCard.
+// The MockPlugin echoes its params as the response body, so a request whose params
+// are an OpenAI/Anthropic-style response drive the raw-body usage parser end-to-end.
+
+/// Collect every `meter.observed` event whose payload is a TOKEN event (asset=usd
+/// + a tokens split) — i.e. the V13b second event, not the V13a api-calls=1 one.
+fn is_token_event(e: &vultrino::outbox::OutboxEvent) -> bool {
+    e.event_type == vultrino::outbox::EVENT_METER_OBSERVED
+        && e.payload["asset"] == "usd"
+        && e.payload.get("tokens").is_some()
+}
+
+/// An /execute whose echoed response body is an OpenAI-style completion carrying a
+/// `usage` block. The MockPlugin echoes params → the response body IS this JSON.
+fn openai_usage_request(credential: &str) -> ExecuteRequest {
+    ExecuteRequest {
+        credential: credential.to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({
+            "id": "cmpl-xyz",
+            "model": "gpt-4o-2024-08-06",
+            "choices": [{"text": "the secret answer"}],
+            "usage": {"prompt_tokens": 1200, "completion_tokens": 345, "total_tokens": 1545}
+        }),
+    }
+}
+
+/// An /execute whose echoed response body is an Anthropic-style message carrying a
+/// `usage` block.
+fn anthropic_usage_request(credential: &str) -> ExecuteRequest {
+    ExecuteRequest {
+        credential: credential.to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({
+            "id": "msg_abc",
+            "model": "claude-opus-4-20260101",
+            "content": [{"type": "text", "text": "the secret answer"}],
+            "usage": {"input_tokens": 5000, "output_tokens": 900}
+        }),
+    }
+}
+
+#[tokio::test]
+async fn test_v13b_openai_usage_emits_token_event_alongside_api_calls() {
+    // Acceptance: a non-streamed response with an OpenAI-style usage block emits a
+    // 2nd meter.observed (asset=usd + tokens{input,output} + dims.model_ref +
+    // correlation_id == the V13a event), in ADDITION to the V13a api-calls=1 event.
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "api-cred", Some("acme")).await;
+    let exec_auth = auth_for_agent(&storage, "agent_llm", Some("acme")).await;
+
+    server
+        .execute_gated(openai_usage_request("api-cred"), exec_auth)
+        .await
+        .unwrap();
+
+    let all = meter_events(&storage).await;
+    // Two meter events for the one call: the V13a api-calls=1 and the V13b token.
+    assert_eq!(all.len(), 2, "one admitted LLM call → V13a + V13b meter events");
+    let api = all
+        .iter()
+        .find(|e| e.payload["asset"] == "api-calls")
+        .expect("the V13a api-calls event");
+    let tok = all
+        .iter()
+        .find(|e| is_token_event(e))
+        .expect("the V13b token event");
+
+    // The token event prices via leria's rate card: asset=usd + a tokens split,
+    // NO amount (leria mints usd from the counts).
+    assert_eq!(tok.payload["asset"], "usd");
+    assert_eq!(tok.payload["tokens"]["input_tokens"], 1200);
+    assert_eq!(tok.payload["tokens"]["output_tokens"], 345);
+    assert!(
+        tok.payload.get("amount").is_none(),
+        "a priced token event must NOT carry an amount (leria rejects ambiguous_amount)"
+    );
+    // The model the provider served selects the rate card.
+    assert_eq!(tok.payload["dims"]["model_ref"], "gpt-4o-2024-08-06");
+    assert_eq!(tok.payload["cost_source"], "gateway-observed");
+    assert_eq!(tok.payload["confidence"], "low");
+    // dims carry the same tenant + credential as the V13a event.
+    assert_eq!(tok.payload["dims"]["tenant"], "acme");
+    assert_eq!(tok.payload["dims"]["credential"], "api-cred");
+
+    // SAME correlation_id (and event_id) as the V13a event: leria threads both
+    // observations onto the same occurrence.
+    assert_eq!(
+        tok.payload["correlation_id"], api.payload["correlation_id"],
+        "the token event shares the V13a correlation_id (same call)"
+    );
+    assert_eq!(tok.payload["event_id"], api.payload["event_id"]);
+    assert_eq!(tok.payload["principal"], api.payload["principal"]);
+}
+
+#[tokio::test]
+async fn test_v13b_anthropic_usage_parsed() {
+    // Acceptance: an Anthropic-style usage block (input_tokens/output_tokens) is
+    // parsed too, producing the same priced shape.
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "api-cred", None).await;
+    let exec_auth = auth_for_agent(&storage, "agent_llm", None).await;
+
+    server
+        .execute_gated(anthropic_usage_request("api-cred"), exec_auth)
+        .await
+        .unwrap();
+
+    let tok = meter_events(&storage)
+        .await
+        .into_iter()
+        .find(is_token_event)
+        .expect("the V13b token event from an Anthropic usage block");
+    assert_eq!(tok.payload["asset"], "usd");
+    assert_eq!(tok.payload["tokens"]["input_tokens"], 5000);
+    assert_eq!(tok.payload["tokens"]["output_tokens"], 900);
+    assert_eq!(tok.payload["dims"]["model_ref"], "claude-opus-4-20260101");
+}
+
+#[tokio::test]
+async fn test_v13b_no_usage_block_emits_only_api_calls() {
+    // Acceptance: a response with NO usage block (a streamed response without a
+    // usage trailer, or a non-LLM action — the echo_request body is {"hello":...})
+    // emits ONLY the V13a api-calls=1 event, no token event. This is the stated
+    // non-streaming-only v1 limitation.
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "api-cred", None).await;
+    let exec_auth = auth_for_agent(&storage, "agent_plain", None).await;
+
+    server
+        .execute_gated(echo_request("api-cred"), exec_auth)
+        .await
+        .unwrap();
+
+    let all = meter_events(&storage).await;
+    assert_eq!(all.len(), 1, "no usage block → only the V13a api-calls event");
+    assert_eq!(all[0].payload["asset"], "api-calls");
+    assert!(
+        !all.iter().any(is_token_event),
+        "no token event when there is no parseable usage block"
+    );
+}
+
+#[tokio::test]
+async fn test_v13b_token_read_is_from_raw_body_before_egress_redaction() {
+    // Acceptance: the token count is read from the RAW body BEFORE scrub_response —
+    // a response that egress WOULD redact still yields the CORRECT count (no
+    // under-count, the dangerous direction). We configure an egress redact rule
+    // that would rewrite the usage numbers in the agent-visible body; the meter
+    // event must still carry the original counts (proving the pre-scrub read).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let mut config = Config::default();
+    config.approval.enabled = true;
+    config.approval.ttl_secs = 3600;
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    // An egress redact rule that rewrites any run of digits in the body — this
+    // would corrupt the usage counts if the meter read happened post-scrub. Built
+    // through the real config parse path (compiles glob + regex) so the test uses
+    // the same compiled `EgressRule` production does.
+    config.egress = Config::parse(
+        "[[egress]]\ncredential_pattern = \"*\"\naction_pattern = \"*\"\nredact_patterns = [\"\\\\d+\"]\n",
+    )
+    .expect("egress rule parses")
+    .egress;
+
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    server.plugins().register(Arc::new(MockPlugin));
+
+    store_tenanted_credential(&storage, "api-cred", None).await;
+    let exec_auth = auth_for_agent(&storage, "agent_llm", None).await;
+
+    let outcome = server
+        .execute_gated(openai_usage_request("api-cred"), exec_auth)
+        .await
+        .unwrap();
+    let resp = match outcome {
+        ExecutionOutcome::Completed(r) => r,
+        other => panic!("expected Completed, got {other:?}"),
+    };
+    // Sanity: the agent-visible body WAS redacted (the digits are gone), so a
+    // post-scrub read would have under-counted.
+    let agent_body = String::from_utf8_lossy(&resp.body);
+    assert!(
+        agent_body.contains("[REDACTED:egress]"),
+        "the egress rule must have redacted the agent-visible body: {agent_body}"
+    );
+    assert!(!agent_body.contains("1200"), "the original count is redacted from the agent body");
+
+    // The meter event nonetheless carries the CORRECT pre-scrub counts.
+    let tok = meter_events(&storage)
+        .await
+        .into_iter()
+        .find(is_token_event)
+        .expect("the V13b token event");
+    assert_eq!(
+        tok.payload["tokens"]["input_tokens"], 1200,
+        "the token count is read pre-scrub (no under-count from egress redaction)"
+    );
+    assert_eq!(tok.payload["tokens"]["output_tokens"], 345);
+    assert_eq!(tok.payload["dims"]["model_ref"], "gpt-4o-2024-08-06");
+}
+
+#[tokio::test]
+async fn test_v13b_denied_action_emits_no_token_event() {
+    // A denied action emits neither the V13a nor the V13b event (the emit is on
+    // the post-admission path a denial never reaches).
+    let (server, storage) = setup_deny_mode(vec![]).await;
+    store_credential(&storage, "api-cred", false).await;
+
+    let err = server
+        .execute_gated(openai_usage_request("api-cred"), ExecAuth::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)));
+
+    assert!(
+        meter_events(&storage).await.is_empty(),
+        "denied → no meter events at all (neither api-calls nor tokens)"
+    );
+}
+
+#[tokio::test]
+async fn test_v13b_token_event_decodes_into_leria_wire_shape() {
+    // Acceptance: the emitted shape decodes into leria's WireEvent (the tokens
+    // pricing path). We model leria's strict (DisallowUnknownFields) decoder with a
+    // mirror struct: asset=usd, a tokens{input,output} split, NO amount, model_ref
+    // in dims, correlation_id present. A surplus/renamed key would fail this decode
+    // exactly as leria's ingest would 400.
+    let (server, storage) = setup().await;
+    store_tenanted_credential(&storage, "api-cred", Some("acme")).await;
+    let exec_auth = auth_for_agent(&storage, "agent_llm", Some("acme")).await;
+
+    server
+        .execute_gated(openai_usage_request("api-cred"), exec_auth)
+        .await
+        .unwrap();
+
+    let tok = meter_events(&storage)
+        .await
+        .into_iter()
+        .find(is_token_event)
+        .expect("the V13b token event");
+
+    // Mirror of leria's WireEvent token path (internal/ingest/pipeline.go):
+    // tokens != nil + asset=usd ⇒ rate-card pricing; dims.model_ref selects the
+    // card; amount must be zero (omitted) for a priced token event.
+    #[derive(serde::Deserialize)]
+    struct WireTokenSplit {
+        input_tokens: i64,
+        output_tokens: i64,
+    }
+    #[derive(serde::Deserialize)]
+    struct WireEventMirror {
+        event_id: String,
+        correlation_id: String,
+        #[allow(dead_code)]
+        principal: String,
+        asset: String,
+        #[serde(default)]
+        amount: i64,
+        tokens: WireTokenSplit,
+        cost_source: String,
+        #[allow(dead_code)]
+        confidence: String,
+        #[allow(dead_code)]
+        occurred_at: String,
+        dims: std::collections::HashMap<String, String>,
+    }
+
+    let wire: WireEventMirror = serde_json::from_value(tok.payload.clone())
+        .expect("token payload decodes into leria's WireEvent token path");
+    assert_eq!(wire.asset, "usd", "leria prices tokens only when asset=usd");
+    assert_eq!(wire.amount, 0, "a priced token event leaves amount zero (omitted)");
+    assert_eq!(wire.tokens.input_tokens, 1200);
+    assert_eq!(wire.tokens.output_tokens, 345);
+    assert_eq!(wire.cost_source, "gateway-observed");
+    assert!(!wire.event_id.is_empty());
+    assert!(!wire.correlation_id.is_empty());
+    assert_eq!(
+        wire.dims.get("model_ref").map(String::as_str),
+        Some("gpt-4o-2024-08-06"),
+        "dims.model_ref selects leria's rate card"
+    );
+}
