@@ -50,6 +50,15 @@
 - [Admin API](./api/admin.md)
 - [MCP Tools](./api/mcp-tools.md)
 
+# Developer Reference
+
+> Implementation-accurate reference (verified against the shipped code) in
+> [`docs/dev/`](../dev/README.md): [Architecture](../dev/ARCHITECTURE.md),
+> [Build & Run](../dev/QUICKSTART.md), [Configuration](../dev/CONFIGURATION.md),
+> [HTTP API & Wire](../dev/API.md), [Usage Metering](../dev/METERING.md),
+> [Security Model](../dev/SECURITY.md), [Integration](../dev/INTEGRATION.md),
+> [Testing](../dev/TESTING.md), and [Limitations](../dev/LIMITATIONS.md).
+
 # LLM Reference
 
 - [Quick Reference](./llm/index.md)

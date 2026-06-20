@@ -535,6 +535,12 @@ Full documentation available in the `docs/` directory:
 - [Plugin Development](docs/src/plugins/)
 - [Deployment Guide](docs/src/deployment/)
 
+For an **implementation-accurate developer reference** — build/run commands, the
+full config/env reference, the exact HTTP wire shapes for `vultrino web`, the
+security model, the usage-metering emit, and the honest v1 limits — see
+**[`docs/dev/`](docs/dev/README.md)**. (Where the dev set and the guides differ,
+the dev set describes what the shipped code does today.)
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
