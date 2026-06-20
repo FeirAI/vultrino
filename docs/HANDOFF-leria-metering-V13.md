@@ -98,9 +98,27 @@ assigned under the lock, gap-free. So leria polls them gap-free by sequence (ver
 `test_v13a_meter_observed_retrievable_via_poll_path`). The poll path returns the same `delivery_body` +
 `Govder-Signature` envelope a push delivery carries, so leria verifies a replayed event exactly like a pushed one.
 
-**Latency floor leria must model:** push delivery cadence `OUTBOX_DELIVERY_SECS = 5` plus the poll interval. The
-fail-open `emit_event` means a dropped meter event is **silent** → leria needs the monotonic-`sequence` gap detector
-on its poll feed (leria-side work, called out in the integration handoff).
+**Latency floor leria must model:** push delivery cadence `OUTBOX_DELIVERY_SECS = 5` plus the poll interval.
+
+**Meter-loss control — be precise (the gap detector does NOT cover everything).** The fail-open `emit_event`
+(`src/server/mod.rs:1257`) swallows an `append_event` failure, so a dropped meter event is **silent**. There are two
+distinct loss modes and they need **different** controls:
+
+- **Lost-in-transit delivery → leria's sequence-gap detector catches it.** A minted event whose *delivery* is lost
+  leaves a hole in the gap-free replayed sequence; leria detects the hole and raises a stale signal.
+- **Swallowed `append_event` → the gap detector CANNOT see it.** The monotonic sequence is minted **inside**
+  `append_event` → `push_event` (`src/storage/file.rs`), i.e. **only on success**. A swallowed append mints **no**
+  sequence, so the stored stream stays **contiguous** — there is no hole to detect. Sequence-gap detection is
+  therefore **not** the compensation for a swallowed append. (An earlier draft of this handoff implied it was; that
+  was an overclaim, corrected here and in leria's `vultrino-integration-handoff.md` / `06-integration-architecture.md`.)
+
+The swallowed-append / sustained-outage case is mitigated **leria-side** by **`on_meter_stale=deny`
+stale-detection** (now the author-time DEFAULT for leria's real-time soft `usd`/`tokens` budgets): vultrino keeps
+admitting actions while leria's meter watermark freezes → leria signals a **precautionary Deny**. An **occasional**
+drop is reconciled later by the authoritative source (invoice / `period_complete`). None of this makes the fail-open
+emit "closed": an out-of-band meter permits a **bounded overshoot** that an outage widens — only `hard`-ceiling mode
+(in-path tokens, **v1-deferred** on the leria side) is zero-overshoot. The fail-open emit stays correct for
+`/execute` availability; leria **mitigates**, it does not eliminate the bounded window.
 
 **Contract note (leria ingest):** vultrino emits the dedup key as **`event_id`** (= the `/execute` `request_id`),
 matching leria's canonical MeterEvent wire field (`WireEvent.event_id`, deduped `(authenticated_source_id,
