@@ -310,8 +310,13 @@ pub fn meter_tokens_payload(
             serde_json::Value::String(m.to_string()),
         );
     }
+    // DISTINCT dedup key from the V13a api-calls event (which uses request_id as its
+    // event_id). The two events share the same OCCURRENCE via correlation_id, but a
+    // colliding event_id carrying a DIFFERENT resolved amount would be classified a
+    // dup-mismatch (disputed) and dropped by leria's namespaced dedup. Suffix it.
+    let token_event_id = format!("{request_id}:tokens");
     serde_json::json!({
-        "event_id": request_id,
+        "event_id": token_event_id,
         "correlation_id": request_id,
         "principal": principal,
         // asset=usd + a tokens split ⇒ leria prices via the rate card; NO amount
@@ -536,7 +541,9 @@ mod tests {
     fn test_meter_tokens_payload_shape_is_what_leria_prices() {
         // V13b: the token meter event is the shape leria PRICES — asset=usd + a
         // tokens{input,output} split + dims.model_ref, NO amount (leria mints usd
-        // from the tokens via the rate card), same event_id/correlation_id as V13a.
+        // from the tokens via the rate card). SAME correlation_id as V13a (the
+        // occurrence handle), but a DISTINCT event_id (request_id + ":tokens") so it
+        // is not a dup-mismatch of the api-calls=1 event under leria's dedup.
         let ts = "2026-06-19T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let p = super::meter_tokens_payload(
             "req-123",
@@ -547,7 +554,7 @@ mod tests {
             Some("gpt-4o"),
             super::TokenUsage { input_tokens: 120, output_tokens: 34 },
         );
-        assert_eq!(p["event_id"], "req-123");
+        assert_eq!(p["event_id"], "req-123:tokens", "distinct dedup key from the api-calls event");
         assert_eq!(p["correlation_id"], "req-123", "same correlation_id as the V13a event");
         assert_eq!(p["principal"], "agent_refund_bot_v3");
         // The pricing trigger: asset=usd + a tokens split (NOT asset=tokens).

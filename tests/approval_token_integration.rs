@@ -3521,13 +3521,21 @@ async fn test_v13b_openai_usage_emits_token_event_alongside_api_calls() {
     assert_eq!(tok.payload["dims"]["tenant"], "acme");
     assert_eq!(tok.payload["dims"]["credential"], "api-cred");
 
-    // SAME correlation_id (and event_id) as the V13a event: leria threads both
-    // observations onto the same occurrence.
+    // SAME correlation_id (the occurrence handle threads both observations onto the
+    // same call) but a DISTINCT event_id: the token event's dedup key is the request
+    // id + ":tokens", so leria does NOT classify it as a dup-mismatch of the
+    // api-calls=1 event (which uses the bare request id as its event_id, with a
+    // different resolved amount).
     assert_eq!(
         tok.payload["correlation_id"], api.payload["correlation_id"],
         "the token event shares the V13a correlation_id (same call)"
     );
-    assert_eq!(tok.payload["event_id"], api.payload["event_id"]);
+    let api_eid = api.payload["event_id"].as_str().unwrap();
+    assert_eq!(tok.payload["event_id"], format!("{api_eid}:tokens"));
+    assert_ne!(
+        tok.payload["event_id"], api.payload["event_id"],
+        "the token event has a DISTINCT dedup key from the api-calls event"
+    );
     assert_eq!(tok.payload["principal"], api.payload["principal"]);
 }
 

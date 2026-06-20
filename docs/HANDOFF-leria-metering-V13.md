@@ -161,8 +161,11 @@ So vultrino emits the token event as (`crate::outbox::meter_tokens_payload`):
 - `tokens = { input_tokens, output_tokens }` as **integers** (the counts; vultrino sends counts, NOT dollars),
 - **no `amount`** key (a priced token event must not carry one; leria mints it),
 - `dims.model_ref = <model>` (selects the rate card),
-- the **same** `event_id` + `correlation_id` (the `/execute` `request_id`) as the V13a event, so leria threads both
-  observations onto the same occurrence,
+- the **same** `correlation_id` (the `/execute` `request_id`) as the V13a event — the occurrence handle that threads
+  both observations onto the same call — but a **DISTINCT** `event_id` of `<request_id>:tokens`. The two events share
+  the credential (so the same dedup `source_id`); a colliding `event_id` carrying a different resolved amount (the
+  V13a event is `amount=1`, the token event is priced usd) would be classified a **dup-mismatch (disputed)** by
+  leria's namespaced `(source_id, event_id)` dedup and **dropped** — so the token event MUST use a distinct `event_id`,
 - `cost_source = "gateway-observed"`, `confidence = "low"`, `dims.tenant` (V11) + `dims.credential`,
 - **no `currency`** (usd is leria's single-base default; a non-usd value is rejected).
 
