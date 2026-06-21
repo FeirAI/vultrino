@@ -628,6 +628,9 @@ pub enum RawPolicyCondition {
     MethodMatch {
         method_match: Vec<String>,
     },
+    ActionMatch {
+        action_match: String,
+    },
     RateLimit {
         rate_limit: RawRateLimit,
     },
@@ -662,6 +665,9 @@ impl TryFrom<RawPolicyCondition> for PolicyCondition {
             RawPolicyCondition::UrlMatch { url_match } => Ok(PolicyCondition::UrlMatch(url_match)),
             RawPolicyCondition::MethodMatch { method_match } => {
                 Ok(PolicyCondition::MethodMatch(method_match))
+            }
+            RawPolicyCondition::ActionMatch { action_match } => {
+                Ok(PolicyCondition::ActionMatch(action_match))
             }
             RawPolicyCondition::RateLimit { rate_limit } => Ok(PolicyCondition::RateLimit {
                 max: rate_limit.max,

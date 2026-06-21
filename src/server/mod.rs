@@ -497,6 +497,8 @@ impl VultrinoServer {
             credential_alias: &credential.alias,
             url,
             method,
+            // The business action label (V8) for the connector ActionMatch dimension.
+            action: Some(request.action.as_str()),
             principal: principal.as_ref(),
             spend: spend.as_ref(),
         };
@@ -1038,6 +1040,10 @@ impl VultrinoServer {
                 credential_alias: &credential.alias,
                 url,
                 method,
+                // Re-bind the approved action so an ActionMatch rule re-fires
+                // correctly on resume (the approved action matches its own rule; a
+                // Deny pushed mid-flight still blocks).
+                action: Some(approval.action.as_str()),
                 principal: principal.as_ref(),
                 spend: None,
             })
@@ -1411,6 +1417,10 @@ impl VultrinoServer {
             credential_alias: &credential.alias,
             url,
             method,
+            // The cap's own action label, so its ActionMatch rule matches and the
+            // granted cap remains listable (without it the connector dimension would
+            // hide every granted capability at tools/list).
+            action: Some(capability.action.as_str()),
             principal: principal.as_ref(),
             spend: None,
         });

@@ -52,6 +52,15 @@ pub enum PolicyCondition {
     /// Match HTTP methods
     MethodMatch(Vec<String>),
 
+    /// Match the request's business ACTION label (V8) against a glob. The govder
+    /// connector compiler AND-clamps this onto each per-capability rule so the
+    /// GRANTED action is enforced in-path — not merely via the use-token's
+    /// (collapsible) action_scope. A request whose action does not match (e.g. an
+    /// ungranted action issued against a granted URL/method envelope, or the
+    /// generic `http.request` against a `web.read` grant) fails this condition and
+    /// falls through to default-deny.
+    ActionMatch(String),
+
     /// Allow only during specific time window
     TimeWindow {
         start: NaiveTime,

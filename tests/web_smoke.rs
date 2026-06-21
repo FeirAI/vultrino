@@ -1441,7 +1441,7 @@ async fn test_admin_deny_does_not_flicker_under_periodic_refresh() {
     let eval = || EvalInput {
         credential_alias: "api-cred",
         url: Some("http://example.com/x"),
-        method: Some("GET"),
+        method: Some("GET"), action: None,
         principal: Some(&principal),
         spend: None,
     };

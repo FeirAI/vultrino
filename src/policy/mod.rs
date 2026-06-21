@@ -83,6 +83,9 @@ pub struct EvalInput<'a> {
     pub credential_alias: &'a str,
     pub url: Option<&'a str>,
     pub method: Option<&'a str>,
+    /// The request's business ACTION label (V8), for `ActionMatch` (the connector
+    /// action-binding dimension). None on paths that do not carry an action.
+    pub action: Option<&'a str>,
     /// Resolved principal, for `principal_pattern` matching (V4).
     pub principal: Option<&'a Principal>,
     /// Extracted spend attempt, for `SpendCap` evaluation (V3).
@@ -190,6 +193,7 @@ impl PolicyEngine {
             credential_alias,
             url,
             method,
+            action: None, // legacy 4-arg path carries no action (connector path uses *_full)
             principal: principal.as_ref(),
             spend: None,
         };
@@ -254,7 +258,7 @@ impl PolicyEngine {
         url: Option<&str>,
         method: Option<&str>,
     ) -> PolicyDecision {
-        let input = EvalInput { credential_alias, url, method, principal: None, spend: None };
+        let input = EvalInput { credential_alias, url, method, action: None, principal: None, spend: None };
         self.evaluate_inner(&input, false)
     }
 
@@ -358,6 +362,14 @@ impl PolicyEngine {
             PolicyCondition::MethodMatch(methods) => input
                 .method
                 .map(|m| methods.iter().any(|x| x.eq_ignore_ascii_case(m)))
+                .unwrap_or(false),
+
+            PolicyCondition::ActionMatch(pattern) => input
+                .action
+                .map(|a| match glob::Pattern::new(pattern) {
+                    Ok(p) => p.matches(a),
+                    Err(_) => pattern == a, // malformed glob -> exact-match fallback
+                })
                 .unwrap_or(false),
 
             PolicyCondition::TimeWindow { start, end } => {
@@ -668,7 +680,7 @@ mod tests {
         let input = EvalInput {
             credential_alias: "c",
             url: None,
-            method: None,
+            method: None, action: None,
             principal: None,
             spend: None,
         };
@@ -735,7 +747,7 @@ mod tests {
         let decision = engine.evaluate_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
-            method: Some("GET"),
+            method: Some("GET"), action: None,
             principal: Some(&halted),
             spend: None,
         });
@@ -749,7 +761,7 @@ mod tests {
         let decision = engine.evaluate_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
-            method: Some("GET"),
+            method: Some("GET"), action: None,
             principal: Some(&other),
             spend: None,
         });
@@ -759,7 +771,7 @@ mod tests {
         let resume = engine.evaluate_readonly_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
-            method: Some("GET"),
+            method: Some("GET"), action: None,
             principal: Some(&halted),
             spend: None,
         });
@@ -784,7 +796,7 @@ mod tests {
         let input = EvalInput {
             credential_alias: "any",
             url: None,
-            method: None,
+            method: None, action: None,
             principal: Some(&p),
             spend: None,
         };
@@ -805,11 +817,11 @@ mod tests {
             owner: None,
             workload_id: Some("spiffe://example.org/ns/prod/sa/agent".to_string()),
         };
-        let input = EvalInput { credential_alias: "any", url: None, method: None, principal: Some(&with_svid), spend: None };
+        let input = EvalInput { credential_alias: "any", url: None, method: None, action: None, principal: Some(&with_svid), spend: None };
         assert!(matches!(engine.evaluate_full(&input), PolicyDecision::Deny(_)), "policy targets the resolved SVID");
         // The same credential WITHOUT presenting the SVID is not caught by the SVID policy.
         let without = Principal { id: "vk_keyX".to_string(), agent_label: None, owner: None, workload_id: None };
-        let input2 = EvalInput { credential_alias: "any", url: None, method: None, principal: Some(&without), spend: None };
+        let input2 = EvalInput { credential_alias: "any", url: None, method: None, action: None, principal: Some(&without), spend: None };
         assert_eq!(engine.evaluate_full(&input2), PolicyDecision::Allow);
     }
 
@@ -962,7 +974,7 @@ mod tests {
     // ==================== V4: principal dimension ====================
 
     fn input_spend<'a>(alias: &'a str, spend: &'a SpendAttempt) -> EvalInput<'a> {
-        EvalInput { credential_alias: alias, url: None, method: None, principal: None, spend: Some(spend) }
+        EvalInput { credential_alias: alias, url: None, method: None, action: None, principal: None, spend: Some(spend) }
     }
 
     fn spend_policy(asset: &str, per_action_max: u64) -> Policy {
@@ -983,9 +995,9 @@ mod tests {
 
         let bot = Principal { id: "tok1".to_string(), agent_label: Some("refund-bot".to_string()), owner: None, workload_id: None };
         let other = Principal { id: "tok2".to_string(), agent_label: Some("other-bot".to_string()), owner: None, workload_id: None };
-        let bot_in = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&bot), spend: None };
-        let other_in = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: Some(&other), spend: None };
-        let none_in = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: None, spend: None };
+        let bot_in = EvalInput { credential_alias: "pay-1", url: None, method: None, action: None, principal: Some(&bot), spend: None };
+        let other_in = EvalInput { credential_alias: "pay-1", url: None, method: None, action: None, principal: Some(&other), spend: None };
+        let none_in = EvalInput { credential_alias: "pay-1", url: None, method: None, action: None, principal: None, spend: None };
         // refund-bot is denied; other agents and principal-less requests are not.
         assert!(matches!(engine.evaluate_full(&bot_in), PolicyDecision::Deny(_)));
         assert_eq!(engine.evaluate_full(&other_in), PolicyDecision::Allow);
@@ -1021,7 +1033,7 @@ mod tests {
         engine.add_policy(Policy::deny_all("kill-by-id", "*").with_principal("tok-*"));
         let p = Principal { id: "tok-abc".to_string(), agent_label: None, owner: None, workload_id: None };
         assert!(matches!(
-            engine.evaluate_full(&EvalInput { credential_alias: "any", url: None, method: None, principal: Some(&p), spend: None }),
+            engine.evaluate_full(&EvalInput { credential_alias: "any", url: None, method: None, action: None, principal: Some(&p), spend: None }),
             PolicyDecision::Deny(_)
         ));
     }
@@ -1043,7 +1055,7 @@ mod tests {
         let engine = PolicyEngine::new();
         engine.add_policy(spend_policy("usd", 100));
         // No spend attempt extracted → SpendCap false → default Deny.
-        let no_spend = EvalInput { credential_alias: "pay-1", url: None, method: None, principal: None, spend: None };
+        let no_spend = EvalInput { credential_alias: "pay-1", url: None, method: None, action: None, principal: None, spend: None };
         assert!(matches!(engine.evaluate_full(&no_spend), PolicyDecision::Deny(_)));
         // Wrong asset also doesn't satisfy the cap → deny.
         let eur = SpendAttempt { asset: "eur".to_string(), amount: 1 };

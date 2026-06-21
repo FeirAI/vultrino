@@ -1592,7 +1592,7 @@ mod tests {
         let decision = engine.evaluate_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
-            method: Some("GET"),
+            method: Some("GET"), action: None,
             principal: Some(&halted),
             spend: None,
         });
@@ -1612,7 +1612,7 @@ mod tests {
         let decision = engine.evaluate_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
-            method: Some("GET"),
+            method: Some("GET"), action: None,
             principal: Some(&other),
             spend: None,
         });

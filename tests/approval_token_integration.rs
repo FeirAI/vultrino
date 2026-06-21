@@ -2326,7 +2326,7 @@ async fn test_v6_kill_policy_survives_cross_process_refresh() {
     let decision = engine.evaluate_full(&EvalInput {
         credential_alias: "anything",
         url: None,
-        method: None,
+        method: None, action: None,
         principal: Some(&halted),
         spend: None,
     });
