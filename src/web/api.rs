@@ -20,6 +20,7 @@ use super::server::AppState;
 
 use crate::auth::ApiKey;
 use crate::auth::{Role, ROLE_ADMIN, ROLE_EXECUTOR, ROLE_READ_ONLY};
+use crate::capability::{Capability, CapabilityMetadata, CapabilityTarget};
 use crate::policy::{Policy, PolicyAction, PolicyRule};
 use crate::storage::IdempotencyState;
 use crate::{Credential, CredentialData, CredentialMetadata};
@@ -834,6 +835,175 @@ pub async fn api_delete_policy(
         Err(crate::storage::StorageError::PolicyNotFound(_)) => {
             error_response(StatusCode::NOT_FOUND, "policy_not_found", format!("No stored policy with id '{}'", id))
         }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
+}
+
+// -------- Capabilities (named MCP tools) --------
+
+/// Body for creating/replacing a capability. On `POST` the id is server-generated
+/// (create); on `PUT` the path id is used (create-or-replace). Mirrors the policy
+/// admin handlers (Admin-gated, Idempotency-Key honored).
+#[derive(Serialize, Deserialize)]
+pub struct CapabilityUpsertRequest {
+    /// The MCP tool name the LLM sees (e.g. `send_email`).
+    pub tool_name: String,
+    /// Description shown to the LLM in tools/list.
+    #[serde(default)]
+    pub description: String,
+    /// The action this capability performs: a canonical `plugin.action` or a
+    /// govder action label (V8).
+    pub action: String,
+    /// The vultrino plugin backing the action (informational).
+    #[serde(default)]
+    pub plugin: Option<String>,
+    /// Target scope (url glob + methods, or fixed plugin params).
+    #[serde(default)]
+    pub target: CapabilityTarget,
+    /// The vault credential alias this capability injects.
+    pub credential_ref: String,
+    /// JSON Schema the LLM fills (the action's own args; `api_key` is added
+    /// dynamically at tools/list time).
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    /// When set, marks this as an LLM-proxy capability (backs `POST /llm` rather
+    /// than appearing as a named MCP tool). Carries the provider base URL.
+    #[serde(default)]
+    pub llm: Option<crate::capability::LlmProxy>,
+}
+
+/// Build a validated `Capability` from a request, forcing the id on PUT or
+/// generating a fresh one on POST.
+fn build_capability(req: CapabilityUpsertRequest, forced_id: Option<String>) -> Result<Capability, String> {
+    let capability = Capability {
+        id: forced_id.unwrap_or_else(|| format!("cap-{}", uuid::Uuid::new_v4())),
+        tool_name: req.tool_name.trim().to_string(),
+        description: req.description,
+        action: req.action.trim().to_string(),
+        plugin: req.plugin.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        target: req.target,
+        credential_ref: req.credential_ref.trim().to_string(),
+        input_schema: req.input_schema,
+        llm: req.llm,
+    };
+    capability.validate()?;
+    Ok(capability)
+}
+
+/// Persist a capability, emit an event, and return the canonical metadata.
+async fn store_capability_and_emit(
+    state: &AppState,
+    capability: &Capability,
+    created: bool,
+) -> (StatusCode, serde_json::Value) {
+    if let Err(e) = state.storage.store_capability(capability).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"code": "storage_error", "error": e.to_string()}),
+        );
+    }
+    // Observable capability-change event on the signed outbox, so govder/feir see
+    // the connector catalog mutate (mirrors the policy-change emit).
+    state
+        .server
+        .emit_event(
+            &capability.id,
+            crate::outbox::EVENT_CAPABILITY_CHANGED,
+            serde_json::json!({
+                "capability_id": capability.id,
+                "tool_name": capability.tool_name,
+                "action": capability.action,
+                "credential_ref": capability.credential_ref,
+                "change": if created { "created" } else { "replaced" },
+            }),
+        )
+        .await;
+    let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+    (status, serde_json::to_value(CapabilityMetadata::from(capability)).unwrap_or_default())
+}
+
+/// `POST /api/v1/capabilities` — create a capability (id generated).
+pub async fn api_create_capability(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CapabilityUpsertRequest>,
+) -> Response {
+    let key = extract_idempotency_key(&headers);
+    let body_hash = idempotency_body_hash(&req);
+    let st = state.clone();
+    idempotent(&state, key, body_hash, move || async move {
+        match build_capability(req, None) {
+            Ok(capability) => store_capability_and_emit(&st, &capability, true).await,
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"code": "invalid_capability", "error": e}),
+            ),
+        }
+    })
+    .await
+}
+
+/// `PUT /api/v1/capabilities/{id}` — create or replace the capability with this id.
+pub async fn api_put_capability(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CapabilityUpsertRequest>,
+) -> Response {
+    let key = extract_idempotency_key(&headers);
+    // Bind the hash to the path id (same as policies) so the same body PUT to a
+    // different id under one Idempotency-Key isn't replayed as the first.
+    let body_hash = idempotency_body_hash(&(id.as_str(), &req));
+    let st = state.clone();
+    idempotent(&state, key, body_hash, move || async move {
+        match build_capability(req, Some(id)) {
+            Ok(capability) => store_capability_and_emit(&st, &capability, false).await,
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"code": "invalid_capability", "error": e}),
+            ),
+        }
+    })
+    .await
+}
+
+/// `GET /api/v1/capabilities` — list all stored capabilities (metadata; no secret).
+pub async fn api_list_capabilities(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+    match state.storage.list_capabilities().await {
+        Ok(mut caps) => {
+            caps.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+            let metadata: Vec<CapabilityMetadata> = caps.iter().map(CapabilityMetadata::from).collect();
+            (StatusCode::OK, Json(serde_json::json!({ "capabilities": metadata }))).into_response()
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
+}
+
+/// `DELETE /api/v1/capabilities/{id}` — remove a stored capability.
+pub async fn api_delete_capability(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.storage.delete_capability(&id).await {
+        Ok(()) => {
+            state
+                .server
+                .emit_event(
+                    &id,
+                    crate::outbox::EVENT_CAPABILITY_CHANGED,
+                    serde_json::json!({ "capability_id": id, "change": "deleted" }),
+                )
+                .await;
+            (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response()
+        }
+        Err(crate::storage::StorageError::CapabilityNotFound(_)) => error_response(
+            StatusCode::NOT_FOUND,
+            "capability_not_found",
+            format!("No stored capability with id '{}'", id),
+        ),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
     }
 }

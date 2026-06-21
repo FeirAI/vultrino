@@ -908,7 +908,7 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
         std::time::Duration::from_secs(vultrino::server::OUTBOX_DELIVERY_SECS),
     ));
 
-    let vultrino = Arc::new(RwLock::new(server));
+    let vultrino = Arc::new(server);
     let mut mcp = McpServer::new(vultrino, auth_manager);
 
     mcp.run_stdio().await?;

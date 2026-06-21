@@ -19,6 +19,8 @@ use crate::config::ServerMode;
 
 use super::api;
 use super::auth::{AdminAuth, LoginRateLimiter};
+use super::llm_proxy;
+use super::mcp_http;
 use super::routes;
 
 /// Web server configuration
@@ -177,6 +179,15 @@ impl WebServer {
                 "/api/v1/policies/{id}",
                 put(api::api_put_policy).delete(api::api_delete_policy),
             )
+            // Capabilities (named MCP tools) — connector M1 admin surface.
+            .route(
+                "/api/v1/capabilities",
+                get(api::api_list_capabilities).post(api::api_create_capability),
+            )
+            .route(
+                "/api/v1/capabilities/{id}",
+                put(api::api_put_capability).delete(api::api_delete_capability),
+            )
             .route("/api/v1/tokens", post(api::api_create_token))
             .route("/api/v1/tokens/{id}/revoke", post(api::api_revoke_token))
             .route("/api/v1/roles", post(api::api_create_role))
@@ -193,6 +204,18 @@ impl WebServer {
             .route("/api/v1/events", get(api::api_list_events))
             .route("/api/v1/events/dead", get(api::api_list_dead_letters))
             .route("/api/v1/events/{sequence}/replay", post(api::api_replay_dead_letter))
+            // Networked MCP transport (connector M1): a remote agent harness
+            // reaches vultrino's MCP over JSON-RPC here, authed + scoped by a
+            // Bearer use-token (vut_) / one-time secret. vultrino holds the
+            // secrets and is network-isolated from the agent.
+            .route("/mcp", post(mcp_http::mcp_jsonrpc))
+            // Metered LLM proxy (connector M1, decision 5): a harness points its
+            // model `base_url` here; the request is forwarded to the provider with
+            // the vault model key injected and token spend metered (V13). The
+            // catch-all path captures the OpenAI route the client appends (e.g.
+            // `/v1/chat/completions`); a bare `/llm` POST is also accepted.
+            .route("/llm", post(llm_proxy::llm_proxy_root))
+            .route("/llm/{*path}", post(llm_proxy::llm_proxy))
             // Static files
             .nest_service("/static", static_dir);
 

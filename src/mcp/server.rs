@@ -42,8 +42,12 @@ impl McpPrincipal {
 
 /// MCP Server for Vultrino
 pub struct McpServer {
-    /// Vultrino server instance
-    vultrino: Arc<RwLock<VultrinoServer>>,
+    /// Vultrino server instance. Held as a bare `Arc` (not behind a `RwLock`):
+    /// every MCP method only ever *reads* the server — the engine mutates its own
+    /// interior state behind its internal locks — so the transport never needs a
+    /// write lock. This lets the networked HTTP transport drive the SAME handler
+    /// off the web process's shared `Arc<VultrinoServer>` (see `web::mcp_http`).
+    vultrino: Arc<VultrinoServer>,
     /// Whether initialized
     initialized: bool,
     /// Auth manager for validating API keys (required)
@@ -52,7 +56,7 @@ pub struct McpServer {
 
 impl McpServer {
     /// Create a new MCP server with auth manager (required)
-    pub fn new(vultrino: Arc<RwLock<VultrinoServer>>, auth_manager: Arc<RwLock<AuthManager>>) -> Self {
+    pub fn new(vultrino: Arc<VultrinoServer>, auth_manager: Arc<RwLock<AuthManager>>) -> Self {
         Self {
             vultrino,
             initialized: false,
@@ -95,7 +99,7 @@ impl McpServer {
         if UseToken::looks_like_token(secret) {
             // Use tokens live in storage; reload so a token minted by the web UI
             // or CLI after this server started is visible.
-            let vultrino = self.vultrino.read().await;
+            let vultrino = &self.vultrino;
             let _ = vultrino.storage().reload().await;
             let token = vultrino
                 .storage()
@@ -103,7 +107,6 @@ impl McpServer {
                 .await
                 .map_err(|e| format!("Storage error: {}", e))?
                 .ok_or_else(|| "Invalid use token".to_string())?;
-            drop(vultrino);
 
             token
                 .check_usable()
@@ -127,7 +130,7 @@ impl McpServer {
     /// approved action runs. A *revoked* token is still rejected.
     async fn resolve_principal_for_read(&self, secret: &str) -> Result<McpPrincipal, String> {
         if UseToken::looks_like_token(secret) {
-            let vultrino = self.vultrino.read().await;
+            let vultrino = &self.vultrino;
             let _ = vultrino.storage().reload().await;
             let token = vultrino
                 .storage()
@@ -135,7 +138,6 @@ impl McpServer {
                 .await
                 .map_err(|e| format!("Storage error: {}", e))?
                 .ok_or_else(|| "Invalid use token".to_string())?;
-            drop(vultrino);
 
             if token.revoked {
                 return Err("Use token has been revoked".to_string());
@@ -226,6 +228,14 @@ impl McpServer {
         Ok(())
     }
 
+    /// Drive a single JSON-RPC message and return the response, for in-process
+    /// testing (mirrors `WebServer::into_router`). Production drives messages via
+    /// [`Self::run_stdio`]; this exposes the same handler without binding stdio so
+    /// the connector capability flow (`tools/list` / `tools/call`) is testable.
+    pub async fn handle_jsonrpc(&mut self, message: &str) -> Option<JsonRpcResponse> {
+        self.handle_message(message).await
+    }
+
     /// Handle a single JSON-RPC message
     async fn handle_message(&mut self, message: &str) -> Option<JsonRpcResponse> {
         // Parse JSON-RPC request
@@ -303,7 +313,7 @@ impl McpServer {
     /// Handle tools/list request
     async fn handle_tools_list(
         &self,
-        _request: &JsonRpcRequest,
+        request: &JsonRpcRequest,
     ) -> Result<serde_json::Value, (i32, String)> {
         let mut tools = vec![
             Tool {
@@ -423,8 +433,67 @@ impl McpServer {
         // disabled installed plugins are filtered out at load time.
         tools.extend(self.get_plugin_tools().await);
 
+        // Connector M1: add the CAPABILITIES (named MCP tools) this principal is
+        // permitted to use. tools/list optionally carries the caller's Bearer
+        // secret (api_key/token) in its params; when present and valid, we resolve
+        // the principal and surface only the capabilities whose action the
+        // principal's policy ALLOWS — a denied/halted/unscoped principal sees
+        // none. (No secret presented → no principal → no capability tools, since a
+        // capability is meaningless without a principal to gate it.)
+        tools.extend(self.get_capability_tools(request).await);
+
         let result = ToolsListResult { tools };
         serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+    }
+
+    /// Enumerate the capability (named-MCP-tool) tools the calling principal is
+    /// permitted to see (connector M1). The principal is resolved from an optional
+    /// `api_key`/`token` field in the `tools/list` params; absent or invalid → no
+    /// capability tools (they require a principal to be policy-gated). Each allowed
+    /// capability becomes a named tool with the operator's input schema (plus the
+    /// injected `api_key` auth field) and description.
+    async fn get_capability_tools(&self, request: &JsonRpcRequest) -> Vec<Tool> {
+        // Pull an optional Bearer secret from the list params. Both `api_key` and
+        // `token` are accepted for ergonomics.
+        let secret = request
+            .params
+            .as_ref()
+            .and_then(|p| {
+                p.get("api_key")
+                    .or_else(|| p.get("token"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(str::to_string);
+
+        let Some(secret) = secret else {
+            return Vec::new();
+        };
+        // Resolve the principal; an invalid/unusable secret yields no tools rather
+        // than an error (tools/list stays a discovery call). Use the read variant
+        // so a still-usable token isn't consumed and a benign reason doesn't error.
+        let principal = match self.resolve_principal_for_read(&secret).await {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+        let auth = principal.auth().clone();
+
+        let capabilities = self.vultrino.list_capabilities_for(Some(&auth)).await;
+
+        capabilities
+            .into_iter()
+            // An LLM-proxy capability is the model channel (it backs `POST /llm`),
+            // not an LLM-callable tool — never surface it in tools/list.
+            .filter(|cap| !cap.is_llm_proxy())
+            .map(|cap| Tool {
+                name: cap.tool_name.clone(),
+                description: if cap.description.trim().is_empty() {
+                    format!("{} (vultrino capability)", cap.action)
+                } else {
+                    cap.description.clone()
+                },
+                input_schema: cap.mcp_input_schema(),
+            })
+            .collect()
     }
 
     /// Enumerate MCP tools from every live plugin in the registry.
@@ -436,9 +505,7 @@ impl McpServer {
     ///   2. `McpToolDefinition::input_schema` (built-in plugins set this)
     ///   3. A minimal `{credential}` default
     async fn get_plugin_tools(&self) -> Vec<Tool> {
-        let vultrino = self.vultrino.read().await;
-        let plugins = vultrino.plugins().all();
-        drop(vultrino);
+        let plugins = self.vultrino.plugins().all();
 
         let mut tools = Vec::new();
         for plugin in plugins {
@@ -510,8 +577,19 @@ impl McpServer {
             "get_credential_info" => self.tool_get_credential_info(params.arguments).await,
             "check_approval" => self.tool_check_approval(params.arguments).await,
             tool => {
-                // Check if it's a plugin tool (format: plugin_name_tool_name)
-                if let Some(result) = self.try_plugin_tool(tool, params.arguments).await {
+                // Connector M1: a named capability tool? Look it up by tool name
+                // and run it through the SAME enforced path the generic tools use.
+                // Checked before the plugin fallthrough so a capability can shadow
+                // a plugin-prefixed name only if it owns that exact name (capability
+                // names are validated to not collide with the generic built-ins).
+                let capability = {
+                    let vultrino = &self.vultrino;
+                    vultrino.capability_by_tool_name(tool).await
+                };
+                if let Some(capability) = capability {
+                    self.tool_call_capability(&capability, params.arguments).await
+                } else if let Some(result) = self.try_plugin_tool(tool, params.arguments).await {
+                    // Otherwise check if it's a plugin tool (format: plugin_tool).
                     result
                 } else {
                     return Err((INVALID_PARAMS, format!("Unknown tool: {}", tool)));
@@ -556,9 +634,7 @@ impl McpServer {
 
         // Walk the registry (single source of truth for live plugins) to
         // find the plugin that owns `tool_name`.
-        let vultrino = self.vultrino.read().await;
-        let plugins = vultrino.plugins().all();
-        drop(vultrino);
+        let plugins = self.vultrino.plugins().all();
 
         for plugin in plugins {
             let plugin_name = plugin.name().to_string();
@@ -601,7 +677,7 @@ impl McpServer {
                 params,
             };
 
-            let vultrino = self.vultrino.read().await;
+            let vultrino = &self.vultrino;
             let response = match vultrino.execute_gated(request, exec_auth).await {
                 Ok(ExecutionOutcome::Completed(resp)) => resp,
                 Ok(ExecutionOutcome::Pending(approval)) => {
@@ -623,13 +699,106 @@ impl McpServer {
         None
     }
 
+    /// Execute a named **capability** tool (connector M1).
+    ///
+    /// Compiles the capability and the LLM args into an [`ExecuteRequest`] (action
+    /// = the capability's V8 action label; credential = its `credential_ref`;
+    /// params mapped from the args within the capability's target scope) and runs
+    /// it through the SAME enforced path the generic tools use, `execute_gated`,
+    /// which applies permission, credential-access, V11 tenant isolation,
+    /// default-deny policy, single-use token consumption, V7 egress scrub, and the
+    /// feir/leria emits. A principal whose policy does NOT allow the action is
+    /// denied here (returns an MCP error), so even though the tool is normally
+    /// hidden in `tools/list`, a guessed/forged `tools/call` cannot bypass the
+    /// gate. The Bearer secret (`api_key`) is stripped from the args before they
+    /// reach the plugin.
+    async fn tool_call_capability(
+        &self,
+        capability: &crate::capability::Capability,
+        args: serde_json::Value,
+    ) -> Result<Vec<ToolContent>, String> {
+        // An LLM-proxy capability is the model channel (it backs `POST /llm`), not
+        // an LLM-callable tool — it is hidden from tools/list, and a guessed/forged
+        // tools/call against its name is rejected here (defense in depth).
+        if capability.is_llm_proxy() {
+            return Err(format!("Unknown tool: {}", capability.tool_name));
+        }
+
+        // The agent presents its use token / API key as the `api_key` argument,
+        // mirroring the generic tools (and the architecture's Bearer model).
+        let secret = match args.get("api_key").and_then(|v| v.as_str()) {
+            Some(k) => k.to_string(),
+            None => return Err("Missing 'api_key' argument".to_string()),
+        };
+
+        let principal = self.resolve_principal(&secret).await?;
+        let exec_auth = Self::build_exec_auth(&principal);
+
+        // Strip the bearer secret out of the args BEFORE mapping them into the
+        // action params — it must never reach a plugin or be persisted into an
+        // approval record (same invariant as try_plugin_tool).
+        let mut clean_args = args.clone();
+        if let Some(obj) = clean_args.as_object_mut() {
+            obj.remove("api_key");
+        }
+
+        // Resolve the canonical plugin for this capability's action so we shape the
+        // params correctly (http canonical request vs. plugin-param overlay).
+        let (canonical_action, _label) = self
+            .vultrino
+            .config()
+            .resolve_action(&capability.action);
+        let plugin_name = canonical_action
+            .split_once('.')
+            .map(|(p, _)| p)
+            .unwrap_or("http")
+            .to_string();
+
+        let params = crate::capability::build_action_params(capability, &plugin_name, &clean_args);
+
+        // The request carries the capability's action label (V8) verbatim;
+        // execute_gated resolves it to the canonical action and enforces the
+        // use-token's action scope against both forms.
+        let request = ExecuteRequest {
+            credential: capability.credential_ref.clone(),
+            action: capability.action.clone(),
+            params,
+        };
+
+        let vultrino = &self.vultrino;
+        let response = match vultrino.execute_gated(request, exec_auth).await {
+            Ok(ExecutionOutcome::Completed(resp)) => resp,
+            Ok(ExecutionOutcome::Pending(approval)) => {
+                return Ok(vec![ToolContent::Text {
+                    text: Self::format_pending(&approval),
+                }]);
+            }
+            // A policy/scope/tenant denial surfaces as an MCP tool error, never a
+            // bypass — the agent is told it is not permitted.
+            Err(e) => return Err(format!("Capability '{}' denied or failed: {}", capability.tool_name, e)),
+        };
+
+        // The body has already been egress-scrubbed inside run_action, so no
+        // secret/PII reflection leaks in the tool output.
+        let body_text = String::from_utf8_lossy(&response.body);
+        let formatted_body = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|j| serde_json::to_string_pretty(&j).ok())
+            .unwrap_or_else(|| body_text.to_string());
+        let output = format!(
+            "Capability: {} | Action: {}\nStatus: {}\n\nResult:\n{}",
+            capability.tool_name, capability.action, response.status, formatted_body
+        );
+        Ok(vec![ToolContent::Text { text: output }])
+    }
+
     /// Handle resources/list request
     async fn handle_resources_list(
         &self,
         _request: &JsonRpcRequest,
     ) -> Result<serde_json::Value, (i32, String)> {
         // List credentials as resources
-        let vultrino = self.vultrino.read().await;
+        let vultrino = &self.vultrino;
         let credentials = vultrino
             .storage()
             .list()
@@ -669,7 +838,7 @@ impl McpServer {
         let auth = principal.auth();
         Self::check_permission(auth, Permission::Read)?;
 
-        let vultrino = self.vultrino.read().await;
+        let vultrino = &self.vultrino;
         let credentials = vultrino
             .storage()
             .list()
@@ -738,7 +907,7 @@ impl McpServer {
         };
 
         // Execute through Vultrino, gating on approval when required.
-        let vultrino = self.vultrino.read().await;
+        let vultrino = &self.vultrino;
         let response = match vultrino
             .execute_gated(request, exec_auth)
             .await
@@ -785,7 +954,7 @@ impl McpServer {
         Self::check_permission(auth, Permission::Read)?;
         Self::check_credential_access(auth, &args.credential)?;
 
-        let vultrino = self.vultrino.read().await;
+        let vultrino = &self.vultrino;
 
         // Try to get by alias first, then by ID
         let storage = vultrino.storage();
@@ -844,12 +1013,11 @@ impl McpServer {
 
         // The ownership check is enforced inside check_and_resume_approval BEFORE
         // any execution, so a non-owner can never trigger the approved action.
-        let vultrino = self.vultrino.read().await;
-        let approval = vultrino
+        let approval = self
+            .vultrino
             .check_and_resume_approval(&args.approval_id, Some(&caller_id))
             .await
             .map_err(|e| e.to_string())?;
-        drop(vultrino);
 
         // V12: surface dual-control (M-of-N) progress so an MCP agent knows it's
         // awaiting additional distinct approvers, not stalled (only meaningful

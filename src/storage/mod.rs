@@ -7,6 +7,7 @@ mod file;
 pub use file::FileStorage;
 
 use crate::approval::{ApprovalRequest, ApprovalStatus};
+use crate::capability::Capability;
 use crate::outbox::OutboxEvent;
 use crate::auth::{ApiKey, Role, UseToken};
 use crate::policy::Policy;
@@ -43,6 +44,9 @@ pub enum StorageError {
 
     #[error("Policy not found: {0}")]
     PolicyNotFound(String),
+
+    #[error("Capability not found: {0}")]
+    CapabilityNotFound(String),
 
     #[error("Conflict: {0}")]
     Conflict(String),
@@ -480,6 +484,36 @@ pub trait StorageBackend: Send + Sync {
     /// Delete a stored policy by id.
     async fn delete_policy(&self, id: &str) -> Result<(), StorageError> {
         Err(StorageError::PolicyNotFound(id.to_string()))
+    }
+
+    // ==================== Capability Storage (connector M1) ====================
+    //
+    // Capabilities are named-MCP-tool definitions (a tool name + action + vault
+    // credential + target scope + input schema). Stored alongside policies in the
+    // same vault; the MCP server reads them to expose per-principal named tools.
+    // Default impls are no-ops/empty so non-file backends and test doubles still
+    // compile; `FileStorage` overrides them.
+
+    /// Store (create or replace) a capability by its id.
+    async fn store_capability(&self, _capability: &Capability) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable(
+            "capability storage not supported by this storage backend".to_string(),
+        ))
+    }
+
+    /// Get a stored capability by id.
+    async fn get_capability(&self, _id: &str) -> Result<Option<Capability>, StorageError> {
+        Ok(None)
+    }
+
+    /// List all stored capabilities.
+    async fn list_capabilities(&self) -> Result<Vec<Capability>, StorageError> {
+        Ok(vec![])
+    }
+
+    /// Delete a stored capability by id.
+    async fn delete_capability(&self, id: &str) -> Result<(), StorageError> {
+        Err(StorageError::CapabilityNotFound(id.to_string()))
     }
 
     // ==================== Idempotency (admin API, V1) ====================

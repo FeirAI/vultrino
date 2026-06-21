@@ -1331,6 +1331,152 @@ impl VultrinoServer {
         Ok(approvals)
     }
 
+    /// Whether the given principal (a `vk_`/`vut_` resolved [`AuthResult`]) would
+    /// be permitted to invoke a capability — used by the MCP server to filter
+    /// `tools/list` so an agent only sees the named tools its policy ALLOWS
+    /// (connector M1). This is a **read-only, no-side-effect** check that reuses
+    /// the SAME enforcement decisions `execute_gated` makes — credential access,
+    /// V11 tenant isolation, and the policy engine — so a tool that wouldn't run
+    /// can never appear in the list (and conversely a listed tool is the same one
+    /// `execute_gated` would admit). It does NOT charge rate limits or extract a
+    /// concrete spend amount (there are no LLM args yet at list time), so a
+    /// capability gated only by a per-action SpendCap is treated as *not yet
+    /// listable-allowed* (fail-closed: SpendCap with no extracted amount denies).
+    ///
+    /// A `None` auth (local/trusted caller) is permitted to see every capability.
+    pub async fn capability_allowed_for(
+        &self,
+        auth: Option<&AuthResult>,
+        capability: &crate::capability::Capability,
+    ) -> bool {
+        // Resolve the capability's credential + canonical action exactly as the
+        // execute path does, so the credential alias and action seen by policy
+        // match the live decision. A missing credential or unparseable action
+        // means the capability can never run → not listable.
+        let credential = match self.resolver.resolve(&capability.credential_ref).await {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let (canonical_action, _label) = self.config.resolve_action(&capability.action);
+        // Resolve only to confirm the action is well-formed (an unparseable action
+        // can never run → not listable). Policy matches on the credential alias +
+        // url/method + principal; the action string itself is enforced through the
+        // use-token's action scope at execute time, not here.
+        if parse_action(&canonical_action).is_err() {
+            return false;
+        }
+
+        if let Some(auth) = auth {
+            // Same permission + credential-access gate execute_gated applies.
+            if !auth.has_permission(Permission::Execute) {
+                return false;
+            }
+            if !auth.can_access_credential(&credential.alias) {
+                return false;
+            }
+            // V11 tenant isolation: a tenant-tagged credential is only usable by a
+            // principal in the same tenant (never observable-away).
+            let principal_tenant = auth.api_key.tenant.as_deref();
+            let cred_tenant = credential
+                .metadata
+                .get("tenant")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            if let Some(ct) = cred_tenant {
+                if principal_tenant != Some(ct) {
+                    return false;
+                }
+            }
+        }
+
+        // Build the principal (V4) for principal_pattern matching, exactly like
+        // execute_gated.
+        let principal = auth.map(|a| crate::policy::Principal {
+            id: a.api_key.id.clone(),
+            agent_label: a.api_key.agent_label.clone(),
+            owner: a.api_key.owner_identity.clone(),
+            workload_id: a.api_key.workload_id.clone(),
+        });
+        // Read-only policy evaluation: no rate-limit charge, no spend extracted.
+        // We pass the capability's target url/method (if pinned) so a url/method
+        // gated allow rule can match at list time.
+        let url = capability.target.url_glob.as_deref();
+        let method = capability.target.methods.first().map(|m| m.as_str());
+        let decision = self.policy_engine.evaluate_readonly_full(&crate::policy::EvalInput {
+            credential_alias: &credential.alias,
+            url,
+            method,
+            principal: principal.as_ref(),
+            spend: None,
+        });
+        // A `Prompt` (approval-gated) capability is still listable — the agent can
+        // call it and will be told to await approval, exactly like a generic gated
+        // tool. Only an outright `Deny` hides it.
+        !matches!(decision, crate::policy::PolicyDecision::Deny(_))
+    }
+
+    /// List the capabilities a principal is permitted to see (connector M1). The
+    /// MCP server turns each into a named tool. Storage is reloaded first so a
+    /// capability created via the admin API (another process) is visible.
+    pub async fn list_capabilities_for(
+        &self,
+        auth: Option<&AuthResult>,
+    ) -> Vec<crate::capability::Capability> {
+        let _ = self.storage.reload().await;
+        let all = self.storage.list_capabilities().await.unwrap_or_default();
+        let mut allowed = Vec::new();
+        for capability in all {
+            if self.capability_allowed_for(auth, &capability).await {
+                allowed.push(capability);
+            }
+        }
+        allowed
+    }
+
+    /// Resolve the **LLM-proxy** capability a principal may use (connector M1,
+    /// decision 5) — the model channel backing `POST /llm`. It reuses the SAME
+    /// read-only enforcement [`Self::capability_allowed_for`] applies (credential
+    /// access, V11 tenant isolation, default-deny policy), so an agent can only
+    /// route its model traffic through a capability it is actually granted.
+    ///
+    /// An agent has one model endpoint, so at most one LLM-proxy capability is
+    /// expected to be allowed; if several match, the first (storage order) is used
+    /// (a misconfiguration the operator should avoid). Returns `None` when the
+    /// principal has no allowed LLM-proxy capability — the `/llm` endpoint then
+    /// fails closed (no provider, no key, no metering bypass). Storage is reloaded
+    /// first so a capability provisioned by another process is visible.
+    pub async fn resolve_llm_proxy_for(
+        &self,
+        auth: Option<&AuthResult>,
+    ) -> Option<crate::capability::Capability> {
+        let _ = self.storage.reload().await;
+        let all = self.storage.list_capabilities().await.unwrap_or_default();
+        for capability in all {
+            if !capability.is_llm_proxy() {
+                continue;
+            }
+            if self.capability_allowed_for(auth, &capability).await {
+                return Some(capability);
+            }
+        }
+        None
+    }
+
+    /// Look up a stored capability by its MCP tool name (connector M1). Reloads
+    /// storage first to pick up a capability registered by another process.
+    pub async fn capability_by_tool_name(
+        &self,
+        tool_name: &str,
+    ) -> Option<crate::capability::Capability> {
+        let _ = self.storage.reload().await;
+        self.storage
+            .list_capabilities()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.tool_name == tool_name)
+    }
+
     /// Register a harness abort callback fired on halt (V6).
     pub fn register_halt_callback(&self, cb: Arc<dyn crate::session::HaltCallback>) {
         self.halt_callbacks.write().push(cb);

@@ -234,6 +234,138 @@ async fn test_admin_policy_crud_hot_reload() {
 }
 
 #[tokio::test]
+async fn test_admin_capability_crud() {
+    // Connector M1: the named-MCP-tool admin surface — POST/GET/PUT/DELETE.
+    let (router, storage, _server, key) = build_admin_router().await;
+
+    // Create a capability → 201; it persists (no secret in the body).
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/capabilities",
+            &key,
+            serde_json::json!({
+                "tool_name": "send_email",
+                "description": "Send an email",
+                "action": "http.request",
+                "plugin": "http",
+                "target": { "url_glob": "https://api.sendgrid.example/v3/mail/send", "methods": ["POST"] },
+                "credential_ref": "cred-sendgrid",
+                "input_schema": { "type": "object", "properties": { "body": { "type": "object" } } }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["tool_name"], "send_email");
+    assert_eq!(storage.list_capabilities().await.unwrap().len(), 1);
+
+    // GET lists it (sorted by tool_name).
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", "/api/v1/capabilities", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(listed["capabilities"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["capabilities"][0]["tool_name"], "send_email");
+
+    // PUT replaces by id.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "PUT",
+            &format!("/api/v1/capabilities/{}", id),
+            &key,
+            serde_json::json!({
+                "tool_name": "send_email_v2",
+                "action": "http.request",
+                "credential_ref": "cred-sendgrid"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(storage.get_capability(&id).await.unwrap().unwrap().tool_name, "send_email_v2");
+
+    // An invalid tool_name (uppercase) → 400.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/capabilities",
+            &key,
+            serde_json::json!({ "tool_name": "Send-Email", "action": "http.request", "credential_ref": "c" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A name colliding with a built-in generic tool → 400.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/capabilities",
+            &key,
+            serde_json::json!({ "tool_name": "http_request", "action": "http.request", "credential_ref": "c" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // DELETE removes it.
+    let resp = router
+        .clone()
+        .oneshot(admin_req("DELETE", &format!("/api/v1/capabilities/{}", id), &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(storage.list_capabilities().await.unwrap().len(), 0);
+
+    // Deleting again → 404.
+    let resp = router
+        .oneshot(admin_req("DELETE", &format!("/api/v1/capabilities/{}", id), &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_admin_capabilities_require_admin() {
+    let (router, _storage, _server, _key) = build_admin_router().await;
+    // No auth → 401.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/capabilities")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // A use token can never reach the admin surface → 403.
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/capabilities",
+            "vut_sometoken",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn test_admin_token_mint_idempotent() {
     let (router, storage, _server, key) = build_admin_router().await;
 

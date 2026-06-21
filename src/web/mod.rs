@@ -9,6 +9,8 @@
 
 mod api;
 mod auth;
+mod llm_proxy;
+mod mcp_http;
 mod routes;
 mod server;
 mod templates;

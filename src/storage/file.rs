@@ -5,6 +5,7 @@
 use super::{IdempotencyState, StorageBackend, StorageError};
 use crate::approval::ApprovalRequest;
 use crate::auth::{ApiKey, Role, UseToken};
+use crate::capability::Capability;
 use crate::crypto::{decrypt, derive_key, encrypt, generate_salt, EncryptedData, MasterKey};
 use crate::policy::Policy;
 use crate::{Credential, CredentialMetadata};
@@ -30,7 +31,11 @@ const STALE_EXECUTING_SECS: i64 = 120;
 /// `#[serde(default)]`, so a v4 binary reads older vaults fine; an older binary
 /// is correctly refused a v4 vault by [`check_version`] rather than silently
 /// dropping admin-managed policies on its next write.
-const STORAGE_VERSION: u32 = 5;
+///
+/// v6 (connector M1): adds the `capabilities` map (named-MCP-tool definitions).
+/// `#[serde(default)]`, so a v6 binary reads older vaults; an older binary is
+/// refused a v6 vault rather than silently dropping capabilities on its next write.
+const STORAGE_VERSION: u32 = 6;
 
 /// A reservation older than this (seconds) is assumed orphaned by a crashed
 /// request and may be re-reserved, so a single failed admin call can't block a
@@ -200,6 +205,12 @@ struct StorageCache {
     /// merges these with the static config policies into the live engine.
     #[serde(default)]
     policies: HashMap<String, Policy>,
+    /// Capabilities (named-MCP-tool definitions) pushed via the admin API
+    /// (connector M1), keyed by capability id. The MCP server reads these to
+    /// expose per-principal named tools. They carry no secret (a credential_ref
+    /// alias only).
+    #[serde(default)]
+    capabilities: HashMap<String, Capability>,
     /// Idempotency records for admin-API mutations, keyed by Idempotency-Key.
     #[serde(default)]
     idempotency: HashMap<String, IdempotencyRecord>,
@@ -1255,6 +1266,37 @@ impl StorageBackend for FileStorage {
         self.locked_mutate(|cache| {
             if cache.policies.remove(id).is_none() {
                 return Err(StorageError::PolicyNotFound(id.to_string()));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    // ==================== Capability Storage (connector M1) ====================
+
+    async fn store_capability(&self, capability: &Capability) -> Result<(), StorageError> {
+        let capability = capability.clone();
+        self.locked_mutate(move |cache| {
+            cache.capabilities.insert(capability.id.clone(), capability);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_capability(&self, id: &str) -> Result<Option<Capability>, StorageError> {
+        let cache = self.cache.read();
+        Ok(cache.capabilities.get(id).cloned())
+    }
+
+    async fn list_capabilities(&self) -> Result<Vec<Capability>, StorageError> {
+        let cache = self.cache.read();
+        Ok(cache.capabilities.values().cloned().collect())
+    }
+
+    async fn delete_capability(&self, id: &str) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            if cache.capabilities.remove(id).is_none() {
+                return Err(StorageError::CapabilityNotFound(id.to_string()));
             }
             Ok(())
         })
