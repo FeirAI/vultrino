@@ -4,8 +4,9 @@
 //! `tower::ServiceExt::oneshot` (no socket bound), verifying the acceptance
 //! criteria from muntin `docs/connectors/ARCHITECTURE.md`:
 //!
-//! - an HTTP JSON-RPC `tools/list` with a valid `vut_` Bearer returns that
-//!   principal's granted named tools (and the generic tools);
+//! - an HTTP JSON-RPC `tools/list` with a valid `vut_` Bearer returns ONLY that
+//!   principal's granted named tools + `check_approval` (a scoped use-token agent
+//!   is not offered vultrino's generic built-in tools — the connector model);
 //! - a missing / invalid / revoked / expired token is rejected `401`, never
 //!   bypassed;
 //! - a `tools/call` over HTTP runs the SAME enforced `execute_gated` path;
@@ -192,9 +193,12 @@ async fn http_tools_list_with_valid_token_returns_principal_tools() {
         names.contains(&"send_email".to_string()),
         "valid vut_ Bearer must surface the principal's granted tool: {names:?}"
     );
-    // The generic tools remain available over the networked transport too.
-    assert!(names.contains(&"http_request".to_string()));
-    assert!(names.contains(&"list_credentials".to_string()));
+    // Connector model: a scoped use-token (vut_) agent sees ONLY its granted named
+    // capabilities (+ check_approval) over the networked transport — NOT the generic
+    // built-in tools.
+    assert!(!names.contains(&"http_request".to_string()), "a use-token agent must NOT see generic http_request: {names:?}");
+    assert!(!names.contains(&"list_credentials".to_string()), "a use-token agent must NOT see generic list_credentials");
+    assert!(names.contains(&"check_approval".to_string()), "the control tool stays available");
 }
 
 #[tokio::test]
@@ -435,8 +439,9 @@ async fn http_header_token_is_authoritative_over_body_token() {
 
 #[tokio::test]
 async fn http_no_capabilities_for_unprivileged_default_deny() {
-    // Default-deny with NO allow policy: even a valid token sees no capability
-    // tools (policy would deny them), but the generic tools remain.
+    // Default-deny with NO allow policy: a valid use-token sees no capability tools
+    // (policy denies them) AND no generic built-ins (the connector model) — only the
+    // check_approval control tool.
     let (router, storage) = build_router_with(config_with_policies(vec![])).await;
     store_credential(&storage, "cred-sendgrid").await;
     register_send_email(&storage, "cred-sendgrid").await;
@@ -452,5 +457,6 @@ async fn http_no_capabilities_for_unprivileged_default_deny() {
     assert_eq!(resp.status(), StatusCode::OK);
     let names = tool_names(&body_value(resp).await);
     assert!(!names.contains(&"send_email".to_string()), "default-deny must hide the capability");
-    assert!(names.contains(&"http_request".to_string()), "generic tools remain");
+    assert!(!names.contains(&"http_request".to_string()), "a use-token agent must NOT see generic built-ins");
+    assert!(names.contains(&"check_approval".to_string()), "the control tool stays available");
 }

@@ -433,6 +433,21 @@ impl McpServer {
         // disabled installed plugins are filtered out at load time.
         tools.extend(self.get_plugin_tools().await);
 
+        // Connector model: a scoped USE-TOKEN (vut_) agent — a harness connected via
+        // a govder-provisioned use-token — sees ONLY its granted named capabilities,
+        // never vultrino's generic built-in tools (http_request / ssh_* / postgres_* /
+        // list_credentials / get_credential_info). The generic surface is for a direct
+        // admin/operator (vk_) key. We keep `check_approval` (the control tool an agent
+        // legitimately needs to poll an approval it triggered). The built-ins are still
+        // default-deny enforced regardless; this is about not OFFERING a generic tool to
+        // a governed agent (it must act through its named capabilities).
+        if matches!(
+            self.resolve_list_principal(request).await,
+            Some(McpPrincipal::UseToken { .. })
+        ) {
+            tools.retain(|t| t.name == "check_approval");
+        }
+
         // Connector M1: add the CAPABILITIES (named MCP tools) this principal is
         // permitted to use. tools/list optionally carries the caller's Bearer
         // secret (api_key/token) in its params; when present and valid, we resolve
@@ -446,15 +461,11 @@ impl McpServer {
         serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
     }
 
-    /// Enumerate the capability (named-MCP-tool) tools the calling principal is
-    /// permitted to see (connector M1). The principal is resolved from an optional
-    /// `api_key`/`token` field in the `tools/list` params; absent or invalid → no
-    /// capability tools (they require a principal to be policy-gated). Each allowed
-    /// capability becomes a named tool with the operator's input schema (plus the
-    /// injected `api_key` auth field) and description.
-    async fn get_capability_tools(&self, request: &JsonRpcRequest) -> Vec<Tool> {
-        // Pull an optional Bearer secret from the list params. Both `api_key` and
-        // `token` are accepted for ergonomics.
+    /// Resolve the optional principal for a `tools/list` call from the secret in
+    /// its params (`api_key` or `token`; the HTTP transport injects the header
+    /// Bearer here). Read-only (does not consume a single-use token); `None` when
+    /// absent or invalid — `tools/list` stays a benign discovery call.
+    async fn resolve_list_principal(&self, request: &JsonRpcRequest) -> Option<McpPrincipal> {
         let secret = request
             .params
             .as_ref()
@@ -462,18 +473,23 @@ impl McpServer {
                 p.get("api_key")
                     .or_else(|| p.get("token"))
                     .and_then(|v| v.as_str())
-            })
-            .map(str::to_string);
+            })?
+            .to_string();
+        self.resolve_principal_for_read(&secret).await.ok()
+    }
 
-        let Some(secret) = secret else {
+    /// Enumerate the capability (named-MCP-tool) tools the calling principal is
+    /// permitted to see (connector M1). The principal is resolved from an optional
+    /// `api_key`/`token` field in the `tools/list` params; absent or invalid → no
+    /// capability tools (they require a principal to be policy-gated). Each allowed
+    /// capability becomes a named tool with the operator's input schema (plus the
+    /// injected `api_key` auth field) and description.
+    async fn get_capability_tools(&self, request: &JsonRpcRequest) -> Vec<Tool> {
+        // Resolve the calling principal from the list params (read-only; the HTTP
+        // transport injects the header Bearer there). Absent/invalid → no capability
+        // tools (they require a principal to be policy-gated).
+        let Some(principal) = self.resolve_list_principal(request).await else {
             return Vec::new();
-        };
-        // Resolve the principal; an invalid/unusable secret yields no tools rather
-        // than an error (tools/list stays a discovery call). Use the read variant
-        // so a still-usable token isn't consumed and a benign reason doesn't error.
-        let principal = match self.resolve_principal_for_read(&secret).await {
-            Ok(p) => p,
-            Err(_) => return Vec::new(),
         };
         let auth = principal.auth().clone();
 

@@ -152,9 +152,13 @@ async fn allowed_principal_sees_capability_in_tools_list() {
     let names = tools_in(&value);
 
     assert!(names.contains(&"send_email".to_string()), "allowed principal must see the named tool: {names:?}");
-    // The generic tools are still present.
-    assert!(names.contains(&"http_request".to_string()), "generic tools must still be listed");
-    assert!(names.contains(&"list_credentials".to_string()));
+    // Connector model: a scoped use-token (vut_) agent sees ONLY its granted named
+    // capabilities + the control tool — NOT vultrino's generic built-in tools (the
+    // generic surface is for a direct admin/operator vk_ key). The built-ins remain
+    // default-deny enforced regardless; this is about not OFFERING them to an agent.
+    assert!(!names.contains(&"http_request".to_string()), "a use-token agent must NOT see generic http_request: {names:?}");
+    assert!(!names.contains(&"list_credentials".to_string()), "a use-token agent must NOT see generic list_credentials");
+    assert!(names.contains(&"check_approval".to_string()), "the control tool stays available to an agent");
 
     // The capability tool exposes its schema with the injected api_key field.
     let send_email = value["result"]["tools"]
@@ -188,8 +192,11 @@ async fn denied_principal_does_not_see_capability() {
         !names.contains(&"send_email".to_string()),
         "a principal not scoped to the credential must NOT see the tool: {names:?}"
     );
-    // Generic tools still appear (they don't depend on the capability gate).
-    assert!(names.contains(&"http_request".to_string()));
+    // Connector model: a use-token sees no generic built-ins either — only its
+    // granted capabilities (none here, since it's scoped to a different credential)
+    // plus the control tool.
+    assert!(!names.contains(&"http_request".to_string()), "a use-token agent must NOT see generic http_request");
+    assert!(names.contains(&"check_approval".to_string()));
 }
 
 #[tokio::test]
