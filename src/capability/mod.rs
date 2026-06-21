@@ -556,6 +556,43 @@ mod tests {
     }
 
     #[test]
+    fn test_llm_upstream_url_host_cannot_be_hijacked_by_path() {
+        // The security premise behind narrowing the config-time provider_base SSRF
+        // check (#5b): the agent supplies only the PATH; it can NEVER change the
+        // operator-fixed host. If any of these adversarial paths produced a URL whose
+        // host != the provider_base host, the narrowing would be unsafe. The upstream
+        // is whatever the http plugin's validate_url_ssrf re-parses, so we assert on
+        // the re-parsed host (exactly what the execute-time SSRF check sees).
+        let c = llm_cap("https://api.openai.com");
+        let attacks = [
+            "/@evil.com/x",
+            "@evil.com/x",
+            "//evil.com/x",
+            "/..//evil.com/x",
+            "/\\evil.com/x",
+            "https://evil.com/x",
+            "/x?next=https://evil.com",
+            "/x#@evil.com",
+            "/%2F%2Fevil.com/x",
+            " /evil.com",
+        ];
+        for path in attacks {
+            if let Some(upstream) = c.llm_upstream_url(path) {
+                let parsed = url::Url::parse(&upstream)
+                    .unwrap_or_else(|e| panic!("upstream for {path:?} must parse: {e}"));
+                assert_eq!(
+                    parsed.host_str(),
+                    Some("api.openai.com"),
+                    "path {path:?} hijacked the host to {:?} (upstream={upstream})",
+                    parsed.host_str()
+                );
+            }
+            // None (rejected) is also acceptable — the point is it must NEVER yield a
+            // different host.
+        }
+    }
+
+    #[test]
     fn test_llm_upstream_url_none_for_non_llm_capability() {
         // A plain (non-LLM) capability has no upstream URL.
         assert!(cap("send_email").llm_upstream_url("/v1/chat/completions").is_none());
