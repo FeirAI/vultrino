@@ -587,6 +587,36 @@ impl McpServer {
             .and_then(|p| serde_json::from_value(p.clone()).ok())
             .ok_or_else(|| (INVALID_PARAMS, "Missing or invalid params".to_string()))?;
 
+        // Defense-in-depth principal gate (GLM review #1): a use-token (`vut_`)
+        // surfaces ONLY its granted named capabilities + check_approval at
+        // tools/list, but tools/call dispatches purely by name — so without this
+        // gate a use-token could CALL a generic built-in by name. The action-scope
+        // check in execute_gated already blocks the http-backed case (a govder
+        // token is scoped to a business-label glob, not the raw `http.request`
+        // action), but the LIST/CALL asymmetry should not be the only line: block
+        // the credential-wielding/enumeration built-ins outright for a use-token.
+        // (Admin `vk_` keys keep the full surface; named caps + check_approval pass.)
+        let caller_is_use_token = params
+            .arguments
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .map(|k| k.starts_with("vut_"))
+            .unwrap_or(false);
+        if caller_is_use_token {
+            match params.name.as_str() {
+                "list_credentials" | "http_request" | "get_credential_info" => {
+                    return Err((
+                        INVALID_PARAMS,
+                        format!(
+                            "tool '{}' is not available to a use-token; call your granted named capabilities instead",
+                            params.name
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
         let result = match params.name.as_str() {
             "list_credentials" => self.tool_list_credentials(params.arguments).await,
             "http_request" => self.tool_http_request(params.arguments).await,

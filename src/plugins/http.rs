@@ -59,8 +59,14 @@ const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
 impl HttpPlugin {
     /// Create a new HTTP plugin
     pub fn new() -> Self {
+        // SSRF: do NOT auto-follow redirects. validate_url_ssrf only checks the
+        // INITIAL url; reqwest's default follows up to 10 hops, so a redirect to a
+        // private/link-local host (e.g. 169.254.169.254 IMDS) would escape the
+        // SSRF allowlist with no re-validation. Policy::none() surfaces the 3xx to
+        // the caller instead of following it. (GLM review #5.)
         let client = Client::builder()
             .user_agent("vultrino/0.1.0")
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to create HTTP client");
 

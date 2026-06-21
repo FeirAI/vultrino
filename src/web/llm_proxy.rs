@@ -273,10 +273,18 @@ async fn llm_proxy_impl(
                 approval.id
             ),
         ),
-        Err(e) => llm_error(
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-            &format!("LLM proxy upstream failed: {e}"),
-        ),
+        Err(e) => {
+            // Do NOT echo the upstream error detail to the agent: on a plugin Err
+            // the egress scrub (which runs on the Ok path) has NOT run, so a
+            // secret-bearing upstream body (e.g. an OAuth token-endpoint error that
+            // echoes the token) could leak through `{e}`. Log the detail
+            // server-side; return a generic message. (GLM review #6.)
+            tracing::warn!(error = %e, "LLM proxy upstream request failed");
+            llm_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "LLM proxy upstream request failed (see server logs)",
+            )
+        }
     }
 }

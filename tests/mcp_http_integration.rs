@@ -460,3 +460,62 @@ async fn http_no_capabilities_for_unprivileged_default_deny() {
     assert!(!names.contains(&"http_request".to_string()), "a use-token agent must NOT see generic built-ins");
     assert!(names.contains(&"check_approval".to_string()), "the control tool stays available");
 }
+
+#[tokio::test]
+async fn http_resources_list_blocked_for_use_token() {
+    // A use-token must NOT enumerate the credential vault via resources/list
+    // (GLM review #3). The handler had no principal/scope filter; the HTTP
+    // transport now returns an empty resource set for a vut_.
+    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    store_credential(&storage, "cred-sendgrid").await;
+    store_credential(&storage, "cred-other-secret").await; // must NOT be enumerable
+    register_send_email(&storage, "cred-sendgrid").await;
+    let token = mint_token(&storage, "cred-sendgrid", Some("http.request"), None, None).await;
+
+    let resp = router
+        .oneshot(mcp_req(
+            Some(&token),
+            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/list" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let value = body_value(resp).await;
+    let resources = value["result"]["resources"].as_array().cloned().unwrap_or_default();
+    assert!(
+        resources.is_empty(),
+        "a use-token must not enumerate the vault via resources/list: {value:?}"
+    );
+}
+
+#[tokio::test]
+async fn http_tools_call_generic_builtin_blocked_for_use_token() {
+    // A use-token surfaces only its named tools at LIST; it must also be unable to
+    // CALL a generic built-in by name (GLM review #1 defense-in-depth).
+    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    store_credential(&storage, "cred-sendgrid").await;
+    register_send_email(&storage, "cred-sendgrid").await;
+    let token = mint_token(&storage, "cred-sendgrid", Some("http.request"), None, None).await;
+
+    let resp = router
+        .oneshot(mcp_req(
+            Some(&token),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "http_request", "arguments": {
+                    "credential": "cred-sendgrid", "method": "GET", "url": "https://api.sendgrid.com/v3/x"
+                }}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let value = body_value(resp).await;
+    let is_rpc_error = value.get("error").is_some();
+    let is_tool_error = value["result"]["isError"].as_bool().unwrap_or(false)
+        || value["result"]["is_error"].as_bool().unwrap_or(false);
+    assert!(
+        is_rpc_error || is_tool_error,
+        "a use-token calling the generic http_request built-in must be rejected: {value:?}"
+    );
+}

@@ -246,6 +246,41 @@ pub async fn mcp_jsonrpc(
     // overwrites any token the agent put in the body.
     inject_bearer(&mut message, &secret);
 
+    // Vault-enumeration gate (GLM review #3). `resources/list` returns EVERY
+    // credential's alias+description with no scope/tenant filter; `resources/read`
+    // exposes a credential resource. A governed use-token (`vut_`) holds named
+    // capabilities, not vault-enumeration rights — so block both for use-tokens at
+    // the transport (the principal is known here from the Bearer). An admin API key
+    // (`vk_`) keeps full access. (Matches UseToken::looks_like_token's `vut_`
+    // prefix.)
+    if secret.starts_with("vut_") {
+        if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
+            match method {
+                "resources/list" => {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": { "resources": [] }
+                        })),
+                    )
+                        .into_response();
+                }
+                "resources/read" => {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": { "code": -32001, "message": "resource access is not permitted for a use-token (use your named tools)" }
+                        })),
+                    )
+                        .into_response();
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Dispatch through the SAME handler stdio uses, off the web process's shared
     // execution server. `McpServer` is a cheap wrapper over the shared `Arc`s, so
     // building one per request is fine; the only mutable state it carries is the

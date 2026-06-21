@@ -159,6 +159,31 @@ impl Capability {
                     base
                 ));
             }
+            // SSRF consistency guard at config time (GLM review #5b): reject an
+            // obvious loopback / private / link-local host literal. The authoritative
+            // (DNS-resolving) check still runs at execute time via the http plugin's
+            // validate_url_ssrf; this also rejects the misconfig at create time.
+            if let Some(host) = parsed.host_str() {
+                let h = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+                let private = h == "localhost"
+                    || h == "::1"
+                    || h.starts_with("127.")
+                    || h.starts_with("169.254.") // link-local incl. cloud metadata 169.254.169.254
+                    || h.starts_with("10.")
+                    || h.starts_with("192.168.")
+                    || (h.starts_with("172.")
+                        && h.split('.')
+                            .nth(1)
+                            .and_then(|o| o.parse::<u8>().ok())
+                            .map(|o| (16..=31).contains(&o))
+                            .unwrap_or(false));
+                if private {
+                    return Err(format!(
+                        "capability llm.provider_base '{}' resolves to a loopback/private/link-local host (SSRF)",
+                        base
+                    ));
+                }
+            }
         }
         Ok(())
     }
