@@ -52,12 +52,10 @@ pub struct HmacRequestParams {
 impl HmacPlugin {
     /// Create a new HMAC plugin
     pub fn new() -> Self {
-        let client = Client::builder()
-            .user_agent("vultrino/0.1.0")
-            .build()
-            .expect("Failed to create HTTP client");
-
-        Self { client }
+        // Same secret-bearing-egress SSRF guards as the HTTP plugin (no auto-redirect
+        // + connect-time private-IP filter); an HMAC-signed request must not follow a
+        // 3xx or a rebinding host into an internal target.
+        Self { client: super::build_guarded_client() }
     }
 
     /// Get current timestamp in milliseconds

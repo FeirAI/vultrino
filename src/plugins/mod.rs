@@ -20,6 +20,7 @@ pub mod types;
 pub mod wasm;
 
 pub use http::HttpPlugin;
+pub(crate) use http::build_guarded_client;
 pub use hmac::HmacPlugin;
 pub use ecdsa::EcdsaPlugin;
 pub use postgres::PostgresPlugin;

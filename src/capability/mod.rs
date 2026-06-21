@@ -159,27 +159,22 @@ impl Capability {
                     base
                 ));
             }
-            // SSRF consistency guard at config time (GLM review #5b): reject an
-            // obvious loopback / private / link-local host literal. The authoritative
-            // (DNS-resolving) check still runs at execute time via the http plugin's
-            // validate_url_ssrf; this also rejects the misconfig at create time.
+            // SSRF config-time guard (GLM review #5b, narrowed): reject ONLY the
+            // link-local range (169.254.0.0/16 — the cloud-metadata SSRF target,
+            // 169.254.169.254), which has no legitimate provider_base use. We do NOT
+            // reject loopback / RFC1918 here: those are legitimate self-hosted /
+            // private model-gateway addresses (the operator-fixed provider_base host
+            // is agent-untouchable — the agent only supplies the path, never the
+            // host, see llm_upstream_url), and the AUTHORITATIVE DNS-resolving SSRF
+            // control runs at execute time in the http plugin's validate_url_ssrf.
+            // Duplicating that broad block here added no security (it is a string
+            // subset of the execute-time check) while breaking the only end-to-end
+            // test that drives the real http plugin through the proxy.
             if let Some(host) = parsed.host_str() {
                 let h = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
-                let private = h == "localhost"
-                    || h == "::1"
-                    || h.starts_with("127.")
-                    || h.starts_with("169.254.") // link-local incl. cloud metadata 169.254.169.254
-                    || h.starts_with("10.")
-                    || h.starts_with("192.168.")
-                    || (h.starts_with("172.")
-                        && h.split('.')
-                            .nth(1)
-                            .and_then(|o| o.parse::<u8>().ok())
-                            .map(|o| (16..=31).contains(&o))
-                            .unwrap_or(false));
-                if private {
+                if h.starts_with("169.254.") {
                     return Err(format!(
-                        "capability llm.provider_base '{}' resolves to a loopback/private/link-local host (SSRF)",
+                        "capability llm.provider_base '{}' points at the link-local / cloud-metadata range (SSRF)",
                         base
                     ));
                 }
@@ -502,6 +497,30 @@ mod tests {
         let mut c = llm_cap("https://api.openai.com");
         c.llm = Some(LlmProxy { provider_base: "ftp://api.openai.com".to_string() });
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_llm_validate_ssrf_narrowed_to_link_local() {
+        // The cloud-metadata / link-local range has no legitimate provider use and is
+        // rejected at config time (defense-in-depth before the execute-time check).
+        let meta = llm_cap("http://169.254.169.254/latest/meta-data");
+        let err = meta.validate().unwrap_err();
+        assert!(err.contains("link-local") || err.contains("metadata"), "got: {err}");
+
+        // Loopback + RFC1918 are LEGITIMATE self-hosted model-gateway addresses (the
+        // operator-fixed host is agent-untouchable). They VALIDATE at config; the
+        // authoritative DNS-resolving SSRF control runs at execute time.
+        for base in [
+            "http://127.0.0.1:9",
+            "http://localhost:11434", // e.g. a local Ollama gateway
+            "http://10.0.0.5:8000",
+            "http://192.168.1.10:8080",
+        ] {
+            assert!(
+                llm_cap(base).validate().is_ok(),
+                "self-hosted gateway base must validate at config: {base}"
+            );
+        }
     }
 
     #[test]

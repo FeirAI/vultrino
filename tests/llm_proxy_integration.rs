@@ -8,9 +8,10 @@
 //!    principal's bound LLM-proxy capability, and drives `execute_gated`. A
 //!    missing Bearer is `401`; a principal with no LLM-proxy capability is `403`
 //!    (fail-closed — no provider, no key, no metering bypass); a request that
-//!    DOES resolve a capability reaches the http plugin (proven by the SSRF guard
-//!    rejecting a private `provider_base`, i.e. the call genuinely ran through the
-//!    enforced path rather than being short-circuited).
+//!    DOES resolve a capability reaches the http plugin (proven by the execute-time
+//!    SSRF guard rejecting a loopback `provider_base` → a scrubbed `502 api_error`,
+//!    a shape only `execute_gated` can produce, i.e. the call genuinely ran through
+//!    the enforced path rather than being short-circuited).
 //!
 //! 2. **Metering + credential injection + egress scrub** (a stub upstream plugin
 //!    registered into the shared server, so the full `execute_gated` → `run_action`
@@ -289,10 +290,16 @@ async fn llm_no_capability_is_403_fail_closed() {
 
 #[tokio::test]
 async fn llm_resolves_capability_and_runs_enforced_path() {
-    // Point the LLM-proxy capability at a PRIVATE provider_base. A request must
-    // resolve the capability and reach the http plugin, where the SSRF guard
-    // rejects the private host — proving the proxy genuinely drove execute_gated
-    // (not a bypass, not a silent drop).
+    // Point the LLM-proxy capability at a loopback provider_base (a self-hosted
+    // gateway address — allowed at config; the agent can't change the host). A
+    // request must resolve the capability and reach the http plugin, where the
+    // authoritative SSRF guard rejects the loopback target at execute time —
+    // proving the proxy genuinely drove execute_gated (not a bypass, not a silent
+    // drop). The SSRF detail is intentionally egress-scrubbed (it never reflects
+    // to the agent), so the proof is the 502 `api_error` shape: distinct from the
+    // 401 (no bearer), 403 (no capability), and 500 (no provider URL) short-circuit
+    // shapes, it can only be produced by execute_gated returning an upstream
+    // failure — i.e. the http plugin actually ran.
     let (router, storage, _srv) =
         build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_provider_credential(&storage, "cred-openai").await;
@@ -303,13 +310,14 @@ async fn llm_resolves_capability_and_runs_enforced_path() {
         .oneshot(llm_req(Some(&token), "v1/chat/completions", serde_json::json!({ "model": "x" })))
         .await
         .unwrap();
-    // The http plugin's SSRF rejection surfaces as a 502 from the proxy (the
-    // upstream "failed"). The point is the call REACHED the plugin.
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-    let text = String::from_utf8_lossy(&body_bytes(resp).await).to_lowercase();
-    assert!(
-        text.contains("private") || text.contains("internal") || text.contains("ssrf"),
-        "the request must reach the http plugin (proving execute_gated ran): {text}"
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes(resp).await).expect("error body is JSON");
+    // Scrubbed upstream-failure shape — proves execute_gated ran + the plugin
+    // rejected the target, WITHOUT leaking the SSRF detail to the agent.
+    assert_eq!(
+        body["error"]["type"], "api_error",
+        "a 502 api_error proves the enforced execute path ran (not a short-circuit): {body}"
     );
 }
 

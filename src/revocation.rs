@@ -41,7 +41,11 @@ pub struct HttpRevocationClient {
 
 impl HttpRevocationClient {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::new() }
+        // The revocation POST carries the client_secret + refresh token, so it uses
+        // the shared guarded client (no auto-redirect + connect-time private-IP
+        // filter) on top of the request-time validate_token_url_ssrf below — closing
+        // both the redirect and the DNS-rebinding vectors for this secret egress.
+        Self { client: crate::plugins::build_guarded_client() }
     }
 }
 

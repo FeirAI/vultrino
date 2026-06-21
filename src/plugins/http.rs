@@ -12,13 +12,64 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Duration, Utc};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 
 /// HTTP plugin for API authentication
 pub struct HttpPlugin {
     client: Client,
+}
+
+/// SsrfGuardResolver is the connect-time half of the SSRF defense. validate_url_ssrf
+/// vets the host's resolution at REQUEST time, but reqwest re-resolves at CONNECT
+/// time, so a DNS-rebinding host (public at validate, private at connect) would slip
+/// past. This custom resolver runs at connect time and filters the system resolution
+/// to ONLY public IPs — a host that now resolves only to private/internal addresses
+/// fails closed (no addresses => connection error). It closes the rebinding TOCTOU
+/// for every request through the client, including OAuth token fetches. (Codex #12b.)
+struct SsrfGuardResolver;
+
+impl Resolve for SsrfGuardResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            // getaddrinfo is blocking; run it off the async reactor. Port 0 is a
+            // placeholder — reqwest applies the real port to each returned IP.
+            let resolved: std::io::Result<Vec<SocketAddr>> =
+                tokio::task::spawn_blocking(move || {
+                    (host.as_str(), 0u16)
+                        .to_socket_addrs()
+                        .map(|it| it.collect::<Vec<_>>())
+                })
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            let addrs = resolved
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+            // Keep ONLY public IPs; fail closed if nothing public remains.
+            let public = filter_public_addrs(addrs).map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> { Box::from(e) },
+            )?;
+            let iter: Addrs = Box::new(public.into_iter());
+            Ok(iter)
+        })
+    }
+}
+
+/// filter_public_addrs keeps only public IPs (drops a rebinding host's private
+/// connect-time answers) and fails closed when none remain. Split out so the SSRF
+/// filter is unit-testable without DNS.
+fn filter_public_addrs(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, &'static str> {
+    let public: Vec<SocketAddr> = addrs
+        .into_iter()
+        .filter(|a| !HttpPlugin::is_private_ip(&a.ip()))
+        .collect();
+    if public.is_empty() {
+        return Err("SSRF guard: host resolved only to private/internal IP addresses");
+    }
+    Ok(public)
 }
 
 /// Parameters for HTTP request action
@@ -56,21 +107,28 @@ struct TokenResponse {
 /// Buffer time before token expiration to trigger refresh (5 minutes)
 const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
 
+/// build_guarded_client constructs the reqwest client EVERY secret-bearing outbound
+/// path must use, so the SSRF guards can't be forgotten by a new caller:
+///   - redirect::Policy::none(): validate_url_ssrf checks only the INITIAL url;
+///     reqwest's default follows up to 10 hops, so a redirect to a private/link-local
+///     host (e.g. 169.254.169.254 IMDS) would escape the allowlist with no
+///     re-validation. none() surfaces the 3xx instead. (GLM #5.)
+///   - dns_resolver(SsrfGuardResolver): filters the CONNECT-time resolution to public
+///     IPs only, closing the DNS-rebinding TOCTOU that the request-time
+///     validate_url_ssrf cannot (the host re-resolves at connect). (Codex #12b.)
+pub(crate) fn build_guarded_client() -> Client {
+    Client::builder()
+        .user_agent("vultrino/0.1.0")
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(std::sync::Arc::new(SsrfGuardResolver))
+        .build()
+        .expect("Failed to create HTTP client")
+}
+
 impl HttpPlugin {
     /// Create a new HTTP plugin
     pub fn new() -> Self {
-        // SSRF: do NOT auto-follow redirects. validate_url_ssrf only checks the
-        // INITIAL url; reqwest's default follows up to 10 hops, so a redirect to a
-        // private/link-local host (e.g. 169.254.169.254 IMDS) would escape the
-        // SSRF allowlist with no re-validation. Policy::none() surfaces the 3xx to
-        // the caller instead of following it. (GLM review #5.)
-        let client = Client::builder()
-            .user_agent("vultrino/0.1.0")
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("Failed to create HTTP client");
-
-        Self { client }
+        Self { client: build_guarded_client() }
     }
 
     /// Validate token URL for SSRF protection - requires HTTPS. `pub(crate)` so
@@ -431,14 +489,12 @@ impl HttpPlugin {
                 }
             }
         }
-        // NOTE (Codex pass 4 — known residual): this validates the host's CURRENT
-        // resolution, but reqwest re-resolves at connect time, so a DNS-rebinding
-        // host (public at validate, private at connect) remains a TOCTOU gap. The
-        // redirect vector is already closed (the client uses redirect::Policy::none).
-        // Fully closing rebinding needs a pinning DNS resolver that re-checks
-        // is_private_ip at connect and reuses only vetted IPs — tracked separately.
-        // (A DNS *failure* here is not itself a fail-open: reqwest's connect uses the
-        // same resolver and fails too.)
+        // This is the REQUEST-time check (fast reject of obvious private targets +
+        // IP literals). The DNS-rebinding TOCTOU it cannot close on its own — a host
+        // public here but private at connect — IS closed by SsrfGuardResolver, which
+        // re-filters the CONNECT-time resolution to public IPs only (see new()). So
+        // the two together cover both the request-time and connect-time windows; a
+        // DNS *failure* here is not a fail-open (reqwest's connect resolves + fails too).
 
         Ok(url)
     }
@@ -749,6 +805,31 @@ mod tests {
         let result = HttpPlugin::validate_url_ssrf("http://169.254.0.1/api");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("private"));
+    }
+
+    // --- connect-time DNS-rebinding filter (Codex #12b) --------------------
+
+    #[test]
+    fn ssrf_resolver_drops_private_keeps_public() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        // A rebinding host that resolves to BOTH a public and an internal IP: the
+        // private one is dropped, the public one survives (we still connect, but
+        // never to the internal target).
+        let public = SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), 443));
+        let imds = SocketAddr::from((Ipv4Addr::new(169, 254, 169, 254), 443));
+        let got = filter_public_addrs(vec![imds, public]).expect("a public IP remains");
+        assert_eq!(got, vec![public], "only the public IP should be kept");
+    }
+
+    #[test]
+    fn ssrf_resolver_fails_closed_when_only_private() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        // The rebinding attack: at connect time the host resolves ONLY to an internal
+        // IP (IMDS / loopback). The filter must fail closed (no addresses to dial).
+        let imds = SocketAddr::from((Ipv4Addr::new(169, 254, 169, 254), 80));
+        let loopback = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 80));
+        let err = filter_public_addrs(vec![imds, loopback]).unwrap_err();
+        assert!(err.contains("private"), "must report a private-only failure: {err}");
     }
 
     #[test]
