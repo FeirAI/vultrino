@@ -587,15 +587,15 @@ impl McpServer {
             .and_then(|p| serde_json::from_value(p.clone()).ok())
             .ok_or_else(|| (INVALID_PARAMS, "Missing or invalid params".to_string()))?;
 
-        // Defense-in-depth principal gate (GLM review #1): a use-token (`vut_`)
-        // surfaces ONLY its granted named capabilities + check_approval at
-        // tools/list, but tools/call dispatches purely by name — so without this
-        // gate a use-token could CALL a generic built-in by name. The action-scope
-        // check in execute_gated already blocks the http-backed case (a govder
-        // token is scoped to a business-label glob, not the raw `http.request`
-        // action), but the LIST/CALL asymmetry should not be the only line: block
-        // the credential-wielding/enumeration built-ins outright for a use-token.
-        // (Admin `vk_` keys keep the full surface; named caps + check_approval pass.)
+        // Principal ALLOWLIST gate (GLM review #1 + Codex pass 4): a use-token
+        // (`vut_`) surfaces ONLY its granted named capabilities + check_approval at
+        // tools/list, but tools/call dispatches purely by name. A denylist of the
+        // three generic built-ins is INSUFFICIENT — any other name (e.g. `ssh_run`,
+        // `postgres_run_sql`, `ssh_deploy`) falls through to `try_plugin_tool` and
+        // runs a raw plugin tool, bypassing the named-capability registry. So for a
+        // use-token, ALLOW ONLY `check_approval` and a tool name that resolves to a
+        // stored named Capability; reject everything else here. (Admin `vk_` keys
+        // keep the full surface — they skip this gate.)
         let caller_is_use_token = params
             .arguments
             .get("api_key")
@@ -603,17 +603,16 @@ impl McpServer {
             .map(|k| k.starts_with("vut_"))
             .unwrap_or(false);
         if caller_is_use_token {
-            match params.name.as_str() {
-                "list_credentials" | "http_request" | "get_credential_info" => {
-                    return Err((
-                        INVALID_PARAMS,
-                        format!(
-                            "tool '{}' is not available to a use-token; call your granted named capabilities instead",
-                            params.name
-                        ),
-                    ));
-                }
-                _ => {}
+            let is_named_capability =
+                self.vultrino.capability_by_tool_name(&params.name).await.is_some();
+            if params.name != "check_approval" && !is_named_capability {
+                return Err((
+                    INVALID_PARAMS,
+                    format!(
+                        "tool '{}' is not available to a use-token; call your granted named capabilities instead",
+                        params.name
+                    ),
+                ));
             }
         }
 
@@ -841,9 +840,35 @@ impl McpServer {
     /// Handle resources/list request
     async fn handle_resources_list(
         &self,
-        _request: &JsonRpcRequest,
+        request: &JsonRpcRequest,
     ) -> Result<serde_json::Value, (i32, String)> {
-        // List credentials as resources
+        // Principal-scoped vault enumeration (GLM review #3 + Codex pass 4). This
+        // gate lives in the SHARED handler so BOTH stdio and HTTP are covered
+        // uniformly (the HTTP transport injects the Bearer into params.api_key):
+        //   - absent/invalid key  -> empty (fail-closed: never enumerate the vault
+        //                            to an unauthenticated caller).
+        //   - UseToken (vut_)     -> empty (a governed agent has named capabilities,
+        //                            not vault-enumeration rights).
+        //   - ApiKey (vk_)        -> only the credentials its role can access.
+        let empty = ResourcesListResult { resources: vec![] };
+        let api_key = request
+            .params
+            .as_ref()
+            .and_then(|p| p.get("api_key"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if api_key.is_empty() {
+            return serde_json::to_value(empty).map_err(|e| (INTERNAL_ERROR, e.to_string()));
+        }
+        let principal = match self.resolve_principal_for_read(api_key).await {
+            Ok(p) => p,
+            Err(_) => return serde_json::to_value(empty).map_err(|e| (INTERNAL_ERROR, e.to_string())),
+        };
+        if matches!(principal, McpPrincipal::UseToken { .. }) {
+            return serde_json::to_value(empty).map_err(|e| (INTERNAL_ERROR, e.to_string()));
+        }
+        let auth = principal.auth();
+
         let vultrino = &self.vultrino;
         let credentials = vultrino
             .storage()
@@ -853,6 +878,7 @@ impl McpServer {
 
         let resources: Vec<Resource> = credentials
             .iter()
+            .filter(|c| auth.can_access_credential(&c.alias))
             .map(|c| Resource {
                 uri: format!("vultrino://credential/{}", c.alias),
                 name: c.alias.clone(),

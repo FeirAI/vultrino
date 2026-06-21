@@ -934,8 +934,13 @@ impl VultrinoServer {
             .await;
         }
 
-        // Record for rate limiting.
-        self.policy_engine.record_request(&credential_alias);
+        // NOTE: rate-limit slots are charged ONCE at admission — the live policy
+        // evaluation (evaluate_full, record=true) calls check_rate_limit when a
+        // RateLimit condition matches. A second post-execution record_request here
+        // double-charged every successful call (a max=2 policy then admitted only
+        // one immediate call, and approval-resumed actions were charged twice).
+        // The admission-time charge is authoritative; do not re-charge here.
+        // (Codex pass 4.)
 
         info!(
             request_id = %request_id,

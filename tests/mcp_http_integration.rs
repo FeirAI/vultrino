@@ -519,3 +519,37 @@ async fn http_tools_call_generic_builtin_blocked_for_use_token() {
         "a use-token calling the generic http_request built-in must be rejected: {value:?}"
     );
 }
+
+#[tokio::test]
+async fn http_tools_call_plugin_tool_name_blocked_for_use_token() {
+    // ALLOWLIST gate (Codex pass 4): a use-token may call ONLY check_approval +
+    // its granted named capabilities. A raw plugin tool name (e.g. ssh_run,
+    // postgres_run_sql) that is NOT a denylisted built-in must still be rejected —
+    // it must not fall through to try_plugin_tool.
+    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    store_credential(&storage, "cred-sendgrid").await;
+    register_send_email(&storage, "cred-sendgrid").await;
+    let token = mint_token(&storage, "cred-sendgrid", Some("http.request"), None, None).await;
+
+    for tool in ["ssh_run", "postgres_run_sql", "ssh_deploy", "totally_made_up"] {
+        let resp = router
+            .clone()
+            .oneshot(mcp_req(
+                Some(&token),
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": { "name": tool, "arguments": { "credential": "cred-sendgrid" } }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = body_value(resp).await;
+        assert!(
+            value.get("error").is_some()
+                || value["result"]["isError"].as_bool().unwrap_or(false)
+                || value["result"]["is_error"].as_bool().unwrap_or(false),
+            "use-token calling plugin tool {tool:?} must be rejected (allowlist): {value:?}"
+        );
+    }
+}

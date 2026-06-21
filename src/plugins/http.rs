@@ -431,8 +431,14 @@ impl HttpPlugin {
                 }
             }
         }
-        // If DNS resolution fails, we'll let the request proceed and fail naturally
-        // This handles cases where DNS might be temporarily unavailable
+        // NOTE (Codex pass 4 — known residual): this validates the host's CURRENT
+        // resolution, but reqwest re-resolves at connect time, so a DNS-rebinding
+        // host (public at validate, private at connect) remains a TOCTOU gap. The
+        // redirect vector is already closed (the client uses redirect::Policy::none).
+        // Fully closing rebinding needs a pinning DNS resolver that re-checks
+        // is_private_ip at connect and reuses only vetted IPs — tracked separately.
+        // (A DNS *failure* here is not itself a fail-open: reqwest's connect uses the
+        // same resolver and fails too.)
 
         Ok(url)
     }

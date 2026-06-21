@@ -131,7 +131,10 @@ fn inject_bearer(message: &mut serde_json::Value, secret: &str) {
         return;
     };
     match method {
-        "tools/list" => {
+        "tools/list" | "resources/list" => {
+            // resources/list is principal-scoped in the shared handler (it returns
+            // empty for a use-token, role-filtered for an API key); inject the Bearer
+            // so the handler can resolve the principal over HTTP too.
             let params = ensure_object(message, "params");
             params.insert("api_key".to_string(), serde_json::Value::String(secret.to_string()));
         }
@@ -246,40 +249,9 @@ pub async fn mcp_jsonrpc(
     // overwrites any token the agent put in the body.
     inject_bearer(&mut message, &secret);
 
-    // Vault-enumeration gate (GLM review #3). `resources/list` returns EVERY
-    // credential's alias+description with no scope/tenant filter; `resources/read`
-    // exposes a credential resource. A governed use-token (`vut_`) holds named
-    // capabilities, not vault-enumeration rights — so block both for use-tokens at
-    // the transport (the principal is known here from the Bearer). An admin API key
-    // (`vk_`) keeps full access. (Matches UseToken::looks_like_token's `vut_`
-    // prefix.)
-    if secret.starts_with("vut_") {
-        if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
-            match method {
-                "resources/list" => {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "result": { "resources": [] }
-                        })),
-                    )
-                        .into_response();
-                }
-                "resources/read" => {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "error": { "code": -32001, "message": "resource access is not permitted for a use-token (use your named tools)" }
-                        })),
-                    )
-                        .into_response();
-                }
-                _ => {}
-            }
-        }
-    }
+    // (Vault-enumeration is gated in the SHARED MCP handler now — handle_resources_list
+    // resolves the injected principal and returns empty for a use-token / role-
+    // filtered for an API key — so both stdio and HTTP are covered by one gate.)
 
     // Dispatch through the SAME handler stdio uses, off the web process's shared
     // execution server. `McpServer` is a cheap wrapper over the shared `Arc`s, so
