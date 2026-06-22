@@ -194,12 +194,26 @@ impl Capability {
     /// `/v1/chat/completions`). Returns `None` if this is not an LLM-proxy
     /// capability or the join fails. The path's leading slash is normalized so
     /// `provider_base` may or may not carry a trailing slash and the result is
-    /// stable. Query strings on `path` are preserved.
+    /// stable. The normalized result is constrained to provider_base's
+    /// scheme/host/port AND path prefix (the agent controls only the path under the
+    /// prefix; see the containment check). NOTE: the LLM proxy does not forward the
+    /// inbound query string in v1 (it captures only the path).
     pub fn llm_upstream_url(&self, path: &str) -> Option<String> {
         let llm = self.llm.as_ref()?;
         let base_str = llm.provider_base.trim_end_matches('/');
         let base = url::Url::parse(base_str).ok()?;
         let suffix = path.trim_start_matches('/');
+        // Reject an ENCODED slash/backslash in the agent path (Codex high): url parsing
+        // keeps %2f/%5c as a single path char, so it survives the prefix-containment
+        // check below — but many upstream servers decode it to a separator, letting
+        // "..%2f..%2fadmin" escape a /openai-scoped base. These have no legitimate use
+        // in an OpenAI-style route.
+        {
+            let lower = suffix.to_ascii_lowercase();
+            if lower.contains("%2f") || lower.contains("%5c") {
+                return None;
+            }
+        }
         let joined = if suffix.is_empty() {
             base_str.to_string()
         } else {

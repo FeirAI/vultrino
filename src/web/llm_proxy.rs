@@ -187,8 +187,11 @@ async fn llm_proxy_impl(
         }
     };
 
-    // 3. Build the upstream provider URL (provider_base + inbound path). A query
-    //    string on the original request is preserved by appending it to the path.
+    // 3. Build the upstream provider URL (provider_base + inbound path). NOTE (v1):
+    //    the inbound query string is NOT forwarded — axum's {*path} captures only the
+    //    path, and `query` is sent as {} below. (Earlier docs wrongly claimed query
+    //    preservation; corrected per review. Forwarding query is a future enhancement
+    //    and would re-run the same scheme/host/port + prefix containment.)
     let upstream = match capability.llm_upstream_url(&path) {
         Some(u) => u,
         None => {

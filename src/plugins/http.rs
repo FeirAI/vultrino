@@ -14,7 +14,7 @@ use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 
 /// HTTP plugin for API authentication
@@ -56,6 +56,12 @@ impl Resolve for SsrfGuardResolver {
             Ok(iter)
         })
     }
+}
+
+/// embedded_v4 reconstructs the IPv4 address carried in two IPv6 segments (used to
+/// decode the IPv4 embedded in NAT64 / 6to4 prefixes so it can be SSRF-classified).
+fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
+    Ipv4Addr::new((hi >> 8) as u8, (hi & 0xff) as u8, (lo >> 8) as u8, (lo & 0xff) as u8)
 }
 
 /// filter_public_addrs keeps only public IPs (drops a rebinding host's private
@@ -413,8 +419,9 @@ impl HttpPlugin {
                 || ipv4.is_broadcast()
                 // Documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)
                 || ipv4.is_documentation()
-                // Unspecified (0.0.0.0)
-                || ipv4.is_unspecified()
+                // "This host on this network" — the WHOLE 0.0.0.0/8, not just
+                // 0.0.0.0: on Linux 0.0.0.1 etc. route to the local host (Codex high).
+                || ipv4.octets()[0] == 0
                 // Shared address space (100.64.0.0/10 - CGNAT)
                 || (ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64)
                 // Loopback extended (127.0.0.0/8 - already covered by is_loopback)
@@ -424,16 +431,24 @@ impl HttpPlugin {
                 || (ipv4.octets()[0] == 224 && ipv4.octets()[1] == 0 && ipv4.octets()[2] == 0)
             }
             IpAddr::V6(ipv6) => {
+                let seg = ipv6.segments();
                 // Loopback (::1)
                 ipv6.is_loopback()
                 // Unspecified (::)
                 || ipv6.is_unspecified()
                 // Unique local (fc00::/7)
-                || ((ipv6.segments()[0] & 0xfe00) == 0xfc00)
+                || ((seg[0] & 0xfe00) == 0xfc00)
                 // Link-local (fe80::/10)
-                || ((ipv6.segments()[0] & 0xffc0) == 0xfe80)
+                || ((seg[0] & 0xffc0) == 0xfe80)
                 // IPv4-mapped addresses - check the IPv4 portion
                 || Self::is_ipv4_mapped_private(ipv6)
+                // NAT64 well-known prefix 64:ff9b::/96 — embedded IPv4 in the low 32
+                // bits; decode + recurse so an internal IPv4 can't be reached via NAT64.
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b
+                    && Self::is_private_ip(&IpAddr::V4(embedded_v4(seg[6], seg[7]))))
+                // 6to4 2002::/16 — embedded IPv4 in segments [1..=2]; decode + recurse.
+                || (seg[0] == 0x2002
+                    && Self::is_private_ip(&IpAddr::V4(embedded_v4(seg[1], seg[2]))))
             }
         }
     }
@@ -833,6 +848,29 @@ mod tests {
         let loopback = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 80));
         let err = filter_public_addrs(vec![imds, loopback]).unwrap_err();
         assert!(err.contains("private"), "must report a private-only failure: {err}");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_this_host_range() {
+        // 0.0.0.0/8 ("this host on this network") — not just 0.0.0.0 (Codex high).
+        for url in ["http://0.0.0.1/api", "http://0.1.2.3/api", "http://0.0.0.0/api"] {
+            let r = HttpPlugin::validate_url_ssrf(url);
+            assert!(r.is_err(), "{url} must be blocked (0.0.0.0/8)");
+        }
+    }
+
+    #[test]
+    fn test_ssrf_blocks_nat64_and_6to4_embedded_private() {
+        use std::net::{IpAddr, Ipv6Addr};
+        // NAT64 64:ff9b::/96 embedding 169.254.169.254 -> blocked via recursion.
+        let nat64 = Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe); // 169.254.169.254
+        assert!(HttpPlugin::is_private_ip(&IpAddr::V6(nat64)), "NAT64-embedded link-local must be blocked");
+        // 6to4 2002::/16 embedding 10.0.0.1 -> blocked.
+        let v6to4 = Ipv6Addr::new(0x2002, 0x0a00, 0x0001, 0, 0, 0, 0, 0); // 10.0.0.1
+        assert!(HttpPlugin::is_private_ip(&IpAddr::V6(v6to4)), "6to4-embedded RFC1918 must be blocked");
+        // NAT64 embedding a PUBLIC IPv4 (8.8.8.8) is allowed (no false positive).
+        let nat64_pub = Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808);
+        assert!(!HttpPlugin::is_private_ip(&IpAddr::V6(nat64_pub)), "NAT64-embedded public IPv4 must be allowed");
     }
 
     #[test]
