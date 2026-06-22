@@ -197,17 +197,42 @@ impl Capability {
     /// stable. Query strings on `path` are preserved.
     pub fn llm_upstream_url(&self, path: &str) -> Option<String> {
         let llm = self.llm.as_ref()?;
-        let base = llm.provider_base.trim_end_matches('/');
+        let base_str = llm.provider_base.trim_end_matches('/');
+        let base = url::Url::parse(base_str).ok()?;
         let suffix = path.trim_start_matches('/');
         let joined = if suffix.is_empty() {
-            base.to_string()
+            base_str.to_string()
         } else {
-            format!("{}/{}", base, suffix)
+            format!("{}/{}", base_str, suffix)
         };
-        // Validate the joined result parses as an absolute http(s) URL so a
-        // malformed path can never produce a non-URL handed to the http plugin.
+        // Validate the joined result parses as an absolute http(s) URL so a malformed
+        // path can never produce a non-URL handed to the http plugin.
         let parsed = url::Url::parse(&joined).ok()?;
         if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return None;
+        }
+        // CONTAINMENT (Codex high): the agent supplies only the path, so the NORMALIZED
+        // upstream must stay on provider_base's scheme/host/port AND under its path
+        // prefix. url::Url normalization resolves dot-segments ("../", "%2e%2e"), so an
+        // agent path that escapes the configured prefix (e.g. base /openai + "../admin"
+        // -> /admin) is rejected here — the agent cannot steer the vault-credential'd
+        // POST to a sibling endpoint on the (possibly internal) provider host. We
+        // validate the PARSED form but return the original string the http plugin
+        // re-parses identically.
+        if parsed.scheme() != base.scheme()
+            || parsed.host_str() != base.host_str()
+            || parsed.port_or_known_default() != base.port_or_known_default()
+        {
+            return None;
+        }
+        let base_path = base.path().trim_end_matches('/'); // "" for a root base
+        let up_path = parsed.path();
+        let contained = if base_path.is_empty() {
+            up_path.starts_with('/')
+        } else {
+            up_path == base_path || up_path.starts_with(&format!("{}/", base_path))
+        };
+        if !contained {
             return None;
         }
         Some(joined)
@@ -590,6 +615,44 @@ mod tests {
             // None (rejected) is also acceptable — the point is it must NEVER yield a
             // different host.
         }
+    }
+
+    #[test]
+    fn test_llm_upstream_url_path_prefix_cannot_be_escaped() {
+        // A provider_base WITH a path prefix scopes the agent to that prefix. An agent
+        // path using dot-segments must NOT normalize outside it (Codex high) — else the
+        // vault-credential'd POST could hit a sibling endpoint on the same (internal)
+        // host. The host is fixed; the prefix must hold too.
+        let c = llm_cap("https://gateway.internal/openai");
+        // Legit paths under the prefix are allowed.
+        assert!(c.llm_upstream_url("/v1/chat/completions").is_some());
+        assert_eq!(c.llm_upstream_url("").as_deref(), Some("https://gateway.internal/openai"));
+        // Escapes are rejected (None).
+        for escape in [
+            "/../admin",
+            "../admin",
+            "/../../etc",
+            "/v1/../../admin",
+            "/%2e%2e/admin",
+            "/..%2Fadmin",
+        ] {
+            let got = c.llm_upstream_url(escape);
+            if let Some(u) = &got {
+                // If not rejected, it MUST still be under /openai/ (never escaped).
+                let p = url::Url::parse(u).unwrap();
+                assert!(
+                    p.path() == "/openai" || p.path().starts_with("/openai/"),
+                    "path {escape:?} escaped the /openai prefix -> {} (path {})",
+                    u,
+                    p.path()
+                );
+            }
+        }
+        // A sibling-prefix host path must not satisfy the prefix (/openai vs /openai2).
+        assert!(c.llm_upstream_url("/../openai2/secret").map_or(true, |u| {
+            let p = url::Url::parse(&u).unwrap();
+            p.path() == "/openai" || p.path().starts_with("/openai/")
+        }));
     }
 
     #[test]

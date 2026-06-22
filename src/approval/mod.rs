@@ -927,6 +927,20 @@ pub fn build_notifiers(cfg: &ApprovalConfig) -> Vec<std::sync::Arc<dyn ApprovalN
     notifiers
 }
 
+/// approval_notifier_client builds the client the approval notifiers use. Notifiers
+/// POST decision-bearing payloads (the approve/deny links carry capability tokens)
+/// plus an optional Authorization header to OPERATOR-configured endpoints. Those
+/// endpoints may legitimately be internal (a private collector), so we do NOT apply
+/// the agent-egress private-IP SSRF resolver here. But we DO disable redirects: a 3xx
+/// from the configured endpoint must not carry the decision token / auth header to an
+/// unintended target (Codex medium).
+fn approval_notifier_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Failed to build approval notifier client")
+}
+
 /// Telegram bot notifier: sends a message with inline Approve/Deny URL buttons.
 pub struct TelegramNotifier {
     config: TelegramConfig,
@@ -937,7 +951,7 @@ impl TelegramNotifier {
     pub fn new(config: TelegramConfig) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: approval_notifier_client(),
         }
     }
 }
@@ -1059,7 +1073,7 @@ impl WebhookNotifier {
     pub fn new(config: WebhookConfig) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: approval_notifier_client(),
         }
     }
 }

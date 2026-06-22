@@ -396,8 +396,11 @@ impl HttpPlugin {
         Ok(())
     }
 
-    /// Check if an IP address is private/internal (SSRF protection)
-    fn is_private_ip(ip: &IpAddr) -> bool {
+    /// Check if an IP address is private/internal (SSRF protection). `pub(crate)` so
+    /// every SSRF check (the connect-time resolver here, the HMAC plugin's literal
+    /// guard, etc.) shares ONE classifier — including the IPv4-mapped-IPv6 case
+    /// (`::ffff:a.b.c.d`) that a separate copy is easy to forget (Codex high).
+    pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
         match ip {
             IpAddr::V4(ipv4) => {
                 // Loopback (127.0.0.0/8)

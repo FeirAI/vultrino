@@ -101,9 +101,12 @@ impl HmacPlugin {
             PluginError::InvalidParams("URL must have a host".to_string())
         })?;
 
-        // Check for IP address literals
+        // Check for IP address literals (these never reach the connect-time DNS
+        // resolver, so the literal guard must catch them). Use the SHARED HTTP-plugin
+        // classifier so IPv4-mapped IPv6 literals (e.g. ::ffff:169.254.169.254) are
+        // rejected here too (Codex high) — a duplicated classifier missed them.
         if let Ok(ip) = host.parse::<IpAddr>() {
-            if Self::is_private_ip(&ip) {
+            if crate::plugins::HttpPlugin::is_private_ip(&ip) {
                 return Err(PluginError::InvalidParams(
                     "Requests to private/internal IP addresses are not allowed".to_string(),
                 ));
@@ -116,7 +119,7 @@ impl HmacPlugin {
 
         if let Ok(addrs) = socket_addr.to_socket_addrs() {
             for addr in addrs {
-                if Self::is_private_ip(&addr.ip()) {
+                if crate::plugins::HttpPlugin::is_private_ip(&addr.ip()) {
                     return Err(PluginError::InvalidParams(format!(
                         "Host '{}' resolves to private/internal IP address",
                         host
@@ -126,28 +129,6 @@ impl HmacPlugin {
         }
 
         Ok(url)
-    }
-
-    /// Check if an IP address is private/internal
-    fn is_private_ip(ip: &IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(ipv4) => {
-                ipv4.is_loopback()
-                    || ipv4.is_private()
-                    || ipv4.is_link_local()
-                    || ipv4.is_broadcast()
-                    || ipv4.is_documentation()
-                    || ipv4.is_unspecified()
-                    || (ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64)
-                    || ipv4.octets()[0] >= 240
-            }
-            IpAddr::V6(ipv6) => {
-                ipv6.is_loopback()
-                    || ipv6.is_unspecified()
-                    || ((ipv6.segments()[0] & 0xfe00) == 0xfc00)
-                    || ((ipv6.segments()[0] & 0xffc0) == 0xfe80)
-            }
-        }
     }
 
     /// Execute an HMAC-signed HTTP request
@@ -448,6 +429,22 @@ mod tests {
     fn test_validate_url_allows_https() {
         let result = HmacPlugin::validate_url_ssrf("https://fapi.asterdex.com/fapi/v1/account");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_url_blocks_ipv4_mapped_ipv6_literals() {
+        // IP literals never reach the connect-time DNS resolver, so the literal guard
+        // must reject IPv4-mapped IPv6 forms of internal targets (Codex high). The
+        // shared HttpPlugin classifier handles ::ffff:a.b.c.d.
+        for url in [
+            "https://[::ffff:127.0.0.1]/api",
+            "https://[::ffff:10.0.0.1]/api",
+            "https://[::ffff:169.254.169.254]/latest/meta-data",
+        ] {
+            let result = HmacPlugin::validate_url_ssrf(url);
+            assert!(result.is_err(), "{url} must be rejected as private/internal");
+            assert!(result.unwrap_err().to_string().contains("private"));
+        }
     }
 
     #[test]
