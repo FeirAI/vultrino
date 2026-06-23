@@ -72,6 +72,64 @@ pub struct Config {
     /// govder degrades gracefully — it skips drift detection on an empty hash).
     /// Never falls back to a bare unkeyed digest.
     pub policy_hash_secret: Option<String>,
+    /// Metered LLM-proxy tunables (connector M1, streaming): the streaming
+    /// kill-switch, the `stream_options.include_usage` injection toggle, and the
+    /// stream-safety DoS caps. Defaults are streaming-on with conservative caps.
+    pub llm_proxy: LlmProxyConfig,
+}
+
+/// Tunables for the metered LLM proxy's streaming path (connector M1).
+///
+/// All defaults make streaming work out of the box (`streaming_enabled = true`)
+/// with usage injection on and conservative resource caps. An operator can flip
+/// `streaming_enabled` off as a kill-switch (a `stream:true` request then has its
+/// stream flags stripped and is served buffered), or tune the caps for unusually
+/// long/large completions.
+#[derive(Debug, Clone)]
+pub struct LlmProxyConfig {
+    /// Master switch for incremental SSE streaming. When `false`, a `stream:true`
+    /// request still works: vultrino strips the stream flags so the upstream
+    /// returns a single JSON body and serves it on the buffered path (so an
+    /// operator disabling streaming never breaks a client, only de-streams it).
+    pub streaming_enabled: bool,
+    /// When `true` and a streamed OpenAI-chat request omits
+    /// `stream_options.include_usage`, vultrino injects `include_usage = true` so
+    /// the provider emits a terminal usage chunk and V13b token metering fires. An
+    /// explicit client value (true OR false) is always honored, never overwritten.
+    pub inject_stream_usage: bool,
+    /// Abort a stream that goes this many seconds without producing a chunk
+    /// (slow-loris upstream). `0` disables the idle timeout.
+    pub stream_idle_timeout_secs: u64,
+    /// Abort a stream that runs longer than this many seconds total (a
+    /// never-ending stream). `0` disables the total timeout.
+    pub stream_total_timeout_secs: u64,
+    /// Abort a stream once it has forwarded more than this many bytes to the agent
+    /// (unbounded body). `0` disables the byte cap.
+    pub stream_max_bytes: u64,
+    /// Fail closed if a single un-delimited SSE line / scrub carry-buffer would
+    /// exceed this many bytes (a delimiter-less giant line would otherwise OOM).
+    /// Must be > 0, and must comfortably exceed the longest credential secret form
+    /// (the scrub carry is sized off that): a secret form approaching this cap would
+    /// make every stream for that capability fail closed. The 4 MiB default is far
+    /// above any real secret.
+    pub stream_max_line_bytes: usize,
+}
+
+impl Default for LlmProxyConfig {
+    fn default() -> Self {
+        Self {
+            streaming_enabled: true,
+            inject_stream_usage: true,
+            // 2 min between chunks, 30 min total — generous for long completions
+            // while still bounding a stuck/slow-loris upstream.
+            stream_idle_timeout_secs: 120,
+            stream_total_timeout_secs: 1800,
+            // 256 MiB forwarded / 4 MiB single-line cap — far above any real
+            // completion, low enough to stop an unbounded/OOM stream.
+            stream_max_bytes: 256 * 1024 * 1024,
+            stream_max_line_bytes: 4 * 1024 * 1024,
+        }
+    }
 }
 
 /// Inbound workload-identity resolution config (V10/R6). A request carrying the
@@ -338,6 +396,8 @@ impl Config {
             })
             .transpose()?;
 
+        let llm_proxy = raw.llm_proxy.map(Into::into).unwrap_or_default();
+
         Ok(Self {
             server,
             storage,
@@ -356,6 +416,7 @@ impl Config {
             // a config dump never carries the key. Defaults to None here; the
             // process entrypoint fills it from `VULTRINO_POLICY_HASH_SECRET`.
             policy_hash_secret: None,
+            llm_proxy,
         })
     }
 
@@ -376,6 +437,7 @@ impl Config {
             tenants: std::collections::HashMap::new(),
             identity: None,
             policy_hash_secret: None,
+            llm_proxy: LlmProxyConfig::default(),
         }
     }
 

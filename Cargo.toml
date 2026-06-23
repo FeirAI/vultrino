@@ -17,7 +17,9 @@ async-trait = "0.1"
 # gzip/deflate/brotli enable response auto-decompression so egress secret-
 # redaction always operates on plaintext (a compressed body would hide a
 # reflected secret); reqwest also strips Content-Encoding when it decompresses.
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip", "deflate", "brotli"], default-features = false }
+# `stream` exposes Response::bytes_stream() for the incremental LLM-proxy SSE path
+# (so a streamed completion is forwarded chunk-by-chunk, not buffered whole).
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip", "deflate", "brotli", "stream"], default-features = false }
 
 # Web UI server
 axum = { version = "0.8", features = ["macros"] }
@@ -66,6 +68,12 @@ glob = "0.3"
 url = "2"
 urlencoding = "2"
 bytes = "1"
+# Stream primitives for the incremental LLM-proxy SSE path: `futures` gives the
+# `Stream`/`StreamExt` traits (StreamingResponse body + adaptor combinators);
+# `async-stream` lets the scrub+meter+abort adaptor be written as linear async
+# code (try_stream!) instead of a hand-rolled poll_next state machine.
+futures = "0.3"
+async-stream = "0.3"
 http = "1"
 once_cell = "1"
 parking_lot = "0.12"
@@ -83,6 +91,12 @@ fd-lock = "4.0.4"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Integration tests build real streaming responses (MockStreamingPlugin) and a
+# property oracle for the incremental scrubber.
+futures = "0.3"
+bytes = "1"
+proptest = "1"
+glob = "0.3"
 
 [features]
 default = []

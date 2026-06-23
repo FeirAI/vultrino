@@ -257,6 +257,179 @@ pub fn extract_model(raw_body: &[u8], request_params: &serde_json::Value) -> Opt
     })
 }
 
+/// Inject `stream_options.include_usage = true` into an OpenAI-chat streaming
+/// request body so the provider emits a terminal usage chunk (V13b token metering
+/// on a streamed turn). Only acts when the request is actually streaming
+/// (`stream == true`) and the client has NOT already set `include_usage` — an
+/// explicit client value (true OR false) is HONORED, never overwritten. The
+/// mutation is structural (additive into `stream_options`), never string concat, so
+/// it can't smuggle or drop sibling fields. The caller gates this on the request
+/// being OpenAI-chat-shaped (Anthropic / responses report usage natively and must
+/// not receive an `stream_options` field). Returns whether it injected.
+pub fn maybe_inject_stream_usage(body: &mut serde_json::Value) -> bool {
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+    if obj.get("stream").and_then(serde_json::Value::as_bool) != Some(true) {
+        return false;
+    }
+    let so = obj
+        .entry("stream_options")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(so_obj) = so.as_object_mut() else {
+        // A non-object stream_options is the client's; don't clobber it.
+        return false;
+    };
+    if so_obj.contains_key("include_usage") {
+        return false; // explicit client value → honor it
+    }
+    so_obj.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+    true
+}
+
+/// Incremental token-usage accumulator for a **streamed** LLM response (V13b on
+/// streams). Fed the RAW (pre-scrub) SSE bytes, it line-buffers across chunk
+/// boundaries and extracts ONLY token counts + the model from the top level of each
+/// recognized `data:` JSON event — never a substring scan (so a prompt that
+/// literally contains `"usage":{…}` can't forge a count) and never any prompt /
+/// content text. [`Self::finish`] yields the final `(usage, model)`.
+///
+/// Tolerates all three wire shapes:
+/// - **OpenAI chat** (`stream_options.include_usage`): a terminal `data:` event with
+///   top-level `usage.{prompt_tokens, completion_tokens}` and `choices: []`.
+/// - **OpenAI responses**: `response.completed` data carries
+///   `response.usage.{input_tokens, output_tokens}`.
+/// - **Anthropic messages**: `message_start` → `message.usage.input_tokens`;
+///   `message_delta` → `usage.output_tokens` (**cumulative** → last-writer-wins, so
+///   the final delta is authoritative; never summed).
+pub struct UsageAccumulator {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    model: Option<String>,
+    /// Carry for a partial trailing SSE line split across chunks.
+    line_buf: Vec<u8>,
+    /// Hard cap on a single un-delimited line; past it we stop accumulating (the
+    /// call just meters V13a-only — safe) rather than buffer unbounded.
+    max_line: usize,
+    capped: bool,
+}
+
+impl UsageAccumulator {
+    pub fn new(max_line: usize) -> Self {
+        Self {
+            input_tokens: None,
+            output_tokens: None,
+            model: None,
+            line_buf: Vec::new(),
+            max_line,
+            capped: false,
+        }
+    }
+
+    /// Feed one RAW upstream chunk (pre-scrub). Parses every complete line it
+    /// completes; a trailing partial line is carried to the next chunk.
+    pub fn push(&mut self, chunk: &[u8]) {
+        if self.capped {
+            return;
+        }
+        for &b in chunk {
+            if b == b'\n' {
+                let line = std::mem::take(&mut self.line_buf);
+                self.process_line(&line);
+            } else {
+                self.line_buf.push(b);
+                if self.line_buf.len() > self.max_line {
+                    // A delimiter-less giant line: stop accumulating (fail safe to
+                    // V13a-only), don't OOM.
+                    self.capped = true;
+                    self.line_buf.clear();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Flush any trailing partial line and return the final `(usage, model)`. A
+    /// usage split is returned only when BOTH input and output counts were seen.
+    pub fn finish(&mut self) -> (Option<TokenUsage>, Option<String>) {
+        if !self.line_buf.is_empty() {
+            let line = std::mem::take(&mut self.line_buf);
+            self.process_line(&line);
+        }
+        let usage = match (self.input_tokens, self.output_tokens) {
+            (Some(input_tokens), Some(output_tokens)) => Some(TokenUsage {
+                input_tokens,
+                output_tokens,
+            }),
+            _ => None,
+        };
+        (usage, self.model.take())
+    }
+
+    fn process_line(&mut self, line: &[u8]) {
+        let Ok(text) = std::str::from_utf8(line) else {
+            return;
+        };
+        let text = text.trim_end_matches('\r').trim();
+        // Only `data:` lines carry the JSON payload; `event:`/`id:`/comments are
+        // framing. A `[DONE]` sentinel is not JSON.
+        let Some(rest) = text.strip_prefix("data:") else {
+            return;
+        };
+        let rest = rest.trim();
+        if rest.is_empty() || rest == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(rest) else {
+            return;
+        };
+        self.absorb(&value);
+    }
+
+    /// Pull token counts + model from the TOP LEVEL of a parsed event (or the
+    /// `message`/`response` envelope), never from nested content.
+    fn absorb(&mut self, v: &serde_json::Value) {
+        if self.model.is_none() {
+            let model = v
+                .get("model")
+                .and_then(|m| m.as_str())
+                .or_else(|| v.get("message").and_then(|m| m.get("model")).and_then(|m| m.as_str()))
+                .or_else(|| v.get("response").and_then(|r| r.get("model")).and_then(|m| m.as_str()));
+            if let Some(m) = model {
+                self.model = Some(m.to_string());
+            }
+        }
+        // Recognized usage carriers: top-level, message.usage, response.usage.
+        let carriers = [
+            v.get("usage"),
+            v.get("message").and_then(|m| m.get("usage")),
+            v.get("response").and_then(|r| r.get("usage")),
+        ];
+        for usage in carriers.into_iter().flatten() {
+            let Some(obj) = usage.as_object() else { continue };
+            // INPUT tokens: FIRST-wins. The prompt count is reported once and early
+            // (OpenAI's terminal usage chunk; Anthropic's `message_start`); a stray
+            // `input_tokens` in a later event must not clobber the real prompt count.
+            if self.input_tokens.is_none() {
+                if let Some(p) = obj.get("prompt_tokens").and_then(serde_json::Value::as_u64) {
+                    self.input_tokens = Some(p);
+                } else if let Some(i) = obj.get("input_tokens").and_then(serde_json::Value::as_u64) {
+                    self.input_tokens = Some(i);
+                }
+            }
+            // OUTPUT tokens: LAST-wins. Anthropic's `output_tokens` is cumulative
+            // across `message_delta` events, so the final value is authoritative
+            // (never summed); OpenAI reports it once.
+            if let Some(c) = obj.get("completion_tokens").and_then(serde_json::Value::as_u64) {
+                self.output_tokens = Some(c);
+            }
+            if let Some(o) = obj.get("output_tokens").and_then(serde_json::Value::as_u64) {
+                self.output_tokens = Some(o);
+            }
+        }
+    }
+}
+
 /// Build the V13b token meter event payload — a second `MeterEvent`-shaped body
 /// emitted for a non-streamed LLM call alongside the V13a `api-calls=1` event for
 /// the **same** call (same `event_id`/`correlation_id`/`principal`/`dims`).
@@ -600,5 +773,139 @@ mod tests {
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("super-secret-signing-key"), "secret must not appear: {dbg}");
         assert!(dbg.contains("redacted"));
+    }
+
+    // --- UsageAccumulator (streamed token metering, V13b) ------------------
+
+    fn accumulate(chunks: &[&[u8]]) -> (Option<super::TokenUsage>, Option<String>) {
+        let mut acc = super::UsageAccumulator::new(1 << 20);
+        for c in chunks {
+            acc.push(c);
+        }
+        acc.finish()
+    }
+
+    #[test]
+    fn usage_accumulator_openai_chat_terminal_chunk() {
+        let (usage, model) = accumulate(&[
+            b"data: {\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":57,\"completion_tokens\":13}}\n\n",
+            b"data: [DONE]\n\n",
+        ]);
+        assert_eq!(usage, Some(super::TokenUsage { input_tokens: 57, output_tokens: 13 }));
+        assert_eq!(model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn usage_accumulator_handles_usage_split_across_chunks() {
+        // The usage JSON line is split mid-token across two pushes.
+        let (usage, _) = accumulate(&[
+            b"data: {\"choices\":[],\"usage\":{\"prompt_to",
+            b"kens\":100,\"completion_tokens\":200}}\n\n",
+        ]);
+        assert_eq!(usage, Some(super::TokenUsage { input_tokens: 100, output_tokens: 200 }));
+    }
+
+    #[test]
+    fn usage_accumulator_anthropic_cumulative_output_last_wins() {
+        // input from message_start; output is CUMULATIVE across message_delta events
+        // → the LAST value is authoritative (must NOT be summed: 5+15 != 15).
+        let (usage, model) = accumulate(&[
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n",
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":15}}\n\n",
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ]);
+        assert_eq!(usage, Some(super::TokenUsage { input_tokens: 25, output_tokens: 15 }));
+        assert_eq!(model.as_deref(), Some("claude-3-5-sonnet"));
+    }
+
+    #[test]
+    fn usage_accumulator_responses_api_completed_event() {
+        let (usage, _) = accumulate(&[
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n\n",
+        ]);
+        assert_eq!(usage, Some(super::TokenUsage { input_tokens: 7, output_tokens: 9 }));
+    }
+
+    #[test]
+    fn usage_accumulator_none_without_usage_trailer() {
+        let (usage, _) = accumulate(&[
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            b"data: [DONE]\n\n",
+        ]);
+        assert_eq!(usage, None);
+    }
+
+    #[test]
+    fn usage_accumulator_ignores_forged_usage_in_content() {
+        // A prompt/content that literally contains a usage object must NOT be counted
+        // — only the TOP LEVEL of a data event is read, never nested content.
+        let (usage, _) = accumulate(&[
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"\\\"usage\\\":{\\\"prompt_tokens\\\":999,\\\"completion_tokens\\\":999}\"}}]}\n\n",
+        ]);
+        assert_eq!(usage, None, "nested/forged usage must not be metered");
+    }
+
+    #[test]
+    fn usage_accumulator_input_is_first_wins() {
+        // input_tokens is reported once + early; a stray later value must NOT clobber
+        // the real prompt count (output stays last-wins / cumulative).
+        let (usage, _) = accumulate(&[
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":1}}}\n\n",
+            b"data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":9,\"output_tokens\":30}}\n\n",
+        ]);
+        assert_eq!(usage, Some(super::TokenUsage { input_tokens: 42, output_tokens: 30 }));
+    }
+
+    #[test]
+    fn usage_accumulator_only_input_or_only_output_yields_none() {
+        // A half-usage (only input, or only output) is not a complete split.
+        let (usage, _) = accumulate(&[b"data: {\"usage\":{\"prompt_tokens\":5}}\n\n"]);
+        assert_eq!(usage, None);
+    }
+
+    // --- maybe_inject_stream_usage -----------------------------------------
+
+    #[test]
+    fn inject_adds_include_usage_when_absent_and_streaming() {
+        let mut body = serde_json::json!({ "model": "gpt-4o", "stream": true });
+        assert!(super::maybe_inject_stream_usage(&mut body));
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn inject_honors_explicit_client_value() {
+        // Explicit false is honored (not overwritten).
+        let mut body =
+            serde_json::json!({ "stream": true, "stream_options": { "include_usage": false } });
+        assert!(!super::maybe_inject_stream_usage(&mut body));
+        assert_eq!(body["stream_options"]["include_usage"], false);
+        // Explicit true is left as-is.
+        let mut body2 =
+            serde_json::json!({ "stream": true, "stream_options": { "include_usage": true } });
+        assert!(!super::maybe_inject_stream_usage(&mut body2));
+        assert_eq!(body2["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn inject_noop_when_not_streaming() {
+        let mut body = serde_json::json!({ "model": "gpt-4o" });
+        assert!(!super::maybe_inject_stream_usage(&mut body));
+        assert!(body.get("stream_options").is_none());
+        // stream:false also no-ops.
+        let mut body2 = serde_json::json!({ "stream": false });
+        assert!(!super::maybe_inject_stream_usage(&mut body2));
+    }
+
+    #[test]
+    fn inject_preserves_sibling_stream_options() {
+        let mut body = serde_json::json!({
+            "stream": true,
+            "stream_options": { "some_other_flag": "x" }
+        });
+        assert!(super::maybe_inject_stream_usage(&mut body));
+        assert_eq!(body["stream_options"]["some_other_flag"], "x");
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 }

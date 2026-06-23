@@ -26,14 +26,25 @@
 //! leria PRICES. The proxy only has to drive that path with the agent's body; the
 //! token accounting is automatic and identical to any other metered action.
 //!
-//! ## Honest non-streaming caveat (carried, not hidden)
-//! vultrino buffers the upstream response whole (no SSE/streaming on the LLM
-//! path). A streamed completion (`{"stream": true}`) omits the `usage` object
-//! unless the client sets `stream_options.include_usage`, so for a streamed turn
-//! ONLY the V13a `api-calls=1` event fires (token counts are non-streaming-only).
-//! This is the documented v1 limitation (decision 5 / ARCHITECTURE caveats):
-//! prefer non-streamed for metered agents. The proxy still works for a streamed
-//! request — it buffers and returns the body — it just can't count tokens on it.
+//! ## Streaming (SSE)
+//! A `{"stream": true}` request is forwarded **incrementally** as
+//! `text/event-stream` (connector M1 streaming), engaged purely on the wire flag
+//! and the operator kill-switch (`[llm_proxy] streaming_enabled`, default on; when
+//! off, the stream flags are stripped and the turn is served buffered). The same
+//! gate runs ([`crate::server::VultrinoServer::execute_gated_streaming`] shares
+//! [`crate::server::VultrinoServer`]'s decision step with the buffered path), and
+//! the streamed body passes through an INCREMENTAL egress scrub (a secret split
+//! across SSE chunks is still caught) before reaching the agent.
+//!
+//! Metering on a streamed turn: V13a `api-calls=1` always fires (even on a halt or
+//! disconnect); the V13b token event fires on a clean end whose usage trailer was
+//! parsed. For OpenAI-chat requests vultrino injects
+//! `stream_options.include_usage` (honoring an explicit client value) so the
+//! provider emits that trailer; Anthropic `/v1/messages` and OpenAI `/v1/responses`
+//! report usage natively. Honest residuals: a capability with an operator `block`/
+//! `redact_patterns` egress rule, or a compressed response, is served BUFFERED
+//! (incremental scrub can't honor those); a client that sets
+//! `include_usage:false`, or a truncated/halted stream, meters V13a only.
 
 use axum::{
     extract::{Path, State},
@@ -57,6 +68,48 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Inbound request headers vultrino forwards verbatim to the provider. This is a
+/// strict ALLOWLIST (not a denylist) so a new SDK header can never accidentally
+/// smuggle the agent's vultrino Bearer, `Host`, `Content-Length`, or
+/// `Accept-Encoding` upstream — only these named provider-protocol headers ride
+/// along. Lower-cased for case-insensitive matching.
+///
+/// - `anthropic-version` is **required** by the Anthropic Messages API (a request
+///   without it 400s), so dropping it (as the pre-streaming proxy did) made the
+///   Anthropic provider unusable. `anthropic-beta` opts into beta features.
+/// - `openai-beta` / `openai-organization` / `openai-project` route/scope an
+///   OpenAI request when the SDK sets them.
+const FORWARDED_PROVIDER_HEADERS: &[&str] = &[
+    "anthropic-version",
+    "anthropic-beta",
+    "openai-beta",
+    "openai-organization",
+    "openai-project",
+];
+
+/// Copy the allowlisted provider-protocol headers from the inbound request into
+/// the forwarded header map. Never copies auth/transport headers (the allowlist
+/// excludes them by construction); the vault credential is injected downstream by
+/// the http plugin.
+fn forward_provider_headers(inbound: &HeaderMap, fwd: &mut HashMap<String, String>) {
+    for &name in FORWARDED_PROVIDER_HEADERS {
+        if let Some(value) = inbound.get(name).and_then(|v| v.to_str().ok()) {
+            let value = value.trim();
+            if !value.is_empty() {
+                fwd.insert(name.to_string(), value.to_string());
+            }
+        }
+    }
+}
+
+/// Whether the inbound proxy path targets an OpenAI **chat/completions**-style
+/// endpoint (so `stream_options.include_usage` injection is appropriate). Matches
+/// `…/chat/completions` and the legacy `…/completions`; excludes `/v1/responses`
+/// and Anthropic `/v1/messages`, which report streamed usage natively.
+fn is_openai_chat_path(path: &str) -> bool {
+    path.trim_end_matches('/').ends_with("/completions")
 }
 
 /// A JSON error response shaped like an OpenAI API error so the harness's model
@@ -241,7 +294,9 @@ async fn llm_proxy_impl(
     //     only). An allowlisted channel whose request carries NO parseable `model`
     //     fails CLOSED (default-deny symmetry) — we never forward an unverifiable
     //     model upstream with the vault key attached. This is the PEP for govder's
-    //     `llm.allowed_models`; the deny happens BEFORE any upstream call.
+    //     `llm.allowed_models`; the deny happens BEFORE any upstream call. It runs
+    //     ABOVE the streaming decision (4d) so a `stream:true` request can NOT evade
+    //     the model allowlist — buffered and streaming enforce identically.
     let requested_model = request_body
         .as_ref()
         .and_then(|b| b.get("model"))
@@ -265,20 +320,55 @@ async fn llm_proxy_impl(
     //     provider default can't exceed it. This bounds per-call output tokens (hence
     //     per-call cost), the enforceable substitute for a SpendCap (which fails closed
     //     on an LLM request that carries no request-time spend). Only the common
-    //     OpenAI-compatible `max_tokens` field is handled in v1.
+    //     OpenAI-compatible `max_tokens` field is handled in v1. Runs ABOVE the
+    //     streaming decision (4d) + usage injection, so it clamps the body BOTH the
+    //     buffered and streaming paths forward — `stream:true` can NOT evade the cap.
     if let Some(ceiling) = capability.llm_max_output_tokens() {
         if let Some(body) = request_body.as_mut() {
             clamp_max_output_tokens(body, ceiling);
         }
     }
 
-    // Forward Content-Type only; the credential (Authorization / API-key header)
-    // is injected by the http plugin from the vault. The agent's own
-    // Authorization header is the vultrino Bearer — it must NOT be forwarded
-    // upstream (the http plugin sets the provider auth header itself), so we do
-    // not copy inbound headers.
+    // 4d. Decide buffered vs streaming. Streaming engages purely on the wire flag
+    //     `{"stream": true}` and the operator kill-switch. When streaming is
+    //     DISABLED but the client asked for it, strip the stream flags so the
+    //     upstream returns a single JSON body served on the buffered path — never a
+    //     buffered `text/event-stream` blob, which would break the client's SSE
+    //     parser. Runs AFTER 4b/4c so the model allowlist + max_output_tokens clamp
+    //     already applied to the body that the streaming path forwards.
+    let streaming_requested = request_body
+        .as_ref()
+        .and_then(|b| b.get("stream"))
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    let streaming_enabled = state.config.llm_proxy.streaming_enabled;
+    let use_streaming = streaming_requested && streaming_enabled;
+    if streaming_requested && !streaming_enabled {
+        if let Some(obj) = request_body.as_mut().and_then(|b| b.as_object_mut()) {
+            obj.remove("stream");
+            obj.remove("stream_options");
+        }
+    }
+    // When streaming an OpenAI-chat request, inject `stream_options.include_usage`
+    // so the provider emits a terminal usage chunk and a streamed turn still meters
+    // V13b token counts. Anthropic `/v1/messages` and OpenAI `/v1/responses` report
+    // usage natively, so they are excluded (an unknown `stream_options` field could
+    // be rejected).
+    if use_streaming && state.config.llm_proxy.inject_stream_usage && is_openai_chat_path(&path) {
+        if let Some(b) = request_body.as_mut() {
+            crate::outbox::maybe_inject_stream_usage(b);
+        }
+    }
+
+    // Forward Content-Type plus a curated ALLOWLIST of provider protocol headers
+    // (e.g. Anthropic's REQUIRED `anthropic-version`). The credential
+    // (Authorization / API-key header) is injected by the http plugin from the
+    // vault. The agent's own Authorization header is the vultrino Bearer — it must
+    // NOT be forwarded upstream — so we copy only the named protocol headers and
+    // never a blanket set. See [`forward_provider_headers`].
     let mut fwd_headers: HashMap<String, String> = HashMap::new();
     fwd_headers.insert("Content-Type".to_string(), "application/json".to_string());
+    forward_provider_headers(&headers, &mut fwd_headers);
 
     // 5. Drive the action through the SAME enforced path the named tools use. The
     //    capability's action label (V8) is enforced + resolved by execute_gated;
@@ -295,6 +385,54 @@ async fn llm_proxy_impl(
             "query": {},
         }),
     };
+
+    // 6. Streaming path: forward the upstream SSE body incrementally. The gate is
+    //    identical to the buffered path; only the response body delivery differs.
+    if use_streaming {
+        return match state
+            .server
+            .execute_gated_streaming(execute_request, exec_auth)
+            .await
+        {
+            Ok(crate::server::StreamingOutcome::Streaming(exec)) => {
+                let status =
+                    StatusCode::from_u16(exec.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                // Preserve the provider Content-Type (e.g. text/event-stream) so the
+                // client's SSE parser engages; default to event-stream for a streamed
+                // turn that didn't echo one.
+                let content_type = exec
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "text/event-stream".to_string());
+                (
+                    status,
+                    [(header::CONTENT_TYPE, content_type)],
+                    axum::body::Body::from_stream(exec.body),
+                )
+                    .into_response()
+            }
+            Ok(crate::server::StreamingOutcome::Pending(approval)) => llm_error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                &format!(
+                    "This model request requires human approval and did not run (approval {})",
+                    approval.id
+                ),
+            ),
+            Err(e) => {
+                // Same no-leak posture as the buffered Err path: the scrub hasn't run
+                // on a pre-stream Err, so never echo the upstream detail to the agent.
+                tracing::warn!(error = %e, "LLM proxy upstream stream failed");
+                llm_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "LLM proxy upstream request failed (see server logs)",
+                )
+            }
+        };
+    }
 
     match state.server.execute_gated(execute_request, exec_auth).await {
         Ok(ExecutionOutcome::Completed(response)) => {

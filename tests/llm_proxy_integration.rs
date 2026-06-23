@@ -128,6 +128,71 @@ impl Plugin for MockLlmPlugin {
 }
 
 // ===========================================================================
+// A stub upstream that emits a REAL multi-chunk `text/event-stream`, with the
+// injected provider key SPLIT across two SSE chunks — so a test can prove the
+// incremental scrubber catches a secret straddling a chunk boundary.
+// ===========================================================================
+
+struct MockStreamingPlugin;
+
+#[async_trait]
+impl Plugin for MockStreamingPlugin {
+    fn name(&self) -> &str {
+        "mockstream"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["chat"]
+    }
+    async fn execute(&self, _request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        // Buffered fallback (unused by the streaming test, required by the trait).
+        Ok(ExecuteResponse {
+            status: 200,
+            headers: HashMap::new(),
+            body: b"{}".to_vec(),
+            updated_credential: None,
+        })
+    }
+    async fn execute_streaming(
+        &self,
+        request: PluginRequest,
+    ) -> Result<vultrino::StreamingResponse, PluginError> {
+        let injected_key = match &request.credential.data {
+            CredentialData::ApiKey { key, .. } => key.expose().to_string(),
+            _ => String::new(),
+        };
+        // Split the injected key across two chunks: the scrubber must hold back the
+        // boundary and still redact the reassembled secret. Chunk 2 also carries an
+        // OpenAI-style terminal usage frame so a test can prove streamed V13b metering.
+        let mid = injected_key.len() / 2;
+        let (key_a, key_b) = injected_key.split_at(mid);
+        let chunk1 = format!("event: message\ndata: {{\"model\":\"gpt-4o-mini\",\"echo\":\"{}", key_a);
+        let chunk2 = format!(
+            "{}\",\"content\":\"hi\"}}\n\ndata: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":11,\"completion_tokens\":22}}}}\n\ndata: [DONE]\n\n",
+            key_b
+        );
+        let body = futures::stream::iter(vec![
+            Ok(bytes::Bytes::from(chunk1)),
+            Ok(bytes::Bytes::from(chunk2)),
+        ]);
+        Ok(vultrino::StreamingResponse {
+            status: 200,
+            headers: HashMap::from([(
+                "content-type".to_string(),
+                "text/event-stream".to_string(),
+            )]),
+            body: Box::pin(body),
+            updated_credential: None,
+        })
+    }
+    fn validate_params(&self, _action: &str, _params: &serde_json::Value) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+// ===========================================================================
 // Harness
 // ===========================================================================
 
@@ -632,4 +697,164 @@ async fn llm_streamed_emits_api_calls_only_no_token_count() {
         token_events.is_empty(),
         "a streamed response (no usage trailer) must NOT emit a token event: {events:?}"
     );
+}
+
+// ===========================================================================
+// P1/P2 — real SSE passthrough + incremental scrub across a chunk boundary
+// ===========================================================================
+
+#[tokio::test]
+async fn llm_streamed_real_sse_passthrough_scrubs_split_key() {
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    // The streaming stub emits a genuine multi-chunk text/event-stream.
+    srv.plugins().register(Arc::new(MockStreamingPlugin));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(&storage, "cred-openai", "mockstream.chat", "https://api.openai.com").await;
+    let token = mint_token(&storage, "cred-openai", Some("mockstream.chat")).await;
+
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": true, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The provider Content-Type is preserved so the client's SSE parser engages.
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.contains("text/event-stream"),
+        "a streamed response must keep Content-Type text/event-stream, got: {ct}"
+    );
+
+    let raw = body_bytes(resp).await;
+    let body_str = String::from_utf8_lossy(&raw);
+    // The injected provider key was SPLIT across two SSE chunks; the incremental
+    // scrubber must still catch the reassembled secret — it must NOT leak.
+    assert!(
+        !body_str.contains(PROVIDER_KEY),
+        "the provider key was split across SSE chunks and LEAKED through the stream: {body_str}"
+    );
+    assert!(
+        body_str.contains("[REDACTED:cred-openai]"),
+        "the boundary-straddling secret should be replaced by the scrub marker: {body_str}"
+    );
+    // The SSE framing flows through untouched (the [DONE] sentinel survives).
+    assert!(
+        body_str.contains("[DONE]"),
+        "the SSE [DONE] sentinel must pass through verbatim: {body_str}"
+    );
+
+    // A real streamed call meters V13a api-calls=1 AND — because chunk 2 carried an
+    // OpenAI usage trailer — the V13b priced token event (the limitation removed).
+    let events = meter_events(&storage).await;
+    let api_calls: Vec<_> = events.iter().filter(|p| p["asset"] == "api-calls").collect();
+    let token_events: Vec<_> = events.iter().filter(|p| p["asset"] == "usd").collect();
+    assert_eq!(api_calls.len(), 1, "a real streamed call meters api-calls=1: {events:?}");
+    assert_eq!(token_events.len(), 1, "a streamed usage trailer now emits V13b: {events:?}");
+    let te = token_events[0];
+    assert_eq!(te["tokens"]["input_tokens"], 11, "input tokens from the streamed usage chunk");
+    assert_eq!(te["tokens"]["output_tokens"], 22, "output tokens from the streamed usage chunk");
+    assert!(te.get("amount").is_none(), "a priced token event must NOT carry an amount");
+    assert_eq!(te["dims"]["model_ref"], "gpt-4o-mini", "model_ref parsed from the stream");
+    assert_eq!(te["correlation_id"], api_calls[0]["correlation_id"], "same occurrence");
+}
+
+#[tokio::test]
+async fn llm_streamed_block_egress_rule_falls_back_to_buffered_withhold() {
+    // An operator `block` egress rule on this (credential, action) can't be honored
+    // incrementally, so a stream:true request must serve BUFFERED and the block rule
+    // withholds the body — never a partial stream of a secret-bearing response.
+    let config = Config {
+        enforcement: EnforcementConfig { default_action: EnforcementDefault::Deny },
+        policies: vec![allow_policy("cred-*")],
+        egress: vec![vultrino::egress::EgressRule {
+            credential_pattern: glob::Pattern::new("cred-*").unwrap(),
+            action_pattern: glob::Pattern::new("*").unwrap(),
+            block: true,
+            redact_patterns: vec![],
+        }],
+        ..Config::default()
+    };
+    let (router, storage, srv) = build_stack(config).await;
+    srv.plugins().register(Arc::new(MockStreamingPlugin));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(&storage, "cred-openai", "mockstream.chat", "https://api.openai.com").await;
+    let token = mint_token(&storage, "cred-openai", Some("mockstream.chat")).await;
+
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": true, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = body_bytes(resp).await;
+    let body_str = String::from_utf8_lossy(&raw);
+    // The block rule withheld the body (buffered fallback ran whole-body egress).
+    assert!(
+        body_str.contains("withheld by egress policy"),
+        "a block rule must withhold the buffered fallback body: {body_str}"
+    );
+    assert!(!body_str.contains(PROVIDER_KEY), "no key leak on the withheld fallback");
+}
+
+// ===========================================================================
+// P4 — a V6 halt cancels an in-flight stream
+// ===========================================================================
+
+#[tokio::test]
+async fn llm_streamed_halt_cancels_midstream() {
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    srv.plugins().register(Arc::new(MockStreamingPlugin));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(&storage, "cred-openai", "mockstream.chat", "https://api.openai.com").await;
+    let token = mint_token(&storage, "cred-openai", Some("mockstream.chat")).await;
+    // The halt target is the in-flight session's principal/token id (the minted
+    // token carries no agent label), which `signal_halt` matches.
+    let token_id = storage.list_use_tokens().await.unwrap().into_iter().next().unwrap().id;
+
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": true, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The gate already passed and the session is registered (begin runs eagerly), so
+    // halting now stores an abort permit; the adaptor aborts on its first poll
+    // (biased select) when the body is consumed below.
+    let outcome = srv.halt_agent(&token_id).await.unwrap();
+    assert_eq!(outcome.agent_label, token_id);
+
+    let raw = body_bytes(resp).await;
+    let body_str = String::from_utf8_lossy(&raw);
+    assert!(
+        body_str.contains("request halted"),
+        "a halted stream must emit the terminal halt frame: {body_str}"
+    );
+    assert!(!body_str.contains(PROVIDER_KEY), "no key leak on the halted stream");
+
+    // A halted streamed call still meters V13a api-calls=1, but NOT V13b (a halted
+    // stream has no trustworthy usage trailer — never under-count).
+    let events = meter_events(&storage).await;
+    let api_calls: Vec<_> = events.iter().filter(|p| p["asset"] == "api-calls").collect();
+    let token_events: Vec<_> = events.iter().filter(|p| p["asset"] == "usd").collect();
+    assert_eq!(api_calls.len(), 1, "a halted streamed call still meters api-calls=1: {events:?}");
+    assert!(token_events.is_empty(), "a halted stream emits no V13b token event: {events:?}");
 }

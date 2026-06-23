@@ -14,8 +14,44 @@ use crate::storage::StorageBackend;
 use crate::{
     Credential, ExecuteRequest, ExecuteResponse, ExecutionOutcome, RequestContext, VultrinoError,
 };
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
+use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+/// The body stream of a streaming execution: scrubbed byte chunks delivered to
+/// the agent. The error type is `io::Error` so axum's `Body::from_stream` accepts
+/// it; in practice the adaptor never yields `Err` — a fatal upstream/scrub
+/// condition is converted into a terminal in-band SSE `error` frame and the stream
+/// ends cleanly (the agent's SDK sees a clean SSE error, not a torn connection).
+pub type ScrubbedBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+
+/// A generic terminal SSE `error` frame emitted in-band when a stream fails after
+/// the head was already sent (upstream transport error, or a fail-closed scrub).
+/// Deliberately detail-free — the agent must never see the upstream error body /
+/// SSRF reason (mirrors the buffered path, which withholds upstream `Err` detail).
+/// `event: error` is the SSE convention both OpenAI and Anthropic clients surface.
+const SSE_ERROR_FRAME: &[u8] =
+    b"event: error\ndata: {\"error\":{\"type\":\"api_error\",\"message\":\"vultrino: upstream stream failed\"}}\n\n";
+
+/// A terminal SSE `error` frame emitted when a stream is HALTED mid-flight (V6).
+/// Distinct message from the generic upstream-failure frame so the agent's logs
+/// show the turn was deliberately stopped, not that the provider errored.
+const SSE_HALT_FRAME: &[u8] =
+    b"event: error\ndata: {\"error\":{\"type\":\"api_error\",\"message\":\"vultrino: request halted\"}}\n\n";
+
+/// One iteration's outcome in the streaming adaptor's select loop: a chunk to
+/// process, a clean end, or one of the terminal conditions (upstream error, a V6
+/// halt, or a DoS cap). Computed inside `select!` (no `yield` there) then matched.
+enum StreamStep {
+    Chunk(Bytes),
+    CleanEof,
+    UpstreamError,
+    Halted,
+    IdleTimeout,
+    TotalTimeout,
+}
 
 /// While a serving process executes an approved action, it refreshes the
 /// approval's execution claim this often so a slow-but-alive worker is never
@@ -136,6 +172,198 @@ impl RunError {
     /// it must not be retried.
     fn committed(error: VultrinoError) -> Self {
         Self { retryable: false, error }
+    }
+}
+
+/// The outcome of gating a request, produced once by
+/// [`VultrinoServer::prepare_execution`] and consumed by either the buffered
+/// (`run_action`) or the streaming (`run_action_streaming`) tail — so both share
+/// the EXACT same gate (no streaming-specific enforcement drift).
+enum PreparedAction {
+    /// Gated on human approval; nothing ran.
+    Pending(Box<ApprovalRequest>),
+    /// Passed every gate; carries everything an action tail needs to run.
+    Ready(Box<ReadyAction>),
+}
+
+/// A resolved, gate-passed action ready for its side-effecting tail.
+struct ReadyAction {
+    credential: Credential,
+    plugin_name: String,
+    action_name: String,
+    params: serde_json::Value,
+    context: RequestContext,
+    use_token_id: Option<String>,
+}
+
+/// Metering attribution captured before `context`/`credential` move into the
+/// plugin request, so the streamed-stream finalizer can emit the V13a/V13b
+/// `meter.observed` events after the stream ends — the same subject/timestamp the
+/// buffered path uses (see [`emit_meter`]).
+#[derive(Clone)]
+struct MeterAttribution {
+    request_id: String,
+    /// V4 principal: agent label, else key/token id, else credential alias.
+    principal: String,
+    /// The action's request timestamp (leria's bucketing clock).
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    /// V11 tenant tag (the credential's tenant, which must match the principal's).
+    tenant: Option<String>,
+    credential_alias: String,
+}
+
+/// A gate-passed streaming execution: the response head (status + already-scrubbed
+/// headers) plus the scrubbed body stream the web layer wraps in an axum
+/// `Body::from_stream`.
+pub struct StreamingExecution {
+    pub status: u16,
+    pub headers: std::collections::HashMap<String, String>,
+    pub body: ScrubbedBodyStream,
+}
+
+/// Streaming analogue of [`ExecutionOutcome`]: a started stream, or a pending
+/// approval (an LLM call routed to approval did not run — surfaced honestly).
+pub enum StreamingOutcome {
+    Streaming(StreamingExecution),
+    Pending(Box<ApprovalRequest>),
+}
+
+/// Emit the V13a `api-calls=1` meter event (always) and — when a token-usage split
+/// is known — the V13b priced token event, for a metered action. A free async fn
+/// over the outbox (`storage`) handle so it can run from BOTH the buffered
+/// `run_action` tail and the streaming finalizer (which outlives `run_action`'s
+/// frame and so can't borrow `&self`); the two paths therefore emit identical
+/// payloads via the same builders. Best-effort, exactly like
+/// [`VultrinoServer::emit_event`] — a metering/outbox hiccup never fails the action.
+async fn emit_meter(
+    storage: &Arc<dyn StorageBackend>,
+    attr: &MeterAttribution,
+    usage: Option<crate::outbox::TokenUsage>,
+    model: Option<&str>,
+) {
+    // V13a: exactly one api-calls=1 observation for the admitted+executed call.
+    if let Err(e) = storage
+        .append_event(
+            &attr.principal,
+            crate::outbox::EVENT_METER_OBSERVED,
+            crate::outbox::meter_observed_payload(
+                &attr.request_id,
+                &attr.principal,
+                attr.occurred_at,
+                attr.tenant.as_deref(),
+                &attr.credential_alias,
+                None,
+            ),
+        )
+        .await
+    {
+        warn!(error = %e, "failed to append V13a meter event");
+    }
+
+    // V13b: the priced token event (asset=usd + tokens split), only when a usage
+    // split was parsed (a streamed turn with no usage trailer emits V13a only).
+    if let Some(usage) = usage {
+        if let Err(e) = storage
+            .append_event(
+                &attr.principal,
+                crate::outbox::EVENT_METER_OBSERVED,
+                crate::outbox::meter_tokens_payload(
+                    &attr.request_id,
+                    &attr.principal,
+                    attr.occurred_at,
+                    attr.tenant.as_deref(),
+                    &attr.credential_alias,
+                    model,
+                    usage,
+                ),
+            )
+            .await
+        {
+            warn!(error = %e, "failed to append V13b token meter event");
+        }
+    }
+}
+
+/// Wrap a fully-buffered (and already egress-scrubbed) [`ExecuteResponse`] as a
+/// single-chunk [`StreamingExecution`]. Used when a `stream:true` request must be
+/// served buffered — an operator block/redact egress rule applies, so incremental
+/// scrub can't honor it. Framing headers are stripped (axum frames from the bytes).
+fn buffered_as_stream(resp: ExecuteResponse) -> StreamingExecution {
+    let ExecuteResponse {
+        status,
+        mut headers,
+        body,
+        ..
+    } = resp;
+    headers.retain(|k, _| {
+        !k.eq_ignore_ascii_case("content-length") && !k.eq_ignore_ascii_case("transfer-encoding")
+    });
+    let chunk = Bytes::from(body);
+    StreamingExecution {
+        status,
+        headers,
+        body: Box::pin(futures::stream::once(
+            async move { Ok::<Bytes, std::io::Error>(chunk) },
+        )),
+    }
+}
+
+/// Emits the metering events for a streamed call EXACTLY ONCE, on whichever of two
+/// paths wins (connector M1, V13b on streams):
+/// - **clean end / in-band error:** the adaptor calls [`Self::finalize`] with the
+///   parsed usage (clean EOF) or `None` (a truncated/errored turn → V13a only).
+/// - **client disconnect / panic:** the adaptor's generator future is dropped
+///   mid-await so `finalize` never runs; `Drop` then spawns a V13a-only emit (a sync
+///   `Drop` can't await, hence the detached task).
+///
+/// An `AtomicBool` makes the two paths mutually exclusive, so V13a fires once and
+/// only once for the call.
+struct StreamFinalizer {
+    storage: Arc<dyn StorageBackend>,
+    attribution: MeterAttribution,
+    emitted: std::sync::atomic::AtomicBool,
+}
+
+impl StreamFinalizer {
+    fn new(storage: Arc<dyn StorageBackend>, attribution: MeterAttribution) -> Self {
+        Self {
+            storage,
+            attribution,
+            emitted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Emit the meter events inline at a known stream terminus. `usage` is `Some`
+    /// only on a clean EOF that parsed a token split; an errored/truncated turn
+    /// passes `None` (V13a only — a partial stream has no trustworthy usage).
+    async fn finalize(&self, usage: Option<crate::outbox::TokenUsage>, model: Option<String>) {
+        if self
+            .emitted
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        emit_meter(&self.storage, &self.attribution, usage, model.as_deref()).await;
+    }
+}
+
+impl Drop for StreamFinalizer {
+    fn drop(&mut self) {
+        // Disconnect/panic before a terminus: emit V13a-only via a detached task
+        // (Drop can't await). No-op if finalize() already emitted.
+        if !self
+            .emitted
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Only spawn when a runtime is live: dropping the body during runtime
+            // shutdown would make `tokio::spawn` panic. Metering is best-effort
+            // (fail-open), so skipping the emit on shutdown is acceptable.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let storage = Arc::clone(&self.storage);
+                let attribution = self.attribution.clone();
+                handle.spawn(async move { emit_meter(&storage, &attribution, None, None).await });
+            }
+        }
     }
 }
 
@@ -361,22 +589,31 @@ impl VultrinoServer {
         Ok(self.execute_gated(request, exec_auth).await?.into_response())
     }
 
-    /// Execute a request, gating it on human approval when required.
+    /// Run the full gating decision for a request **without** running the action.
+    ///
+    /// This is the single, shared gate: permission/scope checks, use-token
+    /// credential+action scope, V11 tenant isolation, policy `evaluate_full`
+    /// (URL/method/rate-limit/principal/spend), V12 dual-control, and approval
+    /// gating. Both the buffered ([`Self::execute_gated`]) and the streaming
+    /// ([`Self::execute_gated_streaming`]) entry points call this so streaming can
+    /// **never** diverge from the buffered enforcement — only how the response body
+    /// is fetched differs.
     ///
     /// Approval is required when **any** of these hold:
     /// - the credential is flagged with metadata `require_approval = "true"`,
     /// - a matching policy returns `Prompt`,
     /// - the auth context forces it (e.g. a use token with `require_approval`).
     ///
-    /// When gated, the action does **not** run: an [`ApprovalRequest`] is
-    /// created, persisted, and announced to the configured notifiers, and
-    /// [`ExecutionOutcome::Pending`] is returned. Otherwise the action runs
-    /// immediately (consuming the use token, if any).
-    pub async fn execute_gated(
+    /// When gated, the action does **not** run: an [`ApprovalRequest`] is created,
+    /// persisted, and announced to notifiers, and [`PreparedAction::Pending`] is
+    /// returned. Otherwise a [`PreparedAction::Ready`] carries everything the action
+    /// tail needs — the use token is NOT consumed here, the tail reserves it
+    /// fail-closed just before the side effect (identical on both paths).
+    async fn prepare_execution(
         &self,
         request: ExecuteRequest,
         exec_auth: ExecAuth,
-    ) -> Result<ExecutionOutcome, VultrinoError> {
+    ) -> Result<PreparedAction, VultrinoError> {
         let mut context = RequestContext::new();
 
         // Permission + scope checks (only when authenticated).
@@ -678,23 +915,59 @@ impl VultrinoServer {
                 "Action gated on human approval"
             );
 
-            return Ok(ExecutionOutcome::Pending(Box::new(approval)));
+            return Ok(PreparedAction::Pending(Box::new(approval)));
         }
 
-        // Not gated: run now (reserving the use token first, fail-closed).
-        let response = self
-            .run_action(
-                credential,
-                plugin_name,
-                action_name,
-                request.params.clone(),
-                context,
-                exec_auth.use_token.as_ref().map(|t| t.id.as_str()),
-            )
-            .await
-            .map_err(|re| re.error)?;
+        // Passed every gate. Hand the resolved action to the caller's tail — the
+        // buffered `run_action` (via `execute_gated`) or the streaming
+        // `run_action_streaming` (via `execute_gated_streaming`). The use token is
+        // NOT consumed here; the tail reserves it fail-closed just before the side
+        // effect, identical on both paths.
+        Ok(PreparedAction::Ready(Box::new(ReadyAction {
+            credential,
+            plugin_name: plugin_name.to_string(),
+            action_name: action_name.to_string(),
+            params: request.params.clone(),
+            context,
+            use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
+        })))
+    }
 
-        Ok(ExecutionOutcome::Completed(response))
+    /// Execute a request, gating it on human approval when required (buffered).
+    ///
+    /// Thin tail over [`Self::prepare_execution`]: gate, then either return the
+    /// pending approval or run the action whole via [`Self::run_action`]. This is
+    /// the original `execute_gated` behavior and signature, unchanged for callers.
+    pub async fn execute_gated(
+        &self,
+        request: ExecuteRequest,
+        exec_auth: ExecAuth,
+    ) -> Result<ExecutionOutcome, VultrinoError> {
+        match self.prepare_execution(request, exec_auth).await? {
+            PreparedAction::Pending(approval) => Ok(ExecutionOutcome::Pending(approval)),
+            PreparedAction::Ready(ready) => {
+                let ReadyAction {
+                    credential,
+                    plugin_name,
+                    action_name,
+                    params,
+                    context,
+                    use_token_id,
+                } = *ready;
+                let response = self
+                    .run_action(
+                        credential,
+                        &plugin_name,
+                        &action_name,
+                        params,
+                        context,
+                        use_token_id.as_deref(),
+                    )
+                    .await
+                    .map_err(|re| re.error)?;
+                Ok(ExecutionOutcome::Completed(response))
+            }
+        }
     }
 
     /// Run a plugin action against a resolved credential.
@@ -783,7 +1056,10 @@ impl VultrinoServer {
         // (and egress). The RAII guard deregisters on drop — including on error
         // or panic — so the registry reflects only genuinely running work, and a
         // halt can see what an agent is doing and fire its abort callbacks.
-        let _session = self.sessions.begin(crate::session::SessionEntry {
+        // Buffered execution ignores the abort handle (a single buffered
+        // plugin.execute isn't chunk-interruptible; halt's token-revoke + kill-policy
+        // legs still apply). The streaming path uses it (run_action_streaming).
+        let (_session, _abort) = self.sessions.begin(crate::session::SessionEntry {
             session_id: request_id.clone(),
             agent_label: context.agent_label.clone(),
             principal_id: context.api_key_id.clone(),
@@ -874,67 +1150,27 @@ impl VultrinoServer {
             .await;
         }
 
-        // V13a (leria metering): this action was ADMITTED (policy allow +
-        // credential injection happened) and has executed. Emit exactly one
-        // `meter.observed` MeterEvent (`asset=api-calls, amount=1`) onto the V9
-        // signed outbox so leria's `gateway-observed` cost source sees the call.
-        //
-        // Placement: post-`scrub_response`, on the same best-effort hook the
-        // `credential.rotated` emit (above) uses. V13a reads NO body bytes (a
-        // count of 1), so the scrub-order hazard that gates V13b's token read does
-        // NOT apply here — emitting after scrub is safe. The emit is best-effort
-        // (`emit_event` swallows append failures): a leria/outbox outage must NOT
-        // block or fail `/execute`. (leria compensates for a silently-dropped
-        // event with a monotonic-`sequence` gap detector on its poll feed — the
-        // v1 subscriber decision: leria POLLS `GET /api/v1/events?after=N`; we add
-        // no push fan-out, the single outbox push slot stays govder's.)
-        //
-        // No body/prompt/secret rides the event — ids + a count of 1 only.
-        // (`meter_principal`/`meter_occurred_at`/`meter_tenant` were captured
-        // above, before `context`/`credential` moved into the plugin request.)
-        // `model` is omitted: V13a does not parse the body.
-        self.emit_event(
-            &meter_principal,
-            crate::outbox::EVENT_METER_OBSERVED,
-            crate::outbox::meter_observed_payload(
-                &request_id,
-                &meter_principal,
-                meter_occurred_at,
-                meter_tenant.as_deref(),
-                &credential_alias,
-                None,
-            ),
+        // V13a/V13b (leria metering): this action was ADMITTED + executed. Emit the
+        // V13a `api-calls=1` event (always) and — when the RAW pre-scrub body carried
+        // a parseable provider usage block — the V13b priced token event, via the
+        // SHARED [`emit_meter`] (the streaming path emits the same payloads through
+        // the same builders, so the two can't drift). Best-effort: an outbox hiccup
+        // must not fail the action. `meter_token_usage` was read pre-scrub above;
+        // `meter_*` attribution was captured before `context`/`credential` moved.
+        let attribution = MeterAttribution {
+            request_id: request_id.clone(),
+            principal: meter_principal,
+            occurred_at: meter_occurred_at,
+            tenant: meter_tenant,
+            credential_alias: credential_alias.clone(),
+        };
+        emit_meter(
+            &self.storage,
+            &attribution,
+            meter_token_usage,
+            meter_model.as_deref(),
         )
         .await;
-
-        // V13b (leria metering, token counts): when the RAW response (read above,
-        // pre-scrub) carried a parseable provider usage block, emit a SECOND
-        // `meter.observed` event for the same call — `asset=usd` + a `tokens`
-        // {input,output} split + `dims.model_ref`, with the SAME
-        // event_id/correlation_id/principal/dims as the V13a event. vultrino sends
-        // COUNTS, not dollars: leria mints usd from the tokens via its RateCard and
-        // pins the rate_card_version (no pricing logic enters vultrino — the V3
-        // boundary). Emitted post-scrub on the same best-effort hook (the read,
-        // not the emit, is the scrub-order-sensitive step). No usage block (a
-        // streamed response without a usage trailer, or a non-LLM action) ⇒ no
-        // token event, only the V13a api-calls=1 above (the stated non-streaming-
-        // only v1 limitation). Counts + ids only — no prompt/body/secret.
-        if let Some(usage) = meter_token_usage {
-            self.emit_event(
-                &meter_principal,
-                crate::outbox::EVENT_METER_OBSERVED,
-                crate::outbox::meter_tokens_payload(
-                    &request_id,
-                    &meter_principal,
-                    meter_occurred_at,
-                    meter_tenant.as_deref(),
-                    &credential_alias,
-                    meter_model.as_deref(),
-                    usage,
-                ),
-            )
-            .await;
-        }
 
         // NOTE: rate-limit slots are charged ONCE at admission — the live policy
         // evaluation (evaluate_full, record=true) calls check_rate_limit when a
@@ -953,6 +1189,387 @@ impl VultrinoServer {
         );
 
         Ok(response)
+    }
+
+    /// Execute a request, gating it on approval, with the response body delivered
+    /// **incrementally** (connector M1, streaming LLM proxy).
+    ///
+    /// Identical gate to [`Self::execute_gated`] (via the shared
+    /// [`Self::prepare_execution`]); only the action tail differs — it runs
+    /// [`Self::run_action_streaming`] instead of `run_action`. An approval-gated
+    /// request returns [`StreamingOutcome::Pending`] *before any upstream byte is
+    /// fetched* (the surface that must never open an SSE body before the gate).
+    pub async fn execute_gated_streaming(
+        &self,
+        request: ExecuteRequest,
+        exec_auth: ExecAuth,
+    ) -> Result<StreamingOutcome, VultrinoError> {
+        match self.prepare_execution(request, exec_auth).await? {
+            PreparedAction::Pending(approval) => Ok(StreamingOutcome::Pending(approval)),
+            PreparedAction::Ready(ready) => {
+                let ReadyAction {
+                    credential,
+                    plugin_name,
+                    action_name,
+                    params,
+                    context,
+                    use_token_id,
+                } = *ready;
+                let full_action = format!("{}.{}", plugin_name, action_name);
+                // An operator `block`/`redact_patterns` egress rule on this
+                // (credential, action) can't be honored incrementally, so serve
+                // BUFFERED (full whole-body egress runs) as a single chunk — a safe,
+                // documented fallback rather than a partial scrub.
+                if !crate::egress::stream_is_egress_safe(
+                    &self.config.egress,
+                    &credential.alias,
+                    &full_action,
+                ) {
+                    let response = self
+                        .run_action(
+                            credential,
+                            &plugin_name,
+                            &action_name,
+                            params,
+                            context,
+                            use_token_id.as_deref(),
+                        )
+                        .await
+                        .map_err(|re| re.error)?;
+                    return Ok(StreamingOutcome::Streaming(buffered_as_stream(response)));
+                }
+                let exec = self
+                    .run_action_streaming(
+                        credential,
+                        &plugin_name,
+                        &action_name,
+                        params,
+                        context,
+                        use_token_id.as_deref(),
+                    )
+                    .await
+                    .map_err(|re| re.error)?;
+                Ok(StreamingOutcome::Streaming(exec))
+            }
+        }
+    }
+
+    /// Streaming analogue of [`Self::run_action`]: same fail-closed preamble
+    /// (preflight → consume use token → in-flight session begin), but the plugin
+    /// returns a [`crate::StreamingResponse`] and the body is forwarded through an
+    /// incremental egress scrub before reaching the agent.
+    ///
+    /// The preamble (validate, consume use token, capture metering attribution) is
+    /// identical to `run_action`; only the post-plugin half diverges. The
+    /// [`crate::session::SessionGuard`] is **moved into the returned stream** so it
+    /// lives until the last byte (the V6 registry reflects genuinely live streams).
+    /// The V13a meter event is emitted from the stream finalizer (so a streamed call
+    /// still meters), via the shared [`emit_meter`]. (Streamed V13b token counts,
+    /// `include_usage` injection, and per-session halt/abort + DoS caps are layered
+    /// on in later phases.)
+    async fn run_action_streaming(
+        &self,
+        credential: Credential,
+        plugin_name: &str,
+        action_name: &str,
+        params: serde_json::Value,
+        context: RequestContext,
+        use_token_id: Option<&str>,
+    ) -> Result<StreamingExecution, RunError> {
+        // Preflight (no side effects, no token consumed): resolve + validate.
+        let plugin = self.plugins.get(plugin_name).ok_or_else(|| {
+            RunError::retryable(VultrinoError::Plugin(
+                crate::plugins::PluginError::NotFound(plugin_name.to_string()),
+            ))
+        })?;
+        plugin
+            .validate_params(action_name, &params)
+            .map_err(|e| RunError::terminal(e.into()))?;
+
+        // Reserve the use token atomically, fail-closed, BEFORE the first byte —
+        // the point of no return, identical to the buffered path.
+        if let Some(tid) = use_token_id {
+            self.storage.consume_use_token(tid).await.map_err(|e| {
+                RunError::terminal(VultrinoError::PolicyDenied(format!(
+                    "Use token cannot be used: {}",
+                    e
+                )))
+            })?;
+        }
+
+        let request_id = context.request_id.clone();
+        let credential_id = credential.id.clone();
+        let credential_alias = credential.alias.clone();
+        let credential_metadata = credential.metadata.clone();
+        let credential_created_at = credential.created_at;
+        // Metering attribution (captured before `context`/`credential` move into the
+        // plugin request), identical derivation to the buffered path.
+        let meter_principal = context
+            .agent_label
+            .clone()
+            .or_else(|| context.api_key_id.clone())
+            .unwrap_or_else(|| credential_alias.clone());
+        let attribution = MeterAttribution {
+            request_id: request_id.clone(),
+            principal: meter_principal,
+            occurred_at: context.timestamp,
+            tenant: credential_metadata
+                .get("tenant")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            credential_alias: credential_alias.clone(),
+        };
+        // Capture the request-side model BEFORE `params` moves into the plugin
+        // request, mirroring the buffered path. The streamed usage tap prefers the
+        // model the provider echoes in the stream, but many streamed shapes omit a
+        // top-level `model`; without this fallback V13b would emit no `dims.model_ref`
+        // and leria would price the call CLOSED → token under-count (the dangerous
+        // direction). The buffered path already falls back this way.
+        let meter_request_model = params
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string);
+        // Capture the credential's secret material to scrub from the streamed body
+        // + headers, before `credential` moves into the plugin request.
+        let secret_material = credential.data.secret_material();
+        let full_action = format!("{}.{}", plugin_name, action_name);
+
+        // V6: register this stream as in-flight. The guard is MOVED into the stream
+        // adaptor below so it deregisters when the stream ends (not at this fn's
+        // return), making the registry reflect genuinely live streams. The abort
+        // handle is `select!`ed in the adaptor so a halt cancels the stream mid-flight.
+        let (session_guard, abort) = self.sessions.begin(crate::session::SessionEntry {
+            session_id: request_id.clone(),
+            agent_label: context.agent_label.clone(),
+            principal_id: context.api_key_id.clone(),
+            token_id: use_token_id.map(|s| s.to_string()),
+            credential: credential_alias.clone(),
+            action: full_action.clone(),
+            started_at: chrono::Utc::now(),
+        });
+
+        let plugin_request = crate::plugins::PluginRequest {
+            credential,
+            action: action_name.to_string(),
+            params,
+            context,
+        };
+
+        // Point of no return: open the upstream stream.
+        let streaming = plugin
+            .execute_streaming(plugin_request)
+            .await
+            .map_err(|e| RunError::committed(e.into()))?;
+
+        let status = streaming.status;
+
+        // Fail closed on a residual-compressed body (an encoding the HTTP client
+        // didn't decode, e.g. zstd): it's opaque to the secret scrubber, so withhold
+        // it rather than forward un-scrubbable bytes. Decided from the head, before
+        // any body byte. (reqwest auto-decodes gzip/deflate/br and strips the header,
+        // so this is the rare exotic-codec case.) Still meters V13a.
+        if crate::egress::headers_indicate_compression(&streaming.headers) {
+            warn!(
+                request_id = %request_id,
+                credential = %credential_alias,
+                "streamed response is compressed and cannot be scrubbed — withholding"
+            );
+            emit_meter(&Arc::clone(&self.storage), &attribution, None, None).await;
+            let placeholder = Bytes::from_static(
+                b"[vultrino: streamed response withheld - a compressed body could not be scrubbed for secrets]",
+            );
+            return Ok(StreamingExecution {
+                status,
+                headers: std::collections::HashMap::from([(
+                    "content-type".to_string(),
+                    "text/plain".to_string(),
+                )]),
+                // Move the V6 guard into the (single-chunk) body so the in-flight
+                // session deregisters when the placeholder is drained, not at this
+                // early return — symmetric with the main streaming path.
+                body: Box::pin(futures::stream::once(async move {
+                    let _guard = session_guard;
+                    Ok::<Bytes, std::io::Error>(placeholder)
+                })),
+            });
+        }
+
+        // Persist any credential update (e.g. OAuth2 refresh), known before the body
+        // streams — identical to the buffered path.
+        if let Some(updated_data) = &streaming.updated_credential {
+            let updated_credential = crate::Credential {
+                id: credential_id,
+                alias: credential_alias.clone(),
+                credential_type: updated_data.credential_type(),
+                data: updated_data.clone(),
+                metadata: credential_metadata,
+                created_at: credential_created_at,
+                updated_at: chrono::Utc::now(),
+            };
+            if let Err(e) = self.storage.store(&updated_credential).await {
+                warn!(request_id = %request_id, error = %e, "Failed to persist updated credential (token refresh)");
+            }
+            self.emit_event(
+                &credential_alias,
+                crate::outbox::EVENT_CREDENTIAL_ROTATED,
+                serde_json::json!({
+                    "credential": credential_alias,
+                    "credential_type": updated_data.credential_type().to_string(),
+                }),
+            )
+            .await;
+        }
+
+        // Scrub the response HEADERS before the head commits to the wire (a secret
+        // reflected in a provider header would otherwise escape — the streaming head
+        // is sent before any body byte), then strip framing headers a re-chunked /
+        // redacted body would invalidate (axum frames from the emitted bytes).
+        let mut headers = streaming.headers;
+        let forms = crate::egress::derive_secret_forms(&secret_material);
+        crate::egress::scrub_headers(&mut headers, &forms, &credential_alias);
+        headers.retain(|k, _| {
+            !k.eq_ignore_ascii_case("content-length")
+                && !k.eq_ignore_ascii_case("transfer-encoding")
+        });
+        drop(forms);
+
+        info!(
+            request_id = %request_id,
+            credential = %credential_alias,
+            action = %full_action,
+            status,
+            "Streaming request started"
+        );
+
+        // Build the body adaptor: hold the session guard for the stream's life, tee
+        // each RAW chunk to the usage accumulator (pre-scrub) AND the incremental
+        // scrubber (emit), enforce the DoS caps, honor a mid-stream halt, and run the
+        // metering finalizer when the stream terminates.
+        let caps = &self.config.llm_proxy;
+        let max_line = caps.stream_max_line_bytes;
+        let max_bytes = caps.stream_max_bytes;
+        let idle = (caps.stream_idle_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(caps.stream_idle_timeout_secs));
+        let total = (caps.stream_total_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(caps.stream_total_timeout_secs));
+        let upstream = streaming.body;
+        let alias_for_stream = credential_alias.clone();
+        let finalizer = StreamFinalizer::new(Arc::clone(&self.storage), attribution);
+        let body = async_stream::stream! {
+            // Held for the stream's whole life → deregisters on completion/drop.
+            let _guard = session_guard;
+            // `finalizer`'s Drop emits V13a-only if the consumer disconnects before a
+            // terminus (the generator is dropped mid-await and the code below never
+            // reaches `finalize`).
+            let finalizer = finalizer;
+            let mut scrubber =
+                crate::egress::StreamScrubber::new(&secret_material, &alias_for_stream, max_line);
+            let mut usage_acc = crate::outbox::UsageAccumulator::new(max_line);
+            let mut upstream = upstream;
+            let mut clean = true;
+            let mut total_bytes: u64 = 0;
+            let deadline = total.map(|d| tokio::time::Instant::now() + d);
+
+            loop {
+                // Race the next upstream chunk against: a mid-stream halt (V6), the
+                // total-duration cap, and the idle cap. `biased` checks halt first.
+                let step = {
+                    let next = upstream.next();
+                    tokio::pin!(next);
+                    tokio::select! {
+                        biased;
+                        _ = abort.notified() => StreamStep::Halted,
+                        _ = async {
+                            match deadline {
+                                Some(d) => tokio::time::sleep_until(d).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => StreamStep::TotalTimeout,
+                        r = async {
+                            match idle {
+                                Some(d) => tokio::time::timeout(d, next.as_mut()).await.map_err(|_| ()),
+                                None => Ok(next.as_mut().await),
+                            }
+                        } => match r {
+                            Err(()) => StreamStep::IdleTimeout,
+                            Ok(None) => StreamStep::CleanEof,
+                            Ok(Some(Ok(chunk))) => StreamStep::Chunk(chunk),
+                            Ok(Some(Err(_))) => StreamStep::UpstreamError,
+                        },
+                    }
+                };
+
+                match step {
+                    StreamStep::CleanEof => break,
+                    StreamStep::Halted => {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(SSE_HALT_FRAME));
+                        clean = false;
+                        break;
+                    }
+                    StreamStep::IdleTimeout
+                    | StreamStep::TotalTimeout
+                    | StreamStep::UpstreamError => {
+                        // Generic in-band SSE error, never the detail (the buffered path
+                        // withholds upstream Err detail too).
+                        yield Ok(Bytes::from_static(SSE_ERROR_FRAME));
+                        clean = false;
+                        break;
+                    }
+                    StreamStep::Chunk(chunk) => {
+                        total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+                        if max_bytes > 0 && total_bytes > max_bytes {
+                            yield Ok(Bytes::from_static(SSE_ERROR_FRAME));
+                            clean = false;
+                            break;
+                        }
+                        // Tee: usage tap reads the RAW chunk (pre-scrub, symmetric with
+                        // the buffered path's pre-scrub usage read); the scrubber emits.
+                        usage_acc.push(&chunk);
+                        match scrubber.push(&chunk) {
+                            Ok(out) => {
+                                if !out.is_empty() {
+                                    yield Ok(Bytes::from(out));
+                                }
+                            }
+                            Err(_) => {
+                                // Scrub fail-closed (e.g. buffer cap).
+                                yield Ok(Bytes::from_static(SSE_ERROR_FRAME));
+                                clean = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if clean {
+                if let Ok(out) = scrubber.finish() {
+                    if !out.is_empty() {
+                        yield Ok(Bytes::from(out));
+                    }
+                }
+                // Clean EOF: emit V13a + (when a usage split was parsed) the V13b
+                // priced token event — identical shape to the buffered path. Prefer
+                // the model the provider echoed in the stream; fall back to the
+                // request-side model so `dims.model_ref` is present whenever the
+                // buffered path would have had it (no stream-only pricing gap).
+                let (usage, stream_model) = usage_acc.finish();
+                let model = stream_model.or(meter_request_model);
+                finalizer.finalize(usage, model).await;
+            } else {
+                // Truncated/halted/errored turn: V13a only (a partial stream has no
+                // trustworthy usage trailer — emitting partial counts would
+                // under-count, the dangerous direction).
+                finalizer.finalize(None, None).await;
+            }
+            // _guard + finalizer drop here (finalizer already emitted → Drop no-op).
+        };
+
+        Ok(StreamingExecution {
+            status,
+            headers,
+            body: Box::pin(body),
+        })
     }
 
     /// Run a previously-approved action. Builds the request from the stored
@@ -1549,13 +2166,20 @@ impl VultrinoServer {
             }
         };
 
-        // Leg 3: fire abort callbacks for what this process has in flight — matched
-        // by the same target as the kill policy (label OR principal/token id), so a
-        // by-id halt aborts a label-less agent's sessions too. Each callback is
-        // best-effort and time-bounded (so a hanging integration can't block the
-        // halt — legs 1 & 2 have already taken effect; with N callbacks the wait is
-        // bounded by N × the per-callback timeout).
+        // Leg 3: cancel + notify what this process has in flight — matched by the
+        // same target as the kill policy (label OR principal/token id), so a by-id
+        // halt aborts a label-less agent's sessions too.
         let in_flight = self.sessions.for_halt_target(label);
+        // 3a: signal the per-session abort so an in-flight STREAM tears down within
+        // one chunk (the streaming adaptor `select!`s on its handle). This is the
+        // concrete in-process preemption — beyond "deny the next gated call".
+        let streams_signalled = self.sessions.signal_halt(label);
+        if streams_signalled > 0 {
+            info!(agent = %label, streams = streams_signalled, "signalled in-flight streams to abort");
+        }
+        // 3b: fire registered harness abort callbacks (external integrations). Each
+        // is best-effort and time-bounded (a hanging integration can't block the
+        // halt — legs 1 & 2 have already taken effect).
         let callbacks = self.halt_callbacks.read().clone();
         for cb in &callbacks {
             if tokio::time::timeout(

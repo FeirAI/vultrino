@@ -19,6 +19,7 @@ use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// A record of one in-flight gated execution (V6). Carries no secrets.
 #[derive(Debug, Clone, Serialize)]
@@ -47,6 +48,11 @@ pub struct SessionEntry {
 #[derive(Default)]
 pub struct SessionRegistry {
     sessions: RwLock<HashMap<String, SessionEntry>>,
+    /// Per-session abort handles, keyed by `session_id`. Kept in a SEPARATE map so
+    /// [`SessionEntry`] stays a pure serializable record (it's surfaced in the halt
+    /// API). A streaming execution `select!`s on its handle so a halt cancels it
+    /// mid-stream (the in-process leg of a halt, beyond "deny the next call").
+    aborts: RwLock<HashMap<String, Arc<Notify>>>,
 }
 
 impl SessionRegistry {
@@ -55,14 +61,56 @@ impl SessionRegistry {
     }
 
     /// Register an in-flight execution; returns an RAII [`SessionGuard`] that
-    /// deregisters it on drop, so an early return or panic still clears it.
-    pub fn begin(self: &Arc<Self>, entry: SessionEntry) -> SessionGuard {
+    /// deregisters it on drop (so an early return or panic still clears it) PLUS a
+    /// cloneable abort handle. A long-lived execution (a stream) should `select!` on
+    /// `notified()` so [`Self::signal_halt`] can cancel it; a buffered execution can
+    /// ignore the handle (halt's token-revoke + kill-policy legs still apply).
+    pub fn begin(self: &Arc<Self>, entry: SessionEntry) -> (SessionGuard, Arc<Notify>) {
         let session_id = entry.session_id.clone();
+        let abort = Arc::new(Notify::new());
         self.sessions.write().insert(session_id.clone(), entry);
-        SessionGuard {
-            registry: Arc::clone(self),
-            session_id,
+        self.aborts.write().insert(session_id.clone(), Arc::clone(&abort));
+        (
+            SessionGuard {
+                registry: Arc::clone(self),
+                session_id,
+            },
+            abort,
+        )
+    }
+
+    /// Signal an abort to every in-flight session matching a **halt target** (the
+    /// same predicate the kill policy + [`Self::for_halt_target`] use: agent label OR
+    /// principal id OR token id). Each matched session's `select!` on its abort
+    /// handle wakes and tears the stream down. Returns the number signalled. This is
+    /// the per-process leg of a halt; the cross-process legs (token revoke + kill
+    /// policy) still apply to everything else.
+    pub fn signal_halt(&self, target: &str) -> usize {
+        let ids: Vec<String> = {
+            let sessions = self.sessions.read();
+            sessions
+                .values()
+                .filter(|s| {
+                    s.agent_label.as_deref() == Some(target)
+                        || s.principal_id.as_deref() == Some(target)
+                        || s.token_id.as_deref() == Some(target)
+                })
+                .map(|s| s.session_id.clone())
+                .collect()
+        };
+        let aborts = self.aborts.read();
+        let mut signalled = 0;
+        for id in &ids {
+            if let Some(abort) = aborts.get(id) {
+                // `notify_one` (not `notify_waiters`) so the signal is NOT lost if the
+                // stream hasn't reached its `select!` on `notified()` yet: a permit is
+                // stored and the next poll completes immediately. Each session has its
+                // own handle with a single waiter (the adaptor), so one permit suffices.
+                abort.notify_one();
+                signalled += 1;
+            }
         }
+        signalled
     }
 
     /// A snapshot of all in-flight sessions.
@@ -117,6 +165,7 @@ pub struct SessionGuard {
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.registry.sessions.write().remove(&self.session_id);
+        self.registry.aborts.write().remove(&self.session_id);
     }
 }
 
@@ -153,9 +202,9 @@ mod tests {
         let reg = Arc::new(SessionRegistry::new());
         assert!(reg.is_empty());
         {
-            let _g1 = reg.begin(entry("s1", Some("bot-7")));
-            let _g2 = reg.begin(entry("s2", Some("bot-9")));
-            let _g3 = reg.begin(entry("s3", None));
+            let (_g1, _a1) = reg.begin(entry("s1", Some("bot-7")));
+            let (_g2, _a2) = reg.begin(entry("s2", Some("bot-9")));
+            let (_g3, _a3) = reg.begin(entry("s3", None));
             assert_eq!(reg.len(), 3);
             assert_eq!(reg.for_agent("bot-7").len(), 1);
             assert_eq!(reg.for_agent("bot-7")[0].session_id, "s1");
@@ -163,7 +212,7 @@ mod tests {
 
             // for_halt_target matches by principal id and token id independently
             // (distinct values so each match arm is exercised on its own).
-            let by_id = reg.begin(SessionEntry {
+            let (by_id, _a4) = reg.begin(SessionEntry {
                 session_id: "s4".to_string(),
                 agent_label: None,
                 principal_id: Some("vk_principal".to_string()),
@@ -185,13 +234,48 @@ mod tests {
     #[test]
     fn test_guard_drop_is_scoped_per_session() {
         let reg = Arc::new(SessionRegistry::new());
-        let g1 = reg.begin(entry("s1", Some("bot-7")));
+        let (g1, _a1) = reg.begin(entry("s1", Some("bot-7")));
         {
-            let _g2 = reg.begin(entry("s2", Some("bot-7")));
+            let (_g2, _a2) = reg.begin(entry("s2", Some("bot-7")));
             assert_eq!(reg.for_agent("bot-7").len(), 2);
         }
         assert_eq!(reg.for_agent("bot-7").len(), 1, "only s2 removed");
         drop(g1);
         assert!(reg.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_signal_halt_wakes_matching_session_abort() {
+        let reg = Arc::new(SessionRegistry::new());
+        let (_g1, abort1) = reg.begin(entry("s1", Some("bot-7")));
+        let (_g2, abort2) = reg.begin(entry("s2", Some("bot-9")));
+
+        // A waiter on bot-7's abort handle.
+        let waiter = {
+            let abort1 = Arc::clone(&abort1);
+            tokio::spawn(async move { abort1.notified().await })
+        };
+        // Give the waiter a moment to register, then halt bot-7.
+        tokio::task::yield_now().await;
+        let signalled = reg.signal_halt("bot-7");
+        assert_eq!(signalled, 1, "exactly bot-7's session is signalled");
+
+        // The matched waiter wakes; the unmatched handle is untouched.
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("halt must wake the matched session within 2s")
+            .unwrap();
+        assert_eq!(reg.signal_halt("bot-9"), 1, "bot-9 still present + signallable");
+        let _ = abort2;
+    }
+
+    #[test]
+    fn test_guard_drop_removes_abort_handle() {
+        let reg = Arc::new(SessionRegistry::new());
+        let (g1, _a1) = reg.begin(entry("s1", Some("bot-7")));
+        assert_eq!(reg.signal_halt("bot-7"), 1);
+        drop(g1);
+        // After the guard drops, there is no abort handle left to signal.
+        assert_eq!(reg.signal_halt("bot-7"), 0, "abort handle removed with the session");
     }
 }

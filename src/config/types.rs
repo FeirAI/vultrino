@@ -32,6 +32,8 @@ pub struct RawConfig {
     pub tenants: Vec<RawTenant>,
     /// Inbound workload-identity resolver (V10/R6).
     pub identity: Option<RawIdentityConfig>,
+    /// Metered LLM-proxy streaming tunables (connector M1).
+    pub llm_proxy: Option<RawLlmProxyConfig>,
 }
 
 /// TOML shape for `[identity]` (V10/R6): `kind = "spiffe"|"oidc"`,
@@ -372,6 +374,42 @@ impl From<RawMcpConfig> for McpConfig {
                 _ => McpTransport::Stdio,
             },
             socket_path: raw.socket_path.map(PathBuf::from),
+        }
+    }
+}
+
+/// TOML shape for `[llm_proxy]` (connector M1, streaming). Every field is
+/// optional; an absent field falls back to [`LlmProxyConfig`]'s streaming-on
+/// default. A `0` timeout/byte cap disables that specific limit.
+#[derive(Debug, Deserialize, Default)]
+pub struct RawLlmProxyConfig {
+    pub streaming_enabled: Option<bool>,
+    pub inject_stream_usage: Option<bool>,
+    pub stream_idle_timeout_secs: Option<u64>,
+    pub stream_total_timeout_secs: Option<u64>,
+    pub stream_max_bytes: Option<u64>,
+    pub stream_max_line_bytes: Option<usize>,
+}
+
+impl From<RawLlmProxyConfig> for LlmProxyConfig {
+    fn from(raw: RawLlmProxyConfig) -> Self {
+        let d = LlmProxyConfig::default();
+        Self {
+            streaming_enabled: raw.streaming_enabled.unwrap_or(d.streaming_enabled),
+            inject_stream_usage: raw.inject_stream_usage.unwrap_or(d.inject_stream_usage),
+            stream_idle_timeout_secs: raw
+                .stream_idle_timeout_secs
+                .unwrap_or(d.stream_idle_timeout_secs),
+            stream_total_timeout_secs: raw
+                .stream_total_timeout_secs
+                .unwrap_or(d.stream_total_timeout_secs),
+            stream_max_bytes: raw.stream_max_bytes.unwrap_or(d.stream_max_bytes),
+            // A 0 line cap is nonsensical (it would fail every chunk); fall back to
+            // the default rather than brick the streaming path.
+            stream_max_line_bytes: raw
+                .stream_max_line_bytes
+                .filter(|&n| n > 0)
+                .unwrap_or(d.stream_max_line_bytes),
         }
     }
 }

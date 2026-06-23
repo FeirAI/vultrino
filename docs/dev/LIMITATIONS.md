@@ -11,11 +11,14 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 - **Only the file storage backend is implemented.** `[storage] backend =
   "keychain"` and `"vault"` parse but error at runtime ("not yet implemented").
   The encrypted file vault is the only working backend.
-- **Token metering is non-streaming-only.** Vultrino buffers response bodies whole
-  and has no SSE/streaming awareness, so a streamed LLM call emits only the V13a
-  `api-calls=1` event, not the V13b token event (the provider's `usage` block is
-  absent from a streamed completion without `stream_options.include_usage`, which
-  Vultrino neither requires nor injects). See [METERING.md](METERING.md).
+- **Streamed metering has honest residuals.** A `{"stream": true}` LLM call is now
+  forwarded as incremental SSE with a streamed token meter (V13b), but: a capability
+  whose `(credential, action)` matches an operator `block`/`redact_patterns` egress
+  rule, or whose response is compressed, is served **buffered** (the incremental
+  scrubber runs only the always-on literal credential-secret scrub, not arbitrary
+  whole-body regex/block); a client that sets `stream_options.include_usage:false`,
+  or a truncated/halted stream, meters the V13a `api-calls=1` event only (no V13b
+  token counts). See [METERING.md](METERING.md).
 - **The meter emit is fail-open / out-of-band.** A swallowed `append_event`
   produces no event and **no sequence gap**, so a consumer's gap detector cannot
   see it — the swallowed-append case must be mitigated consumer-side
@@ -87,8 +90,11 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 
 ## Deferred (acknowledged, not yet built)
 
-- SSE/streaming awareness and the `stream_options.include_usage` decision (the
-  prerequisites for streamed-token metering).
+- Incremental `redact_patterns` regex on the streaming path (arbitrary regex can't
+  be applied correctly at a chunk boundary, so such capabilities are served
+  buffered — see the streamed-metering residual above).
+- GET `/v1/models`, inbound query-string forwarding, and provider selection by the
+  request `model` field on the LLM proxy (one key → one provider stays canonical).
 - An in-path zero-overshoot hard token ceiling.
 - Keychain and HashiCorp Vault storage backends.
 - Outbox push fan-out (today a single push subscriber; additional consumers poll).

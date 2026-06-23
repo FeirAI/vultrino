@@ -31,17 +31,18 @@ pub fn has_unredactable_secret(secrets: &[Zeroizing<String>]) -> bool {
     secrets.iter().any(|s| !s.is_empty() && s.len() < MIN_REDACT_LEN)
 }
 
-/// Scrub the credential's own secret material (and its percent-encoded /
-/// JSON-escaped forms) from a response body and headers (layer 1). Returns
-/// whether anything was changed.
-pub fn redact_secret_material(
-    resp: &mut ExecuteResponse,
-    secrets: &[Zeroizing<String>],
-    alias: &str,
-) -> bool {
-    let marker = format!("[REDACTED:{}]", alias);
-    // Build the forms to scrub, deduped and longest-first so a longer encoded
-    // form is replaced before a shorter form it may contain.
+/// Build the set of forms to scrub for a credential's secret material: the raw
+/// secret plus its percent-encoded and JSON-escaped representations, each at least
+/// [`MIN_REDACT_LEN`] bytes, deduplicated and sorted **longest-first** (so a longer
+/// encoded form is replaced before a shorter form it may contain).
+///
+/// This is the SINGLE source of truth for the scrub form-set: the buffered
+/// [`redact_secret_material`], the streaming [`StreamScrubber`], and
+/// [`scrub_headers`] all call it, so the two paths cannot disagree on what counts
+/// as a secret (a divergence would be a silent secret-leak vector). Parity is thus
+/// guaranteed by construction; the `streamed_scrub_equals_buffered` proptest also
+/// checks output equivalence over many forms/chunkings.
+pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
     let mut forms: Vec<String> = Vec::new();
     for secret in secrets {
         let raw: &str = secret;
@@ -62,6 +63,21 @@ pub fn redact_secret_material(
     forms.sort();
     forms.dedup();
     forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    forms
+}
+
+/// Scrub the credential's own secret material (and its percent-encoded /
+/// JSON-escaped forms) from a response body and headers (layer 1). Returns
+/// whether anything was changed.
+pub fn redact_secret_material(
+    resp: &mut ExecuteResponse,
+    secrets: &[Zeroizing<String>],
+    alias: &str,
+) -> bool {
+    let marker = format!("[REDACTED:{}]", alias);
+    // Forms to scrub, deduped and longest-first (shared with StreamScrubber so the
+    // buffered and streaming paths can never disagree on what counts as a secret).
+    let mut forms: Vec<String> = derive_secret_forms(secrets);
 
     let mut modified = false;
     for form in &forms {
@@ -264,6 +280,211 @@ fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec<u8>
         }
     }
     (out, hit)
+}
+
+/// Scrub the credential's secret forms out of header VALUES in place (the
+/// streaming-path analogue of the header half of [`redact_secret_material`]). The
+/// streaming response head commits to the wire before any body byte, so a secret
+/// reflected in a provider response header must be redacted here, before the head
+/// is flushed. `forms` is the shared [`derive_secret_forms`] set. Returns whether
+/// any header was changed.
+pub fn scrub_headers(
+    headers: &mut std::collections::HashMap<String, String>,
+    forms: &[String],
+    alias: &str,
+) -> bool {
+    let marker = format!("[REDACTED:{}]", alias);
+    let mut modified = false;
+    for v in headers.values_mut() {
+        for form in forms {
+            if v.contains(form.as_str()) {
+                *v = v.replace(form.as_str(), &marker);
+                modified = true;
+            }
+        }
+    }
+    modified
+}
+
+/// Whether a `(credential, action)` is safe to serve on the INCREMENTAL streaming
+/// path (connector M1). The always-on literal credential-secret scrub
+/// ([`StreamScrubber`]) runs incrementally, but the two operator [`EgressRule`]
+/// classifications cannot:
+/// - a `block` rule withholds the WHOLE body (any streamed byte is a leak), and
+/// - `redact_patterns` are arbitrary regexes that can match across an unbounded
+///   span, so no finite carry buffer can apply them correctly at a chunk seam.
+///
+/// When a matching rule carries either, the caller must fall back to the BUFFERED
+/// path (where `apply_egress` runs whole-body) rather than stream — an honest,
+/// fail-closed trade. Returns `true` only when no matching rule has `block` or a
+/// non-empty `redact_patterns`.
+pub fn stream_is_egress_safe(rules: &[EgressRule], alias: &str, action: &str) -> bool {
+    !rules
+        .iter()
+        .any(|r| r.matches(alias, action) && (r.block || !r.redact_patterns.is_empty()))
+}
+
+/// Whether response headers indicate a body the HTTP client did NOT decompress
+/// (an exotic `Content-Encoding`/`Transfer-Encoding` like `zstd`). Such a streamed
+/// body is opaque to the secret scrubber, so the streaming path must withhold it
+/// fail-closed — the streaming analogue of [`block_if_compressed`], decided from
+/// the head before any body byte is forwarded.
+pub fn headers_indicate_compression(headers: &std::collections::HashMap<String, String>) -> bool {
+    headers.iter().any(|(k, v)| {
+        (k.eq_ignore_ascii_case("content-encoding") || k.eq_ignore_ascii_case("transfer-encoding"))
+            && is_compression(v)
+    })
+}
+
+/// A fatal condition on the streaming scrub path. Surfaced so the adaptor can
+/// terminate the stream fail-closed rather than forward un-scrubbable bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScrubError {
+    /// The working buffer (retained carry + a single chunk) exceeded the configured
+    /// hard cap — a delimiter-less giant payload that could OOM. Fail closed.
+    BufferOverflow,
+}
+
+impl std::fmt::Display for ScrubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScrubError::BufferOverflow => {
+                write!(f, "stream scrub buffer exceeded the configured cap")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScrubError {}
+
+/// Incremental secret scrubber for a **streamed** response body (connector M1).
+///
+/// The whole-body [`redact_secret_material`] can't run on a stream, so this scrubs
+/// chunk-by-chunk while keeping the SAME guarantee: the credential's own secret
+/// (and its [`derive_secret_forms`] encoded variants) never reaches the agent —
+/// even when a secret straddles a chunk boundary.
+///
+/// ## Algorithm (carry-buffer)
+/// It holds back the trailing `keep = max_form_len - 1` bytes of the working buffer
+/// (`carry` + new chunk) each round, because a secret could *begin* within those
+/// bytes and complete in the next chunk. Bytes before that danger zone are final:
+/// a longest-first scan replaces every fully-present form occurrence with the
+/// marker and emits the rest. A match that *starts* before the danger zone but
+/// extends into it is fully present (forms are ≤ `max_form_len`), so it is replaced,
+/// not split. [`Self::finish`] flushes the residual carry (a trailing partial form
+/// is not a complete secret, so emitting it raw leaks nothing).
+///
+/// Security note: longest-first position scanning never leaves a complete form
+/// intact — to skip a form occurrence the scan would have to pass its start
+/// position without matching, but at that position the longest matching form (which
+/// includes this one if nothing longer matched) *does* match; the only way an
+/// occurrence is "missed" is if an earlier overlapping match already consumed its
+/// start byte, which destroys the secret anyway.
+pub struct StreamScrubber {
+    /// Secret byte-forms, longest-first, each ≥ [`MIN_REDACT_LEN`]. Zeroized on drop.
+    forms: Vec<Zeroizing<Vec<u8>>>,
+    /// The `[REDACTED:alias]` replacement bytes.
+    marker: Vec<u8>,
+    /// Raw, not-yet-emittable trailing bytes carried to the next chunk. Zeroized.
+    carry: Zeroizing<Vec<u8>>,
+    /// `max_form_len - 1`: how many trailing bytes to hold back (0 when no forms).
+    keep: usize,
+    /// Hard cap on the working buffer (carry + chunk); over it, fail closed.
+    max_buffer: usize,
+}
+
+impl StreamScrubber {
+    /// Build a scrubber for a credential's secret material. `max_buffer` bounds the
+    /// working buffer so a delimiter-less giant chunk fails closed instead of OOMing.
+    pub fn new(secrets: &[Zeroizing<String>], alias: &str, max_buffer: usize) -> Self {
+        let forms: Vec<Zeroizing<Vec<u8>>> = derive_secret_forms(secrets)
+            .into_iter()
+            .map(|s| Zeroizing::new(s.into_bytes()))
+            .collect();
+        let max_form_len = forms.iter().map(|f| f.len()).max().unwrap_or(0);
+        Self {
+            forms,
+            marker: format!("[REDACTED:{}]", alias).into_bytes(),
+            carry: Zeroizing::new(Vec::new()),
+            keep: max_form_len.saturating_sub(1),
+            max_buffer,
+        }
+    }
+
+    /// Whether this scrubber will never modify bytes (no secret ≥ [`MIN_REDACT_LEN`]).
+    /// Such a credential gets pure pass-through, matching the buffered path (which
+    /// also can't redact a sub-`MIN_REDACT_LEN` secret); operators are warned at
+    /// store time via [`has_unredactable_secret`].
+    pub fn is_noop(&self) -> bool {
+        self.forms.is_empty()
+    }
+
+    /// Feed one upstream chunk; returns the bytes safe to forward to the agent now
+    /// (the rest is retained as carry until the next chunk or [`Self::finish`]).
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, ScrubError> {
+        if self.forms.is_empty() {
+            return Ok(chunk.to_vec());
+        }
+        let mut working = std::mem::take(&mut *self.carry);
+        working.extend_from_slice(chunk);
+        if working.len() > self.max_buffer {
+            return Err(ScrubError::BufferOverflow);
+        }
+        let safe_end = working.len().saturating_sub(self.keep);
+        let (out, consumed) = self.scrub_prefix(&working, safe_end);
+        *self.carry = working[consumed..].to_vec();
+        // Wipe the transient working buffer (it held raw, pre-scrub bytes).
+        working.iter_mut().for_each(|b| *b = 0);
+        Ok(out)
+    }
+
+    /// Flush the residual carry at end-of-stream (everything is now final).
+    pub fn finish(&mut self) -> Result<Vec<u8>, ScrubError> {
+        if self.forms.is_empty() || self.carry.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut working = std::mem::take(&mut *self.carry);
+        let (out, _consumed) = self.scrub_prefix(&working, working.len());
+        // Wipe the transient buffer (it held raw, pre-scrub secret-bearing bytes),
+        // symmetric with `push`.
+        working.iter_mut().for_each(|b| *b = 0);
+        Ok(out)
+    }
+
+    /// Scrub `buf`, emitting final output and returning `(output, consumed)`. Bytes
+    /// `buf[consumed..]` are retained as carry. `safe_end` is the input index beyond
+    /// which an as-yet-incomplete match could still be completed by a future chunk:
+    /// at or past it, a non-matching position stops the scan (retain from there).
+    fn scrub_prefix(&self, buf: &[u8], safe_end: usize) -> (Vec<u8>, usize) {
+        let mut out = Vec::with_capacity(buf.len());
+        let mut i = 0;
+        while i < buf.len() {
+            let matched = self.forms.iter().find_map(|form| {
+                let f: &[u8] = form;
+                if i + f.len() <= buf.len() && &buf[i..i + f.len()] == f {
+                    Some(f.len())
+                } else {
+                    None
+                }
+            });
+            match matched {
+                Some(len) => {
+                    out.extend_from_slice(&self.marker);
+                    i += len;
+                }
+                None => {
+                    // No complete form at i. In the danger zone a future chunk could
+                    // still complete a match starting here, so stop and retain.
+                    if i >= safe_end {
+                        break;
+                    }
+                    out.push(buf[i]);
+                    i += 1;
+                }
+            }
+        }
+        (out, i)
+    }
 }
 
 #[cfg(test)]
@@ -537,5 +758,189 @@ mod tests {
         let mut r = resp("hello");
         assert!(!apply_egress(&mut r, &[rule("other-*", "*", true, &[])], "pay-1", "http.request"));
         assert_eq!(String::from_utf8_lossy(&r.body), "hello");
+    }
+
+    // --- StreamScrubber (incremental egress scrub) -------------------------
+
+    /// Run the incremental scrubber over `body`, chunked at `splits`, and return
+    /// the concatenated output (mirrors how the server adaptor drives it).
+    fn run_stream(secrets_in: &[&str], alias: &str, body: &[u8], splits: &[usize]) -> Vec<u8> {
+        let secs = secrets(secrets_in);
+        let mut sc = StreamScrubber::new(&secs, alias, 1 << 20);
+        let mut out = Vec::new();
+        let mut points: Vec<usize> = splits.iter().copied().filter(|&p| p <= body.len()).collect();
+        points.sort_unstable();
+        points.dedup();
+        if points.last() != Some(&body.len()) {
+            points.push(body.len());
+        }
+        let mut start = 0;
+        for p in points {
+            if p < start {
+                continue;
+            }
+            out.extend(sc.push(&body[start..p]).unwrap());
+            start = p;
+        }
+        out.extend(sc.finish().unwrap());
+        out
+    }
+
+    /// Buffered redaction of `body` (the oracle the streamed output must match).
+    fn run_buffered(secrets_in: &[&str], alias: &str, body: &[u8]) -> Vec<u8> {
+        let mut r = ExecuteResponse {
+            status: 200,
+            headers: HashMap::new(),
+            body: body.to_vec(),
+            updated_credential: None,
+        };
+        redact_secret_material(&mut r, &secrets(secrets_in), alias);
+        r.body
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn derive_secret_forms_is_longest_first_and_shared() {
+        // A secret with chars that differ under percent / JSON encoding yields ≥ 2
+        // forms, sorted longest-first. This is the single set both paths use.
+        let forms = derive_secret_forms(&secrets(&["a b\"c/d"]));
+        assert!(forms.len() >= 2, "expected raw + encoded forms: {forms:?}");
+        for w in forms.windows(2) {
+            assert!(w[0].len() >= w[1].len(), "forms must be longest-first: {forms:?}");
+        }
+        // A sub-MIN_REDACT_LEN secret contributes no form (matches buffered behavior).
+        assert!(derive_secret_forms(&secrets(&["pin"])).is_empty());
+    }
+
+    #[test]
+    fn stream_scrubber_no_split() {
+        let out = run_stream(&["sk-supersecret-123"], "x", b"echo sk-supersecret-123 end", &[]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(!s.contains("sk-supersecret-123"));
+        assert!(s.contains("[REDACTED:x]"));
+    }
+
+    #[test]
+    fn stream_scrubber_catches_boundary_split_secret() {
+        let secret = "supersecret-token-value";
+        let body = format!("before {secret} after");
+        let at = body.find(secret).unwrap() + 5; // split INSIDE the secret
+        let out = run_stream(&[secret], "x", body.as_bytes(), &[at]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(!s.contains(secret), "boundary-split secret leaked: {s}");
+        assert!(s.contains("[REDACTED:x]"));
+    }
+
+    #[test]
+    fn stream_scrubber_single_byte_chunks_match_buffered() {
+        let secret = "supersecret-token-value";
+        let body = format!("aa {secret} bb {secret}").into_bytes();
+        let by_byte = run_stream(&[secret], "x", &body, &(1..body.len()).collect::<Vec<_>>());
+        let buffered = run_buffered(&[secret], "x", &body);
+        assert_eq!(by_byte, buffered, "single-byte chunking must equal buffered redaction");
+    }
+
+    #[test]
+    fn stream_scrubber_partial_secret_at_end_is_flushed_not_leaked() {
+        // The stream ends mid-secret: the partial prefix is emitted raw (it is not a
+        // complete secret), and nothing is left stuck in the carry.
+        let secret = "supersecret-token-value";
+        let truncated = &secret.as_bytes()[..10]; // first 10 bytes only
+        let mut body = b"x ".to_vec();
+        body.extend_from_slice(truncated);
+        let out = run_stream(&[secret], "x", &body, &[]);
+        assert_eq!(out, body, "a partial (incomplete) secret must pass through unchanged");
+    }
+
+    #[test]
+    fn stream_scrubber_noop_when_no_redactable_secret() {
+        // All secrets below MIN_REDACT_LEN → pure pass-through.
+        let secs = secrets(&["pin", "abc"]);
+        let mut sc = StreamScrubber::new(&secs, "x", 1 << 20);
+        assert!(sc.is_noop());
+        let out = sc.push(b"the pin is abc here").unwrap();
+        assert_eq!(out, b"the pin is abc here");
+        assert!(sc.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stream_scrubber_buffer_cap_fails_closed() {
+        let secs = secrets(&["supersecret-token-value"]);
+        // Tiny cap: a chunk bigger than the cap trips BufferOverflow (fail closed),
+        // rather than buffering unbounded.
+        let mut sc = StreamScrubber::new(&secs, "x", 8);
+        let err = sc.push(b"way more than eight bytes").unwrap_err();
+        assert_eq!(err, ScrubError::BufferOverflow);
+    }
+
+    #[test]
+    fn stream_is_egress_safe_flags_block_and_regex() {
+        // A matching block rule OR a non-empty redact_patterns ⇒ NOT stream-safe.
+        assert!(!stream_is_egress_safe(&[rule("pay-*", "*", true, &[])], "pay-1", "http.request"));
+        assert!(!stream_is_egress_safe(
+            &[rule("*", "*", false, &["[0-9]+"])],
+            "any",
+            "http.request"
+        ));
+        // A rule that doesn't match, or no rules, is safe to stream.
+        assert!(stream_is_egress_safe(&[rule("other-*", "*", true, &[])], "pay-1", "http.request"));
+        assert!(stream_is_egress_safe(&[], "any", "http.request"));
+    }
+
+    #[test]
+    fn headers_indicate_compression_detects_residual_codecs() {
+        let mut compressed = HashMap::new();
+        compressed.insert("Content-Encoding".to_string(), "zstd".to_string());
+        assert!(headers_indicate_compression(&compressed));
+
+        let mut identity = HashMap::new();
+        identity.insert("content-type".to_string(), "text/event-stream".to_string());
+        identity.insert("content-encoding".to_string(), "identity".to_string());
+        assert!(!headers_indicate_compression(&identity));
+    }
+
+    #[test]
+    fn derive_secret_forms_yields_multiple_forms_for_special_chars() {
+        // A secret with a space + slash percent-encodes to a LONGER form than the raw
+        // bytes, so StreamScrubber's carry (sized off the longest form) must hold back
+        // more than the raw length — the case the proptest below exercises.
+        let forms = derive_secret_forms(&secrets(&["SECRET abcdef/1234567890"]));
+        assert!(forms.len() >= 2, "expected raw + percent-encoded forms: {forms:?}");
+        let longest = forms.iter().map(|f| f.len()).max().unwrap();
+        assert!(longest > "SECRET abcdef/1234567890".len(), "encoded form is longer than raw");
+    }
+
+    proptest::proptest! {
+        /// For ANY surrounding bytes and ANY chunk split, the streamed scrub equals
+        /// the buffered redaction, and no secret survives. The secret contains a space
+        /// and a slash, so it has TWO forms (raw + a longer percent-encoded form);
+        /// only the raw form is planted, so the paths stay byte-identical while the
+        /// carry buffer is still sized off the longer encoded form.
+        #[test]
+        fn streamed_scrub_equals_buffered(
+            prefix in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..48),
+            suffix in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..48),
+            split in 0usize..256,
+        ) {
+            let secret = "SECRET abcdef/1234567890"; // space + slash → raw + longer pct form
+            let mut body = prefix;
+            body.extend_from_slice(secret.as_bytes());
+            body.extend_from_slice(&suffix);
+
+            let buffered = run_buffered(&[secret], "x", &body);
+            let at = split % (body.len() + 1);
+            let streamed = run_stream(&[secret], "x", &body, &[at]);
+            proptest::prop_assert_eq!(&streamed, &buffered, "split at {} diverged", at);
+
+            // Chunking invariance: single-byte splits also equal the oracle.
+            let by_byte = run_stream(&[secret], "x", &body, &(1..body.len()).collect::<Vec<_>>());
+            proptest::prop_assert_eq!(&by_byte, &buffered);
+
+            // No occurrence of the planted secret survives.
+            proptest::prop_assert!(!contains_subslice(&streamed, secret.as_bytes()));
+        }
     }
 }

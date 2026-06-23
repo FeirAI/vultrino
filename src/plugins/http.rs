@@ -517,12 +517,20 @@ impl HttpPlugin {
         Ok(url)
     }
 
-    /// Execute an HTTP request
-    async fn execute_request(
+    /// Build the guarded outbound request shared by the buffered and streaming
+    /// paths: SSRF-validate the URL, OAuth-refresh if needed, inject the vault
+    /// credential, force client-managed encoding, and attach headers/query/body.
+    /// Returns the ready-to-send builder plus any refreshed credential to persist.
+    ///
+    /// Factored out so the streaming path ([`Self::execute_request_streaming`]) and
+    /// the buffered path ([`Self::execute_request`]) share EXACTLY the same SSRF
+    /// guards + credential injection — a streaming-only code path could otherwise
+    /// drift from the buffered one and forget a guard.
+    async fn prepare_request(
         &self,
         params: HttpRequestParams,
         cred_data: &CredentialData,
-    ) -> Result<ExecuteResponse, PluginError> {
+    ) -> Result<(reqwest::RequestBuilder, Option<CredentialData>), PluginError> {
         // Validate URL for SSRF before proceeding
         let validated_url = Self::validate_url_ssrf(&params.url)?;
 
@@ -571,6 +579,17 @@ impl HttpPlugin {
             request = request.json(&body);
         }
 
+        Ok((request, updated_credential))
+    }
+
+    /// Execute an HTTP request, buffering the whole response body.
+    async fn execute_request(
+        &self,
+        params: HttpRequestParams,
+        cred_data: &CredentialData,
+    ) -> Result<ExecuteResponse, PluginError> {
+        let (request, updated_credential) = self.prepare_request(params, cred_data).await?;
+
         // Execute request
         let response = request
             .send()
@@ -579,15 +598,7 @@ impl HttpPlugin {
 
         // Extract response details
         let status = response.status().as_u16();
-        let response_headers: HashMap<String, String> = response
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| {
-                v.to_str()
-                    .ok()
-                    .map(|v| (k.as_str().to_string(), v.to_string()))
-            })
-            .collect();
+        let response_headers = collect_response_headers(response.headers());
 
         let body = response
             .bytes()
@@ -602,6 +613,58 @@ impl HttpPlugin {
             updated_credential,
         })
     }
+
+    /// Execute an HTTP request, returning the response body as an **incremental
+    /// stream** (connector M1, streaming LLM proxy). Status + headers (+ any
+    /// refreshed credential) are known before the body, so a pre-stream error is
+    /// surfaced with the correct status; the body chunks flow through the server's
+    /// scrub + usage tap before reaching the agent. Same guarded client, same SSRF
+    /// + credential injection as the buffered path (via [`Self::prepare_request`]).
+    async fn execute_request_streaming(
+        &self,
+        params: HttpRequestParams,
+        cred_data: &CredentialData,
+    ) -> Result<crate::StreamingResponse, PluginError> {
+        use futures::StreamExt;
+
+        let (request, updated_credential) = self.prepare_request(params, cred_data).await?;
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| PluginError::Http(e.to_string()))?;
+
+        let status = response.status().as_u16();
+        let response_headers = collect_response_headers(response.headers());
+
+        // The upstream body as a chunk stream. A transport error mid-stream becomes
+        // a stream `Err`, which the server's adaptor turns into a terminal SSE error
+        // (it never reflects upstream detail to the agent). No body byte is buffered.
+        let body = response
+            .bytes_stream()
+            .map(|r| r.map_err(|e| PluginError::Http(e.to_string())));
+
+        Ok(crate::StreamingResponse {
+            status,
+            headers: response_headers,
+            body: Box::pin(body),
+            updated_credential,
+        })
+    }
+}
+
+/// Collect reqwest response headers into the plain `HashMap` shape vultrino's
+/// response types use, dropping any non-UTF-8 header value (those can't be
+/// scrubbed/forwarded as a `String` and don't carry model output).
+fn collect_response_headers(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 /// Remove any caller-supplied `Accept-Encoding` so the HTTP client negotiates
@@ -642,6 +705,22 @@ impl Plugin for HttpPlugin {
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
 
                 self.execute_request(params, &request.credential.data).await
+            }
+            _ => Err(PluginError::UnsupportedAction(request.action)),
+        }
+    }
+
+    async fn execute_streaming(
+        &self,
+        request: PluginRequest,
+    ) -> Result<crate::StreamingResponse, PluginError> {
+        match request.action.as_str() {
+            "request" => {
+                let params: HttpRequestParams = serde_json::from_value(request.params)
+                    .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+
+                self.execute_request_streaming(params, &request.credential.data)
+                    .await
             }
             _ => Err(PluginError::UnsupportedAction(request.action)),
         }

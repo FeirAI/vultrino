@@ -545,6 +545,58 @@ impl ExecuteResponse {
     }
 }
 
+/// A response whose body is delivered **incrementally** rather than buffered
+/// whole (connector M1, streaming LLM proxy).
+///
+/// The buffered [`ExecuteResponse`] collapses the upstream body into a `Vec<u8>`
+/// at the plugin seam, which the V7 egress scrub and V13b token-metering then
+/// operate on as one blob. The streaming LLM proxy can't do that — an SSE
+/// completion must reach the agent chunk-by-chunk — so a streaming-capable plugin
+/// returns this instead: the status + headers are known up front (so a pre-stream
+/// non-2xx error can still be detected before any body byte), and `body` yields
+/// the upstream bytes as they arrive. The server wraps `body` in the
+/// incremental-scrub + usage-tap adaptor before it reaches the agent; this type
+/// itself carries the **raw** upstream bytes.
+///
+/// Not `Serialize`/`Clone`/`Debug`: a live byte stream is none of those.
+pub struct StreamingResponse {
+    /// HTTP status code (known before the body streams).
+    pub status: u16,
+    /// Response headers (known before the body streams).
+    pub headers: HashMap<String, String>,
+    /// The upstream response body as a stream of byte chunks. Each item is a
+    /// chunk or a transport error; the server's adaptor scrubs + taps these.
+    pub body: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<bytes::Bytes, plugins::PluginError>> + Send>,
+    >,
+    /// Updated credential data (e.g. after OAuth2 token refresh) — captured before
+    /// the body streams, persisted by the server exactly as on the buffered path.
+    pub updated_credential: Option<CredentialData>,
+}
+
+impl StreamingResponse {
+    /// Wrap a fully-buffered [`ExecuteResponse`] as a single-chunk stream. This is
+    /// the default `Plugin::execute_streaming` behavior: a plugin that only
+    /// implements buffered `execute` still satisfies the streaming contract by
+    /// emitting its whole body as one chunk, so the streaming path never has to
+    /// special-case non-streaming plugins.
+    pub fn from_buffered(resp: ExecuteResponse) -> Self {
+        let ExecuteResponse {
+            status,
+            headers,
+            body,
+            updated_credential,
+        } = resp;
+        let chunk = bytes::Bytes::from(body);
+        Self {
+            status,
+            headers,
+            body: Box::pin(futures::stream::once(async move { Ok(chunk) })),
+            updated_credential,
+        }
+    }
+}
+
 /// Outcome of a (possibly approval-gated) execution.
 ///
 /// Most callers run an action and get a [`ExecuteResponse`] back. But when an

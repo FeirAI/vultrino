@@ -64,12 +64,13 @@ kebab-case enum values):
 V13a reads **no body bytes** (a count of 1), so it emits *after* `scrub_response`
 safely.
 
-## V13b — the token-count observation (non-streaming only)
+## V13b — the token-count observation
 
-For an admitted, **non-streamed** `/execute` whose response carries a parseable
-provider usage block, `run_action` emits a **second** `meter.observed` event (the
-token observation) alongside the V13a event for the same call. A response with no
-parseable usage block (a streamed response without a usage trailer, or any non-LLM
+For an admitted `/execute` (buffered) or LLM-proxy stream whose response carries a
+parseable provider usage block, the metering path emits a **second** `meter.observed`
+event (the token observation) alongside the V13a event for the same call, via the
+shared `emit_meter`. A response with no parseable usage block (a streamed response
+whose client suppressed the usage trailer, a truncated/halted stream, or any non-LLM
 action) emits **only** the V13a event.
 
 Built by `crate::outbox::meter_tokens_payload`:
@@ -122,16 +123,34 @@ recognized count pair yields no token event. The `model` is taken from the
 response body's `model` (the model the provider served), falling back to a `model`
 field in the request params.
 
-### v1 limitation — non-streaming only (honest bound)
+### Streamed token metering
 
-Vultrino buffers response bodies whole and has **no SSE/streaming awareness**, and
-OpenAI omits the `usage` object from a *streamed* completion unless the client
-sets `stream_options.include_usage` (which Vultrino neither requires nor injects).
-So **token-level gateway-observed confidence is non-streaming-only**: a streamed
-LLM call emits only the V13a `api-calls=1` event, and a consumer must fall back to
-a lower-confidence source (provider usage API / invoice) for that call's tokens.
-SSE handling and the `stream_options.include_usage` decision are **out of scope**
-for v1.
+A `{"stream": true}` LLM-proxy call is metered too. The streaming adaptor tees each
+RAW (pre-scrub) SSE chunk to a `crate::outbox::UsageAccumulator`, which line-buffers
+across chunk boundaries and reads the token counts + model from the **top level** of
+each recognized `data:` event (never a substring scan, so a prompt that literally
+contains a `usage` object can't forge a count). On a **clean** end the parsed split
+is emitted as the V13b token event — identical shape to the buffered path. Three
+wire shapes are recognized:
+
+- **OpenAI chat** (`stream_options.include_usage`): a terminal `data:` event with
+  top-level `usage.{prompt_tokens, completion_tokens}` and `choices: []`. To make the
+  provider emit it, vultrino injects `stream_options.include_usage = true` when the
+  request streams and the client did **not** set it (an explicit client value — true
+  OR false — is honored). Gated by `[llm_proxy] inject_stream_usage` (default on).
+- **OpenAI responses**: `response.completed` carries `response.usage.{input_tokens,
+  output_tokens}`.
+- **Anthropic messages**: `message_start` → `message.usage.input_tokens`;
+  `message_delta` → `usage.output_tokens` (**cumulative** → last value wins, never
+  summed). Anthropic / responses report usage natively, so no injection is done.
+
+**Honest bound:** V13a `api-calls=1` always fires (including on a halt or client
+disconnect). V13b fires only on a clean end with a parsed usage split — a client that
+sets `include_usage:false`, or a truncated/halted stream, meters V13a only (emitting
+partial counts would under-count, the dangerous direction). A capability with an
+operator `block`/`redact_patterns` egress rule, or a compressed response, is served
+buffered (the incremental scrubber can't honor whole-body regex/block), so its
+metering follows the buffered path.
 
 ## Consuming the feed: poll or push
 

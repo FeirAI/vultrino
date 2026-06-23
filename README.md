@@ -27,6 +27,7 @@ Vultrino is a secure credential proxy that allows AI agents, LLMs, and automated
 - **Scoped API Keys** — Restrict which credentials each API key can access using glob patterns
 - **Plugin System** — Extend with custom credential types and actions via WASM plugins
 - **MCP Integration** — Native Model Context Protocol support for LLM tools
+- **Metered LLM Proxy** — Point any OpenAI/Anthropic-compatible client's `base_url` at Vultrino with a Vultrino key instead of the provider key; the real model key stays in the vault and token spend is metered. Supports incremental **SSE streaming** (`stream: true`) with on-the-fly secret scrubbing.
 - **Use Tokens** — Single-use or time-scoped grants that let an agent perform one specific action
 - **Action Approvals** — Human-in-the-loop sign-off (admin panel, Telegram, or webhook/email) before an action runs
 - **Web UI** — Clean admin interface for managing credentials, roles, and API keys

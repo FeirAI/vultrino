@@ -105,6 +105,24 @@ pub trait Plugin: Send + Sync {
     /// Execute an action with the credential
     async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError>;
 
+    /// Execute an action, delivering the response body **incrementally**
+    /// (connector M1, streaming LLM proxy).
+    ///
+    /// Only a plugin that can stream (today: [`HttpPlugin`]) overrides this. The
+    /// default buffers via [`Plugin::execute`] and wraps the whole body as a
+    /// single-chunk [`StreamingResponse`] — so every existing plugin
+    /// (hmac/ecdsa/ssh/postgres/WASM) satisfies the streaming contract unchanged,
+    /// and the server's streaming path never has to special-case a non-streaming
+    /// plugin. The server applies the incremental egress scrub + V13b usage tap to
+    /// the returned `body`; this method returns the **raw** upstream bytes.
+    async fn execute_streaming(
+        &self,
+        request: PluginRequest,
+    ) -> Result<crate::StreamingResponse, PluginError> {
+        let resp = self.execute(request).await?;
+        Ok(crate::StreamingResponse::from_buffered(resp))
+    }
+
     /// Validate that params are correct for this action
     fn validate_params(
         &self,
@@ -441,6 +459,79 @@ mod tests {
             pg_tools.contains(&"run_sql".to_string()) && pg_tools.contains(&"backup".to_string()),
             "postgres plugin must expose 'run_sql' and 'backup' MCP tools; got {:?}",
             pg_tools
+        );
+    }
+
+    /// A buffered-only plugin (no `execute_streaming` override) — exercises the
+    /// trait's DEFAULT streaming impl, the contract every non-http plugin relies on.
+    struct BufferedOnlyPlugin;
+
+    #[async_trait]
+    impl Plugin for BufferedOnlyPlugin {
+        fn name(&self) -> &str {
+            "buffered_only"
+        }
+        fn supported_credential_types(&self) -> Vec<CredentialType> {
+            vec![CredentialType::ApiKey]
+        }
+        fn supported_actions(&self) -> Vec<&str> {
+            vec!["echo"]
+        }
+        async fn execute(&self, _req: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+            Ok(ExecuteResponse {
+                status: 207,
+                headers: HashMap::from([("x-test".to_string(), "1".to_string())]),
+                body: b"hello-buffered-body".to_vec(),
+                updated_credential: None,
+            })
+        }
+        fn validate_params(
+            &self,
+            _action: &str,
+            _params: &serde_json::Value,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    fn echo_request() -> PluginRequest {
+        PluginRequest {
+            credential: Credential::new(
+                "c".to_string(),
+                CredentialData::ApiKey {
+                    key: crate::Secret::new("k-some-key-123"),
+                    header_name: "Authorization".to_string(),
+                    header_prefix: "Bearer ".to_string(),
+                },
+            ),
+            action: "echo".to_string(),
+            params: serde_json::json!({}),
+            context: RequestContext::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_execute_streaming_matches_execute() {
+        use futures::StreamExt;
+        let plugin = BufferedOnlyPlugin;
+
+        let buffered = plugin.execute(echo_request()).await.unwrap();
+        let streamed = plugin.execute_streaming(echo_request()).await.unwrap();
+
+        // Head is identical: status + headers known up front.
+        assert_eq!(streamed.status, buffered.status);
+        assert_eq!(streamed.headers, buffered.headers);
+
+        // The default streaming impl yields the whole body as one chunk — byte-for-byte
+        // identical to the buffered body. (P0 acceptance: no plugin behavior changes.)
+        let mut collected = Vec::new();
+        let mut body = streamed.body;
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(
+            collected, buffered.body,
+            "default execute_streaming must yield the same bytes as execute"
         );
     }
 }
