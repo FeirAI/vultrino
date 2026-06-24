@@ -194,6 +194,17 @@ async fn register_llm_capability(
     action: &str,
     provider_base: &str,
 ) {
+    register_llm_capability_models(storage, credential_ref, action, provider_base, Vec::new()).await;
+}
+
+/// Register an LLM-proxy capability with a per-model allowlist (empty = any model).
+async fn register_llm_capability_models(
+    storage: &Arc<dyn StorageBackend>,
+    credential_ref: &str,
+    action: &str,
+    provider_base: &str,
+    allowed_models: Vec<String>,
+) {
     let cap = Capability {
         id: "cap-llm".to_string(),
         tool_name: "model_proxy".to_string(),
@@ -203,7 +214,7 @@ async fn register_llm_capability(
         target: CapabilityTarget::default(),
         credential_ref: credential_ref.to_string(),
         input_schema: serde_json::Value::Null,
-        llm: Some(LlmProxy { provider_base: provider_base.to_string() }),
+        llm: Some(LlmProxy { provider_base: provider_base.to_string(), allowed_models }),
     };
     cap.validate().unwrap();
     storage.store_capability(&cap).await.unwrap();
@@ -286,6 +297,58 @@ async fn llm_no_capability_is_403_fail_closed() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn llm_per_model_allowlist_denies_unlisted_before_upstream() {
+    // Per-model enforcement (P1-1): a capability allowlisting ONLY gpt-4o, pointed at a
+    // loopback provider_base that WOULD 502 if reached. So a 403 on a disallowed model
+    // proves the deny short-circuits BEFORE execute_gated (not the 502 the loopback target
+    // would produce), and a 502 on the allowed model proves it passed the gate to the
+    // enforced path.
+    let (router, storage, _srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability_models(
+        &storage,
+        "cred-openai",
+        "http.request",
+        "http://127.0.0.1:9",
+        vec!["gpt-4o".to_string()],
+    )
+    .await;
+    let token = mint_token(&storage, "cred-openai", Some("http.request")).await;
+
+    // (a) Disallowed model → 403 permission_error, short-circuited before any upstream call.
+    let resp = router
+        .clone()
+        .oneshot(llm_req(Some(&token), "v1/chat/completions", serde_json::json!({ "model": "gpt-3.5-turbo" })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a disallowed model must be denied pre-upstream");
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes(resp).await).expect("error body is JSON");
+    assert_eq!(body["error"]["type"], "permission_error", "deny shape: {body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap_or_default().contains("not permitted"),
+        "deny message names the model rejection: {body}"
+    );
+
+    // (b) Missing model with an allowlist set → fail-closed 403 (can't verify the model).
+    let resp = router
+        .clone()
+        .oneshot(llm_req(Some(&token), "v1/chat/completions", serde_json::json!({ "messages": [] })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a missing model under an allowlist must fail closed");
+
+    // (c) Allowed model → passes the gate, reaches execute_gated, and the loopback target
+    //     502s (the same enforced-path proof as the no-allowlist test) — i.e. NOT short-circuited.
+    let resp = router
+        .oneshot(llm_req(Some(&token), "v1/chat/completions", serde_json::json!({ "model": "gpt-4o" })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "an allowed model must pass the gate and reach the enforced path");
 }
 
 #[tokio::test]

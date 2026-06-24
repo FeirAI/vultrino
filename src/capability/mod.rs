@@ -103,6 +103,15 @@ pub struct LlmProxy {
     /// request path (e.g. `/v1/chat/completions`) to form the upstream URL. Must
     /// be HTTPS in production; the backing policy/egress still apply.
     pub provider_base: String,
+    /// When non-empty, restricts this model channel to a specific set of model
+    /// names (per-model granularity, connector P1-1): a `POST /llm` request whose
+    /// body `model` is not in this list is DENIED (403) before any upstream call.
+    /// The match is exact on the request's `model` field. An EMPTY list (the
+    /// default) permits any model the provider exposes — per-provider scope only.
+    /// govder (the decide plane) sets this from the capability's
+    /// `llm.allowed_models`; vultrino is the enforcing PEP.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_models: Vec<String>,
 }
 
 impl Capability {
@@ -187,6 +196,27 @@ impl Capability {
     /// rather than appearing as a named MCP tool in `tools/list`).
     pub fn is_llm_proxy(&self) -> bool {
         self.llm.is_some()
+    }
+
+    /// Whether a `POST /llm` request for the `requested` model is permitted by this
+    /// capability's model allowlist (per-model granularity, P1-1). Semantics:
+    /// - a non-LLM-proxy capability is not this gate's concern → allowed;
+    /// - an EMPTY `allowed_models` permits any model (per-provider scope only);
+    /// - a non-empty allowlist is DEFAULT-DENY: the requested model must match an
+    ///   entry EXACTLY, and a request with NO model (`None`) is DENIED — an
+    ///   allowlisted channel must see a model to verify it (fail-closed).
+    pub fn llm_model_allowed(&self, requested: Option<&str>) -> bool {
+        let allow = match self.llm.as_ref() {
+            Some(l) => &l.allowed_models,
+            None => return true, // not an LLM-proxy capability; not this gate's concern
+        };
+        if allow.is_empty() {
+            return true; // any-model (per-provider scope only)
+        }
+        match requested {
+            Some(m) => allow.iter().any(|a| a == m),
+            None => false, // fail-closed: allowlist set but no model to check
+        }
     }
 
     /// Build the upstream provider URL for an LLM-proxy `tools` call: the
@@ -511,6 +541,7 @@ mod tests {
         c.target = CapabilityTarget::default();
         c.llm = Some(LlmProxy {
             provider_base: provider_base.to_string(),
+            allowed_models: Vec::new(),
         });
         c
     }
@@ -522,19 +553,50 @@ mod tests {
     }
 
     #[test]
+    fn test_llm_model_allowed_empty_list_permits_any() {
+        // An empty allowlist is per-provider scope only: any model (incl. none) passes.
+        let c = llm_cap("https://api.openai.com");
+        assert!(c.llm_model_allowed(Some("gpt-4o")));
+        assert!(c.llm_model_allowed(Some("anything-at-all")));
+        assert!(c.llm_model_allowed(None));
+    }
+
+    #[test]
+    fn test_llm_model_allowed_enforces_allowlist() {
+        let mut c = llm_cap("https://api.openai.com");
+        c.llm.as_mut().unwrap().allowed_models = vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()];
+        // Exact match on a listed model passes.
+        assert!(c.llm_model_allowed(Some("gpt-4o")));
+        assert!(c.llm_model_allowed(Some("gpt-4o-mini")));
+        // A model not in the list is denied.
+        assert!(!c.llm_model_allowed(Some("gpt-3.5-turbo")));
+        // Exact match: a date-suffixed variant is a DIFFERENT string → denied.
+        assert!(!c.llm_model_allowed(Some("gpt-4o-2024-08-06")));
+        // Fail-closed: an allowlisted channel with NO model to verify is denied.
+        assert!(!c.llm_model_allowed(None));
+    }
+
+    #[test]
+    fn test_llm_model_allowed_non_proxy_capability_is_unconcerned() {
+        // A named-tool (non-LLM-proxy) capability is not this gate's concern.
+        assert!(cap("send_email").llm_model_allowed(Some("whatever")));
+        assert!(cap("send_email").llm_model_allowed(None));
+    }
+
+    #[test]
     fn test_llm_validate_ok_and_rejects_bad_base() {
         assert!(llm_cap("https://api.openai.com").validate().is_ok());
         // Empty provider_base.
         let mut c = llm_cap("https://api.openai.com");
-        c.llm = Some(LlmProxy { provider_base: "  ".to_string() });
+        c.llm = Some(LlmProxy { provider_base: "  ".to_string(), allowed_models: Vec::new() });
         assert!(c.validate().is_err());
         // Non-URL provider_base.
         let mut c = llm_cap("https://api.openai.com");
-        c.llm = Some(LlmProxy { provider_base: "not a url".to_string() });
+        c.llm = Some(LlmProxy { provider_base: "not a url".to_string(), allowed_models: Vec::new() });
         assert!(c.validate().is_err());
         // Disallowed scheme.
         let mut c = llm_cap("https://api.openai.com");
-        c.llm = Some(LlmProxy { provider_base: "ftp://api.openai.com".to_string() });
+        c.llm = Some(LlmProxy { provider_base: "ftp://api.openai.com".to_string(), allowed_models: Vec::new() });
         assert!(c.validate().is_err());
     }
 

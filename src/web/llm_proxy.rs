@@ -221,6 +221,30 @@ async fn llm_proxy_impl(
         }
     };
 
+    // 4b. Per-model enforcement (connector P1-1): when the capability restricts
+    //     models (non-empty allowed_models), the request body's `model` must be in
+    //     the allowlist. An EMPTY allowlist permits any model (per-provider scope
+    //     only). An allowlisted channel whose request carries NO parseable `model`
+    //     fails CLOSED (default-deny symmetry) — we never forward an unverifiable
+    //     model upstream with the vault key attached. This is the PEP for govder's
+    //     `llm.allowed_models`; the deny happens BEFORE any upstream call.
+    let requested_model = request_body
+        .as_ref()
+        .and_then(|b| b.get("model"))
+        .and_then(|m| m.as_str());
+    if !capability.llm_model_allowed(requested_model) {
+        return llm_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            &format!(
+                "Model {} is not permitted for this LLM-proxy capability",
+                requested_model
+                    .map(|m| format!("'{m}'"))
+                    .unwrap_or_else(|| "(unspecified)".to_string()),
+            ),
+        );
+    }
+
     // Forward Content-Type only; the credential (Authorization / API-key header)
     // is injected by the http plugin from the vault. The agent's own
     // Authorization header is the vultrino Bearer — it must NOT be forwarded
