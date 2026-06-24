@@ -112,6 +112,15 @@ pub struct LlmProxy {
     /// `llm.allowed_models`; vultrino is the enforcing PEP.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
+    /// When set, a per-call OUTPUT-TOKEN ceiling: the `/llm` proxy clamps the
+    /// request body's `max_tokens` to `min(requested, ceiling)` (and SETS it to the
+    /// ceiling when the request omits it, so the provider default can't exceed it).
+    /// This bounds per-call output tokens — and therefore per-call cost — which a
+    /// `SpendCap` cannot do for an LLM request (it carries no request-time spend).
+    /// It is the per-call leg of the rate_companion overshoot bound (P1-8); govder
+    /// sizes it from the budget's cost hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
 }
 
 impl Capability {
@@ -217,6 +226,12 @@ impl Capability {
             Some(m) => allow.iter().any(|a| a == m),
             None => false, // fail-closed: allowlist set but no model to check
         }
+    }
+
+    /// The per-call output-token ceiling for this LLM-proxy capability, if any (the
+    /// per-call cost leg of the rate_companion, P1-8). `None` = no ceiling.
+    pub fn llm_max_output_tokens(&self) -> Option<u64> {
+        self.llm.as_ref().and_then(|l| l.max_output_tokens)
     }
 
     /// Build the upstream provider URL for an LLM-proxy `tools` call: the
@@ -542,6 +557,7 @@ mod tests {
         c.llm = Some(LlmProxy {
             provider_base: provider_base.to_string(),
             allowed_models: Vec::new(),
+            max_output_tokens: None,
         });
         c
     }
@@ -588,15 +604,15 @@ mod tests {
         assert!(llm_cap("https://api.openai.com").validate().is_ok());
         // Empty provider_base.
         let mut c = llm_cap("https://api.openai.com");
-        c.llm = Some(LlmProxy { provider_base: "  ".to_string(), allowed_models: Vec::new() });
+        c.llm = Some(LlmProxy { provider_base: "  ".to_string(), allowed_models: Vec::new(), max_output_tokens: None });
         assert!(c.validate().is_err());
         // Non-URL provider_base.
         let mut c = llm_cap("https://api.openai.com");
-        c.llm = Some(LlmProxy { provider_base: "not a url".to_string(), allowed_models: Vec::new() });
+        c.llm = Some(LlmProxy { provider_base: "not a url".to_string(), allowed_models: Vec::new(), max_output_tokens: None });
         assert!(c.validate().is_err());
         // Disallowed scheme.
         let mut c = llm_cap("https://api.openai.com");
-        c.llm = Some(LlmProxy { provider_base: "ftp://api.openai.com".to_string(), allowed_models: Vec::new() });
+        c.llm = Some(LlmProxy { provider_base: "ftp://api.openai.com".to_string(), allowed_models: Vec::new(), max_output_tokens: None });
         assert!(c.validate().is_err());
     }
 

@@ -97,11 +97,20 @@ impl Plugin for MockLlmPlugin {
                 "choices": [{ "delta": { "content": "hi" } }]
             })
         } else {
+            // Echo the forwarded body's max_tokens so the per-call-ceiling test can
+            // prove vultrino clamped it before the upstream call.
+            let received_max_tokens = request
+                .params
+                .get("body")
+                .and_then(|b| b.get("max_tokens"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             serde_json::json!({
                 "id": "chatcmpl-abc123",
                 "model": "gpt-4o-mini",
                 "object": "chat.completion",
                 "provider_key_echo": injected_key,
+                "received_max_tokens": received_max_tokens,
                 "choices": [{ "message": { "role": "assistant", "content": "hi" } }],
                 "usage": { "prompt_tokens": 57, "completion_tokens": 13, "total_tokens": 70 }
             })
@@ -214,7 +223,7 @@ async fn register_llm_capability_models(
         target: CapabilityTarget::default(),
         credential_ref: credential_ref.to_string(),
         input_schema: serde_json::Value::Null,
-        llm: Some(LlmProxy { provider_base: provider_base.to_string(), allowed_models }),
+        llm: Some(LlmProxy { provider_base: provider_base.to_string(), allowed_models, max_output_tokens: None }),
     };
     cap.validate().unwrap();
     storage.store_capability(&cap).await.unwrap();
@@ -456,6 +465,65 @@ async fn llm_non_streamed_injects_key_returns_body_meters_tokens_and_scrubs() {
     assert_eq!(te["cost_source"], "gateway-observed");
     // The token event shares the occurrence with the api-calls event.
     assert_eq!(te["correlation_id"], api_calls[0]["correlation_id"], "same occurrence");
+}
+
+#[tokio::test]
+async fn llm_max_output_tokens_ceiling_clamps_the_forwarded_request() {
+    // Per-call output-token ceiling (rate_companion per-call leg, P1-8): the proxy must
+    // clamp an over-ceiling max_tokens down AND set it when the request omits it, before
+    // the upstream call. The stub echoes the forwarded body's max_tokens so we can assert.
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    srv.plugins().register(Arc::new(MockLlmPlugin));
+    store_provider_credential(&storage, "cred-openai").await;
+
+    // Register an LLM capability with a 1000-token ceiling.
+    let cap = Capability {
+        id: "cap-llm".to_string(),
+        tool_name: "model_proxy".to_string(),
+        description: "ceiling".to_string(),
+        action: "mockllm.chat".to_string(),
+        plugin: None,
+        target: CapabilityTarget::default(),
+        credential_ref: "cred-openai".to_string(),
+        input_schema: serde_json::Value::Null,
+        llm: Some(LlmProxy {
+            provider_base: "https://api.openai.com".to_string(),
+            allowed_models: Vec::new(),
+            max_output_tokens: Some(1000),
+        }),
+    };
+    cap.validate().unwrap();
+    storage.store_capability(&cap).await.unwrap();
+    let token = mint_token(&storage, "cred-openai", Some("mockllm.chat")).await;
+
+    // (a) An over-ceiling request is clamped DOWN to 1000.
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "max_tokens": 9000, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let returned: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(returned["received_max_tokens"], serde_json::json!(1000), "over-ceiling max_tokens must be clamped to the ceiling");
+
+    // (b) A request that OMITS max_tokens has it SET to the ceiling (so the provider
+    //     default can't exceed the per-call bound).
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let returned: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(returned["received_max_tokens"], serde_json::json!(1000), "an omitted max_tokens must be set to the ceiling");
 }
 
 #[tokio::test]

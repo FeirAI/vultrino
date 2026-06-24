@@ -74,6 +74,20 @@ fn llm_error(status: StatusCode, kind: &str, message: &str) -> Response {
         .into_response()
 }
 
+/// Clamp the request body's `max_tokens` to `ceiling` — `min(requested, ceiling)`,
+/// or SET it to `ceiling` when the request omits it (so the provider default can't
+/// exceed the per-call output bound). v1 handles only the OpenAI-compatible
+/// top-level `max_tokens` field; a non-object body is left untouched.
+fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64) {
+    if let Some(obj) = body.as_object_mut() {
+        let clamped = obj
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map_or(ceiling, |req| req.min(ceiling));
+        obj.insert("max_tokens".to_string(), serde_json::json!(clamped));
+    }
+}
+
 /// Resolve the inbound Bearer to an [`ExecAuth`] (authenticate only; the
 /// capability's credential/action scope is enforced authoritatively inside
 /// `execute_gated`). A `vut_` is resolved from storage (reloaded so a token
@@ -206,7 +220,7 @@ async fn llm_proxy_impl(
     // 4. Parse the agent's request body as JSON (OpenAI-compatible). An empty body
     //    is allowed (some endpoints take none); a non-JSON body is rejected so we
     //    never forward garbage upstream with the vault key attached.
-    let request_body: Option<serde_json::Value> = if body.is_empty() {
+    let mut request_body: Option<serde_json::Value> = if body.is_empty() {
         None
     } else {
         match serde_json::from_slice(&body) {
@@ -243,6 +257,19 @@ async fn llm_proxy_impl(
                     .unwrap_or_else(|| "(unspecified)".to_string()),
             ),
         );
+    }
+
+    // 4c. Per-call output-token ceiling (rate_companion per-call leg, P1-8): clamp the
+    //     request body's `max_tokens` to the capability's ceiling — `min(requested,
+    //     ceiling)`, and SET it to the ceiling when the request omits it so the
+    //     provider default can't exceed it. This bounds per-call output tokens (hence
+    //     per-call cost), the enforceable substitute for a SpendCap (which fails closed
+    //     on an LLM request that carries no request-time spend). Only the common
+    //     OpenAI-compatible `max_tokens` field is handled in v1.
+    if let Some(ceiling) = capability.llm_max_output_tokens() {
+        if let Some(body) = request_body.as_mut() {
+            clamp_max_output_tokens(body, ceiling);
+        }
     }
 
     // Forward Content-Type only; the credential (Authorization / API-key header)
@@ -313,5 +340,41 @@ async fn llm_proxy_impl(
                 "LLM proxy upstream request failed (see server logs)",
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_max_output_tokens;
+    use serde_json::json;
+
+    #[test]
+    fn clamps_an_over_ceiling_request_down() {
+        let mut body = json!({ "model": "gpt-4o", "max_tokens": 5000 });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["max_tokens"], json!(1000));
+    }
+
+    #[test]
+    fn leaves_an_under_ceiling_request_unchanged() {
+        let mut body = json!({ "model": "gpt-4o", "max_tokens": 200 });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["max_tokens"], json!(200));
+    }
+
+    #[test]
+    fn sets_the_ceiling_when_the_request_omits_max_tokens() {
+        // The dangerous case: an absent max_tokens lets the provider default (often
+        // very large) blow the per-call cost bound. We must SET it to the ceiling.
+        let mut body = json!({ "model": "gpt-4o", "messages": [] });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["max_tokens"], json!(1000));
+    }
+
+    #[test]
+    fn ignores_a_non_object_body() {
+        let mut body = json!("not an object");
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body, json!("not an object"));
     }
 }
