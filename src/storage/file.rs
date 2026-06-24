@@ -162,6 +162,14 @@ pub struct FileStorage {
     cache: RwLock<StorageCache>,
     /// Salt used for key derivation (stored in file)
     salt: Vec<u8>,
+    /// Change token (mtime, len) of the on-disk vault as of the last decrypt INTO
+    /// `cache` by THIS process. `reload` skips the (expensive) whole-vault decrypt when
+    /// the file is byte-unchanged since then — so a broker poll that finds no new outbox
+    /// events doesn't re-decrypt every secret. `None` until the first load. Per-instance:
+    /// a sibling process's write bumps the file mtime, which this process detects on its
+    /// next reload. (STOPGAP for the read path — subsumed once the outbox moves to its own
+    /// store; see docs/dev/OUTBOX-OUT-OF-VAULT-MIGRATION.md.)
+    last_loaded: parking_lot::Mutex<Option<(std::time::SystemTime, u64)>>,
 }
 
 /// A record of an idempotent admin-API mutation: a reservation taken under the
@@ -326,6 +334,7 @@ impl FileStorage {
             master_key,
             cache: RwLock::new(StorageCache::default()),
             salt,
+            last_loaded: parking_lot::Mutex::new(None),
         };
 
         // Write initial empty storage (through the cross-process lock).
@@ -355,12 +364,17 @@ impl FileStorage {
         let decrypted = decrypt(&storage_file.data, &master_key)?;
         let cache = Self::parse_cache(&decrypted)?;
 
-        Ok(Self {
+        let storage = Self {
             path,
             master_key,
             cache: RwLock::new(cache),
             salt,
-        })
+            last_loaded: parking_lot::Mutex::new(None),
+        };
+        // Seed the change token so the first reload can skip a redundant decrypt of the
+        // file we just loaded (unless a write bumps its mtime first).
+        *storage.last_loaded.lock() = storage.file_change_token();
+        Ok(storage)
     }
 
     /// Parse decrypted bytes into a `StorageCache`, tolerating the legacy
@@ -468,8 +482,22 @@ impl FileStorage {
         let result = f(&mut cache)?;
         self.write_cache_to_disk_sync(&cache)?;
         *self.cache.write() = cache;
+        // Record the just-written file's change token so a following reload (which would
+        // see the new mtime) recognizes the cache is already current and skips a redundant
+        // decrypt of the state we just wrote.
+        *self.last_loaded.lock() = self.file_change_token();
         Ok(result)
         // `_guard` dropped here releases the lock.
+    }
+
+    /// A cheap change token for the on-disk vault: `(mtime, len)`. `None` if the file
+    /// can't be stat'd (e.g. not yet created) — callers then always reload. Any write
+    /// goes through tmp + atomic rename, so a real change always bumps mtime; the target
+    /// filesystems (container ext4/overlayfs) have sub-second mtime resolution, so a
+    /// distinct write is never collapsed into an unchanged token.
+    fn file_change_token(&self) -> Option<(std::time::SystemTime, u64)> {
+        let meta = std::fs::metadata(&self.path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
     }
 
     /// The blocking body of [`Self::reload`]: read the authoritative on-disk
@@ -490,8 +518,22 @@ impl FileStorage {
     fn reload_blocking(&self) -> Result<(), StorageError> {
         let mut flock = self.lock_file_exclusive()?;
         let _guard = flock.write().map_err(StorageError::Io)?;
+        // Read-cache: under the lock (so no write can race the stat→read), skip the
+        // whole-vault decrypt when the file is byte-unchanged (same mtime + len) since
+        // THIS process last loaded it — the in-memory cache is then already current. A
+        // broker poll that finds no new outbox events avoids decrypting every secret.
+        // Correctness: any mutation (append/store) bumps the file mtime (tmp + atomic
+        // rename) and goes through the SAME fd-lock, so a committed change is never
+        // skipped; an unchanged file means our cache already reflects it (we loaded it),
+        // so not overwriting it cannot revert anything (the invariant reload upholds).
+        if let Some(token) = self.file_change_token() {
+            if *self.last_loaded.lock() == Some(token) {
+                return Ok(());
+            }
+        }
         let cache = self.read_cache_from_disk_sync()?;
         *self.cache.write() = cache;
+        *self.last_loaded.lock() = self.file_change_token();
         Ok(())
         // `_guard` dropped here releases the lock.
     }

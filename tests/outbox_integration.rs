@@ -42,6 +42,56 @@ async fn test_monotonic_append_and_gapfree_replay() {
 }
 
 #[tokio::test]
+async fn read_cache_skip_still_sees_cross_instance_and_own_appends() {
+    // The reload read-cache (skip the whole-vault decrypt when the file's (mtime,len) is
+    // unchanged since this instance last loaded) must never cause a MISSED event:
+    //   - an append via instance A must be visible to instance B (separate process model):
+    //     B's change token differs from its last load → B reloads and sees it;
+    //   - A's OWN append stays visible to A: its write records the new token, so the next
+    //     reload skips the redundant decrypt yet the cache it just wrote is current.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    let password = SecretString::from("pw");
+    let a = FileStorage::new(&path, &password).await.unwrap();
+    let b = FileStorage::new(&path, &password).await.unwrap();
+
+    // A appends; A sees its own event (own-append visibility despite the skip).
+    let s1 = a
+        .append_event("appr_1", EVENT_APPROVAL_REQUESTED, serde_json::json!({"n":1}))
+        .await
+        .unwrap();
+    assert_eq!(s1, 1);
+    let a_seen = a.list_events_after(0, 100).await.unwrap();
+    assert_eq!(a_seen.iter().map(|e| e.sequence).collect::<Vec<_>>(), vec![1]);
+
+    // B (a different instance on the same file) must pick up A's append on its next read
+    // — the skip must NOT serve a stale empty cache.
+    let b_seen = b.list_events_after(0, 100).await.unwrap();
+    assert_eq!(
+        b_seen.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        vec![1],
+        "the read-cache skip must not hide a cross-instance append"
+    );
+
+    // A second cross-instance append (via B) must likewise be visible to A.
+    let s2 = b
+        .append_event("appr_2", EVENT_APPROVAL_REQUESTED, serde_json::json!({"n":2}))
+        .await
+        .unwrap();
+    assert_eq!(s2, 2);
+    let a_seen2 = a.list_events_after(0, 100).await.unwrap();
+    assert_eq!(
+        a_seen2.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        vec![1, 2],
+        "A must pick up B's append across the read-cache skip"
+    );
+
+    // An idempotent re-read with NO intervening write returns the same set (the skip path).
+    let a_again = a.list_events_after(0, 100).await.unwrap();
+    assert_eq!(a_again.len(), 2, "a no-change re-read (skip path) is stable");
+}
+
+#[tokio::test]
 async fn test_deliverable_events_preserve_per_subject_order() {
     let storage = storage().await;
     let a1 = storage.append_event("A", "e", serde_json::json!({})).await.unwrap();
