@@ -43,6 +43,13 @@ pub fn has_unredactable_secret(secrets: &[Zeroizing<String>]) -> bool {
 /// guaranteed by construction; the `streamed_scrub_equals_buffered` proptest also
 /// checks output equivalence over many forms/chunkings.
 pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
+    // Add `candidate` only if it is a distinct, long-enough reflection of `raw` (a form
+    // equal to raw, or below the redaction floor, adds nothing).
+    fn add(forms: &mut Vec<String>, candidate: String, raw: &str) {
+        if candidate != raw && candidate.len() >= MIN_REDACT_LEN {
+            forms.push(candidate);
+        }
+    }
     let mut forms: Vec<String> = Vec::new();
     for secret in secrets {
         let raw: &str = secret;
@@ -50,20 +57,59 @@ pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
             continue;
         }
         forms.push(raw.to_string());
-        let pct = urlencoding::encode(raw).into_owned();
-        if pct != raw {
-            forms.push(pct);
-        }
+        // Percent-encoded (URL/query reflection).
+        add(&mut forms, urlencoding::encode(raw).into_owned(), raw);
+        // JSON-escaped inner (serde default: \", \\, \n, control \uXXXX). Also a
+        // slash-escaped variant — HTML-safe JSON encoders emit `/` as `\/`, which the
+        // default escaping does not, so a secret with `/` reflected by such an encoder
+        // would otherwise slip past.
         if let Some(escaped) = json_escaped_inner(raw) {
-            if escaped != raw && escaped.len() >= MIN_REDACT_LEN {
-                forms.push(escaped);
+            if escaped.contains('/') {
+                add(&mut forms, escaped.replace('/', "\\/"), raw);
             }
+            add(&mut forms, escaped, raw);
+        }
+        // Slash-escaped raw (an encoder that escapes only `/`, no other special chars).
+        if raw.contains('/') {
+            add(&mut forms, raw.replace('/', "\\/"), raw);
+        }
+        // ensure_ascii `\uXXXX` form (encoders like Python's json.dumps default emit ALL
+        // non-ASCII as \uXXXX; serde emits raw UTF-8), so a secret with non-ASCII bytes
+        // reflected by such an upstream would evade the default JSON-escaped form.
+        if !raw.is_ascii() {
+            add(&mut forms, ascii_escaped_inner(raw), raw);
         }
     }
     forms.sort();
     forms.dedup();
     forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
     forms
+}
+
+/// A JSON-string inner with EVERY non-ASCII char escaped as `\uXXXX` (with surrogate
+/// pairs for astral code points) — i.e. the "ensure_ascii" encoding (Python json.dumps
+/// default, many others). serde's default escaping emits raw UTF-8 for printable
+/// non-ASCII, so this form catches a secret reflected by an ensure_ascii upstream.
+fn ascii_escaped_inner(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+            c if (c as u32) <= 0xFFFF => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => {
+                let cp = c as u32 - 0x10000;
+                let hi = 0xD800 + (cp >> 10);
+                let lo = 0xDC00 + (cp & 0x3FF);
+                out.push_str(&format!("\\u{:04x}\\u{:04x}", hi, lo));
+            }
+        }
+    }
+    out
 }
 
 /// Scrub the credential's own secret material (and its percent-encoded /
@@ -428,6 +474,11 @@ impl StreamScrubber {
         let mut working = std::mem::take(&mut *self.carry);
         working.extend_from_slice(chunk);
         if working.len() > self.max_buffer {
+            // Fail closed — but first wipe the transient buffer (it holds raw,
+            // pre-scrub secret-bearing bytes), symmetric with the normal push/finish
+            // paths. The overflow early-return previously skipped this, leaving secret
+            // material in freed heap until reuse.
+            working.iter_mut().for_each(|b| *b = 0);
             return Err(ScrubError::BufferOverflow);
         }
         let safe_end = working.len().saturating_sub(self.keep);

@@ -163,12 +163,23 @@ impl Plugin for MockStreamingPlugin {
             CredentialData::ApiKey { key, .. } => key.expose().to_string(),
             _ => String::new(),
         };
+        // Echo the forwarded body's max_tokens (in chunk 1) so a test can prove vultrino
+        // clamped it BEFORE the streaming upstream call — the streaming analogue of the
+        // buffered per-call-ceiling echo.
+        let received_max_tokens = request
+            .params
+            .get("body")
+            .and_then(|b| b.get("max_tokens"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         // Split the injected key across two chunks: the scrubber must hold back the
         // boundary and still redact the reassembled secret. Chunk 2 also carries an
         // OpenAI-style terminal usage frame so a test can prove streamed V13b metering.
         let mid = injected_key.len() / 2;
         let (key_a, key_b) = injected_key.split_at(mid);
-        let chunk1 = format!("event: message\ndata: {{\"model\":\"gpt-4o-mini\",\"echo\":\"{}", key_a);
+        let chunk1 = format!(
+            "event: message\ndata: {{\"model\":\"gpt-4o-mini\",\"received_max_tokens\":{received_max_tokens},\"echo\":\"{key_a}"
+        );
         let chunk2 = format!(
             "{}\",\"content\":\"hi\"}}\n\ndata: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":11,\"completion_tokens\":22}}}}\n\ndata: [DONE]\n\n",
             key_b
@@ -423,6 +434,109 @@ async fn llm_per_model_allowlist_denies_unlisted_before_upstream() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "an allowed model must pass the gate and reach the enforced path");
+}
+
+#[tokio::test]
+async fn llm_streamed_per_model_allowlist_denies_unlisted_before_upstream() {
+    // Enforcement-parity regression (the SSE merge's #1 risk): the per-model allowlist
+    // (4b) must run ABOVE the streaming decision (4d), so `stream:true` can NOT evade it.
+    // A disallowed model with stream:true must still 403 pre-upstream (NOT the 502 the
+    // loopback provider would produce, and NOT a streamed 200).
+    let (router, storage, _srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability_models(
+        &storage,
+        "cred-openai",
+        "http.request",
+        "http://127.0.0.1:9",
+        vec!["gpt-4o".to_string()],
+    )
+    .await;
+    let token = mint_token(&storage, "cred-openai", Some("http.request")).await;
+
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-3.5-turbo", "stream": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a disallowed model must be denied pre-upstream even with stream:true"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes(resp).await).expect("error body is JSON");
+    assert_eq!(body["error"]["type"], "permission_error", "deny shape: {body}");
+
+    // A missing model under an allowlist also fails closed on the streaming path.
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "messages": [], "stream": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a missing model under an allowlist must fail closed even with stream:true"
+    );
+}
+
+#[tokio::test]
+async fn llm_streamed_max_output_tokens_ceiling_clamps_the_forwarded_request() {
+    // Enforcement-parity regression: the per-call max_output_tokens clamp (4c) runs ABOVE
+    // the streaming decision (4d), so it bounds the body BOTH paths forward. A streamed
+    // over-ceiling request must have its forwarded max_tokens clamped to the ceiling — the
+    // only enforceable per-call cost bound on the LLM channel must not be `stream:true`-evadable.
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    srv.plugins().register(Arc::new(MockStreamingPlugin));
+    store_provider_credential(&storage, "cred-openai").await;
+    let cap = Capability {
+        id: "cap-llm-stream".to_string(),
+        tool_name: "model_proxy".to_string(),
+        description: "ceiling".to_string(),
+        action: "mockstream.chat".to_string(),
+        plugin: None,
+        target: CapabilityTarget::default(),
+        credential_ref: "cred-openai".to_string(),
+        input_schema: serde_json::Value::Null,
+        llm: Some(LlmProxy {
+            provider_base: "https://api.openai.com".to_string(),
+            allowed_models: Vec::new(),
+            max_output_tokens: Some(1000),
+        }),
+    };
+    cap.validate().unwrap();
+    storage.store_capability(&cap).await.unwrap();
+    let token = mint_token(&storage, "cred-openai", Some("mockstream.chat")).await;
+
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "max_tokens": 9000, "stream": true, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_str = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+    // The streaming mock echoes the FORWARDED max_tokens in its first SSE frame.
+    assert!(
+        body_str.contains("\"received_max_tokens\":1000"),
+        "streamed over-ceiling max_tokens must be clamped to the 1000 ceiling: {body_str}"
+    );
+    assert!(
+        !body_str.contains("9000"),
+        "the un-clamped 9000 must NOT reach the upstream on the streaming path: {body_str}"
+    );
 }
 
 #[tokio::test]

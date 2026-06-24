@@ -257,15 +257,18 @@ pub fn extract_model(raw_body: &[u8], request_params: &serde_json::Value) -> Opt
     })
 }
 
-/// Inject `stream_options.include_usage = true` into an OpenAI-chat streaming
-/// request body so the provider emits a terminal usage chunk (V13b token metering
-/// on a streamed turn). Only acts when the request is actually streaming
-/// (`stream == true`) and the client has NOT already set `include_usage` — an
-/// explicit client value (true OR false) is HONORED, never overwritten. The
-/// mutation is structural (additive into `stream_options`), never string concat, so
-/// it can't smuggle or drop sibling fields. The caller gates this on the request
-/// being OpenAI-chat-shaped (Anthropic / responses report usage natively and must
-/// not receive an `stream_options` field). Returns whether it injected.
+/// Force `stream_options.include_usage = true` on an OpenAI-chat streaming request
+/// body so the provider emits a terminal usage chunk (V13b token metering on a
+/// streamed turn). Only acts when the request is actually streaming
+/// (`stream == true`). `include_usage` is GATEWAY-OWNED: a client must NOT be able to
+/// opt out of the token trailer by sending `include_usage:false` (that would evade
+/// token metering while still receiving the completion), so an explicit client `false`
+/// is OVERWRITTEN to `true`. A non-object `stream_options` (invalid for OpenAI anyway)
+/// is replaced with one carrying `include_usage:true`; sibling object fields the client
+/// set are preserved. The mutation is structural (never string concat), so it can't
+/// smuggle or drop sibling fields. The caller gates this on the request being
+/// OpenAI-chat-shaped (Anthropic / responses report usage natively and must not receive
+/// a `stream_options` field). Returns whether it changed the body.
 pub fn maybe_inject_stream_usage(body: &mut serde_json::Value) -> bool {
     let Some(obj) = body.as_object_mut() else {
         return false;
@@ -276,15 +279,18 @@ pub fn maybe_inject_stream_usage(body: &mut serde_json::Value) -> bool {
     let so = obj
         .entry("stream_options")
         .or_insert_with(|| serde_json::json!({}));
-    let Some(so_obj) = so.as_object_mut() else {
-        // A non-object stream_options is the client's; don't clobber it.
-        return false;
-    };
-    if so_obj.contains_key("include_usage") {
-        return false; // explicit client value → honor it
+    if !so.is_object() {
+        // A non-object stream_options is invalid for OpenAI; the gateway owns the usage
+        // trailer, so replace it with a well-formed object that forces include_usage.
+        *so = serde_json::json!({ "include_usage": true });
+        return true;
     }
+    let so_obj = so.as_object_mut().expect("is_object checked above");
+    let already_true =
+        so_obj.get("include_usage").and_then(serde_json::Value::as_bool) == Some(true);
+    // FORCE true even over an explicit client false — the client cannot disable metering.
     so_obj.insert("include_usage".to_string(), serde_json::Value::Bool(true));
-    true
+    !already_true
 }
 
 /// Incremental token-usage accumulator for a **streamed** LLM response (V13b on
@@ -364,6 +370,27 @@ impl UsageAccumulator {
             _ => None,
         };
         (usage, self.model.take())
+    }
+
+    /// A NON-consuming peek at the usage parsed so far: `Some` only when BOTH token
+    /// counts have been seen (the same completeness rule as [`Self::finish`]). The
+    /// stream finalizer records this after each chunk so a client disconnect or upstream
+    /// error AFTER the usage trailer arrived (but before clean EOF) still meters V13b
+    /// instead of under-counting — under-counting is the dangerous direction (it keeps
+    /// leria's cumulative ceiling below its limit). Unlike `finish` it does not flush the
+    /// partial line buffer or take the model (it clones it), so it is safe to call every
+    /// chunk; a complete split only materializes once the trailer line is fully parsed.
+    pub fn snapshot(&self) -> Option<(TokenUsage, Option<String>)> {
+        match (self.input_tokens, self.output_tokens) {
+            (Some(input_tokens), Some(output_tokens)) => Some((
+                TokenUsage {
+                    input_tokens,
+                    output_tokens,
+                },
+                self.model.clone(),
+            )),
+            _ => None,
+        }
     }
 
     fn process_line(&mut self, line: &[u8]) {
@@ -865,6 +892,24 @@ mod tests {
         assert_eq!(usage, None);
     }
 
+    #[test]
+    fn usage_accumulator_snapshot_is_some_only_when_complete() {
+        // snapshot() is the non-consuming peek the finalizer records so a disconnect
+        // AFTER the trailer still meters V13b. It is None until BOTH counts are seen, and
+        // Some (without consuming) once the complete trailer is parsed.
+        let mut acc = super::UsageAccumulator::new(1 << 20);
+        acc.push(b"data: {\"model\":\"gpt-4o\",\"choices\":[]}\n\n");
+        assert!(acc.snapshot().is_none(), "no trailer yet → None");
+        acc.push(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\n");
+        let (usage, model) = acc.snapshot().expect("complete trailer → Some");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 22);
+        assert_eq!(model.as_deref(), Some("gpt-4o"));
+        // Non-consuming: finish() still returns the same complete split afterward.
+        let (again, _) = acc.finish();
+        assert_eq!(again.map(|u| u.output_tokens), Some(22));
+    }
+
     // --- maybe_inject_stream_usage -----------------------------------------
 
     #[test]
@@ -875,17 +920,27 @@ mod tests {
     }
 
     #[test]
-    fn inject_honors_explicit_client_value() {
-        // Explicit false is honored (not overwritten).
+    fn inject_forces_include_usage_true_over_client_false() {
+        // GATEWAY-OWNED: an explicit client `false` is OVERWRITTEN to true (a client must
+        // not be able to opt out of the V13b token trailer and evade metering).
         let mut body =
             serde_json::json!({ "stream": true, "stream_options": { "include_usage": false } });
-        assert!(!super::maybe_inject_stream_usage(&mut body));
-        assert_eq!(body["stream_options"]["include_usage"], false);
-        // Explicit true is left as-is.
+        assert!(super::maybe_inject_stream_usage(&mut body)); // changed false -> true
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        // Explicit true is already correct → left as-is, reports no change.
         let mut body2 =
             serde_json::json!({ "stream": true, "stream_options": { "include_usage": true } });
         assert!(!super::maybe_inject_stream_usage(&mut body2));
         assert_eq!(body2["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn inject_replaces_non_object_stream_options() {
+        // A non-object stream_options is invalid for OpenAI; the gateway forces a
+        // well-formed object so the usage trailer is always requested.
+        let mut body = serde_json::json!({ "stream": true, "stream_options": "garbage" });
+        assert!(super::maybe_inject_stream_usage(&mut body));
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
     #[test]

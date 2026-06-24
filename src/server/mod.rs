@@ -311,10 +311,14 @@ fn buffered_as_stream(resp: ExecuteResponse) -> StreamingExecution {
 /// Emits the metering events for a streamed call EXACTLY ONCE, on whichever of two
 /// paths wins (connector M1, V13b on streams):
 /// - **clean end / in-band error:** the adaptor calls [`Self::finalize`] with the
-///   parsed usage (clean EOF) or `None` (a truncated/errored turn → V13a only).
+///   parsed usage (a complete trailer) or `None` (a truncated turn with no trailer →
+///   V13a only).
 /// - **client disconnect / panic:** the adaptor's generator future is dropped
-///   mid-await so `finalize` never runs; `Drop` then spawns a V13a-only emit (a sync
-///   `Drop` can't await, hence the detached task).
+///   mid-await so `finalize` never runs; `Drop` then spawns the emit (a sync `Drop`
+///   can't await, hence the detached task). It emits V13b when a complete usage
+///   trailer was already parsed and recorded via [`Self::record_usage`] BEFORE the
+///   disconnect (so a disconnect right after the trailer doesn't under-count),
+///   otherwise V13a-only.
 ///
 /// An `AtomicBool` makes the two paths mutually exclusive, so V13a fires once and
 /// only once for the call.
@@ -322,6 +326,11 @@ struct StreamFinalizer {
     storage: Arc<dyn StorageBackend>,
     attribution: MeterAttribution,
     emitted: std::sync::atomic::AtomicBool,
+    /// The most-recent COMPLETE usage trailer parsed from the stream (+ resolved
+    /// model), recorded each chunk by the generator. Read by `Drop` so a client
+    /// disconnect AFTER the trailer arrived still meters V13b. `None` until a complete
+    /// split is seen.
+    carried: parking_lot::Mutex<Option<(crate::outbox::TokenUsage, Option<String>)>>,
 }
 
 impl StreamFinalizer {
@@ -330,12 +339,21 @@ impl StreamFinalizer {
             storage,
             attribution,
             emitted: std::sync::atomic::AtomicBool::new(false),
+            carried: parking_lot::Mutex::new(None),
         }
     }
 
-    /// Emit the meter events inline at a known stream terminus. `usage` is `Some`
-    /// only on a clean EOF that parsed a token split; an errored/truncated turn
-    /// passes `None` (V13a only — a partial stream has no trustworthy usage).
+    /// Record the latest COMPLETE usage trailer (from `UsageAccumulator::snapshot`) so a
+    /// subsequent client disconnect before a terminus still emits V13b in `Drop` rather
+    /// than under-counting to V13a-only. Cheap; called once per chunk that completes the
+    /// split (idempotent thereafter — last value wins).
+    fn record_usage(&self, usage: crate::outbox::TokenUsage, model: Option<String>) {
+        *self.carried.lock() = Some((usage, model));
+    }
+
+    /// Emit the meter events inline at a known stream terminus. `usage` is `Some` when a
+    /// complete token split was parsed (a clean EOF, OR a non-clean terminus that still
+    /// had the full trailer); a genuinely partial stream passes `None` (V13a only).
     async fn finalize(&self, usage: Option<crate::outbox::TokenUsage>, model: Option<String>) {
         if self
             .emitted
@@ -349,8 +367,9 @@ impl StreamFinalizer {
 
 impl Drop for StreamFinalizer {
     fn drop(&mut self) {
-        // Disconnect/panic before a terminus: emit V13a-only via a detached task
-        // (Drop can't await). No-op if finalize() already emitted.
+        // Disconnect/panic before a terminus: emit via a detached task (Drop can't
+        // await). No-op if finalize() already emitted. If a complete usage trailer was
+        // recorded before the disconnect, emit V13b (usage); else V13a-only.
         if !self
             .emitted
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -361,7 +380,13 @@ impl Drop for StreamFinalizer {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let storage = Arc::clone(&self.storage);
                 let attribution = self.attribution.clone();
-                handle.spawn(async move { emit_meter(&storage, &attribution, None, None).await });
+                let (usage, model) = match self.carried.lock().take() {
+                    Some((u, m)) => (Some(u), m),
+                    None => (None, None),
+                };
+                handle.spawn(
+                    async move { emit_meter(&storage, &attribution, usage, model.as_deref()).await },
+                );
             }
         }
     }
@@ -1525,6 +1550,12 @@ impl VultrinoServer {
                         // Tee: usage tap reads the RAW chunk (pre-scrub, symmetric with
                         // the buffered path's pre-scrub usage read); the scrubber emits.
                         usage_acc.push(&chunk);
+                        // Carry a COMPLETE trailer into the finalizer so a client
+                        // disconnect right after the usage frame still meters V13b
+                        // (Drop reads this) rather than under-counting to V13a-only.
+                        if let Some((u, m)) = usage_acc.snapshot() {
+                            finalizer.record_usage(u, m.or_else(|| meter_request_model.clone()));
+                        }
                         match scrubber.push(&chunk) {
                             Ok(out) => {
                                 if !out.is_empty() {
@@ -1557,10 +1588,17 @@ impl VultrinoServer {
                 let model = stream_model.or(meter_request_model);
                 finalizer.finalize(usage, model).await;
             } else {
-                // Truncated/halted/errored turn: V13a only (a partial stream has no
-                // trustworthy usage trailer — emitting partial counts would
-                // under-count, the dangerous direction).
-                finalizer.finalize(None, None).await;
+                // Truncated/halted/errored turn. A genuinely partial stream has no
+                // trustworthy usage trailer and meters V13a only (emitting partial
+                // counts would under-count, the dangerous direction). BUT if the
+                // provider's usage trailer ALREADY arrived before this terminus (e.g. an
+                // idle/total timeout or upstream error AFTER the usage + [DONE] frames),
+                // `finish` returns the COMPLETE split — trust it and still emit V13b
+                // (a parsed-complete trailer is authoritative regardless of how the
+                // stream ended; dropping it would under-count).
+                let (usage, stream_model) = usage_acc.finish();
+                let model = stream_model.or(meter_request_model);
+                finalizer.finalize(usage, model).await;
             }
             // _guard + finalizer drop here (finalizer already emitted → Drop no-op).
         };

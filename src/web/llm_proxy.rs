@@ -37,14 +37,16 @@
 //! across SSE chunks is still caught) before reaching the agent.
 //!
 //! Metering on a streamed turn: V13a `api-calls=1` always fires (even on a halt or
-//! disconnect); the V13b token event fires on a clean end whose usage trailer was
-//! parsed. For OpenAI-chat requests vultrino injects
-//! `stream_options.include_usage` (honoring an explicit client value) so the
+//! disconnect); the V13b token event fires whenever a complete usage trailer was
+//! parsed — including a client disconnect or upstream error AFTER the trailer arrived
+//! (the parsed usage is carried into the finalizer's Drop), not only on a clean EOF.
+//! For OpenAI-chat requests vultrino FORCES `stream_options.include_usage = true`
+//! (gateway-owned — a client cannot opt out by sending `include_usage:false`) so the
 //! provider emits that trailer; Anthropic `/v1/messages` and OpenAI `/v1/responses`
 //! report usage natively. Honest residuals: a capability with an operator `block`/
 //! `redact_patterns` egress rule, or a compressed response, is served BUFFERED
-//! (incremental scrub can't honor those); a client that sets
-//! `include_usage:false`, or a truncated/halted stream, meters V13a only.
+//! (incremental scrub can't honor those); a stream that is truncated/halted BEFORE the
+//! usage trailer arrives meters V13a only.
 
 use axum::{
     extract::{Path, State},
@@ -349,11 +351,13 @@ async fn llm_proxy_impl(
             obj.remove("stream_options");
         }
     }
-    // When streaming an OpenAI-chat request, inject `stream_options.include_usage`
-    // so the provider emits a terminal usage chunk and a streamed turn still meters
-    // V13b token counts. Anthropic `/v1/messages` and OpenAI `/v1/responses` report
-    // usage natively, so they are excluded (an unknown `stream_options` field could
-    // be rejected).
+    // When streaming an OpenAI-chat request, force `stream_options.include_usage = true`
+    // so the provider emits a terminal usage chunk and a streamed turn still meters V13b
+    // token counts. include_usage is GATEWAY-OWNED — a client cannot opt out of the token
+    // trailer (sending `include_usage:false` would otherwise evade token metering), so
+    // maybe_inject_stream_usage overwrites a client false. Anthropic `/v1/messages` and
+    // OpenAI `/v1/responses` report usage natively, so they are excluded (an unknown
+    // `stream_options` field could be rejected).
     if use_streaming && state.config.llm_proxy.inject_stream_usage && is_openai_chat_path(&path) {
         if let Some(b) = request_body.as_mut() {
             crate::outbox::maybe_inject_stream_usage(b);
