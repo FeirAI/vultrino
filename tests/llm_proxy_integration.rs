@@ -511,6 +511,38 @@ async fn llm_denied_by_govder_grant_policy_shape_without_an_llm_allow_rule() {
 }
 
 #[tokio::test]
+async fn llm_authorized_by_grant_policy_action_match_rule() {
+    // CROSS-PLANE VERIFICATION (the fix): once govder compiles an action_match Allow rule for
+    // the LLM action onto the (deny-default) grant policy, an /llm call IS authorized — it
+    // reaches the enforced path + meters. This is the positive counterpart to
+    // llm_denied_by_govder_grant_policy_shape_*: same deny-default grant on "cred-*", but WITH
+    // the LLM action rule govder now emits.
+    let grant = Policy::deny_all("govder-grant", "cred-*")
+        .with_rule(PolicyCondition::UrlMatch("https://wttr.in/*".to_string()), PolicyAction::Allow)
+        .with_rule(PolicyCondition::ActionMatch("mockllm.chat".to_string()), PolicyAction::Allow);
+    let (router, storage, srv) = build_stack(config_with_policies(vec![grant])).await;
+    srv.plugins().register(Arc::new(MockLlmPlugin));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(&storage, "cred-openai", "mockllm.chat", "https://api.openai.com").await;
+    let token = mint_token(&storage, "cred-openai", Some("mockllm.chat")).await;
+
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "messages": [{"role":"user","content":"hi"}] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the LLM action allow rule must authorize /llm");
+    let events = meter_events(&storage).await;
+    assert!(
+        !events.is_empty(),
+        "an authorized /llm call must reach the enforced path + meter (the fix works); events: {events:?}"
+    );
+}
+
+#[tokio::test]
 async fn llm_max_output_tokens_ceiling_clamps_the_forwarded_request() {
     // Per-call output-token ceiling (rate_companion per-call leg, P1-8): the proxy must
     // clamp an over-ceiling max_tokens down AND set it when the request omits it, before
