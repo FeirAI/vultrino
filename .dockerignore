@@ -1,0 +1,7 @@
+# Lean context. Exclude the local build dir + git/docs (cargo rebuilds in-image).
+target
+.git
+.github
+.claude
+docs
+*.md
