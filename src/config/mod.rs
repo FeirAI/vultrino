@@ -60,6 +60,18 @@ pub struct Config {
     /// document presented on a request into the principal evaluated by policy.
     /// `None` = no resolver wired (principal stays the `vk_`/`vut_` id).
     pub identity: Option<IdentityConfig>,
+    /// Server-held secret keying the policy `content_hash` (D2). The hash the
+    /// inventory list and create/replace responses emit is an
+    /// **HMAC-SHA256(secret, canonical-policy-bytes)**, not a bare digest — so a
+    /// compromised read-only key cannot brute-force the reduced DTO back into the
+    /// full enforcement topology offline. Sourced from `VULTRINO_POLICY_HASH_SECRET`
+    /// at startup (not parsed from the TOML, so a config dump never carries it).
+    /// MUST be stable across restarts (a per-process random salt would make every
+    /// authored hash mismatch on restart → false drift). `None` = no secret
+    /// configured: `content_hash` is emitted **empty** (the oracle is removed and
+    /// govder degrades gracefully — it skips drift detection on an empty hash).
+    /// Never falls back to a bare unkeyed digest.
+    pub policy_hash_secret: Option<String>,
 }
 
 /// Inbound workload-identity resolution config (V10/R6). A request carrying the
@@ -340,6 +352,10 @@ impl Config {
             outbox,
             tenants,
             identity,
+            // Not parsed from the TOML — sourced from the environment at startup so
+            // a config dump never carries the key. Defaults to None here; the
+            // process entrypoint fills it from `VULTRINO_POLICY_HASH_SECRET`.
+            policy_hash_secret: None,
         })
     }
 
@@ -359,6 +375,7 @@ impl Config {
             outbox: crate::outbox::OutboxConfig::default(),
             tenants: std::collections::HashMap::new(),
             identity: None,
+            policy_hash_secret: None,
         }
     }
 

@@ -524,7 +524,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Load configuration
-    let config = if let Some(config_path) = &cli.config {
+    let mut config = if let Some(config_path) = &cli.config {
         Config::load(config_path).await?
     } else {
         let default_path = Config::default_path();
@@ -534,6 +534,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Config::default()
         }
     };
+
+    // Source the policy `content_hash` secret (D2) from the environment, not the
+    // config file, so a config dump never carries the key. Keying the hash makes it
+    // an HMAC a compromised read-only key cannot recompute offline (otherwise the
+    // reduced policy DTO would be brute-forceable back to the full topology). A
+    // blank value is treated as unset → `content_hash` is emitted empty (no oracle;
+    // govder skips drift detection on an empty hash). The secret MUST be stable
+    // across restarts (the authoring caller stores the hash and re-checks it later).
+    config.policy_hash_secret = std::env::var("VULTRINO_POLICY_HASH_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
     // Execute command
     match cli.command {

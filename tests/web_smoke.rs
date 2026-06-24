@@ -68,8 +68,24 @@ async fn build_admin_router() -> (
 
 /// Like [`build_admin_router`] but also mints and returns a least-privilege
 /// `read-only` key (Permission::Read only), so tests can assert that the inventory
-/// GETs accept it while the mutating admin routes reject it.
+/// GETs accept it while the mutating admin routes reject it. A stable policy-hash
+/// secret is configured so the D2 `content_hash` is a real (keyed) value.
 async fn build_admin_router_with_read() -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    Arc<vultrino::server::VultrinoServer>,
+    String,
+    String,
+) {
+    build_admin_router_full(Some("test-policy-hash-secret")).await
+}
+
+/// Inner builder parameterized by the policy `content_hash` secret (D2). `Some`
+/// keys the hash (HMAC) so it is a real value; `None` simulates a deployment with
+/// no secret configured, where `content_hash` must be emitted empty (no oracle).
+async fn build_admin_router_full(
+    policy_hash_secret: Option<&str>,
+) -> (
     axum::Router,
     Arc<dyn StorageBackend>,
     Arc<vultrino::server::VultrinoServer>,
@@ -94,6 +110,11 @@ async fn build_admin_router_with_read() -> (
         .unwrap();
     storage.store_api_key(&read_api_key).await.unwrap();
 
+    // The web AppState carries the policy-hash secret on its Config — set it here
+    // (production sources it from VULTRINO_POLICY_HASH_SECRET at startup).
+    let mut web_config = Config::default();
+    web_config.policy_hash_secret = policy_hash_secret.map(|s| s.to_string());
+
     let admin = AdminAuth::new("admin", "password123").unwrap();
     let resolver = vultrino::router::CredentialResolver::new(storage.clone());
     let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
@@ -103,7 +124,7 @@ async fn build_admin_router_with_read() -> (
     ));
     let server = WebServer::new(
         WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
-        Config::default(),
+        web_config,
         storage.clone(),
         auth_manager,
         admin,
@@ -1661,8 +1682,9 @@ async fn test_admin_list_policies() {
         let id = created["id"].as_str().unwrap().to_string();
         assert_eq!(created["name"], name);
         let ch = created["content_hash"].as_str().unwrap();
-        assert!(ch.starts_with("sha256:"), "content_hash must be sha256:<hex>: {}", ch);
-        assert_eq!(ch.len(), "sha256:".len() + 64, "sha256 hex must be 64 chars");
+        // With a secret configured, the hash is a KEYED HMAC (self-describing prefix).
+        assert!(ch.starts_with("hmac-sha256:"), "content_hash must be hmac-sha256:<hex>: {}", ch);
+        assert_eq!(ch.len(), "hmac-sha256:".len() + 64, "hmac-sha256 hex must be 64 chars");
         authored_hash.insert(id, ch.to_string());
     }
     let live = server.policy_engine().list_policies().len();
@@ -1768,6 +1790,31 @@ async fn test_policy_content_hash_changes_on_rule_edit() {
     };
     assert_eq!(listed_hash(router.clone(), &id).await, hash_v1);
 
+    // Idempotent re-PUT of IDENTICAL content → SAME hash (deterministic given the
+    // secret; an unchanged policy must never register as false drift).
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "PUT",
+            &format!("/api/v1/policies/{}", id),
+            &key,
+            serde_json::json!({
+                "name": "h",
+                "credential_pattern": "github-*",
+                "default_action": "deny",
+                "rules": [ { "condition": { "method_match": ["GET"] }, "action": "allow" } ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let same: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        same["content_hash"].as_str().unwrap(),
+        hash_v1,
+        "identical content must yield the same hash (no false drift)"
+    );
+
     // PUT a DIFFERENT rule set at the same id → content_hash must change.
     let resp = router
         .clone()
@@ -1789,6 +1836,54 @@ async fn test_policy_content_hash_changes_on_rule_edit() {
     let hash_v2 = replaced["content_hash"].as_str().unwrap().to_string();
     assert_ne!(hash_v1, hash_v2, "content_hash must change when rules change");
     assert_eq!(listed_hash(router, &id).await, hash_v2, "listed hash tracks the new content");
+}
+
+// With NO policy-hash secret configured, content_hash must be EMPTY in BOTH the
+// create/replace response AND the list — removing the brute-force oracle. govder
+// degrades gracefully (it skips drift detection on an empty hash). The hash must
+// NOT fall back to a bare unkeyed digest.
+#[tokio::test]
+async fn test_policy_content_hash_empty_without_secret() {
+    // No secret configured (None).
+    let (router, _storage, _server, key, _read_key) = build_admin_router_full(None).await;
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/policies",
+            &key,
+            serde_json::json!({
+                "name": "n",
+                "credential_pattern": "github-*",
+                "default_action": "deny",
+                "rules": [ { "condition": { "method_match": ["GET"] }, "action": "allow" } ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    // The field is present (additive contract preserved) but EMPTY — no oracle.
+    assert_eq!(created["content_hash"].as_str(), Some(""), "create hash must be empty without a secret");
+
+    // The list item's content_hash is likewise empty, and certainly not a bare digest.
+    let resp = router
+        .oneshot(admin_req("GET", "/api/v1/policies", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    let raw = body_string(resp).await;
+    let listed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let item = listed["policies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"].as_str() == Some(&id))
+        .expect("policy must be listed");
+    assert_eq!(item["content_hash"].as_str(), Some(""), "listed hash must be empty without a secret");
+    // No bare-digest fallback anywhere (neither scheme prefix appears).
+    assert!(!raw.contains("sha256:"), "must not emit any sha256/hmac-sha256 digest without a secret");
 }
 
 // V1: a least-privilege read-only key can GET the inventory endpoints but is

@@ -834,10 +834,13 @@ async fn store_and_reload_policy(state: &AppState, policy: &Policy, created: boo
     let status = if created { StatusCode::CREATED } else { StatusCode::OK };
     // Echo the canonical policy plus its semantic `content_hash` (additive — the
     // existing `id`/`name`/... fields are intact) so the authoring caller (govder)
-    // captures the expected hash at author time to later diff against the list.
+    // captures the expected hash at author time to later diff against the list. The
+    // hash is keyed by the server secret (same function the list uses) so the two
+    // paths produce the same value; empty when no secret is configured.
     let mut body = serde_json::to_value(policy).unwrap_or_default();
     if let Some(obj) = body.as_object_mut() {
-        obj.insert("content_hash".to_string(), serde_json::json!(policy_content_hash(policy)));
+        let content_hash = policy_content_hash(policy, state.config.policy_hash_secret.as_deref());
+        obj.insert("content_hash".to_string(), serde_json::json!(content_hash));
     }
     (status, body)
 }
@@ -857,13 +860,34 @@ struct CanonicalPolicy<'a> {
     rules: &'a [PolicyRule],
 }
 
-/// Deterministic `sha256:<hexlowercase>` over a policy's semantic content
-/// (credential_pattern, principal_pattern distinguishing None vs Some,
-/// default_action, kill, and the ORDERED rules). Identity (`id`/`name`) is
-/// excluded — a rename is not a semantic change. govder captures this at author
-/// time (in the create/replace response) and re-checks it against the listed
-/// value to detect that an enforced policy was mutated out from under its record.
-fn policy_content_hash(policy: &Policy) -> String {
+/// Self-describing hash scheme label. The value is `hmac-sha256:<hexlowercase>`
+/// when a server secret keys the digest, so the scheme is legible on the wire and
+/// can't be confused with the old unkeyed `sha256:` form.
+const POLICY_HASH_PREFIX: &str = "hmac-sha256:";
+
+type PolicyHmac = hmac::Hmac<Sha256>;
+
+/// Deterministic KEYED digest over a policy's semantic content (credential_pattern,
+/// principal_pattern distinguishing None vs Some, default_action, kill, and the
+/// ORDERED rules). Identity (`id`/`name`) is excluded — a rename is not a semantic
+/// change. The digest is **HMAC-SHA256(secret, canonical-bytes)**, not a bare hash:
+/// the canonical preimage is low-entropy (a handful of globs/enums/rules), so a bare
+/// SHA-256 would let a compromised read-only key brute-force the reduced DTO back
+/// into the full enforcement topology offline. Keying it removes that oracle.
+///
+/// When no secret is configured we return an EMPTY string — never a bare unkeyed
+/// digest (that's the oracle we're removing). govder treats an empty `content_hash`
+/// as "drift detection unavailable" and skips it (presence checks still work).
+///
+/// govder captures this value at author time (in the create/replace response) and
+/// re-checks it for EQUALITY against the listed value; it never recomputes the hash
+/// itself, so switching to a keyed scheme is transparent to govder as long as the
+/// list and the create/replace paths use this one function with the same secret.
+/// Identical content + same secret always yields the same digest, so an idempotent
+/// re-PUT of the same policy never registers as false drift.
+fn policy_content_hash(policy: &Policy, secret: Option<&str>) -> String {
+    // No secret → no hash (graceful degradation; do NOT fall back to a bare digest).
+    let Some(secret) = secret else { return String::new() };
     let canonical = CanonicalPolicy {
         credential_pattern: &policy.credential_pattern,
         principal_pattern: &policy.principal_pattern,
@@ -872,10 +896,18 @@ fn policy_content_hash(policy: &Policy) -> String {
         rules: &policy.rules,
     };
     // serde_json over this fixed-field struct is order-stable (struct fields
-    // serialize in declaration order; rules keep their Vec order). Any change to
-    // a hashed field changes the bytes and thus the digest.
+    // serialize in declaration order; rules keep their Vec order). Any change to a
+    // hashed field changes the bytes and thus the digest.
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
-    format!("sha256:{}", hex::encode(Sha256::digest(&bytes)))
+    // `new_from_slice` accepts any key length for HMAC, so this never errors.
+    let mut mac = <PolicyHmac as hmac::Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts any key length");
+    hmac::Mac::update(&mut mac, &bytes);
+    format!(
+        "{}{}",
+        POLICY_HASH_PREFIX,
+        hex::encode(hmac::Mac::finalize(mac).into_bytes())
+    )
 }
 
 /// Reduced, secret-free projection of a policy for the inventory list. Deliberately
@@ -883,7 +915,8 @@ fn policy_content_hash(policy: &Policy) -> String {
 /// the enforcement topology out of the list; govder's reconciler consumes only
 /// id/name/kill/content_hash (semantic-drift via the hash). The full policy is
 /// never exposed by the list — only the create/replace responses echo the author's
-/// canonical view (with content_hash) back to the authoring admin.
+/// canonical view (with content_hash) back to the authoring admin. `content_hash`
+/// is the keyed digest (empty when no server secret is configured).
 #[derive(Serialize)]
 struct PolicyListItem {
     id: String,
@@ -892,13 +925,15 @@ struct PolicyListItem {
     content_hash: String,
 }
 
-impl From<&Policy> for PolicyListItem {
-    fn from(p: &Policy) -> Self {
+impl PolicyListItem {
+    /// Build the reduced item, keying `content_hash` with the server secret (empty
+    /// when `secret` is `None`). Not a `From` impl because it needs the secret.
+    fn new(p: &Policy, secret: Option<&str>) -> Self {
         PolicyListItem {
             id: p.id.clone(),
             name: p.name.clone(),
             kill: p.kill,
-            content_hash: policy_content_hash(p),
+            content_hash: policy_content_hash(p, secret),
         }
     }
 }
@@ -916,7 +951,9 @@ impl From<&Policy> for PolicyListItem {
 pub async fn api_list_policies(_read: ReadApiAuth, State(state): State<AppState>) -> Response {
     let mut policies = state.server.policy_engine().list_policies();
     policies.sort_by(|a, b| a.id.cmp(&b.id));
-    let items: Vec<PolicyListItem> = policies.iter().map(PolicyListItem::from).collect();
+    let secret = state.config.policy_hash_secret.as_deref();
+    let items: Vec<PolicyListItem> =
+        policies.iter().map(|p| PolicyListItem::new(p, secret)).collect();
     (StatusCode::OK, Json(serde_json::json!({ "policies": items }))).into_response()
 }
 
