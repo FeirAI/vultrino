@@ -468,6 +468,49 @@ async fn llm_non_streamed_injects_key_returns_body_meters_tokens_and_scrubs() {
 }
 
 #[tokio::test]
+async fn llm_denied_by_govder_grant_policy_shape_without_an_llm_allow_rule() {
+    // CROSS-PLANE VERIFICATION (govder LLM-auth gap): govder compiles an agent's grant policy
+    // as DENY-DEFAULT, scoped to the credential glob (e.g. "cred-*"), with allow rules ONLY
+    // for the granted MCP tools' URLs — and NO rule for the LLM action. govder installs no
+    // other policy for the LLM credential. This test replicates that exact policy shape and
+    // asks: under vultrino default-deny, is an /llm call authorized? It must NOT be — proving
+    // govder does not currently authorize the /llm channel (the companion-blocking finding).
+    // (The control is llm_non_streamed_* below, which uses an allow_policy → 200 + metering.)
+    let grant = Policy::deny_all("govder-grant", "cred-*")
+        .with_rule(PolicyCondition::UrlMatch("https://wttr.in/*".to_string()), PolicyAction::Allow);
+    let (router, storage, srv) = build_stack(config_with_policies(vec![grant])).await;
+    // The mock plugin returns 200 IF reached — so a non-200 result with ZERO meter events
+    // proves the POLICY denied the call BEFORE any upstream/plugin execution.
+    srv.plugins().register(Arc::new(MockLlmPlugin));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(&storage, "cred-openai", "mockllm.chat", "https://api.openai.com").await;
+    let token = mint_token(&storage, "cred-openai", Some("mockllm.chat")).await;
+
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "messages": [] }),
+        ))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "an /llm call must NOT succeed under a govder-shaped grant policy that has no LLM allow rule \
+         (status {})",
+        resp.status()
+    );
+    let events = meter_events(&storage).await;
+    assert!(
+        events.is_empty(),
+        "the plugin must NOT have run — the grant policy denied the /llm call BEFORE execute (a \
+         POLICY deny, not an upstream failure); meter events seen: {events:?}"
+    );
+}
+
+#[tokio::test]
 async fn llm_max_output_tokens_ceiling_clamps_the_forwarded_request() {
     // Per-call output-token ceiling (rate_companion per-call leg, P1-8): the proxy must
     // clamp an over-ceiling max_tokens down AND set it when the request omits it, before
