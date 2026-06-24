@@ -1610,3 +1610,119 @@ async fn test_reload_never_loses_a_just_stored_policy() {
          the admin Deny would flicker out under the periodic refresh"
     );
 }
+
+// `GET /api/v1/policies` lists the live (enforced) engine policies, admin-gated,
+// sorted by id — the read side the govder reconciliation sweep diffs against.
+#[tokio::test]
+async fn test_admin_list_policies() {
+    let (router, _storage, server, key) = build_admin_router().await;
+
+    // Two policies created out of id order; the list must come back sorted by id.
+    for name in ["zeta", "alpha"] {
+        let resp = router
+            .clone()
+            .oneshot(admin_req(
+                "POST",
+                "/api/v1/policies",
+                &key,
+                serde_json::json!({"name":name,"credential_pattern":"github-*","default_action":"deny"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+    let live = server.policy_engine().list_policies().len();
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", "/api/v1/policies", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let arr = listed["policies"].as_array().unwrap();
+    // The endpoint returns the full live engine set (config + stored), not just
+    // what this test created — assert it matches the engine count.
+    assert_eq!(arr.len(), live);
+    // Sorted by id.
+    let ids: Vec<&str> = arr.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "policies must be sorted by id");
+
+    // Non-admin is rejected before any policy data is returned.
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/policies")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// `GET /api/v1/tokens` lists use tokens as NON-SECRET metadata — id/prefix/scopes,
+// never the token hash or plaintext. This is the read side for the govder
+// reconciliation sweep's orphan-token detection; the no-secret invariant is the
+// security crux (a leaked hash is offline-crackable / a leaked plaintext is a key).
+#[tokio::test]
+async fn test_admin_list_tokens_is_non_secret() {
+    let (router, _storage, _server, key) = build_admin_router().await;
+
+    // Mint a token bound to an agent_label (so the list carries the principal).
+    let mint = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/tokens",
+            &key,
+            serde_json::json!({"name":"t-recon","credential_scope":"cred-*","agent_label":"researcher.v1"}),
+        ))
+        .await
+        .unwrap();
+    let minted: serde_json::Value = serde_json::from_str(&body_string(mint).await).unwrap();
+    let plaintext = minted["token"].as_str().unwrap().to_string();
+    let token_id = minted["metadata"]["id"].as_str().unwrap().to_string();
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", "/api/v1/tokens", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = body_string(resp).await;
+
+    // The minted token is present with the fields the sweep needs (id, agent_label).
+    let listed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let tok = listed["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == token_id)
+        .expect("minted token must appear in the list");
+    assert_eq!(tok["name"], "t-recon");
+    assert_eq!(tok["credential_scope"], "cred-*");
+    assert_eq!(tok["agent_label"], "researcher.v1");
+
+    // NO-SECRET INVARIANT: neither the hash nor the plaintext may appear anywhere
+    // in the response — not as a field, not embedded in any value.
+    assert!(tok.get("token_hash").is_none(), "token_hash must never be listed");
+    assert!(!raw.contains("token_hash"), "no token_hash key anywhere in the response");
+    assert!(!raw.contains(&plaintext), "the token plaintext must never appear in the list");
+
+    // Non-admin is rejected.
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/tokens")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

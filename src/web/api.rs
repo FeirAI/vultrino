@@ -772,6 +772,18 @@ async fn store_and_reload_policy(state: &AppState, policy: &Policy, created: boo
     (status, serde_json::to_value(policy).unwrap_or_default())
 }
 
+/// `GET /api/v1/policies` — list the live (enforced) policy set. Admin-gated.
+/// Returns the in-engine policies (config + stored, merged) — the authoritative
+/// *enforced* state, not just what's persisted — sorted by id. Policies carry no
+/// secrets. Backs the govder cross-plane reconciliation sweep: govder compares
+/// this against its tracked provision records to flag an orphan policy (enforced
+/// but untracked) or a missing one (tracked but not enforced — a containment gap).
+pub async fn api_list_policies(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+    let mut policies = state.server.policy_engine().list_policies();
+    policies.sort_by(|a, b| a.id.cmp(&b.id));
+    (StatusCode::OK, Json(serde_json::json!({ "policies": policies }))).into_response()
+}
+
 /// `POST /api/v1/policies` — create a policy (id generated if omitted).
 pub async fn api_create_policy(
     _admin: AdminApiAuth,
@@ -1040,6 +1052,24 @@ pub struct TokenCreateRequest {
     /// Optional tenant/team this token belongs to (V11).
     #[serde(default)]
     pub tenant: Option<String>,
+}
+
+/// `GET /api/v1/tokens` — list all use tokens as non-secret metadata
+/// (`UseTokenMetadata`: id, prefix, name, scopes, agent_label, use/expiry/revoke
+/// state) sorted by id — NEVER the token hash or plaintext. Admin-gated. Backs the
+/// govder cross-plane reconciliation sweep: govder enumerates live tokens and
+/// flags any whose id has no governance index row (an orphan token = an
+/// uncontainable agent → revoke fail-closed + alert).
+pub async fn api_list_tokens(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+    match state.storage.list_use_tokens().await {
+        Ok(mut tokens) => {
+            tokens.sort_by(|a, b| a.id.cmp(&b.id));
+            let metadata: Vec<UseTokenMetadata> =
+                tokens.iter().map(UseTokenMetadata::from).collect();
+            (StatusCode::OK, Json(serde_json::json!({ "tokens": metadata }))).into_response()
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
 }
 
 /// `POST /api/v1/tokens` — mint a use token; the plaintext is returned once.

@@ -174,7 +174,10 @@ impl WebServer {
             .route("/api/v1/execute", post(api::api_execute))
             .route("/api/v1/approvals/{id}", get(api::api_check_approval))
             // Admin API (V1): runtime config-write surface (Permission::Admin).
-            .route("/api/v1/policies", post(api::api_create_policy))
+            .route(
+                "/api/v1/policies",
+                get(api::api_list_policies).post(api::api_create_policy),
+            )
             .route(
                 "/api/v1/policies/{id}",
                 put(api::api_put_policy).delete(api::api_delete_policy),
@@ -188,7 +191,10 @@ impl WebServer {
                 "/api/v1/capabilities/{id}",
                 put(api::api_put_capability).delete(api::api_delete_capability),
             )
-            .route("/api/v1/tokens", post(api::api_create_token))
+            .route(
+                "/api/v1/tokens",
+                get(api::api_list_tokens).post(api::api_create_token),
+            )
             .route("/api/v1/tokens/{id}/revoke", post(api::api_revoke_token))
             .route("/api/v1/roles", post(api::api_create_role))
             .route("/api/v1/roles/{id}", delete(api::api_delete_role))
