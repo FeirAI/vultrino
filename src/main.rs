@@ -1024,10 +1024,43 @@ async fn load_admin_auth(_config: &Config) -> Result<AdminAuth, Box<dyn std::err
             .ok_or("Missing password_hash in admin.json")?
             .to_string();
 
-        Ok(AdminAuth::from_hash(username, password_hash))
-    } else {
-        Err("Admin credentials not configured. Run 'vultrino init' first.".into())
+        return Ok(AdminAuth::from_hash(username, password_hash));
     }
+
+    // NON-INTERACTIVE bootstrap (headless / Kubernetes): admin.json is absent (an emptyDir or a
+    // fresh pod), but `vultrino init` is interactive and can't run under an orchestrator. Accept
+    // the web-UI admin credentials from the environment, sourced from a mounted Secret (file
+    // variants preferred — never argv). Note: this gates ONLY the web-UI login; agents and govder
+    // authenticate with `vut_`/`vk_` Bearer tokens against the vault, independent of this.
+    if let Some(username) = read_secret_env("VULTRINO_ADMIN_USERNAME") {
+        // A precomputed bcrypt hash (so the plaintext never touches the cluster), else a plaintext
+        // password vultrino hashes itself (AdminAuth::new). Both come from the Secret.
+        if let Some(hash) = read_secret_env("VULTRINO_ADMIN_PASSWORD_HASH") {
+            return Ok(AdminAuth::from_hash(username, hash));
+        }
+        if let Some(password) = read_secret_env("VULTRINO_ADMIN_PASSWORD") {
+            return Ok(AdminAuth::new(&username, &password)?);
+        }
+        return Err("VULTRINO_ADMIN_USERNAME is set but no VULTRINO_ADMIN_PASSWORD_HASH[_FILE] or VULTRINO_ADMIN_PASSWORD[_FILE] is provided".into());
+    }
+
+    Err("Admin credentials not configured. Run 'vultrino init', or (headless) set VULTRINO_ADMIN_USERNAME + VULTRINO_ADMIN_PASSWORD_FILE.".into())
+}
+
+/// Read a secret from the environment with the `*_FILE` convention preferred: if `<VAR>_FILE` is
+/// set, its file contents (trimmed) win (the Kubernetes/CSI secret-file pattern, keeping the value
+/// off argv and out of the process env dump); else fall back to `<VAR>`. Returns None when neither
+/// is set or the value is blank/whitespace.
+fn read_secret_env(var: &str) -> Option<String> {
+    if let Ok(path) = std::env::var(format!("{var}_FILE")) {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            let v = contents.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    std::env::var(var).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 /// Save admin auth to storage
