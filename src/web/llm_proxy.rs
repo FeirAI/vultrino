@@ -170,6 +170,19 @@ fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64) {
         if !any_present {
             obj.insert("max_tokens".to_string(), serde_json::json!(ceiling));
         }
+        // Multiplicity controls (`n` choices, legacy `best_of`) multiply the TOTAL output
+        // tokens (and cost) for a call: `max_tokens` bounds per-choice, so `n:10` produces
+        // ~10x the ceiling. The per-call ceiling is a COST bound, so pin multiplicity to 1
+        // whenever a ceiling is configured (this fn only runs under one). Fail closed: a
+        // present-but-non-numeric or >1 value is forced to 1.
+        for mult in ["n", "best_of"] {
+            if let Some(v) = obj.get(mult) {
+                let keep_as_is = v.as_u64() == Some(1);
+                if !keep_as_is {
+                    obj.insert(mult.to_string(), serde_json::json!(1));
+                }
+            }
+        }
     }
 }
 
@@ -546,6 +559,29 @@ mod tests {
         assert_eq!(body["max_tokens"], json!(1000));
         assert_eq!(body["max_completion_tokens"], json!(1000));
         assert_eq!(body["max_output_tokens"], json!(1000));
+    }
+
+    #[test]
+    fn clamp_pins_output_multiplicity_to_one() {
+        // n / best_of multiply TOTAL output tokens, so under a configured ceiling they must
+        // be pinned to 1 (else max_tokens:1000,n:10 produces ~10x the per-call bound).
+        let mut body = json!({ "max_tokens": 1000, "n": 10 });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["n"], json!(1), "n>1 evades the per-call ceiling");
+        let mut body = json!({ "max_tokens": 1000, "best_of": 8 });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["best_of"], json!(1));
+        // Non-numeric multiplicity fails closed to 1.
+        let mut body = json!({ "max_tokens": 1000, "n": "lots" });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["n"], json!(1));
+        // n:1 is left as-is; absent n is not injected.
+        let mut body = json!({ "max_tokens": 1000, "n": 1 });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["n"], json!(1));
+        let mut body = json!({ "max_tokens": 1000 });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert!(body.get("n").is_none(), "don't inject n when the request didn't ask for choices");
     }
 
     #[test]
