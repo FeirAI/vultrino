@@ -61,6 +61,21 @@ async fn build_admin_router() -> (
     Arc<vultrino::server::VultrinoServer>,
     String,
 ) {
+    let (router, storage, exec_server, admin_key, _read_key) =
+        build_admin_router_with_read().await;
+    (router, storage, exec_server, admin_key)
+}
+
+/// Like [`build_admin_router`] but also mints and returns a least-privilege
+/// `read-only` key (Permission::Read only), so tests can assert that the inventory
+/// GETs accept it while the mutating admin routes reject it.
+async fn build_admin_router_with_read() -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    Arc<vultrino::server::VultrinoServer>,
+    String,
+    String,
+) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
     std::mem::forget(dir);
@@ -73,6 +88,11 @@ async fn build_admin_router() -> (
     let auth_manager = AuthManager::new();
     let (admin_key, api_key) = auth_manager.create_api_key("admin-key", "admin", None).unwrap();
     storage.store_api_key(&api_key).await.unwrap();
+    // Mint a read-only key (least privilege: Permission::Read only).
+    let (read_key, read_api_key) = auth_manager
+        .create_api_key("read-key", vultrino::auth::ROLE_READ_ONLY, None)
+        .unwrap();
+    storage.store_api_key(&read_api_key).await.unwrap();
 
     let admin = AdminAuth::new("admin", "password123").unwrap();
     let resolver = vultrino::router::CredentialResolver::new(storage.clone());
@@ -89,7 +109,7 @@ async fn build_admin_router() -> (
         admin,
         exec_server.clone(),
     );
-    (server.into_router(), storage, exec_server, admin_key)
+    (server.into_router(), storage, exec_server, admin_key, read_key)
 }
 
 fn admin_req(method: &str, uri: &str, key: &str, body: serde_json::Value) -> Request<Body> {
@@ -1611,13 +1631,18 @@ async fn test_reload_never_loses_a_just_stored_policy() {
     );
 }
 
-// `GET /api/v1/policies` lists the live (enforced) engine policies, admin-gated,
-// sorted by id — the read side the govder reconciliation sweep diffs against.
+// `GET /api/v1/policies` lists the live (enforced) engine policies, read-gated,
+// sorted by id, as a REDUCED DTO (id/name/kill/content_hash) — the read side the
+// govder reconciliation sweep diffs against. The list must NOT leak enforcement
+// topology (rules/patterns/default_action), and the content_hash must equal the
+// value echoed at author time.
 #[tokio::test]
 async fn test_admin_list_policies() {
     let (router, _storage, server, key) = build_admin_router().await;
 
     // Two policies created out of id order; the list must come back sorted by id.
+    // Capture the content_hash echoed by the create response (the authored value).
+    let mut authored_hash: std::collections::HashMap<String, String> = Default::default();
     for name in ["zeta", "alpha"] {
         let resp = router
             .clone()
@@ -1630,6 +1655,15 @@ async fn test_admin_list_policies() {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        // The create response echoes the canonical policy PLUS a content_hash, and
+        // keeps the existing id/name fields intact (additive).
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["name"], name);
+        let ch = created["content_hash"].as_str().unwrap();
+        assert!(ch.starts_with("sha256:"), "content_hash must be sha256:<hex>: {}", ch);
+        assert_eq!(ch.len(), "sha256:".len() + 64, "sha256 hex must be 64 chars");
+        authored_hash.insert(id, ch.to_string());
     }
     let live = server.policy_engine().list_policies().len();
 
@@ -1639,7 +1673,8 @@ async fn test_admin_list_policies() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let listed: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let raw = body_string(resp).await;
+    let listed: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let arr = listed["policies"].as_array().unwrap();
     // The endpoint returns the full live engine set (config + stored), not just
     // what this test created — assert it matches the engine count.
@@ -1650,7 +1685,26 @@ async fn test_admin_list_policies() {
     sorted.sort_unstable();
     assert_eq!(ids, sorted, "policies must be sorted by id");
 
-    // Non-admin is rejected before any policy data is returned.
+    // REDUCED DTO: only id/name/kill/content_hash; no enforcement topology leaks.
+    for item in arr {
+        let obj = item.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["content_hash", "id", "kill", "name"], "reduced DTO fields only");
+        // The listed content_hash equals the value captured at author time.
+        let id = obj["id"].as_str().unwrap();
+        if let Some(expected) = authored_hash.get(id) {
+            assert_eq!(obj["content_hash"].as_str().unwrap(), expected,
+                "listed content_hash must equal the authored value");
+        }
+    }
+    // No enforcement topology anywhere in the serialized list.
+    assert!(!raw.contains("credential_pattern"), "list must not leak credential_pattern");
+    assert!(!raw.contains("principal_pattern"), "list must not leak principal_pattern");
+    assert!(!raw.contains("default_action"), "list must not leak default_action");
+    assert!(!raw.contains("\"rules\""), "list must not leak rules");
+
+    // Non-admin (no key) is rejected before any policy data is returned.
     let resp = router
         .oneshot(
             Request::builder()
@@ -1662,6 +1716,153 @@ async fn test_admin_list_policies() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// content_hash changes when the policy's semantic content changes: create →
+// capture hash → PUT a DIFFERENT rule set at the same id → the listed hash differs.
+#[tokio::test]
+async fn test_policy_content_hash_changes_on_rule_edit() {
+    let (router, _storage, _server, key) = build_admin_router().await;
+
+    // Create with one rule set.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/policies",
+            &key,
+            serde_json::json!({
+                "name": "h",
+                "credential_pattern": "github-*",
+                "default_action": "deny",
+                "rules": [ { "condition": { "method_match": ["GET"] }, "action": "allow" } ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let hash_v1 = created["content_hash"].as_str().unwrap().to_string();
+
+    // The listed hash equals the create-time hash (same content).
+    let listed_hash = |router: axum::Router, id: &str| {
+        let id = id.to_string();
+        let key = key.clone();
+        async move {
+            let resp = router
+                .oneshot(admin_req("GET", "/api/v1/policies", &key, serde_json::json!({})))
+                .await
+                .unwrap();
+            let listed: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+            listed["policies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"].as_str() == Some(&id))
+                .unwrap()["content_hash"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    assert_eq!(listed_hash(router.clone(), &id).await, hash_v1);
+
+    // PUT a DIFFERENT rule set at the same id → content_hash must change.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "PUT",
+            &format!("/api/v1/policies/{}", id),
+            &key,
+            serde_json::json!({
+                "name": "h",
+                "credential_pattern": "github-*",
+                "default_action": "deny",
+                "rules": [ { "condition": { "method_match": ["POST"] }, "action": "allow" } ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let replaced: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let hash_v2 = replaced["content_hash"].as_str().unwrap().to_string();
+    assert_ne!(hash_v1, hash_v2, "content_hash must change when rules change");
+    assert_eq!(listed_hash(router, &id).await, hash_v2, "listed hash tracks the new content");
+}
+
+// V1: a least-privilege read-only key can GET the inventory endpoints but is
+// rejected by the mutating admin routes; an admin key can do both.
+#[tokio::test]
+async fn test_read_only_key_inventory_least_privilege() {
+    let (router, _storage, _server, admin_key, read_key) = build_admin_router_with_read().await;
+
+    // Read-only key CAN list tokens and policies (200).
+    for uri in ["/api/v1/tokens", "/api/v1/policies"] {
+        let resp = router
+            .clone()
+            .oneshot(admin_req("GET", uri, &read_key, serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "read key must GET {}", uri);
+    }
+
+    // Read-only key CANNOT mutate: POST /policies and POST /tokens → 403.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/policies",
+            &read_key,
+            serde_json::json!({"name":"p","credential_pattern":"*","default_action":"allow"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "read key must not POST policies");
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/tokens",
+            &read_key,
+            serde_json::json!({"name":"t","credential_scope":"*"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "read key must not POST tokens");
+
+    // Admin key CAN do all: GET inventory AND POST.
+    for uri in ["/api/v1/tokens", "/api/v1/policies"] {
+        let resp = router
+            .clone()
+            .oneshot(admin_req("GET", uri, &admin_key, serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "admin key must GET {}", uri);
+    }
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/policies",
+            &admin_key,
+            serde_json::json!({"name":"p","credential_pattern":"*","default_action":"allow"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "admin key must POST policies");
+
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/tokens",
+            &admin_key,
+            serde_json::json!({"name":"t","credential_scope":"*"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "admin key must POST tokens");
 }
 
 // `GET /api/v1/tokens` lists use tokens as NON-SECRET metadata — id/prefix/scopes,

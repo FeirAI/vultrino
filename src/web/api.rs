@@ -550,6 +550,69 @@ async fn require_admin(
     Ok(auth)
 }
 
+/// Extractor that authenticates a **read** caller from request headers before the
+/// body is read — the least-privilege counterpart of [`AdminApiAuth`]. It backs
+/// only the inventory GETs (`/api/v1/tokens`, `/api/v1/policies`) so a reconcile
+/// key can enumerate state without holding the admin authority that mints/revokes
+/// tokens or rewrites/deletes policies. An admin key still passes (admin holds
+/// `Permission::Read`); a `read-only` key passes the GETs but not the mutating
+/// admin routes; use tokens are rejected exactly as on the admin surface.
+pub struct ReadApiAuth(#[allow(dead_code)] pub AuthResult);
+
+impl FromRequestParts<AppState> for ReadApiAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = require_read(state, &parts.headers).await?;
+        tracing::info!(
+            caller_key_id = %auth.api_key.id,
+            method = %parts.method,
+            path = %parts.uri.path(),
+            "read API request authorized"
+        );
+        Ok(ReadApiAuth(auth))
+    }
+}
+
+/// Authenticate a read caller: an API key with `Permission::Read` (which admin
+/// keys also hold). Use tokens can never reach the inventory surface. Mirrors
+/// [`require_admin`] in every respect except the permission demanded.
+async fn require_read(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<AuthResult, Response> {
+    let secret = extract_api_key(headers).ok_or_else(|| {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "missing_api_key",
+            "Authorization header with Bearer API key required",
+        )
+    })?;
+    if UseToken::looks_like_token(&secret) {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "not_admin",
+            "Use tokens cannot access the admin API; an API key with 'read' permission is required",
+        ));
+    }
+    // Generic message — same enumeration-oracle hygiene as the admin surface.
+    let (key, role) = validate_api_key(state, &secret)
+        .await
+        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", "Invalid API key"))?;
+    let auth = AuthResult { api_key: key, role };
+    if !auth.has_permission(Permission::Read) {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "API key does not have 'read' permission",
+        ));
+    }
+    Ok(auth)
+}
+
 /// Upper bound on a use-token lifetime accepted by the admin API (~10 years),
 /// guarding `chrono::Duration::seconds` from an overflowing input.
 const MAX_TOKEN_LIFETIME_SECS: i64 = 10 * 365 * 24 * 60 * 60;
@@ -769,19 +832,92 @@ async fn store_and_reload_policy(state: &AppState, policy: &Policy, created: boo
         )
         .await;
     let status = if created { StatusCode::CREATED } else { StatusCode::OK };
-    (status, serde_json::to_value(policy).unwrap_or_default())
+    // Echo the canonical policy plus its semantic `content_hash` (additive — the
+    // existing `id`/`name`/... fields are intact) so the authoring caller (govder)
+    // captures the expected hash at author time to later diff against the list.
+    let mut body = serde_json::to_value(policy).unwrap_or_default();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("content_hash".to_string(), serde_json::json!(policy_content_hash(policy)));
+    }
+    (status, body)
 }
 
-/// `GET /api/v1/policies` — list the live (enforced) policy set. Admin-gated.
+/// Canonical, order-stable projection of a policy's **semantic** content, hashed
+/// to detect drift across planes. Field names/shape here define the hash preimage,
+/// so they must stay byte-stable: changing this struct changes every policy's
+/// `content_hash`. `principal_pattern` is kept as `Option` (not flattened to "")
+/// so `None` and `Some("")` hash differently — a present-but-empty glob is a
+/// distinct policy from an absent one.
+#[derive(Serialize)]
+struct CanonicalPolicy<'a> {
+    credential_pattern: &'a str,
+    principal_pattern: &'a Option<String>,
+    default_action: PolicyAction,
+    kill: bool,
+    rules: &'a [PolicyRule],
+}
+
+/// Deterministic `sha256:<hexlowercase>` over a policy's semantic content
+/// (credential_pattern, principal_pattern distinguishing None vs Some,
+/// default_action, kill, and the ORDERED rules). Identity (`id`/`name`) is
+/// excluded — a rename is not a semantic change. govder captures this at author
+/// time (in the create/replace response) and re-checks it against the listed
+/// value to detect that an enforced policy was mutated out from under its record.
+fn policy_content_hash(policy: &Policy) -> String {
+    let canonical = CanonicalPolicy {
+        credential_pattern: &policy.credential_pattern,
+        principal_pattern: &policy.principal_pattern,
+        default_action: policy.default_action,
+        kill: policy.kill,
+        rules: &policy.rules,
+    };
+    // serde_json over this fixed-field struct is order-stable (struct fields
+    // serialize in declaration order; rules keep their Vec order). Any change to
+    // a hashed field changes the bytes and thus the digest.
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    format!("sha256:{}", hex::encode(Sha256::digest(&bytes)))
+}
+
+/// Reduced, secret-free projection of a policy for the inventory list. Deliberately
+/// omits rules / patterns / default_action so a compromised read key cannot read
+/// the enforcement topology out of the list; govder's reconciler consumes only
+/// id/name/kill/content_hash (semantic-drift via the hash). The full policy is
+/// never exposed by the list — only the create/replace responses echo the author's
+/// canonical view (with content_hash) back to the authoring admin.
+#[derive(Serialize)]
+struct PolicyListItem {
+    id: String,
+    name: String,
+    kill: bool,
+    content_hash: String,
+}
+
+impl From<&Policy> for PolicyListItem {
+    fn from(p: &Policy) -> Self {
+        PolicyListItem {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            kill: p.kill,
+            content_hash: policy_content_hash(p),
+        }
+    }
+}
+
+/// `GET /api/v1/policies` — list the live (enforced) policy set. Read-gated
+/// (least privilege: a reconcile key reads inventory without admin write power).
 /// Returns the in-engine policies (config + stored, merged) — the authoritative
-/// *enforced* state, not just what's persisted — sorted by id. Policies carry no
-/// secrets. Backs the govder cross-plane reconciliation sweep: govder compares
-/// this against its tracked provision records to flag an orphan policy (enforced
-/// but untracked) or a missing one (tracked but not enforced — a containment gap).
-pub async fn api_list_policies(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+/// *enforced* state, not just what's persisted — sorted by id, as a REDUCED DTO
+/// (`id`, `name`, `kill`, `content_hash`) that carries no secrets AND no
+/// enforcement topology (rules/patterns/default_action are withheld). Backs the
+/// govder cross-plane reconciliation sweep: govder compares this against its
+/// tracked provision records to flag an orphan policy (enforced but untracked), a
+/// missing one (tracked but not enforced — a containment gap), or a semantic drift
+/// (content_hash != the value captured at author time).
+pub async fn api_list_policies(_read: ReadApiAuth, State(state): State<AppState>) -> Response {
     let mut policies = state.server.policy_engine().list_policies();
     policies.sort_by(|a, b| a.id.cmp(&b.id));
-    (StatusCode::OK, Json(serde_json::json!({ "policies": policies }))).into_response()
+    let items: Vec<PolicyListItem> = policies.iter().map(PolicyListItem::from).collect();
+    (StatusCode::OK, Json(serde_json::json!({ "policies": items }))).into_response()
 }
 
 /// `POST /api/v1/policies` — create a policy (id generated if omitted).
@@ -1056,11 +1192,12 @@ pub struct TokenCreateRequest {
 
 /// `GET /api/v1/tokens` — list all use tokens as non-secret metadata
 /// (`UseTokenMetadata`: id, prefix, name, scopes, agent_label, use/expiry/revoke
-/// state) sorted by id — NEVER the token hash or plaintext. Admin-gated. Backs the
+/// state) sorted by id — NEVER the token hash or plaintext. Read-gated (least
+/// privilege: a reconcile key reads inventory without admin write power). Backs the
 /// govder cross-plane reconciliation sweep: govder enumerates live tokens and
 /// flags any whose id has no governance index row (an orphan token = an
 /// uncontainable agent → revoke fail-closed + alert).
-pub async fn api_list_tokens(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+pub async fn api_list_tokens(_read: ReadApiAuth, State(state): State<AppState>) -> Response {
     match state.storage.list_use_tokens().await {
         Ok(mut tokens) => {
             tokens.sort_by(|a, b| a.id.cmp(&b.id));
