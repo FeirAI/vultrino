@@ -75,9 +75,15 @@ pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
         }
         // ensure_ascii `\uXXXX` form (encoders like Python's json.dumps default emit ALL
         // non-ASCII as \uXXXX; serde emits raw UTF-8), so a secret with non-ASCII bytes
-        // reflected by such an upstream would evade the default JSON-escaped form.
+        // reflected by such an upstream would evade the default JSON-escaped form. Also a
+        // COMPOSED variant with `/` → `\/`, since an ensure_ascii + HTML-safe encoder
+        // applies BOTH transforms to a secret that has non-ASCII AND a slash.
         if !raw.is_ascii() {
-            add(&mut forms, ascii_escaped_inner(raw), raw);
+            let ascii = ascii_escaped_inner(raw);
+            if ascii.contains('/') {
+                add(&mut forms, ascii.replace('/', "\\/"), raw);
+            }
+            add(&mut forms, ascii, raw);
         }
     }
     forms.sort();
@@ -610,6 +616,27 @@ mod tests {
         let mut r = resp(&format!("{{\"echo\":\"{}\"}}", escaped));
         assert!(redact_secret_material(&mut r, &secrets(&[secret]), "x"));
         assert!(!String::from_utf8_lossy(&r.body).contains(&escaped));
+    }
+
+    #[test]
+    fn test_redact_catches_composed_ascii_escaped_slash_form() {
+        // A secret with BOTH non-ASCII and '/', reflected by an ensure_ascii + HTML-safe
+        // JSON encoder (e.g. Python json.dumps escaping slashes): é → é AND / → \/.
+        // Neither the plain ensure_ascii form nor the plain slash-escaped form matches this
+        // composed reflection — the COMPOSED derived form must.
+        let secret = "café/key-1234567";
+        // ensure_ascii renders the non-ASCII 'é' (U+00E9) as the 6 literal chars
+        // backslash-u-0-0-e-9, and an HTML-safe pass renders '/' as backslash-slash. The
+        // composed reflection is therefore "caf" + "é" + "\/" + "key-1234567".
+        let composed = format!("caf{}{}key-1234567", "\\u00e9", "\\/");
+        let mut r = resp(&format!("{{\"echo\":\"{composed}\"}}"));
+        assert!(
+            redact_secret_material(&mut r, &secrets(&[secret]), "x"),
+            "composed ensure_ascii+slash secret must be detected"
+        );
+        let body = String::from_utf8_lossy(&r.body);
+        assert!(!body.contains(composed.as_str()), "composed secret form survived: {body}");
+        assert!(body.contains("[REDACTED:x]"));
     }
 
     #[test]

@@ -106,12 +106,21 @@ fn forward_provider_headers(inbound: &HeaderMap, fwd: &mut HashMap<String, Strin
     }
 }
 
-/// Whether the inbound proxy path targets an OpenAI **chat/completions**-style
+/// Whether the RESOLVED UPSTREAM URL targets an OpenAI **chat/completions**-style
 /// endpoint (so `stream_options.include_usage` injection is appropriate). Matches
-/// `…/chat/completions` and the legacy `…/completions`; excludes `/v1/responses`
-/// and Anthropic `/v1/messages`, which report streamed usage natively.
-fn is_openai_chat_path(path: &str) -> bool {
-    path.trim_end_matches('/').ends_with("/completions")
+/// `…/chat/completions` and the legacy `…/completions`; excludes `/v1/responses` and
+/// Anthropic `/v1/messages`, which report streamed usage natively. It is keyed on the
+/// resolved upstream (provider_base + inbound path), NOT the inbound path alone — a bare
+/// `POST /llm` carries an empty inbound path but its provider_base may itself be the
+/// chat-completions endpoint, and injection must still apply there.
+fn is_openai_chat_endpoint(upstream: &str) -> bool {
+    // Ignore any query/fragment, then suffix-match the path component.
+    let path = upstream
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(upstream)
+        .trim_end_matches('/');
+    path.ends_with("/completions")
 }
 
 /// A JSON error response shaped like an OpenAI API error so the harness's model
@@ -134,12 +143,33 @@ fn llm_error(status: StatusCode, kind: &str, message: &str) -> Response {
 /// exceed the per-call output bound). v1 handles only the OpenAI-compatible
 /// top-level `max_tokens` field; a non-object body is left untouched.
 fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64) {
+    // Every provider-supported output-token field the proxy routes to, so the per-call
+    // ceiling cannot be evaded by naming an alternate field: `max_tokens` (OpenAI chat +
+    // legacy + Anthropic), `max_completion_tokens` (newer OpenAI chat models), and
+    // `max_output_tokens` (OpenAI /v1/responses).
+    const OUTPUT_TOKEN_FIELDS: &[&str] =
+        &["max_tokens", "max_completion_tokens", "max_output_tokens"];
     if let Some(obj) = body.as_object_mut() {
-        let clamped = obj
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .map_or(ceiling, |req| req.min(ceiling));
-        obj.insert("max_tokens".to_string(), serde_json::json!(clamped));
+        let mut any_present = false;
+        for field in OUTPUT_TOKEN_FIELDS {
+            if obj.contains_key(*field) {
+                any_present = true;
+                // Clamp a present field to min(req, ceiling); a present-but-unparseable
+                // value (null / non-number) fails CLOSED to the ceiling.
+                let clamped = obj
+                    .get(*field)
+                    .and_then(|v| v.as_u64())
+                    .map_or(ceiling, |req| req.min(ceiling));
+                obj.insert((*field).to_string(), serde_json::json!(clamped));
+            }
+        }
+        // The request named NO output-token field → set the common one so the provider
+        // default can't exceed the ceiling. Don't inject a second field when the client
+        // already chose one (a newer chat model rejects `max_tokens` if it wanted
+        // `max_completion_tokens`).
+        if !any_present {
+            obj.insert("max_tokens".to_string(), serde_json::json!(ceiling));
+        }
     }
 }
 
@@ -358,7 +388,7 @@ async fn llm_proxy_impl(
     // maybe_inject_stream_usage overwrites a client false. Anthropic `/v1/messages` and
     // OpenAI `/v1/responses` report usage natively, so they are excluded (an unknown
     // `stream_options` field could be rejected).
-    if use_streaming && state.config.llm_proxy.inject_stream_usage && is_openai_chat_path(&path) {
+    if use_streaming && state.config.llm_proxy.inject_stream_usage && is_openai_chat_endpoint(&upstream) {
         if let Some(b) = request_body.as_mut() {
             crate::outbox::maybe_inject_stream_usage(b);
         }
@@ -487,7 +517,7 @@ async fn llm_proxy_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_max_output_tokens;
+    use super::{clamp_max_output_tokens, is_openai_chat_endpoint};
     use serde_json::json;
 
     #[test]
@@ -495,6 +525,41 @@ mod tests {
         let mut body = json!({ "model": "gpt-4o", "max_tokens": 5000 });
         clamp_max_output_tokens(&mut body, 1000);
         assert_eq!(body["max_tokens"], json!(1000));
+    }
+
+    #[test]
+    fn clamps_alternate_output_token_fields() {
+        // The ceiling must not be evadable by naming an alternate output-token field.
+        // max_completion_tokens (newer OpenAI chat):
+        let mut body = json!({ "model": "gpt-5", "max_completion_tokens": 9000 });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["max_completion_tokens"], json!(1000));
+        assert!(body.get("max_tokens").is_none(), "don't inject max_tokens when another field was chosen");
+        // max_output_tokens (OpenAI /v1/responses):
+        let mut body = json!({ "model": "o3", "max_output_tokens": 9000 });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["max_output_tokens"], json!(1000));
+        assert!(body.get("max_tokens").is_none());
+        // All present → all clamped.
+        let mut body = json!({ "max_tokens": 9000, "max_completion_tokens": 8000, "max_output_tokens": 7000 });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["max_tokens"], json!(1000));
+        assert_eq!(body["max_completion_tokens"], json!(1000));
+        assert_eq!(body["max_output_tokens"], json!(1000));
+    }
+
+    #[test]
+    fn chat_endpoint_detected_from_resolved_upstream_url() {
+        // A bare POST /llm has an empty inbound path; the gate must key on the RESOLVED
+        // upstream URL so include_usage injection still applies when provider_base IS the
+        // chat-completions endpoint.
+        assert!(is_openai_chat_endpoint("https://api.openai.com/v1/chat/completions"));
+        assert!(is_openai_chat_endpoint("https://api.openai.com/v1/completions")); // legacy
+        assert!(is_openai_chat_endpoint("https://api.openai.com/v1/chat/completions?x=1"));
+        assert!(is_openai_chat_endpoint("https://api.openai.com/v1/chat/completions/"));
+        // Native-usage endpoints must NOT match (they'd reject stream_options).
+        assert!(!is_openai_chat_endpoint("https://api.openai.com/v1/responses"));
+        assert!(!is_openai_chat_endpoint("https://api.anthropic.com/v1/messages"));
     }
 
     #[test]
