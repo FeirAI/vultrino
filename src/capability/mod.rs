@@ -741,7 +741,7 @@ mod tests {
             }
         }
         // A sibling-prefix host path must not satisfy the prefix (/openai vs /openai2).
-        assert!(c.llm_upstream_url("/../openai2/secret").map_or(true, |u| {
+        assert!(c.llm_upstream_url("/../openai2/secret").is_none_or(|u| {
             let p = url::Url::parse(&u).unwrap();
             p.path() == "/openai" || p.path().starts_with("/openai/")
         }));

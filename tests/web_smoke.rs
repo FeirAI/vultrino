@@ -112,8 +112,10 @@ async fn build_admin_router_full(
 
     // The web AppState carries the policy-hash secret on its Config — set it here
     // (production sources it from VULTRINO_POLICY_HASH_SECRET at startup).
-    let mut web_config = Config::default();
-    web_config.policy_hash_secret = policy_hash_secret.map(|s| s.to_string());
+    let web_config = Config {
+        policy_hash_secret: policy_hash_secret.map(|s| s.to_string()),
+        ..Config::default()
+    };
 
     let admin = AdminAuth::new("admin", "password123").unwrap();
     let resolver = vultrino::router::CredentialResolver::new(storage.clone());
