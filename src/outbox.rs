@@ -103,6 +103,12 @@ pub struct OutboxEvent {
     pub last_attempt_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Internal idempotency key for the INTENT-STAGING drain (D1, v6→v7): an event staged in the
+    /// vault and drained to the outbox store carries a stable id so a crash between the outbox append
+    /// and clearing the vault intent can't duplicate it on re-drain (the store dedups on this). `None`
+    /// for ordinary direct appends. NOT part of `delivery_body` — never delivered to the consumer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_id: Option<String>,
 }
 
 fn default_pending() -> DeliveryState {
@@ -626,6 +632,7 @@ mod tests {
     #[test]
     fn test_delivery_body_shape() {
         let e = OutboxEvent {
+            dedup_id: None,
             sequence: 7,
             subject: "appr_1".to_string(),
             event_type: EVENT_APPROVAL_APPROVED.to_string(),

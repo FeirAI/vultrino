@@ -1,7 +1,9 @@
 # Design: move the signed outbox OUT of the encrypted vault (storage v6 → v7)
 
-Status: **DECISIONS LOCKED (D1–D4 resolved 2026-06-25) — ready to implement.** No code yet.
-Scope: vultrino storage layer (`src/storage/file.rs`, `src/outbox.rs`). Companion §12 deployment item.
+Status: **IMPLEMENTED + adversarially reviewed (2026-06-25).** D1–D4 locked and built; see
+"As-built + post-review hardening" at the end for what shipped vs. this original design (the §3
+SQLite plan is SUPERSEDED — D2 note). Scope: vultrino storage layer (`src/storage/file.rs`,
+`src/storage/outbox_store.rs`, `src/outbox.rs`, `src/server/mod.rs`, `src/main.rs`). Companion §12 item.
 
 > CLARIFICATION (what this does NOT do): the **credentials never leave the encrypted vault and are
 > never exposed**. "Out of the vault" moves only the *signed event log* (budget/approval/lifecycle
@@ -181,9 +183,12 @@ a vault written by a **newer** binary (`found > supported`), so:
 - New `src/storage/outbox_store.rs` (the SQLite outbox store + its tests).
 - `src/server/mod.rs`: the `deliver_outbox_once` loop reads/claims from the store; the GC cadence stays.
 - Config: `[outbox] db_path`, `retention_secs` (already exists), `at_rest_encryption` (D2).
-- k8s (`muntin`): a dedicated outbox PVC for the vultrino StatefulSet (mirrors leria's per-store PVC rule);
-  StatefulSet `volumeClaimTemplates` are immutable → an already-deployed vultrino needs the
-  `--cascade=orphan` recreate runbook (same caveat we hit for leria's 3rd PVC).
+- k8s (`muntin`): AS-BUILT, `outbox.enc` is written ALONGSIDE `credentials.enc` in vultrino's data dir
+  (`outbox_path = vault.with_file_name("outbox.enc")`), so it rides the EXISTING `vault` PVC — no new
+  PVC. The "dedicated outbox PVC" recommended here was considered and DROPPED: the cliff fix is FILE
+  separation (an append re-encrypts only `outbox.enc`, never the secrets vault), which is independent of
+  PVC layout; a separate PVC would only isolate disk IOPS while adding the immutable-`volumeClaimTemplates`
+  `--cascade=orphan` recreate runbook. Retention GC bounds `outbox.enc` on the shared PVC.
 
 ## 6. What this does NOT change
 
@@ -218,3 +223,46 @@ These are stopgaps; this migration is the structural fix.
 - **D3** = sharded per tenant (per-tenant seq + cursor; one-per-vultrino in the shard deployment).
 - **D4** = automatic, no explicit command (no v6 vault deployed → v7 is the format; best-effort
   drain of an old dev/test v6 vault on first open).
+
+## As-built + post-review hardening (2026-06-25)
+
+What shipped differs from the §3 SQLite sketch (D2 note): the outbox is a separate **`outbox.enc`**
+file (`src/storage/outbox_store.rs`) reusing the vault's whole-cache AES-256-GCM + fd-lock +
+tmp+atomic-rename machinery (`OUTBOX_FILE_VERSION=1`), NOT SQLite. Intent-staging (D1) is realized as
+`StorageCache.pending_events: Vec<StagedEvent{dedup_id,subject,event_type,payload}>` staged in the
+vault `locked_mutate`, drained via `OutboxStore::append_deduped` (idempotent on `dedup_id`).
+
+A multi-lens adversarial review of the S2+S3 wiring (11 confirmed findings) drove these fixes:
+
+- **Periodic drainer (the §2a "periodic tick" half).** Originally only the *startup* reconcile + the
+  inline post-commit drain existed; an inline drain that failed on a long-lived process with no further
+  approval traffic orphaned the event until restart. Now `drain_pending_events_periodically`
+  (`server/mod.rs`, `PENDING_DRAIN_SECS`) is spawned in both `run_mcp_server` and `run_web_server` via
+  the `StorageBackend::reconcile_pending_events` trait method (default no-op; FileStorage delegates to
+  `drain_pending_events`). This bounds an orphaned intent's lifetime to one tick.
+- **Post-commit drain is best-effort.** `decide_approval` / `poll_refresh_approval` /
+  `sweep_approval_lifecycle` committed the decision/transition **and** the intent atomically, then
+  drained with `?` — so a transient `outbox.enc` I/O error reported a *committed* approval as "not
+  recorded" to the human approver (and suppressed sweep escalation notifications). The post-commit
+  drain now logs-and-continues (returns Ok with the committed result); the periodic/startup reconciler
+  delivers the staged event.
+- **Crash-DURABILITY of the rename.** Both write paths (`outbox_store::write_to_disk`,
+  `file::write_cache_to_disk_sync`) fsync the **parent directory** after the atomic rename — rename is
+  crash-atomic but the new dir entry is only crash-durable once the dir is fsynced (best-effort;
+  ignored on filesystems without dir fsync).
+- **Migration reserves the sequence range up front.** `migrate_v6_outbox` uses
+  `OutboxStore::insert_events_preserving_seq` (one locked write that bumps `outbox_seq` to the batch
+  max **before** inserting), so the out-of-scope multi-process-open-of-a-v6-vault case can't let a
+  concurrent append grab a not-yet-migrated seq (an `or_insert` no-op = silent legacy-event drop).
+- **Literal-v6 read test.** `migrates_a_literal_version6_on_disk_vault` hand-writes a genuine
+  `version:6` file (in-vault outbox, no `dedup_id`, no `pending_events` key) and asserts the
+  downgrade-read + serde-default contract + sequence-preserving migration — the prior test only
+  round-tripped v7 bytes.
+
+**Considered and consciously NOT done — O(1) dedup index.** `append_deduped` scans the live outbox for
+a matching `dedup_id` (O(retention-bounded-outbox)) on each coupled-emit drain. An index would make
+that lookup O(1), but every drain already re-encrypts + rewrites the whole `outbox.enc` (also O(n)),
+so the scan is never the dominant term — an index would not change the path's asymptotic cost and would
+add cache state to keep consistent. The periodic drainer (above) keeps an intent's lifetime far below
+the outbox retention window, so the dedup memory (the live outbox rows) cannot be GC-pruned out from
+under a still-staged intent in practice — closing the dedup-vs-GC duplicate window without an index.

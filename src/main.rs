@@ -918,6 +918,12 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
         outbox_cfg.clone(),
         std::time::Duration::from_secs(vultrino::server::OUTBOX_DELIVERY_SECS),
     ));
+    // Reconcile any intent-staged events an inline drain left behind (D1 safety net) so a committed
+    // approval decision's signed event is delivered within a tick, not only on the next restart.
+    tokio::spawn(vultrino::server::drain_pending_events_periodically(
+        server.storage().clone(),
+        std::time::Duration::from_secs(vultrino::server::PENDING_DRAIN_SECS),
+    ));
 
     let vultrino = Arc::new(server);
     let mut mcp = McpServer::new(vultrino, auth_manager);
@@ -980,6 +986,11 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
         exec_server.storage().clone(),
         config.outbox.clone(),
         std::time::Duration::from_secs(vultrino::server::OUTBOX_DELIVERY_SECS),
+    ));
+    // Reconcile any intent-staged events an inline drain left behind (D1 safety net).
+    tokio::spawn(vultrino::server::drain_pending_events_periodically(
+        exec_server.storage().clone(),
+        std::time::Duration::from_secs(vultrino::server::PENDING_DRAIN_SECS),
     ));
 
     let web_config = WebConfig {

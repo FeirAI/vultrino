@@ -460,6 +460,26 @@ pub trait StorageBackend: Send + Sync {
         Ok(0)
     }
 
+    /// Reconcile any intent-staged events (D1 transactional outbox) that an inline drain left behind,
+    /// moving them to the outbox store IDEMPOTENTLY. Coupled emits drain inline right after committing
+    /// and startup reconciles once; this is the periodic safety net so an orphaned intent (e.g. an
+    /// inline drain hit a transient outbox-file I/O error on a long-lived process with no further
+    /// approval traffic) is delivered within one tick rather than only at the next restart. Default
+    /// no-op: only the file backend stages events inside the vault.
+    async fn reconcile_pending_events(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Number of intent-staged events still awaiting drain to the outbox (D1). Normally 0. A persistent
+    /// non-zero count is the degraded-mode signal that the outbox store is unwritable: the events are
+    /// committed-but-undelivered AND each new coupled emit re-encrypts the whole secrets vault (the
+    /// staging record lives in the vault), re-opening the O(vault-size) cost the v6→v7 split removed.
+    /// The periodic reconciler logs this so a stuck outbox is alertable, not silently churning. Cheap
+    /// (an in-memory read). Default 0: only the file backend stages events inside the vault.
+    async fn pending_event_count(&self) -> Result<usize, StorageError> {
+        Ok(0)
+    }
+
     // ==================== Policy Storage (admin API, V1) ====================
     //
     // Policies pushed at runtime via the admin API. Distinct from the static

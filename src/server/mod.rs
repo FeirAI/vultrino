@@ -2349,6 +2349,10 @@ pub const OUTBOX_DELIVERY_SECS: u64 = 5;
 /// Run GC on this many delivery passes (so it isn't on the hot delivery path).
 const OUTBOX_GC_EVERY: u64 = 60;
 
+/// Default interval for the background intent-staged-event reconcile (D1). Short, since it only does
+/// in-memory work when there are no orphaned intents (the common case is a no-op early return).
+pub const PENDING_DRAIN_SECS: u64 = 5;
+
 /// Max events delivered per pass (V9), to bound a single pass's work.
 const OUTBOX_BATCH: usize = 64;
 
@@ -2439,6 +2443,40 @@ pub async fn deliver_outbox_periodically(
             if let Err(e) = storage.gc_outbox(config.retention_secs).await {
                 warn!(error = %e, "outbox GC failed");
             }
+        }
+    }
+}
+
+/// Background loop that reconciles intent-staged events (D1 transactional outbox) to the outbox on a
+/// periodic tick. Coupled emits (approval decisions / lifecycle transitions) drain inline right after
+/// committing, and startup reconciles once; this tick is the SAFETY NET that bounds an orphaned
+/// intent's lifetime to one interval when an inline drain failed (a transient outbox.enc I/O error)
+/// on a long-lived process with no further approval traffic — so a committed decision's signed event
+/// is delivered within seconds rather than only at the next restart. A no-op (early in-memory return)
+/// when nothing is staged, so it is cheap to run every tick. Safe to run in more than one process:
+/// the drain is idempotent (each staged event carries a dedup_id; append_deduped won't duplicate).
+pub async fn drain_pending_events_periodically(
+    storage: Arc<dyn StorageBackend>,
+    interval: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Err(e) = storage.reconcile_pending_events().await {
+            warn!(error = %e, "intent-staged event reconcile pass failed");
+        }
+        // Surface a persistent backlog: a non-zero pending count after a reconcile means the outbox
+        // store is unwritable — the staged events are committed-but-undelivered AND each new coupled
+        // emit re-encrypts the whole secrets vault (the staging record lives there), re-opening the
+        // O(vault-size) cost the v6→v7 split removed. Log the count so a stuck outbox is alertable
+        // rather than silently churning the vault. (No-op/cheap when the backlog is 0, the common case.)
+        match storage.pending_event_count().await {
+            Ok(0) => {}
+            Ok(pending) => warn!(
+                pending,
+                "intent-staged events remain undrained — the outbox store may be unwritable; the secrets \
+                 vault is re-encrypted on every new coupled emit until this clears"
+            ),
+            Err(e) => warn!(error = %e, "could not read the intent-staged event backlog"),
         }
     }
 }

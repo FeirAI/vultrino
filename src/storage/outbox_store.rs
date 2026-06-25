@@ -89,8 +89,38 @@ impl OutboxStore {
     ) -> Result<u64, StorageError> {
         let subject = subject.to_string();
         let event_type = event_type.to_string();
-        self.locked_mutate(move |c| Ok(push_event(c, &subject, &event_type, payload)))
+        self.locked_mutate(move |c| Ok(push_event(c, &subject, &event_type, payload, None)))
             .await
+    }
+
+    /// Append an event drained from the vault's intent staging (D1), IDEMPOTENTLY: if an event with
+    /// this `dedup_id` already exists (a re-drain after a crash between the append and clearing the
+    /// vault intent), return its existing sequence WITHOUT inserting a duplicate. Otherwise append a
+    /// fresh event tagged with the id. This is what makes the two-store (vault↔outbox) drain
+    /// exactly-once despite the lack of a cross-store transaction.
+    pub async fn append_deduped(
+        &self,
+        dedup_id: &str,
+        subject: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<u64, StorageError> {
+        let dedup_id = dedup_id.to_string();
+        let subject = subject.to_string();
+        let event_type = event_type.to_string();
+        self.locked_mutate(move |c| {
+            // Scan for a prior event with this dedup id (only the rare drained-event path pays this;
+            // ordinary appends carry no dedup_id). The outbox is retention-bounded, so the scan is small.
+            if let Some(e) = c
+                .outbox
+                .values()
+                .find(|e| e.dedup_id.as_deref() == Some(dedup_id.as_str()))
+            {
+                return Ok(e.sequence); // already drained → idempotent no-op
+            }
+            Ok(push_event(c, &subject, &event_type, payload, Some(dedup_id)))
+        })
+        .await
     }
 
     /// Insert an event that ALREADY has a sequence (the v6→v7 migration: in-vault events keep their
@@ -100,6 +130,33 @@ impl OutboxStore {
         self.locked_mutate(move |c| {
             c.outbox_seq = c.outbox_seq.max(event.sequence);
             c.outbox.entry(event.sequence).or_insert(event);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Batch variant of [`insert_event`] for the v6→v7 migration: RESERVES the whole legacy sequence
+    /// range up front — it advances `outbox_seq` to the batch max in the SAME locked write that inserts
+    /// the events, BEFORE any insert. This closes the (D4-out-of-scope) multi-process-open-of-a-v6-vault
+    /// race where, if the events were inserted one-at-a-time, a concurrent direct `append` between two
+    /// inserts could allocate a sequence a not-yet-migrated legacy event still owns — and `entry().
+    /// or_insert` would then silently DROP that legacy event. With the range reserved first, a
+    /// concurrent append always allocates strictly above the migrated range. Idempotent on each
+    /// sequence, and a single re-encrypt+write instead of one per event.
+    pub async fn insert_events_preserving_seq(
+        &self,
+        events: Vec<OutboxEvent>,
+    ) -> Result<(), StorageError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.locked_mutate(move |c| {
+            for ev in &events {
+                c.outbox_seq = c.outbox_seq.max(ev.sequence);
+            }
+            for ev in events {
+                c.outbox.entry(ev.sequence).or_insert(ev);
+            }
             Ok(())
         })
         .await
@@ -369,10 +426,11 @@ impl OutboxStore {
         let content = serde_json::to_string_pretty(&file)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let temp_path = self.path.with_extension("tmp");
-        // fsync the tmp BEFORE the rename: the rename gives atomicity of the directory entry, but only
-        // sync_all guarantees the CONTENTS are durable — without it a power-loss can make the rename
-        // visible while the tmp bytes are not yet flushed, leaving a corrupt outbox.enc. This path runs
-        // on EVERY append, so the crash window matters here far more than for the rare vault writes.
+        // fsync the tmp BEFORE the rename: the rename gives crash-ATOMICITY of the directory entry (a
+        // reader sees the old OR the new file, never a torn one), but only sync_all guarantees the
+        // CONTENTS are durable — without it a power-loss can make the rename visible while the tmp bytes
+        // are not yet flushed, leaving a corrupt outbox.enc. This path runs on EVERY append, so the crash
+        // window matters here far more than for the rare vault writes.
         {
             let f = std::fs::File::create(&temp_path)?;
             use std::io::Write;
@@ -384,6 +442,15 @@ impl OutboxStore {
                 .sync_all()?;
         }
         std::fs::rename(&temp_path, &self.path)?;
+        // fsync the PARENT directory after the rename: rename gives crash-atomicity, but the new
+        // directory entry is only crash-DURABLE once the containing dir is fsynced. Without it a
+        // power-loss right after the rename can revert the dir entry to the OLD file even though the tmp
+        // bytes were flushed. Best-effort (some filesystems don't support dir fsync — ignore that).
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 
@@ -393,12 +460,14 @@ impl OutboxStore {
     }
 }
 
-/// Increment the sequence and insert a fresh Pending event. Relocated verbatim from FileStorage.
+/// Increment the sequence and insert a fresh Pending event (with an optional intent-drain dedup id).
+/// Relocated from FileStorage (+ the dedup_id for the v6→v7 intent-staging).
 fn push_event(
     cache: &mut OutboxCache,
     subject: &str,
     event_type: &str,
     payload: serde_json::Value,
+    dedup_id: Option<String>,
 ) -> u64 {
     cache.outbox_seq += 1;
     let seq = cache.outbox_seq;
@@ -415,6 +484,7 @@ fn push_event(
             leased_until: None,
             last_attempt_at: None,
             last_error: None,
+            dedup_id,
         },
     );
     seq
@@ -556,6 +626,7 @@ mod tests {
             leased_until: None,
             last_attempt_at: None,
             last_error: None,
+            dedup_id: None,
         };
         s.insert_event(migrated).await.unwrap();
         let all = s.list_after(0, 100).await.unwrap();
@@ -596,6 +667,28 @@ mod tests {
         let s2 = OutboxStore::new(dir.path().join("outbox.enc"), key);
         let got = s2.list_after(0, 10).await.unwrap();
         assert_eq!(got[0].payload["secretish"], marker);
+    }
+
+    #[tokio::test]
+    async fn append_deduped_is_idempotent_on_redrain() {
+        let (s, _d) = store();
+        // First drain of intent "evt-abc" inserts a new event.
+        let s1 = s.append_deduped("evt-abc", "appr-1", "approval.approved", serde_json::json!({"x": 1}))
+            .await
+            .unwrap();
+        // A re-drain (crash between the append and clearing the vault intent) returns the SAME seq,
+        // does NOT insert a duplicate.
+        let s2 = s.append_deduped("evt-abc", "appr-1", "approval.approved", serde_json::json!({"x": 1}))
+            .await
+            .unwrap();
+        assert_eq!(s1, s2, "re-drain of the same dedup_id must return the original seq");
+        assert_eq!(s.list_after(0, 100).await.unwrap().len(), 1, "no duplicate event");
+        // A DIFFERENT dedup id is a distinct event.
+        let s3 = s.append_deduped("evt-def", "appr-2", "approval.denied", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_ne!(s1, s3);
+        assert_eq!(s.list_after(0, 100).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

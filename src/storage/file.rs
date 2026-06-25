@@ -14,8 +14,10 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use super::outbox_store::OutboxStore;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 
 /// An approval whose execution claim is older than this is considered stale
@@ -35,7 +37,7 @@ const STALE_EXECUTING_SECS: i64 = 120;
 /// v6 (connector M1): adds the `capabilities` map (named-MCP-tool definitions).
 /// `#[serde(default)]`, so a v6 binary reads older vaults; an older binary is
 /// refused a v6 vault rather than silently dropping capabilities on its next write.
-const STORAGE_VERSION: u32 = 6;
+const STORAGE_VERSION: u32 = 7; // v7: the signed outbox moved OUT of the vault into its own encrypted file
 
 /// A reservation older than this (seconds) is assumed orphaned by a crashed
 /// request and may be re-reserved, so a single failed admin call can't block a
@@ -61,70 +63,17 @@ fn approval_is_due(a: &ApprovalRequest, now: DateTime<Utc>) -> bool {
         || a.needs_reauth()
 }
 
-/// Append an outbox event into a cache under the lock (V9), assigning the next
-/// monotonic sequence. Used both by the public `append_event` and by the
-/// state-change methods (decide/expire/escalate) so an event is emitted
-/// **atomically** with the state transition it describes — no lost or duplicated
-/// events on a crash between the two.
-fn push_event(
-    cache: &mut StorageCache,
-    subject: &str,
-    event_type: &str,
-    payload: serde_json::Value,
-) -> u64 {
-    cache.outbox_seq += 1;
-    let seq = cache.outbox_seq;
-    cache.outbox.insert(
-        seq,
-        crate::outbox::OutboxEvent {
-            sequence: seq,
-            subject: subject.to_string(),
-            event_type: event_type.to_string(),
-            payload,
-            created_at: Utc::now(),
-            delivery: crate::outbox::DeliveryState::Pending,
-            attempts: 0,
-            leased_until: None,
-            last_attempt_at: None,
-            last_error: None,
-        },
-    );
-    seq
-}
-
-/// The earliest still-pending event per subject (ascending by sequence), so
-/// per-subject ordering holds: a later event for a subject is withheld until its
-/// earlier one is delivered. A dead-lettered (non-Pending) event doesn't block —
-/// the DLQ is the head-of-line release valve. When `respect_lease` is set, an
-/// event whose `leased_until` is still in the future is skipped (claimed by
-/// another deliverer or in post-failure backoff).
-fn earliest_pending_per_subject(
-    outbox: &std::collections::BTreeMap<u64, crate::outbox::OutboxEvent>,
-    limit: usize,
-    respect_lease: bool,
-    now: DateTime<Utc>,
-) -> Vec<crate::outbox::OutboxEvent> {
-    use crate::outbox::DeliveryState;
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for e in outbox.values() {
-        if e.delivery != DeliveryState::Pending {
-            continue;
-        }
-        // A subject is blocked by its earliest pending event regardless of lease,
-        // so a leased earlier event still withholds its later siblings (ordering).
-        if !seen.insert(e.subject.as_str()) {
-            continue;
-        }
-        if respect_lease && e.leased_until.is_some_and(|t| t > now) {
-            continue;
-        }
-        out.push(e.clone());
-        if out.len() >= limit {
-            break;
-        }
-    }
-    out
+/// Stage an outbox event in the vault for the intent drain (D1) — written atomically with the state
+/// change that produced it, inside the SAME locked_mutate. The caller drains it to the split outbox
+/// file after the lock releases (drain_pending_events). Mirrors push_event's call shape so the
+/// coupled-emit sites change minimally. A fresh dedup_id makes the later drain idempotent.
+fn stage_event(cache: &mut StorageCache, subject: &str, event_type: &str, payload: serde_json::Value) {
+    cache.pending_events.push(StagedEvent {
+        dedup_id: uuid::Uuid::new_v4().to_string(),
+        subject: subject.to_string(),
+        event_type: event_type.to_string(),
+        payload,
+    });
 }
 
 /// The agent-safe outbox payload for an approval decision/lifecycle event (V9).
@@ -156,8 +105,13 @@ fn check_version(found: u32) -> Result<(), StorageError> {
 pub struct FileStorage {
     /// Path to the storage file
     path: PathBuf,
-    /// Master encryption key
-    master_key: MasterKey,
+    /// Master encryption key (Arc so the OutboxStore shares the SAME derived key — D2: the outbox
+    /// file is encrypted with it, no separate KDF).
+    master_key: Arc<MasterKey>,
+    /// The signed event outbox in its OWN encrypted file (v7: split out of the secrets vault so an
+    /// event append no longer rewrites all secrets). The vault delegates all outbox trait methods to
+    /// it; coupled emits (approval decisions) stage an intent in the vault then drain to it.
+    outbox: OutboxStore,
     /// In-memory cache of credentials
     cache: RwLock<StorageCache>,
     /// Salt used for key derivation (stored in file)
@@ -170,6 +124,24 @@ pub struct FileStorage {
     /// next reload. (STOPGAP for the read path — subsumed once the outbox moves to its own
     /// store; see docs/dev/OUTBOX-OUT-OF-VAULT-MIGRATION.md.)
     last_loaded: parking_lot::Mutex<Option<(std::time::SystemTime, u64)>>,
+}
+
+/// The outbox file lives alongside the vault (credentials.enc → outbox.enc), in the same data dir
+/// (its own PVC in k8s). Its `.lock`/`.tmp` sidecars don't collide with the vault's.
+fn outbox_path(vault: &Path) -> PathBuf {
+    vault.with_file_name("outbox.enc")
+}
+
+/// An outbox event STAGED in the vault (intent-staging, D1): written atomically with the state change
+/// that produced it (an approval decision), then drained to the split outbox file. `dedup_id` (a fresh
+/// UUID per stage) makes the drain idempotent — a crash between the outbox append and clearing this
+/// intent re-drains without duplicating the event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StagedEvent {
+    dedup_id: String,
+    subject: String,
+    event_type: String,
+    payload: serde_json::Value,
 }
 
 /// A record of an idempotent admin-API mutation: a reservation taken under the
@@ -222,13 +194,19 @@ struct StorageCache {
     /// Idempotency records for admin-API mutations, keyed by Idempotency-Key.
     #[serde(default)]
     idempotency: HashMap<String, IdempotencyRecord>,
-    /// Signed event outbox (V9), keyed by monotonic sequence. `BTreeMap` keeps it
-    /// ordered for gap-free cursor replay.
+    /// LEGACY (v6): the signed event outbox used to live IN the vault. v7 moved it to its own file
+    /// (OutboxStore). These two fields are retained ONLY so a v6 vault's outbox can be READ and
+    /// drained on first v7 open (migrate_v6_outbox); they stay empty thereafter. Do not append here.
     #[serde(default)]
     outbox: std::collections::BTreeMap<u64, crate::outbox::OutboxEvent>,
-    /// Monotonic sequence counter for the outbox (V9): the last assigned sequence.
     #[serde(default)]
     outbox_seq: u64,
+    /// Intent-staging (v7, D1): outbox events written ATOMICALLY with the state change that produced
+    /// them (e.g. an approval decision), pending a drain to the split outbox file. Empty in steady
+    /// state; a crash leaves entries here that the next startup reconciles. Each carries a dedup_id so
+    /// the drain is idempotent.
+    #[serde(default)]
+    pending_events: Vec<StagedEvent>,
 
     // Secondary indexes for O(1) lookups (not serialized, rebuilt on load)
     /// Index: credential alias -> credential ID
@@ -327,11 +305,13 @@ impl FileStorage {
     /// Create a new storage file
     async fn create(path: PathBuf, password: &SecretString) -> Result<Self, StorageError> {
         let salt = generate_salt();
-        let master_key = derive_key(password, &salt)?;
+        let master_key = Arc::new(derive_key(password, &salt)?);
+        let outbox = OutboxStore::new(outbox_path(&path), Arc::clone(&master_key));
 
         let storage = Self {
             path,
             master_key,
+            outbox,
             cache: RwLock::new(StorageCache::default()),
             salt,
             last_loaded: parking_lot::Mutex::new(None),
@@ -358,15 +338,17 @@ impl FileStorage {
         .map_err(|e| StorageError::Serialization(format!("Invalid salt: {}", e)))?;
 
         // Derive key from password
-        let master_key = derive_key(password, &salt)?;
+        let master_key = Arc::new(derive_key(password, &salt)?);
 
         // Decrypt + parse (tolerates the legacy credentials-only format)
         let decrypted = decrypt(&storage_file.data, &master_key)?;
         let cache = Self::parse_cache(&decrypted)?;
 
+        let outbox = OutboxStore::new(outbox_path(&path), Arc::clone(&master_key));
         let storage = Self {
             path,
             master_key,
+            outbox,
             cache: RwLock::new(cache),
             salt,
             last_loaded: parking_lot::Mutex::new(None),
@@ -374,7 +356,70 @@ impl FileStorage {
         // Seed the change token so the first reload can skip a redundant decrypt of the
         // file we just loaded (unless a write bumps its mtime first).
         *storage.last_loaded.lock() = storage.file_change_token();
+
+        // v6→v7 migration (D4, best-effort): a v6 vault carried the outbox INSIDE it. Drain those
+        // events into the new outbox file (preserving their sequence so the broker cursor doesn't
+        // rewind), then clear them from the vault. Idempotent: insert_event is keyed by sequence, and
+        // a partial migration re-runs cleanly on the next open. Fresh v7 vaults have an empty outbox.
+        storage.migrate_v6_outbox().await?;
+        // Reconcile any intent-staged events a prior crash left undrained (D1) — drain them to the
+        // outbox before serving so a coupled emit (an approval decision) is never lost.
+        storage.drain_pending_events().await?;
         Ok(storage)
+    }
+
+    /// Drain a v6 in-vault outbox into the split-out outbox file (one-time, on first v7 open).
+    async fn migrate_v6_outbox(&self) -> Result<(), StorageError> {
+        let legacy: Vec<crate::outbox::OutboxEvent> = {
+            let c = self.cache.read();
+            if c.outbox.is_empty() {
+                return Ok(()); // fresh v7 (or already migrated)
+            }
+            c.outbox.values().cloned().collect()
+        };
+        let count = legacy.len();
+        // Reserve the whole legacy sequence range up front (one locked write) so a concurrent direct
+        // append in the out-of-scope multi-process v6-open case can't grab a not-yet-migrated seq and
+        // cause an or_insert no-op (silent legacy-event drop). Idempotent on re-run.
+        self.outbox.insert_events_preserving_seq(legacy).await?;
+        // Now that the events are durable in the outbox file, clear them from the vault + write v7.
+        self.locked_mutate(|c| {
+            c.outbox.clear();
+            c.outbox_seq = 0;
+            Ok(())
+        })
+        .await?;
+        tracing::info!(count, "migrated v6 in-vault outbox events into the split outbox file (v7)");
+        Ok(())
+    }
+
+    /// Drain intent-staged events (the vault's `pending_events`) to the outbox store IDEMPOTENTLY
+    /// (each carries a dedup_id so a crash between the append and clearing the intent can't duplicate
+    /// it), then clear the drained intents from the vault. Called after every coupled emit + once at
+    /// startup (D1 intent-staging — keeps a state-change and its event effectively atomic across the
+    /// two files: the vault commits the change + the intent together, the outbox gets the event after).
+    async fn drain_pending_events(&self) -> Result<(), StorageError> {
+        let pending: Vec<StagedEvent> = {
+            let c = self.cache.read();
+            if c.pending_events.is_empty() {
+                return Ok(());
+            }
+            c.pending_events.clone()
+        };
+        let mut drained: Vec<String> = Vec::with_capacity(pending.len());
+        for ev in &pending {
+            self.outbox
+                .append_deduped(&ev.dedup_id, &ev.subject, &ev.event_type, ev.payload.clone())
+                .await?;
+            drained.push(ev.dedup_id.clone());
+        }
+        // Clear ONLY the intents we drained (a concurrent stage may have added more).
+        self.locked_mutate(move |c| {
+            c.pending_events.retain(|e| !drained.contains(&e.dedup_id));
+            Ok(())
+        })
+        .await?;
+        Ok(())
     }
 
     /// Parse decrypted bytes into a `StorageCache`, tolerating the legacy
@@ -432,6 +477,15 @@ impl FileStorage {
                 .sync_all()?;
         }
         std::fs::rename(&temp_path, &self.path)?;
+        // fsync the PARENT directory after the rename so the new directory entry is crash-DURABLE, not
+        // just crash-atomic (a power-loss right after the rename could otherwise revert it to the old
+        // file). Lock-step with the outbox store's write path. Best-effort (dir fsync is unsupported on
+        // some filesystems — ignore that case).
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 
@@ -948,10 +1002,18 @@ impl StorageBackend for FileStorage {
                 } else {
                     crate::outbox::EVENT_APPROVAL_DENIED
                 };
-                push_event(cache, &decided.id, event_type, approval_event_payload(&decided));
+                stage_event(cache, &decided.id, event_type, approval_event_payload(&decided));
                 Ok(decided)
             })
             .await?;
+        // Drain the staged decision event to the split outbox file (D1). The vault has ALREADY committed
+        // the decision + the intent atomically, so a drain failure here must NOT be reported to the human
+        // approver as "decision not recorded" — the decision is durable and the periodic/startup
+        // reconciler will deliver the event. Best-effort: log and return Ok with the committed decision.
+        if let Err(e) = self.drain_pending_events().await {
+            tracing::warn!(approval_id = %decided.id, error = %e,
+                "approval decision committed but the staged-event drain failed; the periodic reconciler will deliver it");
+        }
         // Surface a separation-of-duty violation (V5) even when not hard-enforced,
         // so a self-approval is always observable.
         if decided.sod_violation == Some(true) {
@@ -979,7 +1041,7 @@ impl StorageBackend for FileStorage {
                 Some(_) => {}
             }
         }
-        self.locked_mutate(|cache| {
+        let refreshed = self.locked_mutate(|cache| {
             use crate::approval::LifecycleChange;
             let (clone, event) = {
                 let approval = cache
@@ -1002,13 +1064,20 @@ impl StorageBackend for FileStorage {
                 let event = event.map(|et| (approval.id.clone(), et, approval_event_payload(approval)));
                 (approval.clone(), event)
             };
-            // V9: emit the lifecycle event atomically with the transition.
+            // V9: stage the lifecycle event atomically with the transition (drained after the lock).
             if let Some((subj, et, payload)) = event {
-                push_event(cache, &subj, et, payload);
+                stage_event(cache, &subj, et, payload);
             }
             Ok(clone)
         })
-            .await
+        .await?;
+        // Best-effort drain (D1): the lifecycle transition is already committed; a drain failure must
+        // not fail the poll. The periodic/startup reconciler delivers the staged event.
+        if let Err(e) = self.drain_pending_events().await {
+            tracing::warn!(approval_id = %refreshed.id, error = %e,
+                "approval lifecycle transition committed but the staged-event drain failed; the periodic reconciler will deliver it");
+        }
+        Ok(refreshed)
     }
 
     async fn sweep_approval_lifecycle(&self) -> Result<crate::storage::ApprovalSweep, StorageError> {
@@ -1025,7 +1094,7 @@ impl StorageBackend for FileStorage {
         if !any_due {
             return Ok(crate::storage::ApprovalSweep::default());
         }
-        self.locked_mutate(|cache| {
+        let sweep = self.locked_mutate(|cache| {
             let mut sweep = crate::storage::ApprovalSweep::default();
             // Collect events during the &mut iteration; push them after (can't
             // borrow `cache` again while iterating its approvals).
@@ -1053,13 +1122,21 @@ impl StorageBackend for FileStorage {
                     }
                 }
             }
-            // V9: emit lifecycle events atomically with the sweep's transitions.
+            // V9: stage lifecycle events atomically with the sweep's transitions (drained after).
             for (subj, et, payload) in events {
-                push_event(cache, &subj, et, payload);
+                stage_event(cache, &subj, et, payload);
             }
             Ok(sweep)
         })
-            .await
+        .await?;
+        // Best-effort drain (D1): the sweep's transitions are already committed; a drain failure must
+        // not suppress the caller's escalation notifications (run_approval_sweep notifies AFTER this
+        // returns Ok). The periodic/startup reconciler delivers the staged events.
+        if let Err(e) = self.drain_pending_events().await {
+            tracing::warn!(error = %e,
+                "approval sweep transitions committed but the staged-event drain failed; the periodic reconciler will deliver them");
+        }
+        Ok(sweep)
     }
 
     async fn claim_approval_for_execution(
@@ -1117,12 +1194,9 @@ impl StorageBackend for FileStorage {
         event_type: &str,
         payload: serde_json::Value,
     ) -> Result<u64, StorageError> {
-        let subject = subject.to_string();
-        let event_type = event_type.to_string();
-        // The next monotonic sequence is assigned under the lock — authoritative
-        // and gap-free even across the web+MCP processes sharing the vault.
-        self.locked_mutate(move |cache| Ok(push_event(cache, &subject, &event_type, payload)))
-            .await
+        // v7: the outbox lives in its own file — delegate (the vault no longer holds events). This is
+        // the direct-append path (e.g. meter events); coupled emits go through intent-staging instead.
+        self.outbox.append(subject, event_type, payload).await
     }
 
     async fn list_events_after(
@@ -1130,24 +1204,14 @@ impl StorageBackend for FileStorage {
         after: u64,
         limit: usize,
     ) -> Result<Vec<crate::outbox::OutboxEvent>, StorageError> {
-        // Authoritative read: pick up events appended by the other process.
-        self.reload().await?;
-        let cache = self.cache.read();
-        Ok(cache
-            .outbox
-            .range((after + 1)..)
-            .take(limit)
-            .map(|(_, e)| e.clone())
-            .collect())
+        self.outbox.list_after(after, limit).await
     }
 
     async fn deliverable_events(
         &self,
         limit: usize,
     ) -> Result<Vec<crate::outbox::OutboxEvent>, StorageError> {
-        self.reload().await?;
-        let cache = self.cache.read();
-        Ok(earliest_pending_per_subject(&cache.outbox, limit, false, Utc::now()))
+        self.outbox.deliverable(limit).await
     }
 
     async fn claim_deliverable_events(
@@ -1155,21 +1219,7 @@ impl StorageBackend for FileStorage {
         limit: usize,
         lease_secs: u64,
     ) -> Result<Vec<crate::outbox::OutboxEvent>, StorageError> {
-        let lease_until =
-            Utc::now() + chrono::Duration::seconds(i64::try_from(lease_secs.max(1)).unwrap_or(i64::MAX));
-        self.locked_mutate(move |cache| {
-            let now = Utc::now();
-            // The earliest claimable (pending, not actively leased) event per
-            // subject — claiming leases it so another process can't also take it.
-            let claimed = earliest_pending_per_subject(&cache.outbox, limit, true, now);
-            for e in &claimed {
-                if let Some(stored) = cache.outbox.get_mut(&e.sequence) {
-                    stored.leased_until = Some(lease_until);
-                }
-            }
-            Ok(claimed)
-        })
-        .await
+        self.outbox.claim(limit, lease_secs).await
     }
 
     async fn record_event_delivery(
@@ -1179,120 +1229,37 @@ impl StorageBackend for FileStorage {
         error: Option<String>,
         max_attempts: u32,
     ) -> Result<(), StorageError> {
-        use crate::outbox::DeliveryState;
-        self.locked_mutate(move |cache| {
-            if let Some(e) = cache.outbox.get_mut(&sequence) {
-                // Only a Pending (currently-claimed) event accepts an outcome.
-                // `Delivered` and `DeadLettered` are terminal — a late/duplicate
-                // outcome can't un-deliver, resurrect, or re-dead-letter them; a
-                // dead-lettered event re-enters delivery only via explicit replay
-                // (which flips it back to Pending).
-                if e.delivery != DeliveryState::Pending {
-                    return Ok(());
-                }
-                e.attempts += 1;
-                e.last_attempt_at = Some(Utc::now());
-                if success {
-                    e.delivery = DeliveryState::Delivered;
-                    e.leased_until = None;
-                    e.last_error = None;
-                } else {
-                    e.last_error = error;
-                    if e.attempts >= max_attempts {
-                        e.delivery = DeliveryState::DeadLettered;
-                        e.leased_until = None;
-                    } else {
-                        // Backoff: hold a lease into the future so the event isn't
-                        // immediately re-claimed (exponential-ish, capped at 5 min).
-                        let backoff = (10u64.saturating_mul(1 << e.attempts.min(5))).min(300);
-                        e.leased_until = Some(Utc::now() + chrono::Duration::seconds(backoff as i64));
-                    }
-                }
-            }
-            Ok(())
-        })
-        .await
+        self.outbox
+            .record_delivery(sequence, success, error, max_attempts)
+            .await
     }
 
     async fn list_dead_letter_events(
         &self,
         limit: usize,
     ) -> Result<Vec<crate::outbox::OutboxEvent>, StorageError> {
-        use crate::outbox::DeliveryState;
-        self.reload().await?;
-        let cache = self.cache.read();
-        Ok(cache
-            .outbox
-            .values()
-            .filter(|e| e.delivery == DeliveryState::DeadLettered)
-            .take(limit)
-            .cloned()
-            .collect())
+        self.outbox.list_dead_letter(limit).await
     }
 
     async fn replay_dead_letter_event(&self, sequence: u64) -> Result<bool, StorageError> {
-        use crate::outbox::DeliveryState;
-        self.locked_mutate(move |cache| {
-            match cache.outbox.get_mut(&sequence) {
-                Some(e) if e.delivery == DeliveryState::DeadLettered => {
-                    e.delivery = DeliveryState::Pending;
-                    e.attempts = 0;
-                    e.last_error = None;
-                    // Clear any lease so the re-queued event is immediately
-                    // claimable (defensive — dead-lettered events already have none).
-                    e.leased_until = None;
-                    Ok(true)
-                }
-                _ => Ok(false),
-            }
-        })
-        .await
+        self.outbox.replay_dead_letter(sequence).await
     }
 
     async fn gc_outbox(&self, retention_secs: u64) -> Result<usize, StorageError> {
-        use crate::outbox::DeliveryState;
-        let secs = i64::try_from(retention_secs).unwrap_or(i64::MAX);
-        let cutoff = Utc::now() - chrono::Duration::seconds(secs);
-        self.locked_mutate(move |cache| {
-            // Prune a contiguous *prefix* by sequence — the highest sequence whose
-            // event is older than the window — then drop everything at or below it.
-            // Pruning by sequence (not by `created_at` per element) guarantees the
-            // retained suffix is gap-free regardless of clock skew (the replay
-            // no-gaps guarantee holds within the window), and bounds the log even
-            // when push is disabled. A dropped event that wasn't yet Delivered is
-            // surfaced via a warning — the retention window is the replay /
-            // dead-letter-resolution SLA.
-            let prune_below = cache
-                .outbox
-                .iter()
-                .take_while(|(_, e)| e.created_at < cutoff)
-                .map(|(seq, _)| *seq)
-                .last();
-            let Some(prune_below) = prune_below else {
-                return Ok(0);
-            };
-            let mut pruned = 0usize;
-            let mut undelivered_dropped = 0usize;
-            cache.outbox.retain(|seq, e| {
-                if *seq <= prune_below {
-                    pruned += 1;
-                    if e.delivery != DeliveryState::Delivered {
-                        undelivered_dropped += 1;
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-            if undelivered_dropped > 0 {
-                tracing::warn!(
-                    count = undelivered_dropped,
-                    "outbox GC dropped events that were never delivered (older than the retention window)"
-                );
-            }
-            Ok(pruned)
-        })
-        .await
+        self.outbox.gc(retention_secs).await
+    }
+
+    /// Periodic safety-net reconcile of intent-staged events (D1) — delegates to the inherent
+    /// drain_pending_events. Bounds an orphaned intent's lifetime to one tick when an inline drain
+    /// failed, so a committed approval decision's signed event is delivered without waiting for a
+    /// restart (and the intent never outlives the outbox retention window — closing the dedup-vs-GC
+    /// duplicate window, since append_deduped's memory is the live outbox).
+    async fn reconcile_pending_events(&self) -> Result<(), StorageError> {
+        self.drain_pending_events().await
+    }
+
+    async fn pending_event_count(&self) -> Result<usize, StorageError> {
+        Ok(self.cache.read().pending_events.len())
     }
 
     // ==================== Policy Storage (admin API, V1) ====================
@@ -1491,6 +1458,199 @@ mod tests {
             check_version(STORAGE_VERSION + 1),
             Err(StorageError::UnsupportedVersion { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn intent_staged_events_drain_to_outbox_idempotently() {
+        // D1: an event staged in the vault (a coupled emit) drains to the split outbox file, and a
+        // re-drain (crash between the outbox append and clearing the intent) does NOT duplicate it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let storage = FileStorage::new(&path, &SecretString::from("pw")).await.unwrap();
+        let stage = |dedup: &str, subj: &str| StagedEvent {
+            dedup_id: dedup.to_string(),
+            subject: subj.to_string(),
+            event_type: "approval.approved".to_string(),
+            payload: serde_json::json!({}),
+        };
+        storage
+            .locked_mutate(|c| {
+                c.pending_events.push(stage("d1", "appr-1"));
+                c.pending_events.push(stage("d2", "appr-2"));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        storage.drain_pending_events().await.unwrap();
+        assert_eq!(storage.list_events_after(0, 100).await.unwrap().len(), 2, "both staged events drained");
+        assert!(storage.cache.read().pending_events.is_empty(), "drained intents cleared");
+        // Re-stage d1 (simulating a crash that left it undrained) and drain again — no duplicate.
+        storage.locked_mutate(|c| { c.pending_events.push(stage("d1", "appr-1")); Ok(()) }).await.unwrap();
+        storage.drain_pending_events().await.unwrap();
+        assert_eq!(storage.list_events_after(0, 100).await.unwrap().len(), 2, "re-drain of d1 must not duplicate");
+    }
+
+    #[tokio::test]
+    async fn migrates_v6_in_vault_outbox_to_the_split_file() {
+        // v7 migration: a v6 vault held the outbox INSIDE it; on first v7 open it drains to the split
+        // file preserving the sequence (broker cursor stability) + clears it from the vault.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let pw = SecretString::from("pw");
+        {
+            let s = FileStorage::new(&path, &pw).await.unwrap();
+            // Simulate a v6 vault: events living in the vault cache.outbox (the legacy location).
+            s.locked_mutate(|c| {
+                c.outbox.insert(
+                    7,
+                    crate::outbox::OutboxEvent {
+                        sequence: 7,
+                        subject: "s".into(),
+                        event_type: "t".into(),
+                        payload: serde_json::json!({}),
+                        created_at: Utc::now(),
+                        delivery: crate::outbox::DeliveryState::Pending,
+                        attempts: 0,
+                        leased_until: None,
+                        last_attempt_at: None,
+                        last_error: None,
+                        dedup_id: None,
+                    },
+                );
+                c.outbox_seq = 7;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        // Reopen → load runs migrate_v6_outbox.
+        let s2 = FileStorage::new(&path, &pw).await.unwrap();
+        let evs = s2.list_events_after(0, 100).await.unwrap();
+        assert_eq!(evs.len(), 1, "the legacy in-vault event migrated to the split outbox");
+        assert_eq!(evs[0].sequence, 7, "sequence preserved (broker cursor must not rewind)");
+        assert!(s2.cache.read().outbox.is_empty(), "vault outbox cleared post-migration");
+        // A new append continues after the migrated max (no seq reuse).
+        assert_eq!(s2.append_event("new", "t", serde_json::json!({})).await.unwrap(), 8);
+    }
+
+    #[tokio::test]
+    async fn migrates_a_literal_version6_on_disk_vault() {
+        // Unlike the test above (which round-trips v7 bytes), this hand-writes a GENUINE version:6 file:
+        // the outbox lives INSIDE the vault, the OutboxEvent carries NO dedup_id, and there is NO
+        // pending_events key — exactly the v6 on-disk shape. It pins the actual downgrade-read contract:
+        // check_version accepts found=6, and the serde defaults for the v7-only fields (dedup_id /
+        // pending_events) hold when reading real v6 bytes; then the events migrate, sequence preserved.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let pw = SecretString::from("pw");
+
+        // Build a v6-shaped cache via the real structs (so every field's serde form is authentic),
+        // then strip the v7-only `pending_events` key to mimic a true v6 file. `dedup_id: None` is
+        // already omitted on the wire (skip_serializing_if = Option::is_none).
+        let mut cache = StorageCache::default();
+        cache.outbox.insert(
+            5,
+            crate::outbox::OutboxEvent {
+                sequence: 5,
+                subject: "appr-9".into(),
+                event_type: "approval.approved".into(),
+                payload: serde_json::json!({}),
+                created_at: Utc::now(),
+                delivery: crate::outbox::DeliveryState::Pending,
+                attempts: 0,
+                leased_until: None,
+                last_attempt_at: None,
+                last_error: None,
+                dedup_id: None,
+            },
+        );
+        cache.outbox_seq = 5;
+        let mut v = serde_json::to_value(&cache).unwrap();
+        v.as_object_mut().unwrap().remove("pending_events"); // v6 predates intent-staging
+        assert!(
+            !v.to_string().contains("dedup_id"),
+            "v6 outbox events must not carry dedup_id on the wire"
+        );
+        let bytes = serde_json::to_vec(&v).unwrap();
+        // Sanity: the v6 bytes parse via the same path load() uses (serde defaults fill the new fields).
+        FileStorage::parse_cache(&bytes).unwrap();
+
+        // Encrypt + write a StorageFile stamped version:6 (the actual on-disk envelope).
+        let salt = generate_salt();
+        let master_key = derive_key(&pw, &salt).unwrap();
+        let encrypted = encrypt(&bytes, &master_key).unwrap();
+        let file = StorageFile {
+            version: 6,
+            salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &salt),
+            data: encrypted,
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+
+        // Open via the real load path → check_version(6) accepts + migrate_v6_outbox runs.
+        let s = FileStorage::new(&path, &pw).await.unwrap();
+        let evs = s.list_events_after(0, 100).await.unwrap();
+        assert_eq!(evs.len(), 1, "the literal-v6 in-vault event migrated to the split outbox");
+        assert_eq!(evs[0].sequence, 5, "sequence preserved (broker cursor stability)");
+        assert!(evs[0].dedup_id.is_none(), "v6 event had no dedup_id (serde default = None)");
+        assert!(s.cache.read().outbox.is_empty(), "vault outbox cleared post-migration");
+        assert!(s.cache.read().pending_events.is_empty(), "no pending_events in v6 (serde default)");
+        // The vault is rewritten as v7 on disk.
+        let reread: StorageFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reread.version, STORAGE_VERSION, "reopened vault rewritten as v7");
+        // A new append continues strictly after the migrated max.
+        assert_eq!(s.append_event("new", "t", serde_json::json!({})).await.unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn outbox_append_is_decoupled_from_the_secrets_vault_size() {
+        // Acceptance gate (§7, decoupling proof): the v6 cliff was that EVERY outbox append re-encrypted
+        // the whole secrets vault (O(vault-size)). We prove the v7 split removed it DETERMINISTICALLY
+        // (not via flaky latency timing): age the secrets vault with many credentials, snapshot the exact
+        // bytes of credentials.enc, append an outbox event, and assert credentials.enc is BYTE-FOR-BYTE
+        // unchanged (an append must touch only outbox.enc). Byte-equality is immune to mtime granularity
+        // AND stronger than a size check — any re-encrypt changes the per-write nonce, so a rewrite is
+        // always detectable. (The proof is rewrite-ABSENCE, so it holds at any vault size; the aging just
+        // exercises the realistic large-vault case the gate targets.)
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("credentials.enc");
+        let pw = SecretString::from("pw");
+        let storage = FileStorage::new(&path, &pw).await.unwrap();
+
+        // Age the SECRETS vault so credentials.enc is large.
+        for i in 0..200 {
+            let cred = Credential::new(
+                format!("api-{i}"),
+                CredentialData::ApiKey {
+                    key: Secret::new(format!("secret-{i}")),
+                    header_name: "Authorization".to_string(),
+                    header_prefix: "Bearer ".to_string(),
+                },
+            );
+            storage.store(&cred).await.unwrap();
+        }
+        let vault_before = std::fs::read(&path).unwrap();
+        assert!(vault_before.len() > 1000, "the aged secrets vault should be non-trivially large");
+
+        // Append outbox events — these must NOT rewrite the secrets vault.
+        for i in 0..5 {
+            let seq = storage
+                .append_event("subj", "evt", serde_json::json!({ "i": i }))
+                .await
+                .unwrap();
+            assert_eq!(seq, i + 1);
+        }
+
+        let vault_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            vault_before, vault_after,
+            "outbox append re-wrote credentials.enc — the O(secrets-vault-size) cliff is NOT decoupled"
+        );
+        // The events landed in the split outbox.enc and read back without touching the vault.
+        assert!(path.with_file_name("outbox.enc").exists(), "events went to the split outbox.enc");
+        assert_eq!(storage.list_events_after(0, 100).await.unwrap().len(), 5);
+        // Sanity: the secrets vault still holds all 200 credentials after the appends (untouched, intact).
+        assert_eq!(storage.list().await.unwrap().len(), 200);
     }
 
     #[tokio::test]
