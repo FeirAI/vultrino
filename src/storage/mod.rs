@@ -3,8 +3,10 @@
 //! Provides traits and implementations for storing credentials securely.
 
 mod file;
+mod outbox_store;
 
 pub use file::FileStorage;
+pub use outbox_store::OutboxStore;
 
 use crate::approval::{ApprovalRequest, ApprovalStatus};
 use crate::capability::Capability;

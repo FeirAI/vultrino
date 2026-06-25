@@ -13,8 +13,14 @@ Scope: vultrino storage layer (`src/storage/file.rs`, `src/outbox.rs`). Companio
 - **D1 = intent-staging.** Split the outbox into its own store; keep state↔event atomic by staging a
   bounded intent record in the vault under the same lock, draining it to the outbox store after the
   vault commit, and reconciling undrained intents on startup. (Not pure-reconcile.)
-- **D2 = encrypt the outbox store** with per-row AES-256-GCM using the existing master key (a fresh
-  nonce per row). The event metadata never sits in plaintext.
+- **D2 = encrypt the outbox store** with the existing master key, fresh nonce per write — the event
+  metadata never sits in plaintext. IMPLEMENTATION NOTE: realized NOT as SQLite/per-row but as a
+  separate `outbox.enc` file reusing the vault's proven AES-256-GCM whole-cache serialize+encrypt +
+  fd-lock + tmp+atomic-rename+fsync machinery (no new dep on the secrets plane; `OUTBOX_FILE_VERSION=1`
+  envelope). "Encrypt the log" (D2's intent) is fully met; "per-row" was a recommendation, not a
+  locked requirement. The §3 SQLite schema below is SUPERSEDED by this choice. Trade-off: append is
+  O(retention-bounded-outbox) not O(1) — but it's fully decoupled from the (large) SECRETS vault size,
+  which IS the cliff; keep retention short if append latency under a deep backlog ever matters.
 - **D3 = sharded per tenant.** The outbox is partitioned by tenant (per-tenant monotonic seq +
   per-tenant cursor), which is one-outbox-per-vultrino in the per-tenant-shard deployment (P5). A
   *shared* multi-tenant vultrino would additionally need per-tenant broker cursors on the govder

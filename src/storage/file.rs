@@ -418,7 +418,19 @@ impl FileStorage {
         let content = serde_json::to_string_pretty(&storage_file)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let temp_path = self.path.with_extension("tmp");
-        std::fs::write(&temp_path, &content)?;
+        // fsync the tmp BEFORE the rename so the contents are durable, not just the directory entry —
+        // else a power-loss can expose the rename while the bytes are unflushed, corrupting the vault
+        // (catastrophic: every subsequent read fails). Lock-step with OutboxStore::write_to_disk.
+        {
+            let f = std::fs::File::create(&temp_path)?;
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(f);
+            w.write_all(content.as_bytes())?;
+            w.flush()?;
+            w.into_inner()
+                .map_err(|e| StorageError::Io(e.into_error()))?
+                .sync_all()?;
+        }
         std::fs::rename(&temp_path, &self.path)?;
         Ok(())
     }
