@@ -1,7 +1,28 @@
 # Design: move the signed outbox OUT of the encrypted vault (storage v6 → v7)
 
-Status: **DESIGN — for review before implementation.** No code in this document is implemented.
+Status: **DECISIONS LOCKED (D1–D4 resolved 2026-06-25) — ready to implement.** No code yet.
 Scope: vultrino storage layer (`src/storage/file.rs`, `src/outbox.rs`). Companion §12 deployment item.
+
+> CLARIFICATION (what this does NOT do): the **credentials never leave the encrypted vault and are
+> never exposed**. "Out of the vault" moves only the *signed event log* (budget/approval/lifecycle
+> events — agent-safe: credential *aliases*/metadata, never secret values) into its own store, so
+> appending an event stops rewriting the whole secrets file (the O(vault-size) cliff). Per D2 that
+> store is **also encrypted** — nothing sits in plaintext.
+
+## Resolved decisions (the implementation contract)
+- **D1 = intent-staging.** Split the outbox into its own store; keep state↔event atomic by staging a
+  bounded intent record in the vault under the same lock, draining it to the outbox store after the
+  vault commit, and reconciling undrained intents on startup. (Not pure-reconcile.)
+- **D2 = encrypt the outbox store** with per-row AES-256-GCM using the existing master key (a fresh
+  nonce per row). The event metadata never sits in plaintext.
+- **D3 = sharded per tenant.** The outbox is partitioned by tenant (per-tenant monotonic seq +
+  per-tenant cursor), which is one-outbox-per-vultrino in the per-tenant-shard deployment (P5). A
+  *shared* multi-tenant vultrino would additionally need per-tenant broker cursors on the govder
+  side (small cross-plane follow-on; NOT required for the sharded path).
+- **D4 = automatic, no explicit command.** Since nothing is deployed (no v6 vault with an in-vault
+  outbox exists in the wild), v7 is effectively *the* format; the only migration code is a
+  best-effort "drain an old v6 vault's in-vault outbox on first open" for dev/test vaults. Fresh
+  installs start clean at v7. A `--check` dry-run is optional, not required.
 
 ## 1. Problem — the O(vault-size) throughput cliff
 
@@ -116,7 +137,9 @@ CREATE INDEX idx_outbox_delivery ON outbox_events (subject, seq);  -- per-subjec
 
 > Open decision **D3 — one store or per-subject sharding.** A single `outbox.db` is simplest and matches
 > leria. Sharding by subject/tenant would parallelize append but complicates the gap-free global cursor.
-> **Recommendation: single store** (revisit only if the load test in §7 shows append contention).
+> **DECIDED: sharded per tenant (D3).** Partition the outbox by tenant — per-tenant monotonic seq +
+> per-tenant cursor. In the P5 per-tenant-shard deployment this is one outbox per vultrino (clean); a
+> shared multi-tenant vultrino then needs per-tenant broker cursors on the govder side (follow-on).
 
 Location: a sibling file `outbox.db` in the same data dir (`$HOME/.local/share/vultrino/`), on **its own
 PVC** in k8s (separate from the vault PVC), mirroring leria's separate-PVC-per-SQLite-store rule.
@@ -183,8 +206,9 @@ Two smaller §12 wins land first WITHOUT this format change (reversible, no migr
 
 These are stopgaps; this migration is the structural fix.
 
-## Open decisions to confirm before implementation
-- **D1** event/state atomicity: intent-staging (recommended) vs pure-reconcile.
-- **D2** outbox at-rest: app-level AES-GCM per row (recommended) vs SQLCipher vs plaintext-on-PVC.
-- **D3** single store (recommended) vs per-subject sharding.
-- **D4** migration trigger: automatic on first v7 open (recommended) vs explicit subcommand.
+## Decisions — RESOLVED (2026-06-25; see the header for the binding statements)
+- **D1** = intent-staging (state↔event kept atomic across the two files).
+- **D2** = per-row AES-256-GCM on the outbox store (nothing in plaintext).
+- **D3** = sharded per tenant (per-tenant seq + cursor; one-per-vultrino in the shard deployment).
+- **D4** = automatic, no explicit command (no v6 vault deployed → v7 is the format; best-effort
+  drain of an old dev/test v6 vault on first open).
