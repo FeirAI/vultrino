@@ -36,11 +36,19 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   complete are three atomic writes, not one transaction; a crash between them can
   re-run the operation after the ~60s stale window. Exactly-once would need
   transactional storage.
-- **Egress scrubbing is defense-in-depth, not absolute.** It scrubs the
-  credential's own secret (and common encoded forms) from a plaintext response; an
-  endpoint that transforms (re-encodes/hashes/recompresses) the reflected secret
-  can still leak it — use a `block` rule. Secrets shorter than `MIN_REDACT_LEN = 5`
-  are not byte-scrubbed (use a `block` rule).
+- **Egress scrubbing is defense-in-depth, not absolute (byte-exact match against
+  derived forms).** It scrubs the credential's own secret and the common *single-pass*
+  encoder dialects an upstream might ACCIDENTALLY reflect it through: raw, percent-encoding
+  (both hex cases + form-url `+`-for-space), JSON string escaping (`\"`/`\\`/control),
+  slash-escaping (`\/`), ensure_ascii `\uXXXX` (both hex cases), and HTML-safe `</3e/26`,
+  composed where realistic. This catches a buggy upstream echoing the request. It does NOT
+  defend against an **adversarially-encoding** upstream: byte-exact matching cannot beat
+  arbitrary re-encoding (base64, hashing, chunk-reordering, a novel escape dialect). The
+  real protections there are that vultrino never trusts the upstream beyond the injected
+  credential, the **buffered-block fallback** for unparseable/compressed bodies, and an
+  operator `block`/`redact_patterns` rule. Secrets shorter than `MIN_REDACT_LEN = 5` are
+  not byte-scrubbed (use a `block` rule). A structural fix (decode-then-match normalization)
+  is a deferred follow-up.
 - **Halt abort callbacks are per-process.** The in-flight session registry is
   in-memory per process, so leg 3 of a halt (firing abort callbacks) only preempts
   in-flight work *in the process that received the halt*. The cross-process

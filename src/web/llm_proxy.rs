@@ -138,10 +138,11 @@ fn llm_error(status: StatusCode, kind: &str, message: &str) -> Response {
         .into_response()
 }
 
-/// Clamp the request body's `max_tokens` to `ceiling` — `min(requested, ceiling)`,
-/// or SET it to `ceiling` when the request omits it (so the provider default can't
-/// exceed the per-call output bound). v1 handles only the OpenAI-compatible
-/// top-level `max_tokens` field; a non-object body is left untouched.
+/// Bound a request's TOTAL output-token cost to the per-call `ceiling`. This is the
+/// enforceable substitute for a SpendCap on the LLM channel (which fails closed on a
+/// request with no request-time spend), so it must bound EVERY way a request can multiply
+/// output: the scalar limit fields, the choice-multiplicity fields, and the legacy
+/// completions prompt-array (one completion per prompt). A non-object body is untouched.
 fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64) {
     // Every provider-supported output-token field the proxy routes to, so the per-call
     // ceiling cannot be evaded by naming an alternate field: `max_tokens` (OpenAI chat +
@@ -150,38 +151,47 @@ fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64) {
     const OUTPUT_TOKEN_FIELDS: &[&str] =
         &["max_tokens", "max_completion_tokens", "max_output_tokens"];
     if let Some(obj) = body.as_object_mut() {
+        // Multiplicity controls (`n` choices, legacy `best_of`) multiply TOTAL output, so
+        // pin them to 1 (this fn only runs under a configured ceiling). Fail closed: a
+        // present-but-non-numeric or >1 value is forced to 1.
+        for mult in ["n", "best_of"] {
+            if obj.get(mult).is_some_and(|v| v.as_u64() == Some(1)) {
+                continue;
+            }
+            if obj.contains_key(mult) {
+                obj.insert(mult.to_string(), serde_json::json!(1));
+            }
+        }
+        // Legacy /v1/completions returns ONE completion per prompt, so a `prompt` ARRAY
+        // multiplies total output by its length. n/best_of are pinned above, so the only
+        // remaining multiplier is the prompt count; divide the per-prompt budget by it so
+        // count * per_prompt <= ceiling. (A scalar/absent prompt = 1 unit.)
+        let units = obj
+            .get("prompt")
+            .and_then(|p| p.as_array())
+            .map(|a| a.len().max(1) as u64)
+            .unwrap_or(1);
+        let per_unit = (ceiling / units).max(1);
+
         let mut any_present = false;
         for field in OUTPUT_TOKEN_FIELDS {
             if obj.contains_key(*field) {
                 any_present = true;
-                // Clamp a present field to min(req, ceiling); a present-but-unparseable
-                // value (null / non-number) fails CLOSED to the ceiling.
+                // Clamp a present field to min(req, per_unit); a present-but-unparseable
+                // value (null / non-number) fails CLOSED to per_unit.
                 let clamped = obj
                     .get(*field)
                     .and_then(|v| v.as_u64())
-                    .map_or(ceiling, |req| req.min(ceiling));
+                    .map_or(per_unit, |req| req.min(per_unit));
                 obj.insert((*field).to_string(), serde_json::json!(clamped));
             }
         }
         // The request named NO output-token field → set the common one so the provider
-        // default can't exceed the ceiling. Don't inject a second field when the client
+        // default can't exceed the bound. Don't inject a second field when the client
         // already chose one (a newer chat model rejects `max_tokens` if it wanted
         // `max_completion_tokens`).
         if !any_present {
-            obj.insert("max_tokens".to_string(), serde_json::json!(ceiling));
-        }
-        // Multiplicity controls (`n` choices, legacy `best_of`) multiply the TOTAL output
-        // tokens (and cost) for a call: `max_tokens` bounds per-choice, so `n:10` produces
-        // ~10x the ceiling. The per-call ceiling is a COST bound, so pin multiplicity to 1
-        // whenever a ceiling is configured (this fn only runs under one). Fail closed: a
-        // present-but-non-numeric or >1 value is forced to 1.
-        for mult in ["n", "best_of"] {
-            if let Some(v) = obj.get(mult) {
-                let keep_as_is = v.as_u64() == Some(1);
-                if !keep_as_is {
-                    obj.insert(mult.to_string(), serde_json::json!(1));
-                }
-            }
+            obj.insert("max_tokens".to_string(), serde_json::json!(per_unit));
         }
     }
 }
@@ -582,6 +592,24 @@ mod tests {
         let mut body = json!({ "max_tokens": 1000 });
         clamp_max_output_tokens(&mut body, 1000);
         assert!(body.get("n").is_none(), "don't inject n when the request didn't ask for choices");
+    }
+
+    #[test]
+    fn clamp_divides_ceiling_by_legacy_prompt_array_count() {
+        // Legacy /v1/completions returns one completion per prompt, so a prompt ARRAY
+        // multiplies total output. The per-prompt budget must be divided by the count so
+        // count * per_prompt <= ceiling.
+        let mut body = json!({ "prompt": ["a", "b", "c", "d"], "max_tokens": 1000 });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["max_tokens"], json!(250), "1000 / 4 prompts = 250 per prompt");
+        // A scalar prompt is one unit (full ceiling).
+        let mut body = json!({ "prompt": "just one", "max_tokens": 5000 });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["max_tokens"], json!(1000));
+        // Absent max_tokens with a prompt array → set to the divided per-prompt budget.
+        let mut body = json!({ "prompt": ["a", "b"] });
+        clamp_max_output_tokens(&mut body, 1000);
+        assert_eq!(body["max_tokens"], json!(500));
     }
 
     #[test]
