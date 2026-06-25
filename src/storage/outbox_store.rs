@@ -483,7 +483,18 @@ pub(super) fn fsync_parent_dir(path: &Path) -> Result<(), StorageError> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let dir = std::fs::File::open(parent).map_err(StorageError::Io)?;
+    // Opening a directory HANDLE that fails (e.g. Windows std, which does not pass
+    // FILE_FLAG_BACKUP_SEMANTICS, returns PermissionDenied) is best-effort: a dir we cannot open we
+    // cannot fsync — identical to an unsupported dir fsync, and propagating it would hard-fail every
+    // write on such a platform for ZERO durability gain. Only a real sync_all I/O error (EIO) propagates.
+    let dir = match std::fs::File::open(parent) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(dir = %parent.display(), error = %e,
+                "could not open the parent directory to fsync it — the renamed file is crash-atomic but not crash-durable on this platform");
+            return Ok(());
+        }
+    };
     match dir.sync_all() {
         Ok(()) => Ok(()),
         Err(e)

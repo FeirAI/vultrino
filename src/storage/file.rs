@@ -77,6 +77,15 @@ const MAX_PENDING_EVENTS: usize = 10_000;
 /// file after the lock releases (drain_pending_events). A fresh dedup_id makes the later drain
 /// idempotent. Returns an error (so the enclosing locked_mutate ABORTS the state change too) when the
 /// undrained backlog has hit MAX_PENDING_EVENTS — fail-closed back-pressure on a stuck outbox.
+///
+/// At the cap this ALSO aborts the lifecycle sweep/poll transitions (they stage events too). That is
+/// INTENTIONAL and RECOVERABLE, not a fail-open: (a) it is recoverable — the periodic drainer keeps
+/// reducing the backlog, and once it drops below the cap the next sweep re-runs and emits the (overdue)
+/// expiry/escalation events; (b) it is safe — a stale grant still can't be acted on while the sweep is
+/// wedged, because the claim path re-checks needs_reauth() and decide re-checks is_past_ttl()
+/// independently. The alternative (commit the transition but drop its event) would PERMANENTLY lose the
+/// signed lifecycle event, so wedging-then-recovering is preferred. A permanently-stuck outbox is itself
+/// a hard outage that ops must resolve.
 fn stage_event(
     cache: &mut StorageCache,
     subject: &str,
