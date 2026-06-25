@@ -173,19 +173,8 @@ pub fn decrypt(encrypted: &EncryptedData, key: &MasterKey) -> Result<Vec<u8>, Cr
     Ok(plaintext)
 }
 
-/// Encrypt a string and return base64-encoded result
-#[allow(dead_code)]
-pub fn encrypt_string(plaintext: &str, key: &MasterKey) -> Result<EncryptedData, CryptoError> {
-    encrypt(plaintext.as_bytes(), key)
-}
-
-/// Decrypt to a string
-#[allow(dead_code)]
-pub fn decrypt_string(encrypted: &EncryptedData, key: &MasterKey) -> Result<String, CryptoError> {
-    let bytes = decrypt(encrypted, key)?;
-    String::from_utf8(bytes)
-        .map_err(|e| CryptoError::DecryptionFailed(format!("Invalid UTF-8: {}", e)))
-}
+// (removed dead `encrypt_string`/`decrypt_string` helpers — production encrypts/decrypts bytes directly
+// via encrypt/decrypt; the string wrappers were only exercised by their own test.)
 
 #[cfg(test)]
 mod tests {
@@ -200,19 +189,6 @@ mod tests {
         let plaintext = b"Hello, Vultrino!";
         let encrypted = encrypt(plaintext, &key).unwrap();
         let decrypted = decrypt(&encrypted, &key).unwrap();
-
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_string() {
-        let password = SecretString::from("another-password");
-        let salt = generate_salt();
-        let key = derive_key(&password, &salt).unwrap();
-
-        let plaintext = "Secret credential data";
-        let encrypted = encrypt_string(plaintext, &key).unwrap();
-        let decrypted = decrypt_string(&encrypted, &key).unwrap();
 
         assert_eq!(decrypted, plaintext);
     }

@@ -330,9 +330,14 @@ impl HttpPlugin {
                         .await?
                 };
 
-                // Calculate new expiration time
-                let new_expires_at = token_response.expires_in.map(|secs| {
-                    Utc::now() + Duration::seconds(secs as i64)
+                // Calculate new expiration time. `expires_in` comes verbatim from the token endpoint, so
+                // use checked arithmetic (a hostile/buggy huge value must not panic the credential path):
+                // an unrepresentable/overflowing value resolves to None ("unknown expiry").
+                let new_expires_at = token_response.expires_in.and_then(|secs| {
+                    i64::try_from(secs)
+                        .ok()
+                        .and_then(Duration::try_seconds)
+                        .and_then(|d| Utc::now().checked_add_signed(d))
                 });
 
                 // Build updated credential data
@@ -370,17 +375,22 @@ impl HttpPlugin {
                 header_prefix,
             } => {
                 let value = format!("{}{}", header_prefix, key.expose());
+                // Remove any agent-supplied case-variant first so the vault credential is the SOLE copy
+                // of this header on the wire (no header shadowing / duplicate-Authorization confusion).
+                remove_header_ci(headers, header_name);
                 headers.insert(header_name.clone(), value);
             }
 
             CredentialData::BasicAuth { username, password } => {
                 let credentials = format!("{}:{}", username, password.expose());
                 let encoded = STANDARD.encode(credentials.as_bytes());
+                remove_header_ci(headers, "Authorization");
                 headers.insert("Authorization".to_string(), format!("Basic {}", encoded));
             }
 
             CredentialData::OAuth2 { access_token, .. } => {
                 if let Some(token) = access_token {
+                    remove_header_ci(headers, "Authorization");
                     headers.insert(
                         "Authorization".to_string(),
                         format!("Bearer {}", token.expose()),
@@ -549,8 +559,11 @@ impl HttpPlugin {
             _ => (cred_data.clone(), None),
         };
 
-        // Build headers with credential injection
+        // Build headers with credential injection. First drop agent-supplied routing / hop-by-hop
+        // headers (Host-routing tricks, request smuggling) — reqwest derives these from the validated
+        // URL + body, and an agent on this governed capability path must not control them.
         let mut headers = params.headers;
+        strip_unsafe_request_headers(&mut headers);
         self.inject_credentials(&mut headers, &effective_cred)?;
 
         // Let the HTTP client negotiate and auto-decompress the response
@@ -674,6 +687,28 @@ fn force_client_managed_encoding(headers: &mut HashMap<String, String>) {
     headers.retain(|k, _| !k.eq_ignore_ascii_case("accept-encoding"));
 }
 
+/// Remove every header whose name case-insensitively equals `name`. The header map is case-sensitive,
+/// so an agent-supplied case-variant (`authorization`) would otherwise survive alongside the canonical
+/// one we inject — used so the vault credential header is the sole copy on the wire.
+fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
+    headers.retain(|k, _| !k.eq_ignore_ascii_case(name));
+}
+
+/// Drop agent-supplied routing / hop-by-hop headers the PEP must control: `Host` (host-routing tricks
+/// against the upstream), `Content-Length` / `Transfer-Encoding` (request smuggling), `Connection`
+/// (hop-by-hop), and `Content-Encoding` (the body is set by us). reqwest derives all of these from the
+/// validated URL + body, so an agent on the governed capability path can never inject them.
+fn strip_unsafe_request_headers(headers: &mut HashMap<String, String>) {
+    const UNSAFE: [&str; 5] = [
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "content-encoding",
+    ];
+    headers.retain(|k, _| !UNSAFE.iter().any(|u| k.eq_ignore_ascii_case(u)));
+}
+
 impl Default for HttpPlugin {
     fn default() -> Self {
         Self::new()
@@ -777,6 +812,43 @@ impl Plugin for HttpPlugin {
 mod tests {
     use super::*;
     use crate::Secret;
+
+    #[test]
+    fn agent_cannot_shadow_or_duplicate_the_credential_header() {
+        // An agent-supplied case-variant of the credential header must NOT survive next to the injected
+        // vault credential — the vault header must be the SOLE copy on the wire.
+        let plugin = HttpPlugin::new();
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("authorization".to_string(), "Bearer attacker".to_string()); // lowercase variant
+        headers.insert("X-Other".to_string(), "ok".to_string());
+        let cred = CredentialData::ApiKey {
+            key: Secret::new("vault-secret"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        };
+        plugin.inject_credentials(&mut headers, &cred).unwrap();
+        let auth: Vec<_> = headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .collect();
+        assert_eq!(auth.len(), 1, "exactly one Authorization header");
+        assert_eq!(auth[0].1, "Bearer vault-secret", "the vault credential wins");
+        assert_eq!(headers.get("X-Other").map(String::as_str), Some("ok"));
+    }
+
+    #[test]
+    fn strip_unsafe_request_headers_drops_routing_headers() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Host".to_string(), "evil.example.com".to_string());
+        headers.insert("content-length".to_string(), "999".to_string());
+        headers.insert("Transfer-Encoding".to_string(), "chunked".to_string());
+        headers.insert("X-Keep".to_string(), "ok".to_string());
+        strip_unsafe_request_headers(&mut headers);
+        assert!(!headers.keys().any(|k| k.eq_ignore_ascii_case("host")));
+        assert!(!headers.keys().any(|k| k.eq_ignore_ascii_case("content-length")));
+        assert!(!headers.keys().any(|k| k.eq_ignore_ascii_case("transfer-encoding")));
+        assert_eq!(headers.get("X-Keep").map(String::as_str), Some("ok"));
+    }
 
     #[test]
     fn test_validate_params_valid() {

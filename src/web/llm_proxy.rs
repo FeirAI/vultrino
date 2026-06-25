@@ -478,6 +478,15 @@ async fn llm_proxy_impl(
                     approval.id
                 ),
             ),
+            // A policy/rate/budget denial is a 403 authorization decision, not an upstream outage.
+            Err(crate::VultrinoError::PolicyDenied(_)) => {
+                tracing::info!("LLM proxy stream request denied by policy");
+                llm_error(
+                    StatusCode::FORBIDDEN,
+                    "permission_error",
+                    "This model request was denied by policy",
+                )
+            }
             Err(e) => {
                 // Same no-leak posture as the buffered Err path: the scrub hasn't run
                 // on a pre-stream Err, so never echo the upstream detail to the agent.
@@ -522,6 +531,17 @@ async fn llm_proxy_impl(
                 approval.id
             ),
         ),
+        // A policy/rate/budget DENIAL is an authorization decision, not an upstream outage — surface it
+        // as 403 (matching the explicit 403s above), detail-free, so operators don't read denials as
+        // provider flakiness. The server-side detect-event + counters still fire.
+        Err(crate::VultrinoError::PolicyDenied(_)) => {
+            tracing::info!("LLM proxy request denied by policy");
+            llm_error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "This model request was denied by policy",
+            )
+        }
         Err(e) => {
             // Do NOT echo the upstream error detail to the agent: on a plugin Err
             // the egress scrub (which runs on the Ok path) has NOT run, so a

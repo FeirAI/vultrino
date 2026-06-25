@@ -270,6 +270,10 @@ pub const ROLE_ADMIN: &str = "admin";
 pub const ROLE_READ_ONLY: &str = "read-only";
 pub const ROLE_EXECUTOR: &str = "executor";
 
+/// The built-in roles (not persisted in the credential vault). Single source of truth for their COUNT
+/// so callers don't hardcode a magic `+ 3` that silently drifts if the set changes.
+pub const BUILTIN_ROLES: [&str; 3] = [ROLE_ADMIN, ROLE_READ_ONLY, ROLE_EXECUTOR];
+
 /// Create the predefined admin role (full access)
 pub fn admin_role() -> Role {
     Role::new(ROLE_ADMIN, Permission::all())

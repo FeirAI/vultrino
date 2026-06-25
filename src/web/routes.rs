@@ -23,30 +23,37 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
-/// Extract client IP from request, considering X-Forwarded-For for reverse proxy setups
-fn get_client_ip(headers: &HeaderMap, socket_addr: &SocketAddr) -> IpAddr {
-    // Check X-Forwarded-For header first (for reverse proxy setups)
-    if let Some(forwarded) = headers.get("x-forwarded-for") {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            // Take the first IP in the chain (original client)
-            if let Some(first_ip) = forwarded_str.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
+/// Extract the client IP used to key the login throttle.
+///
+/// SECURITY: `X-Forwarded-For` / `X-Real-IP` are fully CLIENT-CONTROLLED. Honoring them unconditionally
+/// lets an attacker send a unique spoofed value per request to get a fresh rate-limit bucket every time,
+/// defeating the admin-login brute-force throttle entirely. So they are trusted ONLY when the operator
+/// has declared vultrino runs behind a trusted proxy (`trust_forwarded`, from VULTRINO_TRUST_FORWARDED_FOR);
+/// otherwise we key on the real socket peer. When trusted we take the RIGHTMOST `X-Forwarded-For` hop —
+/// the address the trusted proxy itself observed — not the leftmost, client-supplied value.
+fn get_client_ip(headers: &HeaderMap, socket_addr: &SocketAddr, trust_forwarded: bool) -> IpAddr {
+    if trust_forwarded {
+        if let Some(forwarded) = headers.get("x-forwarded-for") {
+            if let Ok(s) = forwarded.to_str() {
+                if let Some(ip) = s
+                    .split(',')
+                    .map(str::trim)
+                    .rev()
+                    .filter(|h| !h.is_empty())
+                    .find_map(|h| h.parse::<IpAddr>().ok())
+                {
+                    return ip;
+                }
+            }
+        }
+        if let Some(real_ip) = headers.get("x-real-ip") {
+            if let Ok(s) = real_ip.to_str() {
+                if let Ok(ip) = s.trim().parse::<IpAddr>() {
                     return ip;
                 }
             }
         }
     }
-
-    // Check X-Real-IP header (nginx)
-    if let Some(real_ip) = headers.get("x-real-ip") {
-        if let Ok(ip_str) = real_ip.to_str() {
-            if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
-                return ip;
-            }
-        }
-    }
-
-    // Fall back to direct connection IP
     socket_addr.ip()
 }
 
@@ -87,8 +94,8 @@ pub async fn login_submit(
     session: Session,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    // Get client IP for rate limiting
-    let client_ip = get_client_ip(&headers, &addr);
+    // Get client IP for rate limiting (X-Forwarded-For honored only behind a trusted proxy).
+    let client_ip = get_client_ip(&headers, &addr, state.trust_forwarded_for);
     let rate_limiter = &state.rate_limiter;
 
     // Check rate limit before processing
@@ -153,7 +160,7 @@ pub async fn dashboard(
 
     let stats = DashboardStats {
         total_credentials: credentials.len(),
-        total_roles: roles.len() + 3, // Include built-in roles
+        total_roles: roles.len() + crate::auth::BUILTIN_ROLES.len(), // stored + built-in roles
         total_api_keys: api_keys.len(),
         recent_requests: 0, // TODO: Implement audit logging
     };
@@ -545,7 +552,16 @@ pub async fn credential_delete(
         Ok(None) => {}
         Err(e) => tracing::warn!(error = %e, credential_id = %id, "could not load credential for revoke-propagation before delete"),
     }
-    let _ = state.storage.delete(&id).await;
+    // Surface a failed delete instead of reporting success: a secret that looks deleted but persists is
+    // a fail-open for the PEP console. Log (observable) + return an error rather than a success redirect.
+    if let Err(e) = state.storage.delete(&id).await {
+        tracing::error!(error = %e, credential_id = %id, "failed to delete credential");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to delete credential; see server logs",
+        )
+            .into_response();
+    }
     // Regenerate CSRF token after successful action
     let _ = regenerate_csrf_token(&session).await;
     Redirect::to("/credentials").into_response()
@@ -689,7 +705,14 @@ pub async fn role_delete(
     }
     drop(auth_manager);
 
-    let _ = state.storage.delete_role(&id).await;
+    if let Err(e) = state.storage.delete_role(&id).await {
+        tracing::error!(error = %e, role = %id, "failed to delete role");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to delete role; see server logs",
+        )
+            .into_response();
+    }
 
     // Refresh auth data to update the cached AuthManager
     let _ = refresh_auth_data(&state).await;
@@ -883,7 +906,14 @@ pub async fn key_revoke(
     if !validate_csrf_token(&session, &form.csrf_token).await {
         return Redirect::to("/keys").into_response();
     }
-    let _ = state.storage.delete_api_key(&id).await;
+    if let Err(e) = state.storage.delete_api_key(&id).await {
+        tracing::error!(error = %e, key_id = %id, "failed to delete API key");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to delete API key; see server logs",
+        )
+            .into_response();
+    }
 
     // Refresh auth data to update the cached AuthManager
     let _ = refresh_auth_data(&state).await;
@@ -1063,8 +1093,16 @@ pub async fn token_revoke(
     if !validate_csrf_token(&session, &form.csrf_token).await {
         return Redirect::to("/tokens").into_response();
     }
-    // Mark revoked (preserve the audit trail) rather than hard-deleting.
-    let _ = state.storage.set_use_token_revoked(&id).await;
+    // Mark revoked (preserve the audit trail) rather than hard-deleting. Surface a failed revoke — a
+    // token that looks revoked but is still live is the worst silent failure for a PEP console.
+    if let Err(e) = state.storage.set_use_token_revoked(&id).await {
+        tracing::error!(error = %e, token_id = %id, "failed to revoke use-token");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to revoke token; see server logs",
+        )
+            .into_response();
+    }
     let _ = regenerate_csrf_token(&session).await;
     Redirect::to("/tokens").into_response()
 }
@@ -1278,7 +1316,7 @@ pub async fn api_stats(
 
     axum::Json(serde_json::json!({
         "credentials": credentials.len(),
-        "roles": roles.len() + 3,
+        "roles": roles.len() + crate::auth::BUILTIN_ROLES.len(),
         "api_keys": api_keys.len(),
         "recent_requests": 0
     }))
@@ -1303,14 +1341,17 @@ fn parse_short_duration(s: &str) -> Result<Option<chrono::Duration>, String> {
     let n: i64 = num_str
         .parse()
         .map_err(|_| format!("Invalid duration '{}'. Use e.g. 30m, 24h, 7d.", s))?;
+    // Fallible constructors: a huge count must yield a clean form error, NOT panic the web worker
+    // (chrono's Duration::seconds/minutes/.. panic on out-of-range — a request-path DoS).
     let duration = match unit {
-        "s" => chrono::Duration::seconds(n),
-        "m" => chrono::Duration::minutes(n),
-        "h" => chrono::Duration::hours(n),
-        "d" => chrono::Duration::days(n),
-        "w" => chrono::Duration::weeks(n),
+        "s" => chrono::Duration::try_seconds(n),
+        "m" => chrono::Duration::try_minutes(n),
+        "h" => chrono::Duration::try_hours(n),
+        "d" => chrono::Duration::try_days(n),
+        "w" => chrono::Duration::try_weeks(n),
         _ => return Err(format!("Invalid duration unit in '{}'. Use s, m, h, d, or w.", s)),
-    };
+    }
+    .ok_or_else(|| format!("Duration '{}' is out of range", s))?;
     if duration <= chrono::Duration::zero() {
         return Err("Duration must be positive".to_string());
     }
@@ -1341,15 +1382,22 @@ fn parse_duration(s: &str) -> Result<Option<chrono::Duration>, String> {
         .parse()
         .map_err(|_| format!("Invalid number: {}", num_str))?;
 
+    // Fallible: bound BEFORE constructing so a huge count / the *30 / *365 multiply can't panic the web
+    // worker (a request-path DoS). NOTE: here `m` = MONTHS (parse_short_duration uses `m` = minutes) —
+    // a pre-existing per-context divergence; not changed here to avoid altering existing expiry meanings.
     let duration = match unit {
-        "h" => chrono::Duration::hours(num),
-        "d" => chrono::Duration::days(num),
-        "w" => chrono::Duration::weeks(num),
-        "m" => chrono::Duration::days(num * 30),
-        "y" => chrono::Duration::days(num * 365),
+        "h" => chrono::Duration::try_hours(num),
+        "d" => chrono::Duration::try_days(num),
+        "w" => chrono::Duration::try_weeks(num),
+        "m" => num.checked_mul(30).and_then(chrono::Duration::try_days),
+        "y" => num.checked_mul(365).and_then(chrono::Duration::try_days),
         _ => unreachable!(),
-    };
+    }
+    .ok_or_else(|| format!("Duration '{}' is out of range", s))?;
 
+    if duration <= chrono::Duration::zero() {
+        return Err("Duration must be positive".to_string());
+    }
     Ok(Some(duration))
 }
 
@@ -1396,5 +1444,45 @@ mod tests {
     fn test_parse_duration_invalid() {
         assert!(parse_duration("invalid").is_err());
         assert!(parse_duration("30x").is_err());
+    }
+
+    #[test]
+    fn test_duration_parsers_overflow_is_error_not_panic() {
+        // Out-of-range / overflowing counts must return Err, NEVER panic the web worker (DoS).
+        for s in [
+            "106751991167301d",
+            "9223372036854775807w",
+            "999999999999999999m",
+            "999999999999999999y",
+        ] {
+            assert!(parse_duration(s).is_err(), "parse_duration({s}) must be Err, not panic");
+        }
+        for s in ["9223372036854775807w", "999999999999999999d"] {
+            assert!(
+                parse_short_duration(s).is_err(),
+                "parse_short_duration({s}) must be Err, not panic"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_client_ip_ignores_spoofed_xff_unless_trusted() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let socket: SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("x-forwarded-for"),
+            axum::http::HeaderValue::from_static("1.2.3.4, 5.6.7.8"),
+        );
+        // Untrusted (default): the spoofable header is ignored → real socket peer.
+        assert_eq!(
+            get_client_ip(&headers, &socket, false),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))
+        );
+        // Trusted: take the RIGHTMOST hop (what the trusted proxy observed), not the leftmost client value.
+        assert_eq!(
+            get_client_ip(&headers, &socket, true),
+            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))
+        );
     }
 }

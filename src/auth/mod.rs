@@ -19,5 +19,5 @@ pub use tokens::{
 };
 pub use types::{
     admin_role, executor_role, read_only_role, ApiKey, ApiKeyMetadata, Permission, Role,
-    ROLE_ADMIN, ROLE_EXECUTOR, ROLE_READ_ONLY,
+    BUILTIN_ROLES, ROLE_ADMIN, ROLE_EXECUTOR, ROLE_READ_ONLY,
 };

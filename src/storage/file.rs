@@ -604,6 +604,15 @@ impl FileStorage {
     /// goes through tmp + atomic rename, so a real change always bumps mtime; the target
     /// filesystems (container ext4/overlayfs) have sub-second mtime resolution, so a
     /// distinct write is never collapsed into an unchanged token.
+    ///
+    /// DEPLOYMENT CONSTRAINT (non-security): this read-cache skip relies on sub-second mtime
+    /// resolution. On a coarse-mtime mount (some NFS/overlay configs) two writes in the same tick that
+    /// re-encrypt to an identical length could collapse to the same token, delaying cross-process
+    /// visibility in the READ cache until the next length-changing write. This NEVER affects correctness:
+    /// every security-critical path (consume_use_token, claim_approval_for_execution, idempotency,
+    /// decide) runs under `locked_mutate`, which ALWAYS re-reads authoritative on-disk state under the fd
+    /// lock and ignores this token — so a stale read-cache can't cause token reuse, a double-claim, or an
+    /// admin-Deny bypass. Run on a sub-second-mtime filesystem; coarse-mtime mounts are unsupported.
     fn file_change_token(&self) -> Option<(std::time::SystemTime, u64)> {
         let meta = std::fs::metadata(&self.path).ok()?;
         Some((meta.modified().ok()?, meta.len()))
@@ -1291,7 +1300,10 @@ impl StorageBackend for FileStorage {
     async fn gc_outbox(&self, retention_secs: u64) -> Result<usize, StorageError> {
         // Protect the dedup_ids of any still-staged intents from GC: an outbox event must not be pruned
         // while its vault-side intent is uncleared, or a re-drain after the prune would duplicate it
-        // (enforces the no-duplicate invariant, not just bounds the window).
+        // (enforces the no-duplicate invariant, not just bounds the window). reload() FIRST so the
+        // protect set reflects a SIBLING process's staged intents (this loop runs in both web + MCP over
+        // the shared vault) — reading only the local cache would omit them and prune a sibling's event.
+        self.reload().await?;
         let protected: std::collections::HashSet<String> = {
             let c = self.cache.read();
             c.pending_events.iter().map(|e| e.dedup_id.clone()).collect()
@@ -1303,12 +1315,18 @@ impl StorageBackend for FileStorage {
     /// drain_pending_events. Bounds an orphaned intent's lifetime to one tick when an inline drain
     /// failed, so a committed approval decision's signed event is delivered without waiting for a
     /// restart (and the intent never outlives the outbox retention window — closing the dedup-vs-GC
-    /// duplicate window, since append_deduped's memory is the live outbox).
+    /// duplicate window, since append_deduped's memory is the live outbox). reload() first so this
+    /// cross-process net drains a SIBLING's orphaned intent (e.g. after that process crashed), not only
+    /// intents the current process staged — the drain is idempotent (dedup_id), so a double-drain is safe.
     async fn reconcile_pending_events(&self) -> Result<(), StorageError> {
+        self.reload().await?;
         self.drain_pending_events().await
     }
 
     async fn pending_event_count(&self) -> Result<usize, StorageError> {
+        // reload() so the stuck-outbox backlog alert is accurate across processes (a sibling's staged
+        // intents live on disk, not in this process's cache).
+        self.reload().await?;
         Ok(self.cache.read().pending_events.len())
     }
 

@@ -4,7 +4,7 @@ use crate::auth::AuthManager;
 use crate::config::Config;
 use crate::storage::StorageBackend;
 use axum::{
-    extract::FromRef,
+    extract::{DefaultBodyLimit, FromRef},
     http::{header, HeaderValue},
     routing::{delete, get, post, put},
     Router,
@@ -41,6 +41,13 @@ impl Default for WebConfig {
     }
 }
 
+/// How often the background task reclaims expired login-throttle entries (once per rate-limit window).
+const LOGIN_THROTTLE_CLEANUP_SECS: u64 = 300;
+
+/// Body-size cap for /mcp + /llm (vs axum's 2MB default): generous enough for full chat prompts and
+/// base64 vision images, but still a hard memory bound for the in-path PEP. 32 MiB.
+const LLM_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// Application state shared across handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -49,6 +56,10 @@ pub struct AppState {
     pub admin_auth: Arc<AdminAuth>,
     pub config: Config,
     pub rate_limiter: LoginRateLimiter,
+    /// Honor X-Forwarded-For / X-Real-IP for the login throttle ONLY when set (VULTRINO_TRUST_FORWARDED_FOR)
+    /// — i.e. vultrino runs behind a trusted proxy. Default false: key on the real socket peer so a
+    /// client can't spoof a fresh rate-limit bucket per request. See routes::get_client_ip.
+    pub trust_forwarded_for: bool,
     /// Shared execution server, built once with plugins loaded — reused by the
     /// JSON API handlers instead of rebuilding + re-scanning plugins per request.
     pub server: Arc<crate::server::VultrinoServer>,
@@ -91,12 +102,17 @@ impl WebServer {
         admin_auth: AdminAuth,
         server: Arc<crate::server::VultrinoServer>,
     ) -> Self {
+        // Trust X-Forwarded-For only when explicitly declared behind a trusted proxy.
+        let trust_forwarded_for = std::env::var("VULTRINO_TRUST_FORWARDED_FOR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let app_state = AppState {
             storage,
             auth_manager: Arc::new(RwLock::new(auth_manager)),
             admin_auth: Arc::new(admin_auth),
             config: vultrino_config,
             rate_limiter: LoginRateLimiter::new(),
+            trust_forwarded_for,
             server,
         };
 
@@ -214,14 +230,27 @@ impl WebServer {
             // reaches vultrino's MCP over JSON-RPC here, authed + scoped by a
             // Bearer use-token (vut_) / one-time secret. vultrino holds the
             // secrets and is network-isolated from the agent.
-            .route("/mcp", post(mcp_http::mcp_jsonrpc))
+            // /mcp + /llm carry large payloads (tool args, full chat prompts, base64 vision images), so
+            // they get an explicit GENEROUS-BUT-BOUNDED body limit instead of axum's 2MB default (which
+            // would 413 legitimate vision/large-context requests). The cap is still a hard memory bound —
+            // scoped to these routes only so the small admin-form routes keep the tight default.
+            .route(
+                "/mcp",
+                post(mcp_http::mcp_jsonrpc).layer(DefaultBodyLimit::max(LLM_MAX_BODY_BYTES)),
+            )
             // Metered LLM proxy (connector M1, decision 5): a harness points its
             // model `base_url` here; the request is forwarded to the provider with
             // the vault model key injected and token spend metered (V13). The
             // catch-all path captures the OpenAI route the client appends (e.g.
             // `/v1/chat/completions`); a bare `/llm` POST is also accepted.
-            .route("/llm", post(llm_proxy::llm_proxy_root))
-            .route("/llm/{*path}", post(llm_proxy::llm_proxy))
+            .route(
+                "/llm",
+                post(llm_proxy::llm_proxy_root).layer(DefaultBodyLimit::max(LLM_MAX_BODY_BYTES)),
+            )
+            .route(
+                "/llm/{*path}",
+                post(llm_proxy::llm_proxy).layer(DefaultBodyLimit::max(LLM_MAX_BODY_BYTES)),
+            )
             // Static files
             .nest_service("/static", static_dir);
 
@@ -278,6 +307,21 @@ impl WebServer {
         let listener = tokio::net::TcpListener::bind(&self.config.bind).await?;
 
         tracing::info!(bind = %self.config.bind, "Starting Vultrino Web UI");
+
+        // Periodically reclaim expired login-throttle entries so the attempts/lockouts maps don't grow
+        // unbounded over the process lifetime (cleanup() drops entries past their window). Cheap; runs
+        // once per rate-limit window.
+        {
+            let rl = self.app_state.rate_limiter.clone();
+            tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(LOGIN_THROTTLE_CLEANUP_SECS));
+                loop {
+                    tick.tick().await;
+                    rl.cleanup().await;
+                }
+            });
+        }
 
         // Use into_make_service_with_connect_info to enable IP address extraction for rate limiting
         axum::serve(

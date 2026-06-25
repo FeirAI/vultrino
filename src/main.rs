@@ -552,7 +552,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if mcp {
                 run_mcp_server(config).await?;
             } else {
-                run_server(config, bind).await?;
+                // `serve` without --mcp used to print "running" and bind NOTHING (a footgun: an operator
+                // would point agents at a port that silently refuses). The real surfaces are
+                // `serve --mcp` (MCP stdio) and `vultrino web` (JSON API + console). Fail loudly.
+                return Err(format!(
+                    "`vultrino serve` requires --mcp (the MCP stdio transport). For the JSON API + admin \
+                     console run `vultrino web`. (--bind {bind} applies only to `web`.)"
+                )
+                .into());
             }
         }
         Commands::Add {
@@ -839,33 +846,7 @@ async fn init_storage(config: &Config) -> Result<Arc<dyn StorageBackend>, Box<dy
     }
 }
 
-/// Run the HTTP proxy server
-async fn run_server(config: Config, bind: String) -> Result<(), Box<dyn std::error::Error>> {
-    info!(bind = %bind, "Starting Vultrino server");
-
-    let storage = init_storage(&config).await?;
-    let resolver = CredentialResolver::new(storage.clone());
-    let server = VultrinoServer::new(config, storage, resolver);
-
-    // Load installed plugins
-    if let Err(e) = server.load_plugins().await {
-        warn!("Failed to load plugins: {}", e);
-    }
-    // Merge admin-API-managed policies into the engine (V1).
-    if let Err(e) = server.reload_policies().await {
-        warn!("Failed to load stored policies: {}", e);
-    }
-
-    // TODO: Implement JSON API server
-    // For now, just print info and wait
-    println!("Vultrino server running on {}", bind);
-    println!("Press Ctrl+C to stop");
-
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down");
-
-    Ok(())
-}
+// (removed dead `run_server` stub — `serve` now requires --mcp; the JSON API/console is `vultrino web`.)
 
 /// Run the MCP server for LLM integration
 async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {

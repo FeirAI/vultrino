@@ -39,7 +39,6 @@
 use super::{Plugin, PluginError, PluginRequest};
 use crate::{CredentialData, CredentialType, ExecuteResponse};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -637,34 +636,8 @@ impl Plugin for SshPlugin {
     }
 }
 
-/// Serde helpers (used only for parameter typing; action impls read loosely).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DeployParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    source_dir: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    dest_dir: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    excludes: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    flags: Option<String>,
-    #[serde(default)]
-    dry_run: bool,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RunParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    commands: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    stop_on_error: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    interval_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    timeout_secs: Option<u64>,
-}
+// (removed the dead `DeployParams`/`RunParams` "doc structs": they were never deserialized — the action
+// impls parse the params map by hand — so an unenforced parallel schema would only drift from reality.)
 
 #[cfg(test)]
 mod tests {

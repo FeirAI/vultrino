@@ -291,7 +291,15 @@ pub fn maybe_inject_stream_usage(body: &mut serde_json::Value) -> bool {
         *so = serde_json::json!({ "include_usage": true });
         return true;
     }
-    let so_obj = so.as_object_mut().expect("is_object checked above");
+    // Panic-free (is_object was checked above, but don't `.expect()` on a request-driven path): if it
+    // somehow isn't an object, fail SAFE by forcing a fresh metering object.
+    let so_obj = match so.as_object_mut() {
+        Some(o) => o,
+        None => {
+            *so = serde_json::json!({ "include_usage": true });
+            return true;
+        }
+    };
     let already_true =
         so_obj.get("include_usage").and_then(serde_json::Value::as_bool) == Some(true);
     // FORCE true even over an explicit client false — the client cannot disable metering.

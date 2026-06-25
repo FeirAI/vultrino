@@ -232,7 +232,15 @@ impl PolicyEngine {
                 PolicyCondition::SpendCap { .. } | PolicyCondition::RateLimit { .. } => true,
                 PolicyCondition::And(v) | PolicyCondition::Or(v) => v.iter().any(rule_guards),
                 PolicyCondition::Not(b) => rule_guards(b),
-                _ => false,
+                // EXHAUSTIVE on purpose (no `_`): a newly-added PolicyCondition (e.g. a future financial
+                // /abuse cap) must FORCE a compile error here so its author consciously classifies it as
+                // a resource guard or not — a `_ => false` would silently make it downgradable in V11
+                // observe mode.
+                PolicyCondition::UrlMatch(_)
+                | PolicyCondition::MethodMatch(_)
+                | PolicyCondition::ActionMatch(_)
+                | PolicyCondition::TimeWindow { .. }
+                | PolicyCondition::Always => false,
             }
         }
         let policies = self.policies.read();

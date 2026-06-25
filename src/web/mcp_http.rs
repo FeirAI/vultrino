@@ -135,19 +135,21 @@ fn inject_bearer(message: &mut serde_json::Value, secret: &str) {
             // resources/list is principal-scoped in the shared handler (it returns
             // empty for a use-token, role-filtered for an API key); inject the Bearer
             // so the handler can resolve the principal over HTTP too.
-            let params = ensure_object(message, "params");
-            params.insert("api_key".to_string(), serde_json::Value::String(secret.to_string()));
+            if let Some(params) = ensure_object(message, "params") {
+                params.insert("api_key".to_string(), serde_json::Value::String(secret.to_string()));
+            }
         }
         "tools/call" => {
-            let params = ensure_object(message, "params");
-            let args = params
-                .entry("arguments")
-                .or_insert_with(|| serde_json::Value::Object(Default::default()));
-            if !args.is_object() {
-                *args = serde_json::Value::Object(Default::default());
-            }
-            if let Some(obj) = args.as_object_mut() {
-                obj.insert("api_key".to_string(), serde_json::Value::String(secret.to_string()));
+            if let Some(params) = ensure_object(message, "params") {
+                let args = params
+                    .entry("arguments")
+                    .or_insert_with(|| serde_json::Value::Object(Default::default()));
+                if !args.is_object() {
+                    *args = serde_json::Value::Object(Default::default());
+                }
+                if let Some(obj) = args.as_object_mut() {
+                    obj.insert("api_key".to_string(), serde_json::Value::String(secret.to_string()));
+                }
             }
         }
         _ => {}
@@ -159,17 +161,18 @@ fn inject_bearer(message: &mut serde_json::Value, secret: &str) {
 fn ensure_object<'a>(
     message: &'a mut serde_json::Value,
     field: &str,
-) -> &'a mut serde_json::Map<String, serde_json::Value> {
-    let obj = message
-        .as_object_mut()
-        .expect("JSON-RPC message is a JSON object");
+) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
+    // Panic-free by construction: return None if the message isn't an object (the caller already guards
+    // this, but a future reuse without that guard must not panic the request worker). The inner
+    // as_object_mut is always Some (we just set the entry to an object), and is returned without expect.
+    let obj = message.as_object_mut()?;
     let entry = obj
         .entry(field.to_string())
         .or_insert_with(|| serde_json::Value::Object(Default::default()));
     if !entry.is_object() {
         *entry = serde_json::Value::Object(Default::default());
     }
-    entry.as_object_mut().expect("field was just set to an object")
+    entry.as_object_mut()
 }
 
 /// A JSON-RPC `401`-style transport rejection, returned as an HTTP 401 with a

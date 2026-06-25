@@ -194,12 +194,16 @@ impl OutboxStore {
         self.locked_mutate(move |c| {
             let now = Utc::now();
             let claimed = earliest_pending_per_subject(&c.outbox, limit, true, now);
-            // Floor at 1s + saturate (mirror FileStorage): a 0 lease would stamp leased_until==now,
-            // which earliest_pending_per_subject (t > now) treats as already-expired → a sibling
-            // re-claims the same event = double delivery; a huge value cast as i64 could wrap NEGATIVE
-            // → a born-expired lease, same hole. The lease is the ONLY cross-process at-most-once guard.
-            let lease_until = now
-                + chrono::Duration::seconds(i64::try_from(lease_secs.max(1)).unwrap_or(i64::MAX));
+            // Floor at 1s + CLAMP, never panic (mirror gc's overflow-safe pattern): a 0 lease would stamp
+            // leased_until==now, which earliest_pending_per_subject (t > now) treats as already-expired →
+            // a sibling re-claims the same event = double delivery. A huge lease_secs must NOT panic
+            // (chrono::Duration::seconds + DateTime add both panic out of range) — clamp to ~1 year and
+            // fall back to `now` only if even that overflows. The lease is the ONLY cross-process
+            // at-most-once guard, so it must always produce a valid future instant.
+            let secs = lease_secs.clamp(1, 31_556_952) as i64; // [1s, ~1y]
+            let lease_until = chrono::Duration::try_seconds(secs)
+                .and_then(|d| now.checked_add_signed(d))
+                .unwrap_or(now);
             for e in &claimed {
                 if let Some(stored) = c.outbox.get_mut(&e.sequence) {
                     stored.leased_until = Some(lease_until);

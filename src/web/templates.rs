@@ -466,12 +466,4 @@ pub struct AuditLogTemplate {
     pub flash: Option<FlashMessage>,
 }
 
-// ============== Error Pages ==============
-
-#[derive(Template)]
-#[template(path = "error.html")]
-#[allow(dead_code)]
-pub struct ErrorTemplate {
-    pub status_code: u16,
-    pub message: String,
-}
+// (removed dead `ErrorTemplate` — error paths return error_response()/redirects, never this template.)

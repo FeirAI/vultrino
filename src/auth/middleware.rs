@@ -174,53 +174,10 @@ pub fn authenticate(
     validate_request(auth_manager, &api_key)
 }
 
-/// Map permission requirements to operations
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub enum Operation {
-    /// List credentials
-    ListCredentials,
-    /// Get credential info
-    GetCredentialInfo,
-    /// Add a new credential
-    AddCredential,
-    /// Update an existing credential
-    UpdateCredential,
-    /// Delete a credential
-    DeleteCredential,
-    /// Execute a request using a credential
-    ExecuteRequest,
-}
-
-impl Operation {
-    /// Get the required permission for this operation
-    pub fn required_permission(&self) -> Permission {
-        match self {
-            Operation::ListCredentials => Permission::Read,
-            Operation::GetCredentialInfo => Permission::Read,
-            Operation::AddCredential => Permission::Write,
-            Operation::UpdateCredential => Permission::Update,
-            Operation::DeleteCredential => Permission::Delete,
-            Operation::ExecuteRequest => Permission::Execute,
-        }
-    }
-}
-
-/// Check if an authenticated user can perform an operation
-#[allow(dead_code)]
-pub fn check_operation(
-    auth: &AuthResult,
-    operation: Operation,
-    credential_alias: Option<&str>,
-) -> Result<(), AuthError> {
-    let permission = operation.required_permission();
-
-    if let Some(alias) = credential_alias {
-        auth.require_permission_for_credential(permission, alias)
-    } else {
-        auth.require_permission(permission)
-    }
-}
+// NOTE: the former `Operation` enum + `check_operation` op→permission table was DEAD code (only its own
+// tests referenced it; the live authz path uses auth.require_permission[_for_credential] directly at the
+// API extractors). Removed so a reviewer auditing "how are operations mapped to permissions?" reads the
+// real, single mapping at the call sites rather than a parallel copy that could silently drift.
 
 #[cfg(test)]
 mod tests {
@@ -299,13 +256,5 @@ mod tests {
 
         // Should not access aws credentials
         assert!(auth.require_credential_access("aws-prod").is_err());
-    }
-
-    #[test]
-    fn test_operation_permissions() {
-        assert_eq!(Operation::ListCredentials.required_permission(), Permission::Read);
-        assert_eq!(Operation::AddCredential.required_permission(), Permission::Write);
-        assert_eq!(Operation::ExecuteRequest.required_permission(), Permission::Execute);
-        assert_eq!(Operation::DeleteCredential.required_permission(), Permission::Delete);
     }
 }

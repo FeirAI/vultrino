@@ -38,7 +38,6 @@ use super::{Plugin, PluginError, PluginRequest};
 use crate::{CredentialData, CredentialType, ExecuteResponse};
 use async_trait::async_trait;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -640,30 +639,8 @@ impl Plugin for PostgresPlugin {
     }
 }
 
-/// Serde helper types for parameter typing (action impls read loosely).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RunSqlParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    sql: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    file: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    transaction: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    timeout_secs: Option<u64>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BackupParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    output_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    format: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    timeout_secs: Option<u64>,
-}
+// (removed the dead `RunSqlParams`/`BackupParams` "doc structs": never deserialized — the action impls
+// parse loosely — so they were an unenforced parallel schema that could only drift from the real parsing.)
 
 #[cfg(test)]
 mod tests {

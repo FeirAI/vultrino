@@ -223,13 +223,10 @@ pub fn redact_secret_material(
             resp.body = new_body;
             modified = true;
         }
-        for v in resp.headers.values_mut() {
-            if v.contains(form.as_str()) {
-                *v = v.replace(form.as_str(), &marker);
-                modified = true;
-            }
-        }
     }
+    // Header values go through the SAME shared helper as scrub_headers so the buffered and
+    // streaming-config paths can never diverge on header redaction (the parity guarantee).
+    modified |= scrub_header_values(&mut resp.headers, &forms, &marker);
     // Wipe the derived plaintext forms.
     forms.iter_mut().for_each(|f| f.zeroize());
     modified
@@ -431,11 +428,24 @@ pub fn scrub_headers(
     alias: &str,
 ) -> bool {
     let marker = format!("[REDACTED:{}]", alias);
+    scrub_header_values(headers, forms, &marker)
+}
+
+/// Replace every occurrence of any secret `form` with `marker` across all header VALUES. The SINGLE
+/// implementation shared by the buffered path ([`redact_secret_material`]) and the streaming-config path
+/// ([`scrub_headers`]) — so a future change to header redaction (e.g. case-folding, multi-form handling)
+/// can't silently apply to one path and not the other, extending this module's parity-by-construction
+/// guarantee from the FORMS to the header scrub itself.
+fn scrub_header_values(
+    headers: &mut std::collections::HashMap<String, String>,
+    forms: &[String],
+    marker: &str,
+) -> bool {
     let mut modified = false;
     for v in headers.values_mut() {
         for form in forms {
             if v.contains(form.as_str()) {
-                *v = v.replace(form.as_str(), &marker);
+                *v = v.replace(form.as_str(), marker);
                 modified = true;
             }
         }

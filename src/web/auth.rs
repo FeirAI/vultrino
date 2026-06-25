@@ -27,6 +27,10 @@ const MAX_LOGIN_ATTEMPTS: u32 = 5;
 const RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
 /// Lockout duration after too many failed attempts (in seconds)
 const LOCKOUT_DURATION_SECS: u64 = 900; // 15 minutes
+/// Hard cap on distinct IPs tracked, bounding the map even if the periodic cleanup falls behind. With
+/// the socket-peer keying (X-Forwarded-For honored only behind a trusted proxy) this is unreachable in
+/// practice, but it guarantees the in-path PEP can't be driven to OOM by login traffic.
+const MAX_TRACKED_IPS: usize = 100_000;
 
 /// Rate limiter for login attempts
 ///
@@ -100,6 +104,18 @@ impl LoginRateLimiter {
         let mut attempts = self.attempts.write().await;
         let now = Instant::now();
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+
+        // Bound the map: at capacity for a NEW key, reclaim expired entries inline; if still full, skip
+        // tracking this one (fail toward not-throttling a single new IP rather than unbounded growth).
+        if attempts.len() >= MAX_TRACKED_IPS && !attempts.contains_key(ip) {
+            attempts.retain(|_, ts| {
+                ts.retain(|t| now.duration_since(*t) < window);
+                !ts.is_empty()
+            });
+            if attempts.len() >= MAX_TRACKED_IPS {
+                return;
+            }
+        }
 
         let ip_attempts = attempts.entry(*ip).or_insert_with(Vec::new);
 
