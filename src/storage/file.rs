@@ -63,17 +63,41 @@ fn approval_is_due(a: &ApprovalRequest, now: DateTime<Utc>) -> bool {
         || a.needs_reauth()
 }
 
+/// Upper bound on the vault's staged-but-undrained outbox intents. If the split outbox file is
+/// persistently unwritable, `pending_events` would otherwise grow without limit — and because it lives
+/// IN the secrets vault, every new coupled emit re-encrypts an ever-larger vault (re-opening the
+/// O(vault-size) cliff the v6→v7 split removed). At the cap, staging FAILS CLOSED: a new
+/// security-sensitive decision is refused rather than committed-but-undeliverable, bounding the vault
+/// churn. Generous — only reached after the outbox has been dead for a long time under heavy decision
+/// load (the periodic reconciler clears the backlog within a tick in the normal/transient case).
+const MAX_PENDING_EVENTS: usize = 10_000;
+
 /// Stage an outbox event in the vault for the intent drain (D1) — written atomically with the state
 /// change that produced it, inside the SAME locked_mutate. The caller drains it to the split outbox
-/// file after the lock releases (drain_pending_events). Mirrors push_event's call shape so the
-/// coupled-emit sites change minimally. A fresh dedup_id makes the later drain idempotent.
-fn stage_event(cache: &mut StorageCache, subject: &str, event_type: &str, payload: serde_json::Value) {
+/// file after the lock releases (drain_pending_events). A fresh dedup_id makes the later drain
+/// idempotent. Returns an error (so the enclosing locked_mutate ABORTS the state change too) when the
+/// undrained backlog has hit MAX_PENDING_EVENTS — fail-closed back-pressure on a stuck outbox.
+fn stage_event(
+    cache: &mut StorageCache,
+    subject: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) -> Result<(), StorageError> {
+    if cache.pending_events.len() >= MAX_PENDING_EVENTS {
+        return Err(StorageError::Unavailable(format!(
+            "outbox unwritable: {} signed events staged-but-undelivered (cap {}); refusing the coupled \
+             state change to bound secrets-vault churn (fail-closed — resolve the outbox, then retry)",
+            cache.pending_events.len(),
+            MAX_PENDING_EVENTS
+        )));
+    }
     cache.pending_events.push(StagedEvent {
         dedup_id: uuid::Uuid::new_v4().to_string(),
         subject: subject.to_string(),
         event_type: event_type.to_string(),
         payload,
     });
+    Ok(())
 }
 
 /// The agent-safe outbox payload for an approval decision/lifecycle event (V9).
@@ -378,17 +402,32 @@ impl FileStorage {
             c.outbox.values().cloned().collect()
         };
         let count = legacy.len();
+        let migrated_seqs: std::collections::HashSet<u64> =
+            legacy.iter().map(|e| e.sequence).collect();
         // Reserve the whole legacy sequence range up front (one locked write) so a concurrent direct
         // append in the out-of-scope multi-process v6-open case can't grab a not-yet-migrated seq and
         // cause an or_insert no-op (silent legacy-event drop). Idempotent on re-run.
         self.outbox.insert_events_preserving_seq(legacy).await?;
-        // Now that the events are durable in the outbox file, clear them from the vault + write v7.
-        self.locked_mutate(|c| {
-            c.outbox.clear();
-            c.outbox_seq = 0;
-            Ok(())
-        })
-        .await?;
+        // Clear from the vault ONLY the entries we actually migrated — NOT a blind clear(). If an old v6
+        // writer appended a NEW in-vault outbox entry after our snapshot but before this lock (the
+        // out-of-scope rolling-v6 window), a blind clear would drop it un-migrated = a lost event. Retain
+        // anything we didn't migrate so the next open migrates it too.
+        let leftover = self
+            .locked_mutate(move |c| {
+                c.outbox.retain(|seq, _| !migrated_seqs.contains(seq));
+                let leftover = c.outbox.len();
+                if leftover == 0 {
+                    c.outbox_seq = 0;
+                }
+                Ok(leftover)
+            })
+            .await?;
+        if leftover > 0 {
+            tracing::warn!(
+                leftover,
+                "v6 outbox entries appeared after the migration snapshot; left in the vault for the next open's migration"
+            );
+        }
         tracing::info!(count, "migrated v6 in-vault outbox events into the split outbox file (v7)");
         Ok(())
     }
@@ -477,15 +516,10 @@ impl FileStorage {
                 .sync_all()?;
         }
         std::fs::rename(&temp_path, &self.path)?;
-        // fsync the PARENT directory after the rename so the new directory entry is crash-DURABLE, not
-        // just crash-atomic (a power-loss right after the rename could otherwise revert it to the old
-        // file). Lock-step with the outbox store's write path. Best-effort (dir fsync is unsupported on
-        // some filesystems — ignore that case).
-        if let Some(parent) = self.path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
+        // Make the rename crash-DURABLE (not just crash-atomic): fsync the parent dir, propagating a real
+        // error so a non-durable vault write fails loudly rather than silently committing. Lock-step with
+        // the outbox store's write path (an unsupported dir-fsync is downgraded to a warning there).
+        super::outbox_store::fsync_parent_dir(&self.path)?;
         Ok(())
     }
 
@@ -1002,7 +1036,7 @@ impl StorageBackend for FileStorage {
                 } else {
                     crate::outbox::EVENT_APPROVAL_DENIED
                 };
-                stage_event(cache, &decided.id, event_type, approval_event_payload(&decided));
+                stage_event(cache, &decided.id, event_type, approval_event_payload(&decided))?;
                 Ok(decided)
             })
             .await?;
@@ -1066,7 +1100,7 @@ impl StorageBackend for FileStorage {
             };
             // V9: stage the lifecycle event atomically with the transition (drained after the lock).
             if let Some((subj, et, payload)) = event {
-                stage_event(cache, &subj, et, payload);
+                stage_event(cache, &subj, et, payload)?;
             }
             Ok(clone)
         })
@@ -1124,7 +1158,7 @@ impl StorageBackend for FileStorage {
             }
             // V9: stage lifecycle events atomically with the sweep's transitions (drained after).
             for (subj, et, payload) in events {
-                stage_event(cache, &subj, et, payload);
+                stage_event(cache, &subj, et, payload)?;
             }
             Ok(sweep)
         })
@@ -1246,7 +1280,14 @@ impl StorageBackend for FileStorage {
     }
 
     async fn gc_outbox(&self, retention_secs: u64) -> Result<usize, StorageError> {
-        self.outbox.gc(retention_secs).await
+        // Protect the dedup_ids of any still-staged intents from GC: an outbox event must not be pruned
+        // while its vault-side intent is uncleared, or a re-drain after the prune would duplicate it
+        // (enforces the no-duplicate invariant, not just bounds the window).
+        let protected: std::collections::HashSet<String> = {
+            let c = self.cache.read();
+            c.pending_events.iter().map(|e| e.dedup_id.clone()).collect()
+        };
+        self.outbox.gc(retention_secs, &protected).await
     }
 
     /// Periodic safety-net reconcile of intent-staged events (D1) — delegates to the inherent
@@ -1448,6 +1489,28 @@ mod tests {
     use crate::{CredentialData, Secret};
     use std::collections::HashSet;
     use tempfile::tempdir;
+
+    #[test]
+    fn stage_event_fails_closed_at_the_pending_cap() {
+        // F4: when the undrained backlog hits the cap, staging a new coupled emit must FAIL (so the
+        // enclosing locked_mutate aborts the state change too) — bounding secrets-vault churn under a
+        // persistently-stuck outbox, rather than committing-but-undeliverable forever.
+        let mut cache = StorageCache::default();
+        for i in 0..MAX_PENDING_EVENTS {
+            cache.pending_events.push(StagedEvent {
+                dedup_id: i.to_string(),
+                subject: "s".into(),
+                event_type: "t".into(),
+                payload: serde_json::json!({}),
+            });
+        }
+        let err = stage_event(&mut cache, "s", "t", serde_json::json!({}))
+            .expect_err("at the cap, staging must fail closed");
+        assert!(matches!(err, StorageError::Unavailable(_)), "got {err:?}");
+        // Below the cap it succeeds.
+        cache.pending_events.clear();
+        assert!(stage_event(&mut cache, "s", "t", serde_json::json!({})).is_ok());
+    }
 
     #[test]
     fn test_version_gate() {

@@ -20,8 +20,8 @@
 //! contract is preserved verbatim: monotonic gap-free sequence, per-subject ordering, lease-based
 //! cross-process claim, attempts/backoff/dead-letter, explicit replay, and prefix GC.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -284,9 +284,18 @@ impl OutboxStore {
     }
 
     /// Prune a contiguous PREFIX of events older than the retention window (by sequence, so the
-    /// retained suffix is gap-free regardless of clock skew). Returns the count pruned; warns if a
-    /// pruned event was never Delivered (the window is the delivery/dead-letter SLA).
-    pub async fn gc(&self, retention_secs: u64) -> Result<usize, StorageError> {
+    /// retained suffix is gap-free regardless of clock skew). `protected_dedup_ids` are the dedup_ids of
+    /// vault-side intents NOT yet cleared: an outbox event carrying such a dedup_id is NEVER pruned (the
+    /// prefix prune STOPS below it), so its dedup record outlives the intent. This ENFORCES the
+    /// no-duplicate invariant against the GC-vs-redrain window — without it, a delivered event could be
+    /// pruned while its intent lingered, and a later re-drain would re-append the same logical event with
+    /// a fresh sequence (a phantom duplicate). Returns the count pruned; warns if a pruned event was
+    /// never Delivered (the window is the delivery/dead-letter SLA).
+    pub async fn gc(
+        &self,
+        retention_secs: u64,
+        protected_dedup_ids: &HashSet<String>,
+    ) -> Result<usize, StorageError> {
         // Overflow-safe: a huge retention_secs would panic `Utc::now() - Duration::seconds(secs)`
         // (chrono DateTime add overflow). Use checked arithmetic; an un-representable cutoff means
         // "the window is effectively infinite" → prune nothing.
@@ -297,11 +306,18 @@ impl OutboxStore {
             Some(c) => c,
             None => return Ok(0),
         };
+        // Clone into the (move) closure; the protected set is small (only undrained intents, normally 0).
+        let protected = protected_dedup_ids.clone();
         self.locked_mutate(move |c| {
+            // Stop the prefix prune at the first event that is either young OR still protected by a
+            // staged intent, keeping the retained suffix gap-free AND the dedup record alive.
             let prune_below = c
                 .outbox
                 .iter()
-                .take_while(|(_, e)| e.created_at < cutoff)
+                .take_while(|(_, e)| {
+                    e.created_at < cutoff
+                        && !e.dedup_id.as_deref().is_some_and(|d| protected.contains(d))
+                })
                 .map(|(seq, _)| *seq)
                 .last();
             let Some(prune_below) = prune_below else {
@@ -442,21 +458,45 @@ impl OutboxStore {
                 .sync_all()?;
         }
         std::fs::rename(&temp_path, &self.path)?;
-        // fsync the PARENT directory after the rename: rename gives crash-atomicity, but the new
-        // directory entry is only crash-DURABLE once the containing dir is fsynced. Without it a
-        // power-loss right after the rename can revert the dir entry to the OLD file even though the tmp
-        // bytes were flushed. Best-effort (some filesystems don't support dir fsync — ignore that).
-        if let Some(parent) = self.path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
+        // Make the rename crash-DURABLE (not just crash-atomic). A REAL fsync error is PROPAGATED so the
+        // caller treats the append as failed and does NOT clear the vault-side intent over a non-durable
+        // write (which would lose the signed event on a power-loss). See fsync_parent_dir.
+        fsync_parent_dir(&self.path)?;
         Ok(())
     }
 
     fn file_change_token(&self) -> Option<(SystemTime, u64)> {
         let meta = std::fs::metadata(&self.path).ok()?;
         Some((meta.modified().ok()?, meta.len()))
+    }
+}
+
+/// fsync the parent directory of `path` after an atomic rename, making the new directory entry
+/// crash-DURABLE (rename alone is only crash-atomic — a power-loss right after it can revert the entry
+/// to the old file). A REAL fsync failure is RETURNED so the caller does not treat a non-durable write
+/// as committed (clearing a vault intent after a non-durable outbox append loses the signed event). Only
+/// an explicitly-unsupported directory fsync (some filesystems return ENOTSUP/EINVAL) is downgraded to a
+/// loud warning, since on those filesystems the durability cannot be upgraded anyway. Shared by the
+/// outbox + vault write paths (see file.rs::write_cache_to_disk_sync).
+pub(super) fn fsync_parent_dir(path: &Path) -> Result<(), StorageError> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let dir = std::fs::File::open(parent).map_err(StorageError::Io)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            tracing::warn!(dir = %parent.display(), error = %e,
+                "parent-directory fsync unsupported on this filesystem — the renamed file is crash-atomic but not crash-durable");
+            Ok(())
+        }
+        Err(e) => Err(StorageError::Io(e)),
     }
 }
 
@@ -607,8 +647,27 @@ mod tests {
         let (s, _d) = store();
         s.append("A", "t", serde_json::json!({})).await.unwrap();
         s.append("B", "t", serde_json::json!({})).await.unwrap();
-        assert_eq!(s.gc(0).await.unwrap(), 2, "retention 0 prunes all");
+        assert_eq!(s.gc(0, &HashSet::new()).await.unwrap(), 2, "retention 0 prunes all");
         assert_eq!(s.list_after(0, 100).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn gc_protects_staged_dedup_ids_and_keeps_suffix_gapfree() {
+        // F2: an event whose dedup_id is still staged in the vault must NOT be pruned (else a re-drain
+        // after the prune would duplicate it). The prefix prune stops BELOW the first protected event,
+        // keeping the retained suffix gap-free.
+        let (s, _d) = store();
+        s.append("A", "t", serde_json::json!({})).await.unwrap(); // seq 1, no dedup
+        s.append_deduped("d2", "B", "t", serde_json::json!({})).await.unwrap(); // seq 2, dedup d2
+        s.append("C", "t", serde_json::json!({})).await.unwrap(); // seq 3, no dedup
+        let mut protected = HashSet::new();
+        protected.insert("d2".to_string());
+        // retention 0 would prune all, but d2 (seq 2) is protected → only seq 1 prunes.
+        assert_eq!(s.gc(0, &protected).await.unwrap(), 1, "prune stops below the protected event");
+        let remaining: Vec<u64> = s.list_after(0, 100).await.unwrap().iter().map(|e| e.sequence).collect();
+        assert_eq!(remaining, vec![2, 3], "protected event + suffix retained, gap-free");
+        // Once the intent clears (no longer protected), the next GC prunes it.
+        assert_eq!(s.gc(0, &HashSet::new()).await.unwrap(), 2, "unprotected → pruned");
     }
 
     #[tokio::test]
