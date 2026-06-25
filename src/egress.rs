@@ -71,6 +71,15 @@ pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
             add(&mut forms, pct_lower, raw);
         }
         add(&mut forms, pct, raw);
+        // Mainstream URL-encoder DEFAULT safe-sets (not adversarial — library defaults leave some
+        // chars unescaped that the full encoder escapes): JS encodeURIComponent keeps `!~*'()`,
+        // Python urllib.parse.quote keeps `/` by default. Both hex cases. Bounded named-default
+        // coverage; exhaustive safe-set permutations would use decode-normalize (LIMITATIONS.md).
+        for safe in ["!~*'()", "/"] {
+            for upper in [true, false] {
+                add(&mut forms, percent_encode_safe(raw, safe, upper), raw);
+            }
+        }
         // JSON-escaped inner (serde default: \", \\, \n, control \uXXXX). Also a
         // slash-escaped variant — HTML-safe JSON encoders emit `/` as `\/`, which the
         // default escaping does not, so a secret with `/` reflected by such an encoder
@@ -109,6 +118,29 @@ pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
     forms.dedup();
     forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
     forms
+}
+
+/// Percent-encode `s` leaving the always-unreserved set (A-Za-z0-9 plus `-_.~`) AND the bytes in
+/// `extra_safe` unescaped — i.e. a specific mainstream library's DEFAULT safe-set. Space → %20.
+/// `upper` selects hex case. Used to cover JS `encodeURIComponent` (extra-safe `!~*'()`) and Python
+/// `urllib.parse.quote` (default extra-safe `/`), whose defaults leave chars the full encoder escapes.
+fn percent_encode_safe(s: &str, extra_safe: &str, upper: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let c = b as char;
+        let unreserved = c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~');
+        if (c.is_ascii() && (unreserved || extra_safe.contains(c)))
+            // only ASCII chars can be "safe"; multi-byte UTF-8 is always percent-encoded byte-wise
+            && b < 0x80
+        {
+            out.push(c);
+        } else if upper {
+            out.push_str(&format!("%{:02X}", b));
+        } else {
+            out.push_str(&format!("%{:02x}", b));
+        }
+    }
+    out
 }
 
 /// Lowercase the hex digits in every `%XX` percent-escape of an (ASCII) percent-encoded
@@ -737,6 +769,29 @@ mod tests {
             "HTML-safe JSON (\\u003c/3e/26) secret form must be scrubbed"
         );
         assert!(!String::from_utf8_lossy(&r2.body).contains(html_safe.as_str()));
+    }
+
+    #[test]
+    fn test_redact_catches_url_encoder_default_safe_sets() {
+        // Mainstream URL-encoder DEFAULTS leave some chars unescaped that the full encoder escapes.
+        // (a) JS encodeURIComponent keeps `!~*'()` (space→%20, /→%2F):
+        let secret = "a! b/key-12345";
+        let enc_uri = "a!%20b%2Fkey-12345";
+        let mut r = resp(&format!("ref {enc_uri}"));
+        assert!(
+            redact_secret_material(&mut r, &secrets(&[secret]), "x"),
+            "encodeURIComponent-form secret must be scrubbed"
+        );
+        assert!(!String::from_utf8_lossy(&r.body).contains(enc_uri));
+        // (b) Python urllib.parse.quote keeps `/` by default (space→%20):
+        let secret2 = "a/b key-12345";
+        let quote_default = "a/b%20key-12345";
+        let mut r2 = resp(&format!("ref {quote_default}"));
+        assert!(
+            redact_secret_material(&mut r2, &secrets(&[secret2]), "x"),
+            "quote-default-form secret must be scrubbed"
+        );
+        assert!(!String::from_utf8_lossy(&r2.body).contains(quote_default));
     }
 
     #[test]

@@ -39,9 +39,10 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 - **Egress scrubbing is defense-in-depth, not absolute (byte-exact match against
   derived forms).** It scrubs the credential's own secret and the common *single-pass*
   encoder dialects an upstream might ACCIDENTALLY reflect it through: raw, percent-encoding
-  (both hex cases + form-url `+`-for-space), JSON string escaping (`\"`/`\\`/control),
-  slash-escaping (`\/`), ensure_ascii `\uXXXX` (both hex cases), and HTML-safe `</3e/26`,
-  composed where realistic. This catches a buggy upstream echoing the request. It does NOT
+  (full, both hex cases + form-url `+`-for-space + the common library DEFAULT safe-sets — JS
+  `encodeURIComponent`'s `!~*'()` and Python `urllib.parse.quote`'s `/`), JSON string escaping
+  (`\"`/`\\`/control), slash-escaping (`\/`), ensure_ascii `\uXXXX` (both hex cases), and
+  HTML-safe `</3e/26`, composed where realistic. This catches a buggy upstream echoing the request. It does NOT
   defend against an **adversarially-encoding** upstream: byte-exact matching cannot beat
   arbitrary re-encoding (base64, hashing, chunk-reordering, a novel escape dialect). The
   real protections there are that vultrino never trusts the upstream beyond the injected
