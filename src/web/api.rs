@@ -390,6 +390,221 @@ pub async fn api_check_approval(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+// ============================================================================
+// Approvals JSON API (A3/A4) — the admin-key surface a product aggregator drives
+// to render the approvals inbox and record human decisions. Distinct from the
+// HTML console (session+CSRF) and from `api_check_approval` (the agent's own
+// poll-by-id). Both endpoints below authenticate with an admin `vk_` and are
+// **tenant-partitioned** via the acting key's tenant — the aggregator's per-tenant
+// admin key can only ever see and decide its own tenant's (and untenanted/shared)
+// approvals, exactly like `api_metrics`.
+// ============================================================================
+
+/// One approval projected for the JSON list/decision API. Field semantics mirror
+/// `ApprovalDisplay::from` (the HTML projection) so the two surfaces agree, but
+/// this is a deliberately reduced, machine-friendly shape: ISO-8601 timestamps
+/// (not the panel's pretty-printed strings) and no internal-only fields
+/// (params/decision-token/execution-claim bookkeeping are withheld).
+#[derive(Serialize)]
+pub struct ApprovalSummary {
+    /// `appr_<uuid>` — the id A4 decides with.
+    pub id: String,
+    /// Lifecycle state: `pending` | `escalated` | `approved` | `denied` | `expired`.
+    pub status: String,
+    /// Human one-liner describing the gated action.
+    pub summary: String,
+    /// Business-verb label (V8) when present, else the canonical `plugin.action`.
+    pub action: String,
+    /// Credential alias the action would use.
+    pub credential: String,
+    /// Agent label of the requesting principal, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
+    /// Short description of who requested it (e.g. `api key "deploy-agent"`).
+    pub requested_by: String,
+    /// RFC-3339 / ISO-8601 creation time.
+    pub created_at: String,
+    /// RFC-3339 / ISO-8601 final deadline.
+    pub expires_at: String,
+    /// Distinct approvers required before the action runs (1 = single approval).
+    pub required_approvals: u32,
+    /// Distinct approvals recorded so far.
+    pub approvals_received: u32,
+    /// Whether the request is still open (pending/escalated) and within its TTL —
+    /// i.e. a decision can still be recorded.
+    pub is_open: bool,
+    /// Tenant this approval belongs to (snapshotted at open from the requesting
+    /// principal's tenant); `null` = untenanted (shared, visible to every admin).
+    /// Always emitted so a downstream aggregator (muntin) can backstop-filter by
+    /// tenant as defense-in-depth — an explicit `null` unambiguously means
+    /// "untenanted/shared", which an omitted field could not distinguish.
+    pub tenant: Option<String>,
+}
+
+impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
+    fn from(a: &crate::approval::ApprovalRequest) -> Self {
+        ApprovalSummary {
+            id: a.id.clone(),
+            status: a.status.to_string(),
+            summary: a.summary.clone(),
+            // Same display precedence as ApprovalDisplay: the business verb when
+            // present, otherwise the canonical action.
+            action: a.action_label.clone().unwrap_or_else(|| a.action.clone()),
+            credential: a.credential.clone(),
+            agent_label: a.agent_label.clone(),
+            requested_by: a.requester.describe(),
+            created_at: a.created_at.to_rfc3339(),
+            expires_at: a.expires_at.to_rfc3339(),
+            required_approvals: a.effective_required_approvals(),
+            approvals_received: a.signoffs.len() as u32,
+            is_open: a.status.is_open() && !a.is_past_ttl(),
+            tenant: a.tenant.clone(),
+        }
+    }
+}
+
+/// Optional query filter for the approvals list.
+#[derive(Deserialize)]
+pub struct ApprovalsQuery {
+    /// Filter by lifecycle status (`pending` | `escalated` | `approved` |
+    /// `denied` | `expired`). Omitted → all. `pending` matches only Pending
+    /// (use no filter, or the explicit status, for escalated/decided requests).
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// `GET /api/v1/approvals` — list approvals visible to the acting admin's tenant
+/// (A3). Admin-gated; tenant-partitioned by the SAME verb the HTML list and
+/// `api_metrics` use (`list_approvals_for_tenant`), so vultrino enforces the
+/// per-tenant `visible_to_tenant` partition. Pending first, then most recent —
+/// matching the panel's ordering. Optional `?status=` filter.
+pub async fn api_list_approvals(
+    admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Query(q): Query<ApprovalsQuery>,
+) -> Response {
+    // Reload so the in-memory cache reflects decisions/lifecycle transitions
+    // committed by other processes (mirrors the HTML list + api_check_approval).
+    let _ = state.storage.reload().await;
+    let mut approvals = state
+        .server
+        .list_approvals_for_tenant(admin.0.api_key.tenant.as_deref())
+        .await
+        .unwrap_or_default();
+    // Optional status filter (cheap, in-memory). An unrecognized value matches
+    // nothing rather than erroring — the contract is "filter to this status".
+    if let Some(status) = q.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let want = status.to_ascii_lowercase();
+        approvals.retain(|a| a.status.to_string() == want);
+    }
+    // Pending first, then most recent — same ordering as the admin panel list.
+    approvals.sort_by(|a, b| {
+        let pending = |s: &ApprovalStatus| *s == ApprovalStatus::Pending;
+        pending(&b.status)
+            .cmp(&pending(&a.status))
+            .then(b.created_at.cmp(&a.created_at))
+    });
+    let items: Vec<ApprovalSummary> = approvals.iter().map(ApprovalSummary::from).collect();
+    (StatusCode::OK, Json(serde_json::json!({ "approvals": items }))).into_response()
+}
+
+/// Body for the JSON approve/deny decision (A4).
+#[derive(Deserialize)]
+pub struct DecideReq {
+    /// `true` to approve, `false` to deny.
+    pub approve: bool,
+    /// Optional free-text note recorded with the decision.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// The human operator the aggregator attributes this decision to (their
+    /// email/sub). Used as the approver identity so separation-of-duty stays
+    /// meaningful; falls back to the acting api-key id when absent/blank.
+    #[serde(default)]
+    pub approver: Option<String>,
+}
+
+/// `POST /api/v1/approvals/{id}/decision` — approve or deny an approval over JSON
+/// (A4). Admin-gated AND tenant-partitioned: unlike the global HTML console, this
+/// path FIRST verifies the approval is `visible_to_tenant(acting tenant)` and
+/// returns 404 otherwise (never revealing a cross-tenant approval's existence) —
+/// without this check the endpoint would be a fail-open cross-tenant decision bug.
+/// The decision itself goes through the SAME atomic verb the HTML handlers use
+/// (`storage.decide_approval`).
+pub async fn api_decide_approval(
+    admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DecideReq>,
+) -> Response {
+    // Reload so the existence/visibility check sees the authoritative state.
+    let _ = state.storage.reload().await;
+
+    // SECURITY: enforce the tenant partition before deciding. The HTML console is
+    // a global surface and skips visible_to_tenant; this JSON path must not. Look
+    // the approval up and gate on the acting admin key's tenant — a 404 for a
+    // not-found OR cross-tenant id, so we never reveal another tenant's approval.
+    let acting_tenant = admin.0.api_key.tenant.as_deref();
+    match state.storage.get_approval(&id).await {
+        Ok(Some(a)) if a.visible_to_tenant(acting_tenant) => {}
+        Ok(_) => {
+            // Not found OR not visible to this tenant — identical 404, no oracle.
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "approval_not_found",
+                format!("No approval with id '{}'", id),
+            );
+        }
+        Err(e) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string());
+        }
+    }
+
+    // Attribute the decision to the human operator the aggregator passed (so
+    // separation-of-duty is computed against a person), falling back to the acting
+    // api-key id. decide_approval REQUIRES a non-empty identity, so never pass "".
+    let approver = body
+        .approver
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| admin.0.api_key.id.clone());
+
+    let enforce_sod = state.config.approval.enforce_separation_of_duty;
+    match state
+        .storage
+        .decide_approval(&id, body.approve, "json-api", &approver, enforce_sod, body.note)
+        .await
+    {
+        Ok(decided) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": decided.id,
+                "status": decided.status.to_string(),
+                "executed": decided.executed,
+                // Dual-control progress, so the caller knows whether a denial took
+                // effect immediately or an approval is still awaiting co-approvers.
+                "required_approvals": decided.effective_required_approvals(),
+                "approvals_received": decided.signoffs.len(),
+            })),
+        )
+            .into_response(),
+        // decide_approval returns Conflict for an already-decided/expired request
+        // AND for a hard-enforced separation-of-duty self-approval. 409 conveys
+        // "not actionable in the current state"; the message distinguishes them.
+        Err(crate::storage::StorageError::Conflict(msg)) => {
+            error_response(StatusCode::CONFLICT, "approval_not_decidable", msg)
+        }
+        // Raced away between the visibility check and the decide (e.g. deleted).
+        Err(crate::storage::StorageError::ApprovalNotFound(_)) => error_response(
+            StatusCode::NOT_FOUND,
+            "approval_not_found",
+            format!("No approval with id '{}'", id),
+        ),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
+}
+
 // ============== List Credentials ==============
 
 #[derive(Serialize)]

@@ -188,7 +188,14 @@ impl WebServer {
             )
             .route("/api/v1/credentials/{id}", delete(api::api_delete_credential))
             .route("/api/v1/execute", post(api::api_execute))
+            // Approvals JSON API: agent poll-by-id; admin-key list + decision
+            // (A3/A4) for a product aggregator (tenant-partitioned in the handlers).
+            .route("/api/v1/approvals", get(api::api_list_approvals))
             .route("/api/v1/approvals/{id}", get(api::api_check_approval))
+            .route(
+                "/api/v1/approvals/{id}/decision",
+                post(api::api_decide_approval),
+            )
             // Admin API (V1): runtime config-write surface (Permission::Admin).
             .route(
                 "/api/v1/policies",

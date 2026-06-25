@@ -1083,6 +1083,217 @@ async fn test_admin_metrics_readback() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Helper: open and store a real approval, optionally tenant-tagged, returning its id.
+async fn store_test_approval(
+    storage: &Arc<dyn StorageBackend>,
+    credential: &str,
+    tenant: Option<&str>,
+) -> String {
+    let (approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: credential.to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo::local(),
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: tenant.map(|s| s.to_string()),
+        workload_id: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::Medium,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+    });
+    storage.store_approval(&approval).await.unwrap();
+    approval.id
+}
+
+#[tokio::test]
+async fn test_a3_a4_json_approvals_list_and_decision() {
+    // A3/A4: a product aggregator lists approvals and records a human decision
+    // over the JSON admin-key surface (global admin here — sees every tenant).
+    let (router, storage, _server, key) = build_admin_router().await;
+    let id = store_test_approval(&storage, "stripe-prod", None).await;
+
+    // A3: GET /api/v1/approvals → the approval with the documented JSON shape.
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", "/api/v1/approvals", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let items = body["approvals"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    let a = &items[0];
+    assert_eq!(a["id"], id);
+    assert_eq!(a["status"], "pending");
+    assert_eq!(a["credential"], "stripe-prod");
+    // Business verb takes precedence over the canonical action (mirrors the panel).
+    assert_eq!(a["action"], "payments.refund");
+    assert_eq!(a["required_approvals"], 1);
+    assert_eq!(a["approvals_received"], 0);
+    assert_eq!(a["is_open"], true);
+    assert!(a["created_at"].as_str().unwrap().contains('T'), "ISO-8601 timestamp");
+    // `tenant` is always emitted (never skipped) so an aggregator can backstop-filter;
+    // an untenanted/shared approval serializes it as explicit JSON null.
+    assert!(a.as_object().unwrap().contains_key("tenant"), "tenant field is always present");
+    assert!(a["tenant"].is_null(), "untenanted approval serializes tenant as null");
+
+    // A3 status filter: a non-matching status yields an empty list.
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", "/api/v1/approvals?status=denied", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["approvals"].as_array().unwrap().len(), 0, "filter excludes non-matching");
+
+    // A4: POST decision (approve) → 200 with the result shape; approval flips.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@example.com", "note": "looks good"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["id"], id);
+    assert_eq!(body["status"], "approved");
+    assert_eq!(body["approvals_received"], 1);
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
+    // The decision is attributed to the human operator, not the api key.
+    assert_eq!(stored.approver_identity.as_deref(), Some("alice@example.com"));
+    assert_eq!(stored.decided_by.as_deref(), Some("json-api"));
+
+    // A4: re-deciding an already-decided approval → 409 (not actionable).
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // A4: unknown id → 404.
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/approvals/appr_does_not_exist/decision",
+            &key,
+            serde_json::json!({"approve": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_a4_decision_enforces_tenant_partition() {
+    // A4 SECURITY: the JSON decision path is tenant-partitioned (unlike the global
+    // HTML console). A tenant-A admin key must NOT be able to decide — or even
+    // observe the existence of — a tenant-B approval. Build a router whose auth
+    // manager holds a tenant-scoped admin key.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    // Mint an admin key, then re-seed the auth manager with a tenant-A-scoped clone
+    // of it (same plaintext/hash, tenant set) — public API only.
+    let seed = AuthManager::new();
+    let (admin_key_plain, api_key) = seed.create_api_key("agg-team-a", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some("team-a".to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        Config::default(),
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    // A tenant-B approval and a shared (untenanted) one.
+    let b_id = store_test_approval(&storage, "b-cred", Some("team-b")).await;
+    let shared_id = store_test_approval(&storage, "shared-cred", None).await;
+
+    // A3: the team-A admin sees ONLY the shared approval, never team-B's.
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", "/api/v1/approvals", &admin_key_plain, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let visible = body["approvals"].as_array().unwrap();
+    let ids: Vec<&str> = visible.iter().map(|a| a["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&shared_id.as_str()), "shared approval is visible");
+    assert!(!ids.contains(&b_id.as_str()), "team-B approval must NOT leak into team-A's list");
+    // The one visible approval is the shared/untenanted one — its `tenant` is null,
+    // the signal an aggregator uses to recognize a shared (non-tenant-scoped) approval.
+    let shared = visible.iter().find(|a| a["id"] == shared_id.as_str()).unwrap();
+    assert!(shared["tenant"].is_null(), "shared approval carries tenant=null in the JSON list");
+
+    // A4: deciding the team-B approval as team-A → 404 (no cross-tenant oracle),
+    // and the approval stays pending (the decision did NOT take effect).
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", b_id),
+            &admin_key_plain,
+            serde_json::json!({"approve": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "cross-tenant decision must be 404, not allowed");
+    let stored = storage.get_approval(&b_id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.status,
+        vultrino::approval::ApprovalStatus::Pending,
+        "the cross-tenant approval must remain undecided"
+    );
+
+    // A4: the team-A admin CAN decide the shared (untenanted) approval → 200.
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", shared_id),
+            &admin_key_plain,
+            serde_json::json!({"approve": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "shared approval is decidable by any tenant admin");
+}
+
 #[tokio::test]
 async fn test_admin_token_mint_trims_owner_identity() {
     // V10: a padded owner_identity is trimmed at the mint (so SoD comparisons match).
