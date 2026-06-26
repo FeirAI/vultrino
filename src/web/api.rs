@@ -473,6 +473,43 @@ pub struct ApprovalsQuery {
     pub status: Option<String>,
 }
 
+/// Maximum approvals returned by a single `GET /api/v1/approvals` response. The
+/// list is sorted (pending first, then newest) BEFORE truncating, so the cap
+/// keeps the most relevant rows; the response carries `truncated: true` when more
+/// exist. A hard upper bound on body size / memory until the API grows real
+/// pagination.
+const MAX_APPROVALS_LIST: usize = 500;
+
+/// Sentinel operator recorded when the aggregator supplies no `approver` on a JSON
+/// decision, so the identity is STILL namespaced as `agg:<key-id>:-` (never the
+/// bare key id). This keeps every signoff from one key under the same
+/// `agg:<key-id>:` prefix the same-key M-of-N guards key on. `-` can't be a real
+/// operator (no owner email is `-`), so it never collides with a requester
+/// identity in the self-approval SoD check.
+const NO_OPERATOR_SENTINEL: &str = "-";
+
+/// Require the acting admin key to be tenant-scoped on the product-aggregator
+/// approvals surface, returning its tenant. A `None`-tenant key is a global
+/// admin — a deliberately SEPARATE surface (the HTML console), not this one — so
+/// it is rejected with a flat 403 rather than being silently treated as the
+/// untenanted partition (which would let a global key drive the per-tenant JSON
+/// API). The error reveals nothing about any approval's existence.
+// `async` to match the sibling auth helpers (`require_admin` / `resolve_caller_id`):
+// an `async fn`'s immediate return type is `impl Future<Output = Result<..>>`, not
+// the `Result` itself, so clippy's `result_large_err` (which inspects the immediate
+// return type) does not fire on it — keeping the shared "return a Response on error"
+// idiom without boxing or an explicit allow.
+async fn require_tenant_scoped(admin: &AdminApiAuth) -> Result<&str, Response> {
+    admin.0.api_key.tenant.as_deref().ok_or_else(|| {
+        error_response(
+            StatusCode::FORBIDDEN,
+            "tenant_required",
+            "This endpoint requires a tenant-scoped admin key; a global (untenanted) \
+             key must use the admin console instead.",
+        )
+    })
+}
+
 /// `GET /api/v1/approvals` — list approvals visible to the acting admin's tenant
 /// (A3). Admin-gated; tenant-partitioned by the SAME verb the HTML list and
 /// `api_metrics` use (`list_approvals_for_tenant`), so vultrino enforces the
@@ -483,14 +520,44 @@ pub async fn api_list_approvals(
     State(state): State<AppState>,
     Query(q): Query<ApprovalsQuery>,
 ) -> Response {
+    // SECURITY: this is the per-tenant product-aggregator surface. A key whose
+    // tenant is None is a GLOBAL-authority admin — passed to
+    // list_approvals_for_tenant(None) it would return the UNTENANTED partition
+    // only, but the contract of this route is "the aggregator's own tenant", so a
+    // global key has no legitimate use here. Reject it with a flat 403 (a clear
+    // error, no enumeration oracle) and steer it to the global HTML console.
+    let acting_tenant = match require_tenant_scoped(&admin).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
     // Reload so the in-memory cache reflects decisions/lifecycle transitions
     // committed by other processes (mirrors the HTML list + api_check_approval).
-    let _ = state.storage.reload().await;
-    let mut approvals = state
+    // A backend failure must surface as a 5xx, never a misleading empty 200 — an
+    // aggregator would read {approvals:[]} as "nothing to review" (a fail-open
+    // inbox) when in fact the store was unreadable.
+    if let Err(e) = state.storage.reload().await {
+        tracing::error!(error = %e, "approvals list: storage reload failed");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            "Failed to load approvals",
+        );
+    }
+    let mut approvals = match state
         .server
-        .list_approvals_for_tenant(admin.0.api_key.tenant.as_deref())
+        .list_approvals_for_tenant(Some(acting_tenant))
         .await
-        .unwrap_or_default();
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(error = %e, "approvals list: backend list failed");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "Failed to load approvals",
+            );
+        }
+    };
     // Optional status filter (cheap, in-memory). An unrecognized value matches
     // nothing rather than erroring — the contract is "filter to this status".
     if let Some(status) = q.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -504,8 +571,24 @@ pub async fn api_list_approvals(
             .cmp(&pending(&a.status))
             .then(b.created_at.cmp(&a.created_at))
     });
+    // Bound the response so a tenant with a huge backlog can't return an
+    // unbounded body (memory + latency). We sort BEFORE truncating, so the cap
+    // keeps the most relevant rows (pending first, then newest). `truncated` tells
+    // the aggregator there are more than were returned (it should narrow by
+    // ?status= or page through as the API grows pagination).
+    let total = approvals.len();
+    let truncated = total > MAX_APPROVALS_LIST;
+    approvals.truncate(MAX_APPROVALS_LIST);
     let items: Vec<ApprovalSummary> = approvals.iter().map(ApprovalSummary::from).collect();
-    (StatusCode::OK, Json(serde_json::json!({ "approvals": items }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "approvals": items,
+            "truncated": truncated,
+            "returned": items.len(),
+        })),
+    )
+        .into_response()
 }
 
 /// Body for the JSON approve/deny decision (A4).
@@ -536,6 +619,15 @@ pub async fn api_decide_approval(
     Path(id): Path<String>,
     Json(body): Json<DecideReq>,
 ) -> Response {
+    // SECURITY: this is the per-tenant aggregator surface — a global (untenanted)
+    // admin key has no business deciding here (it would be able to decide ANY
+    // tenant's approval). Reject it 403 before any lookup, so it can't even probe
+    // for an id's existence. Mirrors api_list_approvals.
+    let acting_tenant = match require_tenant_scoped(&admin).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+
     // Reload so the existence/visibility check sees the authoritative state.
     let _ = state.storage.reload().await;
 
@@ -543,9 +635,8 @@ pub async fn api_decide_approval(
     // a global surface and skips visible_to_tenant; this JSON path must not. Look
     // the approval up and gate on the acting admin key's tenant — a 404 for a
     // not-found OR cross-tenant id, so we never reveal another tenant's approval.
-    let acting_tenant = admin.0.api_key.tenant.as_deref();
-    match state.storage.get_approval(&id).await {
-        Ok(Some(a)) if a.visible_to_tenant(acting_tenant) => {}
+    let existing = match state.storage.get_approval(&id).await {
+        Ok(Some(a)) if a.visible_to_tenant(Some(acting_tenant)) => a,
         Ok(_) => {
             // Not found OR not visible to this tenant — identical 404, no oracle.
             return error_response(
@@ -555,22 +646,108 @@ pub async fn api_decide_approval(
             );
         }
         Err(e) => {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string());
+            // Log the detail; return a generic message (don't echo internals).
+            tracing::error!(error = %e, approval_id = %id, "decide: get_approval failed");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "Failed to load approval",
+            );
         }
-    }
+    };
 
-    // Attribute the decision to the human operator the aggregator passed (so
-    // separation-of-duty is computed against a person), falling back to the acting
-    // api-key id. decide_approval REQUIRES a non-empty identity, so never pass "".
-    let approver = body
+    // Attribute the decision to the human operator the aggregator passed, but
+    // record it as an AGGREGATOR-ASSERTED identity — vultrino must not present a
+    // caller-supplied string as a verified identity. The recorded approver is
+    // ALWAYS `agg:<acting-api-key-id>:<operator>`, which (a) keeps the human-
+    // readable operator for audit, and (b) makes the asserting key explicit. The
+    // operator part is a CLAIM the aggregator (muntin) makes — vultrino trusts
+    // muntin to pass the real authenticated operator, but the namespace records
+    // WHICH key made that claim, so a decision is never mistaken for a first-party
+    // identity.
+    //
+    // SECURITY: the namespace MUST be applied unconditionally. When no operator is
+    // supplied we use a sentinel (`agg:<key-id>:-`) rather than the bare key id —
+    // a bare `<key-id>` would NOT carry the `agg:<key-id>:` prefix, so both same-
+    // key M-of-N guards (prefix-based) would fail to recognize it and one key
+    // could satisfy a 2-of-N by mixing a no-approver call with an approver call.
+    // The sentinel `-` can never collide with a requester identity (no owner email
+    // is `-`), so it doesn't spuriously trip the self-approval SoD check either.
+    let operator = body
         .approver
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| admin.0.api_key.id.clone());
+        .unwrap_or(NO_OPERATOR_SENTINEL);
+    let approver = format!("agg:{}:{}", admin.0.api_key.id, operator);
 
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
+
+    // Idempotency (#4/#14) — checked BEFORE the same-key M-of-N guard so a retry of
+    // an ALREADY-RECORDED sign-off replays instead of being mistaken for a fresh
+    // second same-key sign-off. A network timeout after a committed decision can
+    // make the aggregator retry; treat a retry as a no-op success (return the
+    // current summary) when the approval is already decided, the outcome matches,
+    // AND the incoming approver already appears among the recorded sign-offs —
+    // matching ANY signoff (not just the finalizing approver_identity) so a
+    // legitimate CO-APPROVER's retry on an already-granted M-of-N also replays
+    // idempotently rather than 409-ing. (Only fires when !is_open, so it never
+    // short-circuits a genuine fresh sign-off on a still-open request.)
+    if !existing.status.is_open() {
+        let same_outcome = matches!(
+            (existing.status, body.approve),
+            (ApprovalStatus::Approved, true) | (ApprovalStatus::Denied, false)
+        );
+        let approver_already_signed = existing
+            .signoffs
+            .iter()
+            .any(|s| s.approver_identity.eq_ignore_ascii_case(&approver));
+        if same_outcome && approver_already_signed {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": existing.id,
+                    "status": existing.status.to_string(),
+                    "executed": existing.executed,
+                    "required_approvals": existing.effective_required_approvals(),
+                    "approvals_received": existing.signoffs.len(),
+                    "idempotent_replay": true,
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // M-of-N hardening (#2/#7): when separation-of-duty is hard-enforced, a single
+    // aggregator key must NOT be able to satisfy a dual-control threshold by
+    // inventing two distinct operator names. Distinctness across DIFFERENT human
+    // approvers on one aggregator key is a CLAIM the aggregator makes; we cannot
+    // verify it, so under hard SoD a SECOND sign-off from the SAME api key (the
+    // `agg:<key-id>:` prefix) is rejected before it can satisfy threshold M.
+    //
+    // This is a FAST-FAIL on the (reloaded) read snapshot for a clean 409; the
+    // AUTHORITATIVE, TOCTOU-safe enforcement is inside `transition()` under the
+    // storage write lock (ApprovalError::SameAggregatorKey → Conflict → 409), so
+    // two concurrent same-key requests can't both pass this pre-check and double-
+    // sign. (Without hard SoD this is left to the aggregator's own dual-control.)
+    // Runs AFTER the idempotency check so a co-approver's legitimate retry isn't
+    // caught here as a same-key duplicate.
+    if enforce_sod && existing.effective_required_approvals() > 1 {
+        let key_prefix = format!("agg:{}:", admin.0.api_key.id);
+        if existing
+            .signoffs
+            .iter()
+            .any(|s| s.approver_identity.starts_with(&key_prefix))
+        {
+            return error_response(
+                StatusCode::CONFLICT,
+                "separation_of_duty",
+                "Separation of duty: this approval already has a sign-off from this \
+                 aggregator key; a distinct co-approver must use a different key.",
+            );
+        }
+    }
+
     match state
         .storage
         .decide_approval(&id, body.approve, "json-api", &approver, enforce_sod, body.note)
@@ -601,7 +778,15 @@ pub async fn api_decide_approval(
             "approval_not_found",
             format!("No approval with id '{}'", id),
         ),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        // Don't echo raw internal error strings to the client; log them server-side.
+        Err(e) => {
+            tracing::error!(error = %e, approval_id = %id, "decide: decide_approval failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "Failed to record decision",
+            )
+        }
     }
 }
 

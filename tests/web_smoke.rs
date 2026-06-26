@@ -135,6 +135,48 @@ async fn build_admin_router_full(
     (server.into_router(), storage, exec_server, admin_key, read_key)
 }
 
+/// Build a router whose auth manager holds a TENANT-SCOPED admin key, returning
+/// the router, storage, and the key's plaintext + its tenant. The per-tenant JSON
+/// approvals surface (A3/A4) requires a tenant-scoped key (a global/untenanted key
+/// is rejected 403), so the A3/A4 happy-path tests build their key this way.
+async fn build_tenant_admin_router(
+    tenant: &str,
+) -> (axum::Router, Arc<dyn StorageBackend>, String) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    // Mint an admin key, then re-seed the auth manager with a tenant-scoped clone
+    // (same plaintext/hash, tenant set) — public API only.
+    let seed = AuthManager::new();
+    let (admin_key_plain, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some(tenant.to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        Config::default(),
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+    (router, storage, admin_key_plain)
+}
+
 fn admin_req(method: &str, uri: &str, key: &str, body: serde_json::Value) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -1115,9 +1157,12 @@ async fn store_test_approval(
 #[tokio::test]
 async fn test_a3_a4_json_approvals_list_and_decision() {
     // A3/A4: a product aggregator lists approvals and records a human decision
-    // over the JSON admin-key surface (global admin here — sees every tenant).
-    let (router, storage, _server, key) = build_admin_router().await;
-    let id = store_test_approval(&storage, "stripe-prod", None).await;
+    // over the JSON admin-key surface. The surface requires a TENANT-SCOPED key
+    // (a global/untenanted key is rejected 403 — see
+    // test_json_approvals_reject_untenanted_key), so the key here is team-a-scoped
+    // and the approval is tagged to the same tenant so it's visible to it.
+    let (router, storage, key) = build_tenant_admin_router("team-a").await;
+    let id = store_test_approval(&storage, "stripe-prod", Some("team-a")).await;
 
     // A3: GET /api/v1/approvals → the approval with the documented JSON shape.
     let resp = router
@@ -1140,9 +1185,9 @@ async fn test_a3_a4_json_approvals_list_and_decision() {
     assert_eq!(a["is_open"], true);
     assert!(a["created_at"].as_str().unwrap().contains('T'), "ISO-8601 timestamp");
     // `tenant` is always emitted (never skipped) so an aggregator can backstop-filter;
-    // an untenanted/shared approval serializes it as explicit JSON null.
+    // here the approval is tagged to the acting key's tenant.
     assert!(a.as_object().unwrap().contains_key("tenant"), "tenant field is always present");
-    assert!(a["tenant"].is_null(), "untenanted approval serializes tenant as null");
+    assert_eq!(a["tenant"], "team-a", "approval carries its tenant in the JSON list");
 
     // A3 status filter: a non-matching status yields an empty list.
     let resp = router
@@ -1171,8 +1216,13 @@ async fn test_a3_a4_json_approvals_list_and_decision() {
     assert_eq!(body["approvals_received"], 1);
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
-    // The decision is attributed to the human operator, not the api key.
-    assert_eq!(stored.approver_identity.as_deref(), Some("alice@example.com"));
+    // The decision is recorded as an AGGREGATOR-ASSERTED identity:
+    // `agg:<api-key-id>:<operator>` — the human operator is preserved (and is a
+    // CLAIM by the acting key, not a first-party verified identity), namespaced by
+    // the asserting key id.
+    let recorded = stored.approver_identity.as_deref().unwrap();
+    assert!(recorded.starts_with("agg:"), "approver namespaced as an aggregator claim: {recorded}");
+    assert!(recorded.ends_with(":alice@example.com"), "human operator preserved: {recorded}");
     assert_eq!(stored.decided_by.as_deref(), Some("json-api"));
 
     // A4: re-deciding an already-decided approval → 409 (not actionable).
@@ -1292,6 +1342,551 @@ async fn test_a4_decision_enforces_tenant_partition() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "shared approval is decidable by any tenant admin");
+}
+
+#[tokio::test]
+async fn test_json_approvals_reject_untenanted_key() {
+    // SECURITY (#1): the per-tenant aggregator surface must reject a GLOBAL
+    // (untenanted) admin key with 403 on BOTH the list and the decision routes —
+    // a None-tenant key is the global HTML-console surface, not this one, and
+    // letting it through would expose every tenant's approvals. build_admin_router
+    // mints a None-tenant admin key.
+    let (router, storage, _server, key) = build_admin_router().await;
+    let id = store_test_approval(&storage, "stripe-prod", Some("team-a")).await;
+
+    // GET list → 403 (no enumeration, no body of approvals).
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", "/api/v1/approvals", &key, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "untenanted key cannot list");
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "tenant_required");
+    assert!(body.get("approvals").is_none(), "403 must not leak the approvals list");
+
+    // POST decision → 403 BEFORE any lookup (can't even probe an id's existence),
+    // and the approval stays pending.
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "untenanted key cannot decide");
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.status,
+        vultrino::approval::ApprovalStatus::Pending,
+        "decision by an untenanted key must not take effect",
+    );
+}
+
+#[tokio::test]
+async fn test_json_decision_is_idempotent_on_retry() {
+    // #4: a retried decision (same operator, same approve/deny outcome) on an
+    // already-decided approval returns 200 with the current summary — NOT a 409 —
+    // so a network timeout after a committed decision is safe to retry.
+    let (router, storage, key) = build_tenant_admin_router("team-a").await;
+    let id = store_test_approval(&storage, "stripe-prod", Some("team-a")).await;
+
+    let decide = |approve: bool| {
+        admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": approve, "approver": "alice@example.com"}),
+        )
+    };
+
+    // First approve → 200, status approved.
+    let resp = router.clone().oneshot(decide(true)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Same operator approving again (the retry) → 200 idempotent replay, NOT 409.
+    let resp = router.clone().oneshot(decide(true)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "same-operator same-outcome retry is idempotent");
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "approved");
+    assert_eq!(body["idempotent_replay"], true);
+
+    // A CONFLICTING decision (deny after approve) from the same key is still a 409,
+    // not silently swallowed.
+    let resp = router.oneshot(decide(false)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "a different outcome on a decided approval is a conflict");
+}
+
+#[tokio::test]
+async fn test_json_decision_hard_sod_blocks_same_key_second_signoff() {
+    // #2: under hard separation-of-duty, a SINGLE aggregator key must not satisfy a
+    // dual-control (M-of-N) threshold by inventing two distinct operator names.
+    // The first sign-off records `agg:<key-id>:alice`; the second from the same key
+    // (`agg:<key-id>:bob`) is rejected 409 before it can satisfy threshold 2.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let seed = AuthManager::new();
+    let (key, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some("team-a".to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    // Config with hard SoD enforcement on the decision path.
+    let mut sod_config = Config::default();
+    sod_config.approval.enforce_separation_of_duty = true;
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        sod_config,
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    // A dual-control (2-of-N) approval tagged to the acting tenant.
+    let (approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo::local(),
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: Some("team-a".to_string()),
+        workload_id: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: true,
+        criticality: vultrino::approval::CriticalityClass::High,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 2,
+    });
+    let id = approval.id.clone();
+    storage.store_approval(&approval).await.unwrap();
+
+    // First sign-off as "alice" → 200, still awaiting a second distinct approver.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "pending", "one of two sign-offs: still open");
+    assert_eq!(body["approvals_received"], 1);
+
+    // Second sign-off as a DIFFERENT operator name but the SAME aggregator key →
+    // 409. The key cannot fabricate the second distinct approver under hard SoD.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "bob@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "the same aggregator key cannot satisfy M-of-N with a second invented name",
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "separation_of_duty");
+
+    // The approval is still pending (not granted by the single key).
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.signoffs.len(), 1, "the second same-key sign-off was not recorded");
+}
+
+/// Build a tenant-scoped, hard-SoD router + a stored dual-control (2-of-N)
+/// approval, returning (router, storage, key, approval-id). Shared by the same-key
+/// M-of-N regression tests.
+async fn build_hard_sod_dual_control_fixture(
+    tenant: &str,
+) -> (axum::Router, Arc<dyn StorageBackend>, String, String) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let seed = AuthManager::new();
+    let (key, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some(tenant.to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    let mut sod_config = Config::default();
+    sod_config.approval.enforce_separation_of_duty = true;
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        sod_config,
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    let (approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo::local(),
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: Some(tenant.to_string()),
+        workload_id: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: true,
+        criticality: vultrino::approval::CriticalityClass::High,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 2,
+    });
+    let id = approval.id.clone();
+    storage.store_approval(&approval).await.unwrap();
+    (router, storage, key, id)
+}
+
+#[tokio::test]
+async fn test_json_decision_hard_sod_blocks_same_key_no_operator_then_operator() {
+    // [HIGH regression] One key must not satisfy 2-of-N by MIXING a no-`approver`
+    // call (recorded `agg:<key>:-`) with an `approver` call (recorded
+    // `agg:<key>:op`). Before the fix the no-approver call recorded the BARE key
+    // id, which neither prefix-based guard recognized → bypass. Now both share the
+    // `agg:<key>:` prefix, so the second is rejected and the request stays Pending.
+    let (router, storage, key, id) = build_hard_sod_dual_control_fixture("team-a").await;
+
+    // (1) no operator → recorded agg:<key>:- , 1 of 2, still Pending.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "pending", "first (no-operator) sign-off keeps it open");
+    assert_eq!(body["approvals_received"], 1);
+
+    // (2) same key, now WITH an operator → must be rejected 409, NOT granted.
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "anyone@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "no-operator-then-operator from one key must NOT satisfy 2-of-N",
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "separation_of_duty");
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.signoffs.len(), 1, "the second same-key sign-off was not recorded");
+}
+
+#[tokio::test]
+async fn test_json_decision_hard_sod_blocks_same_key_operator_then_no_operator() {
+    // [HIGH regression] The reverse ordering: an `approver` call first, then a
+    // no-`approver` call (the sentinel) from the same key. Both must count as ONE
+    // key — the second is rejected. Also exercises the AUTHORITATIVE in-lock guard:
+    // the second decision still goes through transition() (which re-checks under
+    // the storage lock), so even if the API fast-fail were bypassed it can't
+    // double-sign.
+    let (router, storage, key, id) = build_hard_sod_dual_control_fixture("team-a").await;
+
+    // (1) with operator → recorded agg:<key>:alice@ , 1 of 2, Pending.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "pending");
+    assert_eq!(body["approvals_received"], 1);
+
+    // (2) same key, NO operator (sentinel) → rejected 409, stays Pending.
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "operator-then-no-operator from one key must NOT satisfy 2-of-N",
+    );
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.signoffs.len(), 1, "the second same-key sign-off was not recorded");
+}
+
+#[tokio::test]
+async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
+    // [#2 regression] An NHI whose OWNER is alice@ approved by human alice@ through
+    // the aggregator (recorded as `agg:<key>:alice@`) is a self-approval. SoD is
+    // computed against the BARE operator, so under hard SoD this is rejected 409 —
+    // the agg: namespacing must NOT let a self-approval slip past.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let seed = AuthManager::new();
+    let (key, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some("team-a".to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    let mut sod_config = Config::default();
+    sod_config.approval.enforce_separation_of_duty = true;
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        sod_config,
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    // An approval whose requesting NHI's OWNER is alice@example.com.
+    let (mut approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo {
+            principal_kind: "api_key".to_string(),
+            principal_id: Some("nhi-1".to_string()),
+            principal_name: Some("refund-bot".to_string()),
+            role: Some("executor".to_string()),
+            owner: Some("alice@example.com".to_string()),
+        },
+        use_token_id: None,
+        principal_id: Some("nhi-1".to_string()),
+        agent_label: None,
+        tenant: Some("team-a".to_string()),
+        workload_id: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::Medium,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+    });
+    // Make sure the requester owner is what we expect after open().
+    approval.requester.owner = Some("alice@example.com".to_string());
+    let id = approval.id.clone();
+    storage.store_approval(&approval).await.unwrap();
+
+    // alice@ approving her own NHI's action via the aggregator → 409, stays pending.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "aggregator self-approval (owner == operator) must be caught under hard SoD",
+    );
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.status,
+        vultrino::approval::ApprovalStatus::Pending,
+        "the self-approval must not take effect",
+    );
+
+    // A DIFFERENT operator (not the owner) is allowed → 200, approved.
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "bob@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "a distinct operator may approve");
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
+}
+
+#[tokio::test]
+async fn test_json_decision_idempotent_for_coapprover_retry_on_granted_mofn() {
+    // [#14] After a 2-of-N approval is GRANTED by two distinct aggregator keys, a
+    // retry by the FIRST co-approver (not the finalizing one) must replay 200, not
+    // 409 — idempotency matches ANY recorded sign-off, not just approver_identity.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    // Two DISTINCT aggregator admin keys, both scoped to team-a.
+    let seed = AuthManager::new();
+    let (key_a, api_key_a) = seed.create_api_key("agg-a", "admin", None).unwrap();
+    let (key_b, api_key_b) = seed.create_api_key("agg-b", "admin", None).unwrap();
+    let mut tk_a = api_key_a.clone();
+    tk_a.tenant = Some("team-a".to_string());
+    let mut tk_b = api_key_b.clone();
+    tk_b.tenant = Some("team-a".to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tk_a.clone(), tk_b.clone()]);
+    storage.store_api_key(&tk_a).await.unwrap();
+    storage.store_api_key(&tk_b).await.unwrap();
+
+    let mut sod_config = Config::default();
+    sod_config.approval.enforce_separation_of_duty = true;
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        sod_config,
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    let (approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo::local(),
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: Some("team-a".to_string()),
+        workload_id: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: true,
+        criticality: vultrino::approval::CriticalityClass::High,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 2,
+    });
+    let id = approval.id.clone();
+    storage.store_approval(&approval).await.unwrap();
+
+    let approve = |k: &str, op: &str| {
+        admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            k,
+            serde_json::json!({"approve": true, "approver": op}),
+        )
+    };
+
+    // Key A signs off (1 of 2) → still pending.
+    let resp = router.clone().oneshot(approve(&key_a, "alice@example.com")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Key B signs off (2 of 2) → granted.
+    let resp = router.clone().oneshot(approve(&key_b, "bob@example.com")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "approved");
+
+    // The FIRST co-approver (key A / alice) retries on the now-granted approval →
+    // 200 idempotent replay (NOT 409), even though alice is not the FINALIZING
+    // approver (bob is).
+    let resp = router.oneshot(approve(&key_a, "alice@example.com")).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a co-approver's retry on a granted M-of-N is idempotent, not a conflict",
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "approved");
+    assert_eq!(body["idempotent_replay"], true);
 }
 
 #[tokio::test]

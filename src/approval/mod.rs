@@ -547,6 +547,26 @@ impl ApprovalRequest {
         if decision.enforce_sod && sod == Some(true) {
             return Err(ApprovalError::SeparationOfDuty);
         }
+        // Hard-SoD M-of-N (in-lock, TOCTOU-safe): when more than one distinct
+        // approver is required, a SECOND sign-off may not come from the SAME
+        // aggregator key as an existing one. The api-layer fast-fail also checks
+        // this, but it is racy across concurrent requests; this check runs inside
+        // the storage write lock (transition() executes under locked_mutate), so
+        // two concurrent same-key decisions can't both slip through. Only applies
+        // to aggregator-asserted identities (`agg:<key-id>:…`); bare identities
+        // are unaffected. The aggregator's claim of distinct HUMAN operators is
+        // unverifiable, so under hard SoD one key counts once.
+        if decision.enforce_sod && self.effective_required_approvals() > 1 {
+            if let Some(prefix) = aggregator_key_prefix(&identity) {
+                if self
+                    .signoffs
+                    .iter()
+                    .any(|s| s.approver_identity.starts_with(prefix))
+                {
+                    return Err(ApprovalError::SameAggregatorKey);
+                }
+            }
+        }
         // Approvers must be DISTINCT — the same identity can't satisfy two of the
         // required M sign-offs.
         if self
@@ -608,7 +628,12 @@ impl ApprovalRequest {
     /// Whether a candidate approver identity collides with the requesting agent's
     /// own identity (a self-approval). `None` when either side is unknown.
     fn sod_for(&self, candidate: &str) -> Option<bool> {
-        let approver = candidate.trim();
+        // An aggregator-asserted identity (`agg:<key-id>:<operator>`) must be
+        // compared by its BARE operator, not the namespaced wrapper — otherwise a
+        // self-approval (operator == the requester's owner/label) would never
+        // match the requester identities and SoD would fail OPEN on exactly the
+        // aggregator surface. Bare identities pass through unchanged.
+        let approver = bare_approver_identity(candidate).trim();
         if approver.is_empty() {
             return None;
         }
@@ -710,6 +735,45 @@ pub enum ApprovalError {
     SeparationOfDuty,
     #[error("dual control: this approver has already signed off on this request")]
     DuplicateApprover,
+    /// Hard-SoD M-of-N: a second sign-off arrived under the SAME aggregator key
+    /// as an existing one. Distinctness across different human operators on ONE
+    /// aggregator key is only a CLAIM the aggregator makes (vultrino can't verify
+    /// it), so under hard SoD one key may not satisfy two of the M sign-offs.
+    #[error("separation of duty: this aggregator key already supplied a sign-off; a distinct co-approver must use a different key")]
+    SameAggregatorKey,
+}
+
+/// Prefix that marks an **aggregator-asserted** approver identity recorded by the
+/// product-aggregator JSON surface: `agg:<acting-api-key-id>:<operator>`. The
+/// operator is a CLAIM the aggregator makes; the api-key id segment records WHICH
+/// key asserted it. Used to (a) compute SoD against the bare operator and (b)
+/// detect two sign-offs from the same key under hard M-of-N SoD.
+pub const AGG_IDENTITY_PREFIX: &str = "agg:";
+
+/// If `identity` is an aggregator-asserted identity (`agg:<key-id>:<operator>`),
+/// return the un-namespaced operator (everything after the second colon) for SoD
+/// comparison; otherwise return it unchanged. A malformed `agg:`-prefixed value
+/// with no second colon is returned as-is (treated as an opaque identity).
+fn bare_approver_identity(identity: &str) -> &str {
+    let Some(rest) = identity.strip_prefix(AGG_IDENTITY_PREFIX) else {
+        return identity;
+    };
+    // `rest` is `<key-id>:<operator>`; the operator is after the FIRST colon here
+    // (the second colon overall). `<key-id>` is a UUID with no colons.
+    match rest.split_once(':') {
+        Some((_key_id, operator)) => operator,
+        None => identity, // malformed; leave opaque
+    }
+}
+
+/// The aggregator-key prefix (`agg:<key-id>:`) of an aggregator-asserted identity,
+/// or `None` for a bare (non-aggregator) identity. Two sign-offs sharing this
+/// prefix came from the same acting api key.
+fn aggregator_key_prefix(identity: &str) -> Option<&str> {
+    let rest = identity.strip_prefix(AGG_IDENTITY_PREFIX)?;
+    // Keep through the second overall colon: `agg:<key-id>:`.
+    let key_id_len = rest.find(':')?;
+    Some(&identity[..AGG_IDENTITY_PREFIX.len() + key_id_len + 1])
 }
 
 /// Links embedded in out-of-band notifications.
@@ -1287,6 +1351,88 @@ mod tests {
         a.approve(Decision::new("admin panel", "alice").enforcing_sod(true)).unwrap();
         a.approve(Decision::new("admin panel", "bob").enforcing_sod(true)).unwrap();
         assert_eq!(a.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn test_aggregator_identity_helpers() {
+        // Bare identity passes through unchanged.
+        assert_eq!(bare_approver_identity("alice@example.com"), "alice@example.com");
+        assert_eq!(aggregator_key_prefix("alice@example.com"), None);
+        // agg:<key-id>:<operator> → bare operator + key prefix.
+        let id = "agg:11111111-2222-3333-4444-555555555555:alice@example.com";
+        assert_eq!(bare_approver_identity(id), "alice@example.com");
+        assert_eq!(
+            aggregator_key_prefix(id),
+            Some("agg:11111111-2222-3333-4444-555555555555:")
+        );
+        // An operator containing a colon is preserved whole (only the FIRST two
+        // colons are structural: agg: and the key-id terminator).
+        let weird = "agg:key-1:a:b@example.com";
+        assert_eq!(bare_approver_identity(weird), "a:b@example.com");
+        assert_eq!(aggregator_key_prefix(weird), Some("agg:key-1:"));
+        // Malformed agg: with no second colon is left opaque (no false strip).
+        assert_eq!(bare_approver_identity("agg:no-second-colon"), "agg:no-second-colon");
+        assert_eq!(aggregator_key_prefix("agg:no-second-colon"), None);
+    }
+
+    #[test]
+    fn test_sod_computed_against_bare_operator_of_aggregator_identity() {
+        // [#2 regression] An NHI whose OWNER is alice@ approved by human alice@ via
+        // the aggregator (recorded as `agg:<key>:alice@`) is a self-approval — SoD
+        // must be computed against the BARE operator, not the namespaced wrapper,
+        // or it would fail OPEN on exactly this surface.
+        let (mut a, _) = new_approval();
+        a.requester.owner = Some("alice@example.com".to_string());
+        // Not enforcing: the violation must still be RECORDED (observable).
+        let agg_self = "agg:key-123:alice@example.com";
+        a.approve(Decision::new("json-api", agg_self)).unwrap();
+        assert_eq!(
+            a.sod_violation,
+            Some(true),
+            "aggregator self-approval (owner == operator) must be flagged"
+        );
+
+        // Enforcing: the same self-approval is REJECTED (not merely recorded).
+        let (mut b, _) = new_approval();
+        b.requester.owner = Some("alice@example.com".to_string());
+        let err = b
+            .approve(Decision::new("json-api", agg_self).enforcing_sod(true))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::SeparationOfDuty));
+        assert_eq!(b.status, ApprovalStatus::Pending, "self-approval not recorded");
+
+        // A genuinely DIFFERENT operator on the aggregator surface is clean.
+        let (mut c, _) = new_approval();
+        c.requester.owner = Some("alice@example.com".to_string());
+        c.approve(Decision::new("json-api", "agg:key-123:bob@example.com").enforcing_sod(true))
+            .unwrap();
+        assert_eq!(c.sod_violation, Some(false), "distinct operator satisfies SoD");
+        assert_eq!(c.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn test_hard_sod_rejects_second_signoff_from_same_aggregator_key() {
+        // [#7 in-lock] Under hard SoD on a 2-of-N approval, two sign-offs from the
+        // SAME aggregator key (same `agg:<key-id>:` prefix, different operators)
+        // must NOT both count — the second is rejected, leaving the request open
+        // with a single recorded sign-off.
+        let (mut a, _) = new_approval();
+        a.required_approvals = 2;
+        a.approve(Decision::new("json-api", "agg:keyA:alice@example.com").enforcing_sod(true))
+            .unwrap();
+        assert_eq!(a.signoffs.len(), 1);
+        assert_eq!(a.status, ApprovalStatus::Pending);
+        let err = a
+            .approve(Decision::new("json-api", "agg:keyA:bob@example.com").enforcing_sod(true))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::SameAggregatorKey));
+        assert_eq!(a.signoffs.len(), 1, "the same-key second sign-off was not recorded");
+        assert_eq!(a.status, ApprovalStatus::Pending);
+        // A DIFFERENT aggregator key completes the threshold.
+        a.approve(Decision::new("json-api", "agg:keyB:carol@example.com").enforcing_sod(true))
+            .unwrap();
+        assert_eq!(a.status, ApprovalStatus::Approved);
+        assert_eq!(a.signoffs.len(), 2);
     }
 
     #[test]
