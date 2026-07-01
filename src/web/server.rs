@@ -344,4 +344,13 @@ impl WebServer {
     pub fn bind_address(&self) -> &str {
         &self.config.bind
     }
+
+    /// The process-shared `AuthManager` handle. Exposed so `main` can drive a
+    /// cross-process refresh loop that rebuilds it from the vault (picking up
+    /// `vk_` key/role revocations pushed via the admin API on a sibling process).
+    /// Every enforcement edge on this process — `/api/v1/execute`, `/llm`, and the
+    /// networked MCP transport — reads this same `Arc<RwLock<AuthManager>>`.
+    pub fn auth_manager(&self) -> Arc<RwLock<AuthManager>> {
+        self.app_state.auth_manager.clone()
+    }
 }

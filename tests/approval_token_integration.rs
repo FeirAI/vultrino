@@ -940,6 +940,55 @@ async fn test_refresh_policies_once_picks_up_cross_process_write() {
 }
 
 #[tokio::test]
+async fn test_refresh_auth_once_drops_revoked_key_cross_process() {
+    // The web/admin process revokes a vk_ key; a sibling process (MCP, or an HA web
+    // replica) that built its AuthManager at startup must stop authenticating that key
+    // after one refresh tick — not only at restart. This is the API-key analogue of
+    // test_refresh_policies_once_picks_up_cross_process_write above.
+    use tokio::sync::RwLock;
+    use vultrino::auth::AuthManager;
+    use vultrino::server::refresh_auth_once;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    let password = SecretString::from("pw");
+    let writer: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let reader: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    // Writer (admin process) mints a key against the predefined `executor` role and
+    // persists it to the shared vault.
+    let writer_mgr = AuthManager::new();
+    let (full_key, api_key) = writer_mgr.create_api_key("ci", "executor", None).unwrap();
+    writer.store_api_key(&api_key).await.unwrap();
+
+    // Reader built its manager BEFORE the key was written — stale, so it can't see it.
+    let reader_mgr = Arc::new(RwLock::new(AuthManager::from_data(
+        reader.list_roles().await.unwrap(),
+        reader.list_api_keys().await.unwrap(),
+    )));
+    assert!(reader_mgr.read().await.validate_key(&full_key).is_err());
+
+    // One refresh tick and the reader authenticates the new key.
+    refresh_auth_once(&reader, &reader_mgr).await.unwrap();
+    assert!(reader_mgr.read().await.validate_key(&full_key).is_ok());
+
+    // Writer revokes the key. The stale reader still accepts it until it refreshes —
+    // exactly the pre-fix bug the periodic loop closes.
+    writer.delete_api_key(&api_key.id).await.unwrap();
+    assert!(reader_mgr.read().await.validate_key(&full_key).is_ok());
+
+    // After the next tick the revoked key stops validating cross-process.
+    refresh_auth_once(&reader, &reader_mgr).await.unwrap();
+    assert!(
+        reader_mgr.read().await.validate_key(&full_key).is_err(),
+        "revoked vk_ key must stop validating after a refresh tick"
+    );
+    drop(dir);
+}
+
+#[tokio::test]
 async fn test_deny_pushed_after_approval_blocks_resume() {
     // An allow policy + a require_approval credential opens an approval; once
     // approved, an emergency Deny is pushed and the engine reloaded (as the
