@@ -12,9 +12,23 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use wasmtime::*;
 use wasmtime_wasi::preview1::{WasiP1Ctx};
+
+/// Wall-clock ceiling for a single WASM plugin call (instantiation + execute).
+/// A plugin that exceeds this is trapped via epoch interruption and its action denied.
+const WASM_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cadence at which the watchdog advances the engine epoch (== timeout resolution).
+const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(50);
+/// Max linear-memory bytes any single plugin instance may grow to (64 MiB).
+const MAX_WASM_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+/// Max table elements a plugin may grow to.
+const MAX_WASM_TABLE_ELEMENTS: usize = 10_000;
+/// Max bytes we will read back as a plugin response (defense against a bogus length).
+const MAX_WASM_RESPONSE_BYTES: u32 = 8 * 1024 * 1024;
 
 /// Trait for WASM runtime implementations
 pub trait WasmRuntime: Send + Sync {
@@ -55,26 +69,74 @@ struct WasmResponse {
 /// State for WASM store
 struct WasmState {
     wasi: WasiP1Ctx,
+    limits: StoreLimits,
+}
+
+/// Background watchdog that advances an [`Engine`]'s epoch so that stores with an
+/// epoch deadline trap after a bounded wall-clock time. Stops on drop.
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: &Engine, interval: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let engine = engine.clone(); // Engine is a cheap Arc-backed handle
+        let handle = std::thread::Builder::new()
+            .name("wasm-epoch-ticker".to_string())
+            .spawn(move || {
+                while !stop_thread.load(Ordering::Relaxed) {
+                    std::thread::sleep(interval);
+                    engine.increment_epoch();
+                }
+            })
+            .expect("failed to spawn WASM epoch ticker thread");
+        Self { stop, handle: Some(handle) }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Wasmtime-based WASM runtime
 pub struct WasmtimeRuntime {
     engine: Engine,
     module: RwLock<Option<Module>>,
+    deadline_ticks: u64,
+    _ticker: EpochTicker, // dropped with the runtime -> stops the watchdog thread
 }
 
 impl WasmtimeRuntime {
-    /// Create a new Wasmtime runtime
+    /// Create a new Wasmtime runtime with the default per-call timeout.
     pub fn new() -> Result<Self, PluginError> {
+        Self::with_timeout(WASM_CALL_TIMEOUT)
+    }
+
+    fn with_timeout(timeout: Duration) -> Result<Self, PluginError> {
         let mut config = Config::new();
         config.wasm_backtrace_details(WasmBacktraceDetails::Enable);
+        config.epoch_interruption(true);
 
         let engine = Engine::new(&config)
             .map_err(|e| PluginError::Wasm(format!("Engine creation failed: {}", e)))?;
 
+        let ticker = EpochTicker::start(&engine, EPOCH_TICK_INTERVAL);
+        let deadline_ticks =
+            (timeout.as_millis() / EPOCH_TICK_INTERVAL.as_millis()).max(1) as u64;
+
         Ok(Self {
             engine,
             module: RwLock::new(None),
+            deadline_ticks,
+            _ticker: ticker,
         })
     }
 
@@ -92,7 +154,18 @@ impl WasmtimeRuntime {
             .inherit_stdio()
             .build_p1();
 
-        Store::new(&self.engine, WasmState { wasi })
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(MAX_WASM_MEMORY_BYTES)
+            .table_elements(MAX_WASM_TABLE_ELEMENTS)
+            .instances(1)
+            .memories(1)
+            .tables(1)
+            .build();
+
+        let mut store = Store::new(&self.engine, WasmState { wasi, limits });
+        store.limiter(|state| &mut state.limits);
+        store.set_epoch_deadline(self.deadline_ticks);
+        store
     }
 
     /// Create a linker with WASI imports
@@ -130,6 +203,16 @@ impl WasmtimeRuntime {
             .map_err(|e| PluginError::Wasm(format!("Memory read failed: {}", e)))?;
 
         Ok(buffer)
+    }
+
+    /// Classify a wasmtime call error: an epoch-interrupt trap is a fail-closed deadline
+    /// exceedance (deny), everything else is a generic WASM execution error.
+    fn classify_call_error(op: &str, e: wasmtime::Error) -> PluginError {
+        if matches!(e.downcast_ref::<Trap>(), Some(Trap::Interrupt)) {
+            PluginError::ExecutionFailed("WASM plugin exceeded its execution deadline".to_string())
+        } else {
+            PluginError::Wasm(format!("{} call failed: {}", op, e))
+        }
     }
 
     /// Free memory in WASM
@@ -217,7 +300,7 @@ impl WasmRuntime for WasmtimeRuntime {
         let linker = self.create_linker()?;
         let instance = linker
             .instantiate(&mut store, module)
-            .map_err(|e| PluginError::Wasm(format!("Instantiation failed: {}", e)))?;
+            .map_err(|e| Self::classify_call_error("Instantiate", e))?;
 
         // Get required functions
         let memory = instance
@@ -252,10 +335,17 @@ impl WasmRuntime for WasmtimeRuntime {
         // Call execute
         let result = execute_fn
             .call(&mut store, (request_ptr.offset, request_ptr.len))
-            .map_err(|e| PluginError::Wasm(format!("Execute call failed: {}", e)))?;
+            .map_err(|e| Self::classify_call_error("Execute", e))?;
 
         // Unpack result (high 32 bits = ptr, low 32 bits = len)
         let response_ptr = WasmPtr::new((result >> 32) as u32, (result & 0xFFFFFFFF) as u32);
+
+        if response_ptr.len > MAX_WASM_RESPONSE_BYTES {
+            return Err(PluginError::ExecutionFailed(format!(
+                "WASM plugin response too large: {} bytes (max {})",
+                response_ptr.len, MAX_WASM_RESPONSE_BYTES
+            )));
+        }
 
         // Read response
         let response_bytes = Self::read_from_wasm(&store, &memory, &response_ptr)?;
@@ -417,7 +507,15 @@ impl Plugin for WasmPlugin {
         let cred_json = serde_json::to_value(&request.credential.data)
             .map_err(|e| PluginError::ExecutionFailed(format!("Failed to serialize credential: {}", e)))?;
 
-        self.runtime.read().execute_action(&request.action, &cred_json, &request.params)
+        let runtime = Arc::clone(&self.runtime);
+        let action = request.action.clone();
+        let params = request.params.clone();
+
+        tokio::task::spawn_blocking(move || {
+            runtime.read().execute_action(&action, &cred_json, &params)
+        })
+        .await
+        .map_err(|e| PluginError::ExecutionFailed(format!("WASM execution task failed: {}", e)))?
     }
 
     fn manifest(&self) -> Option<&PluginManifest> {
@@ -488,5 +586,69 @@ impl Plugin for WasmPlugin {
         }
 
         Ok(CredentialData::Custom(secrets))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOOP_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (global $bump (mut i32) (i32.const 1024))
+          (func (export "vultrino_plugin_version") (result i32) (i32.const 1))
+          (func (export "vultrino_alloc") (param $n i32) (result i32)
+            (local $p i32)
+            (local.set $p (global.get $bump))
+            (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+            (local.get $p))
+          (func (export "vultrino_free") (param i32 i32))
+          (func (export "vultrino_execute") (param i32 i32) (result i64)
+            (loop $l (br $l))
+            (i64.const 0)))
+    "#;
+
+    const MEMHOG_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (global $bump (mut i32) (i32.const 1024))
+          (func (export "vultrino_plugin_version") (result i32) (i32.const 1))
+          (func (export "vultrino_alloc") (param $n i32) (result i32)
+            (local $p i32)
+            (local.set $p (global.get $bump))
+            (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+            (local.get $p))
+          (func (export "vultrino_free") (param i32 i32))
+          (func (export "vultrino_execute") (param i32 i32) (result i64)
+            (if (i32.eq (memory.grow (i32.const 2000)) (i32.const -1))
+              (then (unreachable)))
+            (i64.const 0)))
+    "#;
+
+    fn runtime_with(wat: &str, timeout: Duration) -> WasmtimeRuntime {
+        let mut rt = WasmtimeRuntime::with_timeout(timeout).expect("runtime");
+        rt.load_module(wat.as_bytes()).expect("load module");
+        rt
+    }
+
+    #[test]
+    fn infinite_loop_plugin_times_out_and_denies() {
+        let rt = runtime_with(LOOP_WAT, Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        let res = rt.execute_action("do", &serde_json::json!({}), &serde_json::json!({}));
+        let elapsed = start.elapsed();
+        assert!(res.is_err(), "a looping plugin must be denied, got {res:?}");
+        assert!(elapsed < Duration::from_secs(5), "must not hang; took {elapsed:?}");
+    }
+
+    #[test]
+    fn memory_hog_plugin_is_bounded_and_denies() {
+        // 2000 pages = 128 MiB > 64 MiB cap -> memory.grow returns -1 -> unreachable trap.
+        // WITHOUT the limiter this grow would succeed and the call would return Ok,
+        // so this asserts the StoreLimits cap is actually enforced.
+        let rt = runtime_with(MEMHOG_WAT, WASM_CALL_TIMEOUT);
+        let res = rt.execute_action("do", &serde_json::json!({}), &serde_json::json!({}));
+        assert!(res.is_err(), "over-cap memory growth must be denied, got {res:?}");
     }
 }
