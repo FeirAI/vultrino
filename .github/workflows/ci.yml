@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  rust:
+    name: build + test + clippy (zero-warning gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # vultrino has no rust-toolchain.toml. Pin CI to 1.92.0 — the version the zero-warning
+      # convention was verified clean under — so `-D warnings` does not go red on lint churn from
+      # a future floating stable. Bump this deliberately (mirrors feir pinning its toolchain).
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: clippy
+      - run: cargo build
+      - run: cargo test
+      # Zero clippy warnings is a repo convention; -D warnings makes it a hard gate.
+      - run: cargo clippy --all-targets -- -D warnings
