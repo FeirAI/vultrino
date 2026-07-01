@@ -881,6 +881,15 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
         config_policies,
         std::time::Duration::from_secs(vultrino::server::POLICY_REFRESH_SECS),
     ));
+    // vk_ API-key / role revocation is storage-authoritative, but this process built
+    // its AuthManager once at startup. Refresh it on the same cadence as policies so a
+    // key revoked (or a role narrowed) on the web/admin process stops authenticating
+    // here within a tick, instead of only after a restart. Bounded-staleness, like policies.
+    tokio::spawn(vultrino::server::refresh_auth_periodically(
+        server.storage().clone(),
+        auth_manager.clone(),
+        std::time::Duration::from_secs(vultrino::server::POLICY_REFRESH_SECS),
+    ));
     // Also drive the approval SLA sweep here (V5), so an MCP-only deployment (no
     // web process) still escalates/expires requests nobody is polling. Safe to
     // run alongside the web process's sweep — the advance is atomic under the
@@ -979,6 +988,10 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
         enabled: true,
     };
 
+    // Keep a vault handle for the auth-refresh loop; `storage` is moved into the
+    // web server below.
+    let auth_refresh_storage = storage.clone();
+
     let web_server = WebServer::new(
         web_config,
         config,
@@ -987,6 +1000,17 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
         admin_auth,
         exec_server,
     );
+
+    // Cross-process vk_ revocation: rebuild the shared AuthManager from the vault on
+    // the same cadence as the policy refresh, so revoking a key / narrowing a role via
+    // the admin API on another process (or an HA replica) propagates to THIS process's
+    // /api/v1/execute, /llm, and networked-MCP edges — all of which read the same
+    // AppState.auth_manager — within a tick. Use tokens are already immediate.
+    tokio::spawn(vultrino::server::refresh_auth_periodically(
+        auth_refresh_storage,
+        web_server.auth_manager(),
+        std::time::Duration::from_secs(vultrino::server::POLICY_REFRESH_SECS),
+    ));
 
     info!(bind = %web_server.bind_address(), "Starting Vultrino Web UI");
     println!("Vultrino Web UI running at http://{}", web_server.bind_address());

@@ -2597,6 +2597,50 @@ pub async fn refresh_policies_once(
     Ok(())
 }
 
+/// Background loop that periodically rebuilds the shared [`AuthManager`] from the
+/// vault, so a `vk_` API key revoked/expired — or a role narrowed — via the admin
+/// API on *another* process (the web writer, or an HA web replica) stops
+/// authenticating on THIS process within `interval`, rather than only after a
+/// restart. This is the API-key/role analogue of [`refresh_policies_periodically`].
+///
+/// Note: like policies, this gives `vk_` revocation **bounded-staleness**
+/// propagation, not instant. Use tokens (`vut_`) remain immediate — they are
+/// re-read from storage and re-checked under the vault lock on every gated call.
+pub async fn refresh_auth_periodically(
+    storage: Arc<dyn StorageBackend>,
+    auth_manager: Arc<tokio::sync::RwLock<AuthManager>>,
+    interval: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Err(e) = refresh_auth_once(&storage, &auth_manager).await {
+            warn!(error = %e, "periodic auth refresh failed");
+        }
+    }
+}
+
+/// One iteration of the cross-process auth refresh: re-read the vault from disk and
+/// rebuild the shared `AuthManager` from the stored roles + API keys. Rebuilding via
+/// [`AuthManager::from_data`] swaps the whole manager under the write lock in one
+/// assignment, so no half-updated key/role map is ever observable (mirrors
+/// `web::api::refresh_auth_data`, which the admin write handlers call synchronously
+/// on the process that serves them). Separated from the loop for testability.
+///
+/// Fail-closed on error: the `?` returns before the write lock is taken, so a
+/// storage error keeps the previous (last-known-good) manager rather than clearing
+/// the map (which would deny every key) — the loop logs and retries next tick.
+pub async fn refresh_auth_once(
+    storage: &Arc<dyn StorageBackend>,
+    auth_manager: &Arc<tokio::sync::RwLock<AuthManager>>,
+) -> Result<(), crate::storage::StorageError> {
+    storage.reload().await?;
+    let stored_roles = storage.list_roles().await?;
+    let stored_keys = storage.list_api_keys().await?;
+    let mut guard = auth_manager.write().await;
+    *guard = AuthManager::from_data(stored_roles, stored_keys);
+    Ok(())
+}
+
 /// Merge static config policies with admin-managed stored policies into the
 /// engine's policy set: config first, then stored.
 ///
