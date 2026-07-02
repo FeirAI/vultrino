@@ -929,6 +929,9 @@ impl VultrinoServer {
                     "summary": approval.summary,
                     "requested_by": approval.requester.describe(),
                     "criticality": approval.criticality.to_string(),
+                    // V11/R4: per-approval tenant on first-sight so govder routes to the
+                    // named Owner (webhook.go newRecord). None → null (untenanted/shared).
+                    "tenant": approval.tenant,
                 }),
             )
             .await;
