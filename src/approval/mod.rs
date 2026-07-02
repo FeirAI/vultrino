@@ -1119,6 +1119,9 @@ fn webhook_payload(
             "requested_by": approval.requester.describe(),
             "created_at": approval.created_at,
             "expires_at": approval.expires_at,
+            // Consistency with the signed-outbox path; govder tolerates
+            // approval.tenant. None → null (untenanted/shared).
+            "tenant": approval.tenant,
         },
         "links": links_json,
     }))
@@ -1637,6 +1640,22 @@ mod tests {
         // A decided/closed status is not a live notify path → Config error.
         a.status = ApprovalStatus::Approved;
         assert!(matches!(webhook_payload(&a, &links), Err(NotifyError::Config(_))));
+    }
+
+    #[test]
+    fn webhook_payload_carries_tenant() {
+        let (mut approval, token) = new_approval();
+        let links = approval.links("https://vault.example.com", &token);
+
+        // Untenanted (new_approval sets tenant: None) → nested approval.tenant is null.
+        let p = webhook_payload(&approval, &links).expect("pending payload builds");
+        assert!(p["approval"].get("tenant").is_some(), "nested tenant key present");
+        assert!(p["approval"]["tenant"].is_null(), "untenanted ⇒ null");
+
+        // Tenanted → the nested key carries the tenant string.
+        approval.tenant = Some("acme".to_string());
+        let p2 = webhook_payload(&approval, &links).expect("pending payload builds");
+        assert_eq!(p2["approval"]["tenant"], "acme");
     }
 
     #[test]

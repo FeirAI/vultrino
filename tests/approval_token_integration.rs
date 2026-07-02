@@ -354,6 +354,40 @@ async fn test_credential_flag_gates_then_executes_on_approval() {
 }
 
 #[tokio::test]
+async fn test_requested_outbox_event_carries_tenant_key() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "gated-cred", true).await; // require_approval = true
+
+    // Open an approval through the server — this emits the approval.requested
+    // outbox event that govder's signed-webhook receiver consumes.
+    let approval = match server
+        .execute_gated(echo_request("gated-cred"), ExecAuth::default())
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(a) => a,
+        ExecutionOutcome::Completed(_) => panic!("expected pending approval"),
+    };
+    assert_eq!(approval.status, ApprovalStatus::Pending);
+
+    // The requested event's payload carries the `tenant` key on the wire (null for
+    // this untenanted open); govder reads payload.tenant to route + seal.
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    let requested = events
+        .iter()
+        .find(|e| e.event_type == vultrino::outbox::EVENT_APPROVAL_REQUESTED)
+        .expect("a requested event was emitted");
+    assert!(
+        requested.payload.get("tenant").is_some(),
+        "approval.requested carries the tenant key"
+    );
+    assert!(
+        requested.payload["tenant"].is_null(),
+        "untenanted open ⇒ tenant is null"
+    );
+}
+
+#[tokio::test]
 async fn test_denied_approval_never_executes() {
     let (server, storage) = setup().await;
     store_credential(&storage, "gated-cred", true).await;

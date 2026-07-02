@@ -119,6 +119,10 @@ fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
         "summary": a.summary,
         "decided_by": a.decided_by,
         "approver_identity": a.approver_identity,
+        // V11/R4: per-approval tenant so govder can route + seal a multi-tenant
+        // approval (webhook.go approvalPayload.tenant()). None (untenanted/shared)
+        // rides as JSON null, which govder treats as no-per-delivery-tenant.
+        "tenant": a.tenant,
     })
 }
 
@@ -1516,6 +1520,49 @@ mod tests {
     use crate::{CredentialData, Secret};
     use std::collections::HashSet;
     use tempfile::tempdir;
+
+    #[test]
+    fn approval_event_payload_carries_tenant() {
+        use crate::approval::{ApprovalRequest, CriticalityClass, NewApproval, RequesterInfo};
+
+        fn mk(tenant: Option<&str>) -> ApprovalRequest {
+            let (req, _tok) = ApprovalRequest::open(NewApproval {
+                credential: "stripe-prod".to_string(),
+                action: "http.request".to_string(),
+                params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+                requester: RequesterInfo {
+                    principal_kind: "api_key".to_string(),
+                    principal_id: Some("k1".to_string()),
+                    principal_name: Some("agent".to_string()),
+                    role: Some("executor".to_string()),
+                    owner: None,
+                },
+                use_token_id: None,
+                principal_id: Some("k1".to_string()),
+                agent_label: None,
+                tenant: tenant.map(str::to_string),
+                workload_id: None,
+                action_label: None,
+                dual_control: false,
+                criticality: CriticalityClass::Medium,
+                escalate_after: chrono::Duration::minutes(30),
+                escalate_window: chrono::Duration::minutes(30),
+                oob_identity: None,
+                reauth_interval_secs: None,
+                required_approvals: 1,
+            });
+            req
+        }
+
+        // Tenanted: the key carries the tenant string govder routes/seals against.
+        let p = approval_event_payload(&mk(Some("acme")));
+        assert_eq!(p["tenant"], "acme");
+        // Untenanted (shared): the key is present and null (govder fails closed on a
+        // multi-tenant deployment, correct for a shared approval there).
+        let p2 = approval_event_payload(&mk(None));
+        assert!(p2.get("tenant").is_some(), "tenant key must be present");
+        assert!(p2["tenant"].is_null(), "untenanted ⇒ null");
+    }
 
     #[test]
     fn stage_event_fails_closed_at_the_pending_cap() {
