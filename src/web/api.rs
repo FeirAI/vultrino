@@ -1823,6 +1823,7 @@ pub async fn api_resolve_agent_token(
 #[derive(Serialize, Deserialize)]
 pub struct ApprovalTokenCreateRequest {
     pub delegation_grant_ref: String,
+    pub grant_scope: crate::delegation::DelegationGrantScope,
     #[serde(default)]
     pub agent_label: Option<String>,
     pub delegator_identity: String,
@@ -1854,8 +1855,15 @@ pub async fn api_create_approval_token(
                 );
             }
         };
+        if let Err(e) = req.grant_scope.validate() {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"code": "invalid_grant_scope", "error": e}),
+            );
+        }
         let params = NewApprovalToken {
             delegation_grant_ref: req.delegation_grant_ref,
+            grant_scope: req.grant_scope,
             agent_label: req.agent_label,
             delegator_identity: req.delegator_identity,
             tenant: req.tenant.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
@@ -1991,6 +1999,24 @@ pub async fn api_delegate_decide_approval(
     let approver = token.approver_identity();
     let grant_ref = token.delegation_grant_ref.clone();
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
+
+    let eval = crate::delegation::evaluate_delegate_decision(
+        crate::delegation::DelegateEvalInput {
+            grant_scope: &token.grant_scope,
+            delegate_agent_id: &approver,
+            action_class: &existing.action,
+            risk_tier: existing.criticality.to_govder_risk_tier(),
+            irreversible: crate::approval::approval_irreversible(&existing),
+            approve: body.approve,
+        },
+    );
+    if body.approve && !eval.permitted {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "delegate_decision_denied",
+            eval.reason,
+        );
+    }
 
     match state
         .storage

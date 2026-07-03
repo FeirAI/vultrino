@@ -12,6 +12,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::delegation::DelegationGrantScope;
+
 /// Prefix that identifies an approval token (vs. `vk_` API keys or `vut_` use tokens).
 pub const APPROVAL_TOKEN_PREFIX: &str = "vap_";
 
@@ -30,6 +32,9 @@ pub struct ApprovalToken {
     pub token_hash: String,
     /// Govder DelegationGrant id this token is bound to.
     pub delegation_grant_ref: String,
+    /// Snapshot of grant caps consulted at delegate decide (plan 031 D3).
+    #[serde(default)]
+    pub grant_scope: DelegationGrantScope,
     /// Delegate agent label (V4), for audit and SoD attribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
@@ -70,6 +75,7 @@ impl std::fmt::Display for ApprovalTokenInvalid {
 #[derive(Debug, Clone)]
 pub struct NewApprovalToken {
     pub delegation_grant_ref: String,
+    pub grant_scope: DelegationGrantScope,
     pub agent_label: Option<String>,
     pub delegator_identity: String,
     pub tenant: Option<String>,
@@ -82,6 +88,7 @@ impl NewApprovalToken {
         if self.delegation_grant_ref.trim().is_empty() {
             return Err("delegation_grant_ref must not be empty".to_string());
         }
+        self.grant_scope.validate()?;
         if self.delegator_identity.trim().is_empty() {
             return Err("delegator_identity must not be empty".to_string());
         }
@@ -111,6 +118,7 @@ impl ApprovalToken {
             token_prefix: prefix,
             token_hash,
             delegation_grant_ref: params.delegation_grant_ref,
+            grant_scope: params.grant_scope,
             agent_label: params.agent_label,
             delegator_identity: params.delegator_identity,
             tenant: params.tenant,
@@ -219,6 +227,7 @@ mod tests {
     fn test_create_token_shape() {
         let (full, t) = ApprovalToken::create(NewApprovalToken {
             delegation_grant_ref: "grant_abc".to_string(),
+            grant_scope: DelegationGrantScope::default(),
             agent_label: Some("refund-bot".to_string()),
             delegator_identity: "alice@corp".to_string(),
             tenant: Some("acme".to_string()),
@@ -236,6 +245,7 @@ mod tests {
     fn test_check_usable_states() {
         let mut t = ApprovalToken::create(NewApprovalToken {
             delegation_grant_ref: "g1".to_string(),
+            grant_scope: DelegationGrantScope::default(),
             agent_label: None,
             delegator_identity: "bob".to_string(),
             tenant: None,

@@ -55,6 +55,13 @@ async fn build_admin_router() -> (axum::Router, Arc<dyn StorageBackend>, String)
     (server.into_router(), storage, admin_key)
 }
 
+fn low_grant_scope_json() -> serde_json::Value {
+    serde_json::json!({
+        "max_risk_tier": "Low",
+        "action_classes": ["http.request"]
+    })
+}
+
 fn bearer_req(method: &str, uri: &str, token: &str, body: serde_json::Value) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -78,6 +85,7 @@ async fn delegate_approval_records_approver_kind_in_outbox() {
             &admin_key,
             serde_json::json!({
                 "delegation_grant_ref": "grant_test_001",
+                "grant_scope": low_grant_scope_json(),
                 "agent_label": "delegate-bot",
                 "delegator_identity": "alice@corp",
                 "tenant": "acme"
@@ -212,6 +220,7 @@ async fn delegate_decision_delivers_signed_webhook_to_govder_consumer() {
             &admin_key,
             serde_json::json!({
                 "delegation_grant_ref": "grant_webhook_001",
+                "grant_scope": low_grant_scope_json(),
                 "agent_label": "delegate-bot",
                 "delegator_identity": "alice@corp",
                 "tenant": "acme"
@@ -324,6 +333,7 @@ async fn delegate_decision_cross_plane_to_govder() {
             &admin_key,
             serde_json::json!({
                 "delegation_grant_ref": grant_ref,
+                "grant_scope": low_grant_scope_json(),
                 "agent_label": "delegate-bot",
                 "delegator_identity": "alice@corp",
                 "tenant": tenant
@@ -391,23 +401,10 @@ async fn delegate_decision_cross_plane_to_govder() {
     }
 }
 
-/// Cross-plane DENY harness: High-risk approval → delegate decide → outbox → govder
-/// receiver must downgrade to denied (D3 human floor).
+/// D3 human floor at the PEP: High-risk delegate approve is rejected before
+/// status transitions to Approved (no execution, no approval.approved outbox).
 #[tokio::test]
-async fn delegate_decision_cross_plane_high_risk_denied() {
-    let webhook_url = match std::env::var("GOVDER_WEBHOOK_URL") {
-        Ok(u) if !u.trim().is_empty() => u,
-        _ => {
-            eprintln!("GOVDER_WEBHOOK_URL unset — skip (run from govder cross-plane harness)");
-            return;
-        }
-    };
-    let secret = std::env::var("GOVDER_SIGNATURE_SECRET")
-        .expect("GOVDER_SIGNATURE_SECRET required for cross-plane harness");
-    let grant_ref = std::env::var("DELEGATION_GRANT_REF")
-        .expect("DELEGATION_GRANT_REF required for cross-plane harness");
-    let tenant = std::env::var("DELEGATION_TENANT").unwrap_or_else(|_| "tenant-a".to_string());
-
+async fn delegate_decide_high_risk_blocked_at_pep() {
     let (router, storage, admin_key) = build_admin_router().await;
 
     let mint_resp = router
@@ -417,10 +414,11 @@ async fn delegate_decision_cross_plane_high_risk_denied() {
             "/api/v1/approval-tokens",
             &admin_key,
             serde_json::json!({
-                "delegation_grant_ref": grant_ref,
+                "delegation_grant_ref": "grant_high_floor",
+                "grant_scope": low_grant_scope_json(),
                 "agent_label": "delegate-bot",
                 "delegator_identity": "alice@corp",
-                "tenant": tenant
+                "tenant": "acme"
             }),
         ))
         .await
@@ -445,7 +443,7 @@ async fn delegate_decision_cross_plane_high_risk_denied() {
         use_token_id: None,
         principal_id: Some("k1".to_string()),
         agent_label: None,
-        tenant: Some(tenant.clone()),
+        tenant: Some("acme".to_string()),
         workload_id: None,
         action_label: None,
         dual_control: false,
@@ -457,7 +455,6 @@ async fn delegate_decision_cross_plane_high_risk_denied() {
         required_approvals: 1,
     });
     storage.store_approval(&approval).await.unwrap();
-    println!("CROSS_PLANE_APPROVAL_ID={}", approval.id);
 
     let decide_resp = router
         .oneshot(bearer_req(
@@ -468,19 +465,84 @@ async fn delegate_decision_cross_plane_high_risk_denied() {
         ))
         .await
         .unwrap();
-    assert_eq!(decide_resp.status(), StatusCode::OK);
+    assert_eq!(decide_resp.status(), StatusCode::FORBIDDEN);
 
-    let outbox_cfg = vultrino::outbox::OutboxConfig {
-        enabled: true,
-        url: Some(webhook_url),
-        hmac_secret: Some(secret),
-        max_attempts: 3,
-        retention_secs: 3600,
-    };
-    let client = reqwest::Client::new();
-    for _ in 0..8 {
-        vultrino::server::deliver_outbox_once(&storage, &outbox_cfg, &client)
-            .await
+    let stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert!(!stored.executed);
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    assert!(
+        !events.iter().any(|e| e.event_type == EVENT_APPROVAL_APPROVED),
+        "High-risk delegate approve must not emit approval.approved"
+    );
+}
+
+/// Irreversible actions require human approval — blocked at delegate decide PEP.
+#[tokio::test]
+async fn delegate_decide_irreversible_blocked_at_pep() {
+    let (router, storage, admin_key) = build_admin_router().await;
+
+    let mint_resp = router
+        .clone()
+        .oneshot(bearer_req(
+            "POST",
+            "/api/v1/approval-tokens",
+            &admin_key,
+            serde_json::json!({
+                "delegation_grant_ref": "grant_irr_floor",
+                "grant_scope": low_grant_scope_json(),
+                "agent_label": "delegate-bot",
+                "delegator_identity": "alice@corp",
+                "tenant": "acme"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mint_resp.status(), StatusCode::CREATED);
+    let mint_body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(mint_resp.into_body(), usize::MAX).await.unwrap())
             .unwrap();
-    }
+    let vap_secret = mint_body["token"].as_str().unwrap().to_string();
+
+    let (approval, _oob) = vultrino::approval::ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "irreversible": true}),
+        requester: RequesterInfo {
+            principal_kind: "api_key".to_string(),
+            principal_id: Some("k1".to_string()),
+            principal_name: Some("agent".to_string()),
+            role: Some("executor".to_string()),
+            owner: None,
+        },
+        use_token_id: None,
+        principal_id: Some("k1".to_string()),
+        agent_label: None,
+        tenant: Some("acme".to_string()),
+        workload_id: None,
+        action_label: None,
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::Low,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+    });
+    storage.store_approval(&approval).await.unwrap();
+
+    let decide_resp = router
+        .oneshot(bearer_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/delegate-decision", approval.id),
+            &vap_secret,
+            serde_json::json!({"approve": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(decide_resp.status(), StatusCode::FORBIDDEN);
+
+    let stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert!(!stored.executed);
 }
