@@ -292,3 +292,99 @@ async fn delegate_decision_delivers_signed_webhook_to_govder_consumer() {
     assert_eq!(delivered["payload"]["delegation_grant_ref"], "grant_webhook_001");
     assert_eq!(delivered["payload"]["tenant"], "acme");
 }
+
+/// Cross-plane harness entry: invoked by govder
+/// `TestDelegateDecision_VultrinoOutboxToGovderReceiver` with GOVDER_WEBHOOK_URL set
+/// to a live govder runtime receiver (not a mock). Emits `CROSS_PLANE_APPROVAL_ID=`
+/// on stdout for the govder test to assert the sealed record.
+#[tokio::test]
+async fn delegate_decision_cross_plane_to_govder() {
+    let webhook_url = match std::env::var("GOVDER_WEBHOOK_URL") {
+        Ok(u) if !u.trim().is_empty() => u,
+        _ => {
+            eprintln!("GOVDER_WEBHOOK_URL unset — skip (run from govder cross-plane harness)");
+            return;
+        }
+    };
+    let secret = std::env::var("GOVDER_SIGNATURE_SECRET")
+        .expect("GOVDER_SIGNATURE_SECRET required for cross-plane harness");
+    let grant_ref = std::env::var("DELEGATION_GRANT_REF")
+        .expect("DELEGATION_GRANT_REF required for cross-plane harness");
+    let tenant = std::env::var("DELEGATION_TENANT").unwrap_or_else(|_| "tenant-a".to_string());
+
+    let (router, storage, admin_key) = build_admin_router().await;
+
+    let mint_resp = router
+        .clone()
+        .oneshot(bearer_req(
+            "POST",
+            "/api/v1/approval-tokens",
+            &admin_key,
+            serde_json::json!({
+                "delegation_grant_ref": grant_ref,
+                "agent_label": "delegate-bot",
+                "delegator_identity": "alice@corp",
+                "tenant": tenant
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mint_resp.status(), StatusCode::CREATED);
+    let mint_body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(mint_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let vap_secret = mint_body["token"].as_str().unwrap().to_string();
+
+    let (approval, _oob) = vultrino::approval::ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post"}),
+        requester: RequesterInfo {
+            principal_kind: "api_key".to_string(),
+            principal_id: Some("k1".to_string()),
+            principal_name: Some("agent".to_string()),
+            role: Some("executor".to_string()),
+            owner: None,
+        },
+        use_token_id: None,
+        principal_id: Some("k1".to_string()),
+        agent_label: None,
+        tenant: Some(tenant.clone()),
+        workload_id: None,
+        action_label: None,
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::Low,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+    });
+    storage.store_approval(&approval).await.unwrap();
+    println!("CROSS_PLANE_APPROVAL_ID={}", approval.id);
+
+    let decide_resp = router
+        .oneshot(bearer_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/delegate-decision", approval.id),
+            &vap_secret,
+            serde_json::json!({"approve": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(decide_resp.status(), StatusCode::OK);
+
+    let outbox_cfg = vultrino::outbox::OutboxConfig {
+        enabled: true,
+        url: Some(webhook_url),
+        hmac_secret: Some(secret),
+        max_attempts: 3,
+        retention_secs: 3600,
+    };
+    let client = reqwest::Client::new();
+    for _ in 0..8 {
+        vultrino::server::deliver_outbox_once(&storage, &outbox_cfg, &client)
+            .await
+            .unwrap();
+    }
+}
