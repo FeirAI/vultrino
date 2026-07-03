@@ -1763,6 +1763,61 @@ pub async fn api_revoke_token(
     }
 }
 
+// -------- Agent token resolve (plan 031 agent-initiated spawn) --------
+
+/// `GET /api/v1/auth/agent` — resolve a Bearer `vut_` use token to the bound
+/// agent label + tenant. Read-only; used by muntin broker for agent-initiated spawn.
+pub async fn api_resolve_agent_token(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let secret = match extract_api_key(&headers) {
+        Some(s) => s,
+        None => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "missing_token",
+                "Authorization header with Bearer use token required",
+            )
+        }
+    };
+    if !UseToken::looks_like_token(&secret) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "not_use_token",
+            "Agent resolve requires a vut_ use token",
+        );
+    }
+    let _ = state.storage.reload().await;
+    let token = match state
+        .storage
+        .get_use_token_by_hash(&UseToken::hash(&secret))
+        .await
+    {
+        Ok(Some(t)) => t,
+        _ => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "Invalid use token",
+            )
+        }
+    };
+    if let Err(e) = token.check_usable() {
+        return error_response(StatusCode::FORBIDDEN, "token_unusable", e.to_string());
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "token_id": token.id,
+            "agent_label": token.agent_label,
+            "tenant": token.tenant,
+            "token_prefix": token.token_prefix,
+        })),
+    )
+        .into_response()
+}
+
 // -------- Approval tokens (delegate-agent authority, plan 031) --------
 
 #[derive(Serialize, Deserialize)]

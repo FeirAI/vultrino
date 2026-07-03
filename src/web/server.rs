@@ -227,6 +227,7 @@ impl WebServer {
                 "/api/v1/approval-tokens",
                 post(api::api_create_approval_token),
             )
+            .route("/api/v1/auth/agent", get(api::api_resolve_agent_token))
             .route(
                 "/api/v1/approval-tokens/{id}/revoke",
                 post(api::api_revoke_approval_token),
