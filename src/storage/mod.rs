@@ -11,7 +11,7 @@ pub use outbox_store::OutboxStore;
 use crate::approval::{ApprovalRequest, ApprovalStatus};
 use crate::capability::Capability;
 use crate::outbox::OutboxEvent;
-use crate::auth::{ApiKey, Role, UseToken};
+use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
 use crate::policy::Policy;
 use crate::{Credential, CredentialMetadata};
 use async_trait::async_trait;
@@ -40,6 +40,12 @@ pub enum StorageError {
 
     #[error("Use token cannot be used: {0}")]
     UseTokenUnusable(String),
+
+    #[error("Approval token not found: {0}")]
+    ApprovalTokenNotFound(String),
+
+    #[error("Approval token cannot be used: {0}")]
+    ApprovalTokenUnusable(String),
 
     #[error("Approval request not found: {0}")]
     ApprovalNotFound(String),
@@ -227,6 +233,40 @@ pub trait StorageBackend: Send + Sync {
         Err(StorageError::UseTokenNotFound(_id.to_string()))
     }
 
+    // ==================== Approval Token Storage ====================
+    //
+    // Approval tokens are narrow grants for delegate agents (see
+    // `auth::ApprovalToken`). Default implementations are no-ops so test doubles
+    // still compile; `FileStorage` overrides all of them.
+
+    /// Store (create or replace) an approval token.
+    async fn store_approval_token(&self, _token: &ApprovalToken) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable(
+            "approval tokens not supported by this storage backend".to_string(),
+        ))
+    }
+
+    /// Get an approval token by the SHA-256 hash of its plaintext value.
+    async fn get_approval_token_by_hash(
+        &self,
+        _hash: &str,
+    ) -> Result<Option<ApprovalToken>, StorageError> {
+        Ok(None)
+    }
+
+    /// List all approval tokens.
+    async fn list_approval_tokens(&self) -> Result<Vec<ApprovalToken>, StorageError> {
+        Ok(vec![])
+    }
+
+    /// Atomically mark an approval token revoked, returning the updated token.
+    async fn set_approval_token_revoked(
+        &self,
+        _id: &str,
+    ) -> Result<ApprovalToken, StorageError> {
+        Err(StorageError::ApprovalTokenNotFound(_id.to_string()))
+    }
+
     // ==================== Approval Storage ====================
 
     /// Store (create or replace) an approval request.
@@ -318,6 +358,7 @@ pub trait StorageBackend: Send + Sync {
         _approver_identity: &str,
         _enforce_sod: bool,
         _note: Option<String>,
+        _delegation_grant_ref: Option<&str>,
     ) -> Result<ApprovalRequest, StorageError> {
         Err(StorageError::ApprovalNotFound(_id.to_string()))
     }

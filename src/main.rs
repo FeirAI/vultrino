@@ -2278,7 +2278,7 @@ async fn decide_approval(
     // still recorded + logged. SoD enforcement applies to the authenticated panel
     // and the identity-bound out-of-band link.
     storage
-        .decide_approval(&id, approve, "cli", &approver, false, None)
+        .decide_approval(&id, approve, "cli", &approver, false, None, None)
         .await
         .map_err(|e| format!("Could not update approval: {}", e))?;
 

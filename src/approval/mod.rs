@@ -208,6 +208,10 @@ pub struct NewApproval {
     pub workload_id: Option<String>,
 }
 
+fn default_approver_kind() -> String {
+    "human".to_string()
+}
+
 /// One approver's sign-off on a dual-control (M-of-N) approval (V12).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signoff {
@@ -218,6 +222,12 @@ pub struct Signoff {
     pub decided_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Kind of approver (`human` or `delegate-agent`).
+    #[serde(default = "default_approver_kind")]
+    pub approver_kind: String,
+    /// DelegationGrant reference when `approver_kind` is `delegate-agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_grant_ref: Option<String>,
 }
 
 /// A human decision on an approval request (V5). Carries the channel it arrived
@@ -235,6 +245,10 @@ pub struct Decision {
     /// When true, a self-approval (SoD violation) is **rejected** rather than
     /// merely recorded (V5). Set from `enforce_separation_of_duty` config.
     pub enforce_sod: bool,
+    /// Kind of approver (`human` or `delegate-agent`).
+    pub approver_kind: String,
+    /// DelegationGrant reference when `approver_kind` is `delegate-agent`.
+    pub delegation_grant_ref: Option<String>,
 }
 
 impl Decision {
@@ -245,6 +259,8 @@ impl Decision {
             approver_identity: approver_identity.into(),
             note: None,
             enforce_sod: false,
+            approver_kind: default_approver_kind(),
+            delegation_grant_ref: None,
         }
     }
 
@@ -257,6 +273,13 @@ impl Decision {
     /// Reject (rather than only record) a self-approval SoD violation.
     pub fn enforcing_sod(mut self, enforce: bool) -> Self {
         self.enforce_sod = enforce;
+        self
+    }
+
+    /// Mark this decision as arriving from a delegate agent (plan 031).
+    pub fn as_delegate(mut self, grant_ref: impl Into<String>) -> Self {
+        self.approver_kind = "delegate-agent".to_string();
+        self.delegation_grant_ref = Some(grant_ref.into());
         self
     }
 }
@@ -527,6 +550,8 @@ impl ApprovalRequest {
                 channel: decision.channel.clone(),
                 decided_at: now,
                 note: decision.note.clone(),
+                approver_kind: decision.approver_kind.clone(),
+                delegation_grant_ref: decision.delegation_grant_ref.clone(),
             });
             self.status = ApprovalStatus::Denied;
             self.decided_at = Some(now);
@@ -581,6 +606,8 @@ impl ApprovalRequest {
             channel: decision.channel.clone(),
             decided_at: now,
             note: decision.note.clone(),
+            approver_kind: decision.approver_kind.clone(),
+            delegation_grant_ref: decision.delegation_grant_ref.clone(),
         });
         self.approver_identity = Some(identity);
         // Sticky SoD: a violation by ANY of the M approvers flags the decision.

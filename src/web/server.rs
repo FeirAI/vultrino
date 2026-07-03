@@ -196,6 +196,10 @@ impl WebServer {
                 "/api/v1/approvals/{id}/decision",
                 post(api::api_decide_approval),
             )
+            .route(
+                "/api/v1/approvals/{id}/delegate-decision",
+                post(api::api_delegate_decide_approval),
+            )
             // Admin API (V1): runtime config-write surface (Permission::Admin).
             .route(
                 "/api/v1/policies",
@@ -219,6 +223,14 @@ impl WebServer {
                 get(api::api_list_tokens).post(api::api_create_token),
             )
             .route("/api/v1/tokens/{id}/revoke", post(api::api_revoke_token))
+            .route(
+                "/api/v1/approval-tokens",
+                post(api::api_create_approval_token),
+            )
+            .route(
+                "/api/v1/approval-tokens/{id}/revoke",
+                post(api::api_revoke_approval_token),
+            )
             .route("/api/v1/roles", post(api::api_create_role))
             .route("/api/v1/roles/{id}", delete(api::api_delete_role))
             // Kill/halt + session registry (V6).

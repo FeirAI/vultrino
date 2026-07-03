@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::approval::ApprovalStatus;
-use crate::auth::{AuthResult, NewUseToken, Permission, UseToken, UseTokenMetadata};
+use crate::auth::{
+    ApprovalToken, ApprovalTokenMetadata, AuthResult, NewApprovalToken, NewUseToken, Permission,
+    UseToken, UseTokenMetadata,
+};
 use crate::server::ExecAuth;
 use crate::{ExecuteRequest, ExecutionOutcome};
 
@@ -750,7 +753,15 @@ pub async fn api_decide_approval(
 
     match state
         .storage
-        .decide_approval(&id, body.approve, "json-api", &approver, enforce_sod, body.note)
+        .decide_approval(
+            &id,
+            body.approve,
+            "json-api",
+            &approver,
+            enforce_sod,
+            body.note,
+            None,
+        )
         .await
     {
         Ok(decided) => (
@@ -927,11 +938,11 @@ async fn require_admin(
             "Authorization header with Bearer API key required",
         )
     })?;
-    if UseToken::looks_like_token(&secret) {
+    if UseToken::looks_like_token(&secret) || ApprovalToken::looks_like_token(&secret) {
         return Err(error_response(
             StatusCode::FORBIDDEN,
             "not_admin",
-            "Use tokens cannot access the admin API; an API key with 'admin' permission is required",
+            "Use tokens and approval tokens cannot access the admin API; an API key with 'admin' permission is required",
         ));
     }
     // Generic message — don't reveal whether the key was unknown vs. expired
@@ -1749,6 +1760,224 @@ pub async fn api_revoke_token(
             error_response(StatusCode::NOT_FOUND, "token_not_found", format!("No use token with id '{}'", id))
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
+}
+
+// -------- Approval tokens (delegate-agent authority, plan 031) --------
+
+#[derive(Serialize, Deserialize)]
+pub struct ApprovalTokenCreateRequest {
+    pub delegation_grant_ref: String,
+    #[serde(default)]
+    pub agent_label: Option<String>,
+    pub delegator_identity: String,
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// Lifetime in seconds from now (optional).
+    #[serde(default)]
+    pub expires_in_secs: Option<i64>,
+}
+
+/// `POST /api/v1/approval-tokens` — mint an approval token; plaintext returned once.
+pub async fn api_create_approval_token(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<ApprovalTokenCreateRequest>,
+) -> Response {
+    let key = extract_idempotency_key(&headers);
+    let body_hash = idempotency_body_hash(&req);
+    let st = state.clone();
+    idempotent(&state, key, body_hash, move || async move {
+        let expires_in = match req.expires_in_secs {
+            None => None,
+            Some(v) if (1..=MAX_TOKEN_LIFETIME_SECS).contains(&v) => Some(Duration::seconds(v)),
+            Some(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"code": "invalid_token", "error": "expires_in_secs must be between 1 and ~10 years"}),
+                );
+            }
+        };
+        let params = NewApprovalToken {
+            delegation_grant_ref: req.delegation_grant_ref,
+            agent_label: req.agent_label,
+            delegator_identity: req.delegator_identity,
+            tenant: req.tenant.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            expires_in,
+        };
+        if let Err(e) = params.validate() {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"code": "invalid_token", "error": e}),
+            );
+        }
+        if let Some(label) = &params.agent_label {
+            if let Err(e) = crate::auth::validate_agent_label(label) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"code": "invalid_agent_label", "error": e}),
+                );
+            }
+        }
+        let (full_token, token) = ApprovalToken::create(params);
+        if let Err(e) = st.storage.store_approval_token(&token).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"code": "storage_error", "error": e.to_string()}),
+            );
+        }
+        (
+            StatusCode::CREATED,
+            serde_json::json!({
+                "token": full_token,
+                "warning": "This is the only time the token is shown. Store it securely.",
+                "metadata": ApprovalTokenMetadata::from(&token),
+            }),
+        )
+    })
+    .await
+}
+
+/// `POST /api/v1/approval-tokens/{id}/revoke` — revoke an approval token.
+pub async fn api_revoke_approval_token(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.storage.set_approval_token_revoked(&id).await {
+        Ok(token) => (StatusCode::OK, Json(serde_json::json!({
+            "revoked": true,
+            "metadata": ApprovalTokenMetadata::from(&token),
+        })))
+            .into_response(),
+        Err(crate::storage::StorageError::ApprovalTokenNotFound(_)) => error_response(
+            StatusCode::NOT_FOUND,
+            "token_not_found",
+            format!("No approval token with id '{}'", id),
+        ),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+    }
+}
+
+/// `POST /api/v1/approvals/{id}/delegate-decision` — approve or deny via a `vap_`
+/// delegate-agent token (plan 031). Bearer auth only; records channel
+/// `delegate-agent` and the token's delegation grant ref on the sign-off.
+pub async fn api_delegate_decide_approval(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<DecideReq>,
+) -> Response {
+    let secret = match extract_api_key(&headers) {
+        Some(s) => s,
+        None => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "missing_token",
+                "Authorization header with Bearer approval token required",
+            )
+        }
+    };
+    if !ApprovalToken::looks_like_token(&secret) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "not_approval_token",
+            "Delegate decisions require a vap_ approval token",
+        );
+    }
+
+    let _ = state.storage.reload().await;
+    let token = match state
+        .storage
+        .get_approval_token_by_hash(&ApprovalToken::hash(&secret))
+        .await
+    {
+        Ok(Some(t)) => t,
+        _ => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "Invalid approval token",
+            )
+        }
+    };
+    if let Err(e) = token.check_usable() {
+        return error_response(StatusCode::FORBIDDEN, "token_unusable", e.to_string());
+    }
+
+    let existing = match state.storage.get_approval(&id).await {
+        Ok(Some(a)) if a.visible_to_tenant(token.tenant.as_deref()) => a,
+        Ok(_) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "approval_not_found",
+                format!("No approval with id '{}'", id),
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, approval_id = %id, "delegate decide: get_approval failed");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "Failed to load approval",
+            );
+        }
+    };
+
+    if !existing.status.is_open() {
+        return error_response(
+            StatusCode::CONFLICT,
+            "approval_not_decidable",
+            format!("Approval is already {}", existing.status),
+        );
+    }
+
+    let approver = token.approver_identity();
+    let grant_ref = token.delegation_grant_ref.clone();
+    let enforce_sod = state.config.approval.enforce_separation_of_duty;
+
+    match state
+        .storage
+        .decide_approval(
+            &id,
+            body.approve,
+            "delegate-agent",
+            &approver,
+            enforce_sod,
+            body.note,
+            Some(&grant_ref),
+        )
+        .await
+    {
+        Ok(decided) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": decided.id,
+                "status": decided.status.to_string(),
+                "executed": decided.executed,
+                "required_approvals": decided.effective_required_approvals(),
+                "approvals_received": decided.signoffs.len(),
+                "delegation_grant_ref": grant_ref,
+            })),
+        )
+            .into_response(),
+        Err(crate::storage::StorageError::Conflict(msg)) => {
+            error_response(StatusCode::CONFLICT, "approval_not_decidable", msg)
+        }
+        Err(crate::storage::StorageError::ApprovalNotFound(_)) => error_response(
+            StatusCode::NOT_FOUND,
+            "approval_not_found",
+            format!("No approval with id '{}'", id),
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, approval_id = %id, "delegate decide: decide_approval failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "Failed to record decision",
+            )
+        }
     }
 }
 

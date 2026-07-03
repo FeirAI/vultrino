@@ -6,11 +6,16 @@
 //! - Scope access to specific credentials or patterns
 //! - Optional key expiration
 
+mod approval_tokens;
 mod manager;
 mod middleware;
 mod tokens;
 mod types;
 
+pub use approval_tokens::{
+    ApprovalToken, ApprovalTokenInvalid, ApprovalTokenMetadata, NewApprovalToken,
+    APPROVAL_TOKEN_PREFIX,
+};
 pub use manager::{AuthManager, AuthManagerError};
 pub use middleware::{authenticate, extract_api_key, validate_request, AuthError, AuthResult};
 pub use tokens::{

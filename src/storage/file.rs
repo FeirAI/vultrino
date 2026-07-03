@@ -4,7 +4,7 @@
 
 use super::{IdempotencyState, StorageBackend, StorageError};
 use crate::approval::ApprovalRequest;
-use crate::auth::{ApiKey, Role, UseToken};
+use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
 use crate::capability::Capability;
 use crate::crypto::{decrypt, derive_key, encrypt, generate_salt, EncryptedData, MasterKey};
 use crate::policy::Policy;
@@ -123,6 +123,15 @@ fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
         // approval (webhook.go approvalPayload.tenant()). None (untenanted/shared)
         // rides as JSON null, which govder treats as no-per-delivery-tenant.
         "tenant": a.tenant,
+        "approver_kind": a
+            .signoffs
+            .last()
+            .map(|s| s.approver_kind.as_str())
+            .unwrap_or("human"),
+        "delegation_grant_ref": a
+            .signoffs
+            .last()
+            .and_then(|s| s.delegation_grant_ref.clone()),
     })
 }
 
@@ -215,6 +224,9 @@ struct StorageCache {
     /// Use tokens by ID
     #[serde(default)]
     use_tokens: HashMap<String, UseToken>,
+    /// Approval tokens by ID (delegate-agent authority, plan 031).
+    #[serde(default)]
+    approval_tokens: HashMap<String, ApprovalToken>,
     /// Approval requests by ID
     #[serde(default)]
     approvals: HashMap<String, ApprovalRequest>,
@@ -258,6 +270,9 @@ struct StorageCache {
     /// Index: use token hash -> use token ID
     #[serde(skip)]
     use_token_hash_index: HashMap<String, String>,
+    /// Index: approval token hash -> approval token ID
+    #[serde(skip)]
+    approval_token_hash_index: HashMap<String, String>,
 }
 
 impl StorageCache {
@@ -268,6 +283,7 @@ impl StorageCache {
         self.role_name_index.clear();
         self.api_key_hash_index.clear();
         self.use_token_hash_index.clear();
+        self.approval_token_hash_index.clear();
 
         // Rebuild credential alias index
         for (id, cred) in &self.credentials {
@@ -287,6 +303,12 @@ impl StorageCache {
         // Rebuild use token hash index
         for (id, token) in &self.use_tokens {
             self.use_token_hash_index.insert(token.token_hash.clone(), id.clone());
+        }
+
+        // Rebuild approval token hash index
+        for (id, token) in &self.approval_tokens {
+            self.approval_token_hash_index
+                .insert(token.token_hash.clone(), id.clone());
         }
     }
 
@@ -950,6 +972,50 @@ impl StorageBackend for FileStorage {
             .await
     }
 
+    // ==================== Approval Token Storage ====================
+
+    async fn store_approval_token(&self, token: &ApprovalToken) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            cache
+                .approval_token_hash_index
+                .insert(token.token_hash.clone(), token.id.clone());
+            cache
+                .approval_tokens
+                .insert(token.id.clone(), token.clone());
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_approval_token_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<ApprovalToken>, StorageError> {
+        let cache = self.cache.read();
+        if let Some(id) = cache.approval_token_hash_index.get(hash) {
+            Ok(cache.approval_tokens.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_approval_tokens(&self) -> Result<Vec<ApprovalToken>, StorageError> {
+        let cache = self.cache.read();
+        Ok(cache.approval_tokens.values().cloned().collect())
+    }
+
+    async fn set_approval_token_revoked(&self, id: &str) -> Result<ApprovalToken, StorageError> {
+        self.locked_mutate(|cache| {
+            let token = cache
+                .approval_tokens
+                .get_mut(id)
+                .ok_or_else(|| StorageError::ApprovalTokenNotFound(id.to_string()))?;
+            token.revoked = true;
+            Ok(token.clone())
+        })
+        .await
+    }
+
     // ==================== Approval Storage ====================
 
     async fn store_approval(&self, approval: &ApprovalRequest) -> Result<(), StorageError> {
@@ -1031,6 +1097,7 @@ impl StorageBackend for FileStorage {
         approver_identity: &str,
         enforce_sod: bool,
         note: Option<String>,
+        delegation_grant_ref: Option<&str>,
     ) -> Result<ApprovalRequest, StorageError> {
         use crate::approval::Decision;
         let decided = self
@@ -1042,9 +1109,12 @@ impl StorageBackend for FileStorage {
                 // Advance the SLA lifecycle first so a decision raced against the
                 // final deadline is rejected as expired, not silently accepted.
                 approval.advance_lifecycle();
-                let decision = Decision::new(channel, approver_identity)
+                let mut decision = Decision::new(channel, approver_identity)
                     .with_note(note)
                     .enforcing_sod(enforce_sod);
+                if let Some(grant_ref) = delegation_grant_ref {
+                    decision = decision.as_delegate(grant_ref);
+                }
                 let result = if approve {
                     approval.approve(decision)
                 } else {
