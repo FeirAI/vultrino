@@ -113,12 +113,18 @@ impl CriticalityClass {
 }
 
 /// Whether the approval action is irreversible (plan 031 D3 floor input).
-/// Vultrino may set `params.irreversible: true` on the approval request.
+/// Uses the trusted stamp from capability/policy at open time — requester-authored
+/// `params.irreversible` is ignored for delegate/human floor evaluation.
 pub fn approval_irreversible(a: &ApprovalRequest) -> bool {
-    a.params
-        .get("irreversible")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    a.trusted_irreversible
+}
+
+/// Map a capability/policy reversibility label to the D3 irreversible floor.
+pub fn reversibility_requires_human_floor(reversibility: &str) -> bool {
+    matches!(
+        reversibility.trim(),
+        "irreversible" | "partially-reversible" | "partially_reversible"
+    )
 }
 
 /// The result of advancing an approval through its SLA lifecycle (V5).
@@ -204,6 +210,8 @@ pub struct NewApproval {
     pub dual_control: bool,
     /// Criticality class of this action (V5), recorded for SLA/analytics.
     pub criticality: CriticalityClass,
+    /// Trusted irreversibility stamp from capability/policy at open (D3 floor).
+    pub trusted_irreversible: Option<bool>,
     /// First SLA window: Pending → Escalated after this elapses (V5).
     pub escalate_after: chrono::Duration,
     /// Second SLA window: Escalated → Expired this long after escalation (V5).
@@ -365,6 +373,9 @@ pub struct ApprovalRequest {
     /// recorded for separation-of-duty / complacency analytics.
     #[serde(default)]
     pub criticality: CriticalityClass,
+    /// Trusted irreversibility from capability/policy at open (D3); not requester params.
+    #[serde(default)]
+    pub trusted_irreversible: bool,
     pub created_at: DateTime<Utc>,
     /// First SLA boundary (V5): when Pending auto-escalates to Escalated.
     #[serde(default)]
@@ -449,6 +460,7 @@ impl ApprovalRequest {
             required_approvals: params.required_approvals.max(1),
             signoffs: Vec::new(),
             criticality: params.criticality,
+            trusted_irreversible: params.trusted_irreversible.unwrap_or(false),
             created_at: now,
             escalate_at: now + params.escalate_after,
             escalated_at: None,
@@ -1251,6 +1263,7 @@ mod tests {
             action_label: None,
             dual_control: false,
             criticality: CriticalityClass::Medium,
+            trusted_irreversible: None,
             escalate_after: chrono::Duration::minutes(30),
             escalate_window: chrono::Duration::minutes(30),
             oob_identity: None,

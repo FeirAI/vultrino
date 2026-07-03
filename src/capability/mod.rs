@@ -18,6 +18,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+fn default_reversible() -> String {
+    "reversible".to_string()
+}
+
 /// The plugin backing a capability and the scope of what its action may target.
 ///
 /// For the `http` plugin this is a URL glob + an allowed-methods list; the LLM
@@ -77,6 +81,10 @@ pub struct Capability {
     /// only the action's own arguments (e.g. `to`, `subject`, `body`).
     #[serde(default)]
     pub input_schema: serde_json::Value,
+    /// Reversibility class stamped on approvals opened for this capability
+    /// (`reversible` | `partially-reversible` | `irreversible`). Drives the D3 floor.
+    #[serde(default = "default_reversible")]
+    pub reversibility: String,
     /// When set, this capability is an **LLM-proxy** capability rather than a
     /// named MCP tool: it backs the `POST /llm/...` model endpoint a harness
     /// points its `base_url` at (connector M1, decision 5). It is NOT exposed in
@@ -158,6 +166,14 @@ impl Capability {
         }
         if self.credential_ref.trim().is_empty() {
             return Err("capability credential_ref must not be empty".to_string());
+        }
+        match self.reversibility.trim() {
+            "reversible" | "partially-reversible" | "irreversible" => {}
+            other => {
+                return Err(format!(
+                    "capability reversibility {other:?} must be reversible, partially-reversible, or irreversible"
+                ));
+            }
         }
         if let Some(glob) = &self.target.url_glob {
             glob::Pattern::new(glob)
@@ -472,6 +488,7 @@ mod tests {
                 "properties": { "body": { "type": "object" } },
                 "required": ["body"]
             }),
+            reversibility: "reversible".to_string(),
             llm: None,
         }
     }

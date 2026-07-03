@@ -29,8 +29,10 @@ struct MockGrant {
     grant_id: String,
     tenant_id: String,
     delegate_agent_id: String,
+    delegate_agent_ep: Option<String>,
     scope: DelegationGrantScope,
     revoked: bool,
+    expiry: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -84,11 +86,13 @@ async fn mock_list_grants(
                 "grant_id": g.grant_id,
                 "tenant_id": g.tenant_id,
                 "delegate_agent_id": g.delegate_agent_id,
+                "delegate_agent_ep": g.delegate_agent_ep,
                 "scope": {
                     "max_risk_tier": g.scope.max_risk_tier,
                     "action_classes": g.scope.action_classes,
                 },
                 "revoked": g.revoked,
+                "expiry": g.expiry,
             })
         })
         .collect();
@@ -143,15 +147,19 @@ fn default_mock_grants() -> Vec<MockGrant> {
         grant_id: id.to_string(),
         tenant_id: "acme".to_string(),
         delegate_agent_id: "delegate-bot".to_string(),
+        delegate_agent_ep: Some("ep_delegate_bot_acme".to_string()),
         scope: scope.clone(),
         revoked: false,
+        expiry: None,
     })
     .chain(std::iter::once(MockGrant {
         grant_id: "grant_cross".to_string(),
         tenant_id: "tenant-a".to_string(),
         delegate_agent_id: "delegate-bot".to_string(),
+        delegate_agent_ep: std::env::var("DELEGATION_DELEGATE_EP").ok(),
         scope: scope.clone(),
         revoked: false,
+        expiry: None,
     }))
     .collect()
 }
@@ -247,8 +255,9 @@ async fn delegate_approval_records_approver_kind_in_outbox() {
         },
         use_token_id: None,
         principal_id: Some("k1".to_string()),
-        agent_label: None,
+        agent_label: Some("ep_requester_acme".to_string()),
         tenant: Some("acme".to_string()),
+        trusted_irreversible: None,
         workload_id: None,
         action_label: None,
         dual_control: false,
@@ -380,8 +389,9 @@ async fn delegate_decision_delivers_signed_webhook_to_govder_consumer() {
         },
         use_token_id: None,
         principal_id: Some("k1".to_string()),
-        agent_label: None,
+        agent_label: Some("ep_requester_acme".to_string()),
         tenant: Some("acme".to_string()),
+        trusted_irreversible: None,
         workload_id: None,
         action_label: None,
         dual_control: false,
@@ -480,6 +490,8 @@ async fn delegate_decision_cross_plane_to_govder() {
             .unwrap();
     let vap_secret = mint_body["token"].as_str().unwrap().to_string();
 
+    let requester_ep = std::env::var("DELEGATION_REQUESTER_EP")
+        .expect("DELEGATION_REQUESTER_EP required for cross-plane harness");
     let (approval, _oob) = vultrino::approval::ApprovalRequest::open(NewApproval {
         credential: "stripe-prod".to_string(),
         action: "http.request".to_string(),
@@ -493,8 +505,9 @@ async fn delegate_decision_cross_plane_to_govder() {
         },
         use_token_id: None,
         principal_id: Some("k1".to_string()),
-        agent_label: None,
+        agent_label: Some(requester_ep),
         tenant: Some(tenant.clone()),
+        trusted_irreversible: None,
         workload_id: None,
         action_label: None,
         dual_control: false,
@@ -575,8 +588,9 @@ async fn delegate_decide_high_risk_blocked_at_pep() {
         },
         use_token_id: None,
         principal_id: Some("k1".to_string()),
-        agent_label: None,
+        agent_label: Some("ep_requester_acme".to_string()),
         tenant: Some("acme".to_string()),
+        trusted_irreversible: None,
         workload_id: None,
         action_label: None,
         dual_control: false,
@@ -640,7 +654,7 @@ async fn delegate_decide_irreversible_blocked_at_pep() {
     let (approval, _oob) = vultrino::approval::ApprovalRequest::open(NewApproval {
         credential: "stripe-prod".to_string(),
         action: "http.request".to_string(),
-        params: serde_json::json!({"method": "post", "irreversible": true}),
+        params: serde_json::json!({"method": "post"}),
         requester: RequesterInfo {
             principal_kind: "api_key".to_string(),
             principal_id: Some("k1".to_string()),
@@ -650,8 +664,9 @@ async fn delegate_decide_irreversible_blocked_at_pep() {
         },
         use_token_id: None,
         principal_id: Some("k1".to_string()),
-        agent_label: None,
+        agent_label: Some("ep_requester_acme".to_string()),
         tenant: Some("acme".to_string()),
+        trusted_irreversible: Some(true),
         workload_id: None,
         action_label: None,
         dual_control: false,

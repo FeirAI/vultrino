@@ -136,6 +136,7 @@ fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
             .and_then(|s| s.delegation_grant_ref.clone()),
         "risk_tier": a.criticality.to_govder_risk_tier(),
         "irreversible": crate::approval::approval_irreversible(a),
+        "agent_label": a.agent_label,
     })
 }
 
@@ -1629,6 +1630,7 @@ mod tests {
                 action_label: None,
                 dual_control: false,
                 criticality: CriticalityClass::Medium,
+            trusted_irreversible: None,
                 escalate_after: chrono::Duration::minutes(30),
                 escalate_window: chrono::Duration::minutes(30),
                 oob_identity: None,

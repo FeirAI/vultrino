@@ -115,6 +115,7 @@ async fn register_send_email(storage: &Arc<dyn StorageBackend>, credential_ref: 
             "properties": { "body": { "type": "object" } },
             "required": ["body"]
         }),
+        reversibility: "reversible".to_string(),
         llm: None,
     };
     storage.store_capability(&cap).await.unwrap();
@@ -322,6 +323,7 @@ async fn http_tools_call_runs_enforced_path() {
         },
         credential_ref: "cred-internal".to_string(),
         input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        reversibility: "reversible".to_string(),
         llm: None,
     };
     storage.store_capability(&cap).await.unwrap();

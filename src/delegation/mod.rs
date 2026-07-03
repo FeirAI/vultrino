@@ -1,5 +1,7 @@
-//! Delegation grant evaluation (plan 031 D3) — fail-closed floors for delegate-agent
-//! approvals at the vultrino decide path (before status transitions to Approved).
+//! Delegation grant evaluation (plan 031 D3) — **test/mock only**.
+//!
+//! Production delegate decisions consult govder via [`crate::govder::GovderClient`].
+//! This local evaluator exists for integration-test mock govder servers only.
 
 use serde::{Deserialize, Serialize};
 

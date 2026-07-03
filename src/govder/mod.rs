@@ -16,12 +16,23 @@ use url::Url;
 pub use tenant_assert::sign_tenant_assertion;
 
 /// Configuration for outbound govder delegation calls.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GovderConfig {
     pub base_url: String,
     pub assertion_secret: String,
     pub assertion_ttl: Duration,
     pub http_timeout: Duration,
+}
+
+impl std::fmt::Debug for GovderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GovderConfig")
+            .field("base_url", &self.base_url)
+            .field("assertion_secret", &"<redacted>")
+            .field("assertion_ttl", &self.assertion_ttl)
+            .field("http_timeout", &self.http_timeout)
+            .finish()
+    }
 }
 
 impl GovderConfig {
@@ -72,6 +83,9 @@ pub struct DelegationGrant {
     pub grant_id: String,
     pub tenant_id: String,
     pub delegate_agent_id: String,
+    /// Canonical enforcement principal (ep_…) bound to vap_ tokens.
+    #[serde(default)]
+    pub delegate_agent_ep: Option<String>,
     pub scope: GovderGrantScope,
     pub revoked: bool,
     #[serde(default)]
@@ -104,6 +118,7 @@ pub struct EvaluateInput<'a> {
     pub tenant: &'a str,
     pub grant_id: &'a str,
     pub delegate_agent_id: &'a str,
+    pub requester_agent_id: &'a str,
     pub action_class: &'a str,
     pub risk_tier: &'a str,
     pub irreversible: bool,
@@ -172,11 +187,22 @@ impl GovderClient {
                 "delegation: grant {grant_id} is revoked (fail-closed)"
             )));
         }
+        if let Some(expiry) = grant.expiry.as_deref() {
+            if !expiry.trim().is_empty() {
+                if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expiry) {
+                    if exp < chrono::Utc::now() {
+                        return Err(GovderError::Policy(format!(
+                            "delegation: grant {grant_id} is expired (fail-closed)"
+                        )));
+                    }
+                }
+            }
+        }
         if let Some(delegate) = delegate_agent_id {
-            if !delegate.trim().is_empty() && delegate != grant.delegate_agent_id {
+            if !delegate.trim().is_empty() && !delegate_matches_grant(&grant, delegate) {
                 return Err(GovderError::Policy(format!(
-                    "delegation: grant delegate {} does not match requested delegate {delegate} (fail-closed)",
-                    grant.delegate_agent_id
+                    "delegation: grant delegate {:?} does not match requested delegate {delegate} (fail-closed)",
+                    grant_canonical_delegate(&grant)
                 )));
             }
         }
@@ -210,6 +236,7 @@ impl GovderClient {
         let body = EvaluateRequest {
             grant_id: input.grant_id.to_string(),
             delegate_agent_id: input.delegate_agent_id.to_string(),
+            requester_agent_id: input.requester_agent_id.to_string(),
             action_class: input.action_class.to_string(),
             risk_tier: input.risk_tier.to_string(),
             irreversible: input.irreversible,
@@ -285,10 +312,35 @@ impl GovderClient {
     }
 }
 
+fn grant_canonical_delegate(grant: &DelegationGrant) -> String {
+    grant
+        .delegate_agent_ep
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(grant.delegate_agent_id.as_str())
+        .to_string()
+}
+
+fn delegate_matches_grant(grant: &DelegationGrant, delegate: &str) -> bool {
+    let d = delegate.trim();
+    if d.is_empty() {
+        return false;
+    }
+    if d == grant.delegate_agent_id.trim() {
+        return true;
+    }
+    grant
+        .delegate_agent_ep
+        .as_deref()
+        .map(|ep| d == ep.trim())
+        .unwrap_or(false)
+}
+
 #[derive(Serialize)]
 struct EvaluateRequest {
     grant_id: String,
     delegate_agent_id: String,
+    requester_agent_id: String,
     action_class: String,
     risk_tier: String,
     irreversible: bool,

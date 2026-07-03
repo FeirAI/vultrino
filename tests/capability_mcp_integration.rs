@@ -65,6 +65,7 @@ async fn register_capability(storage: &Arc<dyn StorageBackend>, credential_ref: 
             "properties": { "body": { "type": "object" } },
             "required": ["body"]
         }),
+        reversibility: "reversible".to_string(),
         llm: None,
     };
     storage.store_capability(&cap).await.unwrap();
@@ -300,6 +301,7 @@ async fn allowed_tools_call_reaches_execute_past_policy() {
         },
         credential_ref: "cred-internal".to_string(),
         input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        reversibility: "reversible".to_string(),
         llm: None,
     };
     storage.store_capability(&cap).await.unwrap();
@@ -380,6 +382,7 @@ async fn capability_tool_output_does_not_leak_secret() {
         },
         credential_ref: "cred-internal".to_string(),
         input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        reversibility: "reversible".to_string(),
         llm: None,
     };
     storage.store_capability(&cap).await.unwrap();

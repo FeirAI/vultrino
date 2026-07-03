@@ -2945,6 +2945,7 @@ async fn test_v11_approvals_are_tenant_scoped() {
         action_label: None,
         dual_control: false,
         criticality: vultrino::approval::CriticalityClass::Medium,
+            trusted_irreversible: None,
         escalate_after: Duration::minutes(30),
         escalate_window: Duration::minutes(30),
         oob_identity: None,

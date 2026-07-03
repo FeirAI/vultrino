@@ -442,10 +442,20 @@ pub struct ApprovalSummary {
     /// tenant as defense-in-depth — an explicit `null` unambiguously means
     /// "untenanted/shared", which an omitted field could not distinguish.
     pub tenant: Option<String>,
+    /// `human` or `delegate-agent` when a terminal decision was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approver_kind: Option<String>,
+    /// Govder DelegationGrant id when decided by a delegate agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_grant_ref: Option<String>,
+    /// Channel / identity that decided the approval (human panel, delegate-agent, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
 }
 
 impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
     fn from(a: &crate::approval::ApprovalRequest) -> Self {
+        let last = a.signoffs.last();
         ApprovalSummary {
             id: a.id.clone(),
             status: a.status.to_string(),
@@ -462,6 +472,25 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
             approvals_received: a.signoffs.len() as u32,
             is_open: a.status.is_open() && !a.is_past_ttl(),
             tenant: a.tenant.clone(),
+            approver_kind: last.map(|s| s.approver_kind.clone()).or_else(|| {
+                if a.status.is_open() {
+                    None
+                } else {
+                    a.decided_by.as_ref().map(|_| "human".to_string())
+                }
+            }),
+            delegation_grant_ref: last
+                .and_then(|s| s.delegation_grant_ref.clone())
+                .or(None),
+            decided_by: a.decided_by.clone().or_else(|| {
+                last.map(|s| {
+                    if s.approver_kind == "delegate-agent" {
+                        s.channel.clone()
+                    } else {
+                        s.approver_identity.clone()
+                    }
+                })
+            }),
         }
     }
 }
@@ -1463,6 +1492,9 @@ pub struct CapabilityUpsertRequest {
     /// dynamically at tools/list time).
     #[serde(default)]
     pub input_schema: serde_json::Value,
+    /// Reversibility class (`reversible` | `partially-reversible` | `irreversible`).
+    #[serde(default)]
+    pub reversibility: Option<String>,
     /// When set, marks this as an LLM-proxy capability (backs `POST /llm` rather
     /// than appearing as a named MCP tool). Carries the provider base URL.
     #[serde(default)]
@@ -1481,6 +1513,13 @@ fn build_capability(req: CapabilityUpsertRequest, forced_id: Option<String>) -> 
         target: req.target,
         credential_ref: req.credential_ref.trim().to_string(),
         input_schema: req.input_schema,
+        reversibility: req
+            .reversibility
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("reversible")
+            .to_string(),
         llm: req.llm,
     };
     capability.validate()?;
@@ -1766,11 +1805,20 @@ pub async fn api_revoke_token(
 
 // -------- Agent token resolve (plan 031 agent-initiated spawn) --------
 
+/// Optional query filter for agent token resolve.
+#[derive(Deserialize)]
+pub struct AgentResolveQuery {
+    /// When set (e.g. `agent.spawn`), the token's `action_scope` must match.
+    #[serde(default)]
+    pub required_action: Option<String>,
+}
+
 /// `GET /api/v1/auth/agent` — resolve a Bearer `vut_` use token to the bound
 /// agent label + tenant. Read-only; used by muntin broker for agent-initiated spawn.
 pub async fn api_resolve_agent_token(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    Query(query): Query<AgentResolveQuery>,
 ) -> Response {
     let secret = match extract_api_key(&headers) {
         Some(s) => s,
@@ -1807,6 +1855,23 @@ pub async fn api_resolve_agent_token(
     if let Err(e) = token.check_usable() {
         return error_response(StatusCode::FORBIDDEN, "token_unusable", e.to_string());
     }
+    if let Some(required) = query
+        .required_action
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !token.allows_action(required) {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "token_scope_denied",
+                format!(
+                    "Use token action_scope {:?} does not permit required action {required:?}",
+                    token.action_scope
+                ),
+            );
+        }
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1814,6 +1879,10 @@ pub async fn api_resolve_agent_token(
             "agent_label": token.agent_label,
             "tenant": token.tenant,
             "token_prefix": token.token_prefix,
+            "action_scope": token.action_scope,
+            "max_uses": token.max_uses,
+            "uses": token.uses,
+            "require_approval": token.require_approval,
         })),
     )
         .into_response()
@@ -1888,7 +1957,7 @@ pub async fn api_create_approval_token(
                 );
             }
         };
-        let grant_scope = match govder
+        let (grant, grant_scope) = match govder
             .lookup_grant(
                 &tenant,
                 req.delegation_grant_ref.trim(),
@@ -1896,7 +1965,7 @@ pub async fn api_create_approval_token(
             )
             .await
         {
-            Ok((_, scope)) => scope,
+            Ok(pair) => pair,
             Err(crate::govder::GovderError::Policy(msg)) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -1914,10 +1983,11 @@ pub async fn api_create_approval_token(
                 );
             }
         };
+        let agent_label = req.agent_label.or_else(|| grant.delegate_agent_ep.clone());
         let params = NewApprovalToken {
             delegation_grant_ref: req.delegation_grant_ref,
             grant_scope,
-            agent_label: req.agent_label,
+            agent_label,
             delegator_identity: req.delegator_identity,
             tenant: req.tenant.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             expires_in,
@@ -2079,11 +2149,24 @@ pub async fn api_delegate_decide_approval(
             );
         }
     };
+    let requester_agent_id = existing
+        .agent_label
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("");
+    if requester_agent_id.is_empty() {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "requester_required",
+            "Approval must carry requester agent_label for delegate evaluation (fail-closed)",
+        );
+    }
     let eval = match govder
         .evaluate_delegate_decision(crate::govder::EvaluateInput {
             tenant,
             grant_id: &grant_ref,
             delegate_agent_id: &approver,
+            requester_agent_id,
             action_class: &existing.action,
             risk_tier: existing.criticality.to_govder_risk_tier(),
             irreversible: crate::approval::approval_irreversible(&existing),
@@ -2104,7 +2187,7 @@ pub async fn api_delegate_decide_approval(
             );
         }
     };
-    if body.approve && !eval.permitted {
+    if !eval.permitted {
         return error_response(
             StatusCode::FORBIDDEN,
             "delegate_decision_denied",

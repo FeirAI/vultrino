@@ -863,6 +863,9 @@ impl VultrinoServer {
             if requester.owner.is_none() {
                 requester.owner = principal.as_ref().and_then(|p| p.owner.clone());
             }
+            let trusted_irreversible = self
+                .trusted_irreversible_for_action(&full_action, action_label.as_deref())
+                .await;
             let (approval, decision_token) = ApprovalRequest::open(NewApproval {
                 credential: credential.alias.clone(),
                 action: full_action.clone(),
@@ -878,6 +881,7 @@ impl VultrinoServer {
                 action_label: action_label.clone(),
                 dual_control,
                 criticality,
+                trusted_irreversible: Some(trusted_irreversible),
                 escalate_after: sla.escalate_after(),
                 escalate_window: sla.escalate_window(),
                 oob_identity: self.approval_config.oob_approver_identity.clone(),
@@ -2086,6 +2090,27 @@ impl VultrinoServer {
         // call it and will be told to await approval, exactly like a generic gated
         // tool. Only an outright `Deny` hides it.
         !matches!(decision, crate::policy::PolicyDecision::Deny(_))
+    }
+
+    /// Trusted irreversibility for D3 floors: resolve from stored capability metadata
+    /// (not requester-authored params). Matches canonical action or govder label.
+    async fn trusted_irreversible_for_action(
+        &self,
+        canonical_action: &str,
+        action_label: Option<&str>,
+    ) -> bool {
+        let _ = self.storage.reload().await;
+        let caps = self.storage.list_capabilities().await.unwrap_or_default();
+        for cap in caps {
+            let (resolved, label) = self.config.resolve_action(&cap.action);
+            if resolved == canonical_action
+                || action_label.map(|l| l == cap.action.as_str()).unwrap_or(false)
+                || label.as_deref() == action_label
+            {
+                return crate::approval::reversibility_requires_human_floor(&cap.reversibility);
+            }
+        }
+        false
     }
 
     /// List the capabilities a principal is permitted to see (connector M1). The
