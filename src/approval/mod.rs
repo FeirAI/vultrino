@@ -100,6 +100,27 @@ impl std::fmt::Display for CriticalityClass {
     }
 }
 
+impl CriticalityClass {
+    /// Govder risk_tier wire value (plan 031 D3 cross-plane contract).
+    pub fn to_govder_risk_tier(self) -> &'static str {
+        match self {
+            CriticalityClass::Low => "Low",
+            CriticalityClass::Medium => "Medium",
+            CriticalityClass::High => "High",
+            CriticalityClass::Critical => "Extreme",
+        }
+    }
+}
+
+/// Whether the approval action is irreversible (plan 031 D3 floor input).
+/// Vultrino may set `params.irreversible: true` on the approval request.
+pub fn approval_irreversible(a: &ApprovalRequest) -> bool {
+    a.params
+        .get("irreversible")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// The result of advancing an approval through its SLA lifecycle (V5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleChange {

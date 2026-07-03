@@ -110,6 +110,8 @@ fn stage_event(
 }
 
 /// The agent-safe outbox payload for an approval decision/lifecycle event (V9).
+/// Cross-plane contract (plan 031 D3): `risk_tier` + `irreversible` mirror
+/// govder enforce/approvalPayload and feed delegate D3 floors on the webhook path.
 fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
     serde_json::json!({
         "approval_id": a.id,
@@ -132,6 +134,8 @@ fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
             .signoffs
             .last()
             .and_then(|s| s.delegation_grant_ref.clone()),
+        "risk_tier": a.criticality.to_govder_risk_tier(),
+        "irreversible": crate::approval::approval_irreversible(a),
     })
 }
 
