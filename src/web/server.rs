@@ -63,6 +63,8 @@ pub struct AppState {
     /// Shared execution server, built once with plugins loaded — reused by the
     /// JSON API handlers instead of rebuilding + re-scanning plugins per request.
     pub server: Arc<crate::server::VultrinoServer>,
+    /// Govder decide-plane client for delegation grant/evaluate (plan 031).
+    pub govder: Option<Arc<crate::govder::GovderClient>>,
 }
 
 impl FromRef<AppState> for Arc<dyn StorageBackend> {
@@ -106,6 +108,16 @@ impl WebServer {
         let trust_forwarded_for = std::env::var("VULTRINO_TRUST_FORWARDED_FOR")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let govder = vultrino_config
+            .govder
+            .as_ref()
+            .and_then(|cfg| match crate::govder::GovderClient::new(cfg.clone()) {
+                Ok(c) => Some(Arc::new(c)),
+                Err(e) => {
+                    tracing::error!(error = %e, "govder client init failed — delegate paths fail-closed");
+                    None
+                }
+            });
         let app_state = AppState {
             storage,
             auth_manager: Arc::new(RwLock::new(auth_manager)),
@@ -114,6 +126,7 @@ impl WebServer {
             rate_limiter: LoginRateLimiter::new(),
             trust_forwarded_for,
             server,
+            govder,
         };
 
         Self { config, app_state }

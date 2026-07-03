@@ -730,7 +730,7 @@ async fn test_ownership_check_blocks_foreign_principal() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "test", "secops", false, None, None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "test", "secops", false, None, None, None).await.unwrap();
 
     // Foreign principal: rejected, and the action must NOT have run.
     let err = server
@@ -782,7 +782,7 @@ async fn test_preflight_failure_is_retryable_and_does_not_burn_token() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None, None).await.unwrap();
 
     let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
     assert!(!resumed.executed, "preflight failure must remain retryable");
@@ -805,7 +805,7 @@ async fn test_stale_execution_claim_recovers() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None, None).await.unwrap();
 
     // Simulate a crashed worker holding a stale claim.
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -835,7 +835,7 @@ async fn test_heartbeat_prevents_stale_reclaim() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None, None).await.unwrap();
 
     // Worker A claims, then its claim ages past the stale window...
     let claimed = storage.claim_approval_for_execution(&approval.id).await.unwrap();
@@ -876,7 +876,7 @@ async fn test_resume_with_unusable_token_is_terminal() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None).await.unwrap();
+    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None, None).await.unwrap();
 
     // Token is revoked after approval but before the agent polls to execute.
     storage.set_use_token_revoked(&token.id).await.unwrap();
@@ -1039,7 +1039,7 @@ async fn test_deny_pushed_after_approval_blocks_resume() {
         ExecutionOutcome::Pending(a) => a.id,
         other => panic!("expected Pending, got {other:?}"),
     };
-    storage.decide_approval(&approval_id, true, "approver", "secops", false, None, None).await.unwrap();
+    storage.decide_approval(&approval_id, true, "approver", "secops", false, None, None, None).await.unwrap();
 
     // Emergency Deny pushed (evaluated after the allow policy, which defaults to
     // Allow → continue → the Deny policy denies).
@@ -1125,7 +1125,7 @@ async fn test_default_deny_approved_action_still_resumes() {
     };
 
     storage
-        .decide_approval(&approval_id, true, "test approver", "secops", false, None, None)
+        .decide_approval(&approval_id, true, "test approver", "secops", false, None, None, None)
         .await
         .unwrap();
 
@@ -1301,7 +1301,7 @@ async fn test_per_agent_deny_refires_at_resume() {
     // Push a per-agent Deny and approve; the resume must be blocked.
     storage.store_policy(&Policy::deny_all("kill-bot", "api-*").with_principal("refund-bot")).await.unwrap();
     server.reload_policies().await.unwrap();
-    storage.decide_approval(&approval_id, true, "approver", "secops", false, None, None).await.unwrap();
+    storage.decide_approval(&approval_id, true, "approver", "secops", false, None, None, None).await.unwrap();
 
     let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
     assert!(
@@ -1376,7 +1376,7 @@ async fn test_spend_capped_approval_resumes_without_recheck() {
         other => panic!("expected PolicyDenied, got {other:?}"),
     }
 
-    storage.decide_approval(&approval_id, true, "approver", "secops", false, None, None).await.unwrap();
+    storage.decide_approval(&approval_id, true, "approver", "secops", false, None, None, None).await.unwrap();
 
     // Resume must succeed (read-only spend check treats it as already-admitted).
     let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
@@ -1727,7 +1727,7 @@ async fn test_v5_approver_identity_recorded_and_sod_computable() {
 
     // A blank approver identity is rejected (every decision must be attributable).
     let err = storage
-        .decide_approval(&approval.id, true, "admin panel", "  ", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "  ", false, None, None, None)
         .await
         .unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("approver identity"), "got: {err}");
@@ -1735,7 +1735,7 @@ async fn test_v5_approver_identity_recorded_and_sod_computable() {
     // Self-approval (approver == requester owner) records the identity and is a
     // computable SoD violation.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "agent-x", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "agent-x", false, None, None, None)
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -1772,7 +1772,7 @@ async fn test_v5_distinct_approver_satisfies_sod() {
         other => panic!("expected Pending, got {other:?}"),
     };
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops-oncall", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "secops-oncall", false, None, None, None)
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -1802,7 +1802,7 @@ async fn test_v5_reauth_lapse_expires_on_poll() {
 
     // Approve it, then back-date the decision so the reauth window has lapsed.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None, None)
         .await
         .unwrap();
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -1857,7 +1857,7 @@ async fn test_v5_enforce_sod_rejects_self_approval_end_to_end() {
 
     // Self-approval is rejected (SoD enforced).
     let err = storage
-        .decide_approval(&approval.id, true, "admin panel", "agent-x", true, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "agent-x", true, None, None, None)
         .await
         .unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("separation of duty"), "got: {err}");
@@ -1866,7 +1866,7 @@ async fn test_v5_enforce_sod_rejects_self_approval_end_to_end() {
 
     // A distinct approver succeeds even with enforcement on.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops-oncall", true, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "secops-oncall", true, None, None, None)
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -1900,7 +1900,7 @@ async fn test_v5_decide_past_deadline_is_rejected() {
     // never approved. (The rejected transaction isn't persisted, so the record
     // stays open until the next poll/sweep expires it — which we then confirm.)
     let err = storage
-        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None, None)
         .await
         .unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("expire"), "got: {err}");
@@ -1931,7 +1931,7 @@ async fn test_v5_poll_refresh_does_not_clobber_a_decision() {
 
     // Decide it (Approved).
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None, None)
         .await
         .unwrap();
 
@@ -1971,7 +1971,7 @@ async fn test_v5_sweep_expires_reauth_lapsed_grant_preserving_approver() {
 
     // Approve as alice, then back-date the decision past the reauth window.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "alice", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "alice", false, None, None, None)
         .await
         .unwrap();
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -2135,7 +2135,7 @@ async fn test_v6_halt_denies_approved_action_on_resume() {
 
     // Approve it, then halt the agent before it polls to execute.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None, None)
         .await
         .unwrap();
     server.halt_agent("bot-7").await.unwrap();
@@ -2453,7 +2453,7 @@ async fn test_v9_lifecycle_events_emitted_to_outbox() {
 
     // Decide → approval.approved emitted atomically with the decision.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None, None)
         .await
         .unwrap();
     let events = storage.list_events_after(0, 100).await.unwrap();
@@ -2504,7 +2504,7 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
 
     // First approver → still pending (1 of 2), action must NOT run.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "alice", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "alice", false, None, None, None)
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -2513,7 +2513,7 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
 
     // The same approver can't satisfy the second sign-off.
     let err = storage
-        .decide_approval(&approval.id, true, "admin panel", "alice", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "alice", false, None, None, None)
         .await
         .unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("already signed off"), "got: {err}");
@@ -2525,7 +2525,7 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
 
     // A second DISTINCT approver meets the threshold → Approved → runs on next poll.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "bob", false, None, None)
+        .decide_approval(&approval.id, true, "admin panel", "bob", false, None, None, None)
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();

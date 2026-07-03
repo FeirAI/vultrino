@@ -761,6 +761,7 @@ pub async fn api_decide_approval(
             enforce_sod,
             body.note,
             None,
+            None,
         )
         .await
     {
@@ -1823,7 +1824,9 @@ pub async fn api_resolve_agent_token(
 #[derive(Serialize, Deserialize)]
 pub struct ApprovalTokenCreateRequest {
     pub delegation_grant_ref: String,
-    pub grant_scope: crate::delegation::DelegationGrantScope,
+    /// Ignored when govder is configured — scope is snapshotted from govder SoR.
+    #[serde(default)]
+    pub grant_scope: Option<crate::delegation::DelegationGrantScope>,
     #[serde(default)]
     pub agent_label: Option<String>,
     pub delegator_identity: String,
@@ -1855,15 +1858,65 @@ pub async fn api_create_approval_token(
                 );
             }
         };
-        if let Err(e) = req.grant_scope.validate() {
-            return (
-                StatusCode::BAD_REQUEST,
-                serde_json::json!({"code": "invalid_grant_scope", "error": e}),
-            );
-        }
+        let govder = match &st.govder {
+            Some(c) => c,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({
+                        "code": "govder_not_configured",
+                        "error": "Delegation approval tokens require govder (GOVDER_BASE_URL + GOVDER_TENANT_ASSERTION_SECRET)"
+                    }),
+                );
+            }
+        };
+        let tenant = req
+            .tenant
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let tenant = match tenant {
+            Some(t) => t,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({
+                        "code": "tenant_required",
+                        "error": "tenant is required to validate delegation_grant_ref against govder"
+                    }),
+                );
+            }
+        };
+        let grant_scope = match govder
+            .lookup_grant(
+                &tenant,
+                req.delegation_grant_ref.trim(),
+                req.agent_label.as_deref(),
+            )
+            .await
+        {
+            Ok((_, scope)) => scope,
+            Err(crate::govder::GovderError::Policy(msg)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"code": "invalid_grant_ref", "error": msg}),
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "approval token mint: govder grant lookup failed");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({
+                        "code": "govder_unavailable",
+                        "error": "Failed to validate delegation grant against govder (fail-closed)"
+                    }),
+                );
+            }
+        };
         let params = NewApprovalToken {
             delegation_grant_ref: req.delegation_grant_ref,
-            grant_scope: req.grant_scope,
+            grant_scope,
             agent_label: req.agent_label,
             delegator_identity: req.delegator_identity,
             tenant: req.tenant.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
@@ -2000,16 +2053,57 @@ pub async fn api_delegate_decide_approval(
     let grant_ref = token.delegation_grant_ref.clone();
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
 
-    let eval = crate::delegation::evaluate_delegate_decision(
-        crate::delegation::DelegateEvalInput {
-            grant_scope: &token.grant_scope,
+    let govder = match &state.govder {
+        Some(c) => c,
+        None => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "govder_not_configured",
+                "Delegate decisions require govder (GOVDER_BASE_URL + GOVDER_TENANT_ASSERTION_SECRET)",
+            );
+        }
+    };
+    let tenant = token
+        .tenant
+        .as_deref()
+        .or(existing.tenant.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let tenant = match tenant {
+        Some(t) => t,
+        None => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "tenant_required",
+                "Approval and token must carry tenant for govder delegate evaluation (fail-closed)",
+            );
+        }
+    };
+    let eval = match govder
+        .evaluate_delegate_decision(crate::govder::EvaluateInput {
+            tenant,
+            grant_id: &grant_ref,
             delegate_agent_id: &approver,
             action_class: &existing.action,
             risk_tier: existing.criticality.to_govder_risk_tier(),
             irreversible: crate::approval::approval_irreversible(&existing),
             approve: body.approve,
-        },
-    );
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(crate::govder::GovderError::Policy(msg)) => {
+            return error_response(StatusCode::FORBIDDEN, "delegate_decision_denied", msg);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, approval_id = %id, "delegate decide: govder evaluate failed");
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "govder_unavailable",
+                "Failed to evaluate delegate decision against govder (fail-closed)",
+            );
+        }
+    };
     if body.approve && !eval.permitted {
         return error_response(
             StatusCode::FORBIDDEN,
@@ -2017,6 +2111,7 @@ pub async fn api_delegate_decide_approval(
             eval.reason,
         );
     }
+    let pep_ok = if body.approve { Some(true) } else { None };
 
     match state
         .storage
@@ -2028,6 +2123,7 @@ pub async fn api_delegate_decide_approval(
             enforce_sod,
             body.note,
             Some(&grant_ref),
+            pep_ok,
         )
         .await
     {

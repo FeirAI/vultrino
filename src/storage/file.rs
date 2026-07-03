@@ -1102,6 +1102,7 @@ impl StorageBackend for FileStorage {
         enforce_sod: bool,
         note: Option<String>,
         delegation_grant_ref: Option<&str>,
+        delegate_pep_ok: Option<bool>,
     ) -> Result<ApprovalRequest, StorageError> {
         use crate::approval::Decision;
         let decided = self
@@ -1110,6 +1111,15 @@ impl StorageBackend for FileStorage {
                     .approvals
                     .get_mut(id)
                     .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
+                if channel == "delegate-agent"
+                    && approve
+                    && delegate_pep_ok != Some(true)
+                {
+                    return Err(StorageError::Conflict(
+                        "delegate approval blocked: govder PEP evaluation required (fail-closed)"
+                            .to_string(),
+                    ));
+                }
                 // Advance the SLA lifecycle first so a decision raced against the
                 // final deadline is rejected as expired, not silently accepted.
                 approval.advance_lifecycle();

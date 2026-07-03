@@ -1,11 +1,13 @@
 //! Integration test for delegate-agent approval decisions (plan 031 phase 3).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use secrecy::SecretString;
 use tempfile::tempdir;
@@ -14,9 +16,145 @@ use tower::ServiceExt;
 use vultrino::approval::{NewApproval, RequesterInfo};
 use vultrino::auth::AuthManager;
 use vultrino::config::Config;
+use vultrino::delegation::{DelegateEvalInput, DelegationGrantScope, evaluate_delegate_decision};
+use vultrino::govder::GovderConfig;
 use vultrino::outbox::EVENT_APPROVAL_APPROVED;
 use vultrino::storage::{FileStorage, StorageBackend};
 use vultrino::web::{AdminAuth, WebConfig, WebServer};
+
+const TEST_GOVDER_SECRET: &str = "test-govder-assertion-secret";
+
+#[derive(Clone)]
+struct MockGrant {
+    grant_id: String,
+    tenant_id: String,
+    delegate_agent_id: String,
+    scope: DelegationGrantScope,
+    revoked: bool,
+}
+
+#[derive(Clone, Default)]
+struct MockGovderState {
+    grants: Arc<HashMap<String, Vec<MockGrant>>>,
+    evaluate_hits: Arc<Mutex<usize>>,
+}
+
+async fn start_mock_govder(grants: Vec<MockGrant>) -> GovderConfig {
+    let mut by_tenant: HashMap<String, Vec<MockGrant>> = HashMap::new();
+    for g in grants {
+        by_tenant.entry(g.tenant_id.clone()).or_default().push(g);
+    }
+    let state = MockGovderState {
+        grants: Arc::new(by_tenant),
+        evaluate_hits: Arc::new(Mutex::new(0)),
+    };
+    let app = Router::new()
+        .route("/v1/delegation/grants", get(mock_list_grants))
+        .route(
+            "/v1/delegation/evaluate-decision",
+            post(mock_evaluate_delegate_decision),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    GovderConfig {
+        base_url: format!("http://{addr}"),
+        assertion_secret: TEST_GOVDER_SECRET.to_string(),
+        assertion_ttl: Duration::from_secs(90),
+        http_timeout: Duration::from_secs(5),
+    }
+}
+
+async fn mock_list_grants(
+    State(st): State<MockGovderState>,
+    headers: HeaderMap,
+) -> axum::Json<serde_json::Value> {
+    assert!(
+        headers.get("X-Govder-Tenant-Assertion").is_some(),
+        "mock govder expects tenant assertion"
+    );
+    // Tests use a single tenant per case; return all grants (lookup filters by id).
+    let grants: Vec<_> = st
+        .grants
+        .values()
+        .flatten()
+        .map(|g| {
+            serde_json::json!({
+                "grant_id": g.grant_id,
+                "tenant_id": g.tenant_id,
+                "delegate_agent_id": g.delegate_agent_id,
+                "scope": {
+                    "max_risk_tier": g.scope.max_risk_tier,
+                    "action_classes": g.scope.action_classes,
+                },
+                "revoked": g.revoked,
+            })
+        })
+        .collect();
+    axum::Json(serde_json::json!({ "grants": grants }))
+}
+
+async fn mock_evaluate_delegate_decision(
+    State(st): State<MockGovderState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    assert!(
+        headers.get("X-Govder-Tenant-Assertion").is_some(),
+        "mock govder expects tenant assertion on evaluate-decision"
+    );
+    *st.evaluate_hits.lock().unwrap() += 1;
+    let grant_id = body["grant_id"].as_str().unwrap_or("");
+    let grant = st
+        .grants
+        .values()
+        .flatten()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant must exist in mock govder");
+    let eval = evaluate_delegate_decision(DelegateEvalInput {
+        grant_scope: &grant.scope,
+        delegate_agent_id: body["delegate_agent_id"].as_str().unwrap_or(""),
+        action_class: body["action_class"].as_str().unwrap_or(""),
+        risk_tier: body["risk_tier"].as_str().unwrap_or(""),
+        irreversible: body["irreversible"].as_bool().unwrap_or(false),
+        approve: body["approve"].as_bool().unwrap_or(false),
+    });
+    axum::Json(serde_json::json!({
+        "permitted": eval.permitted,
+        "gate_verdict": if eval.permitted { "ALLOW" } else { "DENY" },
+        "reason": eval.reason,
+    }))
+}
+
+fn default_mock_grants() -> Vec<MockGrant> {
+    let scope = DelegationGrantScope {
+        max_risk_tier: "Low".to_string(),
+        action_classes: vec!["http.request".to_string()],
+    };
+    [
+        "grant_test_001",
+        "grant_webhook_001",
+        "grant_high_floor",
+        "grant_irr_floor",
+    ]
+    .into_iter()
+    .map(|id| MockGrant {
+        grant_id: id.to_string(),
+        tenant_id: "acme".to_string(),
+        delegate_agent_id: "delegate-bot".to_string(),
+        scope: scope.clone(),
+        revoked: false,
+    })
+    .chain(std::iter::once(MockGrant {
+        grant_id: "grant_cross".to_string(),
+        tenant_id: "tenant-a".to_string(),
+        delegate_agent_id: "delegate-bot".to_string(),
+        scope: scope.clone(),
+        revoked: false,
+    }))
+    .collect()
+}
 
 async fn build_admin_router() -> (axum::Router, Arc<dyn StorageBackend>, String) {
     let dir = tempdir().unwrap();
@@ -33,6 +171,9 @@ async fn build_admin_router() -> (axum::Router, Arc<dyn StorageBackend>, String)
 
     let mut config = Config::default();
     config.approval.enabled = true;
+    config.govder = Some(
+        GovderConfig::from_env().unwrap_or(start_mock_govder(default_mock_grants()).await),
+    );
 
     let admin = AdminAuth::new("admin", "password123").unwrap();
     let resolver = vultrino::router::CredentialResolver::new(storage.clone());
@@ -53,13 +194,6 @@ async fn build_admin_router() -> (axum::Router, Arc<dyn StorageBackend>, String)
         exec_server,
     );
     (server.into_router(), storage, admin_key)
-}
-
-fn low_grant_scope_json() -> serde_json::Value {
-    serde_json::json!({
-        "max_risk_tier": "Low",
-        "action_classes": ["http.request"]
-    })
 }
 
 fn bearer_req(method: &str, uri: &str, token: &str, body: serde_json::Value) -> Request<Body> {
@@ -85,7 +219,6 @@ async fn delegate_approval_records_approver_kind_in_outbox() {
             &admin_key,
             serde_json::json!({
                 "delegation_grant_ref": "grant_test_001",
-                "grant_scope": low_grant_scope_json(),
                 "agent_label": "delegate-bot",
                 "delegator_identity": "alice@corp",
                 "tenant": "acme"
@@ -220,7 +353,7 @@ async fn delegate_decision_delivers_signed_webhook_to_govder_consumer() {
             &admin_key,
             serde_json::json!({
                 "delegation_grant_ref": "grant_webhook_001",
-                "grant_scope": low_grant_scope_json(),
+
                 "agent_label": "delegate-bot",
                 "delegator_identity": "alice@corp",
                 "tenant": "acme"
@@ -333,7 +466,7 @@ async fn delegate_decision_cross_plane_to_govder() {
             &admin_key,
             serde_json::json!({
                 "delegation_grant_ref": grant_ref,
-                "grant_scope": low_grant_scope_json(),
+
                 "agent_label": "delegate-bot",
                 "delegator_identity": "alice@corp",
                 "tenant": tenant
@@ -415,7 +548,7 @@ async fn delegate_decide_high_risk_blocked_at_pep() {
             &admin_key,
             serde_json::json!({
                 "delegation_grant_ref": "grant_high_floor",
-                "grant_scope": low_grant_scope_json(),
+
                 "agent_label": "delegate-bot",
                 "delegator_identity": "alice@corp",
                 "tenant": "acme"
@@ -490,7 +623,7 @@ async fn delegate_decide_irreversible_blocked_at_pep() {
             &admin_key,
             serde_json::json!({
                 "delegation_grant_ref": "grant_irr_floor",
-                "grant_scope": low_grant_scope_json(),
+
                 "agent_label": "delegate-bot",
                 "delegator_identity": "alice@corp",
                 "tenant": "acme"

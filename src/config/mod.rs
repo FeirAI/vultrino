@@ -76,6 +76,9 @@ pub struct Config {
     /// kill-switch, the `stream_options.include_usage` injection toggle, and the
     /// stream-safety DoS caps. Defaults are streaming-on with conservative caps.
     pub llm_proxy: LlmProxyConfig,
+    /// Govder decide-plane client config (plan 031). Sourced from
+    /// `GOVDER_BASE_URL` + `GOVDER_TENANT_ASSERTION_SECRET` at startup — not TOML.
+    pub govder: Option<crate::govder::GovderConfig>,
 }
 
 /// Tunables for the metered LLM proxy's streaming path (connector M1).
@@ -417,6 +420,7 @@ impl Config {
             // process entrypoint fills it from `VULTRINO_POLICY_HASH_SECRET`.
             policy_hash_secret: None,
             llm_proxy,
+            govder: None,
         })
     }
 
@@ -438,6 +442,7 @@ impl Config {
             identity: None,
             policy_hash_secret: None,
             llm_proxy: LlmProxyConfig::default(),
+            govder: None,
         }
     }
 

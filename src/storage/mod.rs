@@ -359,6 +359,7 @@ pub trait StorageBackend: Send + Sync {
         _enforce_sod: bool,
         _note: Option<String>,
         _delegation_grant_ref: Option<&str>,
+        _delegate_pep_ok: Option<bool>,
     ) -> Result<ApprovalRequest, StorageError> {
         Err(StorageError::ApprovalNotFound(_id.to_string()))
     }

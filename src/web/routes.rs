@@ -1157,7 +1157,7 @@ pub async fn approval_approve(
     // tenant-scoped admin surface gates on (metrics already scopes by the key tenant).
     let result = state
         .storage
-        .decide_approval(&id, true, "admin panel", &auth.session.username, enforce_sod, None, None)
+        .decide_approval(&id, true, "admin panel", &auth.session.username, enforce_sod, None, None, None)
         .await;
     let _ = regenerate_csrf_token(&session).await;
     // Surface a rejected decision (e.g. a separation-of-duty self-approval, or an
@@ -1185,7 +1185,7 @@ pub async fn approval_deny(
     // tenant-scoping rationale).
     let result = state
         .storage
-        .decide_approval(&id, false, "admin panel", &auth.session.username, enforce_sod, None, None)
+        .decide_approval(&id, false, "admin panel", &auth.session.username, enforce_sod, None, None, None)
         .await;
     let _ = regenerate_csrf_token(&session).await;
     match result {
@@ -1286,7 +1286,7 @@ pub async fn approval_decide_submit(
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
     match state
         .storage
-        .decide_approval(&id, approve, "out-of-band link", approver_identity, enforce_sod, None, None)
+        .decide_approval(&id, approve, "out-of-band link", approver_identity, enforce_sod, None, None, None)
         .await
     {
         Ok(_) => {

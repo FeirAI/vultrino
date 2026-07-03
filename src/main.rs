@@ -545,6 +545,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.policy_hash_secret = std::env::var("VULTRINO_POLICY_HASH_SECRET")
         .ok()
         .filter(|s| !s.trim().is_empty());
+    config.govder = vultrino::govder::GovderConfig::from_env();
 
     // Execute command
     match cli.command {
@@ -2278,7 +2279,7 @@ async fn decide_approval(
     // still recorded + logged. SoD enforcement applies to the authenticated panel
     // and the identity-bound out-of-band link.
     storage
-        .decide_approval(&id, approve, "cli", &approver, false, None, None)
+        .decide_approval(&id, approve, "cli", &approver, false, None, None, None)
         .await
         .map_err(|e| format!("Could not update approval: {}", e))?;
 

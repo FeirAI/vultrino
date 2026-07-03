@@ -7,6 +7,7 @@
 pub mod approval;
 pub mod auth;
 pub mod delegation;
+pub mod govder;
 pub mod capability;
 pub mod config;
 pub mod crypto;
