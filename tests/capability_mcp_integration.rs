@@ -1,6 +1,6 @@
 //! Connector M1 — capability (named MCP tool) integration tests.
 //!
-//! Verifies the acceptance criteria from muntin
+//! Verifies the acceptance criteria from feir-os
 //! `docs/connectors/ARCHITECTURE.md`:
 //! - a capability registered + a principal whose policy ALLOWS its action sees
 //!   the named tool in `tools/list` and a `tools/call` runs it through the SAME

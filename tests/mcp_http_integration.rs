@@ -2,7 +2,7 @@
 //!
 //! Exercises the real Axum router's `POST /mcp` endpoint via
 //! `tower::ServiceExt::oneshot` (no socket bound), verifying the acceptance
-//! criteria from muntin `docs/connectors/ARCHITECTURE.md`:
+//! criteria from feir-os `docs/connectors/ARCHITECTURE.md`:
 //!
 //! - an HTTP JSON-RPC `tools/list` with a valid `vut_` Bearer returns ONLY that
 //!   principal's granted named tools + `check_approval` (a scoped use-token agent

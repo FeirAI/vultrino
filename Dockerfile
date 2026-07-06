@@ -1,6 +1,6 @@
 # vultrino — enforce plane (the in-path PEP, the crown-jewel image).
 # Holds every provider secret + the vault password in memory at runtime → runs on a DEDICATED,
-# tainted, node-isolated pool (see muntin/deploy/k8s). reqwest uses rustls-tls (no OpenSSL), so a
+# tainted, node-isolated pool (see feir-os/deploy/k8s). reqwest uses rustls-tls (no OpenSSL), so a
 # fully-static musl build → distroless/static is viable as a size optimization; this default uses
 # the robust glibc build → distroless/cc (ships glibc + libgcc + CA certs for HTTPS egress).
 #
@@ -8,7 +8,7 @@
 #   - the encrypted vault (credentials.enc) is a RWO PersistentVolume mount; rootfs is read-only
 #     except that mount. Point vultrino's storage at the mount via config.toml / env.
 #   - VULTRINO_PASSWORD_FILE is a CSI-mounted secret FILE (never an env literal, never a layer).
-# Base tags float here; CI resolves+pins by @sha256 before push (muntin/deploy/k8s/ci).
+# Base tags float here; CI resolves+pins by @sha256 before push (feir-os/deploy/k8s/ci).
 # syntax=docker/dockerfile:1
 
 ARG RUST_VERSION=1

@@ -11,7 +11,7 @@ This doc is the vultrino-team summary; that doc is the detail.
 
 ## Why
 
-leria is the OS's metering/FinOps plane (`govder decides · vultrino enforces · feir proves · leria meters`). Its
+leria is the OS's metering/FinOps plane (`govder decides · vultrino enforces · averin proves · leria meters`). Its
 single durable book-of-record needs a **real-time** spend signal, and the earliest one is what vultrino already
 sees in-path on `/execute`. Today vultrino surfaces none of it as telemetry. **vultrino is leria's
 `gateway-observed` cost source** — the fast (but estimate-grade) input its reconciliation kernel anchors on.

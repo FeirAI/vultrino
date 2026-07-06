@@ -476,7 +476,7 @@ pub struct ApprovalSummary {
     pub is_open: bool,
     /// Tenant this approval belongs to (snapshotted at open from the requesting
     /// principal's tenant); `null` = untenanted (shared, visible to every admin).
-    /// Always emitted so a downstream aggregator (muntin) can backstop-filter by
+    /// Always emitted so a downstream aggregator (feir-os) can backstop-filter by
     /// tenant as defense-in-depth — an explicit `null` unambiguously means
     /// "untenanted/shared", which an omitted field could not distinguish.
     pub tenant: Option<String>,
@@ -729,8 +729,8 @@ pub async fn api_decide_approval(
     // caller-supplied string as a verified identity. The recorded approver is
     // ALWAYS `agg:<acting-api-key-id>:<operator>`, which (a) keeps the human-
     // readable operator for audit, and (b) makes the asserting key explicit. The
-    // operator part is a CLAIM the aggregator (muntin) makes — vultrino trusts
-    // muntin to pass the real authenticated operator, but the namespace records
+    // operator part is a CLAIM the aggregator (feir-os) makes — vultrino trusts
+    // feir-os to pass the real authenticated operator, but the namespace records
     // WHICH key made that claim, so a decision is never mistaken for a first-party
     // identity.
     //
@@ -1629,7 +1629,7 @@ async fn store_capability_and_emit(
             serde_json::json!({"code": "storage_error", "error": e.to_string()}),
         );
     }
-    // Observable capability-change event on the signed outbox, so govder/feir see
+    // Observable capability-change event on the signed outbox, so govder/averin see
     // the connector catalog mutate (mirrors the policy-change emit).
     state
         .server
@@ -1945,7 +1945,7 @@ pub struct AgentResolveQuery {
 }
 
 /// `GET /api/v1/auth/agent` — resolve a Bearer `vut_` use token to the bound
-/// agent label + tenant. Read-only; used by muntin broker for agent-initiated spawn.
+/// agent label + tenant. Read-only; used by feir-os broker for agent-initiated spawn.
 pub async fn api_resolve_agent_token(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,

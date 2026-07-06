@@ -14,7 +14,7 @@ jobs:
       # The Rust version is pinned in rust-toolchain.toml (1.92.0 + clippy/rustfmt). cargo honors that file
       # regardless of which toolchain this action installs, so local builds and CI share ONE source of truth.
       # The zero-warning clippy gate below therefore always runs under 1.92.0. Bump it there, not here
-      # (mirrors feir/.github/workflows/ci.yml). components: is a belt-and-suspenders pre-install.
+      # (mirrors averin/.github/workflows/ci.yml). components: is a belt-and-suspenders pre-install.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

@@ -183,7 +183,7 @@ a vault written by a **newer** binary (`found > supported`), so:
 - New `src/storage/outbox_store.rs` (the SQLite outbox store + its tests).
 - `src/server/mod.rs`: the `deliver_outbox_once` loop reads/claims from the store; the GC cadence stays.
 - Config: `[outbox] db_path`, `retention_secs` (already exists), `at_rest_encryption` (D2).
-- k8s (`muntin`): AS-BUILT, `outbox.enc` is written ALONGSIDE `credentials.enc` in vultrino's data dir
+- k8s (`feir-os`): AS-BUILT, `outbox.enc` is written ALONGSIDE `credentials.enc` in vultrino's data dir
   (`outbox_path = vault.with_file_name("outbox.enc")`), so it rides the EXISTING `vault` PVC — no new
   PVC. The "dedicated outbox PVC" recommended here was considered and DROPPED: the cliff fix is FILE
   separation (an append re-encrypts only `outbox.enc`, never the secrets vault), which is independent of

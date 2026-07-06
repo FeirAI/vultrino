@@ -752,7 +752,7 @@ impl McpServer {
     /// it through the SAME enforced path the generic tools use, `execute_gated`,
     /// which applies permission, credential-access, V11 tenant isolation,
     /// default-deny policy, single-use token consumption, V7 egress scrub, and the
-    /// feir/leria emits. A principal whose policy does NOT allow the action is
+    /// averin/leria emits. A principal whose policy does NOT allow the action is
     /// denied here (returns an MCP error), so even though the tool is normally
     /// hidden in `tools/list`, a guessed/forged `tools/call` cannot bypass the
     /// gate. The Bearer secret (`api_key`) is stripped from the args before they

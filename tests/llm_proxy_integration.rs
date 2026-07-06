@@ -1,7 +1,7 @@
 //! Connector M1, decision 5 — metered LLM-proxy integration tests.
 //!
 //! Two complementary layers prove the acceptance criteria from the build brief
-//! and muntin `docs/connectors/ARCHITECTURE.md`:
+//! and feir-os `docs/connectors/ARCHITECTURE.md`:
 //!
 //! 1. **Endpoint / wiring** (real Axum router via `tower::ServiceExt::oneshot`):
 //!    the `POST /llm/{*path}` endpoint authenticates the Bearer, resolves the

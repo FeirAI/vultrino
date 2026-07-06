@@ -1,6 +1,6 @@
 //! Capabilities — named MCP tools backed by a vault credential + a scoped action.
 //!
-//! The connector's locked design (muntin `docs/connectors/ARCHITECTURE.md`): a
+//! The connector's locked design (feir-os `docs/connectors/ARCHITECTURE.md`): a
 //! *capability* is a **named MCP tool** (e.g. `send_email`) that an agent
 //! harness sees in `tools/list` and invokes via `tools/call`. Where vultrino's
 //! MCP today exposes only generic tools (`http_request`, …), a capability turns
@@ -8,7 +8,7 @@
 //! into its own LLM-facing tool. A `tools/call` is compiled into an
 //! [`crate::ExecuteRequest`] and run through the SAME enforced path the generic
 //! tools use ([`crate::server::VultrinoServer::execute_gated`]): default-deny
-//! policy, single-use token consumption, egress scrub, and feir/leria emits all
+//! policy, single-use token consumption, egress scrub, and averin/leria emits all
 //! still apply. The credential is referenced by alias; the agent never sees it.
 //!
 //! Capabilities are operator/control-plane config (created via the Admin API,

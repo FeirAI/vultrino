@@ -73,7 +73,7 @@ metrics. All hot-reload without a restart.
 
 ## Cross-plane composition (optional)
 
-> The combined four-plane OS (govder decides · vultrino enforces · feir proves ·
+> The combined four-plane OS (govder decides · vultrino enforces · averin proves ·
 > leria meters) is a separate product. Vultrino references only the **contracts**
 > an integrator needs; you can ignore this section entirely when using Vultrino
 > alone. The contracts below are exactly the standalone API surfaces above — there
@@ -111,7 +111,7 @@ in [METERING.md](METERING.md). Wire-contract specifics:
   `amount`** — the consumer mints usd from the counts. Vultrino sends counts, not
   dollars, and holds no pricing/ledger state.
 
-### vultrino → a proof plane (e.g. feir)
+### vultrino → a proof plane (e.g. averin)
 
 Vultrino's signed event outbox is the authentic, ordered record a proof plane can
 ingest and attest over. Vultrino itself does not produce cryptographic proofs; it
