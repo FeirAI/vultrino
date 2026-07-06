@@ -3,7 +3,7 @@
 Vultrino is a standalone Rust binary. This walks you from source to a running
 JSON API with a real end-to-end credential-broker request. Commands here are
 verified against `src/main.rs`, `src/web/server.rs`, and the four-plane e2e
-harness (`/Users/dzcodes/Projects/govder/e2e`), which is the authoritative
+harness (`/Users/dzcodes/Projects/feir-ai/govder/e2e`), which is the authoritative
 record of how the binary is actually built, configured, and run.
 
 ## Prerequisites
