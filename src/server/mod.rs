@@ -161,17 +161,26 @@ struct RunError {
 impl RunError {
     /// A transient preflight failure (e.g. plugin not loaded) — safe to retry.
     fn retryable(error: VultrinoError) -> Self {
-        Self { retryable: true, error }
+        Self {
+            retryable: true,
+            error,
+        }
     }
     /// A permanent preflight failure (unusable token, bad params, missing
     /// credential) — nothing ran, but retrying won't help.
     fn terminal(error: VultrinoError) -> Self {
-        Self { retryable: false, error }
+        Self {
+            retryable: false,
+            error,
+        }
     }
     /// The plugin began executing and then failed — may have side-effected, so
     /// it must not be retried.
     fn committed(error: VultrinoError) -> Self {
-        Self { retryable: false, error }
+        Self {
+            retryable: false,
+            error,
+        }
     }
 }
 
@@ -302,9 +311,9 @@ fn buffered_as_stream(resp: ExecuteResponse) -> StreamingExecution {
     StreamingExecution {
         status,
         headers,
-        body: Box::pin(futures::stream::once(
-            async move { Ok::<Bytes, std::io::Error>(chunk) },
-        )),
+        body: Box::pin(futures::stream::once(async move {
+            Ok::<Bytes, std::io::Error>(chunk)
+        })),
     }
 }
 
@@ -355,10 +364,7 @@ impl StreamFinalizer {
     /// complete token split was parsed (a clean EOF, OR a non-clean terminus that still
     /// had the full trailer); a genuinely partial stream passes `None` (V13a only).
     async fn finalize(&self, usage: Option<crate::outbox::TokenUsage>, model: Option<String>) {
-        if self
-            .emitted
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.emitted.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         emit_meter(&self.storage, &self.attribution, usage, model.as_deref()).await;
@@ -370,10 +376,7 @@ impl Drop for StreamFinalizer {
         // Disconnect/panic before a terminus: emit via a detached task (Drop can't
         // await). No-op if finalize() already emitted. If a complete usage trailer was
         // recorded before the disconnect, emit V13b (usage); else V13a-only.
-        if !self
-            .emitted
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        if !self.emitted.swap(true, std::sync::atomic::Ordering::SeqCst) {
             // Only spawn when a runtime is live: dropping the body during runtime
             // shutdown would make `tokio::spawn` panic. Metering is best-effort
             // (fail-open), so skipping the emit on shutdown is acceptable.
@@ -384,9 +387,9 @@ impl Drop for StreamFinalizer {
                     Some((u, m)) => (Some(u), m),
                     None => (None, None),
                 };
-                handle.spawn(
-                    async move { emit_meter(&storage, &attribution, usage, model.as_deref()).await },
-                );
+                handle.spawn(async move {
+                    emit_meter(&storage, &attribution, usage, model.as_deref()).await
+                });
             }
         }
     }
@@ -467,7 +470,8 @@ impl VultrinoServer {
         // since either is almost always a misconfiguration that would otherwise
         // be discovered only via behavior (a flood of denials, or — worse —
         // silent fail-open).
-        if let Some(msg) = zero_policy_enforcement_warning(default_deny, !config.policies.is_empty())
+        if let Some(msg) =
+            zero_policy_enforcement_warning(default_deny, !config.policies.is_empty())
         {
             warn!("{}", msg);
         }
@@ -503,7 +507,10 @@ impl VultrinoServer {
                 IdentityResolverKind::Spiffe => Arc::new(SpiffeResolver::new(ic.allowed.clone())),
                 IdentityResolverKind::Oidc => Arc::new(OidcResolver::new(ic.allowed.clone())),
             };
-            InboundIdentity { header: ic.header.clone(), resolver }
+            InboundIdentity {
+                header: ic.header.clone(),
+                resolver,
+            }
         });
 
         Self {
@@ -560,7 +567,7 @@ impl VultrinoServer {
 
     /// Load all installed WASM plugins
     pub async fn load_plugins(&self) -> Result<(), VultrinoError> {
-        use crate::plugins::{PluginLoader, PluginInstaller};
+        use crate::plugins::{PluginInstaller, PluginLoader};
 
         let installer = PluginInstaller::default();
         let installed = installer.list().await.map_err(|e| {
@@ -611,7 +618,10 @@ impl VultrinoServer {
             Some(a) => ExecAuth::from_api_key(a.clone()),
             None => ExecAuth::default(),
         };
-        Ok(self.execute_gated(request, exec_auth).await?.into_response())
+        Ok(self
+            .execute_gated(request, exec_auth)
+            .await?
+            .into_response())
     }
 
     /// Run the full gating decision for a request **without** running the action.
@@ -769,7 +779,11 @@ impl VultrinoServer {
         // V12: a dual-control token forces the action through the approval flow
         // (M-of-N), even when policy would Allow it and the credential doesn't
         // require approval — dual control must not be bypassable on the Allow path.
-        let dual_control = exec_auth.use_token.as_ref().map(|t| t.dual_control).unwrap_or(false);
+        let dual_control = exec_auth
+            .use_token
+            .as_ref()
+            .map(|t| t.dual_control)
+            .unwrap_or(false);
         let mut needs_approval = exec_auth.force_approval || dual_control;
         match decision {
             crate::policy::PolicyDecision::Allow => {}
@@ -866,7 +880,7 @@ impl VultrinoServer {
             let trusted_irreversible = self
                 .trusted_irreversible_for_action(&full_action, action_label.as_deref())
                 .await;
-            let (approval, decision_token) = ApprovalRequest::open(NewApproval {
+            let (mut approval, decision_token) = ApprovalRequest::open(NewApproval {
                 credential: credential.alias.clone(),
                 action: full_action.clone(),
                 params: request.params.clone(),
@@ -894,6 +908,13 @@ impl VultrinoServer {
                     1
                 },
             });
+            // Spend is extracted by the trusted policy layer above. Stamp it only
+            // after opening so requester-authored params can never supply these
+            // grant-cap facts.
+            approval.trusted_spend_amount_minor = spend
+                .as_ref()
+                .map(|s| i64::try_from(s.amount).unwrap_or(i64::MAX));
+            approval.trusted_spend_asset = spend.as_ref().map(|s| s.asset.clone());
 
             // Bound the number of *pending* approvals a use token can open: each
             // open reserves a future use, so outstanding pending approvals plus
@@ -921,7 +942,8 @@ impl VultrinoServer {
                 }
                 None => self.storage.store_approval(&approval).await?,
             }
-            self.dispatch_notifications(&approval, &decision_token).await;
+            self.dispatch_notifications(&approval, &decision_token)
+                .await;
             // V9: emit the requested event to the signed outbox.
             self.emit_event(
                 &approval.id,
@@ -1619,7 +1641,10 @@ impl VultrinoServer {
 
     /// Run a previously-approved action. Builds the request from the stored
     /// approval and executes it (consuming the use token, if any).
-    async fn resume_approved(&self, approval: &ApprovalRequest) -> Result<ExecuteResponse, RunError> {
+    async fn resume_approved(
+        &self,
+        approval: &ApprovalRequest,
+    ) -> Result<ExecuteResponse, RunError> {
         // V11 note: cross-tenant credential isolation is enforced at request time
         // in `execute_gated` (before an approval is ever opened), so a cross-tenant
         // request can't create an approval to resume. The resume re-evaluates
@@ -1697,8 +1722,9 @@ impl VultrinoServer {
         // so no spend attempt is needed. A spend cap *changed* after the approval
         // opened therefore does not re-bind to this in-flight action; an operator
         // who needs to stop such an in-flight approval should push an explicit Deny.
-        if let crate::policy::PolicyDecision::Deny(reason) =
-            self.policy_engine.evaluate_readonly_full(&crate::policy::EvalInput {
+        if let crate::policy::PolicyDecision::Deny(reason) = self
+            .policy_engine
+            .evaluate_readonly_full(&crate::policy::EvalInput {
                 credential_alias: &credential.alias,
                 url,
                 method,
@@ -1760,11 +1786,10 @@ impl VultrinoServer {
         // Best-effort: pick up cross-process decisions.
         let _ = self.storage.reload().await;
 
-        let approval = self
-            .storage
-            .get_approval(id)
-            .await?
-            .ok_or_else(|| VultrinoError::InvalidRequest(format!("Approval not found: {}", id)))?;
+        let approval =
+            self.storage.get_approval(id).await?.ok_or_else(|| {
+                VultrinoError::InvalidRequest(format!("Approval not found: {}", id))
+            })?;
 
         // Ownership check BEFORE any side effect: a non-owner must not be able to
         // trigger execution of someone else's approved action.
@@ -1868,7 +1893,11 @@ impl VultrinoServer {
         if self.notifiers.is_empty() {
             return;
         }
-        let base = self.approval_config.public_base_url.as_deref().unwrap_or("");
+        let base = self
+            .approval_config
+            .public_base_url
+            .as_deref()
+            .unwrap_or("");
         let links = approval.links(base, decision_token);
         for notifier in &self.notifiers {
             if let Err(e) = notifier.notify(approval, &links).await {
@@ -1928,7 +1957,11 @@ impl VultrinoServer {
     /// calling operation — an event-log problem must not block the action it
     /// describes (the action's own success is the source of truth).
     pub async fn emit_event(&self, subject: &str, event_type: &str, payload: serde_json::Value) {
-        if let Err(e) = self.storage.append_event(subject, event_type, payload).await {
+        if let Err(e) = self
+            .storage
+            .append_event(subject, event_type, payload)
+            .await
+        {
             warn!(error = %e, event_type, "failed to append outbox event");
         }
     }
@@ -2075,17 +2108,19 @@ impl VultrinoServer {
         // gated allow rule can match at list time.
         let url = capability.target.url_glob.as_deref();
         let method = capability.target.methods.first().map(|m| m.as_str());
-        let decision = self.policy_engine.evaluate_readonly_full(&crate::policy::EvalInput {
-            credential_alias: &credential.alias,
-            url,
-            method,
-            // The cap's own action label, so its ActionMatch rule matches and the
-            // granted cap remains listable (without it the connector dimension would
-            // hide every granted capability at tools/list).
-            action: Some(capability.action.as_str()),
-            principal: principal.as_ref(),
-            spend: None,
-        });
+        let decision = self
+            .policy_engine
+            .evaluate_readonly_full(&crate::policy::EvalInput {
+                credential_alias: &credential.alias,
+                url,
+                method,
+                // The cap's own action label, so its ActionMatch rule matches and the
+                // granted cap remains listable (without it the connector dimension would
+                // hide every granted capability at tools/list).
+                action: Some(capability.action.as_str()),
+                principal: principal.as_ref(),
+                spend: None,
+            });
         // A `Prompt` (approval-gated) capability is still listable — the agent can
         // call it and will be told to await approval, exactly like a generic gated
         // tool. Only an outright `Deny` hides it.
@@ -2100,17 +2135,48 @@ impl VultrinoServer {
         action_label: Option<&str>,
     ) -> bool {
         let _ = self.storage.reload().await;
-        let caps = self.storage.list_capabilities().await.unwrap_or_default();
-        for cap in caps {
-            let (resolved, label) = self.config.resolve_action(&cap.action);
-            if resolved == canonical_action
-                || action_label.map(|l| l == cap.action.as_str()).unwrap_or(false)
-                || label.as_deref() == action_label
-            {
-                return crate::approval::reversibility_requires_human_floor(&cap.reversibility);
+        let caps = match self.storage.list_capabilities().await {
+            Ok(caps) => caps,
+            Err(error) => {
+                // This stamp decides whether a machine may replace a human. An
+                // unavailable catalog must therefore fail to the human floor.
+                tracing::error!(%error, "capability lookup failed while deriving trusted irreversibility");
+                return true;
+            }
+        };
+
+        // Prefer the exact govder action label. Several capabilities commonly
+        // resolve to the same canonical plugin verb (for example http.request),
+        // so returning the first canonical match can pick a reversible sibling
+        // for an irreversible capability. When only the canonical form is known,
+        // use the strictest matching value; no match also fails to the human floor.
+        if let Some(label) = action_label.map(str::trim).filter(|s| !s.is_empty()) {
+            let exact: Vec<_> = caps
+                .iter()
+                .filter(|cap| {
+                    let (_, configured_label) = self.config.resolve_action(&cap.action);
+                    cap.action.trim() == label || configured_label.as_deref() == Some(label)
+                })
+                .collect();
+            if !exact.is_empty() {
+                return exact.iter().any(|cap| {
+                    crate::approval::reversibility_requires_human_floor(&cap.reversibility)
+                });
             }
         }
-        false
+
+        let canonical: Vec<_> = caps
+            .iter()
+            .filter(|cap| self.config.resolve_action(&cap.action).0 == canonical_action)
+            .collect();
+        if canonical.is_empty() {
+            tracing::warn!(%canonical_action, ?action_label,
+                "no capability metadata matched approval action; requiring human floor");
+            return true;
+        }
+        canonical
+            .iter()
+            .any(|cap| crate::approval::reversibility_requires_human_floor(&cap.reversibility))
     }
 
     /// List the capabilities a principal is permitted to see (connector M1). The
@@ -2412,7 +2478,9 @@ pub async fn deliver_outbox_once(
     // subject). Cost is one extra lock acquisition per event vs a batch — fine for
     // an outbox where the network POST dominates.
     for _ in 0..OUTBOX_BATCH {
-        let mut claimed = storage.claim_deliverable_events(1, OUTBOX_LEASE_SECS).await?;
+        let mut claimed = storage
+            .claim_deliverable_events(1, OUTBOX_LEASE_SECS)
+            .await?;
         debug_assert!(claimed.len() <= 1, "claim(1) must return at most one event");
         let Some(event) = claimed.pop() else {
             break;
@@ -2723,6 +2791,23 @@ fn parse_action(action: &str) -> Result<(&str, &str), VultrinoError> {
 mod tests {
     use super::*;
 
+    async fn irreversibility_test_server() -> (VultrinoServer, Arc<dyn StorageBackend>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        std::mem::forget(dir);
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::FileStorage::new(&path, &secrecy::SecretString::from("test-password"))
+                .await
+                .unwrap(),
+        );
+        let server = VultrinoServer::new(
+            Config::default(),
+            storage.clone(),
+            CredentialResolver::new(storage.clone()),
+        );
+        (server, storage)
+    }
+
     #[test]
     fn test_parse_action() {
         let (plugin, action) = parse_action("http.request").unwrap();
@@ -2770,5 +2855,41 @@ mod tests {
         // With policies configured, no warning regardless of posture.
         assert!(zero_policy_enforcement_warning(true, true).is_none());
         assert!(zero_policy_enforcement_warning(false, true).is_none());
+    }
+
+    #[tokio::test]
+    async fn trusted_irreversibility_uses_strictest_canonical_match_and_fails_unknown_closed() {
+        use crate::capability::{Capability, CapabilityTarget};
+        let (server, storage) = irreversibility_test_server().await;
+        for (id, reversibility) in [
+            ("a-reversible", "reversible"),
+            ("b-irreversible", "irreversible"),
+        ] {
+            storage
+                .store_capability(&Capability {
+                    id: id.to_string(),
+                    tool_name: id.replace('-', "_"),
+                    description: id.to_string(),
+                    action: "http.request".to_string(),
+                    plugin: Some("http".to_string()),
+                    target: CapabilityTarget::default(),
+                    credential_ref: "cred".to_string(),
+                    input_schema: serde_json::json!({}),
+                    reversibility: reversibility.to_string(),
+                    llm: None,
+                })
+                .await
+                .unwrap();
+        }
+        assert!(
+            server
+                .trusted_irreversible_for_action("http.request", None)
+                .await
+        );
+        assert!(
+            server
+                .trusted_irreversible_for_action("unknown.action", None)
+                .await
+        );
     }
 }

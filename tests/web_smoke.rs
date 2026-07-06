@@ -49,7 +49,9 @@ async fn build_router() -> (axum::Router, Arc<dyn StorageBackend>) {
 }
 
 async fn body_string(resp: axum::response::Response) -> String {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     String::from_utf8_lossy(&bytes).to_string()
 }
 
@@ -61,8 +63,7 @@ async fn build_admin_router() -> (
     Arc<vultrino::server::VultrinoServer>,
     String,
 ) {
-    let (router, storage, exec_server, admin_key, _read_key) =
-        build_admin_router_with_read().await;
+    let (router, storage, exec_server, admin_key, _read_key) = build_admin_router_with_read().await;
     (router, storage, exec_server, admin_key)
 }
 
@@ -102,7 +103,9 @@ async fn build_admin_router_full(
 
     // Mint an admin key in the auth manager (and persist it) so the API accepts it.
     let auth_manager = AuthManager::new();
-    let (admin_key, api_key) = auth_manager.create_api_key("admin-key", "admin", None).unwrap();
+    let (admin_key, api_key) = auth_manager
+        .create_api_key("admin-key", "admin", None)
+        .unwrap();
     storage.store_api_key(&api_key).await.unwrap();
     // Mint a read-only key (least privilege: Permission::Read only).
     let (read_key, read_api_key) = auth_manager
@@ -125,14 +128,23 @@ async fn build_admin_router_full(
         resolver,
     ));
     let server = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         web_config,
         storage.clone(),
         auth_manager,
         admin,
         exec_server.clone(),
     );
-    (server.into_router(), storage, exec_server, admin_key, read_key)
+    (
+        server.into_router(),
+        storage,
+        exec_server,
+        admin_key,
+        read_key,
+    )
 }
 
 /// Build a router whose auth manager holds a TENANT-SCOPED admin key, returning
@@ -166,7 +178,10 @@ async fn build_tenant_admin_router(
         resolver,
     ));
     let router = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         Config::default(),
         storage.clone(),
         auth_manager,
@@ -191,7 +206,12 @@ fn admin_req(method: &str, uri: &str, key: &str, body: serde_json::Value) -> Req
 async fn test_health_endpoint() {
     let (router, _) = build_router().await;
     let resp = router
-        .oneshot(Request::builder().uri("/api/v1/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -202,7 +222,12 @@ async fn test_health_endpoint() {
 async fn test_login_page_renders() {
     let (router, _) = build_router().await;
     let resp = router
-        .oneshot(Request::builder().uri("/login").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -278,7 +303,11 @@ async fn test_admin_policy_crud_hot_reload() {
     let created: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let id = created["id"].as_str().unwrap().to_string();
     assert_eq!(storage.list_stored_policies().await.unwrap().len(), 1);
-    assert!(server.policy_engine().list_policies().iter().any(|p| p.id == id));
+    assert!(server
+        .policy_engine()
+        .list_policies()
+        .iter()
+        .any(|p| p.id == id));
 
     // PUT replaces by id.
     let resp = router
@@ -292,7 +321,10 @@ async fn test_admin_policy_crud_hot_reload() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(storage.get_policy(&id).await.unwrap().unwrap().name, "allow-gh-2");
+    assert_eq!(
+        storage.get_policy(&id).await.unwrap().unwrap().name,
+        "allow-gh-2"
+    );
 
     // Invalid glob in credential_pattern → 400.
     let resp = router
@@ -310,12 +342,21 @@ async fn test_admin_policy_crud_hot_reload() {
     // DELETE removes it from storage and the engine.
     let resp = router
         .clone()
-        .oneshot(admin_req("DELETE", &format!("/api/v1/policies/{}", id), &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "DELETE",
+            &format!("/api/v1/policies/{}", id),
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(storage.list_stored_policies().await.unwrap().len(), 0);
-    assert!(!server.policy_engine().list_policies().iter().any(|p| p.id == id));
+    assert!(!server
+        .policy_engine()
+        .list_policies()
+        .iter()
+        .any(|p| p.id == id));
 }
 
 #[tokio::test]
@@ -351,7 +392,12 @@ async fn test_admin_capability_crud() {
     // GET lists it (sorted by tool_name).
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", "/api/v1/capabilities", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/capabilities",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -375,7 +421,15 @@ async fn test_admin_capability_crud() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(storage.get_capability(&id).await.unwrap().unwrap().tool_name, "send_email_v2");
+    assert_eq!(
+        storage
+            .get_capability(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .tool_name,
+        "send_email_v2"
+    );
 
     // An invalid tool_name (uppercase) → 400.
     let resp = router
@@ -406,7 +460,12 @@ async fn test_admin_capability_crud() {
     // DELETE removes it.
     let resp = router
         .clone()
-        .oneshot(admin_req("DELETE", &format!("/api/v1/capabilities/{}", id), &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "DELETE",
+            &format!("/api/v1/capabilities/{}", id),
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -414,7 +473,12 @@ async fn test_admin_capability_crud() {
 
     // Deleting again → 404.
     let resp = router
-        .oneshot(admin_req("DELETE", &format!("/api/v1/capabilities/{}", id), &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "DELETE",
+            &format!("/api/v1/capabilities/{}", id),
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -482,8 +546,15 @@ async fn test_admin_token_mint_idempotent() {
     let resp2 = router.clone().oneshot(mint("k1")).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::CREATED);
     let v2: serde_json::Value = serde_json::from_str(&body_string(resp2).await).unwrap();
-    assert!(v2["token"].is_null(), "replay must not re-expose the plaintext token");
-    assert_eq!(storage.list_use_tokens().await.unwrap().len(), 1, "no duplicate token minted");
+    assert!(
+        v2["token"].is_null(),
+        "replay must not re-expose the plaintext token"
+    );
+    assert_eq!(
+        storage.list_use_tokens().await.unwrap().len(),
+        1,
+        "no duplicate token minted"
+    );
 
     // A different key mints a new, distinct token.
     let resp3 = router.oneshot(mint("k2")).await.unwrap();
@@ -523,7 +594,14 @@ async fn test_admin_revoked_token_cannot_execute() {
         .await
         .unwrap();
     assert_eq!(revoke.status(), StatusCode::OK);
-    assert!(storage.get_use_token(&token_id).await.unwrap().unwrap().revoked);
+    assert!(
+        storage
+            .get_use_token(&token_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked
+    );
 
     // Using the revoked token on /execute is rejected at the auth seam (403),
     // before any credential resolution or upstream call.
@@ -594,7 +672,12 @@ async fn test_admin_role_create_and_credential_delete_and_put_policy() {
     let cred: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
     let cred_id = cred["id"].as_str().unwrap().to_string();
     let r = router
-        .oneshot(admin_req("DELETE", &format!("/api/v1/credentials/{}", cred_id), &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "DELETE",
+            &format!("/api/v1/credentials/{}", cred_id),
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
@@ -619,8 +702,19 @@ async fn test_admin_put_policy_idempotency_bound_to_path() {
     // to the path, so the second is a key/body Mismatch (409) — NOT a verbatim
     // replay of id1's response (which is what the bug would do). id2 is not
     // created as a copy of id1.
-    assert_eq!(router.clone().oneshot(put("id1", "same")).await.unwrap().status(), StatusCode::OK);
-    assert_eq!(router.oneshot(put("id2", "same")).await.unwrap().status(), StatusCode::CONFLICT);
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(put("id1", "same"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        router.oneshot(put("id2", "same")).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
     assert!(storage.get_policy("id1").await.unwrap().is_some());
     assert!(storage.get_policy("id2").await.unwrap().is_none());
 }
@@ -651,17 +745,89 @@ async fn test_admin_token_strictness_compiles() {
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
-    let tok = storage.get_use_token(v["metadata"]["id"].as_str().unwrap()).await.unwrap().unwrap();
+    let tok = storage
+        .get_use_token(v["metadata"]["id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(tok.max_uses, Some(5));
     assert!(tok.require_approval);
     assert!(!tok.dual_control);
 
     // Unknown strictness → 400.
     let r = router
-        .oneshot(mint(serde_json::json!({"name":"x","credential_scope":"*","strictness":"loose"})))
+        .oneshot(mint(
+            serde_json::json!({"name":"x","credential_scope":"*","strictness":"loose"}),
+        ))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_agent_action_consume_is_scoped_atomic_and_approval_aware() {
+    let (router, storage, _server, key) = build_admin_router().await;
+    let mint = |name: &str, require_approval: bool| {
+        admin_req(
+            "POST",
+            "/api/v1/tokens",
+            &key,
+            serde_json::json!({
+                "name": name,
+                "credential_scope": "*",
+                "action_scope": "agent.spawn",
+                "max_uses": 1,
+                "require_approval": require_approval,
+                "agent_label": "ep_parent",
+                "tenant": "acme"
+            }),
+        )
+    };
+    let minted = router.clone().oneshot(mint("spawn", false)).await.unwrap();
+    assert_eq!(minted.status(), StatusCode::CREATED);
+    let body: serde_json::Value = serde_json::from_str(&body_string(minted).await).unwrap();
+    let token = body["token"].as_str().unwrap().to_string();
+    let id = body["metadata"]["id"].as_str().unwrap().to_string();
+    let consume = || {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/agent/consume?required_action=agent.spawn")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        router.clone().oneshot(consume()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(storage.get_use_token(&id).await.unwrap().unwrap().uses, 1);
+    assert_eq!(
+        router.clone().oneshot(consume()).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let gated = router
+        .clone()
+        .oneshot(mint("gated-spawn", true))
+        .await
+        .unwrap();
+    let gated_body: serde_json::Value = serde_json::from_str(&body_string(gated).await).unwrap();
+    let gated_token = gated_body["token"].as_str().unwrap();
+    let gated_id = gated_body["metadata"]["id"].as_str().unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/agent/consume?required_action=agent.spawn")
+        .header("Authorization", format!("Bearer {gated_token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        storage.get_use_token(gated_id).await.unwrap().unwrap().uses,
+        0
+    );
 }
 
 #[tokio::test]
@@ -676,10 +842,29 @@ async fn test_admin_token_agent_label_validation() {
         )
     };
     // Glob metacharacters and the ':' key-prefix separator are rejected.
-    assert_eq!(router.clone().oneshot(mint("bot-*")).await.unwrap().status(), StatusCode::BAD_REQUEST);
-    assert_eq!(router.clone().oneshot(mint("cred:foo")).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(mint("bot-*"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(mint("cred:foo"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
     // A plain label is accepted.
-    assert_eq!(router.oneshot(mint("refund-bot")).await.unwrap().status(), StatusCode::CREATED);
+    assert_eq!(
+        router.oneshot(mint("refund-bot")).await.unwrap().status(),
+        StatusCode::CREATED
+    );
 }
 
 #[tokio::test]
@@ -694,11 +879,28 @@ async fn test_admin_token_expiry_bounds() {
         )
     };
     // Non-positive and absurdly-large (overflow-guard) lifetimes are rejected.
-    assert_eq!(router.clone().oneshot(mint(0)).await.unwrap().status(), StatusCode::BAD_REQUEST);
-    assert_eq!(router.clone().oneshot(mint(-5)).await.unwrap().status(), StatusCode::BAD_REQUEST);
-    assert_eq!(router.clone().oneshot(mint(i64::MAX)).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        router.clone().oneshot(mint(0)).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        router.clone().oneshot(mint(-5)).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(mint(i64::MAX))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
     // A sane lifetime succeeds.
-    assert_eq!(router.oneshot(mint(3600)).await.unwrap().status(), StatusCode::CREATED);
+    assert_eq!(
+        router.oneshot(mint(3600)).await.unwrap().status(),
+        StatusCode::CREATED
+    );
 }
 
 #[tokio::test]
@@ -725,8 +927,16 @@ async fn test_admin_credential_idempotency_deterministic_metadata() {
     let r1 = router.clone().oneshot(make("c-idem")).await.unwrap();
     assert_eq!(r1.status(), StatusCode::CREATED);
     let r2 = router.oneshot(make("c-idem")).await.unwrap();
-    assert_eq!(r2.status(), StatusCode::CREATED, "multi-key metadata must replay, not 409");
-    assert_eq!(storage.list().await.unwrap().len(), 1, "no duplicate credential");
+    assert_eq!(
+        r2.status(),
+        StatusCode::CREATED,
+        "multi-key metadata must replay, not 409"
+    );
+    assert_eq!(
+        storage.list().await.unwrap().len(),
+        1,
+        "no duplicate credential"
+    );
 }
 
 #[tokio::test]
@@ -735,7 +945,12 @@ async fn test_admin_delete_role_in_use_conflict() {
     // Create a custom role via the admin API.
     let r = router
         .clone()
-        .oneshot(admin_req("POST", "/api/v1/roles", &key, serde_json::json!({"name":"temp","permissions":["read"]})))
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/roles",
+            &key,
+            serde_json::json!({"name":"temp","permissions":["read"]}),
+        ))
         .await
         .unwrap();
     let role: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
@@ -762,7 +977,12 @@ async fn test_admin_delete_role_in_use_conflict() {
 
     // Deleting the in-use role is refused atomically with 409.
     let r = router
-        .oneshot(admin_req("DELETE", &format!("/api/v1/roles/{}", role_id), &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "DELETE",
+            &format!("/api/v1/roles/{}", role_id),
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::CONFLICT);
@@ -773,7 +993,12 @@ async fn test_admin_delete_role_in_use_conflict() {
 async fn test_admin_cannot_delete_builtin_role() {
     let (router, _storage, _server, key) = build_admin_router().await;
     let resp = router
-        .oneshot(admin_req("DELETE", "/api/v1/roles/admin", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "DELETE",
+            "/api/v1/roles/admin",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -791,7 +1016,8 @@ async fn test_admin_idempotency_key_body_mismatch() {
             .header("content-type", "application/json")
             .header("idempotency-key", idem)
             .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({"name":name,"credential_scope":"*"})).unwrap(),
+                serde_json::to_vec(&serde_json::json!({"name":name,"credential_scope":"*"}))
+                    .unwrap(),
             ))
             .unwrap()
     };
@@ -805,7 +1031,10 @@ async fn test_admin_idempotency_key_body_mismatch() {
     // A replayed mint must not leak the plaintext token in the stored body.
     let r3 = router.oneshot(mint("m1", "alpha")).await.unwrap();
     let v3: serde_json::Value = serde_json::from_str(&body_string(r3).await).unwrap();
-    assert!(v3["token"].is_null(), "replay must not return the plaintext token");
+    assert!(
+        v3["token"].is_null(),
+        "replay must not return the plaintext token"
+    );
     assert!(v3.get("token_note").is_some());
 }
 
@@ -830,7 +1059,10 @@ async fn test_admin_credential_create_no_secret_echo() {
     let body = body_string(resp).await;
     // The response must carry metadata but never the secret material.
     assert!(body.contains("\"alias\":\"gh\""));
-    assert!(!body.contains("super-secret-value"), "secret must not be echoed: {body}");
+    assert!(
+        !body.contains("super-secret-value"),
+        "secret must not be echoed: {body}"
+    );
     // It is, however, persisted (and usable).
     let stored = storage.get_by_alias("gh").await.unwrap().unwrap();
     assert_eq!(stored.alias, "gh");
@@ -854,7 +1086,7 @@ async fn test_out_of_band_decide_flow() {
         action_label: None,
         dual_control: false,
         criticality: vultrino::approval::CriticalityClass::Medium,
-            trusted_irreversible: None,
+        trusted_irreversible: None,
         escalate_after: chrono::Duration::minutes(30),
         escalate_window: chrono::Duration::minutes(30),
         oob_identity: Some("oncall".to_string()),
@@ -886,7 +1118,10 @@ async fn test_out_of_band_decide_flow() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/approvals/{}/decide?token=wrong&decision=approve", approval.id))
+                .uri(format!(
+                    "/approvals/{}/decide?token=wrong&decision=approve",
+                    approval.id
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -935,7 +1170,7 @@ async fn test_out_of_band_decide_without_named_identity_is_refused() {
         action_label: None,
         dual_control: false,
         criticality: vultrino::approval::CriticalityClass::Medium,
-            trusted_irreversible: None,
+        trusted_irreversible: None,
         escalate_after: chrono::Duration::minutes(30),
         escalate_window: chrono::Duration::minutes(30),
         oob_identity: None, // no named identity bound
@@ -974,7 +1209,12 @@ async fn test_admin_halt_agent_installs_kill_and_lists_sessions() {
     // POST halt for an agent → 200 with a machine-readable outcome.
     let resp = router
         .clone()
-        .oneshot(admin_req("POST", "/api/v1/agents/bot-7/halt", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/agents/bot-7/halt",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -983,13 +1223,22 @@ async fn test_admin_halt_agent_installs_kill_and_lists_sessions() {
     assert_eq!(out["deny_policy_id"], "halt:bot-7");
 
     // The authoritative kill policy landed in the live engine and storage.
-    assert!(server.policy_engine().list_policies().iter().any(|p| p.id == "halt:bot-7" && p.kill));
+    assert!(server
+        .policy_engine()
+        .list_policies()
+        .iter()
+        .any(|p| p.id == "halt:bot-7" && p.kill));
     assert!(storage.get_policy("halt:bot-7").await.unwrap().is_some());
 
     // GET /sessions → 200, per-process scope, empty here (nothing in flight).
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", "/api/v1/sessions", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/sessions",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1000,11 +1249,20 @@ async fn test_admin_halt_agent_installs_kill_and_lists_sessions() {
     // DELETE halt → lifts it; the kill policy is gone from the engine.
     let resp = router
         .clone()
-        .oneshot(admin_req("DELETE", "/api/v1/agents/bot-7/halt", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "DELETE",
+            "/api/v1/agents/bot-7/halt",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(!server.policy_engine().list_policies().iter().any(|p| p.id == "halt:bot-7"));
+    assert!(!server
+        .policy_engine()
+        .list_policies()
+        .iter()
+        .any(|p| p.id == "halt:bot-7"));
 
     // Unauthenticated halt → 401 (admin-only).
     let resp = router
@@ -1028,12 +1286,21 @@ async fn test_admin_halt_rejects_glob_label() {
     // "bot-*" is URL-safe as a path segment; the handler must reject it.
     let resp = router
         .clone()
-        .oneshot(admin_req("POST", "/api/v1/agents/bot-*/halt", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/agents/bot-*/halt",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     // No kill policy was installed.
-    assert!(!server.policy_engine().list_policies().iter().any(|p| p.kill));
+    assert!(!server
+        .policy_engine()
+        .list_policies()
+        .iter()
+        .any(|p| p.kill));
 }
 
 #[tokio::test]
@@ -1044,7 +1311,12 @@ async fn test_admin_event_replay_api() {
     // A halt emits an agent.halted event.
     let resp = router
         .clone()
-        .oneshot(admin_req("POST", "/api/v1/agents/bot-7/halt", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/agents/bot-7/halt",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1052,7 +1324,12 @@ async fn test_admin_event_replay_api() {
     // GET /api/v1/events?after=0 → the event + a next_cursor.
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", "/api/v1/events?after=0", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/events?after=0",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1068,7 +1345,12 @@ async fn test_admin_event_replay_api() {
     // Replaying after the cursor → no more events (no gaps, no dupes).
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", &format!("/api/v1/events?after={cursor}"), &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            &format!("/api/v1/events?after={cursor}"),
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
@@ -1077,7 +1359,12 @@ async fn test_admin_event_replay_api() {
     // The DLQ endpoint works (empty here).
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", "/api/v1/events/dead", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/events/dead",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1103,7 +1390,12 @@ async fn test_admin_metrics_readback() {
     let (router, _storage, _server, key) = build_admin_router().await;
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", "/api/v1/metrics", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/metrics",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1146,7 +1438,7 @@ async fn store_test_approval(
         action_label: Some("payments.refund".to_string()),
         dual_control: false,
         criticality: vultrino::approval::CriticalityClass::Medium,
-            trusted_irreversible: None,
+        trusted_irreversible: None,
         escalate_after: chrono::Duration::minutes(30),
         escalate_window: chrono::Duration::minutes(30),
         oob_identity: None,
@@ -1170,7 +1462,12 @@ async fn test_a3_a4_json_approvals_list_and_decision() {
     // A3: GET /api/v1/approvals → the approval with the documented JSON shape.
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", "/api/v1/approvals", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/approvals",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1186,20 +1483,38 @@ async fn test_a3_a4_json_approvals_list_and_decision() {
     assert_eq!(a["required_approvals"], 1);
     assert_eq!(a["approvals_received"], 0);
     assert_eq!(a["is_open"], true);
-    assert!(a["created_at"].as_str().unwrap().contains('T'), "ISO-8601 timestamp");
+    assert!(
+        a["created_at"].as_str().unwrap().contains('T'),
+        "ISO-8601 timestamp"
+    );
     // `tenant` is always emitted (never skipped) so an aggregator can backstop-filter;
     // here the approval is tagged to the acting key's tenant.
-    assert!(a.as_object().unwrap().contains_key("tenant"), "tenant field is always present");
-    assert_eq!(a["tenant"], "team-a", "approval carries its tenant in the JSON list");
+    assert!(
+        a.as_object().unwrap().contains_key("tenant"),
+        "tenant field is always present"
+    );
+    assert_eq!(
+        a["tenant"], "team-a",
+        "approval carries its tenant in the JSON list"
+    );
 
     // A3 status filter: a non-matching status yields an empty list.
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", "/api/v1/approvals?status=denied", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/approvals?status=denied",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["approvals"].as_array().unwrap().len(), 0, "filter excludes non-matching");
+    assert_eq!(
+        body["approvals"].as_array().unwrap().len(),
+        0,
+        "filter excludes non-matching"
+    );
 
     // A4: POST decision (approve) → 200 with the result shape; approval flips.
     let resp = router
@@ -1224,8 +1539,14 @@ async fn test_a3_a4_json_approvals_list_and_decision() {
     // CLAIM by the acting key, not a first-party verified identity), namespaced by
     // the asserting key id.
     let recorded = stored.approver_identity.as_deref().unwrap();
-    assert!(recorded.starts_with("agg:"), "approver namespaced as an aggregator claim: {recorded}");
-    assert!(recorded.ends_with(":alice@example.com"), "human operator preserved: {recorded}");
+    assert!(
+        recorded.starts_with("agg:"),
+        "approver namespaced as an aggregator claim: {recorded}"
+    );
+    assert!(
+        recorded.ends_with(":alice@example.com"),
+        "human operator preserved: {recorded}"
+    );
     assert_eq!(stored.decided_by.as_deref(), Some("json-api"));
 
     // A4: re-deciding an already-decided approval → 409 (not actionable).
@@ -1284,7 +1605,10 @@ async fn test_a4_decision_enforces_tenant_partition() {
         resolver,
     ));
     let router = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         Config::default(),
         storage.clone(),
         auth_manager,
@@ -1300,19 +1624,36 @@ async fn test_a4_decision_enforces_tenant_partition() {
     // A3: the team-A admin sees ONLY the shared approval, never team-B's.
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", "/api/v1/approvals", &admin_key_plain, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/approvals",
+            &admin_key_plain,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let visible = body["approvals"].as_array().unwrap();
     let ids: Vec<&str> = visible.iter().map(|a| a["id"].as_str().unwrap()).collect();
-    assert!(ids.contains(&shared_id.as_str()), "shared approval is visible");
-    assert!(!ids.contains(&b_id.as_str()), "team-B approval must NOT leak into team-A's list");
+    assert!(
+        ids.contains(&shared_id.as_str()),
+        "shared approval is visible"
+    );
+    assert!(
+        !ids.contains(&b_id.as_str()),
+        "team-B approval must NOT leak into team-A's list"
+    );
     // The one visible approval is the shared/untenanted one — its `tenant` is null,
     // the signal an aggregator uses to recognize a shared (non-tenant-scoped) approval.
-    let shared = visible.iter().find(|a| a["id"] == shared_id.as_str()).unwrap();
-    assert!(shared["tenant"].is_null(), "shared approval carries tenant=null in the JSON list");
+    let shared = visible
+        .iter()
+        .find(|a| a["id"] == shared_id.as_str())
+        .unwrap();
+    assert!(
+        shared["tenant"].is_null(),
+        "shared approval carries tenant=null in the JSON list"
+    );
 
     // A4: deciding the team-B approval as team-A → 404 (no cross-tenant oracle),
     // and the approval stays pending (the decision did NOT take effect).
@@ -1326,7 +1667,11 @@ async fn test_a4_decision_enforces_tenant_partition() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "cross-tenant decision must be 404, not allowed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "cross-tenant decision must be 404, not allowed"
+    );
     let stored = storage.get_approval(&b_id).await.unwrap().unwrap();
     assert_eq!(
         stored.status,
@@ -1344,7 +1689,11 @@ async fn test_a4_decision_enforces_tenant_partition() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "shared approval is decidable by any tenant admin");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "shared approval is decidable by any tenant admin"
+    );
 }
 
 #[tokio::test]
@@ -1360,13 +1709,25 @@ async fn test_json_approvals_reject_untenanted_key() {
     // GET list → 403 (no enumeration, no body of approvals).
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", "/api/v1/approvals", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/approvals",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "untenanted key cannot list");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "untenanted key cannot list"
+    );
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["code"], "tenant_required");
-    assert!(body.get("approvals").is_none(), "403 must not leak the approvals list");
+    assert!(
+        body.get("approvals").is_none(),
+        "403 must not leak the approvals list"
+    );
 
     // POST decision → 403 BEFORE any lookup (can't even probe an id's existence),
     // and the approval stays pending.
@@ -1379,7 +1740,11 @@ async fn test_json_approvals_reject_untenanted_key() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "untenanted key cannot decide");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "untenanted key cannot decide"
+    );
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(
         stored.status,
@@ -1411,7 +1776,11 @@ async fn test_json_decision_is_idempotent_on_retry() {
 
     // Same operator approving again (the retry) → 200 idempotent replay, NOT 409.
     let resp = router.clone().oneshot(decide(true)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "same-operator same-outcome retry is idempotent");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "same-operator same-outcome retry is idempotent"
+    );
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
     assert_eq!(body["idempotent_replay"], true);
@@ -1419,7 +1788,11 @@ async fn test_json_decision_is_idempotent_on_retry() {
     // A CONFLICTING decision (deny after approve) from the same key is still a 409,
     // not silently swallowed.
     let resp = router.oneshot(decide(false)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT, "a different outcome on a decided approval is a conflict");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "a different outcome on a decided approval is a conflict"
+    );
 }
 
 #[tokio::test]
@@ -1454,7 +1827,10 @@ async fn test_json_decision_hard_sod_blocks_same_key_second_signoff() {
         resolver,
     ));
     let router = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         sod_config,
         storage.clone(),
         auth_manager,
@@ -1477,7 +1853,7 @@ async fn test_json_decision_hard_sod_blocks_same_key_second_signoff() {
         action_label: Some("payments.refund".to_string()),
         dual_control: true,
         criticality: vultrino::approval::CriticalityClass::High,
-            trusted_irreversible: None,
+        trusted_irreversible: None,
         escalate_after: chrono::Duration::minutes(30),
         escalate_window: chrono::Duration::minutes(30),
         oob_identity: None,
@@ -1500,7 +1876,10 @@ async fn test_json_decision_hard_sod_blocks_same_key_second_signoff() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["status"], "pending", "one of two sign-offs: still open");
+    assert_eq!(
+        body["status"], "pending",
+        "one of two sign-offs: still open"
+    );
     assert_eq!(body["approvals_received"], 1);
 
     // Second sign-off as a DIFFERENT operator name but the SAME aggregator key →
@@ -1526,7 +1905,11 @@ async fn test_json_decision_hard_sod_blocks_same_key_second_signoff() {
     // The approval is still pending (not granted by the single key).
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
-    assert_eq!(stored.signoffs.len(), 1, "the second same-key sign-off was not recorded");
+    assert_eq!(
+        stored.signoffs.len(),
+        1,
+        "the second same-key sign-off was not recorded"
+    );
 }
 
 /// Build a tenant-scoped, hard-SoD router + a stored dual-control (2-of-N)
@@ -1560,7 +1943,10 @@ async fn build_hard_sod_dual_control_fixture(
         resolver,
     ));
     let router = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         sod_config,
         storage.clone(),
         auth_manager,
@@ -1582,7 +1968,7 @@ async fn build_hard_sod_dual_control_fixture(
         action_label: Some("payments.refund".to_string()),
         dual_control: true,
         criticality: vultrino::approval::CriticalityClass::High,
-            trusted_irreversible: None,
+        trusted_irreversible: None,
         escalate_after: chrono::Duration::minutes(30),
         escalate_window: chrono::Duration::minutes(30),
         oob_identity: None,
@@ -1616,7 +2002,10 @@ async fn test_json_decision_hard_sod_blocks_same_key_no_operator_then_operator()
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["status"], "pending", "first (no-operator) sign-off keeps it open");
+    assert_eq!(
+        body["status"], "pending",
+        "first (no-operator) sign-off keeps it open"
+    );
     assert_eq!(body["approvals_received"], 1);
 
     // (2) same key, now WITH an operator → must be rejected 409, NOT granted.
@@ -1638,7 +2027,11 @@ async fn test_json_decision_hard_sod_blocks_same_key_no_operator_then_operator()
     assert_eq!(body["code"], "separation_of_duty");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
-    assert_eq!(stored.signoffs.len(), 1, "the second same-key sign-off was not recorded");
+    assert_eq!(
+        stored.signoffs.len(),
+        1,
+        "the second same-key sign-off was not recorded"
+    );
 }
 
 #[tokio::test]
@@ -1684,7 +2077,11 @@ async fn test_json_decision_hard_sod_blocks_same_key_operator_then_no_operator()
     );
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
-    assert_eq!(stored.signoffs.len(), 1, "the second same-key sign-off was not recorded");
+    assert_eq!(
+        stored.signoffs.len(),
+        1,
+        "the second same-key sign-off was not recorded"
+    );
 }
 
 #[tokio::test]
@@ -1718,7 +2115,10 @@ async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
         resolver,
     ));
     let router = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         sod_config,
         storage.clone(),
         auth_manager,
@@ -1747,7 +2147,7 @@ async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
         action_label: Some("payments.refund".to_string()),
         dual_control: false,
         criticality: vultrino::approval::CriticalityClass::Medium,
-            trusted_irreversible: None,
+        trusted_irreversible: None,
         escalate_after: chrono::Duration::minutes(30),
         escalate_window: chrono::Duration::minutes(30),
         oob_identity: None,
@@ -1792,7 +2192,11 @@ async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "a distinct operator may approve");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a distinct operator may approve"
+    );
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
 }
@@ -1832,7 +2236,10 @@ async fn test_json_decision_idempotent_for_coapprover_retry_on_granted_mofn() {
         resolver,
     ));
     let router = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         sod_config,
         storage.clone(),
         auth_manager,
@@ -1854,7 +2261,7 @@ async fn test_json_decision_idempotent_for_coapprover_retry_on_granted_mofn() {
         action_label: Some("payments.refund".to_string()),
         dual_control: true,
         criticality: vultrino::approval::CriticalityClass::High,
-            trusted_irreversible: None,
+        trusted_irreversible: None,
         escalate_after: chrono::Duration::minutes(30),
         escalate_window: chrono::Duration::minutes(30),
         oob_identity: None,
@@ -1874,10 +2281,18 @@ async fn test_json_decision_idempotent_for_coapprover_retry_on_granted_mofn() {
     };
 
     // Key A signs off (1 of 2) → still pending.
-    let resp = router.clone().oneshot(approve(&key_a, "alice@example.com")).await.unwrap();
+    let resp = router
+        .clone()
+        .oneshot(approve(&key_a, "alice@example.com"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     // Key B signs off (2 of 2) → granted.
-    let resp = router.clone().oneshot(approve(&key_b, "bob@example.com")).await.unwrap();
+    let resp = router
+        .clone()
+        .oneshot(approve(&key_b, "bob@example.com"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
@@ -1885,7 +2300,10 @@ async fn test_json_decision_idempotent_for_coapprover_retry_on_granted_mofn() {
     // The FIRST co-approver (key A / alice) retries on the now-granted approval →
     // 200 idempotent replay (NOT 409), even though alice is not the FINALIZING
     // approver (bob is).
-    let resp = router.oneshot(approve(&key_a, "alice@example.com")).await.unwrap();
+    let resp = router
+        .oneshot(approve(&key_a, "alice@example.com"))
+        .await
+        .unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::OK,
@@ -1917,7 +2335,11 @@ async fn test_admin_token_mint_trims_owner_identity() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let tokens = storage.list_use_tokens().await.unwrap();
     let t = tokens.iter().find(|t| t.name == "owned-bot").unwrap();
-    assert_eq!(t.owner_identity.as_deref(), Some("alice@example.com"), "owner trimmed");
+    assert_eq!(
+        t.owner_identity.as_deref(),
+        Some("alice@example.com"),
+        "owner trimmed"
+    );
 }
 
 #[tokio::test]
@@ -1947,7 +2369,8 @@ async fn test_v10_inbound_svid_resolves_into_evaluated_principal() {
         header: "x-spiffe-verified".to_string(),
         allowed: vec!["example.org".to_string()],
     });
-    config.policies = vec![Policy::deny_all("block-svid", "*").with_principal("spiffe://example.org/*")];
+    config.policies =
+        vec![Policy::deny_all("block-svid", "*").with_principal("spiffe://example.org/*")];
 
     let admin = AdminAuth::new("admin", "password123").unwrap();
     let resolver = vultrino::router::CredentialResolver::new(storage.clone());
@@ -1957,7 +2380,10 @@ async fn test_v10_inbound_svid_resolves_into_evaluated_principal() {
         resolver,
     ));
     let web = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         config,
         storage.clone(),
         AuthManager::new(),
@@ -2002,7 +2428,8 @@ async fn test_v10_inbound_svid_resolves_into_evaluated_principal() {
         if with_svid {
             b = b.header("x-spiffe-verified", "spiffe://example.org/ns/prod/sa/agent");
         }
-        b.body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()
+        b.body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
     };
 
     // WITH the SVID: the resolved principal matches the trust-domain Deny → blocked
@@ -2059,7 +2486,10 @@ async fn test_v10_inbound_oidc_resolves_subject_and_binds_owner() {
         resolver,
     ));
     let web = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         config,
         storage.clone(),
         AuthManager::new(),
@@ -2102,15 +2532,27 @@ async fn test_v10_inbound_oidc_resolves_subject_and_binds_owner() {
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::ACCEPTED, "require_approval opens an approval");
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "require_approval opens an approval"
+    );
 
     // The opened approval carries the resolved OIDC subject (workload_id) and the
     // human owner (email) bound from the claims — proving both branches fired.
     let approvals = storage.list_approvals().await.unwrap();
     assert_eq!(approvals.len(), 1);
     let a = &approvals[0];
-    assert_eq!(a.workload_id.as_deref(), Some("user-7"), "OIDC subject -> workload_id");
-    assert_eq!(a.requester.owner.as_deref(), Some("alice@example.com"), "OIDC email -> owner binding");
+    assert_eq!(
+        a.workload_id.as_deref(),
+        Some("user-7"),
+        "OIDC subject -> workload_id"
+    );
+    assert_eq!(
+        a.requester.owner.as_deref(),
+        Some("alice@example.com"),
+        "OIDC email -> owner binding"
+    );
 }
 
 /// Regression (V13a): an admin-installed per-agent Deny installed via `PUT
@@ -2149,12 +2591,16 @@ async fn test_admin_deny_does_not_flicker_under_periodic_refresh() {
     // engine default — making a flicker (deny → allow) cleanly observable.
     let mut config = Config::default();
     config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
-    assert!(config.outbox.url.is_none() && config.outbox.hmac_secret.is_none(),
-        "this regression must run with the outbox disabled");
+    assert!(
+        config.outbox.url.is_none() && config.outbox.hmac_secret.is_none(),
+        "this regression must run with the outbox disabled"
+    );
 
     // Mint an admin key so the admin PUT is accepted.
     let auth_manager = AuthManager::new();
-    let (admin_key, api_key) = auth_manager.create_api_key("admin-key", "admin", None).unwrap();
+    let (admin_key, api_key) = auth_manager
+        .create_api_key("admin-key", "admin", None)
+        .unwrap();
     storage.store_api_key(&api_key).await.unwrap();
 
     let admin = AdminAuth::new("admin", "password123").unwrap();
@@ -2165,7 +2611,10 @@ async fn test_admin_deny_does_not_flicker_under_periodic_refresh() {
         resolver,
     ));
     let web = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         config.clone(),
         storage.clone(),
         auth_manager,
@@ -2213,8 +2662,9 @@ async fn test_admin_deny_does_not_flicker_under_periodic_refresh() {
         let stop = refresh_stop.clone();
         refreshers.push(tokio::spawn(async move {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = vultrino::server::refresh_policies_once(&storage, &engine, &config_policies)
-                    .await;
+                let _ =
+                    vultrino::server::refresh_policies_once(&storage, &engine, &config_policies)
+                        .await;
                 if tight {
                     tokio::task::yield_now().await;
                 } else {
@@ -2297,7 +2747,8 @@ async fn test_admin_deny_does_not_flicker_under_periodic_refresh() {
     let eval = || EvalInput {
         credential_alias: "api-cred",
         url: Some("http://example.com/x"),
-        method: Some("GET"), action: None,
+        method: Some("GET"),
+        action: None,
         principal: Some(&principal),
         spend: None,
     };
@@ -2338,7 +2789,11 @@ async fn test_admin_deny_does_not_flicker_under_periodic_refresh() {
             ))
             .await
             .unwrap();
-        assert_eq!(put.status(), StatusCode::OK, "re-PUT #{i} of the Deny must succeed");
+        assert_eq!(
+            put.status(),
+            StatusCode::OK,
+            "re-PUT #{i} of the Deny must succeed"
+        );
 
         // Engine truth: the per-agent Deny must be present immediately after the PUT.
         match exec_server.policy_engine().evaluate_full(&eval()) {
@@ -2394,7 +2849,11 @@ async fn test_admin_deny_does_not_flicker_under_periodic_refresh() {
         "the admin Deny must remain persisted after the refresh churn"
     );
     assert!(
-        exec_server.policy_engine().list_policies().iter().any(|p| p.id == deny_id),
+        exec_server
+            .policy_engine()
+            .list_policies()
+            .iter()
+            .any(|p| p.id == deny_id),
         "the admin Deny must remain in the live engine after the refresh churn"
     );
 }
@@ -2450,7 +2909,13 @@ async fn test_reload_never_loses_a_just_stored_policy() {
         storage.store_policy(&p).await.unwrap();
         // store_and_reload_policy reads the cache here (list_stored_policies) to
         // load the engine; a missing id means the engine would load WITHOUT the Deny.
-        if !storage.list_stored_policies().await.unwrap().iter().any(|x| x.id == id) {
+        if !storage
+            .list_stored_policies()
+            .await
+            .unwrap()
+            .iter()
+            .any(|x| x.id == id)
+        {
             lost += 1;
         }
         let _ = storage.delete_policy(&id).await;
@@ -2498,15 +2963,28 @@ async fn test_admin_list_policies() {
         assert_eq!(created["name"], name);
         let ch = created["content_hash"].as_str().unwrap();
         // With a secret configured, the hash is a KEYED HMAC (self-describing prefix).
-        assert!(ch.starts_with("hmac-sha256:"), "content_hash must be hmac-sha256:<hex>: {}", ch);
-        assert_eq!(ch.len(), "hmac-sha256:".len() + 64, "hmac-sha256 hex must be 64 chars");
+        assert!(
+            ch.starts_with("hmac-sha256:"),
+            "content_hash must be hmac-sha256:<hex>: {}",
+            ch
+        );
+        assert_eq!(
+            ch.len(),
+            "hmac-sha256:".len() + 64,
+            "hmac-sha256 hex must be 64 chars"
+        );
         authored_hash.insert(id, ch.to_string());
     }
     let live = server.policy_engine().list_policies().len();
 
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", "/api/v1/policies", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/policies",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2527,18 +3005,34 @@ async fn test_admin_list_policies() {
         let obj = item.as_object().unwrap();
         let mut keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
         keys.sort_unstable();
-        assert_eq!(keys, vec!["content_hash", "id", "kill", "name"], "reduced DTO fields only");
+        assert_eq!(
+            keys,
+            vec!["content_hash", "id", "kill", "name"],
+            "reduced DTO fields only"
+        );
         // The listed content_hash equals the value captured at author time.
         let id = obj["id"].as_str().unwrap();
         if let Some(expected) = authored_hash.get(id) {
-            assert_eq!(obj["content_hash"].as_str().unwrap(), expected,
-                "listed content_hash must equal the authored value");
+            assert_eq!(
+                obj["content_hash"].as_str().unwrap(),
+                expected,
+                "listed content_hash must equal the authored value"
+            );
         }
     }
     // No enforcement topology anywhere in the serialized list.
-    assert!(!raw.contains("credential_pattern"), "list must not leak credential_pattern");
-    assert!(!raw.contains("principal_pattern"), "list must not leak principal_pattern");
-    assert!(!raw.contains("default_action"), "list must not leak default_action");
+    assert!(
+        !raw.contains("credential_pattern"),
+        "list must not leak credential_pattern"
+    );
+    assert!(
+        !raw.contains("principal_pattern"),
+        "list must not leak principal_pattern"
+    );
+    assert!(
+        !raw.contains("default_action"),
+        "list must not leak default_action"
+    );
     assert!(!raw.contains("\"rules\""), "list must not leak rules");
 
     // Non-admin (no key) is rejected before any policy data is returned.
@@ -2588,7 +3082,12 @@ async fn test_policy_content_hash_changes_on_rule_edit() {
         let key = key.clone();
         async move {
             let resp = router
-                .oneshot(admin_req("GET", "/api/v1/policies", &key, serde_json::json!({})))
+                .oneshot(admin_req(
+                    "GET",
+                    "/api/v1/policies",
+                    &key,
+                    serde_json::json!({}),
+                ))
                 .await
                 .unwrap();
             let listed: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
@@ -2649,8 +3148,15 @@ async fn test_policy_content_hash_changes_on_rule_edit() {
     assert_eq!(resp.status(), StatusCode::OK);
     let replaced: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let hash_v2 = replaced["content_hash"].as_str().unwrap().to_string();
-    assert_ne!(hash_v1, hash_v2, "content_hash must change when rules change");
-    assert_eq!(listed_hash(router, &id).await, hash_v2, "listed hash tracks the new content");
+    assert_ne!(
+        hash_v1, hash_v2,
+        "content_hash must change when rules change"
+    );
+    assert_eq!(
+        listed_hash(router, &id).await,
+        hash_v2,
+        "listed hash tracks the new content"
+    );
 }
 
 // With NO policy-hash secret configured, content_hash must be EMPTY in BOTH the
@@ -2681,11 +3187,20 @@ async fn test_policy_content_hash_empty_without_secret() {
     let created: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let id = created["id"].as_str().unwrap().to_string();
     // The field is present (additive contract preserved) but EMPTY — no oracle.
-    assert_eq!(created["content_hash"].as_str(), Some(""), "create hash must be empty without a secret");
+    assert_eq!(
+        created["content_hash"].as_str(),
+        Some(""),
+        "create hash must be empty without a secret"
+    );
 
     // The list item's content_hash is likewise empty, and certainly not a bare digest.
     let resp = router
-        .oneshot(admin_req("GET", "/api/v1/policies", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/policies",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     let raw = body_string(resp).await;
@@ -2696,9 +3211,16 @@ async fn test_policy_content_hash_empty_without_secret() {
         .iter()
         .find(|p| p["id"].as_str() == Some(&id))
         .expect("policy must be listed");
-    assert_eq!(item["content_hash"].as_str(), Some(""), "listed hash must be empty without a secret");
+    assert_eq!(
+        item["content_hash"].as_str(),
+        Some(""),
+        "listed hash must be empty without a secret"
+    );
     // No bare-digest fallback anywhere (neither scheme prefix appears).
-    assert!(!raw.contains("sha256:"), "must not emit any sha256/hmac-sha256 digest without a secret");
+    assert!(
+        !raw.contains("sha256:"),
+        "must not emit any sha256/hmac-sha256 digest without a secret"
+    );
 }
 
 // V1: a least-privilege read-only key can GET the inventory endpoints but is
@@ -2728,7 +3250,11 @@ async fn test_read_only_key_inventory_least_privilege() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "read key must not POST policies");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "read key must not POST policies"
+    );
 
     let resp = router
         .clone()
@@ -2740,7 +3266,11 @@ async fn test_read_only_key_inventory_least_privilege() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "read key must not POST tokens");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "read key must not POST tokens"
+    );
 
     // Admin key CAN do all: GET inventory AND POST.
     for uri in ["/api/v1/tokens", "/api/v1/policies"] {
@@ -2761,7 +3291,11 @@ async fn test_read_only_key_inventory_least_privilege() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED, "admin key must POST policies");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "admin key must POST policies"
+    );
 
     let resp = router
         .oneshot(admin_req(
@@ -2772,7 +3306,11 @@ async fn test_read_only_key_inventory_least_privilege() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED, "admin key must POST tokens");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "admin key must POST tokens"
+    );
 }
 
 // `GET /api/v1/tokens` lists use tokens as NON-SECRET metadata — id/prefix/scopes,
@@ -2800,7 +3338,12 @@ async fn test_admin_list_tokens_is_non_secret() {
 
     let resp = router
         .clone()
-        .oneshot(admin_req("GET", "/api/v1/tokens", &key, serde_json::json!({})))
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/tokens",
+            &key,
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2820,9 +3363,18 @@ async fn test_admin_list_tokens_is_non_secret() {
 
     // NO-SECRET INVARIANT: neither the hash nor the plaintext may appear anywhere
     // in the response — not as a field, not embedded in any value.
-    assert!(tok.get("token_hash").is_none(), "token_hash must never be listed");
-    assert!(!raw.contains("token_hash"), "no token_hash key anywhere in the response");
-    assert!(!raw.contains(&plaintext), "the token plaintext must never appear in the list");
+    assert!(
+        tok.get("token_hash").is_none(),
+        "token_hash must never be listed"
+    );
+    assert!(
+        !raw.contains("token_hash"),
+        "no token_hash key anywhere in the response"
+    );
+    assert!(
+        !raw.contains(&plaintext),
+        "the token plaintext must never appear in the list"
+    );
 
     // Non-admin is rejected.
     let resp = router

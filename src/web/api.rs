@@ -51,7 +51,11 @@ async fn validate_api_key(state: &AppState, api_key: &str) -> Result<(ApiKey, Ro
 /// Refresh auth data from storage (called after key/role modifications)
 pub async fn refresh_auth_data(state: &AppState) -> Result<(), String> {
     // Reload storage to get latest data
-    state.storage.reload().await.map_err(|e| format!("Failed to reload storage: {}", e))?;
+    state
+        .storage
+        .reload()
+        .await
+        .map_err(|e| format!("Failed to reload storage: {}", e))?;
 
     // Get fresh keys and roles
     let stored_keys = state.storage.list_api_keys().await.unwrap_or_default();
@@ -133,18 +137,38 @@ pub struct ExecuteApiResponse {
 async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, Response> {
     if UseToken::looks_like_token(secret) {
         let _ = state.storage.reload().await;
-        let token = match state.storage.get_use_token_by_hash(&UseToken::hash(secret)).await {
+        let token = match state
+            .storage
+            .get_use_token_by_hash(&UseToken::hash(secret))
+            .await
+        {
             Ok(Some(t)) => t,
-            _ => return Err(error_response(StatusCode::UNAUTHORIZED, "invalid_token", "Invalid use token")),
+            _ => {
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_token",
+                    "Invalid use token",
+                ))
+            }
         };
         if let Err(e) = token.check_usable() {
-            return Err(error_response(StatusCode::FORBIDDEN, "token_unusable", e.to_string()));
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "token_unusable",
+                e.to_string(),
+            ));
         }
         Ok(ExecAuth::from_use_token(token))
     } else {
         let (key, role) = match validate_api_key(state, secret).await {
             Ok(kr) => kr,
-            Err(e) => return Err(error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", e)),
+            Err(e) => {
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_api_key",
+                    e,
+                ))
+            }
         };
         Ok(ExecAuth::from_api_key(AuthResult { api_key: key, role }))
     }
@@ -171,7 +195,11 @@ fn resolve_inbound_principal(
 async fn resolve_caller_id(state: &AppState, secret: &str) -> Result<String, Response> {
     if UseToken::looks_like_token(secret) {
         let _ = state.storage.reload().await;
-        match state.storage.get_use_token_by_hash(&UseToken::hash(secret)).await {
+        match state
+            .storage
+            .get_use_token_by_hash(&UseToken::hash(secret))
+            .await
+        {
             // Polling is read-only, so an exhausted/expired token still
             // authenticates — but a revoked token is rejected.
             Ok(Some(t)) if !t.revoked => Ok(t.id),
@@ -180,12 +208,20 @@ async fn resolve_caller_id(state: &AppState, secret: &str) -> Result<String, Res
                 "token_revoked",
                 "Use token has been revoked",
             )),
-            _ => Err(error_response(StatusCode::UNAUTHORIZED, "invalid_token", "Invalid use token")),
+            _ => Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "Invalid use token",
+            )),
         }
     } else {
         match validate_api_key(state, secret).await {
             Ok((key, _role)) => Ok(key.id),
-            Err(e) => Err(error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", e)),
+            Err(e) => Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_api_key",
+                e,
+            )),
         }
     }
 }
@@ -320,7 +356,9 @@ pub async fn api_check_approval(
         Err(crate::VultrinoError::PolicyDenied(msg)) => {
             return error_response(StatusCode::FORBIDDEN, "not_authorized", msg)
         }
-        Err(e) => return error_response(StatusCode::NOT_FOUND, "approval_not_found", e.to_string()),
+        Err(e) => {
+            return error_response(StatusCode::NOT_FOUND, "approval_not_found", e.to_string())
+        }
     };
 
     let mut body = serde_json::json!({
@@ -451,6 +489,8 @@ pub struct ApprovalSummary {
     /// Channel / identity that decided the approval (human panel, delegate-agent, …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decided_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub veto_until: Option<String>,
 }
 
 impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
@@ -479,18 +519,14 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
                     a.decided_by.as_ref().map(|_| "human".to_string())
                 }
             }),
-            delegation_grant_ref: last
-                .and_then(|s| s.delegation_grant_ref.clone())
-                .or(None),
-            decided_by: a.decided_by.clone().or_else(|| {
-                last.map(|s| {
-                    if s.approver_kind == "delegate-agent" {
-                        s.channel.clone()
-                    } else {
-                        s.approver_identity.clone()
-                    }
-                })
-            }),
+            delegation_grant_ref: last.and_then(|s| s.delegation_grant_ref.clone()).or(None),
+            // The product field answers WHO, not which transport channel handled
+            // the decision. The channel remains on the underlying signoff/event.
+            decided_by: last
+                .map(|s| s.approver_identity.clone())
+                .or_else(|| a.approver_identity.clone())
+                .or_else(|| a.decided_by.clone()),
+            veto_until: a.delegate_veto_until.map(|t| t.to_rfc3339()),
         }
     }
 }
@@ -866,9 +902,7 @@ pub async fn api_list_credentials(
     // after key/role mutations via refresh_auth_data, not on every read).
     let (key, role) = match validate_api_key(&state, &api_key).await {
         Ok((k, r)) => (k, r),
-        Err(e) => {
-            return error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", e)
-        }
+        Err(e) => return error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", e),
     };
 
     let auth_result = AuthResult {
@@ -899,7 +933,13 @@ pub async fn api_list_credentials(
         })
         .collect();
 
-    (StatusCode::OK, Json(ListCredentialsResponse { credentials: filtered })).into_response()
+    (
+        StatusCode::OK,
+        Json(ListCredentialsResponse {
+            credentials: filtered,
+        }),
+    )
+        .into_response()
 }
 
 // ============== Health Check ==============
@@ -977,9 +1017,13 @@ async fn require_admin(
     }
     // Generic message — don't reveal whether the key was unknown vs. expired
     // vs. role-missing (avoid an enumeration oracle on the admin surface).
-    let (key, role) = validate_api_key(state, &secret)
-        .await
-        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", "Invalid API key"))?;
+    let (key, role) = validate_api_key(state, &secret).await.map_err(|_| {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "Invalid API key",
+        )
+    })?;
     let auth = AuthResult { api_key: key, role };
     if !auth.has_permission(Permission::Admin) {
         return Err(error_response(
@@ -1040,9 +1084,13 @@ async fn require_read(
         ));
     }
     // Generic message — same enumeration-oracle hygiene as the admin surface.
-    let (key, role) = validate_api_key(state, &secret)
-        .await
-        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "invalid_api_key", "Invalid API key"))?;
+    let (key, role) = validate_api_key(state, &secret).await.map_err(|_| {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "Invalid API key",
+        )
+    })?;
     let auth = AuthResult { api_key: key, role };
     if !auth.has_permission(Permission::Read) {
         return Err(error_response(
@@ -1070,12 +1118,7 @@ fn extract_idempotency_key(headers: &axum::http::HeaderMap) -> Option<String> {
 /// Rebuild a stored JSON response (status + body) for an idempotent replay.
 fn replay_json(status: u16, body: String) -> Response {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
-        .into_response()
+    (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 /// Stable hash of a request body, used to bind an `Idempotency-Key` to the
@@ -1141,7 +1184,11 @@ where
         let (status, body) = op().await;
         return (status, Json(body)).into_response();
     };
-    match state.storage.idempotency_check_or_reserve(&key, &body_hash).await {
+    match state
+        .storage
+        .idempotency_check_or_reserve(&key, &body_hash)
+        .await
+    {
         Ok(IdempotencyState::Done { status, body }) => return replay_json(status, body),
         Ok(IdempotencyState::Pending) => {
             return error_response(
@@ -1159,13 +1206,21 @@ where
         }
         Ok(IdempotencyState::Fresh) => {}
         Err(e) => {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string())
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                e.to_string(),
+            )
         }
     }
     let (status, body) = op().await;
     if status.is_success() {
         let body_str = serde_json::to_string(&redact_for_replay(&body)).unwrap_or_default();
-        if let Err(e) = state.storage.idempotency_complete(&key, &body_hash, status.as_u16(), &body_str).await {
+        if let Err(e) = state
+            .storage
+            .idempotency_complete(&key, &body_hash, status.as_u16(), &body_str)
+            .await
+        {
             // Completion not recorded → a retry may re-run the op (at-least-once).
             tracing::warn!(error = %e, idempotency_key = %key, "failed to record idempotency completion");
         }
@@ -1213,8 +1268,12 @@ fn build_policy(req: PolicyUpsertRequest, forced_id: Option<String>) -> Result<P
     }
     // Fail loud on a credential_pattern that doesn't compile, rather than
     // storing a policy whose glob silently degrades to never matching.
-    glob::Pattern::new(&req.credential_pattern)
-        .map_err(|e| format!("invalid credential_pattern '{}': {}", req.credential_pattern, e))?;
+    glob::Pattern::new(&req.credential_pattern).map_err(|e| {
+        format!(
+            "invalid credential_pattern '{}': {}",
+            req.credential_pattern, e
+        )
+    })?;
     // Use the builder so new optional Policy fields get their defaults.
     let mut policy = Policy::deny_all(req.name, req.credential_pattern);
     policy.id = forced_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1233,7 +1292,11 @@ fn build_policy(req: PolicyUpsertRequest, forced_id: Option<String>) -> Result<P
 }
 
 /// Persist a policy and hot-reload the engine, returning the canonical object.
-async fn store_and_reload_policy(state: &AppState, policy: &Policy, created: bool) -> (StatusCode, serde_json::Value) {
+async fn store_and_reload_policy(
+    state: &AppState,
+    policy: &Policy,
+    created: bool,
+) -> (StatusCode, serde_json::Value) {
     if let Err(e) = state.storage.store_policy(policy).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1272,7 +1335,11 @@ async fn store_and_reload_policy(state: &AppState, policy: &Policy, created: boo
             }),
         )
         .await;
-    let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
     // Echo the canonical policy plus its semantic `content_hash` (additive — the
     // existing `id`/`name`/... fields are intact) so the authoring caller (govder)
     // captures the expected hash at author time to later diff against the list. The
@@ -1328,7 +1395,9 @@ type PolicyHmac = hmac::Hmac<Sha256>;
 /// re-PUT of the same policy never registers as false drift.
 fn policy_content_hash(policy: &Policy, secret: Option<&str>) -> String {
     // No secret → no hash (graceful degradation; do NOT fall back to a bare digest).
-    let Some(secret) = secret else { return String::new() };
+    let Some(secret) = secret else {
+        return String::new();
+    };
     let canonical = CanonicalPolicy {
         credential_pattern: &policy.credential_pattern,
         principal_pattern: &policy.principal_pattern,
@@ -1393,9 +1462,15 @@ pub async fn api_list_policies(_read: ReadApiAuth, State(state): State<AppState>
     let mut policies = state.server.policy_engine().list_policies();
     policies.sort_by(|a, b| a.id.cmp(&b.id));
     let secret = state.config.policy_hash_secret.as_deref();
-    let items: Vec<PolicyListItem> =
-        policies.iter().map(|p| PolicyListItem::new(p, secret)).collect();
-    (StatusCode::OK, Json(serde_json::json!({ "policies": items }))).into_response()
+    let items: Vec<PolicyListItem> = policies
+        .iter()
+        .map(|p| PolicyListItem::new(p, secret))
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "policies": items })),
+    )
+        .into_response()
 }
 
 /// `POST /api/v1/policies` — create a policy (id generated if omitted).
@@ -1454,14 +1529,24 @@ pub async fn api_delete_policy(
     match state.storage.delete_policy(&id).await {
         Ok(()) => {
             if let Err(e) = state.server.reload_policies().await {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "reload_error", e.to_string());
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "reload_error",
+                    e.to_string(),
+                );
             }
             (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response()
         }
-        Err(crate::storage::StorageError::PolicyNotFound(_)) => {
-            error_response(StatusCode::NOT_FOUND, "policy_not_found", format!("No stored policy with id '{}'", id))
-        }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        Err(crate::storage::StorageError::PolicyNotFound(_)) => error_response(
+            StatusCode::NOT_FOUND,
+            "policy_not_found",
+            format!("No stored policy with id '{}'", id),
+        ),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -1503,13 +1588,19 @@ pub struct CapabilityUpsertRequest {
 
 /// Build a validated `Capability` from a request, forcing the id on PUT or
 /// generating a fresh one on POST.
-fn build_capability(req: CapabilityUpsertRequest, forced_id: Option<String>) -> Result<Capability, String> {
+fn build_capability(
+    req: CapabilityUpsertRequest,
+    forced_id: Option<String>,
+) -> Result<Capability, String> {
     let capability = Capability {
         id: forced_id.unwrap_or_else(|| format!("cap-{}", uuid::Uuid::new_v4())),
         tool_name: req.tool_name.trim().to_string(),
         description: req.description,
         action: req.action.trim().to_string(),
-        plugin: req.plugin.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        plugin: req
+            .plugin
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         target: req.target,
         credential_ref: req.credential_ref.trim().to_string(),
         input_schema: req.input_schema,
@@ -1554,8 +1645,15 @@ async fn store_capability_and_emit(
             }),
         )
         .await;
-    let status = if created { StatusCode::CREATED } else { StatusCode::OK };
-    (status, serde_json::to_value(CapabilityMetadata::from(capability)).unwrap_or_default())
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        serde_json::to_value(CapabilityMetadata::from(capability)).unwrap_or_default(),
+    )
 }
 
 /// `POST /api/v1/capabilities` — create a capability (id generated).
@@ -1606,14 +1704,26 @@ pub async fn api_put_capability(
 }
 
 /// `GET /api/v1/capabilities` — list all stored capabilities (metadata; no secret).
-pub async fn api_list_capabilities(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+pub async fn api_list_capabilities(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+) -> Response {
     match state.storage.list_capabilities().await {
         Ok(mut caps) => {
             caps.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
-            let metadata: Vec<CapabilityMetadata> = caps.iter().map(CapabilityMetadata::from).collect();
-            (StatusCode::OK, Json(serde_json::json!({ "capabilities": metadata }))).into_response()
+            let metadata: Vec<CapabilityMetadata> =
+                caps.iter().map(CapabilityMetadata::from).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "capabilities": metadata })),
+            )
+                .into_response()
         }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -1640,7 +1750,11 @@ pub async fn api_delete_capability(
             "capability_not_found",
             format!("No stored capability with id '{}'", id),
         ),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -1691,9 +1805,17 @@ pub async fn api_list_tokens(_read: ReadApiAuth, State(state): State<AppState>) 
             tokens.sort_by(|a, b| a.id.cmp(&b.id));
             let metadata: Vec<UseTokenMetadata> =
                 tokens.iter().map(UseTokenMetadata::from).collect();
-            (StatusCode::OK, Json(serde_json::json!({ "tokens": metadata }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "tokens": metadata })),
+            )
+                .into_response()
         }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -1791,15 +1913,24 @@ pub async fn api_revoke_token(
     Path(id): Path<String>,
 ) -> Response {
     match state.storage.set_use_token_revoked(&id).await {
-        Ok(token) => (StatusCode::OK, Json(serde_json::json!({
+        Ok(token) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
             "revoked": true,
             "metadata": UseTokenMetadata::from(&token),
-        })))
+            })),
+        )
             .into_response(),
-        Err(crate::storage::StorageError::UseTokenNotFound(_)) => {
-            error_response(StatusCode::NOT_FOUND, "token_not_found", format!("No use token with id '{}'", id))
-        }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        Err(crate::storage::StorageError::UseTokenNotFound(_)) => error_response(
+            StatusCode::NOT_FOUND,
+            "token_not_found",
+            format!("No use token with id '{}'", id),
+        ),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -1883,6 +2014,113 @@ pub async fn api_resolve_agent_token(
             "max_uses": token.max_uses,
             "uses": token.uses,
             "require_approval": token.require_approval,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/auth/agent/consume` — atomically authorize and consume one
+/// agent-facing action use. Unlike the read-only resolver, this is suitable for
+/// side effects such as sub-agent spawn: max_uses is load-bearing and tokens
+/// that require the approval workflow fail closed here.
+pub async fn api_consume_agent_token(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<AgentResolveQuery>,
+) -> Response {
+    let secret = match extract_api_key(&headers) {
+        Some(s) => s,
+        None => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "missing_token",
+                "Authorization header with Bearer use token required",
+            )
+        }
+    };
+    if !UseToken::looks_like_token(&secret) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "not_use_token",
+            "Agent action requires a vut_ use token",
+        );
+    }
+    let _ = state.storage.reload().await;
+    let token = match state
+        .storage
+        .get_use_token_by_hash(&UseToken::hash(&secret))
+        .await
+    {
+        Ok(Some(t)) => t,
+        _ => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "Invalid use token",
+            )
+        }
+    };
+    if let Err(e) = token.check_usable() {
+        return error_response(StatusCode::FORBIDDEN, "token_unusable", e.to_string());
+    }
+    let required = query
+        .required_action
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(required) = required else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "required_action",
+            "required_action is mandatory for token consumption",
+        );
+    };
+    if !token.allows_action(required) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "token_scope_denied",
+            format!("Use token does not permit required action {required:?}"),
+        );
+    }
+    if token.require_approval {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "token_approval_required",
+            "This token requires the governed approval execution path; direct agent action consumption is denied",
+        );
+    }
+    let agent_label = token
+        .agent_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let tenant = token
+        .tenant
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if agent_label.is_none() || tenant.is_none() {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "token_identity_missing",
+            "Agent action token must bind both agent_label and tenant",
+        );
+    }
+    let consumed = match state.storage.consume_use_token(&token.id).await {
+        Ok(t) => t,
+        Err(e) => return error_response(StatusCode::FORBIDDEN, "token_unusable", e.to_string()),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "token_id": consumed.id,
+            "agent_label": consumed.agent_label,
+            "tenant": consumed.tenant,
+            "token_prefix": consumed.token_prefix,
+            "action_scope": consumed.action_scope,
+            "max_uses": consumed.max_uses,
+            "uses": consumed.uses,
+            "require_approval": consumed.require_approval,
         })),
     )
         .into_response()
@@ -2032,17 +2270,24 @@ pub async fn api_revoke_approval_token(
     Path(id): Path<String>,
 ) -> Response {
     match state.storage.set_approval_token_revoked(&id).await {
-        Ok(token) => (StatusCode::OK, Json(serde_json::json!({
+        Ok(token) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
             "revoked": true,
             "metadata": ApprovalTokenMetadata::from(&token),
-        })))
+            })),
+        )
             .into_response(),
         Err(crate::storage::StorageError::ApprovalTokenNotFound(_)) => error_response(
             StatusCode::NOT_FOUND,
             "token_not_found",
             format!("No approval token with id '{}'", id),
         ),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -2164,6 +2409,7 @@ pub async fn api_delegate_decide_approval(
     let eval = match govder
         .evaluate_delegate_decision(crate::govder::EvaluateInput {
             tenant,
+            decision_id: &existing.id,
             grant_id: &grant_ref,
             delegate_agent_id: &approver,
             requester_agent_id,
@@ -2171,6 +2417,8 @@ pub async fn api_delegate_decide_approval(
             risk_tier: existing.criticality.to_govder_risk_tier(),
             irreversible: crate::approval::approval_irreversible(&existing),
             approve: body.approve,
+            spend_amount_minor: existing.trusted_spend_amount_minor,
+            spend_asset: existing.trusted_spend_asset.as_deref(),
         })
         .await
     {
@@ -2194,19 +2442,33 @@ pub async fn api_delegate_decide_approval(
             eval.reason,
         );
     }
-    let pep_ok = if body.approve { Some(true) } else { None };
+    const MAX_DELEGATE_VETO_SECS: u64 = 7 * 24 * 60 * 60;
+    if eval.veto_window_secs > MAX_DELEGATE_VETO_SECS {
+        tracing::error!(approval_id = %id, veto_window_secs = eval.veto_window_secs,
+            "delegate decide: govder returned an out-of-bounds veto window");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "govder_invalid_response",
+            "Govder returned an invalid delegate veto window (fail-closed)",
+        );
+    }
+    let veto_until = if body.approve && eval.veto_window_secs > 0 {
+        let seconds = i64::try_from(eval.veto_window_secs).unwrap_or(i64::MAX);
+        Some(chrono::Utc::now() + chrono::Duration::seconds(seconds))
+    } else {
+        None
+    };
 
     match state
         .storage
-        .decide_approval(
+        .decide_delegate_approval(
             &id,
             body.approve,
-            "delegate-agent",
             &approver,
             enforce_sod,
             body.note,
-            Some(&grant_ref),
-            pep_ok,
+            &grant_ref,
+            veto_until,
         )
         .await
     {
@@ -2219,6 +2481,7 @@ pub async fn api_delegate_decide_approval(
                 "required_approvals": decided.effective_required_approvals(),
                 "approvals_received": decided.signoffs.len(),
                 "delegation_grant_ref": grant_ref,
+                "veto_until": decided.delegate_veto_until.map(|t| t.to_rfc3339()),
             })),
         )
             .into_response(),
@@ -2257,7 +2520,10 @@ pub async fn api_halt_agent(
     let st = state.clone();
     idempotent(&state, key, body_hash, move || async move {
         match st.server.halt_agent(&label).await {
-            Ok(outcome) => (StatusCode::OK, serde_json::to_value(outcome).unwrap_or_default()),
+            Ok(outcome) => (
+                StatusCode::OK,
+                serde_json::to_value(outcome).unwrap_or_default(),
+            ),
             Err(e) => (
                 StatusCode::BAD_REQUEST,
                 serde_json::json!({"code": "halt_failed", "error": e.to_string()}),
@@ -2414,16 +2680,31 @@ pub async fn api_list_events(
             )
                 .into_response()
         }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        ),
     }
 }
 
 /// `GET /api/v1/events/dead` — the dead-letter queue (events that exhausted their
 /// delivery retries) (V9).
-pub async fn api_list_dead_letters(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+pub async fn api_list_dead_letters(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+) -> Response {
     match state.storage.list_dead_letter_events(1000).await {
-        Ok(events) => (StatusCode::OK, Json(serde_json::json!({ "dead_letters": events }))).into_response(),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        Ok(events) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "dead_letters": events })),
+        )
+            .into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -2435,13 +2716,21 @@ pub async fn api_replay_dead_letter(
     Path(sequence): Path<u64>,
 ) -> Response {
     match state.storage.replay_dead_letter_event(sequence).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "requeued": true, "sequence": sequence }))).into_response(),
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "requeued": true, "sequence": sequence })),
+        )
+            .into_response(),
         Ok(false) => error_response(
             StatusCode::NOT_FOUND,
             "not_dead_lettered",
             format!("no dead-lettered event with sequence {sequence}"),
         ),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -2530,10 +2819,16 @@ pub async fn api_delete_role(
         Err(crate::storage::StorageError::Conflict(msg)) => {
             error_response(StatusCode::CONFLICT, "role_in_use", msg)
         }
-        Err(crate::storage::StorageError::RoleNotFound(_)) => {
-            error_response(StatusCode::NOT_FOUND, "role_not_found", format!("No role with id '{}'", id))
-        }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        Err(crate::storage::StorageError::RoleNotFound(_)) => error_response(
+            StatusCode::NOT_FOUND,
+            "role_not_found",
+            format!("No role with id '{}'", id),
+        ),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -2562,7 +2857,10 @@ pub async fn api_create_credential(
     let st = state.clone();
     idempotent(&state, key, body_hash, move || async move {
         if req.alias.trim().is_empty() {
-            return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_credential","error":"alias must not be empty"}));
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"code":"invalid_credential","error":"alias must not be empty"}),
+            );
         }
         let mut cred = Credential::new(req.alias, req.data);
         cred.metadata = req.metadata;
@@ -2578,12 +2876,21 @@ pub async fn api_create_credential(
         if let Err(e) = st.storage.store(&cred).await {
             // Duplicate alias is a client error, not a 500.
             if let crate::storage::StorageError::AlreadyExists(_) = e {
-                return (StatusCode::CONFLICT, serde_json::json!({"code":"credential_exists","error":e.to_string()}));
+                return (
+                    StatusCode::CONFLICT,
+                    serde_json::json!({"code":"credential_exists","error":e.to_string()}),
+                );
             }
-            return (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({"code":"storage_error","error":e.to_string()}));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"code":"storage_error","error":e.to_string()}),
+            );
         }
         // Return metadata only — never the secret.
-        (StatusCode::CREATED, serde_json::to_value(CredentialMetadata::from(&cred)).unwrap_or_default())
+        (
+            StatusCode::CREATED,
+            serde_json::to_value(CredentialMetadata::from(&cred)).unwrap_or_default(),
+        )
     })
     .await
 }
@@ -2608,14 +2915,22 @@ pub async fn api_delete_credential(
             .await;
         }
         Ok(None) => {}
-        Err(e) => tracing::warn!(error = %e, credential_id = %id, "could not load credential for revoke-propagation before delete"),
+        Err(e) => {
+            tracing::warn!(error = %e, credential_id = %id, "could not load credential for revoke-propagation before delete")
+        }
     }
     match state.storage.delete(&id).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response(),
-        Err(crate::storage::StorageError::NotFound(_)) => {
-            error_response(StatusCode::NOT_FOUND, "credential_not_found", format!("No credential with id '{}'", id))
-        }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string()),
+        Err(crate::storage::StorageError::NotFound(_)) => error_response(
+            StatusCode::NOT_FOUND,
+            "credential_not_found",
+            format!("No credential with id '{}'", id),
+        ),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -2637,7 +2952,10 @@ mod tests {
         let req: PolicyUpsertRequest = serde_json::from_str(json).unwrap();
         assert!(!req.kill, "kill must default to false when omitted");
         let policy = build_policy(req, Some("p1".to_string())).unwrap();
-        assert!(!policy.kill, "a normal compiled policy must not be a kill policy");
+        assert!(
+            !policy.kill,
+            "a normal compiled policy must not be a kill policy"
+        );
         assert_eq!(policy.default_action, PolicyAction::Deny);
     }
 
@@ -2663,16 +2981,19 @@ mod tests {
         let req: PolicyUpsertRequest = serde_json::from_str(json).unwrap();
         assert!(req.kill, "kill:true must parse off the wire");
         let kill_policy = build_policy(req, Some("kill-bot-7".to_string())).unwrap();
-        assert!(kill_policy.kill, "build_policy must propagate kill=true to the Policy");
+        assert!(
+            kill_policy.kill,
+            "build_policy must propagate kill=true to the Policy"
+        );
 
         let engine = PolicyEngine::new();
         engine.set_default_deny(false);
         // Ordered FIRST: a broad allow whose allow RULE matches the request. Pre-fix
         // an ordinary deny added after this would never be reached for the agent.
-        engine.add_policy(
-            Policy::allow_all("allow-all", "*")
-                .with_rule(PolicyCondition::UrlMatch("*".to_string()), PolicyAction::Allow),
-        );
+        engine.add_policy(Policy::allow_all("allow-all", "*").with_rule(
+            PolicyCondition::UrlMatch("*".to_string()),
+            PolicyAction::Allow,
+        ));
         // Then the admin-authored kill policy (added AFTER the allow on purpose).
         engine.add_policy(kill_policy);
 
@@ -2685,13 +3006,16 @@ mod tests {
         let decision = engine.evaluate_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
-            method: Some("GET"), action: None,
+            method: Some("GET"),
+            action: None,
             principal: Some(&halted),
             spend: None,
         });
         match decision {
             PolicyDecision::Deny(r) => assert!(r.contains("halted"), "reason: {r}"),
-            other => panic!("an admin-authored kill policy must override the allow rule, got {other:?}"),
+            other => {
+                panic!("an admin-authored kill policy must override the allow rule, got {other:?}")
+            }
         }
 
         // A different agent is unaffected → the allow rule still applies (the kill
@@ -2705,11 +3029,16 @@ mod tests {
         let decision = engine.evaluate_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
-            method: Some("GET"), action: None,
+            method: Some("GET"),
+            action: None,
             principal: Some(&other),
             spend: None,
         });
-        assert_eq!(decision, PolicyDecision::Allow, "non-halted agent still allowed");
+        assert_eq!(
+            decision,
+            PolicyDecision::Allow,
+            "non-halted agent still allowed"
+        );
     }
 
     #[test]
@@ -2717,10 +3046,19 @@ mod tests {
         // Omitted, empty, and whitespace-only all fall back to the default.
         assert_eq!(resolve_execute_action(None), "http.request");
         assert_eq!(resolve_execute_action(Some(String::new())), "http.request");
-        assert_eq!(resolve_execute_action(Some("   ".to_string())), "http.request");
+        assert_eq!(
+            resolve_execute_action(Some("   ".to_string())),
+            "http.request"
+        );
         // A real action (canonical or label) is preserved verbatim.
-        assert_eq!(resolve_execute_action(Some("postgres.run_sql".to_string())), "postgres.run_sql");
-        assert_eq!(resolve_execute_action(Some("payments.refund".to_string())), "payments.refund");
+        assert_eq!(
+            resolve_execute_action(Some("postgres.run_sql".to_string())),
+            "postgres.run_sql"
+        );
+        assert_eq!(
+            resolve_execute_action(Some("payments.refund".to_string())),
+            "payments.refund"
+        );
     }
 
     #[test]
@@ -2745,10 +3083,7 @@ mod tests {
     #[test]
     fn test_extract_api_key_invalid_format() {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            "Basic dXNlcjpwYXNz".parse().unwrap(),
-        );
+        headers.insert(header::AUTHORIZATION, "Basic dXNlcjpwYXNz".parse().unwrap());
 
         let result = extract_api_key(&headers);
         assert_eq!(result, None);
@@ -2757,10 +3092,7 @@ mod tests {
     #[test]
     fn test_extract_api_key_no_token() {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            "Bearer ".parse().unwrap(),
-        );
+        headers.insert(header::AUTHORIZATION, "Bearer ".parse().unwrap());
 
         let result = extract_api_key(&headers);
         assert_eq!(result, Some("".to_string()));
@@ -2814,7 +3146,10 @@ mod tests {
         let request: ExecuteApiRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.credential, "stripe-api");
         assert_eq!(request.method, "POST");
-        assert_eq!(request.headers.get("Content-Type"), Some(&"application/json".to_string()));
+        assert_eq!(
+            request.headers.get("Content-Type"),
+            Some(&"application/json".to_string())
+        );
         assert!(request.body.is_some());
     }
 

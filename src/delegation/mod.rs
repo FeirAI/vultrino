@@ -54,13 +54,22 @@ pub struct DelegateEvalInput<'a> {
 pub struct DelegateEvalResult {
     pub permitted: bool,
     pub reason: String,
+    pub veto_window_secs: u64,
 }
 
 /// Evaluate a delegate approval verdict. Mirrors govder delegation/evaluate.go D3 floors.
+///
+/// Test/mock only: production delegate decisions consult govder via
+/// [`crate::govder::GovderClient::evaluate_delegate_decision`]. Gated behind
+/// `cfg(test)` or the `mock-govder` feature so a production build can never
+/// regress to local-only evaluation (the "no fallback when govder is
+/// configured" guarantee is enforced compile-time).
+#[cfg(any(test, feature = "mock-govder"))]
 pub fn evaluate_delegate_decision(input: DelegateEvalInput<'_>) -> DelegateEvalResult {
     let deny = |reason: &str| DelegateEvalResult {
         permitted: false,
         reason: reason.to_string(),
+        veto_window_secs: 0,
     };
 
     if input.delegate_agent_id.trim().is_empty() {
@@ -81,14 +90,22 @@ pub fn evaluate_delegate_decision(input: DelegateEvalInput<'_>) -> DelegateEvalR
         "Medium" => 2,
         "High" => 3,
         "Extreme" => 4,
-        _ => return deny(&format!("delegation: unknown risk_tier {risk:?} (fail-closed)")),
+        _ => {
+            return deny(&format!(
+                "delegation: unknown risk_tier {risk:?} (fail-closed)"
+            ))
+        }
     };
 
     let max = input.grant_scope.max_risk_tier.trim();
     let max_strength = match max {
         "Low" => 1,
         "Medium" => 2,
-        _ => return deny(&format!("delegation: invalid grant max_risk_tier {max:?} (fail-closed)")),
+        _ => {
+            return deny(&format!(
+                "delegation: invalid grant max_risk_tier {max:?} (fail-closed)"
+            ))
+        }
     };
 
     if risk_strength > max_strength {
@@ -104,7 +121,9 @@ pub fn evaluate_delegate_decision(input: DelegateEvalInput<'_>) -> DelegateEvalR
     if !input.grant_scope.action_classes.is_empty() {
         let action = input.action_class.trim();
         if action.is_empty() {
-            return deny("delegation: action class is required when grant scopes actions (fail-closed)");
+            return deny(
+                "delegation: action class is required when grant scopes actions (fail-closed)",
+            );
         }
         if !input
             .grant_scope
@@ -125,6 +144,7 @@ pub fn evaluate_delegate_decision(input: DelegateEvalInput<'_>) -> DelegateEvalR
     DelegateEvalResult {
         permitted: true,
         reason: "delegate approved within grant caps".to_string(),
+        veto_window_secs: 0,
     }
 }
 

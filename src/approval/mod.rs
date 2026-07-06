@@ -376,6 +376,14 @@ pub struct ApprovalRequest {
     /// Trusted irreversibility from capability/policy at open (D3); not requester params.
     #[serde(default)]
     pub trusted_irreversible: bool,
+    /// Trusted spend facts from the policy extractor at open (D3 grant caps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_spend_amount_minor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_spend_asset: Option<String>,
+    /// End of the delegator's veto window for a delegate-approved action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate_veto_until: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     /// First SLA boundary (V5): when Pending auto-escalates to Escalated.
     #[serde(default)]
@@ -461,6 +469,9 @@ impl ApprovalRequest {
             signoffs: Vec::new(),
             criticality: params.criticality,
             trusted_irreversible: params.trusted_irreversible.unwrap_or(false),
+            trusted_spend_amount_minor: None,
+            trusted_spend_asset: None,
+            delegate_veto_until: None,
             created_at: now,
             escalate_at: now + params.escalate_after,
             escalated_at: None,
@@ -568,11 +579,18 @@ impl ApprovalRequest {
             self.expire_if_due();
             return Err(ApprovalError::Expired);
         }
-        // A decision is valid in either open state (Pending or Escalated).
-        if !self.status.is_open() {
+        let now = Utc::now();
+        // A human may veto a delegate-approved action until its deferred execution
+        // window closes. Outside that one transition, a decision is valid only in
+        // an open state (Pending or Escalated).
+        let is_delegate_veto = to == ApprovalStatus::Denied
+            && self.status == ApprovalStatus::Approved
+            && !self.executed
+            && self.delegate_veto_until.map(|t| now < t).unwrap_or(false)
+            && decision.approver_kind != "delegate-agent";
+        if !self.status.is_open() && !is_delegate_veto {
             return Err(ApprovalError::AlreadyDecided(self.status));
         }
-        let now = Utc::now();
         let sod = self.sod_for(&identity);
 
         if to == ApprovalStatus::Denied {
@@ -754,6 +772,17 @@ impl ApprovalRequest {
         (Utc::now() - decided_at).num_seconds() > interval as i64
     }
 
+    /// A delegate approval is intentionally non-executable until the delegator's
+    /// veto interval elapses.
+    pub fn veto_pending(&self) -> bool {
+        self.status == ApprovalStatus::Approved
+            && !self.executed
+            && self
+                .delegate_veto_until
+                .map(|t| Utc::now() < t)
+                .unwrap_or(false)
+    }
+
     /// Constant-time check of a presented out-of-band decision token.
     pub fn verify_decision_token(&self, token: &str) -> bool {
         let presented = hash_decision_token(token);
@@ -771,8 +800,14 @@ impl ApprovalRequest {
         let base = base_url.trim_end_matches('/');
         let enc = urlencoding::encode(decision_token);
         ApprovalLinks {
-            approve_url: format!("{}/approvals/{}/decide?token={}&decision=approve", base, self.id, enc),
-            deny_url: format!("{}/approvals/{}/decide?token={}&decision=deny", base, self.id, enc),
+            approve_url: format!(
+                "{}/approvals/{}/decide?token={}&decision=approve",
+                base, self.id, enc
+            ),
+            deny_url: format!(
+                "{}/approvals/{}/decide?token={}&decision=deny",
+                base, self.id, enc
+            ),
             panel_url: format!("{}/approvals", base),
         }
     }
@@ -950,7 +985,11 @@ impl ApprovalConfig {
     /// as the sentinel for "use the default of 1 hour" (a zero-TTL approval would
     /// expire before anyone could decide).
     pub fn ttl(&self) -> chrono::Duration {
-        let secs = if self.ttl_secs == 0 { 3600 } else { self.ttl_secs };
+        let secs = if self.ttl_secs == 0 {
+            3600
+        } else {
+            self.ttl_secs
+        };
         chrono::Duration::seconds(secs as i64)
     }
 
@@ -970,7 +1009,11 @@ impl ApprovalConfig {
                 // each phase is a non-zero whole second (a 0s window is what the
                 // config validator rejects for explicit overrides — keep derived
                 // defaults to the same shape).
-                let total = if self.ttl_secs == 0 { 3600 } else { self.ttl_secs.max(2) };
+                let total = if self.ttl_secs == 0 {
+                    3600
+                } else {
+                    self.ttl_secs.max(2)
+                };
                 let half = (total / 2).max(1);
                 CriticalitySla {
                     escalate_after_secs: half,
@@ -990,7 +1033,10 @@ impl ApprovalConfig {
 
     /// Effective SLA for a class: the override if present, else the default.
     pub fn sla_for(&self, class: CriticalityClass) -> CriticalitySla {
-        self.sla_overrides.get(&class).copied().unwrap_or_else(|| self.default_sla(class))
+        self.sla_overrides
+            .get(&class)
+            .copied()
+            .unwrap_or_else(|| self.default_sla(class))
     }
 
     /// Criticality class for a `(credential, action)` — first matching rule, or
@@ -1036,7 +1082,11 @@ pub trait ApprovalNotifier: Send + Sync {
     /// Channel name for logging (e.g. `telegram`).
     fn channel(&self) -> &'static str;
     /// Deliver a notification for `approval`, embedding `links`.
-    async fn notify(&self, approval: &ApprovalRequest, links: &ApprovalLinks) -> Result<(), NotifyError>;
+    async fn notify(
+        &self,
+        approval: &ApprovalRequest,
+        links: &ApprovalLinks,
+    ) -> Result<(), NotifyError>;
 }
 
 /// Build the set of notifiers configured in `cfg`.
@@ -1086,8 +1136,15 @@ impl ApprovalNotifier for TelegramNotifier {
         "telegram"
     }
 
-    async fn notify(&self, approval: &ApprovalRequest, links: &ApprovalLinks) -> Result<(), NotifyError> {
-        let api = format!("https://api.telegram.org/bot{}/sendMessage", self.config.bot_token);
+    async fn notify(
+        &self,
+        approval: &ApprovalRequest,
+        links: &ApprovalLinks,
+    ) -> Result<(), NotifyError> {
+        let api = format!(
+            "https://api.telegram.org/bot{}/sendMessage",
+            self.config.bot_token
+        );
 
         // V5: reflect escalation in the header so a re-ping reads as escalated.
         let header = if approval.status == ApprovalStatus::Escalated {
@@ -1211,7 +1268,11 @@ impl ApprovalNotifier for WebhookNotifier {
         "webhook"
     }
 
-    async fn notify(&self, approval: &ApprovalRequest, links: &ApprovalLinks) -> Result<(), NotifyError> {
+    async fn notify(
+        &self,
+        approval: &ApprovalRequest,
+        links: &ApprovalLinks,
+    ) -> Result<(), NotifyError> {
         let payload = webhook_payload(approval, links)?;
 
         let mut req = self.client.post(&self.config.url).json(&payload);
@@ -1236,7 +1297,9 @@ impl ApprovalNotifier for WebhookNotifier {
 
 /// Minimal HTML escaping for Telegram `parse_mode: HTML`.
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -1285,6 +1348,21 @@ mod tests {
     }
 
     #[test]
+    fn delegate_veto_window_defers_execution_and_allows_human_veto() {
+        let (mut approval, _) = new_approval();
+        approval.delegate_veto_until = Some(Utc::now() + chrono::Duration::minutes(5));
+        approval
+            .approve(Decision::new("delegate-agent", "ep_delegate").as_delegate("dg_1"))
+            .unwrap();
+        assert!(approval.veto_pending());
+        approval
+            .deny(Decision::new("admin panel", "human@example.com"))
+            .unwrap();
+        assert_eq!(approval.status, ApprovalStatus::Denied);
+        assert!(!approval.veto_pending());
+    }
+
+    #[test]
     fn test_summarize_generic() {
         let s = summarize("db-prod", "postgres.run_sql", &serde_json::json!({}));
         assert_eq!(s, "postgres.run_sql on db-prod");
@@ -1318,14 +1396,19 @@ mod tests {
         assert_eq!(a.approver_identity.as_deref(), Some("alice"));
 
         let err = a.deny(Decision::new("admin panel", "bob")).unwrap_err();
-        assert!(matches!(err, ApprovalError::AlreadyDecided(ApprovalStatus::Approved)));
+        assert!(matches!(
+            err,
+            ApprovalError::AlreadyDecided(ApprovalStatus::Approved)
+        ));
     }
 
     #[test]
     fn test_expired_cannot_be_approved() {
         let (mut a, _) = new_approval();
         a.expires_at = Utc::now() - chrono::Duration::minutes(1);
-        let err = a.approve(Decision::new("admin panel", "alice")).unwrap_err();
+        let err = a
+            .approve(Decision::new("admin panel", "alice"))
+            .unwrap_err();
         assert!(matches!(err, ApprovalError::Expired));
         assert_eq!(a.status, ApprovalStatus::Expired);
     }
@@ -1341,9 +1424,15 @@ mod tests {
         assert_eq!(a.signoffs.len(), 1);
         assert_eq!(a.approvals_remaining(), 1);
         // The same approver can't satisfy the second sign-off (case-insensitive).
-        let err = a.approve(Decision::new("admin panel", "ALICE")).unwrap_err();
+        let err = a
+            .approve(Decision::new("admin panel", "ALICE"))
+            .unwrap_err();
         assert!(matches!(err, ApprovalError::DuplicateApprover));
-        assert_eq!(a.status, ApprovalStatus::Pending, "duplicate doesn't advance");
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "duplicate doesn't advance"
+        );
         assert_eq!(a.signoffs.len(), 1);
         // A second DISTINCT approver meets the threshold → Approved.
         a.approve(Decision::new("admin panel", "bob")).unwrap();
@@ -1364,13 +1453,24 @@ mod tests {
         let mut v = serde_json::to_value(&a).unwrap();
         v.as_object_mut().unwrap().remove("required_approvals"); // pre-V12: absent
         let restored: ApprovalRequest = serde_json::from_value(v).unwrap();
-        assert_eq!(restored.required_approvals, 1, "serde default for the absent field");
-        assert_eq!(restored.effective_required_approvals(), 2, "dual_control forces >= 2");
+        assert_eq!(
+            restored.required_approvals, 1,
+            "serde default for the absent field"
+        );
+        assert_eq!(
+            restored.effective_required_approvals(),
+            2,
+            "dual_control forces >= 2"
+        );
 
         // A single approval does NOT grant it.
         let mut r = restored;
         r.approve(Decision::new("admin panel", "alice")).unwrap();
-        assert_eq!(r.status, ApprovalStatus::Pending, "single approval must not grant dual control");
+        assert_eq!(
+            r.status,
+            ApprovalStatus::Pending,
+            "single approval must not grant dual control"
+        );
         r.approve(Decision::new("admin panel", "bob")).unwrap();
         assert_eq!(r.status, ApprovalStatus::Approved);
     }
@@ -1385,7 +1485,11 @@ mod tests {
         assert_eq!(a.sod_violation, Some(false));
         a.deny(Decision::new("admin panel", "agent")).unwrap(); // self-deny → violation
         assert_eq!(a.status, ApprovalStatus::Denied);
-        assert_eq!(a.sod_violation, Some(true), "deny SoD must be sticky-true over a prior false");
+        assert_eq!(
+            a.sod_violation,
+            Some(true),
+            "deny SoD must be sticky-true over a prior false"
+        );
     }
 
     #[test]
@@ -1412,15 +1516,20 @@ mod tests {
         assert!(matches!(err, ApprovalError::SeparationOfDuty));
         assert_eq!(a.signoffs.len(), 0, "self-approval not recorded");
         // Two distinct non-requester approvers still grant it.
-        a.approve(Decision::new("admin panel", "alice").enforcing_sod(true)).unwrap();
-        a.approve(Decision::new("admin panel", "bob").enforcing_sod(true)).unwrap();
+        a.approve(Decision::new("admin panel", "alice").enforcing_sod(true))
+            .unwrap();
+        a.approve(Decision::new("admin panel", "bob").enforcing_sod(true))
+            .unwrap();
         assert_eq!(a.status, ApprovalStatus::Approved);
     }
 
     #[test]
     fn test_aggregator_identity_helpers() {
         // Bare identity passes through unchanged.
-        assert_eq!(bare_approver_identity("alice@example.com"), "alice@example.com");
+        assert_eq!(
+            bare_approver_identity("alice@example.com"),
+            "alice@example.com"
+        );
         assert_eq!(aggregator_key_prefix("alice@example.com"), None);
         // agg:<key-id>:<operator> → bare operator + key prefix.
         let id = "agg:11111111-2222-3333-4444-555555555555:alice@example.com";
@@ -1435,7 +1544,10 @@ mod tests {
         assert_eq!(bare_approver_identity(weird), "a:b@example.com");
         assert_eq!(aggregator_key_prefix(weird), Some("agg:key-1:"));
         // Malformed agg: with no second colon is left opaque (no false strip).
-        assert_eq!(bare_approver_identity("agg:no-second-colon"), "agg:no-second-colon");
+        assert_eq!(
+            bare_approver_identity("agg:no-second-colon"),
+            "agg:no-second-colon"
+        );
         assert_eq!(aggregator_key_prefix("agg:no-second-colon"), None);
     }
 
@@ -1463,14 +1575,22 @@ mod tests {
             .approve(Decision::new("json-api", agg_self).enforcing_sod(true))
             .unwrap_err();
         assert!(matches!(err, ApprovalError::SeparationOfDuty));
-        assert_eq!(b.status, ApprovalStatus::Pending, "self-approval not recorded");
+        assert_eq!(
+            b.status,
+            ApprovalStatus::Pending,
+            "self-approval not recorded"
+        );
 
         // A genuinely DIFFERENT operator on the aggregator surface is clean.
         let (mut c, _) = new_approval();
         c.requester.owner = Some("alice@example.com".to_string());
         c.approve(Decision::new("json-api", "agg:key-123:bob@example.com").enforcing_sod(true))
             .unwrap();
-        assert_eq!(c.sod_violation, Some(false), "distinct operator satisfies SoD");
+        assert_eq!(
+            c.sod_violation,
+            Some(false),
+            "distinct operator satisfies SoD"
+        );
         assert_eq!(c.status, ApprovalStatus::Approved);
     }
 
@@ -1490,7 +1610,11 @@ mod tests {
             .approve(Decision::new("json-api", "agg:keyA:bob@example.com").enforcing_sod(true))
             .unwrap_err();
         assert!(matches!(err, ApprovalError::SameAggregatorKey));
-        assert_eq!(a.signoffs.len(), 1, "the same-key second sign-off was not recorded");
+        assert_eq!(
+            a.signoffs.len(),
+            1,
+            "the same-key second sign-off was not recorded"
+        );
         assert_eq!(a.status, ApprovalStatus::Pending);
         // A DIFFERENT aggregator key completes the threshold.
         a.approve(Decision::new("json-api", "agg:keyB:carol@example.com").enforcing_sod(true))
@@ -1566,28 +1690,46 @@ mod tests {
         // just the agent label.
         let (mut a, _) = new_approval(); // principal_name "agent"
         a.requester.owner = Some("alice@example.com".to_string());
-        a.approve(Decision::new("admin panel", "ALICE@example.com")).unwrap();
-        assert_eq!(a.violates_sod(), Some(true), "approver == bound owner → SoD violation");
+        a.approve(Decision::new("admin panel", "ALICE@example.com"))
+            .unwrap();
+        assert_eq!(
+            a.violates_sod(),
+            Some(true),
+            "approver == bound owner → SoD violation"
+        );
 
         // SoD checks ALL the agent's identities: approving under the agent's own
         // name (not the owner) is still a self-approval.
         let (mut b, _) = new_approval(); // principal_name "agent"
         b.requester.owner = Some("alice@example.com".to_string());
         b.approve(Decision::new("admin panel", "agent")).unwrap();
-        assert_eq!(b.violates_sod(), Some(true), "self-approval under any identity is flagged");
+        assert_eq!(
+            b.violates_sod(),
+            Some(true),
+            "self-approval under any identity is flagged"
+        );
 
         // A genuinely distinct approver (neither the owner nor the agent) is clean.
         let (mut c, _) = new_approval();
         c.requester.owner = Some("alice@example.com".to_string());
-        c.approve(Decision::new("admin panel", "secops-oncall")).unwrap();
-        assert_eq!(c.violates_sod(), Some(false), "distinct approver satisfies SoD");
+        c.approve(Decision::new("admin panel", "secops-oncall"))
+            .unwrap();
+        assert_eq!(
+            c.violates_sod(),
+            Some(false),
+            "distinct approver satisfies SoD"
+        );
 
         // A blank owner must NOT poison the result to not-computable — SoD falls
         // through to the agent's other identities (the old `.or()` chain bug).
         let (mut d, _) = new_approval(); // principal_name "agent"
         d.requester.owner = Some("   ".to_string());
         d.approve(Decision::new("admin panel", "agent")).unwrap();
-        assert_eq!(d.violates_sod(), Some(true), "blank owner doesn't poison SoD to None");
+        assert_eq!(
+            d.violates_sod(),
+            Some(true),
+            "blank owner doesn't poison SoD to None"
+        );
     }
 
     #[test]
@@ -1600,7 +1742,8 @@ mod tests {
 
         // A distinct approver satisfies SoD.
         let (mut b, _) = new_approval();
-        b.deny(Decision::new("admin panel", "secops-oncall")).unwrap();
+        b.deny(Decision::new("admin panel", "secops-oncall"))
+            .unwrap();
         assert_eq!(b.violates_sod(), Some(false));
     }
 
@@ -1610,7 +1753,11 @@ mod tests {
         let (mut a, _) = new_approval();
         a.approve(Decision::new("admin panel", "agent")).unwrap();
         assert_eq!(a.sod_violation, Some(true));
-        assert_eq!(a.status, ApprovalStatus::Approved, "allowed when not enforcing");
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Approved,
+            "allowed when not enforcing"
+        );
 
         // Hard-reject a self-approval when enforcing; the request stays undecided
         // and the approver is cleared.
@@ -1623,13 +1770,15 @@ mod tests {
         assert!(b.approver_identity.is_none());
 
         // A distinct approver passes even when enforcing.
-        b.approve(Decision::new("admin panel", "secops").enforcing_sod(true)).unwrap();
+        b.approve(Decision::new("admin panel", "secops").enforcing_sod(true))
+            .unwrap();
         assert_eq!(b.status, ApprovalStatus::Approved);
         assert_eq!(b.sod_violation, Some(false));
 
         // A self-*denial* is harmless and is never blocked, even when enforcing.
         let (mut c, _) = new_approval();
-        c.deny(Decision::new("admin panel", "agent").enforcing_sod(true)).unwrap();
+        c.deny(Decision::new("admin panel", "agent").enforcing_sod(true))
+            .unwrap();
         assert_eq!(c.status, ApprovalStatus::Denied);
         assert_eq!(c.sod_violation, Some(true), "recorded even on deny");
     }
@@ -1644,8 +1793,16 @@ mod tests {
         let decided_at = a.decided_at;
         a.expire_reauth_lapsed();
         assert_eq!(a.status, ApprovalStatus::Expired);
-        assert_eq!(a.decided_by.as_deref(), Some("admin panel"), "channel preserved");
-        assert_eq!(a.approver_identity.as_deref(), Some("alice"), "approver preserved");
+        assert_eq!(
+            a.decided_by.as_deref(),
+            Some("admin panel"),
+            "channel preserved"
+        );
+        assert_eq!(
+            a.approver_identity.as_deref(),
+            Some("alice"),
+            "approver preserved"
+        );
         assert_eq!(a.decided_at, decided_at, "decision time preserved");
         let note = a.decision_note.as_deref().unwrap();
         assert!(note.contains("ok by me"), "original note kept: {note}");
@@ -1655,7 +1812,10 @@ mod tests {
         let (mut b, _) = new_approval();
         b.approve(Decision::new("admin panel", "bob")).unwrap();
         b.expire_reauth_lapsed();
-        assert_eq!(b.decision_note.as_deref(), Some("re-authorization window lapsed before execution"));
+        assert_eq!(
+            b.decision_note.as_deref(),
+            Some("re-authorization window lapsed before execution")
+        );
     }
 
     #[test]
@@ -1695,12 +1855,18 @@ mod tests {
         };
         let e = webhook_payload(&a, &panel_only).unwrap();
         assert_eq!(e["event"], "approval.escalated");
-        assert!(e["links"].get("approve_url").is_none(), "blank links omitted");
+        assert!(
+            e["links"].get("approve_url").is_none(),
+            "blank links omitted"
+        );
         assert!(e["links"]["panel_url"].is_string());
 
         // A decided/closed status is not a live notify path → Config error.
         a.status = ApprovalStatus::Approved;
-        assert!(matches!(webhook_payload(&a, &links), Err(NotifyError::Config(_))));
+        assert!(matches!(
+            webhook_payload(&a, &links),
+            Err(NotifyError::Config(_))
+        ));
     }
 
     #[test]
@@ -1710,7 +1876,10 @@ mod tests {
 
         // Untenanted (new_approval sets tenant: None) → nested approval.tenant is null.
         let p = webhook_payload(&approval, &links).expect("pending payload builds");
-        assert!(p["approval"].get("tenant").is_some(), "nested tenant key present");
+        assert!(
+            p["approval"].get("tenant").is_some(),
+            "nested tenant key present"
+        );
         assert!(p["approval"]["tenant"].is_null(), "untenanted ⇒ null");
 
         // Tenanted → the nested key carries the tenant string.
@@ -1721,7 +1890,10 @@ mod tests {
 
     #[test]
     fn test_sla_windows_per_class() {
-        let mut cfg = ApprovalConfig { ttl_secs: 7200, ..Default::default() };
+        let mut cfg = ApprovalConfig {
+            ttl_secs: 7200,
+            ..Default::default()
+        };
         // Critical escalates faster than Low.
         let crit = cfg.sla_for(CriticalityClass::Critical);
         let low = cfg.sla_for(CriticalityClass::Low);
@@ -1732,7 +1904,10 @@ mod tests {
         // An override takes precedence.
         cfg.sla_overrides.insert(
             CriticalityClass::High,
-            CriticalitySla { escalate_after_secs: 1, escalate_window_secs: 2 },
+            CriticalitySla {
+                escalate_after_secs: 1,
+                escalate_window_secs: 2,
+            },
         );
         assert_eq!(cfg.sla_for(CriticalityClass::High).escalate_after_secs, 1);
     }

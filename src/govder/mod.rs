@@ -6,7 +6,7 @@
 
 mod tenant_assert;
 
-use crate::delegation::{DelegationGrantScope, DelegateEvalResult};
+use crate::delegation::{DelegateEvalResult, DelegationGrantScope};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -116,6 +116,7 @@ impl From<&GovderGrantScope> for DelegationGrantScope {
 #[derive(Debug, Clone)]
 pub struct EvaluateInput<'a> {
     pub tenant: &'a str,
+    pub decision_id: &'a str,
     pub grant_id: &'a str,
     pub delegate_agent_id: &'a str,
     pub requester_agent_id: &'a str,
@@ -123,6 +124,8 @@ pub struct EvaluateInput<'a> {
     pub risk_tier: &'a str,
     pub irreversible: bool,
     pub approve: bool,
+    pub spend_amount_minor: Option<i64>,
+    pub spend_asset: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,6 +133,8 @@ struct EvaluateResponse {
     permitted: bool,
     #[serde(default)]
     reason: String,
+    #[serde(default)]
+    veto_window_secs: u64,
 }
 
 /// HTTP client for govder delegation endpoints.
@@ -155,9 +160,7 @@ impl GovderClient {
                 }
             })
             .ok_or_else(|| GovderError::BadUrl("missing host".to_string()))?;
-        let http = Client::builder()
-            .timeout(cfg.http_timeout)
-            .build()?;
+        let http = Client::builder().timeout(cfg.http_timeout).build()?;
         Ok(Self {
             cfg,
             base,
@@ -182,6 +185,12 @@ impl GovderClient {
                     "delegation: grant {grant_id:?} not found in govder (fail-closed)"
                 ))
             })?;
+        if grant.tenant_id != tenant {
+            return Err(GovderError::Policy(format!(
+                "delegation: grant {grant_id} tenant {:?} does not match requested tenant {tenant:?} (fail-closed)",
+                grant.tenant_id
+            )));
+        }
         if grant.revoked {
             return Err(GovderError::Policy(format!(
                 "delegation: grant {grant_id} is revoked (fail-closed)"
@@ -207,17 +216,15 @@ impl GovderClient {
             }
         }
         let scope = DelegationGrantScope::from(&grant.scope);
-        scope
-            .validate()
-            .map_err(|e| GovderError::Policy(format!("delegation: invalid grant scope from govder: {e}")))?;
+        scope.validate().map_err(|e| {
+            GovderError::Policy(format!("delegation: invalid grant scope from govder: {e}"))
+        })?;
         Ok((grant, scope))
     }
 
     pub async fn list_grants(&self, tenant: &str) -> Result<Vec<DelegationGrant>, GovderError> {
         let path = "/v1/delegation/grants";
-        let resp = self
-            .signed_json(tenant, "GET", path, "", None)
-            .await?;
+        let resp = self.signed_json(tenant, "GET", path, "", None).await?;
         let status = resp.status().as_u16();
         let body = resp.text().await?;
         if !(200..300).contains(&status) {
@@ -234,6 +241,7 @@ impl GovderClient {
         input: EvaluateInput<'_>,
     ) -> Result<DelegateEvalResult, GovderError> {
         let body = EvaluateRequest {
+            decision_id: input.decision_id.to_string(),
             grant_id: input.grant_id.to_string(),
             delegate_agent_id: input.delegate_agent_id.to_string(),
             requester_agent_id: input.requester_agent_id.to_string(),
@@ -241,6 +249,8 @@ impl GovderClient {
             risk_tier: input.risk_tier.to_string(),
             irreversible: input.irreversible,
             approve: input.approve,
+            spend_amount_minor: input.spend_amount_minor,
+            spend_asset: input.spend_asset.map(str::to_string),
         };
         let bytes = serde_json::to_vec(&body).map_err(|e| GovderError::Decode(e.to_string()))?;
         let resp = self
@@ -270,6 +280,7 @@ impl GovderClient {
             } else {
                 out.reason
             },
+            veto_window_secs: out.veto_window_secs,
         })
     }
 
@@ -289,7 +300,9 @@ impl GovderClient {
         if !query.is_empty() {
             url.set_query(Some(query));
         }
-        let exp = chrono::Utc::now() + chrono::Duration::from_std(self.cfg.assertion_ttl).unwrap_or(chrono::Duration::seconds(90));
+        let exp = chrono::Utc::now()
+            + chrono::Duration::from_std(self.cfg.assertion_ttl)
+                .unwrap_or(chrono::Duration::seconds(90));
         let assertion = sign_tenant_assertion(
             &self.cfg.assertion_secret,
             tenant,
@@ -306,7 +319,9 @@ impl GovderClient {
         );
         req = req.header("X-Govder-Tenant-Assertion", assertion);
         if let Some(b) = body {
-            req = req.header("Content-Type", "application/json").body(b.to_vec());
+            req = req
+                .header("Content-Type", "application/json")
+                .body(b.to_vec());
         }
         Ok(req.send().await?)
     }
@@ -338,6 +353,7 @@ fn delegate_matches_grant(grant: &DelegationGrant, delegate: &str) -> bool {
 
 #[derive(Serialize)]
 struct EvaluateRequest {
+    decision_id: String,
     grant_id: String,
     delegate_agent_id: String,
     requester_agent_id: String,
@@ -345,6 +361,10 @@ struct EvaluateRequest {
     risk_tier: String,
     irreversible: bool,
     approve: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spend_amount_minor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spend_asset: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -358,7 +378,7 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
-    fn assertion_has_three_segments() {
+    fn assertion_has_four_segments() {
         let exp = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
         let a = sign_tenant_assertion(
             "secret",
@@ -370,6 +390,6 @@ mod tests {
             b"",
             exp,
         );
-        assert_eq!(a.split('.').count(), 3);
+        assert_eq!(a.split('.').count(), 4);
     }
 }

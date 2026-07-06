@@ -2,6 +2,7 @@
 //!
 //! Stores credentials in an encrypted JSON file on disk.
 
+use super::outbox_store::OutboxStore;
 use super::{IdempotencyState, StorageBackend, StorageError};
 use crate::approval::ApprovalRequest;
 use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
@@ -14,7 +15,6 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use super::outbox_store::OutboxStore;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,8 +58,7 @@ const IDEMPOTENCY_RETENTION_SECS: i64 = 24 * 60 * 60;
 fn approval_is_due(a: &ApprovalRequest, now: DateTime<Utc>) -> bool {
     use crate::approval::ApprovalStatus;
     (a.status.is_open()
-        && (now >= a.expires_at
-            || (a.status == ApprovalStatus::Pending && now >= a.escalate_at)))
+        && (now >= a.expires_at || (a.status == ApprovalStatus::Pending && now >= a.escalate_at)))
         || a.needs_reauth()
 }
 
@@ -137,6 +136,8 @@ fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
         "risk_tier": a.criticality.to_govder_risk_tier(),
         "irreversible": crate::approval::approval_irreversible(a),
         "agent_label": a.agent_label,
+        "spend_amount_minor": a.trusted_spend_amount_minor,
+        "spend_asset": a.trusted_spend_asset,
     })
 }
 
@@ -302,12 +303,14 @@ impl StorageCache {
 
         // Rebuild API key hash index
         for (id, key) in &self.api_keys {
-            self.api_key_hash_index.insert(key.key_hash.clone(), id.clone());
+            self.api_key_hash_index
+                .insert(key.key_hash.clone(), id.clone());
         }
 
         // Rebuild use token hash index
         for (id, token) in &self.use_tokens {
-            self.use_token_hash_index.insert(token.token_hash.clone(), id.clone());
+            self.use_token_hash_index
+                .insert(token.token_hash.clone(), id.clone());
         }
 
         // Rebuild approval token hash index
@@ -348,7 +351,10 @@ struct StorageFile {
 
 impl FileStorage {
     /// Create a new file storage, loading existing data if present
-    pub async fn new(path: impl AsRef<Path>, password: &SecretString) -> Result<Self, StorageError> {
+    pub async fn new(
+        path: impl AsRef<Path>,
+        password: &SecretString,
+    ) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
 
         // Ensure parent directory exists
@@ -468,7 +474,10 @@ impl FileStorage {
                 "v6 outbox entries appeared after the migration snapshot; left in the vault for the next open's migration"
             );
         }
-        tracing::info!(count, "migrated v6 in-vault outbox events into the split outbox file (v7)");
+        tracing::info!(
+            count,
+            "migrated v6 in-vault outbox events into the split outbox file (v7)"
+        );
         Ok(())
     }
 
@@ -488,7 +497,12 @@ impl FileStorage {
         let mut drained: Vec<String> = Vec::with_capacity(pending.len());
         for ev in &pending {
             self.outbox
-                .append_deduped(&ev.dedup_id, &ev.subject, &ev.event_type, ev.payload.clone())
+                .append_deduped(
+                    &ev.dedup_id,
+                    &ev.subject,
+                    &ev.event_type,
+                    ev.payload.clone(),
+                )
                 .await?;
             drained.push(ev.dedup_id.clone());
         }
@@ -499,6 +513,80 @@ impl FileStorage {
         })
         .await?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_approval_atomic(
+        &self,
+        id: &str,
+        approve: bool,
+        channel: &str,
+        approver_identity: &str,
+        enforce_sod: bool,
+        note: Option<String>,
+        delegation_grant_ref: Option<&str>,
+        delegate_pep_ok: Option<bool>,
+        veto_until: Option<DateTime<Utc>>,
+    ) -> Result<ApprovalRequest, StorageError> {
+        use crate::approval::Decision;
+        let decided = self
+            .locked_mutate(|cache| {
+                let approval = cache
+                    .approvals
+                    .get_mut(id)
+                    .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
+                if channel == "delegate-agent" && approve && delegate_pep_ok != Some(true) {
+                    return Err(StorageError::Conflict(
+                        "delegate approval blocked: govder PEP evaluation required (fail-closed)"
+                            .to_string(),
+                    ));
+                }
+                approval.advance_lifecycle();
+                let mut decision = Decision::new(channel, approver_identity)
+                    .with_note(note)
+                    .enforcing_sod(enforce_sod);
+                if let Some(grant_ref) = delegation_grant_ref {
+                    decision = decision.as_delegate(grant_ref);
+                }
+                let result = if approve {
+                    approval.approve(decision)
+                } else {
+                    approval.deny(decision)
+                };
+                result.map_err(|e| StorageError::Conflict(e.to_string()))?;
+                // The deadline and delegate decision are one vault mutation. A
+                // rejected/raced decision therefore cannot delay an unrelated
+                // human approval by leaving a stray veto window behind.
+                if approve && channel == "delegate-agent" {
+                    approval.delegate_veto_until = veto_until;
+                }
+                let decided = approval.clone();
+                let event_type = if approve {
+                    crate::outbox::EVENT_APPROVAL_APPROVED
+                } else {
+                    crate::outbox::EVENT_APPROVAL_DENIED
+                };
+                stage_event(
+                    cache,
+                    &decided.id,
+                    event_type,
+                    approval_event_payload(&decided),
+                )?;
+                Ok(decided)
+            })
+            .await?;
+        if let Err(e) = self.drain_pending_events().await {
+            tracing::warn!(approval_id = %decided.id, error = %e,
+                "approval decision committed but the staged-event drain failed; the periodic reconciler will deliver it");
+        }
+        if decided.sod_violation == Some(true) {
+            tracing::warn!(
+                approval_id = %decided.id,
+                approver = %approver_identity,
+                "separation-of-duty: approver is the requesting agent (self-approval)"
+            );
+        }
+        Ok(decided)
     }
 
     /// Parse decrypted bytes into a `StorageCache`, tolerating the legacy
@@ -712,11 +800,15 @@ impl StorageBackend for FileStorage {
                     return Err(StorageError::AlreadyExists(credential.alias.clone()));
                 }
             }
-            cache.alias_index.insert(credential.alias.clone(), credential.id.clone());
-            cache.credentials.insert(credential.id.clone(), credential.clone());
+            cache
+                .alias_index
+                .insert(credential.alias.clone(), credential.id.clone());
+            cache
+                .credentials
+                .insert(credential.id.clone(), credential.clone());
             Ok(())
         })
-            .await
+        .await
     }
 
     async fn get(&self, id: &str) -> Result<Option<Credential>, StorageError> {
@@ -735,7 +827,11 @@ impl StorageBackend for FileStorage {
 
     async fn list(&self) -> Result<Vec<CredentialMetadata>, StorageError> {
         let cache = self.cache.read();
-        Ok(cache.credentials.values().map(CredentialMetadata::from).collect())
+        Ok(cache
+            .credentials
+            .values()
+            .map(CredentialMetadata::from)
+            .collect())
     }
 
     async fn delete(&self, id: &str) -> Result<(), StorageError> {
@@ -747,7 +843,7 @@ impl StorageBackend for FileStorage {
                 Err(StorageError::NotFound(id.to_string()))
             }
         })
-            .await
+        .await
     }
 
     async fn update(&self, credential: &Credential) -> Result<(), StorageError> {
@@ -771,10 +867,12 @@ impl StorageBackend for FileStorage {
                     .insert(credential.alias.clone(), credential.id.clone());
             }
 
-            cache.credentials.insert(credential.id.clone(), credential.clone());
+            cache
+                .credentials
+                .insert(credential.id.clone(), credential.clone());
             Ok(())
         })
-            .await
+        .await
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {
@@ -796,11 +894,13 @@ impl StorageBackend for FileStorage {
                     return Err(StorageError::RoleAlreadyExists(role.name.clone()));
                 }
             }
-            cache.role_name_index.insert(role.name.clone(), role.id.clone());
+            cache
+                .role_name_index
+                .insert(role.name.clone(), role.id.clone());
             cache.roles.insert(role.id.clone(), role.clone());
             Ok(())
         })
-            .await
+        .await
     }
 
     async fn get_role(&self, id: &str) -> Result<Option<Role>, StorageError> {
@@ -831,7 +931,7 @@ impl StorageBackend for FileStorage {
                 Err(StorageError::RoleNotFound(id.to_string()))
             }
         })
-            .await
+        .await
     }
 
     async fn delete_role_if_unreferenced(&self, id: &str) -> Result<(), StorageError> {
@@ -857,11 +957,13 @@ impl StorageBackend for FileStorage {
 
     async fn store_api_key(&self, key: &ApiKey) -> Result<(), StorageError> {
         self.locked_mutate(|cache| {
-            cache.api_key_hash_index.insert(key.key_hash.clone(), key.id.clone());
+            cache
+                .api_key_hash_index
+                .insert(key.key_hash.clone(), key.id.clone());
             cache.api_keys.insert(key.id.clone(), key.clone());
             Ok(())
         })
-            .await
+        .await
     }
 
     async fn get_api_key_by_hash(&self, hash: &str) -> Result<Option<ApiKey>, StorageError> {
@@ -887,7 +989,7 @@ impl StorageBackend for FileStorage {
                 Err(StorageError::ApiKeyNotFound(id.to_string()))
             }
         })
-            .await
+        .await
     }
 
     async fn update_api_key_last_used(&self, id: &str) -> Result<(), StorageError> {
@@ -899,7 +1001,7 @@ impl StorageBackend for FileStorage {
                 Err(StorageError::ApiKeyNotFound(id.to_string()))
             }
         })
-            .await
+        .await
     }
 
     // ==================== Use Token Storage ====================
@@ -912,7 +1014,7 @@ impl StorageBackend for FileStorage {
             cache.use_tokens.insert(token.id.clone(), token.clone());
             Ok(())
         })
-            .await
+        .await
     }
 
     async fn get_use_token(&self, id: &str) -> Result<Option<UseToken>, StorageError> {
@@ -943,7 +1045,7 @@ impl StorageBackend for FileStorage {
                 Err(StorageError::UseTokenNotFound(id.to_string()))
             }
         })
-            .await
+        .await
     }
 
     async fn consume_use_token(&self, id: &str) -> Result<UseToken, StorageError> {
@@ -962,7 +1064,7 @@ impl StorageBackend for FileStorage {
             token.last_used_at = Some(Utc::now());
             Ok(token.clone())
         })
-            .await
+        .await
     }
 
     async fn set_use_token_revoked(&self, id: &str) -> Result<UseToken, StorageError> {
@@ -974,7 +1076,7 @@ impl StorageBackend for FileStorage {
             token.revoked = true;
             Ok(token.clone())
         })
-            .await
+        .await
     }
 
     // ==================== Approval Token Storage ====================
@@ -1025,10 +1127,12 @@ impl StorageBackend for FileStorage {
 
     async fn store_approval(&self, approval: &ApprovalRequest) -> Result<(), StorageError> {
         self.locked_mutate(|cache| {
-            cache.approvals.insert(approval.id.clone(), approval.clone());
+            cache
+                .approvals
+                .insert(approval.id.clone(), approval.clone());
             Ok(())
         })
-            .await
+        .await
     }
 
     async fn store_approval_reserving(
@@ -1057,10 +1161,12 @@ impl StorageBackend for FileStorage {
                     "use token has no remaining capacity for a new pending approval".to_string(),
                 ));
             }
-            cache.approvals.insert(approval.id.clone(), approval.clone());
+            cache
+                .approvals
+                .insert(approval.id.clone(), approval.clone());
             Ok(())
         })
-            .await
+        .await
     }
 
     async fn get_approval(&self, id: &str) -> Result<Option<ApprovalRequest>, StorageError> {
@@ -1078,10 +1184,12 @@ impl StorageBackend for FileStorage {
             if !cache.approvals.contains_key(&approval.id) {
                 return Err(StorageError::ApprovalNotFound(approval.id.clone()));
             }
-            cache.approvals.insert(approval.id.clone(), approval.clone());
+            cache
+                .approvals
+                .insert(approval.id.clone(), approval.clone());
             Ok(())
         })
-            .await
+        .await
     }
 
     async fn delete_approval(&self, id: &str) -> Result<(), StorageError> {
@@ -1091,7 +1199,7 @@ impl StorageBackend for FileStorage {
             }
             Ok(())
         })
-            .await
+        .await
     }
 
     async fn decide_approval(
@@ -1105,66 +1213,42 @@ impl StorageBackend for FileStorage {
         delegation_grant_ref: Option<&str>,
         delegate_pep_ok: Option<bool>,
     ) -> Result<ApprovalRequest, StorageError> {
-        use crate::approval::Decision;
-        let decided = self
-            .locked_mutate(|cache| {
-                let approval = cache
-                    .approvals
-                    .get_mut(id)
-                    .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
-                if channel == "delegate-agent"
-                    && approve
-                    && delegate_pep_ok != Some(true)
-                {
-                    return Err(StorageError::Conflict(
-                        "delegate approval blocked: govder PEP evaluation required (fail-closed)"
-                            .to_string(),
-                    ));
-                }
-                // Advance the SLA lifecycle first so a decision raced against the
-                // final deadline is rejected as expired, not silently accepted.
-                approval.advance_lifecycle();
-                let mut decision = Decision::new(channel, approver_identity)
-                    .with_note(note)
-                    .enforcing_sod(enforce_sod);
-                if let Some(grant_ref) = delegation_grant_ref {
-                    decision = decision.as_delegate(grant_ref);
-                }
-                let result = if approve {
-                    approval.approve(decision)
-                } else {
-                    approval.deny(decision)
-                };
-                result.map_err(|e| StorageError::Conflict(e.to_string()))?;
-                let decided = approval.clone();
-                // V9: emit the decision event atomically with the decision.
-                let event_type = if approve {
-                    crate::outbox::EVENT_APPROVAL_APPROVED
-                } else {
-                    crate::outbox::EVENT_APPROVAL_DENIED
-                };
-                stage_event(cache, &decided.id, event_type, approval_event_payload(&decided))?;
-                Ok(decided)
-            })
-            .await?;
-        // Drain the staged decision event to the split outbox file (D1). The vault has ALREADY committed
-        // the decision + the intent atomically, so a drain failure here must NOT be reported to the human
-        // approver as "decision not recorded" — the decision is durable and the periodic/startup
-        // reconciler will deliver the event. Best-effort: log and return Ok with the committed decision.
-        if let Err(e) = self.drain_pending_events().await {
-            tracing::warn!(approval_id = %decided.id, error = %e,
-                "approval decision committed but the staged-event drain failed; the periodic reconciler will deliver it");
-        }
-        // Surface a separation-of-duty violation (V5) even when not hard-enforced,
-        // so a self-approval is always observable.
-        if decided.sod_violation == Some(true) {
-            tracing::warn!(
-                approval_id = %decided.id,
-                approver = %approver_identity,
-                "separation-of-duty: approver is the requesting agent (self-approval)"
-            );
-        }
-        Ok(decided)
+        self.decide_approval_atomic(
+            id,
+            approve,
+            channel,
+            approver_identity,
+            enforce_sod,
+            note,
+            delegation_grant_ref,
+            delegate_pep_ok,
+            None,
+        )
+        .await
+    }
+
+    async fn decide_delegate_approval(
+        &self,
+        id: &str,
+        approve: bool,
+        approver_identity: &str,
+        enforce_sod: bool,
+        note: Option<String>,
+        delegation_grant_ref: &str,
+        veto_until: Option<DateTime<Utc>>,
+    ) -> Result<ApprovalRequest, StorageError> {
+        self.decide_approval_atomic(
+            id,
+            approve,
+            "delegate-agent",
+            approver_identity,
+            enforce_sod,
+            note,
+            Some(delegation_grant_ref),
+            if approve { Some(true) } else { None },
+            veto_until,
+        )
+        .await
     }
 
     async fn poll_refresh_approval(&self, id: &str) -> Result<ApprovalRequest, StorageError> {
@@ -1182,36 +1266,38 @@ impl StorageBackend for FileStorage {
                 Some(_) => {}
             }
         }
-        let refreshed = self.locked_mutate(|cache| {
-            use crate::approval::LifecycleChange;
-            let (clone, event) = {
-                let approval = cache
-                    .approvals
-                    .get_mut(id)
-                    .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
-                // Escalate / expire as due.
-                let mut event = match approval.advance_lifecycle() {
-                    LifecycleChange::Escalated => Some(crate::outbox::EVENT_APPROVAL_ESCALATED),
-                    LifecycleChange::Expired => Some(crate::outbox::EVENT_APPROVAL_EXPIRED),
-                    LifecycleChange::None => None,
+        let refreshed = self
+            .locked_mutate(|cache| {
+                use crate::approval::LifecycleChange;
+                let (clone, event) = {
+                    let approval = cache
+                        .approvals
+                        .get_mut(id)
+                        .ok_or_else(|| StorageError::ApprovalNotFound(id.to_string()))?;
+                    // Escalate / expire as due.
+                    let mut event = match approval.advance_lifecycle() {
+                        LifecycleChange::Escalated => Some(crate::outbox::EVENT_APPROVAL_ESCALATED),
+                        LifecycleChange::Expired => Some(crate::outbox::EVENT_APPROVAL_EXPIRED),
+                        LifecycleChange::None => None,
+                    };
+                    // A still-approved-but-unrun grant gone stale must be re-approved:
+                    // flip it to expired (preserving the original approver) so the agent
+                    // resubmits rather than running on a decision nobody re-confirmed.
+                    if event.is_none() && approval.needs_reauth() {
+                        approval.expire_reauth_lapsed();
+                        event = Some(crate::outbox::EVENT_APPROVAL_EXPIRED);
+                    }
+                    let event =
+                        event.map(|et| (approval.id.clone(), et, approval_event_payload(approval)));
+                    (approval.clone(), event)
                 };
-                // A still-approved-but-unrun grant gone stale must be re-approved:
-                // flip it to expired (preserving the original approver) so the agent
-                // resubmits rather than running on a decision nobody re-confirmed.
-                if event.is_none() && approval.needs_reauth() {
-                    approval.expire_reauth_lapsed();
-                    event = Some(crate::outbox::EVENT_APPROVAL_EXPIRED);
+                // V9: stage the lifecycle event atomically with the transition (drained after the lock).
+                if let Some((subj, et, payload)) = event {
+                    stage_event(cache, &subj, et, payload)?;
                 }
-                let event = event.map(|et| (approval.id.clone(), et, approval_event_payload(approval)));
-                (approval.clone(), event)
-            };
-            // V9: stage the lifecycle event atomically with the transition (drained after the lock).
-            if let Some((subj, et, payload)) = event {
-                stage_event(cache, &subj, et, payload)?;
-            }
-            Ok(clone)
-        })
-        .await?;
+                Ok(clone)
+            })
+            .await?;
         // Best-effort drain (D1): the lifecycle transition is already committed; a drain failure must
         // not fail the poll. The periodic/startup reconciler delivers the staged event.
         if let Err(e) = self.drain_pending_events().await {
@@ -1221,7 +1307,9 @@ impl StorageBackend for FileStorage {
         Ok(refreshed)
     }
 
-    async fn sweep_approval_lifecycle(&self) -> Result<crate::storage::ApprovalSweep, StorageError> {
+    async fn sweep_approval_lifecycle(
+        &self,
+    ) -> Result<crate::storage::ApprovalSweep, StorageError> {
         use crate::approval::LifecycleChange;
         // Cheap pre-check on the (freshly reloaded) in-memory cache: if nothing
         // is due, skip the lock + re-encrypt + disk write entirely so an idle
@@ -1235,41 +1323,54 @@ impl StorageBackend for FileStorage {
         if !any_due {
             return Ok(crate::storage::ApprovalSweep::default());
         }
-        let sweep = self.locked_mutate(|cache| {
-            let mut sweep = crate::storage::ApprovalSweep::default();
-            // Collect events during the &mut iteration; push them after (can't
-            // borrow `cache` again while iterating its approvals).
-            let mut events: Vec<(String, &'static str, serde_json::Value)> = Vec::new();
-            for approval in cache.approvals.values_mut() {
-                match approval.advance_lifecycle() {
-                    LifecycleChange::Escalated => {
-                        sweep.escalated.push(approval.clone());
-                        events.push((approval.id.clone(), crate::outbox::EVENT_APPROVAL_ESCALATED, approval_event_payload(approval)));
-                    }
-                    LifecycleChange::Expired => {
-                        sweep.expired.push(approval.id.clone());
-                        events.push((approval.id.clone(), crate::outbox::EVENT_APPROVAL_EXPIRED, approval_event_payload(approval)));
-                    }
-                    LifecycleChange::None => {
-                        // Also expire an approved-but-unrun grant whose continuous
-                        // reauth window lapsed, so an abandoned stale grant doesn't
-                        // linger as `Approved` in the panel (it must be re-approved).
-                        // Preserves the original approver attribution.
-                        if approval.needs_reauth() {
-                            approval.expire_reauth_lapsed();
+        let sweep = self
+            .locked_mutate(|cache| {
+                let mut sweep = crate::storage::ApprovalSweep::default();
+                // Collect events during the &mut iteration; push them after (can't
+                // borrow `cache` again while iterating its approvals).
+                let mut events: Vec<(String, &'static str, serde_json::Value)> = Vec::new();
+                for approval in cache.approvals.values_mut() {
+                    match approval.advance_lifecycle() {
+                        LifecycleChange::Escalated => {
+                            sweep.escalated.push(approval.clone());
+                            events.push((
+                                approval.id.clone(),
+                                crate::outbox::EVENT_APPROVAL_ESCALATED,
+                                approval_event_payload(approval),
+                            ));
+                        }
+                        LifecycleChange::Expired => {
                             sweep.expired.push(approval.id.clone());
-                            events.push((approval.id.clone(), crate::outbox::EVENT_APPROVAL_EXPIRED, approval_event_payload(approval)));
+                            events.push((
+                                approval.id.clone(),
+                                crate::outbox::EVENT_APPROVAL_EXPIRED,
+                                approval_event_payload(approval),
+                            ));
+                        }
+                        LifecycleChange::None => {
+                            // Also expire an approved-but-unrun grant whose continuous
+                            // reauth window lapsed, so an abandoned stale grant doesn't
+                            // linger as `Approved` in the panel (it must be re-approved).
+                            // Preserves the original approver attribution.
+                            if approval.needs_reauth() {
+                                approval.expire_reauth_lapsed();
+                                sweep.expired.push(approval.id.clone());
+                                events.push((
+                                    approval.id.clone(),
+                                    crate::outbox::EVENT_APPROVAL_EXPIRED,
+                                    approval_event_payload(approval),
+                                ));
+                            }
                         }
                     }
                 }
-            }
-            // V9: stage lifecycle events atomically with the sweep's transitions (drained after).
-            for (subj, et, payload) in events {
-                stage_event(cache, &subj, et, payload)?;
-            }
-            Ok(sweep)
-        })
-        .await?;
+                // V9: stage lifecycle events atomically with the sweep's transitions (drained after).
+                for (subj, et, payload) in events {
+                    stage_event(cache, &subj, et, payload)?;
+                }
+                Ok(sweep)
+            })
+            .await?;
         // Best-effort drain (D1): the sweep's transitions are already committed; a drain failure must
         // not suppress the caller's escalation notifications (run_approval_sweep notifies AFTER this
         // returns Ok). The periodic/startup reconciler delivers the staged events.
@@ -1304,6 +1405,7 @@ impl StorageBackend for FileStorage {
                 // re-auth window lapsed — it must be re-approved, not run on a
                 // stale decision. The poll path expires it; this guards the race.
                 || approval.needs_reauth()
+                || approval.veto_pending()
             {
                 Ok(None)
             } else {
@@ -1312,7 +1414,7 @@ impl StorageBackend for FileStorage {
                 Ok(Some(approval.clone()))
             }
         })
-            .await
+        .await
     }
 
     async fn heartbeat_approval(&self, id: &str) -> Result<(), StorageError> {
@@ -1324,7 +1426,7 @@ impl StorageBackend for FileStorage {
             }
             Ok(())
         })
-            .await
+        .await
     }
 
     // ==================== Event outbox (V9) ====================
@@ -1395,7 +1497,10 @@ impl StorageBackend for FileStorage {
         self.reload().await?;
         let protected: std::collections::HashSet<String> = {
             let c = self.cache.read();
-            c.pending_events.iter().map(|e| e.dedup_id.clone()).collect()
+            c.pending_events
+                .iter()
+                .map(|e| e.dedup_id.clone())
+                .collect()
         };
         self.outbox.gc(retention_secs, &protected).await
     }
@@ -1525,7 +1630,10 @@ impl StorageBackend for FileStorage {
                         // it, so this also rejects any hashless legacy record.)
                         IdempotencyState::Mismatch
                     } else if rec.done {
-                        IdempotencyState::Done { status: rec.status, body: rec.response.clone() }
+                        IdempotencyState::Done {
+                            status: rec.status,
+                            body: rec.response.clone(),
+                        }
                     } else {
                         // In-flight, same body, not yet stale → back off.
                         IdempotencyState::Pending
@@ -1630,7 +1738,7 @@ mod tests {
                 action_label: None,
                 dual_control: false,
                 criticality: CriticalityClass::Medium,
-            trusted_irreversible: None,
+                trusted_irreversible: None,
                 escalate_after: chrono::Duration::minutes(30),
                 escalate_window: chrono::Duration::minutes(30),
                 oob_identity: None,
@@ -1689,7 +1797,9 @@ mod tests {
         // re-drain (crash between the outbox append and clearing the intent) does NOT duplicate it.
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.enc");
-        let storage = FileStorage::new(&path, &SecretString::from("pw")).await.unwrap();
+        let storage = FileStorage::new(&path, &SecretString::from("pw"))
+            .await
+            .unwrap();
         let stage = |dedup: &str, subj: &str| StagedEvent {
             dedup_id: dedup.to_string(),
             subject: subj.to_string(),
@@ -1705,12 +1815,29 @@ mod tests {
             .await
             .unwrap();
         storage.drain_pending_events().await.unwrap();
-        assert_eq!(storage.list_events_after(0, 100).await.unwrap().len(), 2, "both staged events drained");
-        assert!(storage.cache.read().pending_events.is_empty(), "drained intents cleared");
+        assert_eq!(
+            storage.list_events_after(0, 100).await.unwrap().len(),
+            2,
+            "both staged events drained"
+        );
+        assert!(
+            storage.cache.read().pending_events.is_empty(),
+            "drained intents cleared"
+        );
         // Re-stage d1 (simulating a crash that left it undrained) and drain again — no duplicate.
-        storage.locked_mutate(|c| { c.pending_events.push(stage("d1", "appr-1")); Ok(()) }).await.unwrap();
+        storage
+            .locked_mutate(|c| {
+                c.pending_events.push(stage("d1", "appr-1"));
+                Ok(())
+            })
+            .await
+            .unwrap();
         storage.drain_pending_events().await.unwrap();
-        assert_eq!(storage.list_events_after(0, 100).await.unwrap().len(), 2, "re-drain of d1 must not duplicate");
+        assert_eq!(
+            storage.list_events_after(0, 100).await.unwrap().len(),
+            2,
+            "re-drain of d1 must not duplicate"
+        );
     }
 
     #[tokio::test]
@@ -1749,11 +1876,26 @@ mod tests {
         // Reopen → load runs migrate_v6_outbox.
         let s2 = FileStorage::new(&path, &pw).await.unwrap();
         let evs = s2.list_events_after(0, 100).await.unwrap();
-        assert_eq!(evs.len(), 1, "the legacy in-vault event migrated to the split outbox");
-        assert_eq!(evs[0].sequence, 7, "sequence preserved (broker cursor must not rewind)");
-        assert!(s2.cache.read().outbox.is_empty(), "vault outbox cleared post-migration");
+        assert_eq!(
+            evs.len(),
+            1,
+            "the legacy in-vault event migrated to the split outbox"
+        );
+        assert_eq!(
+            evs[0].sequence, 7,
+            "sequence preserved (broker cursor must not rewind)"
+        );
+        assert!(
+            s2.cache.read().outbox.is_empty(),
+            "vault outbox cleared post-migration"
+        );
         // A new append continues after the migrated max (no seq reuse).
-        assert_eq!(s2.append_event("new", "t", serde_json::json!({})).await.unwrap(), 8);
+        assert_eq!(
+            s2.append_event("new", "t", serde_json::json!({}))
+                .await
+                .unwrap(),
+            8
+        );
     }
 
     #[tokio::test]
@@ -1812,17 +1954,41 @@ mod tests {
         // Open via the real load path → check_version(6) accepts + migrate_v6_outbox runs.
         let s = FileStorage::new(&path, &pw).await.unwrap();
         let evs = s.list_events_after(0, 100).await.unwrap();
-        assert_eq!(evs.len(), 1, "the literal-v6 in-vault event migrated to the split outbox");
-        assert_eq!(evs[0].sequence, 5, "sequence preserved (broker cursor stability)");
-        assert!(evs[0].dedup_id.is_none(), "v6 event had no dedup_id (serde default = None)");
-        assert!(s.cache.read().outbox.is_empty(), "vault outbox cleared post-migration");
-        assert!(s.cache.read().pending_events.is_empty(), "no pending_events in v6 (serde default)");
+        assert_eq!(
+            evs.len(),
+            1,
+            "the literal-v6 in-vault event migrated to the split outbox"
+        );
+        assert_eq!(
+            evs[0].sequence, 5,
+            "sequence preserved (broker cursor stability)"
+        );
+        assert!(
+            evs[0].dedup_id.is_none(),
+            "v6 event had no dedup_id (serde default = None)"
+        );
+        assert!(
+            s.cache.read().outbox.is_empty(),
+            "vault outbox cleared post-migration"
+        );
+        assert!(
+            s.cache.read().pending_events.is_empty(),
+            "no pending_events in v6 (serde default)"
+        );
         // The vault is rewritten as v7 on disk.
         let reread: StorageFile =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(reread.version, STORAGE_VERSION, "reopened vault rewritten as v7");
+        assert_eq!(
+            reread.version, STORAGE_VERSION,
+            "reopened vault rewritten as v7"
+        );
         // A new append continues strictly after the migrated max.
-        assert_eq!(s.append_event("new", "t", serde_json::json!({})).await.unwrap(), 6);
+        assert_eq!(
+            s.append_event("new", "t", serde_json::json!({}))
+                .await
+                .unwrap(),
+            6
+        );
     }
 
     #[tokio::test]
@@ -1853,7 +2019,10 @@ mod tests {
             storage.store(&cred).await.unwrap();
         }
         let vault_before = std::fs::read(&path).unwrap();
-        assert!(vault_before.len() > 1000, "the aged secrets vault should be non-trivially large");
+        assert!(
+            vault_before.len() > 1000,
+            "the aged secrets vault should be non-trivially large"
+        );
 
         // Append outbox events — these must NOT rewrite the secrets vault.
         for i in 0..5 {
@@ -1870,7 +2039,10 @@ mod tests {
             "outbox append re-wrote credentials.enc — the O(secrets-vault-size) cliff is NOT decoupled"
         );
         // The events landed in the split outbox.enc and read back without touching the vault.
-        assert!(path.with_file_name("outbox.enc").exists(), "events went to the split outbox.enc");
+        assert!(
+            path.with_file_name("outbox.enc").exists(),
+            "events went to the split outbox.enc"
+        );
         assert_eq!(storage.list_events_after(0, 100).await.unwrap().len(), 5);
         // Sanity: the secrets vault still holds all 200 credentials after the appends (untouched, intact).
         assert_eq!(storage.list().await.unwrap().len(), 200);
@@ -2050,7 +2222,11 @@ mod tests {
 
         // Test update last used
         storage.update_api_key_last_used("key-1").await.unwrap();
-        let updated = storage.get_api_key_by_hash("hash123").await.unwrap().unwrap();
+        let updated = storage
+            .get_api_key_by_hash("hash123")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(updated.last_used_at.is_some());
     }
 
@@ -2072,7 +2248,15 @@ mod tests {
         // Survives a reopen (persisted under v4).
         {
             let storage = FileStorage::new(&path, &password).await.unwrap();
-            assert_eq!(storage.get_policy(&id).await.unwrap().unwrap().credential_pattern, "github-*");
+            assert_eq!(
+                storage
+                    .get_policy(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .credential_pattern,
+                "github-*"
+            );
             storage.delete_policy(&id).await.unwrap();
             assert!(storage.get_policy(&id).await.unwrap().is_none());
             assert!(matches!(
@@ -2091,69 +2275,120 @@ mod tests {
 
         // First reservation is Fresh; a concurrent second one (same body) Pending.
         assert_eq!(
-            storage.idempotency_check_or_reserve("k1", "hashA").await.unwrap(),
+            storage
+                .idempotency_check_or_reserve("k1", "hashA")
+                .await
+                .unwrap(),
             IdempotencyState::Fresh
         );
         assert_eq!(
-            storage.idempotency_check_or_reserve("k1", "hashA").await.unwrap(),
+            storage
+                .idempotency_check_or_reserve("k1", "hashA")
+                .await
+                .unwrap(),
             IdempotencyState::Pending
         );
         // Same key with a DIFFERENT body hash → Mismatch (never a wrong replay).
         assert_eq!(
-            storage.idempotency_check_or_reserve("k1", "hashB").await.unwrap(),
+            storage
+                .idempotency_check_or_reserve("k1", "hashB")
+                .await
+                .unwrap(),
             IdempotencyState::Mismatch
         );
 
         // Completing the op stores the response; subsequent checks replay it.
-        storage.idempotency_complete("k1", "hashA", 201, "{\"ok\":true}").await.unwrap();
+        storage
+            .idempotency_complete("k1", "hashA", 201, "{\"ok\":true}")
+            .await
+            .unwrap();
         assert_eq!(
-            storage.idempotency_check_or_reserve("k1", "hashA").await.unwrap(),
-            IdempotencyState::Done { status: 201, body: "{\"ok\":true}".to_string() }
+            storage
+                .idempotency_check_or_reserve("k1", "hashA")
+                .await
+                .unwrap(),
+            IdempotencyState::Done {
+                status: 201,
+                body: "{\"ok\":true}".to_string()
+            }
         );
         // Completing a key whose reservation was GC'd re-creates a hash-bound
         // record: same body replays, different body mismatches.
-        storage.idempotency_complete("gone", "hashG", 200, "{}").await.unwrap();
+        storage
+            .idempotency_complete("gone", "hashG", 200, "{}")
+            .await
+            .unwrap();
         assert_eq!(
-            storage.idempotency_check_or_reserve("gone", "hashG").await.unwrap(),
-            IdempotencyState::Done { status: 200, body: "{}".to_string() }
+            storage
+                .idempotency_check_or_reserve("gone", "hashG")
+                .await
+                .unwrap(),
+            IdempotencyState::Done {
+                status: 200,
+                body: "{}".to_string()
+            }
         );
         assert_eq!(
-            storage.idempotency_check_or_reserve("gone", "different").await.unwrap(),
+            storage
+                .idempotency_check_or_reserve("gone", "different")
+                .await
+                .unwrap(),
             IdempotencyState::Mismatch
         );
         // A mismatched body still refuses to replay even after completion.
         assert_eq!(
-            storage.idempotency_check_or_reserve("k1", "hashB").await.unwrap(),
+            storage
+                .idempotency_check_or_reserve("k1", "hashB")
+                .await
+                .unwrap(),
             IdempotencyState::Mismatch
         );
 
         // Release only drops a pending reservation, never a completed record.
         assert_eq!(
-            storage.idempotency_check_or_reserve("k2", "h").await.unwrap(),
+            storage
+                .idempotency_check_or_reserve("k2", "h")
+                .await
+                .unwrap(),
             IdempotencyState::Fresh
         );
         storage.idempotency_release("k2").await.unwrap();
         assert_eq!(
-            storage.idempotency_check_or_reserve("k2", "h").await.unwrap(),
+            storage
+                .idempotency_check_or_reserve("k2", "h")
+                .await
+                .unwrap(),
             IdempotencyState::Fresh,
             "released key should be re-reservable"
         );
         // Releasing a completed key is a no-op (still replays).
         storage.idempotency_release("k1").await.unwrap();
         assert!(matches!(
-            storage.idempotency_check_or_reserve("k1", "hashA").await.unwrap(),
+            storage
+                .idempotency_check_or_reserve("k1", "hashA")
+                .await
+                .unwrap(),
             IdempotencyState::Done { .. }
         ));
 
         // A stale completion (different body) must NOT clobber a live reservation
         // that re-used the key for a different request (GC-race safety).
         assert_eq!(
-            storage.idempotency_check_or_reserve("race", "live").await.unwrap(),
+            storage
+                .idempotency_check_or_reserve("race", "live")
+                .await
+                .unwrap(),
             IdempotencyState::Fresh
         );
-        storage.idempotency_complete("race", "stale", 200, "{}").await.unwrap();
+        storage
+            .idempotency_complete("race", "stale", 200, "{}")
+            .await
+            .unwrap();
         assert_eq!(
-            storage.idempotency_check_or_reserve("race", "live").await.unwrap(),
+            storage
+                .idempotency_check_or_reserve("race", "live")
+                .await
+                .unwrap(),
             IdempotencyState::Pending,
             "a stale completion must not turn the live reservation into a Done replay"
         );

@@ -16,7 +16,7 @@ use tower::ServiceExt;
 use vultrino::approval::{NewApproval, RequesterInfo};
 use vultrino::auth::AuthManager;
 use vultrino::config::Config;
-use vultrino::delegation::{DelegateEvalInput, DelegationGrantScope, evaluate_delegate_decision};
+use vultrino::delegation::{evaluate_delegate_decision, DelegateEvalInput, DelegationGrantScope};
 use vultrino::govder::GovderConfig;
 use vultrino::outbox::EVENT_APPROVAL_APPROVED;
 use vultrino::storage::{FileStorage, StorageBackend};
@@ -174,14 +174,15 @@ async fn build_admin_router() -> (axum::Router, Arc<dyn StorageBackend>, String)
         Arc::new(FileStorage::new(&path, &password).await.unwrap());
 
     let auth_manager = AuthManager::new();
-    let (admin_key, api_key) = auth_manager.create_api_key("admin-key", "admin", None).unwrap();
+    let (admin_key, api_key) = auth_manager
+        .create_api_key("admin-key", "admin", None)
+        .unwrap();
     storage.store_api_key(&api_key).await.unwrap();
 
     let mut config = Config::default();
     config.approval.enabled = true;
-    config.govder = Some(
-        GovderConfig::from_env().unwrap_or(start_mock_govder(default_mock_grants()).await),
-    );
+    config.govder =
+        Some(GovderConfig::from_env().unwrap_or(start_mock_govder(default_mock_grants()).await));
 
     let admin = AdminAuth::new("admin", "password123").unwrap();
     let resolver = vultrino::router::CredentialResolver::new(storage.clone());
@@ -235,9 +236,12 @@ async fn delegate_approval_records_approver_kind_in_outbox() {
         .await
         .unwrap();
     assert_eq!(mint_resp.status(), StatusCode::CREATED);
-    let mint_body: serde_json::Value =
-        serde_json::from_slice(&axum::body::to_bytes(mint_resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+    let mint_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(mint_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let vap_secret = mint_body["token"].as_str().unwrap().to_string();
     assert!(vap_secret.starts_with("vap_"));
 
@@ -283,7 +287,10 @@ async fn delegate_approval_records_approver_kind_in_outbox() {
     assert_eq!(decide_resp.status(), StatusCode::OK);
 
     approval = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(approval.status, vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(
+        approval.status,
+        vultrino::approval::ApprovalStatus::Approved
+    );
     assert_eq!(approval.signoffs.len(), 1);
     assert_eq!(approval.signoffs[0].approver_kind, "delegate-agent");
     assert_eq!(
@@ -332,11 +339,10 @@ async fn delegate_decision_delivers_signed_webhook_to_govder_consumer() {
         "http://{}/webhooks/vultrino-approvals",
         listener.local_addr().unwrap()
     );
-    let mock = Router::new()
-        .route(
-            "/webhooks/vultrino-approvals",
-            post(mock_govder_webhook).with_state(cap_state),
-        );
+    let mock = Router::new().route(
+        "/webhooks/vultrino-approvals",
+        post(mock_govder_webhook).with_state(cap_state),
+    );
     tokio::spawn(async move {
         axum::serve(listener, mock).await.unwrap();
     });
@@ -371,9 +377,12 @@ async fn delegate_decision_delivers_signed_webhook_to_govder_consumer() {
         .await
         .unwrap();
     assert_eq!(mint_resp.status(), StatusCode::CREATED);
-    let mint_body: serde_json::Value =
-        serde_json::from_slice(&axum::body::to_bytes(mint_resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+    let mint_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(mint_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let vap_secret = mint_body["token"].as_str().unwrap().to_string();
 
     let (approval, _oob) = vultrino::approval::ApprovalRequest::open(NewApproval {
@@ -432,18 +441,27 @@ async fn delegate_decision_delivers_signed_webhook_to_govder_consumer() {
         .find(|(_, body)| {
             serde_json::from_slice::<serde_json::Value>(body)
                 .ok()
-                .and_then(|v| v.get("event").and_then(|e| e.as_str().map(|s| s.to_string())))
+                .and_then(|v| {
+                    v.get("event")
+                        .and_then(|e| e.as_str().map(|s| s.to_string()))
+                })
                 == Some("approval.approved".to_string())
         })
         .expect("approval.approved delivery must reach govder consumer");
     let (sig, body) = approved;
     let expected_sig = vultrino::outbox::sign_body(WEBHOOK_SECRET, body);
-    assert_eq!(*sig, expected_sig, "Govder-Signature must match vultrino sign_body");
+    assert_eq!(
+        *sig, expected_sig,
+        "Govder-Signature must match vultrino sign_body"
+    );
 
     let delivered: serde_json::Value = serde_json::from_slice(body).unwrap();
     assert_eq!(delivered["event"], "approval.approved");
     assert_eq!(delivered["payload"]["approver_kind"], "delegate-agent");
-    assert_eq!(delivered["payload"]["delegation_grant_ref"], "grant_webhook_001");
+    assert_eq!(
+        delivered["payload"]["delegation_grant_ref"],
+        "grant_webhook_001"
+    );
     assert_eq!(delivered["payload"]["tenant"], "acme");
 }
 
@@ -485,9 +503,12 @@ async fn delegate_decision_cross_plane_to_govder() {
         .await
         .unwrap();
     assert_eq!(mint_resp.status(), StatusCode::CREATED);
-    let mint_body: serde_json::Value =
-        serde_json::from_slice(&axum::body::to_bytes(mint_resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+    let mint_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(mint_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let vap_secret = mint_body["token"].as_str().unwrap().to_string();
 
     let requester_ep = std::env::var("DELEGATION_REQUESTER_EP")
@@ -570,9 +591,12 @@ async fn delegate_decide_high_risk_blocked_at_pep() {
         .await
         .unwrap();
     assert_eq!(mint_resp.status(), StatusCode::CREATED);
-    let mint_body: serde_json::Value =
-        serde_json::from_slice(&axum::body::to_bytes(mint_resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+    let mint_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(mint_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let vap_secret = mint_body["token"].as_str().unwrap().to_string();
 
     let (approval, _oob) = vultrino::approval::ApprovalRequest::open(NewApproval {
@@ -619,8 +643,47 @@ async fn delegate_decide_high_risk_blocked_at_pep() {
     assert!(!stored.executed);
     let events = storage.list_events_after(0, 100).await.unwrap();
     assert!(
-        !events.iter().any(|e| e.event_type == EVENT_APPROVAL_APPROVED),
+        !events
+            .iter()
+            .any(|e| e.event_type == EVENT_APPROVAL_APPROVED),
         "High-risk delegate approve must not emit approval.approved"
+    );
+}
+
+/// F11: a buggy/malicious govder returning a cross-tenant grant must be rejected
+/// at mint time. The mock returns all grants (incl. tenant-a's `grant_cross`);
+/// minting a vap_ for `grant_cross` under tenant `acme` must fail with 400
+/// invalid_grant_ref rather than bind a cross-tenant grant to a token.
+#[tokio::test]
+async fn delegate_mint_rejects_cross_tenant_grant() {
+    let (router, _storage, admin_key) = build_admin_router().await;
+
+    let mint_resp = router
+        .oneshot(bearer_req(
+            "POST",
+            "/api/v1/approval-tokens",
+            &admin_key,
+            serde_json::json!({
+                "delegation_grant_ref": "grant_cross",
+                "agent_label": "delegate-bot",
+                "delegator_identity": "alice@corp",
+                "tenant": "acme"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mint_resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(mint_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["code"], "invalid_grant_ref");
+    let msg = body["error"].as_str().unwrap();
+    assert!(
+        msg.contains("does not match requested tenant"),
+        "expected cross-tenant rejection message, got {msg:?}"
     );
 }
 
@@ -646,9 +709,12 @@ async fn delegate_decide_irreversible_blocked_at_pep() {
         .await
         .unwrap();
     assert_eq!(mint_resp.status(), StatusCode::CREATED);
-    let mint_body: serde_json::Value =
-        serde_json::from_slice(&axum::body::to_bytes(mint_resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+    let mint_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(mint_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let vap_secret = mint_body["token"].as_str().unwrap().to_string();
 
     let (approval, _oob) = vultrino::approval::ApprovalRequest::open(NewApproval {

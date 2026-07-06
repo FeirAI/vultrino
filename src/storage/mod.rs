@@ -9,9 +9,9 @@ pub use file::FileStorage;
 pub use outbox_store::OutboxStore;
 
 use crate::approval::{ApprovalRequest, ApprovalStatus};
+use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
 use crate::capability::Capability;
 use crate::outbox::OutboxEvent;
-use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
 use crate::policy::Policy;
 use crate::{Credential, CredentialMetadata};
 use async_trait::async_trait;
@@ -260,10 +260,7 @@ pub trait StorageBackend: Send + Sync {
     }
 
     /// Atomically mark an approval token revoked, returning the updated token.
-    async fn set_approval_token_revoked(
-        &self,
-        _id: &str,
-    ) -> Result<ApprovalToken, StorageError> {
+    async fn set_approval_token_revoked(&self, _id: &str) -> Result<ApprovalToken, StorageError> {
         Err(StorageError::ApprovalTokenNotFound(_id.to_string()))
     }
 
@@ -362,6 +359,21 @@ pub trait StorageBackend: Send + Sync {
         _delegate_pep_ok: Option<bool>,
     ) -> Result<ApprovalRequest, StorageError> {
         Err(StorageError::ApprovalNotFound(_id.to_string()))
+    }
+
+    /// Atomically record a govder-authorized delegate decision and its optional
+    /// veto deadline. A backend that cannot commit both together fails closed.
+    async fn decide_delegate_approval(
+        &self,
+        id: &str,
+        _approve: bool,
+        _approver_identity: &str,
+        _enforce_sod: bool,
+        _note: Option<String>,
+        _delegation_grant_ref: &str,
+        _veto_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<ApprovalRequest, StorageError> {
+        Err(StorageError::ApprovalNotFound(id.to_string()))
     }
 
     /// Atomically advance one approval through its SLA lifecycle and apply a

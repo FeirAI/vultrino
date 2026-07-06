@@ -2,6 +2,7 @@
 
 use crate::auth::AuthManager;
 use crate::config::Config;
+use crate::config::ServerMode;
 use crate::storage::StorageBackend;
 use axum::{
     extract::{DefaultBodyLimit, FromRef},
@@ -15,7 +16,6 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
-use crate::config::ServerMode;
 
 use super::api;
 use super::auth::{AdminAuth, LoginRateLimiter};
@@ -188,8 +188,14 @@ impl WebServer {
             .route("/approvals/{id}/deny", post(routes::approval_deny))
             // Out-of-band decision links (Telegram / webhook / email).
             // Capability-token authorized, no session required.
-            .route("/approvals/{id}/decide", get(routes::approval_decide_confirm))
-            .route("/approvals/{id}/decide", post(routes::approval_decide_submit))
+            .route(
+                "/approvals/{id}/decide",
+                get(routes::approval_decide_confirm),
+            )
+            .route(
+                "/approvals/{id}/decide",
+                post(routes::approval_decide_submit),
+            )
             .route("/audit", get(routes::audit_log))
             // API endpoints for HTMX (web UI)
             .route("/api/stats", get(routes::api_stats))
@@ -199,7 +205,10 @@ impl WebServer {
                 "/api/v1/credentials",
                 get(api::api_list_credentials).post(api::api_create_credential),
             )
-            .route("/api/v1/credentials/{id}", delete(api::api_delete_credential))
+            .route(
+                "/api/v1/credentials/{id}",
+                delete(api::api_delete_credential),
+            )
             .route("/api/v1/execute", post(api::api_execute))
             // Approvals JSON API: agent poll-by-id; admin-key list + decision
             // (A3/A4) for a product aggregator (tenant-partitioned in the handlers).
@@ -242,6 +251,10 @@ impl WebServer {
             )
             .route("/api/v1/auth/agent", get(api::api_resolve_agent_token))
             .route(
+                "/api/v1/auth/agent/consume",
+                post(api::api_consume_agent_token),
+            )
+            .route(
                 "/api/v1/approval-tokens/{id}/revoke",
                 post(api::api_revoke_approval_token),
             )
@@ -258,7 +271,10 @@ impl WebServer {
             // Signed event outbox replay + DLQ (V9).
             .route("/api/v1/events", get(api::api_list_events))
             .route("/api/v1/events/dead", get(api::api_list_dead_letters))
-            .route("/api/v1/events/{sequence}/replay", post(api::api_replay_dead_letter))
+            .route(
+                "/api/v1/events/{sequence}/replay",
+                post(api::api_replay_dead_letter),
+            )
             // Networked MCP transport (connector M1): a remote agent harness
             // reaches vultrino's MCP over JSON-RPC here, authed + scoped by a
             // Bearer use-token (vut_) / one-time secret. vultrino holds the
@@ -347,8 +363,9 @@ impl WebServer {
         {
             let rl = self.app_state.rate_limiter.clone();
             tokio::spawn(async move {
-                let mut tick =
-                    tokio::time::interval(std::time::Duration::from_secs(LOGIN_THROTTLE_CLEANUP_SECS));
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                    LOGIN_THROTTLE_CLEANUP_SECS,
+                ));
                 loop {
                     tick.tick().await;
                     rl.cleanup().await;

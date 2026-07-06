@@ -100,7 +100,17 @@ glob = "0.3"
 
 [features]
 default = []
+# Gate for the local delegation evaluator (`evaluate_delegate_decision`). Off by
+# default so a production build cannot call the local evaluator; the external
+# integration test `delegate_approval_integration` requires this feature (see
+# the `[[test]]` block below).
+mock-govder = []
 # crypto-signing = ["ethers", "ed25519-dalek"]
+
+[[test]]
+name = "delegate_approval_integration"
+path = "tests/delegate_approval_integration.rs"
+required-features = ["mock-govder"]
 
 [[bin]]
 name = "vultrino"
