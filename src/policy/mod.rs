@@ -310,45 +310,66 @@ impl PolicyEngine {
             return PolicyDecision::Allow;
         }
 
-        for policy in matching_policies {
-            for rule in &policy.rules {
-                // A top-level SpendCap is evaluated here (per-action, stateless) —
-                // NOT as a side effect of the recursive boolean walk. Nested
-                // SpendCap is rejected by Policy::validate at config/admin load.
-                let matched = match &rule.condition {
-                    PolicyCondition::SpendCap { asset, per_action_max } => {
-                        self.spend_within_cap(
-                            input.spend,
-                            asset,
-                            *per_action_max,
-                            record, // check the cap on the live path; skip on resume
-                        )
+        // Stored policies originate in a HashMap, so their iteration order cannot
+        // determine authorization. Explicit decisions use fail-closed precedence:
+        // Deny > Prompt > Allow. Defaults apply only if no explicit rule matched.
+        for wanted in [
+            PolicyAction::Deny,
+            PolicyAction::Prompt,
+            PolicyAction::Allow,
+        ] {
+            for policy in &matching_policies {
+                for rule in &policy.rules {
+                    if rule.action != wanted {
+                        continue;
                     }
-                    other => self.evaluate_condition(other, input, record),
-                };
-                if matched {
-                    match rule.action {
-                        PolicyAction::Allow => return PolicyDecision::Allow,
-                        PolicyAction::Deny => {
-                            return PolicyDecision::Deny(format!(
+                    // A top-level SpendCap is evaluated here (per-action, stateless) —
+                    // NOT as a side effect of the recursive boolean walk. Nested
+                    // SpendCap is rejected by Policy::validate at config/admin load.
+                    let matched = match &rule.condition {
+                        PolicyCondition::SpendCap { asset, per_action_max } => {
+                            self.spend_within_cap(
+                                input.spend,
+                                asset,
+                                *per_action_max,
+                                record, // check the cap on the live path; skip on resume
+                            )
+                        }
+                        other => self.evaluate_condition(other, input, record),
+                    };
+                    if matched {
+                        return match rule.action {
+                            PolicyAction::Allow => PolicyDecision::Allow,
+                            PolicyAction::Deny => PolicyDecision::Deny(format!(
                                 "Denied by policy '{}': rule matched",
                                 policy.name
-                            ))
-                        }
-                        PolicyAction::Prompt => return PolicyDecision::Prompt,
+                            )),
+                            PolicyAction::Prompt => PolicyDecision::Prompt,
+                        };
                     }
                 }
             }
+        }
 
-            match policy.default_action {
-                PolicyAction::Allow => continue,
-                PolicyAction::Deny => {
-                    return PolicyDecision::Deny(format!(
-                        "Denied by policy '{}': default action",
-                        policy.name
-                    ))
+        for wanted in [
+            PolicyAction::Deny,
+            PolicyAction::Prompt,
+            PolicyAction::Allow,
+        ] {
+            for policy in &matching_policies {
+                if policy.default_action != wanted {
+                    continue;
                 }
-                PolicyAction::Prompt => return PolicyDecision::Prompt,
+                match policy.default_action {
+                    PolicyAction::Allow => return PolicyDecision::Allow,
+                    PolicyAction::Deny => {
+                        return PolicyDecision::Deny(format!(
+                            "Denied by policy '{}': default action",
+                            policy.name
+                        ))
+                    }
+                    PolicyAction::Prompt => return PolicyDecision::Prompt,
+                }
             }
         }
 
@@ -784,6 +805,37 @@ mod tests {
             spend: None,
         });
         assert!(matches!(resume, PolicyDecision::Deny(_)), "kill applies on resume too");
+    }
+
+    #[test]
+    fn test_explicit_deny_overrides_allow_independent_of_policy_order() {
+        let allow = Policy::allow_all("allow-all", "*").with_rule(
+            PolicyCondition::UrlMatch("*".to_string()),
+            PolicyAction::Allow,
+        );
+        let deny = Policy::deny_all("budget-exhausted", "*")
+            .with_rule(PolicyCondition::Always, PolicyAction::Deny);
+        let input = EvalInput {
+            credential_alias: "agent-credential",
+            url: Some("https://api.example.com/resource"),
+            method: Some("GET"),
+            action: None,
+            principal: None,
+            spend: None,
+        };
+
+        for policies in [
+            vec![allow.clone(), deny.clone()],
+            vec![deny.clone(), allow.clone()],
+        ] {
+            let engine = PolicyEngine::new();
+            engine.load_policies(policies);
+
+            match engine.evaluate_full(&input) {
+                PolicyDecision::Deny(reason) => assert!(reason.contains("budget-exhausted")),
+                other => panic!("explicit deny must override allow, got {other:?}"),
+            }
+        }
     }
 
     #[test]
