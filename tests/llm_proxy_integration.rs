@@ -300,7 +300,7 @@ async fn register_llm_capability_models(
         credential_ref: credential_ref.to_string(),
         input_schema: serde_json::Value::Null,
         reversibility: "reversible".to_string(),
-        llm: Some(LlmProxy { provider_base: provider_base.to_string(), allowed_models, max_output_tokens: None }),
+		llm: Some(LlmProxy { provider_base: provider_base.to_string(), allowed_models, max_output_tokens: None, ..Default::default() }),
     };
     cap.validate().unwrap();
     storage.store_capability(&cap).await.unwrap();
@@ -514,6 +514,7 @@ async fn llm_streamed_max_output_tokens_ceiling_clamps_the_forwarded_request() {
             provider_base: "https://api.openai.com".to_string(),
             allowed_models: Vec::new(),
             max_output_tokens: Some(1000),
+			..Default::default()
         }),
     };
     cap.validate().unwrap();
@@ -748,6 +749,7 @@ async fn llm_max_output_tokens_ceiling_clamps_the_forwarded_request() {
             provider_base: "https://api.openai.com".to_string(),
             allowed_models: Vec::new(),
             max_output_tokens: Some(1000),
+			..Default::default()
         }),
     };
     cap.validate().unwrap();

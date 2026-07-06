@@ -555,3 +555,23 @@ async fn http_tools_call_plugin_tool_name_blocked_for_use_token() {
         );
     }
 }
+
+#[tokio::test]
+async fn official_client_handshake_shape_negotiates_and_accepts_notification_without_id() {
+    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let token = mint_token(&storage, "cred-*", Some("http.request"), None, None).await;
+    let response = router.clone().oneshot(mcp_req(Some(&token), serde_json::json!({
+        "jsonrpc":"2.0", "id":0, "method":"initialize", "params":{
+            "protocolVersion":"2025-06-18", "capabilities":{},
+            "clientInfo":{"name":"langchain-mcp-adapters","version":"1.x"}
+        }
+    }))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_value(response).await;
+    assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
+
+    let notification = router.oneshot(mcp_req(Some(&token), serde_json::json!({
+        "jsonrpc":"2.0", "method":"notifications/initialized"
+    }))).await.unwrap();
+    assert_eq!(notification.status(), StatusCode::ACCEPTED);
+}

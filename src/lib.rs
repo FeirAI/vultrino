@@ -6,12 +6,12 @@
 
 pub mod approval;
 pub mod auth;
-pub mod delegation;
-pub mod govder;
 pub mod capability;
 pub mod config;
 pub mod crypto;
+pub mod delegation;
 pub mod egress;
+pub mod govder;
 pub mod identity;
 pub mod mcp;
 pub mod outbox;
@@ -76,6 +76,8 @@ pub enum CredentialType {
     Certificate,
     /// HMAC-signed API key (e.g., Binance, AsterDex)
     HmacApiKey,
+    /// AWS Signature Version 4 (Bedrock Converse/Invoke).
+    AwsSigV4,
     /// ECDSA private key for signing (e.g., Ethereum, Hyperliquid)
     EcdsaKey,
     /// SSH connection with password authentication
@@ -95,6 +97,7 @@ impl std::fmt::Display for CredentialType {
             CredentialType::PrivateKey => write!(f, "private_key"),
             CredentialType::Certificate => write!(f, "certificate"),
             CredentialType::HmacApiKey => write!(f, "hmac_api_key"),
+            CredentialType::AwsSigV4 => write!(f, "aws_sigv4"),
             CredentialType::EcdsaKey => write!(f, "ecdsa_key"),
             CredentialType::SshPassword => write!(f, "ssh_password"),
             CredentialType::Postgres => write!(f, "postgres"),
@@ -188,10 +191,7 @@ pub enum CredentialData {
     },
 
     /// HTTP Basic Authentication
-    BasicAuth {
-        username: String,
-        password: Secret,
-    },
+    BasicAuth { username: String, password: Secret },
 
     /// Private key for signing operations
     PrivateKey {
@@ -201,10 +201,7 @@ pub enum CredentialData {
     },
 
     /// Certificate for mTLS
-    Certificate {
-        cert_pem: String,
-        key_pem: Secret,
-    },
+    Certificate { cert_pem: String, key_pem: Secret },
 
     /// HMAC-signed API key (e.g., Binance, AsterDex)
     HmacApiKey {
@@ -218,6 +215,17 @@ pub enum CredentialData {
         /// Receive window in milliseconds (default: 5000)
         #[serde(default = "default_recv_window")]
         recv_window: u64,
+    },
+
+    /// AWS access credentials signed by the HTTP plugin using SigV4.
+    AwsSigV4 {
+        access_key_id: String,
+        secret_access_key: Secret,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_token: Option<Secret>,
+        region: String,
+        #[serde(default = "default_bedrock_service")]
+        service: String,
     },
 
     /// ECDSA private key for signing (e.g., Ethereum, Hyperliquid)
@@ -283,6 +291,10 @@ fn default_recv_window() -> u64 {
     5000
 }
 
+fn default_bedrock_service() -> String {
+    "bedrock-runtime".to_string()
+}
+
 fn default_ssh_port() -> u16 {
     22
 }
@@ -333,8 +345,23 @@ impl CredentialData {
                 }
                 v
             }
-            CredentialData::HmacApiKey { api_secret, .. } => vec![z(api_secret.expose().to_string())],
-            CredentialData::EcdsaKey { private_key, .. } => vec![z(private_key.expose().to_string())],
+            CredentialData::HmacApiKey { api_secret, .. } => {
+                vec![z(api_secret.expose().to_string())]
+            }
+            CredentialData::AwsSigV4 {
+                secret_access_key,
+                session_token,
+                ..
+            } => {
+                let mut values = vec![z(secret_access_key.expose().to_string())];
+                if let Some(token) = session_token {
+                    values.push(z(token.expose().to_string()));
+                }
+                values
+            }
+            CredentialData::EcdsaKey { private_key, .. } => {
+                vec![z(private_key.expose().to_string())]
+            }
             CredentialData::SshPassword { password, .. } => vec![z(password.expose().to_string())],
             CredentialData::Postgres { password, .. } => vec![z(password.expose().to_string())],
             CredentialData::PrivateKey { key_pem, passphrase } => {
@@ -345,9 +372,7 @@ impl CredentialData {
                 v
             }
             CredentialData::Certificate { key_pem, .. } => vec![z(key_pem.expose().to_string())],
-            CredentialData::Custom(map) => {
-                map.values().map(|s| z(s.expose().to_string())).collect()
-            }
+            CredentialData::Custom(map) => map.values().map(|s| z(s.expose().to_string())).collect(),
         }
     }
 
@@ -360,6 +385,7 @@ impl CredentialData {
             CredentialData::PrivateKey { .. } => CredentialType::PrivateKey,
             CredentialData::Certificate { .. } => CredentialType::Certificate,
             CredentialData::HmacApiKey { .. } => CredentialType::HmacApiKey,
+            CredentialData::AwsSigV4 { .. } => CredentialType::AwsSigV4,
             CredentialData::EcdsaKey { .. } => CredentialType::EcdsaKey,
             CredentialData::SshPassword { .. } => CredentialType::SshPassword,
             CredentialData::Postgres { .. } => CredentialType::Postgres,
@@ -568,9 +594,7 @@ pub struct StreamingResponse {
     pub headers: HashMap<String, String>,
     /// The upstream response body as a stream of byte chunks. Each item is a
     /// chunk or a transport error; the server's adaptor scrubs + taps these.
-    pub body: std::pin::Pin<
-        Box<dyn futures::Stream<Item = Result<bytes::Bytes, plugins::PluginError>> + Send>,
-    >,
+    pub body: std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, plugins::PluginError>> + Send>>,
     /// Updated credential data (e.g. after OAuth2 token refresh) — captured before
     /// the body streams, persisted by the server exactly as on the buffered path.
     pub updated_credential: Option<CredentialData>,

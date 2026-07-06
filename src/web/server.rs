@@ -22,6 +22,7 @@ use super::auth::{AdminAuth, LoginRateLimiter};
 use super::llm_proxy;
 use super::mcp_http;
 use super::routes;
+use super::workload_exchange;
 
 /// Web server configuration
 #[derive(Debug, Clone)]
@@ -65,6 +66,9 @@ pub struct AppState {
     pub server: Arc<crate::server::VultrinoServer>,
     /// Govder decide-plane client for delegation grant/evaluate (plan 031).
     pub govder: Option<Arc<crate::govder::GovderClient>>,
+    pub workload_grants:
+        Arc<RwLock<std::collections::HashMap<String, super::workload_exchange::WorkloadGrantTemplate>>>,
+    pub workload_jtis: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl FromRef<AppState> for Arc<dyn StorageBackend> {
@@ -108,16 +112,17 @@ impl WebServer {
         let trust_forwarded_for = std::env::var("VULTRINO_TRUST_FORWARDED_FOR")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let govder = vultrino_config
-            .govder
-            .as_ref()
-            .and_then(|cfg| match crate::govder::GovderClient::new(cfg.clone()) {
-                Ok(c) => Some(Arc::new(c)),
-                Err(e) => {
-                    tracing::error!(error = %e, "govder client init failed — delegate paths fail-closed");
-                    None
-                }
-            });
+        let govder =
+            vultrino_config
+                .govder
+                .as_ref()
+                .and_then(|cfg| match crate::govder::GovderClient::new(cfg.clone()) {
+                    Ok(c) => Some(Arc::new(c)),
+                    Err(e) => {
+                        tracing::error!(error = %e, "govder client init failed — delegate paths fail-closed");
+                        None
+                    }
+                });
         let app_state = AppState {
             storage,
             auth_manager: Arc::new(RwLock::new(auth_manager)),
@@ -127,6 +132,8 @@ impl WebServer {
             trust_forwarded_for,
             server,
             govder,
+            workload_grants: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            workload_jtis: Arc::new(RwLock::new(std::collections::HashSet::new())),
         };
 
         Self { config, app_state }
@@ -140,8 +147,8 @@ impl WebServer {
         // Determine if we should use secure cookies and HSTS:
         // - TLS is configured, OR
         // - Running in Server mode (likely behind a reverse proxy with TLS)
-        let use_secure_mode = self.app_state.config.server.tls.is_some()
-            || self.app_state.config.server.mode == ServerMode::Server;
+        let use_secure_mode =
+            self.app_state.config.server.tls.is_some() || self.app_state.config.server.mode == ServerMode::Server;
 
         let session_layer = SessionManagerLayer::new(session_store)
             // Secure flag - only send cookies over HTTPS
@@ -188,14 +195,8 @@ impl WebServer {
             .route("/approvals/{id}/deny", post(routes::approval_deny))
             // Out-of-band decision links (Telegram / webhook / email).
             // Capability-token authorized, no session required.
-            .route(
-                "/approvals/{id}/decide",
-                get(routes::approval_decide_confirm),
-            )
-            .route(
-                "/approvals/{id}/decide",
-                post(routes::approval_decide_submit),
-            )
+            .route("/approvals/{id}/decide", get(routes::approval_decide_confirm))
+            .route("/approvals/{id}/decide", post(routes::approval_decide_submit))
             .route("/audit", get(routes::audit_log))
             // API endpoints for HTMX (web UI)
             .route("/api/stats", get(routes::api_stats))
@@ -205,19 +206,13 @@ impl WebServer {
                 "/api/v1/credentials",
                 get(api::api_list_credentials).post(api::api_create_credential),
             )
-            .route(
-                "/api/v1/credentials/{id}",
-                delete(api::api_delete_credential),
-            )
+            .route("/api/v1/credentials/{id}", delete(api::api_delete_credential))
             .route("/api/v1/execute", post(api::api_execute))
             // Approvals JSON API: agent poll-by-id; admin-key list + decision
             // (A3/A4) for a product aggregator (tenant-partitioned in the handlers).
             .route("/api/v1/approvals", get(api::api_list_approvals))
             .route("/api/v1/approvals/{id}", get(api::api_check_approval))
-            .route(
-                "/api/v1/approvals/{id}/decision",
-                post(api::api_decide_approval),
-            )
+            .route("/api/v1/approvals/{id}/decision", post(api::api_decide_approval))
             .route(
                 "/api/v1/approvals/{id}/delegate-decision",
                 post(api::api_delegate_decide_approval),
@@ -240,20 +235,11 @@ impl WebServer {
                 "/api/v1/capabilities/{id}",
                 put(api::api_put_capability).delete(api::api_delete_capability),
             )
-            .route(
-                "/api/v1/tokens",
-                get(api::api_list_tokens).post(api::api_create_token),
-            )
+            .route("/api/v1/tokens", get(api::api_list_tokens).post(api::api_create_token))
             .route("/api/v1/tokens/{id}/revoke", post(api::api_revoke_token))
-            .route(
-                "/api/v1/approval-tokens",
-                post(api::api_create_approval_token),
-            )
+            .route("/api/v1/approval-tokens", post(api::api_create_approval_token))
             .route("/api/v1/auth/agent", get(api::api_resolve_agent_token))
-            .route(
-                "/api/v1/auth/agent/consume",
-                post(api::api_consume_agent_token),
-            )
+            .route("/api/v1/auth/agent/consume", post(api::api_consume_agent_token))
             .route(
                 "/api/v1/approval-tokens/{id}/revoke",
                 post(api::api_revoke_approval_token),
@@ -271,10 +257,7 @@ impl WebServer {
             // Signed event outbox replay + DLQ (V9).
             .route("/api/v1/events", get(api::api_list_events))
             .route("/api/v1/events/dead", get(api::api_list_dead_letters))
-            .route(
-                "/api/v1/events/{sequence}/replay",
-                post(api::api_replay_dead_letter),
-            )
+            .route("/api/v1/events/{sequence}/replay", post(api::api_replay_dead_letter))
             // Networked MCP transport (connector M1): a remote agent harness
             // reaches vultrino's MCP over JSON-RPC here, authed + scoped by a
             // Bearer use-token (vut_) / one-time secret. vultrino holds the
@@ -287,6 +270,14 @@ impl WebServer {
                 "/mcp",
                 post(mcp_http::mcp_jsonrpc).layer(DefaultBodyLimit::max(LLM_MAX_BODY_BYTES)),
             )
+            .route(
+                "/api/v1/workload-grants/{agent}",
+                axum::routing::put(workload_exchange::put_workload_grant),
+            )
+            .route(
+                "/api/v1/workload/exchange",
+                post(workload_exchange::exchange_workload_token),
+            )
             // Metered LLM proxy (connector M1, decision 5): a harness points its
             // model `base_url` here; the request is forwarded to the provider with
             // the vault model key injected and token spend metered (V13). The
@@ -295,6 +286,14 @@ impl WebServer {
             .route(
                 "/llm",
                 post(llm_proxy::llm_proxy_root).layer(DefaultBodyLimit::max(LLM_MAX_BODY_BYTES)),
+            )
+            .route(
+                "/llm/channels/{channel}",
+                post(llm_proxy::llm_proxy_channel_root).layer(DefaultBodyLimit::max(LLM_MAX_BODY_BYTES)),
+            )
+            .route(
+                "/llm/channels/{channel}/{*path}",
+                post(llm_proxy::llm_proxy_channel).layer(DefaultBodyLimit::max(LLM_MAX_BODY_BYTES)),
             )
             .route(
                 "/llm/{*path}",
@@ -363,9 +362,7 @@ impl WebServer {
         {
             let rl = self.app_state.rate_limiter.clone();
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(
-                    LOGIN_THROTTLE_CLEANUP_SECS,
-                ));
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(LOGIN_THROTTLE_CLEANUP_SECS));
                 loop {
                     tick.tick().await;
                     rl.cleanup().await;

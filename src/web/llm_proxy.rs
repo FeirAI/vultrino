@@ -49,7 +49,7 @@
 //! usage trailer arrives meters V13a only.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -89,7 +89,21 @@ const FORWARDED_PROVIDER_HEADERS: &[&str] = &[
     "openai-beta",
     "openai-organization",
     "openai-project",
+    "x-goog-user-project",
+    "x-goog-api-client",
+    "x-ms-client-request-id",
 ];
+
+fn provider_feature_enabled(protocol: &str) -> bool {
+    let flag = match protocol {
+        "azure-openai" => Some("VULTRINO_PROVIDER_AZURE_OPENAI_ENABLED"),
+        "bedrock-converse" | "bedrock-invoke" => Some("VULTRINO_PROVIDER_BEDROCK_ENABLED"),
+        "gemini" => Some("VULTRINO_PROVIDER_GEMINI_ENABLED"),
+        "vertex-ai" => Some("VULTRINO_PROVIDER_VERTEX_AI_ENABLED"),
+        _ => None,
+    };
+    flag.is_none_or(|name| std::env::var(name).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")))
+}
 
 /// Copy the allowlisted provider-protocol headers from the inbound request into
 /// the forwarded header map. Never copies auth/transport headers (the allowlist
@@ -148,8 +162,7 @@ fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64) {
     // ceiling cannot be evaded by naming an alternate field: `max_tokens` (OpenAI chat +
     // legacy + Anthropic), `max_completion_tokens` (newer OpenAI chat models), and
     // `max_output_tokens` (OpenAI /v1/responses).
-    const OUTPUT_TOKEN_FIELDS: &[&str] =
-        &["max_tokens", "max_completion_tokens", "max_output_tokens"];
+    const OUTPUT_TOKEN_FIELDS: &[&str] = &["max_tokens", "max_completion_tokens", "max_output_tokens"];
     if let Some(obj) = body.as_object_mut() {
         // Multiplicity controls (`n` choices, legacy `best_of`) multiply TOTAL output, so
         // pin them to 1 (this fn only runs under a configured ceiling). Fail closed: a
@@ -204,11 +217,7 @@ fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64) {
 async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, Response> {
     if UseToken::looks_like_token(secret) {
         let _ = state.storage.reload().await;
-        let token = match state
-            .storage
-            .get_use_token_by_hash(&UseToken::hash(secret))
-            .await
-        {
+        let token = match state.storage.get_use_token_by_hash(&UseToken::hash(secret)).await {
             Ok(Some(t)) => t,
             _ => {
                 return Err(llm_error(
@@ -229,10 +238,7 @@ async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, R
     } else {
         let manager = state.auth_manager.read().await;
         match manager.validate_key(secret) {
-            Ok((key, role)) => Ok(ExecAuth::from_api_key(crate::auth::AuthResult {
-                api_key: key,
-                role,
-            })),
+            Ok((key, role)) => Ok(ExecAuth::from_api_key(crate::auth::AuthResult { api_key: key, role })),
             Err(e) => Err(llm_error(
                 StatusCode::UNAUTHORIZED,
                 "invalid_request_error",
@@ -247,9 +253,10 @@ async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, R
 pub async fn llm_proxy_root(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     body: axum::body::Bytes,
 ) -> Response {
-    llm_proxy_impl(state, String::new(), headers, body).await
+    llm_proxy_impl(state, None, String::new(), query, headers, body).await
 }
 
 /// `POST /llm/{*path}` — the metered LLM proxy.
@@ -263,15 +270,39 @@ pub async fn llm_proxy(
     State(state): State<AppState>,
     Path(path): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     body: axum::body::Bytes,
 ) -> Response {
-    llm_proxy_impl(state, path, headers, body).await
+    llm_proxy_impl(state, None, path, query, headers, body).await
+}
+
+/// Explicit model-channel route for cross-provider fallback/dynamic selection.
+pub async fn llm_proxy_channel(
+    State(state): State<AppState>,
+    Path((channel, path)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> Response {
+    llm_proxy_impl(state, Some(channel), path, query, headers, body).await
+}
+
+pub async fn llm_proxy_channel_root(
+    State(state): State<AppState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> Response {
+    llm_proxy_impl(state, Some(channel), String::new(), query, headers, body).await
 }
 
 /// Shared implementation for both `/llm` and `/llm/{*path}`.
 async fn llm_proxy_impl(
     state: AppState,
+    channel: Option<String>,
     path: String,
+    query: HashMap<String, String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -296,25 +327,30 @@ async fn llm_proxy_impl(
     //    can only route model traffic through a capability it is actually granted.
     let capability = match state
         .server
-        .resolve_llm_proxy_for(exec_auth.auth.as_ref())
+        .resolve_llm_proxy_channel_for(exec_auth.auth.as_ref(), channel.as_deref())
         .await
     {
-        Some(c) => c,
-        None => {
-            return llm_error(
-                StatusCode::FORBIDDEN,
-                "permission_error",
-                "No LLM-proxy capability is provisioned for this principal",
-            )
-        }
+        Ok(c) => c,
+        Err(message) => return llm_error(StatusCode::FORBIDDEN, "permission_error", &message),
     };
+    let llm = capability.llm.as_ref().expect("resolved LLM capability has llm config");
+    if !provider_feature_enabled(&llm.protocol) {
+        return llm_error(
+            StatusCode::FORBIDDEN,
+            "provider_feature_disabled",
+            &format!("Provider protocol '{}' is disabled", llm.protocol),
+        );
+    }
+    let provider = llm.provider.clone().unwrap_or_else(|| llm.protocol.clone());
+    let region = llm.region.clone();
+    let channel_name = channel.clone().unwrap_or_else(|| capability.id.clone());
 
     // 3. Build the upstream provider URL (provider_base + inbound path). NOTE (v1):
     //    the inbound query string is NOT forwarded — axum's {*path} captures only the
     //    path, and `query` is sent as {} below. (Earlier docs wrongly claimed query
     //    preservation; corrected per review. Forwarding query is a future enhancement
     //    and would re-run the same scheme/host/port + prefix containment.)
-    let upstream = match capability.llm_upstream_url(&path) {
+    let mut upstream = match capability.llm_upstream_url(&path) {
         Some(u) => u,
         None => {
             return llm_error(
@@ -324,6 +360,20 @@ async fn llm_proxy_impl(
             )
         }
     };
+    // Provider query parameters such as Azure OpenAI's required `api-version`
+    // are preserved. The capability still fixes scheme/host/path prefix, so a
+    // query can never redirect the request to another origin.
+    if !query.is_empty() {
+        if let Ok(mut parsed) = url::Url::parse(&upstream) {
+            {
+                let mut pairs = parsed.query_pairs_mut();
+                for (key, value) in &query {
+                    pairs.append_pair(key, value);
+                }
+            }
+            upstream = parsed.to_string();
+        }
+    }
 
     // 4. Parse the agent's request body as JSON (OpenAI-compatible). An empty body
     //    is allowed (some endpoints take none); a non-JSON body is rejected so we
@@ -440,20 +490,18 @@ async fn llm_proxy_impl(
             "headers": fwd_headers,
             "body": request_body,
             "query": {},
+            "_feir_provider": provider,
+            "_feir_region": region,
+            "_feir_channel": channel_name,
         }),
     };
 
     // 6. Streaming path: forward the upstream SSE body incrementally. The gate is
     //    identical to the buffered path; only the response body delivery differs.
     if use_streaming {
-        return match state
-            .server
-            .execute_gated_streaming(execute_request, exec_auth)
-            .await
-        {
+        return match state.server.execute_gated_streaming(execute_request, exec_auth).await {
             Ok(crate::server::StreamingOutcome::Streaming(exec)) => {
-                let status =
-                    StatusCode::from_u16(exec.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                let status = StatusCode::from_u16(exec.status).unwrap_or(StatusCode::BAD_GATEWAY);
                 // Preserve the provider Content-Type (e.g. text/event-stream) so the
                 // client's SSE parser engages; default to event-stream for a streamed
                 // turn that didn't echo one.
@@ -505,20 +553,14 @@ async fn llm_proxy_impl(
             // Return the provider body + status verbatim (post egress-scrub, so no
             // model key ever reflects back). Preserve the provider Content-Type so
             // the harness's OpenAI client parses it correctly.
-            let status =
-                StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
             let content_type = response
                 .headers
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                 .map(|(_, v)| v.clone())
                 .unwrap_or_else(|| "application/json".to_string());
-            (
-                status,
-                [(header::CONTENT_TYPE, content_type)],
-                response.body,
-            )
-                .into_response()
+            (status, [(header::CONTENT_TYPE, content_type)], response.body).into_response()
         }
         // An LLM call should never be approval-gated in practice, but if a policy
         // routes it to approval, surface that honestly rather than silently
@@ -577,7 +619,10 @@ mod tests {
         let mut body = json!({ "model": "gpt-5", "max_completion_tokens": 9000 });
         clamp_max_output_tokens(&mut body, 1000);
         assert_eq!(body["max_completion_tokens"], json!(1000));
-        assert!(body.get("max_tokens").is_none(), "don't inject max_tokens when another field was chosen");
+        assert!(
+            body.get("max_tokens").is_none(),
+            "don't inject max_tokens when another field was chosen"
+        );
         // max_output_tokens (OpenAI /v1/responses):
         let mut body = json!({ "model": "o3", "max_output_tokens": 9000 });
         clamp_max_output_tokens(&mut body, 1000);
@@ -611,7 +656,10 @@ mod tests {
         assert_eq!(body["n"], json!(1));
         let mut body = json!({ "max_tokens": 1000 });
         clamp_max_output_tokens(&mut body, 1000);
-        assert!(body.get("n").is_none(), "don't inject n when the request didn't ask for choices");
+        assert!(
+            body.get("n").is_none(),
+            "don't inject n when the request didn't ask for choices"
+        );
     }
 
     #[test]
@@ -639,7 +687,9 @@ mod tests {
         // chat-completions endpoint.
         assert!(is_openai_chat_endpoint("https://api.openai.com/v1/chat/completions"));
         assert!(is_openai_chat_endpoint("https://api.openai.com/v1/completions")); // legacy
-        assert!(is_openai_chat_endpoint("https://api.openai.com/v1/chat/completions?x=1"));
+        assert!(is_openai_chat_endpoint(
+            "https://api.openai.com/v1/chat/completions?x=1"
+        ));
         assert!(is_openai_chat_endpoint("https://api.openai.com/v1/chat/completions/"));
         // Native-usage endpoints must NOT match (they'd reject stream_options).
         assert!(!is_openai_chat_endpoint("https://api.openai.com/v1/responses"));

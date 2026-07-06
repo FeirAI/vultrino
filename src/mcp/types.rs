@@ -9,6 +9,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
+    #[serde(default)]
     pub id: JsonRpcId,
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,6 +67,12 @@ pub enum JsonRpcId {
     String(String),
     Number(i64),
     Null,
+}
+
+impl Default for JsonRpcId {
+    fn default() -> Self {
+        Self::Null
+    }
 }
 
 /// JSON-RPC error
@@ -200,6 +207,9 @@ pub struct ToolCallParams {
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallResult {
     pub content: Vec<ToolContent>,
+    /// MCP structured tool output. Older clients continue to consume `content`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
 }
@@ -287,10 +297,7 @@ mod tests {
 
     #[test]
     fn test_jsonrpc_response_success() {
-        let response = JsonRpcResponse::success(
-            JsonRpcId::Number(1),
-            serde_json::json!({"status": "ok"}),
-        );
+        let response = JsonRpcResponse::success(JsonRpcId::Number(1), serde_json::json!({"status": "ok"}));
 
         assert!(response.error.is_none());
         assert!(response.result.is_some());

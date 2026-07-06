@@ -14,6 +14,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
 /// A successfully authenticated MCP caller — either a long-lived API key or a
 /// narrow, ephemeral use token.
 enum McpPrincipal {
@@ -38,7 +40,6 @@ impl McpPrincipal {
         }
     }
 }
-
 
 /// MCP Server for Vultrino
 pub struct McpServer {
@@ -71,10 +72,7 @@ impl McpServer {
             .validate_key(api_key)
             .map_err(|e| format!("Invalid API key: {}", e))?;
 
-        Ok(AuthResult {
-            api_key: key,
-            role,
-        })
+        Ok(AuthResult { api_key: key, role })
     }
 
     /// Check permission for a validated auth
@@ -188,6 +186,33 @@ impl McpServer {
         )
     }
 
+    /// Project the backward-compatible pending text into MCP structuredContent.
+    /// The text stays present for older clients; LangGraph middleware consumes
+    /// this artifact to create a durable interrupt without scraping prose.
+    fn structured_approval_content(content: &[ToolContent]) -> Option<serde_json::Value> {
+        let text = match content.first()? {
+            ToolContent::Text { text } => text,
+            _ => return None,
+        };
+        let field = |name: &str| text.lines().find_map(|line| line.strip_prefix(name).map(str::trim));
+        let approval_id = field("approval_id:")?;
+        let status = field("status:").unwrap_or("pending");
+        let expires_at = field("expires:");
+        let (completed, required) = field("progress:")
+            .and_then(|v| v.split_once('/'))
+            .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+            .unwrap_or((0, 1));
+        Some(json!({
+            "type": "feir.approval.v1",
+            "approval_id": approval_id,
+            "status": status,
+            "expires_at": expires_at,
+            "progress": { "completed": completed, "required": required },
+            "proof_reference": null,
+            "execute_at_most_once": true
+        }))
+    }
+
     /// Run the MCP server over stdio
     pub async fn run_stdio(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let stdin = tokio::io::stdin();
@@ -254,10 +279,17 @@ impl McpServer {
         // Route to handler
         let result = match request.method.as_str() {
             "initialize" => self.handle_initialize(&request).await,
-            "initialized" => {
+            "notifications/initialized" | "initialized" => {
                 // Notification, no response
                 self.initialized = true;
                 info!("MCP client initialized");
+                return None;
+            }
+            "notifications/cancelled" => {
+                // Execution cancellation is cooperative. HTTP disconnects cancel
+                // the request future; this notification is accepted for MCP
+                // conformance and intentionally has no response.
+                info!(params = ?request.params, "MCP client cancelled a request");
                 return None;
             }
             "tools/list" => self.handle_tools_list(&request).await,
@@ -277,12 +309,17 @@ impl McpServer {
     }
 
     /// Handle initialize request
-    async fn handle_initialize(
-        &mut self,
-        _request: &JsonRpcRequest,
-    ) -> Result<serde_json::Value, (i32, String)> {
+    async fn handle_initialize(&mut self, request: &JsonRpcRequest) -> Result<serde_json::Value, (i32, String)> {
+        let requested = request
+            .params
+            .as_ref()
+            .and_then(|p| p.get("protocolVersion"))
+            .and_then(|v| v.as_str());
+        let negotiated = requested
+            .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
+            .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0]);
         let result = InitializeResult {
-            protocol_version: "2024-11-05".to_string(),
+            protocol_version: negotiated.to_string(),
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
                     list_changed: Some(false),
@@ -311,10 +348,7 @@ impl McpServer {
     }
 
     /// Handle tools/list request
-    async fn handle_tools_list(
-        &self,
-        request: &JsonRpcRequest,
-    ) -> Result<serde_json::Value, (i32, String)> {
+    async fn handle_tools_list(&self, request: &JsonRpcRequest) -> Result<serde_json::Value, (i32, String)> {
         let mut tools = vec![
             Tool {
                 name: "list_credentials".to_string(),
@@ -469,11 +503,7 @@ impl McpServer {
         let secret = request
             .params
             .as_ref()
-            .and_then(|p| {
-                p.get("api_key")
-                    .or_else(|| p.get("token"))
-                    .and_then(|v| v.as_str())
-            })?
+            .and_then(|p| p.get("api_key").or_else(|| p.get("token")).and_then(|v| v.as_str()))?
             .to_string();
         self.resolve_principal_for_read(&secret).await.ok()
     }
@@ -577,10 +607,7 @@ impl McpServer {
     }
 
     /// Handle tools/call request
-    async fn handle_tools_call(
-        &self,
-        request: &JsonRpcRequest,
-    ) -> Result<serde_json::Value, (i32, String)> {
+    async fn handle_tools_call(&self, request: &JsonRpcRequest) -> Result<serde_json::Value, (i32, String)> {
         let params: ToolCallParams = request
             .params
             .as_ref()
@@ -603,8 +630,7 @@ impl McpServer {
             .map(|k| k.starts_with("vut_"))
             .unwrap_or(false);
         if caller_is_use_token {
-            let is_named_capability =
-                self.vultrino.capability_by_tool_name(&params.name).await.is_some();
+            let is_named_capability = self.vultrino.capability_by_tool_name(&params.name).await.is_some();
             if params.name != "check_approval" && !is_named_capability {
                 return Err((
                     INVALID_PARAMS,
@@ -644,8 +670,10 @@ impl McpServer {
 
         match result {
             Ok(content) => {
+                let structured_content = Self::structured_approval_content(&content);
                 let result = ToolCallResult {
                     content,
+                    structured_content,
                     is_error: None,
                 };
                 serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
@@ -653,6 +681,7 @@ impl McpServer {
             Err(e) => {
                 let result = ToolCallResult {
                     content: vec![ToolContent::Text { text: e }],
+                    structured_content: None,
                     is_error: Some(true),
                 };
                 serde_json::to_value(result).map_err(|e| (INTERNAL_ERROR, e.to_string()))
@@ -689,11 +718,7 @@ impl McpServer {
             }
             let short_name = &tool_name[prefix.len()..];
 
-            let mcp_tool = match plugin
-                .mcp_tool_definitions()
-                .into_iter()
-                .find(|t| t.name == short_name)
-            {
+            let mcp_tool = match plugin.mcp_tool_definitions().into_iter().find(|t| t.name == short_name) {
                 Some(t) => t,
                 None => continue,
             };
@@ -789,10 +814,7 @@ impl McpServer {
 
         // Resolve the canonical plugin for this capability's action so we shape the
         // params correctly (http canonical request vs. plugin-param overlay).
-        let (canonical_action, _label) = self
-            .vultrino
-            .config()
-            .resolve_action(&capability.action);
+        let (canonical_action, _label) = self.vultrino.config().resolve_action(&capability.action);
         let plugin_name = canonical_action
             .split_once('.')
             .map(|(p, _)| p)
@@ -838,10 +860,7 @@ impl McpServer {
     }
 
     /// Handle resources/list request
-    async fn handle_resources_list(
-        &self,
-        request: &JsonRpcRequest,
-    ) -> Result<serde_json::Value, (i32, String)> {
+    async fn handle_resources_list(&self, request: &JsonRpcRequest) -> Result<serde_json::Value, (i32, String)> {
         // Principal-scoped vault enumeration (GLM review #3 + Codex pass 4). This
         // gate lives in the SHARED handler so BOTH stdio and HTTP are covered
         // uniformly (the HTTP transport injects the Bearer into params.api_key):
@@ -892,18 +911,15 @@ impl McpServer {
     }
 
     /// Tool: list_credentials
-    async fn tool_list_credentials(
-        &self,
-        args: serde_json::Value,
-    ) -> Result<Vec<ToolContent>, String> {
+    async fn tool_list_credentials(&self, args: serde_json::Value) -> Result<Vec<ToolContent>, String> {
         #[derive(serde::Deserialize)]
         struct Args {
             api_key: String,
             pattern: Option<String>,
         }
 
-        let args: Args = serde_json::from_value(args)
-            .map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
+        let args: Args =
+            serde_json::from_value(args).map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
         // Authenticate (API key or use token) and check permission.
         let principal = self.resolve_principal(&args.api_key).await?;
@@ -942,10 +958,7 @@ impl McpServer {
                     .get("description")
                     .map(|d| format!(" - {}", d))
                     .unwrap_or_default();
-                lines.push(format!(
-                    "- {} (type: {}){}",
-                    cred.alias, cred.credential_type, desc
-                ));
+                lines.push(format!("- {} (type: {}){}", cred.alias, cred.credential_type, desc));
             }
             lines.join("\n")
         };
@@ -954,10 +967,7 @@ impl McpServer {
     }
 
     /// Tool: http_request
-    async fn tool_http_request(
-        &self,
-        args: serde_json::Value,
-    ) -> Result<Vec<ToolContent>, String> {
+    async fn tool_http_request(&self, args: serde_json::Value) -> Result<Vec<ToolContent>, String> {
         let args: HttpRequestArgs =
             serde_json::from_value(args).map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
@@ -997,8 +1007,7 @@ impl McpServer {
         let body_text = String::from_utf8_lossy(&response.body);
 
         // Try to pretty-print JSON
-        let formatted_body = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text)
-        {
+        let formatted_body = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
             serde_json::to_string_pretty(&json).unwrap_or_else(|_| body_text.to_string())
         } else {
             body_text.to_string()
@@ -1013,10 +1022,7 @@ impl McpServer {
     }
 
     /// Tool: get_credential_info
-    async fn tool_get_credential_info(
-        &self,
-        args: serde_json::Value,
-    ) -> Result<Vec<ToolContent>, String> {
+    async fn tool_get_credential_info(&self, args: serde_json::Value) -> Result<Vec<ToolContent>, String> {
         let args: GetCredentialInfoArgs =
             serde_json::from_value(args).map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
@@ -1056,9 +1062,7 @@ impl McpServer {
                     }
                 }
 
-                Ok(vec![ToolContent::Text {
-                    text: info.join("\n"),
-                }])
+                Ok(vec![ToolContent::Text { text: info.join("\n") }])
             }
             None => Err(format!("Credential not found: {}", args.credential)),
         }
@@ -1066,10 +1070,7 @@ impl McpServer {
 
     /// Tool: check_approval — poll a pending approval, and run the action once
     /// it has been approved, returning the real result.
-    async fn tool_check_approval(
-        &self,
-        args: serde_json::Value,
-    ) -> Result<Vec<ToolContent>, String> {
+    async fn tool_check_approval(&self, args: serde_json::Value) -> Result<Vec<ToolContent>, String> {
         #[derive(serde::Deserialize)]
         struct Args {
             api_key: String,
@@ -1104,7 +1105,7 @@ impl McpServer {
         } else {
             String::new()
         };
-        let text = match approval.status {
+        let human_text = match approval.status {
             ApprovalStatus::Pending => format!(
                 "\u{23F3} Approval {} is still PENDING. A human has not decided yet.{} Wait about \
                  10-30 seconds, then call `check_approval` again with the same approval_id.\nExpires: {}",
@@ -1170,6 +1171,15 @@ impl McpServer {
             }
         };
 
+        let text = format!(
+            "{}\n\napproval_id: {}\nstatus: {}\nexpires: {}\nprogress: {}/{}",
+            human_text,
+            approval.id,
+            format!("{:?}", approval.status).to_ascii_lowercase(),
+            approval.expires_at.to_rfc3339(),
+            approval.signoffs.len(),
+            approval.effective_required_approvals(),
+        );
         Ok(vec![ToolContent::Text { text }])
     }
 }
@@ -1177,6 +1187,24 @@ impl McpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_approval_has_structured_content() {
+        let content = vec![ToolContent::Text {
+            text: "human text\napproval_id: appr_123\nstatus: pending\nexpires: 2030-01-01T00:00:00Z".to_string(),
+        }];
+        let structured = McpServer::structured_approval_content(&content).unwrap();
+        assert_eq!(structured["type"], "feir.approval.v1");
+        assert_eq!(structured["approval_id"], "appr_123");
+        assert_eq!(structured["execute_at_most_once"], true);
+    }
+
+    #[test]
+    fn jsonrpc_notification_may_omit_id() {
+        let request: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).unwrap();
+        assert_eq!(request.id, JsonRpcId::Null);
+    }
 
     #[test]
     fn test_tool_definitions() {

@@ -106,6 +106,13 @@ pub struct Capability {
 /// metering (V13a api-calls + V13b token counts) fires on the response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmProxy {
+    /// Certified wire family used for feature gating and assurance reporting.
+    #[serde(default = "default_llm_protocol")]
+    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     /// The real model provider's base URL (scheme + host, optionally a path
     /// prefix), e.g. `https://api.openai.com`. The proxy appends the inbound
     /// request path (e.g. `/v1/chat/completions`) to form the upstream URL. Must
@@ -129,6 +136,23 @@ pub struct LlmProxy {
     /// sizes it from the budget's cost hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+}
+
+fn default_llm_protocol() -> String {
+    "openai-chat".to_string()
+}
+
+impl Default for LlmProxy {
+    fn default() -> Self {
+        Self {
+            protocol: default_llm_protocol(),
+            provider: None,
+            region: None,
+            provider_base: String::new(),
+            allowed_models: Vec::new(),
+            max_output_tokens: None,
+        }
+    }
 }
 
 impl Capability {
@@ -180,13 +204,17 @@ impl Capability {
                 .map_err(|e| format!("capability target.url_glob '{}' is not a valid glob: {}", glob, e))?;
         }
         if let Some(llm) = &self.llm {
+            match llm.protocol.as_str() {
+                "openai-chat" | "openai-responses" | "azure-openai" | "anthropic-messages" | "bedrock-converse"
+                | "bedrock-invoke" | "gemini" | "vertex-ai" | "observed-only" => {}
+                other => return Err(format!("capability llm.protocol '{}' is not supported", other)),
+            }
             let base = llm.provider_base.trim();
             if base.is_empty() {
                 return Err("capability llm.provider_base must not be empty".to_string());
             }
-            let parsed = url::Url::parse(base).map_err(|e| {
-                format!("capability llm.provider_base '{}' is not a valid URL: {}", base, e)
-            })?;
+            let parsed = url::Url::parse(base)
+                .map_err(|e| format!("capability llm.provider_base '{}' is not a valid URL: {}", base, e))?;
             if parsed.scheme() != "http" && parsed.scheme() != "https" {
                 return Err(format!(
                     "capability llm.provider_base '{}' must use http or https",
@@ -326,11 +354,8 @@ impl Capability {
         };
         // Ensure a properties map exists, then add the auth field.
         let obj = schema.as_object_mut().expect("schema is an object");
-        obj.entry("type")
-            .or_insert_with(|| serde_json::json!("object"));
-        let props = obj
-            .entry("properties")
-            .or_insert_with(|| serde_json::json!({}));
+        obj.entry("type").or_insert_with(|| serde_json::json!("object"));
+        let props = obj.entry("properties").or_insert_with(|| serde_json::json!({}));
         if let Some(props) = props.as_object_mut() {
             props.insert(
                 "api_key".to_string(),
@@ -341,9 +366,7 @@ impl Capability {
             );
         }
         // Require api_key.
-        let required = obj
-            .entry("required")
-            .or_insert_with(|| serde_json::json!([]));
+        let required = obj.entry("required").or_insert_with(|| serde_json::json!([]));
         if let Some(arr) = required.as_array_mut() {
             if !arr.iter().any(|v| v.as_str() == Some("api_key")) {
                 arr.insert(0, serde_json::json!("api_key"));
@@ -407,11 +430,7 @@ impl From<&Capability> for CapabilityMetadata {
 ///
 /// The caller is responsible for having stripped the `api_key` from `args`
 /// before this (it must never reach a plugin).
-pub fn build_action_params(
-    capability: &Capability,
-    plugin_name: &str,
-    args: &serde_json::Value,
-) -> serde_json::Value {
+pub fn build_action_params(capability: &Capability, plugin_name: &str, args: &serde_json::Value) -> serde_json::Value {
     let args_obj = args.as_object().cloned().unwrap_or_default();
 
     if plugin_name == "http" {
@@ -503,7 +522,7 @@ mod tests {
         assert!(cap("").validate().is_err());
         assert!(cap("Send-Email").validate().is_err()); // uppercase + hyphen
         assert!(cap("send email").validate().is_err()); // space
-        // Collision with a built-in generic tool.
+                                                        // Collision with a built-in generic tool.
         assert!(cap("http_request").validate().is_err());
         assert!(cap("check_approval").validate().is_err());
     }
@@ -575,6 +594,7 @@ mod tests {
             provider_base: provider_base.to_string(),
             allowed_models: Vec::new(),
             max_output_tokens: None,
+            ..Default::default()
         });
         c
     }
@@ -621,15 +641,30 @@ mod tests {
         assert!(llm_cap("https://api.openai.com").validate().is_ok());
         // Empty provider_base.
         let mut c = llm_cap("https://api.openai.com");
-        c.llm = Some(LlmProxy { provider_base: "  ".to_string(), allowed_models: Vec::new(), max_output_tokens: None });
+        c.llm = Some(LlmProxy {
+            provider_base: "  ".to_string(),
+            allowed_models: Vec::new(),
+            max_output_tokens: None,
+            ..Default::default()
+        });
         assert!(c.validate().is_err());
         // Non-URL provider_base.
         let mut c = llm_cap("https://api.openai.com");
-        c.llm = Some(LlmProxy { provider_base: "not a url".to_string(), allowed_models: Vec::new(), max_output_tokens: None });
+        c.llm = Some(LlmProxy {
+            provider_base: "not a url".to_string(),
+            allowed_models: Vec::new(),
+            max_output_tokens: None,
+            ..Default::default()
+        });
         assert!(c.validate().is_err());
         // Disallowed scheme.
         let mut c = llm_cap("https://api.openai.com");
-        c.llm = Some(LlmProxy { provider_base: "ftp://api.openai.com".to_string(), allowed_models: Vec::new(), max_output_tokens: None });
+        c.llm = Some(LlmProxy {
+            provider_base: "ftp://api.openai.com".to_string(),
+            allowed_models: Vec::new(),
+            max_output_tokens: None,
+            ..Default::default()
+        });
         assert!(c.validate().is_err());
     }
 
@@ -683,10 +718,7 @@ mod tests {
             Some("https://gateway.internal/openai/v1/chat/completions")
         );
         // Empty path → the base itself.
-        assert_eq!(
-            c.llm_upstream_url("").as_deref(),
-            Some("https://api.openai.com")
-        );
+        assert_eq!(c.llm_upstream_url("").as_deref(), Some("https://api.openai.com"));
     }
 
     #[test]
@@ -712,8 +744,8 @@ mod tests {
         ];
         for path in attacks {
             if let Some(upstream) = c.llm_upstream_url(path) {
-                let parsed = url::Url::parse(&upstream)
-                    .unwrap_or_else(|e| panic!("upstream for {path:?} must parse: {e}"));
+                let parsed =
+                    url::Url::parse(&upstream).unwrap_or_else(|e| panic!("upstream for {path:?} must parse: {e}"));
                 assert_eq!(
                     parsed.host_str(),
                     Some("api.openai.com"),
@@ -735,7 +767,10 @@ mod tests {
         let c = llm_cap("https://gateway.internal/openai");
         // Legit paths under the prefix are allowed.
         assert!(c.llm_upstream_url("/v1/chat/completions").is_some());
-        assert_eq!(c.llm_upstream_url("").as_deref(), Some("https://gateway.internal/openai"));
+        assert_eq!(
+            c.llm_upstream_url("").as_deref(),
+            Some("https://gateway.internal/openai")
+        );
         // Escapes are rejected (None).
         for escape in [
             "/../admin",

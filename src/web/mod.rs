@@ -14,6 +14,7 @@ mod mcp_http;
 mod routes;
 mod server;
 mod templates;
+mod workload_exchange;
 
 pub use auth::{AdminAuth, WebSession};
 pub use server::{WebConfig, WebServer};

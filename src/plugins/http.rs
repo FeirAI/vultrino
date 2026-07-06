@@ -10,12 +10,96 @@ use crate::{CredentialData, CredentialType, ExecuteResponse, Secret};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Duration, Utc};
+use hmac::{Hmac, Mac};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn hmac_bytes(key: &[u8], data: &str) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn sign_aws_sigv4(
+    headers: &mut HashMap<String, String>,
+    method: &Method,
+    url: &url::Url,
+    body: &[u8],
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: Option<&str>,
+    region: &str,
+    service: &str,
+    now: DateTime<Utc>,
+) -> Result<(), PluginError> {
+    if access_key_id.trim().is_empty()
+        || secret_access_key.is_empty()
+        || region.trim().is_empty()
+        || service.trim().is_empty()
+    {
+        return Err(PluginError::InvalidParams(
+            "AWS SigV4 credential requires access key, secret key, region, and service".into(),
+        ));
+    }
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.format("%Y%m%d").to_string();
+    let host = url
+        .host_str()
+        .ok_or_else(|| PluginError::InvalidParams("AWS URL has no host".into()))?;
+    let host = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    remove_header_ci(headers, "authorization");
+    remove_header_ci(headers, "x-amz-date");
+    remove_header_ci(headers, "x-amz-security-token");
+    headers.insert("host".into(), host.clone());
+    headers.insert("x-amz-date".into(), amz_date.clone());
+    if let Some(token) = session_token {
+        headers.insert("x-amz-security-token".into(), token.to_string());
+    }
+    let mut signed = vec![("host", host), ("x-amz-date", amz_date.clone())];
+    if let Some(token) = session_token {
+        signed.push(("x-amz-security-token", token.to_string()));
+    }
+    signed.sort_by_key(|(name, _)| *name);
+    let canonical_headers = signed
+        .iter()
+        .map(|(k, v)| format!("{}:{}\n", k, v.trim()))
+        .collect::<String>();
+    let signed_headers = signed.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(";");
+    let payload_hash = hex::encode(Sha256::digest(body));
+    let canonical_uri = if url.path().is_empty() { "/" } else { url.path() };
+    let canonical_query = url.query().unwrap_or("");
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method.as_str(),
+        canonical_uri,
+        canonical_query,
+        canonical_headers,
+        signed_headers,
+        payload_hash
+    );
+    let scope = format!("{date}/{region}/{service}/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex::encode(Sha256::digest(canonical_request.as_bytes()))
+    );
+    let k_date = hmac_bytes(format!("AWS4{secret_access_key}").as_bytes(), &date);
+    let k_region = hmac_bytes(&k_date, region);
+    let k_service = hmac_bytes(&k_region, service);
+    let k_signing = hmac_bytes(&k_service, "aws4_request");
+    let signature = hex::encode(hmac_bytes(&k_signing, &string_to_sign));
+    headers.insert("Authorization".into(), format!("AWS4-HMAC-SHA256 Credential={access_key_id}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"));
+    Ok(())
+}
 
 /// HTTP plugin for API authentication
 pub struct HttpPlugin {
@@ -37,21 +121,16 @@ impl Resolve for SsrfGuardResolver {
             let host = name.as_str().to_string();
             // getaddrinfo is blocking; run it off the async reactor. Port 0 is a
             // placeholder — reqwest applies the real port to each returned IP.
-            let resolved: std::io::Result<Vec<SocketAddr>> =
-                tokio::task::spawn_blocking(move || {
-                    (host.as_str(), 0u16)
-                        .to_socket_addrs()
-                        .map(|it| it.collect::<Vec<_>>())
-                })
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-            let addrs = resolved
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            let resolved: std::io::Result<Vec<SocketAddr>> = tokio::task::spawn_blocking(move || {
+                (host.as_str(), 0u16).to_socket_addrs().map(|it| it.collect::<Vec<_>>())
+            })
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            let addrs = resolved.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
             // Keep ONLY public IPs; fail closed if nothing public remains.
-            let public = filter_public_addrs(addrs).map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> { Box::from(e) },
-            )?;
+            let public =
+                filter_public_addrs(addrs).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::from(e) })?;
             let iter: Addrs = Box::new(public.into_iter());
             Ok(iter)
         })
@@ -134,7 +213,9 @@ pub(crate) fn build_guarded_client() -> Client {
 impl HttpPlugin {
     /// Create a new HTTP plugin
     pub fn new() -> Self {
-        Self { client: build_guarded_client() }
+        Self {
+            client: build_guarded_client(),
+        }
     }
 
     /// Validate token URL for SSRF protection - requires HTTPS. `pub(crate)` so
@@ -142,8 +223,8 @@ impl HttpPlugin {
     /// reuse the same HTTPS + IP-literal + DNS private-range guard rather than
     /// re-implementing it inconsistently.
     pub(crate) fn validate_token_url_ssrf(url_str: &str) -> Result<url::Url, PluginError> {
-        let url = url::Url::parse(url_str)
-            .map_err(|e| PluginError::InvalidParams(format!("Invalid token URL: {}", e)))?;
+        let url =
+            url::Url::parse(url_str).map_err(|e| PluginError::InvalidParams(format!("Invalid token URL: {}", e)))?;
 
         // Token URLs must use HTTPS to prevent credential leakage
         if url.scheme() != "https" {
@@ -153,9 +234,9 @@ impl HttpPlugin {
         }
 
         // Get the host
-        let host = url.host_str().ok_or_else(|| {
-            PluginError::InvalidParams("Token URL must have a host".to_string())
-        })?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| PluginError::InvalidParams("Token URL must have a host".to_string()))?;
 
         // Check for IP address literals
         if let Ok(ip) = host.parse::<IpAddr>() {
@@ -391,10 +472,7 @@ impl HttpPlugin {
             CredentialData::OAuth2 { access_token, .. } => {
                 if let Some(token) = access_token {
                     remove_header_ci(headers, "Authorization");
-                    headers.insert(
-                        "Authorization".to_string(),
-                        format!("Bearer {}", token.expose()),
-                    );
+                    headers.insert("Authorization".to_string(), format!("Bearer {}", token.expose()));
                 } else {
                     return Err(PluginError::ExecutionFailed(
                         "OAuth2 credential has no access token".to_string(),
@@ -475,8 +553,7 @@ impl HttpPlugin {
 
     /// Validate URL for SSRF protection
     fn validate_url_ssrf(url_str: &str) -> Result<url::Url, PluginError> {
-        let url = url::Url::parse(url_str)
-            .map_err(|e| PluginError::InvalidParams(format!("Invalid URL: {}", e)))?;
+        let url = url::Url::parse(url_str).map_err(|e| PluginError::InvalidParams(format!("Invalid URL: {}", e)))?;
 
         // Only allow http and https schemes
         match url.scheme() {
@@ -490,9 +567,9 @@ impl HttpPlugin {
         }
 
         // Get the host
-        let host = url.host_str().ok_or_else(|| {
-            PluginError::InvalidParams("URL must have a host".to_string())
-        })?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| PluginError::InvalidParams("URL must have a host".to_string()))?;
 
         // Check for IP address literals
         if let Ok(ip) = host.parse::<IpAddr>() {
@@ -542,7 +619,7 @@ impl HttpPlugin {
         cred_data: &CredentialData,
     ) -> Result<(reqwest::RequestBuilder, Option<CredentialData>), PluginError> {
         // Validate URL for SSRF before proceeding
-        let validated_url = Self::validate_url_ssrf(&params.url)?;
+        let mut validated_url = Self::validate_url_ssrf(&params.url)?;
 
         // Parse method
         let method = Method::from_str(&params.method.to_uppercase())
@@ -559,12 +636,53 @@ impl HttpPlugin {
             _ => (cred_data.clone(), None),
         };
 
+        // SigV4 signs the complete request target. Merge caller query parameters
+        // into the URL before signing (in deterministic order) so reqwest cannot
+        // append unsigned parameters after the Authorization header is produced.
+        let uses_aws_sigv4 = matches!(effective_cred, CredentialData::AwsSigV4 { .. });
+        if uses_aws_sigv4 && !params.query.is_empty() {
+            let mut query = validated_url
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>();
+            query.extend(params.query.iter().map(|(key, value)| (key.clone(), value.clone())));
+            query.sort();
+            validated_url.set_query(None);
+            validated_url.query_pairs_mut().extend_pairs(query);
+        }
+
         // Build headers with credential injection. First drop agent-supplied routing / hop-by-hop
         // headers (Host-routing tricks, request smuggling) — reqwest derives these from the validated
         // URL + body, and an agent on this governed capability path must not control them.
         let mut headers = params.headers;
         strip_unsafe_request_headers(&mut headers);
-        self.inject_credentials(&mut headers, &effective_cred)?;
+        let aws_body = match &params.body {
+            Some(body) => serde_json::to_vec(body).map_err(|e| PluginError::InvalidParams(e.to_string()))?,
+            None => Vec::new(),
+        };
+        match &effective_cred {
+            CredentialData::AwsSigV4 {
+                access_key_id,
+                secret_access_key,
+                session_token,
+                region,
+                service,
+            } => {
+                sign_aws_sigv4(
+                    &mut headers,
+                    &method,
+                    &validated_url,
+                    &aws_body,
+                    access_key_id,
+                    secret_access_key.expose(),
+                    session_token.as_ref().map(Secret::expose),
+                    region,
+                    service,
+                    Utc::now(),
+                )?;
+            }
+            _ => self.inject_credentials(&mut headers, &effective_cred)?,
+        }
 
         // Let the HTTP client negotiate and auto-decompress the response
         // (gzip/deflate/brotli features) so egress secret-redaction always sees
@@ -583,13 +701,17 @@ impl HttpPlugin {
         }
 
         // Add query parameters
-        if !params.query.is_empty() {
+        if !uses_aws_sigv4 && !params.query.is_empty() {
             request = request.query(&params.query);
         }
 
         // Add body
-        if let Some(body) = params.body {
-            request = request.json(&body);
+        if params.body.is_some() {
+            if uses_aws_sigv4 {
+                request = request.header("content-type", "application/json").body(aws_body);
+            } else if let Some(body) = params.body {
+                request = request.json(&body);
+            }
         }
 
         Ok((request, updated_credential))
@@ -604,10 +726,7 @@ impl HttpPlugin {
         let (request, updated_credential) = self.prepare_request(params, cred_data).await?;
 
         // Execute request
-        let response = request
-            .send()
-            .await
-            .map_err(|e| PluginError::Http(e.to_string()))?;
+        let response = request.send().await.map_err(|e| PluginError::Http(e.to_string()))?;
 
         // Extract response details
         let status = response.status().as_u16();
@@ -642,10 +761,7 @@ impl HttpPlugin {
 
         let (request, updated_credential) = self.prepare_request(params, cred_data).await?;
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| PluginError::Http(e.to_string()))?;
+        let response = request.send().await.map_err(|e| PluginError::Http(e.to_string()))?;
 
         let status = response.status().as_u16();
         let response_headers = collect_response_headers(response.headers());
@@ -672,11 +788,7 @@ impl HttpPlugin {
 fn collect_response_headers(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
     headers
         .iter()
-        .filter_map(|(k, v)| {
-            v.to_str()
-                .ok()
-                .map(|v| (k.as_str().to_string(), v.to_string()))
-        })
+        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
         .collect()
 }
 
@@ -726,6 +838,7 @@ impl Plugin for HttpPlugin {
             CredentialType::ApiKey,
             CredentialType::BasicAuth,
             CredentialType::OAuth2,
+            CredentialType::AwsSigV4,
         ]
     }
 
@@ -736,8 +849,8 @@ impl Plugin for HttpPlugin {
     async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
         match request.action.as_str() {
             "request" => {
-                let params: HttpRequestParams = serde_json::from_value(request.params)
-                    .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+                let params: HttpRequestParams =
+                    serde_json::from_value(request.params).map_err(|e| PluginError::InvalidParams(e.to_string()))?;
 
                 self.execute_request(params, &request.credential.data).await
             }
@@ -745,27 +858,19 @@ impl Plugin for HttpPlugin {
         }
     }
 
-    async fn execute_streaming(
-        &self,
-        request: PluginRequest,
-    ) -> Result<crate::StreamingResponse, PluginError> {
+    async fn execute_streaming(&self, request: PluginRequest) -> Result<crate::StreamingResponse, PluginError> {
         match request.action.as_str() {
             "request" => {
-                let params: HttpRequestParams = serde_json::from_value(request.params)
-                    .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+                let params: HttpRequestParams =
+                    serde_json::from_value(request.params).map_err(|e| PluginError::InvalidParams(e.to_string()))?;
 
-                self.execute_request_streaming(params, &request.credential.data)
-                    .await
+                self.execute_request_streaming(params, &request.credential.data).await
             }
             _ => Err(PluginError::UnsupportedAction(request.action)),
         }
     }
 
-    fn validate_params(
-        &self,
-        action: &str,
-        params: &serde_json::Value,
-    ) -> Result<(), PluginError> {
+    fn validate_params(&self, action: &str, params: &serde_json::Value) -> Result<(), PluginError> {
         match action {
             "request" => {
                 // Validate required fields
@@ -812,6 +917,38 @@ impl Plugin for HttpPlugin {
 mod tests {
     use super::*;
     use crate::Secret;
+
+    #[test]
+    fn aws_sigv4_signs_bedrock_without_exposing_secret() {
+        let mut headers = HashMap::new();
+        let url = url::Url::parse("https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic/invoke").unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        sign_aws_sigv4(
+            &mut headers,
+            &Method::POST,
+            &url,
+            br#"{"input":"hi"}"#,
+            "AKIDEXAMPLE",
+            "very-secret-key",
+            Some("session-token"),
+            "us-east-1",
+            "bedrock-runtime",
+            now,
+        )
+        .unwrap();
+        let auth = headers.get("Authorization").unwrap();
+        assert!(
+            auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260102/us-east-1/bedrock-runtime/aws4_request")
+        );
+        assert!(!auth.contains("very-secret-key"));
+        assert_eq!(headers.get("x-amz-date").map(String::as_str), Some("20260102T030405Z"));
+        assert_eq!(
+            headers.get("x-amz-security-token").map(String::as_str),
+            Some("session-token")
+        );
+    }
 
     #[test]
     fn agent_cannot_shadow_or_duplicate_the_credential_header() {
@@ -909,10 +1046,7 @@ mod tests {
 
         plugin.inject_credentials(&mut headers, &cred_data).unwrap();
 
-        assert_eq!(
-            headers.get("Authorization"),
-            Some(&"Bearer test-key-123".to_string())
-        );
+        assert_eq!(headers.get("Authorization"), Some(&"Bearer test-key-123".to_string()));
     }
 
     #[test]
@@ -1015,13 +1149,22 @@ mod tests {
         use std::net::{IpAddr, Ipv6Addr};
         // NAT64 64:ff9b::/96 embedding 169.254.169.254 -> blocked via recursion.
         let nat64 = Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe); // 169.254.169.254
-        assert!(HttpPlugin::is_private_ip(&IpAddr::V6(nat64)), "NAT64-embedded link-local must be blocked");
+        assert!(
+            HttpPlugin::is_private_ip(&IpAddr::V6(nat64)),
+            "NAT64-embedded link-local must be blocked"
+        );
         // 6to4 2002::/16 embedding 10.0.0.1 -> blocked.
         let v6to4 = Ipv6Addr::new(0x2002, 0x0a00, 0x0001, 0, 0, 0, 0, 0); // 10.0.0.1
-        assert!(HttpPlugin::is_private_ip(&IpAddr::V6(v6to4)), "6to4-embedded RFC1918 must be blocked");
+        assert!(
+            HttpPlugin::is_private_ip(&IpAddr::V6(v6to4)),
+            "6to4-embedded RFC1918 must be blocked"
+        );
         // NAT64 embedding a PUBLIC IPv4 (8.8.8.8) is allowed (no false positive).
         let nat64_pub = Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808);
-        assert!(!HttpPlugin::is_private_ip(&IpAddr::V6(nat64_pub)), "NAT64-embedded public IPv4 must be allowed");
+        assert!(
+            !HttpPlugin::is_private_ip(&IpAddr::V6(nat64_pub)),
+            "NAT64-embedded public IPv4 must be allowed"
+        );
     }
 
     #[test]
@@ -1097,7 +1240,9 @@ mod tests {
         assert!(HttpPlugin::is_private_ip(&"fc00::1".parse::<IpAddr>().unwrap()));
 
         // Public IPv6
-        assert!(!HttpPlugin::is_private_ip(&"2001:4860:4860::8888".parse::<IpAddr>().unwrap()));
+        assert!(!HttpPlugin::is_private_ip(
+            &"2001:4860:4860::8888".parse::<IpAddr>().unwrap()
+        ));
     }
 
     #[test]
