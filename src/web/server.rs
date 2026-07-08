@@ -407,6 +407,7 @@ impl WebServer {
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
 
         Ok(())
@@ -425,4 +426,44 @@ impl WebServer {
     pub fn auth_manager(&self) -> Arc<RwLock<AuthManager>> {
         self.app_state.auth_manager.clone()
     }
+}
+
+/// Wait for SIGTERM (unix) or Ctrl+C, whichever fires first, and return.
+///
+/// Feeds `axum::serve`'s `with_graceful_shutdown`: on k8s node drain / rolling
+/// update, the kubelet sends SIGTERM and then waits up to
+/// `terminationGracePeriod` (30s) before SIGKILL. Once this future resolves,
+/// axum stops accepting new connections but lets already-accepted ones finish —
+/// it does not abort in-flight request futures. That matters for the fail-closed
+/// vault write path: `FileStorage::locked_mutate` holds the cross-process fd-lock
+/// and does its encrypt + tmp-write + fsync + rename entirely synchronously
+/// (no internal `.await`), so once a request has entered it, graceful shutdown
+/// cannot observe or interrupt it mid-write — the write either hasn't started
+/// (and the request just finishes normally before shutdown proceeds) or runs to
+/// completion. There is no code path that leaves a half-written vault or a
+/// half-emitted outbox record as a result of this signal.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("shutdown signal received, draining in-flight requests");
 }
