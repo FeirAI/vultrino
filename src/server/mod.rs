@@ -1780,8 +1780,15 @@ impl VultrinoServer {
                 method,
                 // Re-bind the approved action so an ActionMatch rule re-fires
                 // correctly on resume (the approved action matches its own rule; a
-                // Deny pushed mid-flight still blocks).
-                action: Some(approval.action.as_str()),
+                // Deny pushed mid-flight still blocks). Present the ORIGINAL business
+                // verb (the action_label the requester presented, e.g. "telegram.send"),
+                // not the resolved canonical plugin action ("http.request"): the
+                // live-path eval at open matched on `request.action` (the label), and a
+                // connector policy's ActionMatch rule is keyed on that business verb.
+                // Using the canonical action here would fall through to default-deny for
+                // every label-mapped action after approval. Dispatch still uses the
+                // canonical `approval.action` (parse_action above).
+                action: Some(approval.action_label.as_deref().unwrap_or(approval.action.as_str())),
                 principal: principal.as_ref(),
                 spend: None,
             })
