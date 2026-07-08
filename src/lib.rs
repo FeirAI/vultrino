@@ -84,6 +84,9 @@ pub enum CredentialType {
     SshPassword,
     /// PostgreSQL connection credentials
     Postgres,
+    /// A secret substituted directly into the request URL (e.g. Telegram's
+    /// `bot<TOKEN>/sendMessage` path-embedded token) rather than a header.
+    UrlToken,
     /// Custom credential type
     Custom(String),
 }
@@ -101,6 +104,7 @@ impl std::fmt::Display for CredentialType {
             CredentialType::EcdsaKey => write!(f, "ecdsa_key"),
             CredentialType::SshPassword => write!(f, "ssh_password"),
             CredentialType::Postgres => write!(f, "postgres"),
+            CredentialType::UrlToken => write!(f, "url_token"),
             CredentialType::Custom(name) => write!(f, "custom:{}", name),
         }
     }
@@ -271,6 +275,15 @@ pub enum CredentialData {
         sslmode: String,
     },
 
+    /// A secret substituted directly into the request URL path rather than a
+    /// header (e.g. Telegram Bot API: `POST https://api.telegram.org/bot<TOKEN>/sendMessage`).
+    /// The http plugin replaces a literal `{credential}` placeholder in the
+    /// request URL with `token` and injects no auth header for this variant.
+    UrlToken {
+        /// The secret value substituted into the URL
+        token: Secret,
+    },
+
     /// Custom credential data
     Custom(HashMap<String, Secret>),
 }
@@ -367,6 +380,7 @@ impl CredentialData {
             }
             CredentialData::SshPassword { password, .. } => vec![z(password.expose().to_string())],
             CredentialData::Postgres { password, .. } => vec![z(password.expose().to_string())],
+            CredentialData::UrlToken { token } => vec![z(token.expose().to_string())],
             CredentialData::PrivateKey {
                 key_pem,
                 passphrase,
@@ -397,6 +411,7 @@ impl CredentialData {
             CredentialData::EcdsaKey { .. } => CredentialType::EcdsaKey,
             CredentialData::SshPassword { .. } => CredentialType::SshPassword,
             CredentialData::Postgres { .. } => CredentialType::Postgres,
+            CredentialData::UrlToken { .. } => CredentialType::UrlToken,
             CredentialData::Custom(_) => CredentialType::Custom("custom".to_string()),
         }
     }

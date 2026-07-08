@@ -4,6 +4,8 @@
 //! - API Key authentication (Bearer tokens, custom headers)
 //! - Basic Authentication
 //! - OAuth2 (token refresh, etc.)
+//! - URL-embedded tokens (secret substituted into the request path/query rather
+//!   than a header — e.g. Telegram's `bot<TOKEN>/sendMessage`)
 
 use super::{Plugin, PluginError, PluginRequest};
 use crate::{CredentialData, CredentialType, ExecuteResponse, Secret};
@@ -257,7 +259,9 @@ pub(crate) async fn read_body_capped(response: reqwest::Response) -> Result<Vec<
     let mut buf: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| PluginError::Http(e.to_string()))?;
+        // .without_url(): reqwest's Display embeds the request URL, which for a
+        // UrlToken credential contains the secret — never surface it in an error.
+        let chunk = chunk.map_err(|e| PluginError::Http(e.without_url().to_string()))?;
         if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
             return Err(PluginError::Http(format!(
                 "upstream response body exceeds the {MAX_RESPONSE_BYTES}-byte cap"
@@ -554,6 +558,58 @@ impl HttpPlugin {
         Ok(())
     }
 
+    /// Substitute the `{URL_TOKEN_PLACEHOLDER}` placeholder in a request URL with a
+    /// vault-held [`CredentialData::UrlToken`] secret (Telegram-style
+    /// `bot<TOKEN>/sendMessage` APIs that put the secret in the URL path rather than
+    /// a header — there is no header for the http plugin to inject it into). Fails
+    /// closed:
+    ///   - no placeholder present -> error. A `UrlToken` credential with nowhere to
+    ///     inject is a misconfiguration, not a silent unauthenticated request.
+    ///   - substitution changes the scheme or host -> error. The SSRF/url_glob
+    ///     policy checks run against the pre-substitution URL (the `{credential}`
+    ///     placeholder is inert to them); this guard makes sure the token itself
+    ///     can't smuggle a different origin past those checks (REVIEW).
+    ///
+    /// Runs on the raw URL *string*, before `url::Url::parse`: the parser
+    /// percent-encodes `{`/`}` (they're outside the path percent-encode set), so a
+    /// literal-substring match against an already-parsed URL would never find the
+    /// placeholder.
+    fn substitute_url_token(url_str: &str, token: &Secret) -> Result<String, PluginError> {
+        const PLACEHOLDER: &str = "{credential}";
+
+        if !url_str.contains(PLACEHOLDER) {
+            return Err(PluginError::InvalidParams(format!(
+                "UrlToken credential requires a '{}' placeholder in the request URL",
+                PLACEHOLDER
+            )));
+        }
+
+        // Parse the PRE-substitution URL first to capture the scheme/host the
+        // caller (and any upstream url_glob policy) actually approved. This parse
+        // is safe to log/echo in errors below — it never contains the token.
+        let before = url::Url::parse(url_str)
+            .map_err(|e| PluginError::InvalidParams(format!("Invalid URL: {}", e)))?;
+
+        let substituted = url_str.replace(PLACEHOLDER, token.expose());
+
+        // Re-parse the substituted URL to check it's still well-formed and to
+        // compare scheme/host — do NOT include the substituted string in any
+        // error here, it now contains the secret.
+        let after = url::Url::parse(&substituted).map_err(|_| {
+            PluginError::InvalidParams(
+                "URL is invalid after credential substitution".to_string(),
+            )
+        })?;
+
+        if after.scheme() != before.scheme() || after.host_str() != before.host_str() {
+            return Err(PluginError::InvalidParams(
+                "credential substitution altered the request scheme or host".to_string(),
+            ));
+        }
+
+        Ok(substituted)
+    }
+
     /// Check if an IP address is private/internal (SSRF protection). `pub(crate)` so
     /// every SSRF check (the connect-time resolver here, the HMAC plugin's literal
     /// guard, etc.) shares ONE classifier — including the IPv4-mapped-IPv6 case
@@ -680,9 +736,20 @@ impl HttpPlugin {
     /// drift from the buffered one and forget a guard.
     async fn prepare_request(
         &self,
-        params: HttpRequestParams,
+        mut params: HttpRequestParams,
         cred_data: &CredentialData,
     ) -> Result<(reqwest::RequestBuilder, Option<CredentialData>), PluginError> {
+        // UrlToken credentials substitute the secret into the URL PATH before
+        // anything else runs, so the SSRF host check just below (and the DNS-
+        // resolving SsrfGuardResolver at connect time) validate the REAL
+        // destination (e.g. api.telegram.org), not the `{credential}` placeholder.
+        // `substitute_url_token` itself guards against the substitution smuggling
+        // a different scheme/host past the checks that already ran on the
+        // placeholder URL (request-time url_glob policy, upstream of this plugin).
+        if let CredentialData::UrlToken { token } = cred_data {
+            params.url = Self::substitute_url_token(&params.url, token)?;
+        }
+
         // Validate URL for SSRF before proceeding
         let mut validated_url = Self::validate_url_ssrf(&params.url)?;
 
@@ -754,6 +821,8 @@ impl HttpPlugin {
                     Utc::now(),
                 )?;
             }
+            // The token was already substituted into the URL above; no header to set.
+            CredentialData::UrlToken { .. } => {}
             _ => self.inject_credentials(&mut headers, &effective_cred)?,
         }
 
@@ -807,7 +876,9 @@ impl HttpPlugin {
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
-            .map_err(|e| PluginError::Http(e.to_string()))?;
+            // .without_url(): see read_body_capped — the request URL may embed a
+            // UrlToken secret and reqwest's Display would otherwise echo it.
+            .map_err(|e| PluginError::Http(e.without_url().to_string()))?;
 
         // Extract response details
         let status = response.status().as_u16();
@@ -841,7 +912,9 @@ impl HttpPlugin {
         let response = request
             .send()
             .await
-            .map_err(|e| PluginError::Http(e.to_string()))?;
+            // .without_url(): see read_body_capped — the request URL may embed a
+            // UrlToken secret and reqwest's Display would otherwise echo it.
+            .map_err(|e| PluginError::Http(e.without_url().to_string()))?;
 
         let status = response.status().as_u16();
         let response_headers = collect_response_headers(response.headers());
@@ -851,7 +924,7 @@ impl HttpPlugin {
         // (it never reflects upstream detail to the agent). No body byte is buffered.
         let body = response
             .bytes_stream()
-            .map(|r| r.map_err(|e| PluginError::Http(e.to_string())));
+            .map(|r| r.map_err(|e| PluginError::Http(e.without_url().to_string())));
 
         Ok(crate::StreamingResponse {
             status,
@@ -923,6 +996,7 @@ impl Plugin for HttpPlugin {
             CredentialType::BasicAuth,
             CredentialType::OAuth2,
             CredentialType::AwsSigV4,
+            CredentialType::UrlToken,
         ]
     }
 
@@ -1198,6 +1272,96 @@ mod tests {
         // user:pass base64 encoded
         let expected = format!("Basic {}", STANDARD.encode("user:pass"));
         assert_eq!(headers.get("Authorization"), Some(&expected));
+    }
+
+    // UrlToken credential tests
+
+    #[test]
+    fn test_substitute_url_token_replaces_placeholder() {
+        let token = Secret::new("123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11");
+        let substituted = HttpPlugin::substitute_url_token(
+            "https://api.telegram.org/bot{credential}/sendMessage",
+            &token,
+        )
+        .unwrap();
+
+        assert_eq!(
+            substituted,
+            "https://api.telegram.org/bot123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11/sendMessage"
+        );
+        // Host must be exactly the pre-substitution host — the real target.
+        let url = url::Url::parse(&substituted).unwrap();
+        assert_eq!(url.host_str(), Some("api.telegram.org"));
+    }
+
+    #[test]
+    fn test_substitute_url_token_fails_closed_without_placeholder() {
+        let token = Secret::new("some-secret-token");
+        let result = HttpPlugin::substitute_url_token(
+            "https://api.telegram.org/sendMessage",
+            &token,
+        );
+        assert!(matches!(result, Err(PluginError::InvalidParams(_))));
+    }
+
+    #[test]
+    fn test_substitute_url_token_rejects_host_change() {
+        // Non-special schemes parse the host "opaque" (url crate: `{`/`}` are not
+        // forbidden opaque-host characters, unlike the strict domain validation
+        // http/https use), so a placeholder can legally sit inside the host here.
+        // Once the real token is substituted in, the host textually changes — the
+        // guard must reject that even though validate_url_ssrf (elsewhere) already
+        // restricts schemes to http/https; this proves the guard's own logic holds
+        // independent of that separate defense.
+        let token = Secret::new("evil.example.com");
+        let result =
+            HttpPlugin::substitute_url_token("myapp://api.{credential}/path", &token);
+        assert!(matches!(result, Err(PluginError::InvalidParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_request_url_token_substitutes_and_sets_no_header() {
+        let plugin = HttpPlugin::new();
+        let cred_data = CredentialData::UrlToken {
+            token: Secret::new("123456:ABC-DEF"),
+        };
+        let params = HttpRequestParams {
+            method: "POST".to_string(),
+            url: "https://api.telegram.org/bot{credential}/sendMessage".to_string(),
+            headers: HashMap::new(),
+            query: HashMap::new(),
+            body: None,
+        };
+
+        let (request_builder, _updated) =
+            plugin.prepare_request(params, &cred_data).await.unwrap();
+        let request = request_builder.build().unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.telegram.org/bot123456:ABC-DEF/sendMessage"
+        );
+        assert_eq!(request.url().host_str(), Some("api.telegram.org"));
+        // No auth header — the secret lives only in the URL for this credential type.
+        assert!(request.headers().get("Authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_request_url_token_fails_closed_without_placeholder() {
+        let plugin = HttpPlugin::new();
+        let cred_data = CredentialData::UrlToken {
+            token: Secret::new("123456:ABC-DEF"),
+        };
+        let params = HttpRequestParams {
+            method: "POST".to_string(),
+            url: "https://api.telegram.org/sendMessage".to_string(),
+            headers: HashMap::new(),
+            query: HashMap::new(),
+            body: None,
+        };
+
+        let result = plugin.prepare_request(params, &cred_data).await;
+        assert!(matches!(result, Err(PluginError::InvalidParams(_))));
     }
 
     // SSRF Protection Tests
