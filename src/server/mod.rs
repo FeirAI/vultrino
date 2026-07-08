@@ -900,6 +900,18 @@ impl VultrinoServer {
             let trusted_irreversible = self
                 .trusted_irreversible_for_action(&full_action, action_label.as_deref())
                 .await;
+            // Extract the capability's declared approval-preview fields from the
+            // SAME params that will execute (never a separate/mutable copy), so
+            // the approver sees exactly what will run. None when the backing
+            // capability declares no `approval_preview` spec (unchanged fallback
+            // to `summary`).
+            let preview = self
+                .approval_preview_for_action(
+                    &full_action,
+                    action_label.as_deref(),
+                    &request.params,
+                )
+                .await;
             let (mut approval, decision_token) = ApprovalRequest::open(NewApproval {
                 credential: credential.alias.clone(),
                 action: full_action.clone(),
@@ -912,6 +924,7 @@ impl VultrinoServer {
                 tenant: principal_tenant.clone(),
                 // R6: snapshot the resolved workload identity for resume re-eval.
                 workload_id: principal.as_ref().and_then(|p| p.workload_id.clone()),
+                preview,
                 action_label: action_label.clone(),
                 dual_control,
                 criticality,
@@ -2236,6 +2249,52 @@ impl VultrinoServer {
             .any(|cap| crate::approval::reversibility_requires_human_floor(&cap.reversibility))
     }
 
+    /// Extract the approval-preview VALUES for an action being gated, if its
+    /// backing capability declares an `approval_preview` spec. Looks up the
+    /// capability the SAME way [`Self::trusted_irreversible_for_action`] does
+    /// (prefer an exact `action_label` match, else the first capability whose
+    /// resolved canonical action matches). Returns `None` when no matching
+    /// capability is found, or it has no `approval_preview` spec — the caller
+    /// then falls back to the existing `summary` line, unchanged.
+    ///
+    /// SECURITY: `params` must be the SAME params that will execute (not a
+    /// separate/mutable copy) — the approver must see what will actually run.
+    async fn approval_preview_for_action(
+        &self,
+        canonical_action: &str,
+        action_label: Option<&str>,
+        params: &serde_json::Value,
+    ) -> Option<crate::capability::ApprovalPreview> {
+        let _ = self.storage.reload().await;
+        let caps = match self.storage.list_capabilities().await {
+            Ok(caps) => caps,
+            Err(error) => {
+                tracing::error!(%error, "capability lookup failed while deriving approval preview");
+                return None;
+            }
+        };
+
+        if let Some(label) = action_label.map(str::trim).filter(|s| !s.is_empty()) {
+            let exact = caps.iter().find(|cap| {
+                let (_, configured_label) = self.config.resolve_action(&cap.action);
+                cap.action.trim() == label || configured_label.as_deref() == Some(label)
+            });
+            if let Some(cap) = exact {
+                return cap
+                    .approval_preview
+                    .as_ref()
+                    .map(|spec| crate::capability::extract_preview(spec, params));
+            }
+        }
+
+        let cap = caps
+            .iter()
+            .find(|cap| self.config.resolve_action(&cap.action).0 == canonical_action)?;
+        cap.approval_preview
+            .as_ref()
+            .map(|spec| crate::capability::extract_preview(spec, params))
+    }
+
     /// List the capabilities a principal is permitted to see (connector M1). The
     /// MCP server turns each into a named tool. Storage is reloaded first so a
     /// capability created via the admin API (another process) is visible.
@@ -2966,6 +3025,7 @@ mod tests {
                     input_schema: serde_json::json!({}),
                     reversibility: reversibility.to_string(),
                     llm: None,
+                    approval_preview: None,
                 })
                 .await
                 .unwrap();

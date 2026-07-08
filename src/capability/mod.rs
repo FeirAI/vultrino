@@ -94,6 +94,12 @@ pub struct Capability {
     /// token spend (V13) on the response. See [`Capability::is_llm_proxy`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmProxy>,
+    /// Optional per-capability approval-preview SPEC: which `params` fields an
+    /// approver should see (action-type-specific), extracted fresh at each
+    /// approval-open by [`extract_preview`]. `None` = today's behavior unchanged
+    /// (the approver sees only the generic `summarize()` one-liner).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_preview: Option<ApprovalPreviewSpec>,
 }
 
 /// LLM-proxy configuration on a [`Capability`] (connector M1, decision 5).
@@ -140,6 +146,116 @@ pub struct LlmProxy {
 
 fn default_llm_protocol() -> String {
     "openai-chat".to_string()
+}
+
+/// Operator-declared approval-preview SPEC on a [`Capability`]: which fields of
+/// the request `params` an approver should see when this capability's action is
+/// gated on human approval, instead of just the generic `summarize()` one-liner
+/// (or a raw params dump, which is never exposed — see [`ApprovalPreview`]).
+///
+/// This is config, not data: it names *paths*, not values. The values are
+/// extracted at approval-open time by [`extract_preview`] from the SAME `params`
+/// that will execute, so the approver sees exactly what will run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalPreviewSpec {
+    /// Optional heading shown above the extracted fields (e.g. "Telegram message").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Fields to extract from `params`, in display order.
+    #[serde(default)]
+    pub fields: Vec<PreviewFieldSpec>,
+}
+
+/// One field the approval preview extracts: a display `label` and a dot `path`
+/// into the request `params` (e.g. `body.chat_id` -> `params["body"]["chat_id"]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewFieldSpec {
+    pub label: String,
+    pub path: String,
+    /// Display hint: `"text"` (wrapped block, e.g. a message body) or `"inline"`
+    /// (default). Purely a UI hint — extraction behavior is identical either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
+/// Extracted approval-preview VALUES, computed by [`extract_preview`] from a live
+/// `params` blob at approval-open time. This — never the raw `params`, never the
+/// credential — is what an approval's JSON projection exposes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalPreview {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub fields: Vec<PreviewField>,
+}
+
+/// One extracted preview field: a label plus its coerced display value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewField {
+    pub label: String,
+    pub value: String,
+    #[serde(default = "default_preview_format")]
+    pub format: String,
+}
+
+fn default_preview_format() -> String {
+    "inline".to_string()
+}
+
+/// Walk a dot path (e.g. `"body.chat_id"`) into a JSON object, returning the leaf
+/// value if every segment resolves to an object key. Never descends into arrays
+/// or any structure not named by the path.
+fn dot_path_get<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        current = current.as_object()?.get(segment)?;
+    }
+    Some(current)
+}
+
+/// Coerce a JSON leaf value to its display string per the wire contract: a JSON
+/// string as-is, a number/bool via `to_string`, and `null`/missing/anything else
+/// (object/array — the spec only names leaf paths) skipped (`None`).
+fn coerce_preview_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Null => None,
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => None,
+    }
+}
+
+/// Extract an [`ApprovalPreview`]'s VALUES from a live `params` blob per a
+/// capability's declared [`ApprovalPreviewSpec`]. Pure and total: a missing or
+/// null leaf, or a path through a non-object, is silently skipped (not an
+/// error) — only fields the spec names are ever read, and only those that
+/// resolve to a scalar are ever emitted. This is the SOLE way preview values
+/// reach an approval; the raw `params` is never otherwise exposed.
+pub fn extract_preview(spec: &ApprovalPreviewSpec, params: &serde_json::Value) -> ApprovalPreview {
+    let fields = spec
+        .fields
+        .iter()
+        .filter_map(|field_spec| {
+            let value = dot_path_get(params, &field_spec.path)?;
+            let display = coerce_preview_value(value)?;
+            Some(PreviewField {
+                label: field_spec.label.clone(),
+                value: display,
+                format: field_spec
+                    .format
+                    .clone()
+                    .unwrap_or_else(default_preview_format),
+            })
+        })
+        .collect();
+    ApprovalPreview {
+        title: spec.title.clone(),
+        fields,
+    }
 }
 
 impl Default for LlmProxy {
@@ -433,6 +549,8 @@ pub struct CapabilityMetadata {
     pub input_schema: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmProxy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_preview: Option<ApprovalPreviewSpec>,
 }
 
 impl From<&Capability> for CapabilityMetadata {
@@ -447,6 +565,7 @@ impl From<&Capability> for CapabilityMetadata {
             credential_ref: c.credential_ref.clone(),
             input_schema: c.input_schema.clone(),
             llm: c.llm.clone(),
+            approval_preview: c.approval_preview.clone(),
         }
     }
 }
@@ -547,6 +666,7 @@ mod tests {
             }),
             reversibility: "reversible".to_string(),
             llm: None,
+            approval_preview: None,
         }
     }
 
@@ -893,5 +1013,140 @@ mod tests {
         let params = build_action_params(&c, "postgres", &args);
         assert_eq!(params["sql"], "SELECT 1");
         assert_eq!(params["database"], "prod");
+    }
+
+    // ---- extract_preview ----
+
+    #[test]
+    fn test_extract_preview_dot_path_into_nested_body() {
+        let spec = ApprovalPreviewSpec {
+            title: Some("Telegram message".to_string()),
+            fields: vec![
+                PreviewFieldSpec {
+                    label: "To (chat)".to_string(),
+                    path: "body.chat_id".to_string(),
+                    format: None,
+                },
+                PreviewFieldSpec {
+                    label: "Message".to_string(),
+                    path: "body.text".to_string(),
+                    format: Some("text".to_string()),
+                },
+            ],
+        };
+        let params = serde_json::json!({
+            "method": "POST",
+            "url": "https://api.telegram.org/bot123/sendMessage",
+            "body": { "chat_id": "7647924153", "text": "hello there" }
+        });
+        let preview = extract_preview(&spec, &params);
+        assert_eq!(preview.title.as_deref(), Some("Telegram message"));
+        assert_eq!(preview.fields.len(), 2);
+        assert_eq!(preview.fields[0].label, "To (chat)");
+        assert_eq!(preview.fields[0].value, "7647924153");
+        assert_eq!(preview.fields[0].format, "inline"); // default
+        assert_eq!(preview.fields[1].label, "Message");
+        assert_eq!(preview.fields[1].value, "hello there");
+        assert_eq!(preview.fields[1].format, "text");
+    }
+
+    #[test]
+    fn test_extract_preview_coerces_number_and_bool() {
+        let spec = ApprovalPreviewSpec {
+            title: None,
+            fields: vec![
+                PreviewFieldSpec {
+                    label: "Amount".to_string(),
+                    path: "body.amount".to_string(),
+                    format: None,
+                },
+                PreviewFieldSpec {
+                    label: "Urgent".to_string(),
+                    path: "body.urgent".to_string(),
+                    format: None,
+                },
+            ],
+        };
+        let params = serde_json::json!({ "body": { "amount": 42, "urgent": true } });
+        let preview = extract_preview(&spec, &params);
+        assert_eq!(preview.fields[0].value, "42");
+        assert_eq!(preview.fields[1].value, "true");
+    }
+
+    #[test]
+    fn test_extract_preview_skips_missing_or_null_field() {
+        let spec = ApprovalPreviewSpec {
+            title: None,
+            fields: vec![
+                PreviewFieldSpec {
+                    label: "Present".to_string(),
+                    path: "body.text".to_string(),
+                    format: None,
+                },
+                PreviewFieldSpec {
+                    label: "Missing".to_string(),
+                    path: "body.nonexistent".to_string(),
+                    format: None,
+                },
+                PreviewFieldSpec {
+                    label: "Null".to_string(),
+                    path: "body.nothing".to_string(),
+                    format: None,
+                },
+            ],
+        };
+        let params = serde_json::json!({ "body": { "text": "hi", "nothing": null } });
+        let preview = extract_preview(&spec, &params);
+        // Only the present, non-null field survives.
+        assert_eq!(preview.fields.len(), 1);
+        assert_eq!(preview.fields[0].label, "Present");
+        assert_eq!(preview.fields[0].value, "hi");
+    }
+
+    #[test]
+    fn test_extract_preview_only_emits_declared_fields() {
+        // params carries far more than the spec names (including a nested object
+        // and an array) — extract_preview must emit ONLY the declared paths and
+        // must never descend into / surface anything else (e.g. secrets sitting
+        // alongside the declared fields in `params`).
+        let spec = ApprovalPreviewSpec {
+            title: None,
+            fields: vec![PreviewFieldSpec {
+                label: "To".to_string(),
+                path: "body.to".to_string(),
+                format: None,
+            }],
+        };
+        let params = serde_json::json!({
+            "method": "POST",
+            "url": "https://api.example.com/send",
+            "headers": { "Authorization": "Bearer super-secret" },
+            "body": {
+                "to": "a@b.com",
+                "cc": ["x@y.com"],
+                "metadata": { "internal_id": "should-not-leak" }
+            }
+        });
+        let preview = extract_preview(&spec, &params);
+        assert_eq!(preview.fields.len(), 1);
+        assert_eq!(preview.fields[0].label, "To");
+        assert_eq!(preview.fields[0].value, "a@b.com");
+    }
+
+    #[test]
+    fn test_extract_preview_path_through_non_object_is_skipped() {
+        // A path that walks through a scalar or array (not an object) must be
+        // skipped rather than panicking.
+        let spec = ApprovalPreviewSpec {
+            title: None,
+            fields: vec![PreviewFieldSpec {
+                label: "Bad".to_string(),
+                path: "body.to.nested".to_string(),
+                format: None,
+            }],
+        };
+        let params = serde_json::json!({ "body": { "to": "a@b.com" } });
+        let preview = extract_preview(&spec, &params);
+        assert!(preview.fields.is_empty());
     }
 }

@@ -1783,6 +1783,7 @@ mod tests {
                 agent_label: None,
                 tenant: tenant.map(str::to_string),
                 workload_id: None,
+                preview: None,
                 action_label: None,
                 dual_control: false,
                 criticality: CriticalityClass::Medium,

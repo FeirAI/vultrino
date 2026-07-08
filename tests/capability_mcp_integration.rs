@@ -70,6 +70,7 @@ async fn register_capability(
         }),
         reversibility: "reversible".to_string(),
         llm: None,
+        approval_preview: None,
     };
     storage.store_capability(&cap).await.unwrap();
     cap
@@ -329,6 +330,7 @@ async fn allowed_tools_call_reaches_execute_past_policy() {
         input_schema: serde_json::json!({ "type": "object", "properties": {} }),
         reversibility: "reversible".to_string(),
         llm: None,
+        approval_preview: None,
     };
     storage.store_capability(&cap).await.unwrap();
     let token = mint_token(&storage, "cred-*", Some("http.request")).await;
@@ -416,6 +418,7 @@ async fn capability_tool_output_does_not_leak_secret() {
         input_schema: serde_json::json!({ "type": "object", "properties": {} }),
         reversibility: "reversible".to_string(),
         llm: None,
+        approval_preview: None,
     };
     storage.store_capability(&cap).await.unwrap();
     let token = mint_token(&storage, "cred-*", Some("http.request")).await;

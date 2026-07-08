@@ -324,6 +324,7 @@ async fn register_llm_capability_models(
             max_output_tokens: None,
             ..Default::default()
         }),
+        approval_preview: None,
     };
     cap.validate().unwrap();
     storage.store_capability(&cap).await.unwrap();
@@ -591,6 +592,7 @@ async fn llm_streamed_max_output_tokens_ceiling_clamps_the_forwarded_request() {
             max_output_tokens: Some(1000),
             ..Default::default()
         }),
+        approval_preview: None,
     };
     cap.validate().unwrap();
     storage.store_capability(&cap).await.unwrap();
@@ -905,6 +907,7 @@ async fn llm_max_output_tokens_ceiling_clamps_the_forwarded_request() {
             max_output_tokens: Some(1000),
             ..Default::default()
         }),
+        approval_preview: None,
     };
     cap.validate().unwrap();
     storage.store_capability(&cap).await.unwrap();

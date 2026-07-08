@@ -3699,6 +3699,7 @@ async fn test_v11_approvals_are_tenant_scoped() {
         agent_label: None,
         tenant: None,
         workload_id: None,
+        preview: None,
         action_label: None,
         dual_control: false,
         criticality: vultrino::approval::CriticalityClass::Medium,

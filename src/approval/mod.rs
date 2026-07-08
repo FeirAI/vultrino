@@ -235,6 +235,11 @@ pub struct NewApproval {
     /// Resolved workload-identity subject of the opener (V10/R6), snapshotted so a
     /// `principal_pattern` Deny targeting an SVID/OIDC subject re-fires on resume.
     pub workload_id: Option<String>,
+    /// Per-capability approval preview, extracted at open time from the SAME
+    /// `params` above per the backing capability's `approval_preview` spec (if
+    /// any). `None` when the capability declares no spec — the approver falls
+    /// back to `summary`.
+    pub preview: Option<crate::capability::ApprovalPreview>,
 }
 
 fn default_approver_kind() -> String {
@@ -352,6 +357,14 @@ pub struct ApprovalRequest {
     /// resumes (the resume principal carries it as a match dimension).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_id: Option<String>,
+    /// Extracted approval-preview VALUES (action-type-specific fields, e.g. a
+    /// Telegram message's `text` + `chat_id`), computed once at open time from
+    /// the executing `params` per the backing capability's declared spec.
+    /// Exposes ONLY the declared field values — never the raw `params`, never
+    /// the credential. `None` when the capability declares no
+    /// `approval_preview` (unchanged fallback to `summary`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<crate::capability::ApprovalPreview>,
     /// govder business-verb label for the action (V8), shown to the approver
     /// instead of the canonical `plugin.action` when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -463,6 +476,7 @@ impl ApprovalRequest {
             agent_label: params.agent_label,
             tenant: params.tenant,
             workload_id: params.workload_id,
+            preview: params.preview,
             action_label: params.action_label,
             dual_control: params.dual_control,
             required_approvals: params.required_approvals.max(1),
@@ -1328,6 +1342,7 @@ mod tests {
             agent_label: None,
             tenant: None,
             workload_id: None,
+            preview: None,
             action_label: None,
             dual_control: false,
             criticality: CriticalityClass::Medium,

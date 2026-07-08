@@ -126,6 +126,7 @@ async fn register_send_email(storage: &Arc<dyn StorageBackend>, credential_ref: 
         }),
         reversibility: "reversible".to_string(),
         llm: None,
+        approval_preview: None,
     };
     storage.store_capability(&cap).await.unwrap();
 }
@@ -411,6 +412,7 @@ async fn http_tools_call_runs_enforced_path() {
         input_schema: serde_json::json!({ "type": "object", "properties": {} }),
         reversibility: "reversible".to_string(),
         llm: None,
+        approval_preview: None,
     };
     storage.store_capability(&cap).await.unwrap();
     let token = mint_token(&storage, "cred-*", Some("http.request"), None, None).await;

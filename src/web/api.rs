@@ -501,6 +501,14 @@ pub struct ApprovalSummary {
     /// delegate-decide path does (`approval::approval_irreversible`). Always
     /// emitted so consumers get a stable shape.
     pub irreversible: bool,
+    /// Action-type-specific approval preview (e.g. a Telegram message's `text` +
+    /// `chat_id`), extracted at open time per the backing capability's declared
+    /// `approval_preview` spec. Exposes ONLY the declared field VALUES — never
+    /// the raw `params` (deliberately withheld from this projection) and never
+    /// the credential. `None` when the capability declares no spec; a product
+    /// aggregator then falls back to `summary` (unchanged today's behavior).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<crate::capability::ApprovalPreview>,
 }
 
 impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
@@ -539,6 +547,7 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
             veto_until: a.delegate_veto_until.map(|t| t.to_rfc3339()),
             risk_tier: a.criticality.to_govder_risk_tier().to_string(),
             irreversible: crate::approval::approval_irreversible(a),
+            preview: a.preview.clone(),
         }
     }
 }
@@ -1596,6 +1605,11 @@ pub struct CapabilityUpsertRequest {
     /// than appearing as a named MCP tool). Carries the provider base URL.
     #[serde(default)]
     pub llm: Option<crate::capability::LlmProxy>,
+    /// Optional approval-preview spec: which `params` fields an approver should
+    /// see (action-type-specific) when this capability's action is gated on
+    /// human approval. `None` = unchanged fallback to the generic summary line.
+    #[serde(default)]
+    pub approval_preview: Option<crate::capability::ApprovalPreviewSpec>,
 }
 
 /// Build a validated `Capability` from a request, forcing the id on PUT or
@@ -1624,6 +1638,7 @@ fn build_capability(
             .unwrap_or("reversible")
             .to_string(),
         llm: req.llm,
+        approval_preview: req.approval_preview,
     };
     capability.validate()?;
     Ok(capability)
@@ -2983,6 +2998,7 @@ mod tests {
             required_approvals: 1,
             tenant: Some("acme".to_string()),
             workload_id: None,
+            preview: None,
         });
         approval
     }
