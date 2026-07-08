@@ -210,8 +210,10 @@ impl HmacPlugin {
                 .body(body);
         }
 
-        // Execute request
+        // Execute request. Per-request read timeout (the shared client only carries a
+        // connect_timeout, kept stream-safe); the HMAC path never streams.
         let response = request
+            .timeout(super::REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|e| PluginError::Http(e.to_string()))?;
@@ -228,11 +230,7 @@ impl HmacPlugin {
             })
             .collect();
 
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| PluginError::Http(e.to_string()))?
-            .to_vec();
+        let body = super::read_body_capped(response).await?;
 
         Ok(ExecuteResponse {
             status,

@@ -152,9 +152,13 @@ impl WasmtimeRuntime {
 
     /// Create a store with WASI context
     fn create_store(&self) -> Store<WasmState> {
-        let wasi = wasmtime_wasi::WasiCtxBuilder::new()
-            .inherit_stdio()
-            .build_p1();
+        // Deliberately NOT inherit_stdio(): in MCP-over-stdio mode the host's
+        // stdin/stdout IS the JSON-RPC channel to the agent, so a plugin holding the
+        // real fds could read/inject agent protocol messages or leak a decrypted
+        // credential. With nothing set, WASI stdin reads empty and stdout/stderr are
+        // discarded; plugins exchange data only through the host-function/memory
+        // interface, never stdio. (H4, ported from fix/agent-boundary-hardening.)
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new().build_p1();
 
         let limits = StoreLimitsBuilder::new()
             .memory_size(MAX_WASM_MEMORY_BYTES)

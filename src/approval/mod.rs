@@ -1111,6 +1111,11 @@ pub fn build_notifiers(cfg: &ApprovalConfig) -> Vec<std::sync::Arc<dyn ApprovalN
 fn approval_notifier_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // Bound both connect and total time: a stalled Telegram/webhook endpoint
+        // must never hang an approval-decision notification. This client never
+        // streams. (timeouts, ported from fix/agent-boundary-hardening.)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("Failed to build approval notifier client")
 }

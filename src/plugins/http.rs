@@ -215,13 +215,57 @@ const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
 ///   - dns_resolver(SsrfGuardResolver): filters the CONNECT-time resolution to public
 ///     IPs only, closing the DNS-rebinding TOCTOU that the request-time
 ///     validate_url_ssrf cannot (the host re-resolves at connect). (Codex #12b.)
+///   - connect_timeout: bound only connection ESTABLISHMENT, never the whole
+///     request — a total client `.timeout()` here would also kill the long-lived
+///     SSE streaming path (`execute_request_streaming`), which shares this client.
+///     The buffered path applies its own total read timeout per request instead.
+///     (H4/timeouts, ported from fix/agent-boundary-hardening, streaming-reconciled.)
 pub(crate) fn build_guarded_client() -> Client {
     Client::builder()
         .user_agent("vultrino/0.1.0")
         .redirect(reqwest::redirect::Policy::none())
         .dns_resolver(std::sync::Arc::new(SsrfGuardResolver))
+        .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .expect("Failed to create HTTP client")
+}
+
+/// Total read timeout for a BUFFERED outbound request (applied per-request so it
+/// never touches the streaming path, whose connections are intentionally long-lived).
+pub(crate) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Connection-establishment timeout for every guarded client (safe for streaming —
+/// it bounds only the TCP/TLS connect, not the stream lifetime).
+pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Hard cap on a BUFFERED response body read into memory. The in-path proxy holds
+/// the fd-lock while it reads; an unbounded upstream body could OOM it. The streaming
+/// path is not buffered (it is metered chunk-by-chunk by the server's usage tap).
+pub(crate) const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// read_body_capped reads a buffered response body but refuses to buffer more than
+/// [`MAX_RESPONSE_BYTES`], failing closed (an oversize / unbounded-chunked upstream
+/// cannot OOM the in-path proxy). A declared oversize Content-Length is rejected up
+/// front; a lying/chunked upstream is caught while streaming the bytes.
+pub(crate) async fn read_body_capped(response: reqwest::Response) -> Result<Vec<u8>, PluginError> {
+    use futures::StreamExt;
+    if let Some(len) = response.content_length() {
+        if len as usize > MAX_RESPONSE_BYTES {
+            return Err(PluginError::Http(format!(
+                "upstream response body {len} bytes exceeds the {MAX_RESPONSE_BYTES}-byte cap"
+            )));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| PluginError::Http(e.to_string()))?;
+        if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(PluginError::Http(format!(
+                "upstream response body exceeds the {MAX_RESPONSE_BYTES}-byte cap"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 impl HttpPlugin {
@@ -756,8 +800,11 @@ impl HttpPlugin {
     ) -> Result<ExecuteResponse, PluginError> {
         let (request, updated_credential) = self.prepare_request(params, cred_data).await?;
 
-        // Execute request
+        // Execute request. The total read timeout is applied PER-REQUEST here (not on
+        // the shared client) so it bounds this buffered call without truncating the
+        // long-lived SSE streaming path, which shares the same client.
         let response = request
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|e| PluginError::Http(e.to_string()))?;
@@ -766,11 +813,7 @@ impl HttpPlugin {
         let status = response.status().as_u16();
         let response_headers = collect_response_headers(response.headers());
 
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| PluginError::Http(e.to_string()))?
-            .to_vec();
+        let body = read_body_capped(response).await?;
 
         Ok(ExecuteResponse {
             status,
@@ -967,6 +1010,29 @@ impl Plugin for HttpPlugin {
 mod tests {
     use super::*;
     use crate::Secret;
+
+    fn resp_with_body(body: Vec<u8>) -> reqwest::Response {
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_allows_within_limit() {
+        let body = vec![7u8; 4096];
+        let got = read_body_capped(resp_with_body(body.clone())).await.unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_rejects_oversize_declared_length() {
+        // http::Response sets Content-Length from the body, so an over-cap body is
+        // rejected up front via the content_length pre-check.
+        let body = vec![0u8; MAX_RESPONSE_BYTES + 1];
+        let err = read_body_capped(resp_with_body(body)).await.unwrap_err();
+        assert!(
+            format!("{err:?}").contains("cap"),
+            "want a cap-exceeded error, got {err:?}"
+        );
+    }
 
     #[test]
     fn aws_sigv4_signs_bedrock_without_exposing_secret() {
