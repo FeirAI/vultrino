@@ -454,6 +454,11 @@ enum KeyCommands {
         /// Expiration duration (e.g., "30d", "24h", "never")
         #[arg(short, long, default_value = "never")]
         expires: String,
+
+        /// Bind the key to a tenant (V11). Required for the per-tenant JSON surfaces
+        /// (approvals list/decide, metrics); omit for a global admin key.
+        #[arg(short, long)]
+        tenant: Option<String>,
     },
 
     /// List all API keys
@@ -668,8 +673,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 name,
                 role,
                 expires,
+                tenant,
             } => {
-                create_api_key(config, name, role, expires).await?;
+                create_api_key(config, name, role, expires, tenant).await?;
             }
             KeyCommands::List { format } => {
                 list_api_keys(config, format).await?;
@@ -1892,6 +1898,7 @@ async fn create_api_key(
     name: String,
     role: String,
     expires: String,
+    tenant: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
 
@@ -1914,7 +1921,7 @@ async fn create_api_key(
 
     // Create the key
     let (full_key, api_key) = auth_manager
-        .create_api_key(&name, &role, expires_in)
+        .create_api_key_scoped(&name, &role, expires_in, tenant.clone())
         .map_err(|e| format!("Failed to create API key: {}", e))?;
 
     // Store the key
@@ -1926,6 +1933,10 @@ async fn create_api_key(
     println!("Name:    {}", api_key.name);
     println!("ID:      {}", api_key.id);
     println!("Role:    {}", role);
+    match api_key.tenant.as_deref() {
+        Some(t) => println!("Tenant:  {} (tenant-scoped)", t),
+        None => println!("Tenant:  <global>"),
+    }
     if let Some(expires_at) = api_key.expires_at {
         println!("Expires: {}", expires_at.format("%Y-%m-%d %H:%M:%S UTC"));
     } else {

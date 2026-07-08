@@ -239,6 +239,20 @@ impl AuthManager {
         role_name: &str,
         expires_in: Option<Duration>,
     ) -> AuthResult<(String, ApiKey)> {
+        self.create_api_key_scoped(name, role_name, expires_in, None)
+    }
+
+    /// Like [`Self::create_api_key`] but binds the key to a tenant (V11). A
+    /// tenant-scoped admin key is required for the per-tenant JSON surfaces
+    /// (approvals list/decide, metrics); a `None` tenant is a global admin key
+    /// (the HTML console surface). Used by `key create --tenant`.
+    pub fn create_api_key_scoped(
+        &self,
+        name: impl Into<String>,
+        role_name: &str,
+        expires_in: Option<Duration>,
+        tenant: Option<String>,
+    ) -> AuthResult<(String, ApiKey)> {
         // Validate role exists
         let role = self
             .get_role(role_name)
@@ -260,7 +274,7 @@ impl AuthManager {
             last_used_at: None,
             agent_label: None,
             owner_identity: None,
-            tenant: None,
+            tenant: tenant.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
             workload_id: None,
         };
 
