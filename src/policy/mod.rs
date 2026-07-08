@@ -992,6 +992,60 @@ mod tests {
         assert_eq!(engine.evaluate_full(&input2), PolicyDecision::Allow);
     }
 
+    // Regression guard for the resume_approved fix (server/mod.rs): a connector
+    // capability's grant policy rule is keyed on the BUSINESS VERB (e.g.
+    // "telegram.send"), but the approval record stores the RESOLVED canonical action
+    // ("http.request", via action_labels). On resume the fix re-presents the verb
+    // (approval.action_label); presenting the canonical action instead (the pre-fix
+    // bug) falls through to default-deny AFTER a human already approved. This asserts
+    // the load-bearing semantic: the verb matches the connector ActionMatch rule; the
+    // canonical action does not — so the resume MUST present the label.
+    #[test]
+    fn connector_rule_matches_business_verb_not_canonical_action() {
+        let engine = PolicyEngine::new();
+        engine.set_default_deny(true);
+        engine.add_policy(Policy {
+            id: "1".to_string(),
+            name: "govder-ep-demo-l3".to_string(),
+            credential_pattern: "cred-telegram".to_string(),
+            principal_pattern: None,
+            rules: vec![PolicyRule {
+                condition: PolicyCondition::And(vec![
+                    PolicyCondition::ActionMatch("telegram.send".to_string()),
+                    PolicyCondition::UrlMatch("https://api.telegram.org/*".to_string()),
+                    PolicyCondition::MethodMatch(vec!["POST".to_string()]),
+                ]),
+                action: PolicyAction::Allow,
+            }],
+            default_action: PolicyAction::Deny,
+            kill: false,
+        });
+        let mk = |action: &'static str| EvalInput {
+            credential_alias: "cred-telegram",
+            url: Some("https://api.telegram.org/bot123:ABC/sendMessage"),
+            method: Some("POST"),
+            action: Some(action),
+            principal: None,
+            spend: None,
+        };
+        // The business verb — what resume_approved now re-presents via action_label — matches.
+        assert!(
+            !matches!(
+                engine.evaluate_readonly_full(&mk("telegram.send")),
+                PolicyDecision::Deny(_)
+            ),
+            "connector rule must match the business verb the resume presents",
+        );
+        // The canonical resolved action — the pre-fix bug — matches no rule -> default deny.
+        assert!(
+            matches!(
+                engine.evaluate_readonly_full(&mk("http.request")),
+                PolicyDecision::Deny(_)
+            ),
+            "canonical action must NOT match the verb-keyed rule (why the resume must present the label)",
+        );
+    }
+
     #[test]
     fn test_url_pattern_matching() {
         let engine = PolicyEngine::new();
