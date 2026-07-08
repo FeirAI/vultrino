@@ -102,8 +102,12 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 - Incremental `redact_patterns` regex on the streaming path (arbitrary regex can't
   be applied correctly at a chunk boundary, so such capabilities are served
   buffered — see the streamed-metering residual above).
-- GET `/v1/models`, inbound query-string forwarding, and provider selection by the
-  request `model` field on the LLM proxy (one key → one provider stays canonical).
+- GET `/v1/models` and provider selection by the request `model` field on the LLM
+  proxy (one key → one provider stays canonical; an explicit `/llm/channels/{channel}`
+  route already covers deliberate cross-provider fallback). Inbound provider
+  query parameters (e.g. Azure OpenAI's `api-version`) **are** forwarded — appended
+  onto the capability-fixed upstream URL, with credential-like keys (`key`,
+  `api_key`, `access_token`, `sig`, …) rejected so a query can't smuggle a credential.
 - An in-path zero-overshoot hard token ceiling.
 - Keychain and HashiCorp Vault storage backends.
 - Outbox push fan-out (today a single push subscriber; additional consumers poll).

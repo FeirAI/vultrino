@@ -71,6 +71,26 @@ The admin API is a complete runtime control surface for your own control logic:
 push/replace/delete policies, mint/revoke use tokens, halt/unhalt an agent, read
 metrics. All hot-reload without a restart.
 
+### 7. Route model traffic through the metered LLM proxy (optional)
+
+For an OpenAI-compatible harness, point its model `base_url` at Vultrino's
+`POST /llm` and give it the same `vut_`/`vk_` bearer it uses for `/mcp`. The
+provider key stays in the vault, the request runs through the same enforced path as
+a named tool (policy, single-use consumption, egress scrub), and token spend is
+metered (V13). Enable the capability's provider family with its
+`VULTRINO_PROVIDER_*_ENABLED` switch (default-deny), and — for a streamed turn —
+leave `[llm_proxy] streaming_enabled` on (the default) to forward SSE incrementally.
+See [API.md](API.md) and [CONFIGURATION.md](CONFIGURATION.md).
+
+For a **framework-native runtime** that authenticates by a signed workload
+assertion rather than a pre-minted token, enable the exchange
+(`VULTRINO_WORKLOAD_EXCHANGE_ENABLED` + a ≥32-byte
+`VULTRINO_WORKLOAD_ASSERTION_SECRET`), author a grant template per agent
+(`PUT /api/v1/workload-grants/{agent}`), and have the runtime call
+`POST /api/v1/workload/exchange` with its `vwa_` assertion to mint the short-lived
+MCP + model tokens. The runtime can hold a non-consuming liveness lease via
+`GET /api/v1/runtime/control` so a revoke/expiry/halt tears its work down.
+
 ## Cross-plane composition (optional)
 
 > The combined four-plane OS (govder decides · vultrino enforces · averin proves ·

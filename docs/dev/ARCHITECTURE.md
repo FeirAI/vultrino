@@ -205,7 +205,42 @@ Self-approval (separation of duty) is recorded and, if
 The label must be a literal identifier (`[A-Za-z0-9._-]`, ≤128) — never a glob —
 so a halt can't accidentally deny a whole fleet. An `agent.halted` event is
 emitted. `DELETE …/halt` lifts the kill policy; already-revoked tokens stay
-revoked (mint fresh tokens to resume).
+revoked (mint fresh tokens to resume). Leg 1's principal-scoped bulk revocation
+(every token matching the target's `agent_label`/id) is the same revoke-by-target
+mechanism a decision plane's W2 kill drives; `delete_workload_grant` performs the
+analogous revoke-by-`(tenant, agent_label)` when an exchange grant is deprovisioned.
+
+### Metered LLM proxy & streaming (connector M1)
+
+`POST /llm` (`src/web/llm_proxy.rs`) points a harness's OpenAI-compatible model
+`base_url` at Vultrino so the provider key never leaves the vault and token spend is
+metered (V13). The inbound `vut_`/`vk_` bearer resolves the principal's bound
+LLM-proxy capability, and the request is driven through the **same** `execute_gated`
+→ `run_action` path as a named tool (default-deny policy, single-use consumption,
+egress scrub, V13a/V13b emit). Three enforcement steps run **above** the
+buffered-vs-streaming branch, so a `{"stream": true}` body cannot evade any of them:
+the provider-protocol gate (`VULTRINO_PROVIDER_*_ENABLED`, default-deny — an unmapped
+protocol including `observed-only` fails closed), the per-capability model allowlist
+(a channel with no parseable `model` fails closed), and the per-call output-token
+clamp (`max_tokens`/`max_completion_tokens`/`max_output_tokens` plus `n`/`best_of`/
+prompt-array multiplicity). A streamed turn is then forwarded incrementally as SSE
+via `execute_gated_streaming` (which shares the buffered path's decision step),
+bounded by the `[llm_proxy]` idle/total timeouts and byte/line caps, and gated by the
+`streaming_enabled` kill-switch (when off, the stream flags are stripped and the turn
+is served buffered).
+
+### Workload token exchange (connector M1)
+
+`POST /api/v1/workload/exchange` (`src/web/workload_exchange.rs`, gated by
+`VULTRINO_WORKLOAD_EXCHANGE_ENABLED`) lets a framework-native runtime trade a signed
+`vwa_` assertion — HMAC-SHA256-verified against `VULTRINO_WORKLOAD_ASSERTION_SECRET`
+(≥32 bytes) — for short-lived MCP + per-channel model use tokens. It fails closed on
+a forged/expired assertion (`401`), a cross-process fd-locked `jti` replay (`409`),
+or an identity-binding mismatch against the admin-authored grant template (`403`);
+a partial mint failure revokes every token already minted. A runtime then holds a
+non-consuming liveness lease via `GET /api/v1/runtime/control`, which returns
+`409 runtime_cancelled` once the token is revoked/expired (W2) or the principal is
+halted (W3) — the in-process teardown signal for cooperative framework execution.
 
 ### Signed event outbox (`src/outbox.rs`, V9)
 

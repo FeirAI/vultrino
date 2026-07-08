@@ -19,6 +19,23 @@ below — Vultrino prefers a loud config error to a silent misconfiguration.
 | `VULTRINO_API_URL` | `vultrino request --key …` | `http://127.0.0.1:7879` | — | Base URL the CLI's `--key` mode posts `/api/v1/execute` to (connect to a running `web` server instead of opening the vault directly). |
 | `RUST_LOG` | tracing (`EnvFilter::from_default_env`) | derived from `-v` flags | — | Standard `tracing` filter. The `-v`/`-vv`/`-vvv` global CLI flags raise the base level (INFO → DEBUG → TRACE). |
 | `USER` / `LOGNAME` | `vultrino approval approve/deny` | `cli` | — | The local OS user recorded as the approver identity (`cli:<user>`) for a CLI approval decision. |
+| `VULTRINO_WORKLOAD_EXCHANGE_ENABLED` | `web` (workload exchange) | unset | — | Master switch for `POST /api/v1/workload/exchange`. Off unless set to `1`/`true`; otherwise the route returns `404 feature_disabled`. Fail-closed. |
+| `VULTRINO_WORKLOAD_ASSERTION_SECRET` | `web` (workload exchange) | — | Yes, when exchange is enabled | HMAC-SHA256 verifier key for inbound `vwa_` assertions. **Must be ≥32 bytes**; a shorter/absent value fails the exchange closed with `503 exchange_unconfigured`. |
+| `VULTRINO_WORKLOAD_ASSERTION_SECRET_FILE` | `web` (workload exchange) | — | — | Path to a file whose (trimmed) contents are the verifier key. Takes precedence over `VULTRINO_WORKLOAD_ASSERTION_SECRET` when set to a non-blank path; same ≥32-byte requirement. |
+| `VULTRINO_PROVIDER_OPENAI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `openai-chat` / `openai-responses` provider protocols on `POST /llm`. |
+| `VULTRINO_PROVIDER_AZURE_OPENAI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `azure-openai` protocol. |
+| `VULTRINO_PROVIDER_ANTHROPIC_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `anthropic-messages` protocol. |
+| `VULTRINO_PROVIDER_BEDROCK_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `bedrock-converse` / `bedrock-invoke` protocols. |
+| `VULTRINO_PROVIDER_GEMINI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `gemini` protocol. |
+| `VULTRINO_PROVIDER_VERTEX_AI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `vertex-ai` protocol. |
+| `VULTRINO_MCP_ALLOWED_ORIGINS` | `web` (MCP transport) | unset | — | Comma-separated `Origin` allowlist for browser MCP requests. A request's `Origin` must equal the request `Host` **or** an entry here, else `403`. |
+
+> **Provider protocol gate is default-deny (fail-closed).** Each `VULTRINO_PROVIDER_*_ENABLED`
+> switch accepts `1`/`true` to turn its family on; anything else (including any
+> unset switch) leaves that protocol disabled. A protocol with **no** mapped switch
+> — including the validated `observed-only` protocol — can never carry
+> credential-injected proxy traffic. A request routed to a disabled protocol is
+> denied with `403 provider_feature_disabled` before any upstream call.
 
 There is **no** environment variable for the bind address, storage path, or
 policies — those are CLI flags (`--bind`) or config keys.
@@ -93,6 +110,32 @@ transport = "stdio"       # "stdio" | "socket"
 The shipped MCP transport is **stdio** (`run_stdio`); `socket` is parsed but the
 socket transport is not the run path. `enabled` is informational for the `mcp`
 subcommand.
+
+### `[llm_proxy]` — metered LLM proxy streaming (connector M1)
+
+```toml
+[llm_proxy]
+streaming_enabled        = true        # default true — SSE kill-switch
+inject_stream_usage      = true        # default true — force OpenAI-chat usage trailer
+stream_idle_timeout_secs = 120         # default 120 (0 disables)
+stream_total_timeout_secs = 1800       # default 1800 (0 disables)
+stream_max_bytes         = 268435456   # default 256 MiB (0 disables)
+stream_max_line_bytes    = 4194304     # default 4 MiB (must be > 0)
+```
+
+Every key is optional; an absent key falls back to the streaming-on default.
+
+| Key | Default | Behavior |
+|-----|---------|----------|
+| `streaming_enabled` | `true` | Master switch for incremental SSE. When `false`, a `{"stream": true}` request still works — Vultrino strips the stream flags and serves it on the buffered path (disabling streaming de-streams a client, never breaks it). |
+| `inject_stream_usage` | `true` | When a streamed **OpenAI-chat** request omits `stream_options.include_usage`, force it to `true` so the provider emits a terminal usage chunk and V13b token metering fires. An explicit client value (true **or** false) is honored, never overwritten. Anthropic `/v1/messages` and OpenAI `/v1/responses` report usage natively and are excluded. |
+| `stream_idle_timeout_secs` | `120` | Abort a stream idle this many seconds (slow-loris upstream). `0` disables. |
+| `stream_total_timeout_secs` | `1800` | Abort a stream running longer than this in total. `0` disables. |
+| `stream_max_bytes` | `268435456` (256 MiB) | Abort a stream once it has forwarded more than this many bytes. `0` disables. |
+| `stream_max_line_bytes` | `4194304` (4 MiB) | Fail closed if a single un-delimited SSE line / scrub carry-buffer would exceed this. A `0`/absent value falls back to the default (a 0 cap would fail every chunk). |
+
+The provider-protocol gate (`VULTRINO_PROVIDER_*_ENABLED`, above) is separate from
+these streaming tunables and governs which protocols may carry traffic at all.
 
 ### `[[policies]]` — static declarative policies
 

@@ -30,6 +30,11 @@ The integration suites and their focus:
 | `tests/outbox_integration.rs` | Signed outbox: ordering, gap-free replay, dead-letter, delivery. |
 | `tests/approval_token_integration.rs` | Use-token lifecycle, approval gating/lifecycle/dual-control, and the **V13a/V13b `meter.observed` emit** (`test_v13a_*`, `test_v13b_*`). |
 | `tests/web_smoke.rs` | The `vultrino web` JSON API + admin surface end-to-end (in-process axum router). |
+| `tests/llm_proxy_integration.rs` | The metered LLM proxy: provider gate, model allowlist, output-token clamp, buffered + streaming enforcement. |
+| `tests/workload_exchange_integration.rs` | HTTP-level deny paths for `POST /api/v1/workload/exchange`: forged HMAC → `401`, replayed `jti` → `409`, identity-binding mismatch → `403`, expired assertion → `401`, feature disabled → `404`, enabled-but-unconfigured → `503`. |
+
+(Further suites exist — `capability_mcp_integration.rs`, `mcp_http_integration.rs`,
+`delegate_approval_integration.rs` — run `ls tests/` for the full set.)
 
 Unit tests also live alongside the code — notably `src/outbox.rs`
 (`test_meter_observed_payload_shape`, `test_parse_token_usage_*`,

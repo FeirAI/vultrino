@@ -91,6 +91,18 @@ WASM plugin you install.
   principal (adds a `workload_id` policy match dimension and binds the owner for
   separation of duty) but never replaces the `vk_`/`vut_` id — a halt keyed on the
   id always holds, and a bad document can only fail to refine, never elevate.
+- **Workload token exchange (`vwa_` assertions):** the optional exchange endpoint
+  (`POST /api/v1/workload/exchange`, gated off by default behind
+  `VULTRINO_WORKLOAD_EXCHANGE_ENABLED`) authenticates a framework runtime by an
+  HMAC-SHA256 assertion signed with `VULTRINO_WORKLOAD_ASSERTION_SECRET` (≥32
+  bytes, else the endpoint fails closed with `503 exchange_unconfigured`). A
+  forged/tampered or expired assertion is rejected (`401 invalid_workload_identity`);
+  a replayed `jti` is rejected (`409 assertion_replay`, durable + fd-locked so the
+  guard holds across processes); the assertion's issuer/subject/audience/tenant/agent
+  must match the admin-authored grant template or the exchange is denied
+  (`403 identity_binding_mismatch`). A successful exchange mints only short-lived
+  (TTL ≤ 3600s) MCP + per-channel model **use tokens** — never an admin credential —
+  and a partial mint failure revokes every token already minted for that exchange.
 
 ## Trust boundaries
 
@@ -136,6 +148,16 @@ it — use a `block` rule for endpoints you don't trust. Secrets shorter than
 entropy); credential-store time warns about these, and they should use a `block`
 rule. A still-compressed body is withheld entirely (fail-closed).
 
+**Streaming (SSE).** A streamed LLM-proxy turn (`{"stream": true}`) is scrubbed
+**incrementally** — each raw SSE chunk is passed through the always-on
+credential-secret scrub before it reaches the caller, with a carry-buffer sized off
+the longest secret form so a secret split across chunk boundaries is still caught.
+The stricter whole-body controls (an operator `block`/`redact_patterns` rule, or a
+compressed body) cannot be honored at a chunk boundary, so a capability that needs
+them is served **buffered** instead. An operator can force buffered service for
+every turn with `[llm_proxy] streaming_enabled = false`. See
+[METERING.md](METERING.md) for the streamed token-metering residuals.
+
 ## Defaults that fail safe
 
 - Engine default `deny`; SpendCap unparseable → deny; cross-tenant + untenanted
@@ -144,6 +166,13 @@ rule. A still-compressed body is withheld entirely (fail-closed).
 - An outbox push with no URL or no signing secret is a hard config error
   (an unsigned/undeliverable outbox is rejected).
 - A halt label must be a literal id (no glob), so a halt can't deny a fleet.
+- The metered LLM proxy's provider-protocol gate is **default-deny**: each of the
+  six provider families requires its explicit `VULTRINO_PROVIDER_*_ENABLED` switch,
+  and any unmapped protocol — including the validated `observed-only` telemetry
+  protocol — fails closed, so no credential-injected proxy traffic flows for a
+  protocol an operator hasn't turned on.
+- A browser-originated MCP request's `Origin` must match the request `Host` or an
+  entry in `VULTRINO_MCP_ALLOWED_ORIGINS`, else the MCP transport rejects it (`403`).
 
 ## What Vultrino deliberately does NOT do
 
@@ -157,9 +186,9 @@ rule. A still-compressed body is withheld entirely (fail-closed).
   bounds (does not eliminate) overshoot. A zero-overshoot in-path hard ceiling is
   not built in v1.
 - **No SVID/OIDC signature verification.** The `[identity]` header is trusted as
-  edge-verified; Vultrino does not validate the token signature itself.
-- **No streaming/SSE awareness.** Response bodies are buffered whole; token
-  metering is non-streaming-only.
+  edge-verified; Vultrino does not validate the token signature itself. (The
+  workload-exchange `vwa_` assertion, by contrast, **is** cryptographically verified
+  by Vultrino against `VULTRINO_WORKLOAD_ASSERTION_SECRET` — see above.)
 - **No built-in TLS/network exposure hardening.** Serve plaintext HTTP behind a
   TLS-terminating reverse proxy; bind to localhost unless fronted.
 - **No keychain / HashiCorp Vault storage backend.** Declared in config, not

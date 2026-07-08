@@ -26,7 +26,10 @@ Three auth modes across the surface:
 | Surface | Auth | Header |
 |---------|------|--------|
 | JSON API: execute, approval poll, list credentials | API key **or** use token | `Authorization: Bearer vk_…` or `Authorization: Bearer vut_…` |
-| JSON API: admin (policies, tokens, roles, credentials write, halt, sessions, metrics, events) | API key with `admin` permission only — **use tokens rejected** | `Authorization: Bearer vk_admin…` |
+| JSON API: admin (policies, tokens, roles, credentials write, halt, sessions, metrics, events, workload grants) | API key with `admin` permission only — **use tokens rejected** | `Authorization: Bearer vk_admin…` |
+| Metered LLM proxy (`POST /llm…`) | API key **or** use token (the same bearer used for `/mcp`) | `Authorization: Bearer vk_…` / `vut_…` |
+| Workload token exchange (`POST /api/v1/workload/exchange`) | a signed `vwa_` workload assertion — **not** an API key | `Authorization: Bearer vwa_…` |
+| Runtime control lease (`GET /api/v1/runtime/control`) | the MCP **use token** minted by an exchange | `Authorization: Bearer vut_…` |
 | HTML admin panel (`/login`, `/dashboard`, `/credentials`, …) | session cookie (login form) + CSRF token on writes | — |
 | Health, OOB approval decision link | none (the OOB link is authorized by a capability token in the URL) | — |
 
@@ -216,6 +219,27 @@ response carries **metadata only** — the secret is never echoed.
 | `GET` | `/api/v1/sessions` | `200 { sessions: [...], process_scope: true }` — in-flight executions in **this** process. |
 
 `label` must be a literal identifier (`[A-Za-z0-9._-]`, ≤128) — globs are rejected.
+The halt also revokes every use token matching the target's `agent_label` (or token
+id) — the principal-scoped bulk-revocation leg a decision plane's W2 kill drives.
+
+### Workload grant templates (exchange provisioning)
+
+Author/remove the exchange templates the `vwa_` workload exchange mints tokens from.
+
+| Method | Path | Body / result |
+|--------|------|---------------|
+| `PUT` | `/api/v1/workload-grants/{agent}` | Body `WorkloadGrantTemplate`; `200 {stored, agent_label}`. |
+| `DELETE` | `/api/v1/workload-grants/{agent}?tenant=<t>` | `200 {removed, revoked_tokens}`. Idempotent. |
+
+`WorkloadGrantTemplate` binds the identity an exchange assertion must present
+(`tenant`, `agent_label`, `issuer`, `subject`, `audience`) to the scopes each minted
+token carries: `mcp_credential_scope` / `mcp_action_scope` (+ optional `mcp_max_uses`,
+`mcp_require_approval`) for the MCP token, and a `model_channels` map (each a
+`{credential_scope, action_scope}`) for the per-channel model tokens. `ttl_secs`
+must be in **30..3600** and the `{agent}` path segment must equal `agent_label`
+(else `400 invalid_workload_grant`). **`DELETE` revokes every token previously
+minted for `(tenant, agent_label)`** and removes the template; it is idempotent so a
+decision plane can safely retry deprovision cleanup.
 
 ### Metrics (V12)
 
@@ -273,6 +297,90 @@ client can retry. Records are retained 24h.
 > window) re-runs the operation. It is exactly-once only absent a mid-op crash.
 > A replayed token mint returns metadata + a note, **not** the plaintext (the
 > vault never retains it).
+
+## Workload token exchange (connector M1)
+
+A framework-native runtime (e.g. a LangChain agent) exchanges a signed workload
+assertion for the short-lived use tokens it then presents to `/mcp` and `/llm`.
+The endpoint is **gated off** unless `VULTRINO_WORKLOAD_EXCHANGE_ENABLED` is set,
+and needs a ≥32-byte `VULTRINO_WORKLOAD_ASSERTION_SECRET` configured.
+
+### `POST /api/v1/workload/exchange` — mint runtime tokens (`vwa_` assertion)
+
+Authenticate with `Authorization: Bearer vwa_<payload>.<sig>` — an HMAC-SHA256
+`vwa_` assertion whose payload carries `kind` (`oidc`|`spiffe`), `iss`, `sub`,
+`aud`, `tenant`, `agent_label`, `jti`, and `exp`. On success mints an MCP token
+plus one model token per `model_channels` entry (all with TTL ≤ 3600s); a partial
+mint failure revokes every token already minted.
+
+**Response `200`:**
+
+```json
+{
+  "mcp_token": "vut_…",
+  "model_tokens": { "default": "vut_…" },
+  "expires_at_unix": 1750000000,
+  "metadata": { "mcp": { … }, "models": [ { … } ] }
+}
+```
+
+**Deny semantics:**
+
+| Status | Code | When |
+|--------|------|------|
+| `404` | `feature_disabled` | `VULTRINO_WORKLOAD_EXCHANGE_ENABLED` is not set. |
+| `503` | `exchange_unconfigured` | Verifier secret absent or < 32 bytes. |
+| `401` | `invalid_workload_identity` | Missing Bearer, forged/tampered signature, expired/overlong `exp`, bad `kind`, or empty `jti`. |
+| `403` | `grant_not_found` | No template authored for `(tenant, agent_label)`. |
+| `403` | `identity_binding_mismatch` | `iss`/`sub`/`aud`/`tenant`/`agent_label` do not match the stored template. |
+| `409` | `assertion_replay` | The `jti` was already exchanged (durable, cross-process, fd-locked). |
+| `503` | `grant_store_unavailable` / `replay_store_unavailable` | Grant/replay store I/O failure. |
+
+### `GET /api/v1/runtime/control` — non-consuming liveness lease
+
+Authenticate with the exchange's **MCP use token** (`Authorization: Bearer vut_…`).
+A framework runtime polls this to learn whether its authority still holds; the poll
+does **not** consume a use. `200 {"active": true, "agent_label", "tenant"}` while
+live. A revoked/expired token or a halted principal returns `409 runtime_cancelled`
+(so W2 revocation/expiry and W3 principal-kill both terminate the lease); a missing
+token → `401 missing_runtime_token`, an unknown token → `401 invalid_runtime_token`.
+
+## Metered LLM proxy (connector M1, decision 5)
+
+A harness points its model `base_url` at Vultrino so the provider key never leaves
+the vault and token spend is metered (V13). Authenticate with the same `vut_`/`vk_`
+bearer used for `/mcp`.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `POST` | `/llm` | Provider URL is the bound capability's `provider_base` verbatim (no extra path). |
+| `POST` | `/llm/{*path}` | The OpenAI-style route the client appends (e.g. `/v1/chat/completions`) is joined onto `provider_base`. |
+| `POST` | `/llm/channels/{channel}` / `/llm/channels/{channel}/{*path}` | Explicit model-channel selection (cross-provider fallback). |
+
+The bearer resolves to the principal's bound LLM-proxy capability; the request is
+driven through the **same enforced path** as a named tool (default-deny policy,
+single-use consumption, egress scrub, V13a/V13b metering). Enforcement runs **above**
+the buffered-vs-streaming branch, so a `{"stream": true}` request cannot evade it:
+
+- **Provider gate:** the capability's protocol must be enabled via its
+  `VULTRINO_PROVIDER_*_ENABLED` switch (default-deny) — else `403 provider_feature_disabled`.
+- **Model allowlist:** when the capability restricts models, the body's `model` must
+  be allowed (an allowlisted channel with no parseable `model` fails closed) — else
+  `403 permission_error`.
+- **Output-token clamp:** under a configured per-call ceiling, `max_tokens` /
+  `max_completion_tokens` / `max_output_tokens` are clamped (and set when absent),
+  and `n`/`best_of`/legacy prompt-array multiplicity is pinned so the ceiling can't
+  be multiplied around.
+- **Streaming:** `{"stream": true}` is forwarded incrementally as
+  `text/event-stream` when `[llm_proxy] streaming_enabled` is on (default); when off,
+  the stream flags are stripped and the turn is served buffered. Bounded by stream
+  idle/total timeouts and byte/line caps.
+
+Errors are shaped like an OpenAI API error (`{"error": {"type", "message"}}`):
+`401 invalid_request_error` (bad bearer), `403 permission_error` / `provider_feature_disabled`
+(denied), `400 invalid_request_error` (non-JSON body or a credential-like query param),
+`502 api_error` (upstream failure — detail is logged, never echoed, since the scrub
+has not run on an error path).
 
 ## Objects & enums
 
