@@ -210,7 +210,7 @@ impl Capability {
         if let Some(llm) = &self.llm {
             match llm.protocol.as_str() {
                 "openai-chat" | "openai-responses" | "azure-openai" | "anthropic-messages"
-                | "bedrock-converse" | "bedrock-invoke" | "gemini" | "vertex-ai"
+                | "bedrock-converse" | "bedrock-invoke" | "gemini" | "vertex-ai" | "nvidia"
                 | "observed-only" => {}
                 other => {
                     return Err(format!(
@@ -254,6 +254,18 @@ impl Capability {
                 if h.starts_with("169.254.") {
                     return Err(format!(
                         "capability llm.provider_base '{}' points at the link-local / cloud-metadata range (SSRF)",
+                        base
+                    ));
+                }
+                // A "nvidia" channel reuses the OpenAI-compatible wire but is a
+                // DISTINCT, separately-gated provider (VULTRINO_PROVIDER_NVIDIA_ENABLED)
+                // so an operator can run NVIDIA without enabling the generic OpenAI
+                // provider. Pin its provider_base to NVIDIA hosts so a nvidia-labeled
+                // channel can never be aimed at a different provider's endpoint.
+                if llm.protocol == "nvidia" && !(h == "nvidia.com" || h.ends_with(".nvidia.com"))
+                {
+                    return Err(format!(
+                        "capability llm.protocol 'nvidia' requires an NVIDIA provider_base host (*.nvidia.com); got '{}'",
                         base
                     ));
                 }
@@ -568,6 +580,29 @@ mod tests {
         let mut c = cap("send_email");
         c.target.url_glob = Some("https://[invalid".to_string());
         assert!(c.validate().is_err());
+    }
+
+    fn nvidia_cap(base: &str) -> Capability {
+        let mut c = cap("nemotron");
+        c.target.url_glob = None; // an LLM-proxy channel is not a named MCP tool endpoint
+        c.llm = Some(LlmProxy {
+            protocol: "nvidia".to_string(),
+            provider: Some("nvidia".to_string()),
+            provider_base: base.to_string(),
+            allowed_models: vec![],
+            ..Default::default()
+        });
+        c
+    }
+
+    #[test]
+    fn nvidia_channel_accepts_nvidia_host_only() {
+        // The real NVIDIA OpenAI-compatible endpoint is accepted.
+        assert!(nvidia_cap("https://integrate.api.nvidia.com/v1").validate().is_ok());
+        // A nvidia-labeled channel pointed at another provider is rejected (least
+        // privilege: "nvidia" means NVIDIA, so the generic OpenAI switch can stay off).
+        assert!(nvidia_cap("https://api.openai.com/v1").validate().is_err());
+        assert!(nvidia_cap("https://evil.example.com/v1").validate().is_err());
     }
 
     #[test]

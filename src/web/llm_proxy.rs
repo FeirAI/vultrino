@@ -97,12 +97,18 @@ const FORWARDED_PROVIDER_HEADERS: &[&str] = &[
 fn provider_feature_enabled(protocol: &str) -> bool {
     let flag = match protocol {
         "openai-chat" | "openai-responses" => "VULTRINO_PROVIDER_OPENAI_ENABLED",
+        // NVIDIA's integrate.api.nvidia.com is OpenAI-wire-compatible, so it rides the
+        // same transparent-proxy path as openai-chat — but on its OWN switch, so an
+        // operator can run NVIDIA (e.g. a hermes fleet on Nemotron) WITHOUT enabling the
+        // generic OpenAI provider. capability validation pins a nvidia channel's
+        // provider_base to an *.nvidia.com host.
+        "nvidia" => "VULTRINO_PROVIDER_NVIDIA_ENABLED",
         "azure-openai" => "VULTRINO_PROVIDER_AZURE_OPENAI_ENABLED",
         "anthropic-messages" => "VULTRINO_PROVIDER_ANTHROPIC_ENABLED",
         "bedrock-converse" | "bedrock-invoke" => "VULTRINO_PROVIDER_BEDROCK_ENABLED",
         "gemini" => "VULTRINO_PROVIDER_GEMINI_ENABLED",
         "vertex-ai" => "VULTRINO_PROVIDER_VERTEX_AI_ENABLED",
-        // FAIL CLOSED on anything unmapped. Capability validation whitelists the six
+        // FAIL CLOSED on anything unmapped. Capability validation whitelists the seven
         // provider families above plus "observed-only"; an observed-only channel is
         // telemetry-grade and must never be served credential-injected proxy traffic,
         // and any future protocol must be wired to an explicit VULTRINO_PROVIDER_*
@@ -664,6 +670,20 @@ mod tests {
         assert!(!provider_feature_enabled(""));
         // A mapped protocol whose switch is unset is also denied (default-deny).
         assert!(!provider_feature_enabled("vertex-ai"));
+        // nvidia is a real, separately-gated provider: unset => denied (does NOT ride
+        // the generic OpenAI switch).
+        assert!(!provider_feature_enabled("nvidia"));
+    }
+
+    #[test]
+    fn nvidia_gate_is_independent_of_openai() {
+        // Enabling NVIDIA must not require (or imply) the generic OpenAI provider, and
+        // vice-versa. Uses a switch no other test touches to stay race-free.
+        std::env::set_var("VULTRINO_PROVIDER_NVIDIA_ENABLED", "1");
+        assert!(provider_feature_enabled("nvidia"));
+        // openai-chat stays denied unless ITS own switch is set.
+        assert!(!provider_feature_enabled("openai-chat"));
+        std::env::remove_var("VULTRINO_PROVIDER_NVIDIA_ENABLED");
     }
 
     #[test]
