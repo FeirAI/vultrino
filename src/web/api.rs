@@ -491,6 +491,16 @@ pub struct ApprovalSummary {
     pub decided_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub veto_until: Option<String>,
+    /// Govder risk_tier (`Low` | `Medium` | `High` | `Extreme`) computed from the
+    /// approval's criticality class via the SAME mapping the delegate-decide path
+    /// evaluates against (`CriticalityClass::to_govder_risk_tier`) — lets a product
+    /// aggregator render the same risk chip the D3 PEP floor actually enforced.
+    /// Always emitted (not `skip_serializing_if`) so consumers get a stable shape.
+    pub risk_tier: String,
+    /// Trusted irreversibility stamp (D3 floor input), computed the same way the
+    /// delegate-decide path does (`approval::approval_irreversible`). Always
+    /// emitted so consumers get a stable shape.
+    pub irreversible: bool,
 }
 
 impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
@@ -527,6 +537,8 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
                 .or_else(|| a.approver_identity.clone())
                 .or_else(|| a.decided_by.clone()),
             veto_until: a.delegate_veto_until.map(|t| t.to_rfc3339()),
+            risk_tier: a.criticality.to_govder_risk_tier().to_string(),
+            irreversible: crate::approval::approval_irreversible(a),
         }
     }
 }
@@ -2937,6 +2949,73 @@ pub async fn api_delete_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal `ApprovalRequest` for `ApprovalSummary` serialization tests
+    /// (V041 governance chips): only the fields that drive `risk_tier` /
+    /// `irreversible` vary between cases; everything else is a fixed baseline.
+    fn sample_approval(
+        criticality: crate::approval::CriticalityClass,
+        trusted_irreversible: bool,
+    ) -> crate::approval::ApprovalRequest {
+        use crate::approval::{NewApproval, RequesterInfo};
+        let (approval, _decision_token) = crate::approval::ApprovalRequest::open(NewApproval {
+            credential: "stripe-prod".to_string(),
+            action: "http.request".to_string(),
+            params: serde_json::json!({"method": "post"}),
+            requester: RequesterInfo {
+                principal_kind: "api_key".to_string(),
+                principal_id: Some("k1".to_string()),
+                principal_name: Some("agent".to_string()),
+                role: Some("executor".to_string()),
+                owner: None,
+            },
+            use_token_id: None,
+            principal_id: Some("k1".to_string()),
+            agent_label: Some("ep_requester_acme".to_string()),
+            action_label: None,
+            dual_control: false,
+            criticality,
+            trusted_irreversible: Some(trusted_irreversible),
+            escalate_after: chrono::Duration::minutes(30),
+            escalate_window: chrono::Duration::minutes(30),
+            oob_identity: None,
+            reauth_interval_secs: None,
+            required_approvals: 1,
+            tenant: Some("acme".to_string()),
+            workload_id: None,
+        });
+        approval
+    }
+
+    /// Pins `ApprovalSummary`'s JSON field names/values for the decide-time
+    /// governance annotations (`risk_tier` / `irreversible`) that feir-os renders
+    /// Risk/irreversible chips from. Both fields must be computed via the SAME
+    /// mapping the delegate-decide PEP evaluates against
+    /// (`CriticalityClass::to_govder_risk_tier` / `approval::approval_irreversible`)
+    /// and must be emitted unconditionally (never omitted), so a low-risk
+    /// reversible approval and a high-risk irreversible approval both carry a
+    /// stable, always-present shape.
+    #[test]
+    fn test_approval_summary_emits_risk_tier_and_irreversible() {
+        let low_reversible =
+            sample_approval(crate::approval::CriticalityClass::Low, false);
+        let summary = ApprovalSummary::from(&low_reversible);
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["risk_tier"], "Low");
+        assert_eq!(json["irreversible"], false);
+        // Always emitted: the keys must be present even though `irreversible` is
+        // `false` (which `skip_serializing_if = "Option::is_none"` siblings on
+        // this struct would otherwise omit if these fields were optional).
+        assert!(json.get("risk_tier").is_some());
+        assert!(json.get("irreversible").is_some());
+
+        let high_irreversible =
+            sample_approval(crate::approval::CriticalityClass::Critical, true);
+        let summary = ApprovalSummary::from(&high_irreversible);
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["risk_tier"], "Extreme");
+        assert_eq!(json["irreversible"], true);
+    }
 
     #[test]
     fn test_build_policy_kill_defaults_false_when_omitted() {

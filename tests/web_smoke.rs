@@ -5,6 +5,7 @@
 //! `tower::ServiceExt::oneshot`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -13,8 +14,10 @@ use tempfile::tempdir;
 use tower::ServiceExt;
 
 use vultrino::approval::{ApprovalRequest, NewApproval, RequesterInfo};
-use vultrino::auth::{AuthManager, NewUseToken, UseToken};
+use vultrino::auth::{ApprovalToken, AuthManager, NewApprovalToken, NewUseToken, UseToken};
 use vultrino::config::Config;
+use vultrino::delegation::DelegationGrantScope;
+use vultrino::govder::GovderConfig;
 use vultrino::storage::{FileStorage, StorageBackend};
 use vultrino::web::{AdminAuth, WebConfig, WebServer};
 
@@ -40,6 +43,40 @@ async fn build_router() -> (axum::Router, Arc<dyn StorageBackend>) {
             enabled: true,
         },
         Config::default(),
+        storage.clone(),
+        AuthManager::new(),
+        admin,
+        exec_server,
+    );
+    (server.into_router(), storage)
+}
+
+/// Like [`build_router`] but with a caller-supplied `Config` — used by the
+/// govder-unreachable 503 tests to configure `config.govder` pointed at a dead
+/// port (no admin key is minted, matching `build_router`'s no-auth-fixture shape;
+/// tests that need one build it directly against the returned storage).
+async fn build_router_with_config(config: Config) -> (axum::Router, Arc<dyn StorageBackend>) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir); // keep the file alive for the test's lifetime
+
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        config.clone(),
+        storage.clone(),
+        resolver,
+    ));
+    let server = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        config,
         storage.clone(),
         AuthManager::new(),
         admin,
@@ -3531,4 +3568,160 @@ async fn test_admin_list_tokens_is_non_secret() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ============================================================================
+// Govder-unreachable 503 fail-closed branches (plan 031). These three handlers
+// only ever run when govder is either unconfigured or unreachable, so they get
+// NO coverage from any feature-gated suite (delegate_approval_integration.rs
+// always stands up a live mock govder). Exercised here, in the un-gated
+// web-smoke suite, so `cargo test` (no features) always runs them.
+// ============================================================================
+
+/// Store a minimal `vap_` approval token directly in storage (bypassing the
+/// `POST /api/v1/approval-tokens` mint route, which itself requires govder —
+/// these tests need a *usable* token while govder is absent/unreachable).
+async fn store_delegate_token(
+    storage: &Arc<dyn StorageBackend>,
+    tenant: Option<&str>,
+) -> String {
+    let (plaintext, token) = ApprovalToken::create(NewApprovalToken {
+        delegation_grant_ref: "grant_test_001".to_string(),
+        grant_scope: DelegationGrantScope::default(),
+        agent_label: Some("delegate-bot".to_string()),
+        delegator_identity: "alice@corp".to_string(),
+        tenant: tenant.map(str::to_string),
+        expires_in: None,
+    });
+    storage.store_approval_token(&token).await.unwrap();
+    plaintext
+}
+
+/// Open and store a minimal pending approval directly (bypassing the execute
+/// path — these tests only need a decidable record for the delegate-decision
+/// handler to load before it reaches the govder check).
+async fn store_pending_approval(
+    storage: &Arc<dyn StorageBackend>,
+    tenant: Option<&str>,
+) -> ApprovalRequest {
+    let (approval, _decision_token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post"}),
+        requester: RequesterInfo {
+            principal_kind: "api_key".to_string(),
+            principal_id: Some("k1".to_string()),
+            principal_name: Some("agent".to_string()),
+            role: Some("executor".to_string()),
+            owner: None,
+        },
+        use_token_id: None,
+        principal_id: Some("k1".to_string()),
+        agent_label: Some("ep_requester_acme".to_string()),
+        action_label: None,
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::Low,
+        trusted_irreversible: Some(false),
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+        tenant: tenant.map(str::to_string),
+        workload_id: None,
+    });
+    storage.store_approval(&approval).await.unwrap();
+    approval
+}
+
+#[tokio::test]
+async fn test_approval_token_mint_503s_when_govder_not_configured() {
+    // build_admin_router's web Config carries no govder (Config::default()).
+    let (router, _storage, _exec, admin_key) = build_admin_router().await;
+
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/approval-tokens",
+            &admin_key,
+            serde_json::json!({
+                "delegation_grant_ref": "grant_test_001",
+                "agent_label": "delegate-bot",
+                "delegator_identity": "alice@corp",
+                "tenant": "acme"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "govder_not_configured");
+}
+
+#[tokio::test]
+async fn test_delegate_decide_503s_when_govder_not_configured() {
+    // build_router's web Config carries no govder (Config::default()).
+    let (router, storage) = build_router().await;
+
+    let vap_secret = store_delegate_token(&storage, Some("acme")).await;
+    let approval = store_pending_approval(&storage, Some("acme")).await;
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/approvals/{}/delegate-decision", approval.id))
+                .header("authorization", format!("Bearer {}", vap_secret))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"approve": true}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "govder_not_configured");
+}
+
+#[tokio::test]
+async fn test_delegate_decide_503s_when_govder_unreachable() {
+    // Bind a socket to reserve a free port, then drop it immediately so the
+    // port is provably unreachable (connection refused) — no listener stands
+    // up at `govder_url` for the whole test.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let govder_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let mut config = Config::default();
+    config.approval.enabled = true;
+    config.govder = Some(GovderConfig {
+        base_url: govder_url,
+        assertion_secret: "test-govder-assertion-secret".to_string(),
+        assertion_ttl: Duration::from_secs(90),
+        http_timeout: Duration::from_secs(5),
+    });
+    let (router, storage) = build_router_with_config(config).await;
+
+    let vap_secret = store_delegate_token(&storage, Some("acme")).await;
+    let approval = store_pending_approval(&storage, Some("acme")).await;
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/approvals/{}/delegate-decision", approval.id))
+                .header("authorization", format!("Bearer {}", vap_secret))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"approve": true}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "govder_unavailable");
 }

@@ -9,14 +9,23 @@ Vultrino is a standard Cargo project; its tests are pure Rust (unit tests in
 `src/**` modules + integration tests in `tests/`):
 
 ```bash
-# Everything (unit + integration):
+# Everything except the mock-govder delegate suite (unit + integration):
 cargo test
+
+# The delegate-approval integration suite (tenant-equality, D3 PEP floors,
+# approver_kind outbox, signed webhook) — gated behind `mock-govder` so the
+# src-side mock evaluator never ships in a default/production build (see
+# src/delegation/mod.rs). Cargo's `[[test]] required-features` means plain
+# `cargo test` silently skips this file entirely — BOTH invocations below are
+# required to exercise the full suite; CI runs both.
+cargo test --features mock-govder
 
 # A single integration suite:
 cargo test --test approval_token_integration
 cargo test --test outbox_integration
 cargo test --test auth_integration
 cargo test --test web_smoke
+cargo test --features mock-govder --test delegate_approval_integration
 
 # A single test by name substring:
 cargo test test_v13a_
@@ -33,8 +42,13 @@ The integration suites and their focus:
 | `tests/llm_proxy_integration.rs` | The metered LLM proxy: provider gate, model allowlist, output-token clamp, buffered + streaming enforcement. |
 | `tests/workload_exchange_integration.rs` | HTTP-level deny paths for `POST /api/v1/workload/exchange`: forged HMAC → `401`, replayed `jti` → `409`, identity-binding mismatch → `403`, expired assertion → `401`, feature disabled → `404`, enabled-but-unconfigured → `503`. |
 
-(Further suites exist — `capability_mcp_integration.rs`, `mcp_http_integration.rs`,
-`delegate_approval_integration.rs` — run `ls tests/` for the full set.)
+(Further suites exist — `capability_mcp_integration.rs`, `mcp_http_integration.rs`
+— run `ls tests/` for the full set.)
+
+`tests/delegate_approval_integration.rs` covers tenant-equality, D3 PEP risk/
+irreversibility floors, `approver_kind` outbox events, and the signed govder
+webhook for delegate-agent approval decisions. It requires `--features
+mock-govder` (see above) — it is **not** part of the plain `cargo test` run.
 
 Unit tests also live alongside the code — notably `src/outbox.rs`
 (`test_meter_observed_payload_shape`, `test_parse_token_usage_*`,
@@ -77,10 +91,11 @@ run the same PEP path locally (no server) and are handy for testing a policy.
 
 ## Contributing
 
-- **Build/lint before sending changes:** `cargo build`, `cargo test`,
-  `cargo clippy`, `cargo fmt`. The code uses fail-closed validation extensively —
-  preserve it (a malformed glob/regex/config should error at load, never silently
-  degrade to never-matching).
+- **Build/lint before sending changes:** `cargo build`, `cargo test`, `cargo test
+  --features mock-govder` (both are required — see above), `cargo clippy`,
+  `cargo fmt`. The code uses fail-closed validation extensively — preserve it (a
+  malformed glob/regex/config should error at load, never silently degrade to
+  never-matching).
 - **Accuracy of these docs:** if you change a route, env var, config key, payload
   shape, default, or guarantee, update the corresponding `docs/dev/*` file in the
   same change — this set is the implementation-accurate reference and is checked

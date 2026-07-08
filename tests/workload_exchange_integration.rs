@@ -151,6 +151,9 @@ fn exchange_req(assertion: &str) -> Request<Body> {
 /// A `vwa_` assertion signed with the wrong key (forged/tampered HMAC) is
 /// rejected 401 — the signature is verified before any claim is trusted.
 #[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
 async fn forged_hmac_assertion_is_401() {
     let _guard = ENV_LOCK.lock().unwrap();
     enable_exchange();
@@ -166,6 +169,9 @@ async fn forged_hmac_assertion_is_401() {
 /// A valid assertion may be exchanged exactly once. Replaying the SAME assertion
 /// (same `jti`) is refused 409 — the `jti` is single-consumed (replay guard).
 #[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
 async fn replayed_jti_second_request_is_409() {
     let _guard = ENV_LOCK.lock().unwrap();
     enable_exchange();
@@ -191,6 +197,9 @@ async fn replayed_jti_second_request_is_409() {
 /// stored grant template (but whose tenant+agent DO, so the grant is found) is
 /// refused 403 — the identity binding is enforced, not just the signature.
 #[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
 async fn identity_binding_mismatch_is_403() {
     let _guard = ENV_LOCK.lock().unwrap();
     enable_exchange();
@@ -209,6 +218,9 @@ async fn identity_binding_mismatch_is_403() {
 /// A validly-signed assertion whose `exp` is in the past is refused 401 — expiry
 /// is checked inside signature verification, so an expired token never mints.
 #[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
 async fn expired_assertion_is_401() {
     let _guard = ENV_LOCK.lock().unwrap();
     enable_exchange();
@@ -226,6 +238,9 @@ async fn expired_assertion_is_401() {
 /// With the feature flag off, the endpoint refuses BEFORE looking at the
 /// assertion at all: it 404s (`feature_disabled`) so the surface is invisible.
 #[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
 async fn feature_disabled_is_404() {
     let _guard = ENV_LOCK.lock().unwrap();
     // Explicitly OFF: remove the enable flag (secret state is irrelevant here).
@@ -245,6 +260,9 @@ async fn feature_disabled_is_404() {
 /// (`exchange_unconfigured`) — it fails closed rather than trusting assertions
 /// against a missing/short key.
 #[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
 async fn enabled_without_secret_is_503() {
     let _guard = ENV_LOCK.lock().unwrap();
     unsafe {
