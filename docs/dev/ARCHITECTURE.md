@@ -273,8 +273,9 @@ The default backend is an **encrypted file vault**:
   is never stored.
 - **On-disk shape:** a JSON file with `version`, `salt`, and an encrypted blob
   holding the cache (credentials, roles, API keys, use tokens, approvals, stored
-  policies, idempotency records, and the outbox event log).
-- **Format version:** `STORAGE_VERSION = 5`. A vault whose recorded version is
+  policies, and idempotency records; since v7 the signed outbox lives OUTSIDE the
+  vault in its own encrypted file).
+- **Format version:** `STORAGE_VERSION = 7`. A vault whose recorded version is
   **greater** than the binary understands is **refused** (`check_version`). A
   newer binary reads older vaults (new fields use `#[serde(default)]`), but the
   first write upgrades the on-disk format — after which an older binary sharing the

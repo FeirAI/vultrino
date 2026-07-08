@@ -36,14 +36,18 @@ transport = "stdio"
 
 ```toml
 [server]
-bind = "127.0.0.1:7878"  # Address for HTTP proxy
+bind = "127.0.0.1:7878"  # legacy `serve` default; see note below
 mode = "local"            # "local" or "server"
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `bind` | Address and port for the HTTP proxy | `127.0.0.1:7878` |
-| `mode` | Deployment mode (`local` or `server`) | `local` |
+| `bind` | Listen address for the `serve` subcommand. **`vultrino web` (the HTTP JSON API + admin UI) defaults to `127.0.0.1:7879`** and the `--bind` flag overrides per process. | `127.0.0.1:7878` |
+| `mode` | Deployment mode: `server` sets `require_auth = true` on the in-process default (`local` otherwise). | `local` |
+
+> The JSON API and admin UI are served by **`vultrino web`** on `7879`, not by
+> this `[server].bind`. `vultrino serve` (which this key configures) no longer
+> starts an API server on its own — see the [CLI reference](../components/cli.md#serve).
 
 ### Storage Section
 

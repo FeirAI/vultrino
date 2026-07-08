@@ -74,122 +74,91 @@ Makes an authenticated HTTP request.
 
 ---
 
-### add_credential
+### get_credential_info
 
-Stores a new credential.
+Returns metadata (type, description) for one credential — never the secret.
 
 **Input:**
 ```json
 {
-  "alias": "string (required) - unique name",
-  "type": "string (required) - api_key|basic_auth",
-  "key": "string (for api_key) - the secret value",
-  "username": "string (for basic_auth)",
-  "password": "string (for basic_auth)",
-  "description": "string (optional)"
+  "credential": "string (required) - alias or id"
 }
 ```
 
-**Output:**
-```json
-{
-  "success": true,
-  "id": "uuid",
-  "alias": "string"
-}
-```
-
-**Permission Required:** write
+**Permission Required:** read
 
 ---
 
-### delete_credential
+### check_approval
 
-Removes a credential.
+Polls an action that was gated for human approval. Once approved, this tool runs
+the original action and returns its result; while pending it says to keep polling.
+You may only poll approvals created by the same `api_key`/use token.
 
 **Input:**
 ```json
 {
-  "alias": "string (required)"
+  "approval_id": "string (required) - the appr_… id from a gated call"
 }
 ```
 
-**Output:**
-```json
-{
-  "success": true
-}
-```
+**Permission Required:** execute
 
-**Permission Required:** delete
+> **Credential writes are not MCP tools.** The stdio MCP server exposes only
+> `list_credentials`, `http_request`, `get_credential_info`, and `check_approval`
+> (plus any plugin/capability tools). Adding or deleting credentials is done with
+> the CLI (`vultrino add` / `vultrino remove`) or the admin JSON API — there is no
+> `add_credential` / `delete_credential` MCP tool.
+
+Every tool call also takes an `api_key` argument — a `vk_` API key or a `vut_`
+use token — which Vultrino consumes and never forwards to the target.
 
 ---
 
 ## HTTP API Endpoints
 
-### Proxy Request
+Served by `vultrino web` at `http://127.0.0.1:7879`. All routes are under
+`/api/v1/` and take `Authorization: Bearer vk_…` or `vut_…`. There is no
+credential header and no transparent proxy. Full wire reference:
+[`docs/dev/API.md`](../../dev/API.md).
+
+### Execute an action
 
 ```
-{METHOD} /{target_url}
-Headers:
-  X-Vultrino-Credential: {alias}
-  Authorization: Bearer {api_key} (if RBAC enabled)
-```
-
-### List Credentials
-
-```
-GET /v1/credentials
-Authorization: Bearer {api_key}
-```
-
-### Get Credential
-
-```
-GET /v1/credentials/{alias}
-Authorization: Bearer {api_key}
-```
-
-### Create Credential
-
-```
-POST /v1/credentials
-Authorization: Bearer {api_key}
-Content-Type: application/json
-
-{
-  "alias": "string",
-  "type": "api_key|basic_auth",
-  "data": { ... },
-  "description": "string"
-}
-```
-
-### Delete Credential
-
-```
-DELETE /v1/credentials/{alias}
-Authorization: Bearer {api_key}
-```
-
-### Execute Action
-
-```
-POST /v1/execute
-Authorization: Bearer {api_key}
+POST /api/v1/execute
+Authorization: Bearer {vk_ or vut_ token}
 Content-Type: application/json
 
 {
   "credential": "alias",
-  "action": "http.request",
-  "params": {
-    "method": "GET",
-    "url": "https://...",
-    "headers": {},
-    "body": null
-  }
+  "method": "GET",
+  "url": "https://...",
+  "action": "http.request",   // optional; defaults to http.request
+  "headers": {},              // optional
+  "body": null,               // optional
+  "query": {}                 // optional
 }
 ```
+
+Returns `{ "status", "headers", "body" }` on `200`, or a `202` pending-approval
+envelope with an `approval_id` to poll.
+
+### List Credentials (metadata only)
+
+```
+GET /api/v1/credentials
+Authorization: Bearer {api_key}    # requires the `read` permission
+```
+
+### Create / Delete Credential (admin API key only)
+
+```
+POST   /api/v1/credentials         # body: { alias, metadata?, data }
+DELETE /api/v1/credentials/{id}    # by id, not alias
+```
+
+There is no `GET /api/v1/credentials/{alias}` route. See
+[Admin API](../api/admin.md).
 
 ---
 
@@ -205,17 +174,14 @@ vultrino add --alias NAME --key SECRET
 # List credentials
 vultrino list
 
-# Make request
-vultrino request -c ALIAS URL
+# Make request (credential alias is the first positional argument)
+vultrino request ALIAS URL
 
-# Start proxy
-vultrino serve
-
-# Start web UI
+# Start the HTTP API + web UI (default 127.0.0.1:7879)
 vultrino web
 
-# Start MCP server
-vultrino serve --mcp
+# Start MCP server (stdio) for AI agents
+vultrino mcp   # or: vultrino serve --mcp
 
 # Manage roles
 vultrino role create NAME --permissions read,execute
@@ -262,12 +228,10 @@ vultrino key revoke KEY_PREFIX
 
 | Code | Meaning |
 |------|---------|
-| missing_credential | X-Vultrino-Credential header required |
-| unauthorized | Invalid or expired API key |
-| forbidden | Permission denied |
-| not_found | Credential not found |
-| policy_denied | Request blocked by policy |
-| upstream_error | Target server error |
+| invalid_api_key / invalid_token | Missing or invalid bearer token |
+| permission_denied | Role lacks the required permission |
+| token_unusable | Use token revoked, expired, or exhausted |
+| execute_error | Policy denied, credential not found, SSRF block, or plugin error |
 
 ---
 
@@ -317,8 +281,8 @@ Parse it according to the content-type:
 
 | Port | Service |
 |------|---------|
-| 7878 | HTTP Proxy |
-| 7879 | Web UI |
+| 7879 | `vultrino web` — HTTP JSON API (`/api/v1/…`, `/mcp`, `/llm`) + admin UI |
+| stdio | `vultrino mcp` — MCP server for local AI agents (no port) |
 
 ---
 

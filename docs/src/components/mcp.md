@@ -27,28 +27,32 @@ export VULTRINO_PASSWORD="your-password"
 vultrino mcp
 ```
 
-The MCP server uses stdio transport, communicating via stdin/stdout.
+The MCP server uses stdio transport, communicating via stdin/stdout. A remote
+harness can instead reach the **networked** MCP transport at `POST /mcp` on
+`vultrino web` (JSON-RPC, authenticated by a `Bearer vk_`/`vut_` token).
 
 ## API Key Authentication
 
-AI agents authenticate by calling the `authenticate` tool with their API key:
+There is no `authenticate` tool and no session step. Every tool call carries an
+`api_key` argument — a regular API key (`vk_…`) **or** a use token (`vut_…`) —
+which Vultrino validates per call and scopes to that principal's role. The
+argument is consumed by Vultrino and never forwarded to the target API.
 
 ```json
 {
-  "tool": "authenticate",
-  "arguments": {
-    "api_key": "vk_your_api_key_here"
-  }
+  "tool": "list_credentials",
+  "arguments": { "api_key": "vk_your_api_key_here" }
 }
 ```
 
-**Authentication flow:**
-1. Admin creates API key: `vultrino key create ai-agent --role executor`
-2. MCP server starts with storage password
-3. AI agent calls `authenticate` tool with its API key
-4. Server validates key and scopes subsequent requests to the key's role
+**Setup:**
+1. Admin creates an API key: `vultrino key create ai-agent --role executor`
+2. The agent includes that key as `api_key` in every tool call.
 
-**Without authentication:** Full access (for local development). In production, always have agents authenticate first.
+A tool call with a missing or invalid `api_key` is rejected. A **use-token**
+(`vut_`) agent sees only the named capabilities its token grants (plus
+`check_approval`), not the generic built-in tools below — those are for a direct
+operator holding a `vk_` key.
 
 ## Configuring AI Clients
 
@@ -88,7 +92,7 @@ Add to your MCP configuration:
 }
 ```
 
-**Important:** For scoped access, the AI agent should call the `authenticate` tool with its API key as the first action. Without authentication, the agent has full access to all credentials.
+**Important:** The agent must include its `api_key` (a `vk_` key or `vut_` use token) in **every** tool call; there is no separate authenticate step.
 
 ### Generic MCP Client
 
@@ -111,8 +115,8 @@ const client = new Client({
 
 await client.connect(transport);
 
-// Authenticate with API key for scoped access
-await client.callTool("authenticate", {
+// Every tool call carries the api_key (vk_ or vut_) — no separate authenticate step
+await client.callTool("list_credentials", {
   api_key: process.env.VULTRINO_API_KEY
 });
 ```
@@ -178,45 +182,38 @@ Make an authenticated HTTP request.
 > "Use github-api to get my user profile"
 > "Make a POST request to Stripe to create a customer using stripe-api"
 
-### `add_credential`
+### `get_credential_info`
 
-Add a new credential (requires write permission).
-
-**Input:**
-```json
-{
-  "alias": "new-api",
-  "type": "api_key",
-  "key": "secret-key-value",
-  "description": "Optional description"
-}
-```
-
-**Output:**
-```json
-{
-  "success": true,
-  "id": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
-
-### `delete_credential`
-
-Delete a credential (requires delete permission).
+Return metadata (type, description) for one credential — never the secret.
 
 **Input:**
 ```json
 {
-  "alias": "old-api"
+  "api_key": "vk_...",
+  "credential": "github-api"
 }
 ```
 
-**Output:**
+### `check_approval`
+
+Poll an action that was gated for human approval. Once approved, this tool runs
+the original action and returns its result; while pending it reports the status
+and tells the agent to keep polling. An agent may only poll approvals it created
+(same `api_key`/use token).
+
+**Input:**
 ```json
 {
-  "success": true
+  "api_key": "vk_...",
+  "approval_id": "appr_..."
 }
 ```
+
+> **Note:** Adding or deleting credentials is not exposed as an MCP tool. Use the
+> CLI (`vultrino add` / `vultrino remove`) or the admin JSON API. The built-in
+> MCP tools are `list_credentials`, `http_request`, `get_credential_info`, and
+> `check_approval`, plus any tools contributed by installed plugins or granted
+> capabilities.
 
 ## Security Model
 

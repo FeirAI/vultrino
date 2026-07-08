@@ -26,10 +26,12 @@ For programmatic access to documentation, these raw markdown paths are available
 
 ### Making Authenticated Requests
 
-**Via HTTP Proxy:**
+**Via HTTP API (`vultrino web`, default port 7879):**
 ```bash
-curl -H "X-Vultrino-Credential: <alias>" \
-     http://localhost:7878/https://target-api.com/endpoint
+curl -sX POST http://localhost:7879/api/v1/execute \
+     -H "Authorization: Bearer vk_your_api_key_here" \
+     -H "Content-Type: application/json" \
+     -d '{"credential": "<alias>", "method": "GET", "url": "https://target-api.com/endpoint"}'
 ```
 
 **Via MCP (AI Agents):**
@@ -136,26 +138,25 @@ Example response to user:
 
 ## HTTP API Quick Reference
 
-### Proxy Request
+Base URL `http://127.0.0.1:7879` (served by `vultrino web`). All routes are under
+`/api/v1/`. Authenticate every call with `Authorization: Bearer vk_…` (API key)
+or `vut_…` (use token). There is no credential header and no transparent proxy.
+
+### Execute an action
 ```
-GET /https://api.example.com/endpoint
-X-Vultrino-Credential: <alias>
-Authorization: Bearer <vultrino-api-key>  (if RBAC enabled)
+POST /api/v1/execute
+Authorization: Bearer <vk_ or vut_ token>
+Content-Type: application/json
+
+{"credential": "<alias>", "method": "GET", "url": "https://api.example.com/endpoint"}
 ```
+The body is flat; `action` is optional (defaults to `http.request`). Optional
+`headers`, `body`, and `query` fields are also accepted.
 
 ### List Credentials
 ```
-GET /v1/credentials
+GET /api/v1/credentials
 Authorization: Bearer <vultrino-api-key>
-```
-
-### Execute Action
-```
-POST /v1/execute
-Authorization: Bearer <vultrino-api-key>
-Content-Type: application/json
-
-{"credential": "<alias>", "action": "http.request", "params": {...}}
 ```
 
 ## Configuration Summary
@@ -166,13 +167,12 @@ Content-Type: application/json
 - `RUST_LOG` — Log level
 
 ### Default Ports
-- `7878` — HTTP proxy
-- `7879` — Web UI
+- `7879` — `vultrino web`: HTTP JSON API (`/api/v1/…`, `/mcp`, `/llm`) **and** the HTML admin UI
+- stdio — `vultrino mcp`: MCP server for local AI agents (no port)
 
 ### File Locations
-- `~/.vultrino/credentials.enc` — Encrypted credentials
-- `~/.vultrino/admin.json` — Admin auth
-- `/etc/vultrino/config.toml` — System config
+- `~/.local/share/vultrino/credentials.enc` — Encrypted vault (default; `~/` path is configurable)
+- Config: `--config <path>`, else the OS config dir (`~/.config/vultrino/config.toml` on Linux)
 
 ## Security Model
 

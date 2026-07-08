@@ -1,307 +1,152 @@
-# HTTP Proxy
+# HTTP API (Credential Broker)
 
-The Vultrino HTTP Proxy automatically injects credentials into outgoing HTTP requests, allowing applications to make authenticated API calls without knowing the actual secrets.
+Vultrino runs actions with a credential on the caller's behalf and injects the
+secret in-path, so the client makes authenticated calls without ever seeing the
+credential. There is **no** transparent forwarding proxy and **no** credential
+header — a caller names a credential alias and an action, and Vultrino executes
+it through the enforced Policy Enforcement Point.
 
-## Overview
+> **This page is a task-oriented overview.** The complete, code-verified route
+> table (every path, header, request/response shape, and error code) lives in
+> [`docs/dev/API.md`](../../dev/API.md). Where this page and the dev reference
+> differ, the dev reference wins.
 
-The proxy:
-- Accepts HTTP requests with a credential alias header
-- Looks up the credential from encrypted storage
-- Injects appropriate authentication (API key, Bearer token, Basic auth)
-- Forwards the request to the target URL
-- Returns the response to the client
+## The server
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Client     │────▶│   Vultrino   │────▶│   Target     │
-│   (no creds) │     │   Proxy      │     │   API        │
-└──────────────┘     └──────────────┘     └──────────────┘
-                     Injects auth header
-```
-
-## Starting the Proxy
+The JSON API is served by **`vultrino web`**, the same process that serves the
+HTML admin panel:
 
 ```bash
 export VULTRINO_PASSWORD="your-password"
-vultrino serve
-# Proxy listening on http://127.0.0.1:7878
+vultrino web
+# Listening on http://127.0.0.1:7879
 ```
 
 Custom bind address:
-```bash
-vultrino serve --bind 0.0.0.0:8080
-```
-
-## Making Requests
-
-### Using X-Vultrino-Credential Header
-
-The simplest method — specify the credential alias in a header:
 
 ```bash
-curl -H "X-Vultrino-Credential: github-api" \
-     http://localhost:7878/https://api.github.com/user
+vultrino web --bind 0.0.0.0:8080
 ```
 
-The proxy will:
-1. Extract the credential alias from `X-Vultrino-Credential`
-2. Look up the credential in storage
-3. Strip the header
-4. Add the appropriate auth header (e.g., `Authorization: Bearer ghp_xxx`)
-5. Forward to `https://api.github.com/user`
+The server speaks plaintext HTTP; terminate TLS at a reverse proxy for network
+exposure. `vultrino serve` does **not** serve this API — see [the CLI
+reference](./cli.md#serve).
 
-### With API Key Authentication
+## Authentication
 
-When using RBAC, include your Vultrino API key:
+Every JSON API route under `/api/v1/` (except `/api/v1/health`) authenticates a
+bearer token:
+
+```
+Authorization: Bearer vk_your_api_key      # an API key
+Authorization: Bearer vut_your_use_token   # a single-/multi-use scoped token
+```
+
+A `vut_` prefix is recognized as a **use token** (scoped to one credential/action
+with optional use limits); anything else is validated as an **API key**. Admin
+routes additionally require an API key whose role holds the `admin` permission
+(use tokens are rejected).
+
+## Running an action — `POST /api/v1/execute`
+
+The credential broker. Vultrino resolves the credential by alias, injects the
+secret, runs the action, scrubs the response, and returns it — the secret never
+leaves the vault.
 
 ```bash
-curl -H "Authorization: Bearer vk_your_api_key" \
-     -H "X-Vultrino-Credential: github-api" \
-     http://localhost:7878/https://api.github.com/user
+curl -sX POST http://127.0.0.1:7879/api/v1/execute \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "credential": "github-api",
+        "method": "GET",
+        "url": "https://api.github.com/user"
+      }'
 ```
 
-## URL Formats
+The request body is flat (not nested under `params`):
 
-### Full URL in Path
+| Field | Required | Notes |
+|-------|----------|-------|
+| `credential` | yes | Credential alias. |
+| `method` | yes | HTTP method. |
+| `url` | yes | Target URL (must be a public host — SSRF guard). |
+| `action` | no | Canonical `plugin.action` or a govder action label. Omitted → `http.request`. |
+| `headers` | no | Extra request headers. |
+| `body` | no | Request body (JSON). |
+| `query` | no | Query params. |
 
-```
-http://localhost:7878/https://api.github.com/user
-http://localhost:7878/https://api.stripe.com/v1/charges
-```
+**Success (`200`)** returns the upstream status, headers, and body (a string,
+after egress scrub):
 
-### Standard HTTP Proxy
-
-Configure your HTTP client to use Vultrino as a proxy:
-
-```bash
-export HTTP_PROXY=http://localhost:7878
-export HTTPS_PROXY=http://localhost:7878
-
-curl -H "X-Vultrino-Credential: github-api" \
-     https://api.github.com/user
+```json
+{ "status": 200, "headers": { "content-type": "application/json" }, "body": "…" }
 ```
 
-## Authentication Injection
+**Approval required (`202`)** — the action did **not** run; poll the returned
+`approval_id`:
 
-Vultrino automatically formats authentication based on credential type:
-
-### API Key
-
-For `api_key` credentials, injects as Bearer token:
-
-```
-Authorization: Bearer <key>
-```
-
-### Basic Auth
-
-For `basic_auth` credentials, injects Base64-encoded credentials:
-
-```
-Authorization: Basic <base64(username:password)>
-```
-
-### Custom Header
-
-Some APIs expect the key in a custom header. Configure in the credential metadata:
-
-```bash
-vultrino add --alias custom-api --key xxx \
-  --metadata '{"header_name": "X-API-Key"}'
-```
-
-Results in:
-```
-X-API-Key: xxx
-```
-
-## Request Flow
-
-1. **Receive Request**
-   - Parse target URL from path or proxy request
-   - Extract `X-Vultrino-Credential` header
-   - Extract `Authorization` header (if RBAC enabled)
-
-2. **Authenticate**
-   - Validate API key (if provided)
-   - Check role permissions
-   - Verify credential scope access
-
-3. **Policy Check**
-   - Evaluate policies for the credential
-   - Check URL patterns, methods, rate limits
-   - Deny if any policy fails
-
-4. **Credential Injection**
-   - Decrypt credential from storage
-   - Format appropriate auth header
-   - Remove Vultrino-specific headers
-
-5. **Forward Request**
-   - Send to target URL
-   - Stream response back to client
-   - Log audit entry
-
-## Configuration
-
-```toml
-[server]
-bind = "127.0.0.1:7878"
-mode = "local"              # "local" or "server"
-timeout = 30                # Request timeout in seconds
-max_body_size = 10485760    # 10MB max request body
-
-[proxy]
-strip_headers = [           # Headers to remove before forwarding
-  "X-Vultrino-Credential",
-  "X-Vultrino-Policy",
-]
-inject_headers = {          # Headers to add to all requests
-  "X-Forwarded-By" = "vultrino"
-}
-```
-
-## Error Responses
-
-### 400 Bad Request
-
-Missing credential header:
 ```json
 {
-  "error": "missing_credential",
-  "message": "X-Vultrino-Credential header is required"
+  "outcome": "pending_approval",
+  "approval_id": "appr_…",
+  "message": "This action requires human approval before it runs. … Poll GET /api/v1/approvals/{id} …",
+  "summary": "http.request on deploy-hook",
+  "expires_at": "2026-06-20T11:30:00Z"
 }
 ```
 
-### 401 Unauthorized
+Poll `GET /api/v1/approvals/{id}` with the **same** bearer; the action runs at
+most once, on the first poll after a human approves.
 
-Invalid or expired API key:
+## Injection by credential type
+
+Vultrino formats the injected auth from the stored credential type — for example
+`api_key` becomes `Authorization: Bearer <key>` (or a custom header per the
+credential's `header_name`/`header_prefix`), `basic_auth` becomes
+`Authorization: Basic <base64(user:pass)>`, and `oauth2` injects (and refreshes)
+the access token. The client sends none of these; it only names the alias.
+
+## Listing credentials — `GET /api/v1/credentials`
+
+Metadata only — secrets are never returned. Requires the `read` permission and
+is filtered to the caller's role scope.
+
 ```json
-{
-  "error": "unauthorized",
-  "message": "Invalid or expired API key"
-}
+{ "credentials": [ { "alias": "github-api", "credential_type": "api_key", "description": "…" } ] }
 ```
 
-### 403 Forbidden
+There is no `GET /api/v1/credentials/{alias}` route. Credential **writes**
+(`POST /api/v1/credentials`, `DELETE /api/v1/credentials/{id}`) are admin-only —
+see [Admin API](../api/admin.md).
 
-Permission denied by RBAC or policy:
-```json
-{
-  "error": "forbidden",
-  "message": "Permission denied for credential 'github-api'"
-}
-```
+## Other surfaces on the same server
 
-### 404 Not Found
+The `web` process also serves, on the same port:
 
-Credential not found:
-```json
-{
-  "error": "not_found",
-  "message": "Credential 'unknown-api' not found"
-}
-```
+- **`POST /mcp`** — the networked MCP transport (JSON-RPC), for remote agent
+  harnesses. See [MCP Server](./mcp.md).
+- **`POST /llm` and `/llm/channels/{channel}/…`** — the metered LLM proxy: point
+  a harness's model `base_url` here so the provider key stays in the vault and
+  token spend is metered. Providers are default-deny (`VULTRINO_PROVIDER_*_ENABLED`).
+  See [the LLM proxy reference](../../dev/API.md#metered-llm-proxy-connector-m1-decision-5).
+- **`POST /api/v1/workload/exchange`** and **`GET /api/v1/runtime/control`** — the
+  workload-identity token exchange (a signed `vwa_` assertion is traded for
+  short-lived use tokens) and its non-consuming liveness lease.
 
-### 502 Bad Gateway
+## Error responses
 
-Target server error:
-```json
-{
-  "error": "upstream_error",
-  "message": "Failed to connect to target server"
-}
-```
-
-## Language Examples
-
-### curl
-
-```bash
-curl -H "X-Vultrino-Credential: github-api" \
-     http://localhost:7878/https://api.github.com/user
-```
-
-### Python
-
-```python
-import requests
-
-response = requests.get(
-    "http://localhost:7878/https://api.github.com/user",
-    headers={"X-Vultrino-Credential": "github-api"}
-)
-print(response.json())
-```
-
-### JavaScript (Node.js)
-
-```javascript
-const response = await fetch(
-  "http://localhost:7878/https://api.github.com/user",
-  {
-    headers: {
-      "X-Vultrino-Credential": "github-api"
-    }
-  }
-);
-const data = await response.json();
-```
-
-### Go
-
-```go
-req, _ := http.NewRequest("GET",
-    "http://localhost:7878/https://api.github.com/user", nil)
-req.Header.Set("X-Vultrino-Credential", "github-api")
-
-client := &http.Client{}
-resp, _ := client.Do(req)
-```
-
-### Rust
-
-```rust
-let client = reqwest::Client::new();
-let response = client
-    .get("http://localhost:7878/https://api.github.com/user")
-    .header("X-Vultrino-Credential", "github-api")
-    .send()
-    .await?;
-```
-
-## Performance
-
-### Connection Pooling
-
-The proxy maintains connection pools to frequently accessed backends, reducing latency for repeated requests.
-
-### Streaming
-
-Large responses are streamed directly to the client without buffering the entire body in memory.
-
-### Caching
-
-The proxy does not cache responses. Implement caching in your application or use a dedicated cache layer.
+JSON API errors are `{ "error": "message", "code": "machine_code" }`. Common:
+`400 execute_error` (policy denied, credential not found, SSRF block, plugin
+error), `401 missing_api_key` / `invalid_api_key` / `invalid_token`,
+`403 permission_denied` / `not_admin` / `token_unusable`, `404 *_not_found`.
 
 ## Security
 
-### Network Binding
-
-Always bind to localhost in production. Use a reverse proxy (nginx, Caddy) for external access.
-
-### TLS
-
-The proxy can make requests to HTTPS endpoints. For production, also put the proxy itself behind TLS.
-
-### Audit Logging
-
-All requests are logged with:
-- Timestamp
-- Credential alias used
-- Target URL
-- HTTP method
-- Source IP
-- Response status
-
-Audit logs never include actual credential values.
+- **Bind to localhost** and put a TLS-terminating reverse proxy (nginx, Caddy) in
+  front for any network exposure.
+- **Default-deny policy.** A credential matching no policy is denied unless
+  `[enforcement] default_action = "allow"`. See [Policy Configuration](../guides/policies.md).
+- **Egress scrub.** Responses are scanned and the credential's own reflected
+  secret is redacted before return; `[[egress]]` rules can block or redact
+  further. See [Configuration](../getting-started/configuration.md#egress-controls).

@@ -5,10 +5,12 @@ Complete reference for Vultrino's Model Context Protocol (MCP) tools.
 ## Overview
 
 Vultrino exposes tools through MCP that allow AI agents to:
-- List available credentials
-- Make authenticated HTTP requests
-- Manage credentials (with appropriate permissions)
+- List available credentials (`list_credentials`) and inspect one (`get_credential_info`)
+- Make authenticated HTTP requests (`http_request`)
 - Poll for human approval of gated actions (`check_approval`)
+
+Installed plugins and granted capabilities can contribute additional named tools.
+Credential writes are **not** MCP tools (see the note below `get_credential_info`).
 
 > **Authentication.** Every tool takes an `api_key` argument. It accepts a regular API key (`vk_…`) **or** a [use token](../guides/use-tokens.md) (`vut_…`). A use token additionally constrains which credential and action the call may use, and how many times. The `api_key` argument is consumed by Vultrino and is **never** forwarded to the target API or plugin.
 
@@ -25,8 +27,11 @@ List all credentials available to the current session.
   "description": "List all available credential aliases. Returns metadata only, never actual secrets.",
   "inputSchema": {
     "type": "object",
-    "properties": {},
-    "required": []
+    "properties": {
+      "api_key": { "type": "string", "description": "API key (vk_) or use token (vut_)" },
+      "pattern": { "type": "string", "description": "Optional glob to filter aliases (e.g. 'github-*')" }
+    },
+    "required": ["api_key"]
   }
 }
 ```
@@ -74,6 +79,10 @@ Make an authenticated HTTP request using a stored credential.
   "inputSchema": {
     "type": "object",
     "properties": {
+      "api_key": {
+        "type": "string",
+        "description": "API key (vk_) or use token (vut_)"
+      },
       "credential": {
         "type": "string",
         "description": "Alias of the credential to use for authentication"
@@ -85,21 +94,23 @@ Make an authenticated HTTP request using a stored credential.
       },
       "url": {
         "type": "string",
-        "description": "Target URL (must be HTTPS for security)"
+        "description": "Target URL"
       },
       "headers": {
         "type": "object",
         "description": "Additional headers to include in the request",
-        "additionalProperties": {
-          "type": "string"
-        }
+        "additionalProperties": { "type": "string" }
       },
       "body": {
-        "type": "string",
         "description": "Request body (for POST, PUT, PATCH requests)"
+      },
+      "query": {
+        "type": "object",
+        "description": "Query parameters to append to the URL",
+        "additionalProperties": { "type": "string" }
       }
     },
-    "required": ["credential", "method", "url"]
+    "required": ["api_key", "credential", "method", "url"]
   }
 }
 ```
@@ -200,156 +211,55 @@ A `Denied` or `Expired` status returns a `message` instructing the agent to stop
 
 ---
 
-### add_credential
+### get_credential_info
 
-Add a new credential to storage.
-
-**Schema:**
-```json
-{
-  "name": "add_credential",
-  "description": "Store a new credential. The credential will be encrypted at rest and only accessible by alias.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "alias": {
-        "type": "string",
-        "description": "Unique human-readable name for this credential"
-      },
-      "type": {
-        "type": "string",
-        "enum": ["api_key", "basic_auth"],
-        "description": "Type of credential"
-      },
-      "key": {
-        "type": "string",
-        "description": "API key or token value (for api_key type)"
-      },
-      "username": {
-        "type": "string",
-        "description": "Username (for basic_auth type)"
-      },
-      "password": {
-        "type": "string",
-        "description": "Password (for basic_auth type)"
-      },
-      "description": {
-        "type": "string",
-        "description": "Optional description of what this credential is for"
-      }
-    },
-    "required": ["alias", "type"]
-  }
-}
-```
-
-**Input (API Key):**
-```json
-{
-  "alias": "new-service-api",
-  "type": "api_key",
-  "key": "sk_live_xxxxxxxxxxxx",
-  "description": "API key for new service"
-}
-```
-
-**Input (Basic Auth):**
-```json
-{
-  "alias": "jenkins-ci",
-  "type": "basic_auth",
-  "username": "admin",
-  "password": "token123",
-  "description": "Jenkins CI access"
-}
-```
-
-**Output:**
-```json
-{
-  "success": true,
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "alias": "new-service-api"
-}
-```
-
-**Required Permission:** `write`
-
-**Error Responses:**
-
-| Error | Description |
-|-------|-------------|
-| `permission_denied` | No write permission |
-| `alias_exists` | A credential with this alias already exists |
-| `invalid_type` | Unknown credential type |
-
----
-
-### delete_credential
-
-Remove a credential from storage.
+Return metadata about one credential — its type and description. Never exposes the
+secret value.
 
 **Schema:**
 ```json
 {
-  "name": "delete_credential",
-  "description": "Delete a credential by its alias. This action cannot be undone.",
+  "name": "get_credential_info",
+  "description": "Get metadata (type, description) for a specific credential. Does not expose the actual secret value.",
   "inputSchema": {
     "type": "object",
     "properties": {
-      "alias": {
-        "type": "string",
-        "description": "Alias of the credential to delete"
-      }
+      "api_key": { "type": "string", "description": "API key or use token" },
+      "credential": { "type": "string", "description": "The credential alias or id" }
     },
-    "required": ["alias"]
+    "required": ["api_key", "credential"]
   }
 }
 ```
 
-**Input:**
-```json
-{
-  "alias": "old-api-key"
-}
-```
-
-**Output:**
-```json
-{
-  "success": true
-}
-```
-
-**Required Permission:** `delete`
-
-**Error Responses:**
-
-| Error | Description |
-|-------|-------------|
-| `permission_denied` | No delete permission |
-| `not_found` | Credential with this alias not found |
+**Required Permission:** `read`
 
 ---
+
+> **Credential writes are not MCP tools.** The stdio/networked MCP server exposes
+> exactly four built-in tools — `list_credentials`, `http_request`,
+> `get_credential_info`, `check_approval` — plus any tools contributed by
+> installed plugins or granted capabilities. To add or delete credentials, use the
+> CLI (`vultrino add` / `vultrino remove`) or the admin JSON API
+> (`POST /api/v1/credentials`, `DELETE /api/v1/credentials/{id}`). There is no
+> `add_credential` or `delete_credential` tool.
 
 ## Permission Requirements
 
 | Tool | Required Permission |
 |------|---------------------|
 | `list_credentials` | `read` |
+| `get_credential_info` | `read` |
 | `http_request` | `execute` |
 | `check_approval` | `execute` |
-| `add_credential` | `write` |
-| `delete_credential` | `delete` |
 
 ## Scope Restrictions
 
 If the API key's role has credential scopes, tools are further restricted:
 
 - `list_credentials` — Only shows credentials matching scope patterns
+- `get_credential_info` — Only resolves credentials matching scope patterns
 - `http_request` — Only works with credentials matching scope patterns
-- `add_credential` — New credentials must match scope patterns
-- `delete_credential` — Can only delete credentials matching scope patterns
 
 ## Error Format
 

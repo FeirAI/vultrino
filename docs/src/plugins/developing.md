@@ -228,7 +228,7 @@ The output will be at `target/wasm32-wasip1/release/my_plugin.wasm`.
 
 1. Copy or symlink your plugin to `~/.vultrino/plugins/my-plugin/`
 2. Ensure `plugin.toml` and the `.wasm` file are present
-3. Start Vultrino: `vultrino serve`
+3. Start Vultrino: `vultrino web` (or `vultrino mcp` for the MCP server)
 4. The plugin should be loaded automatically
 
 ## Best Practices

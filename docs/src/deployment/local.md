@@ -12,13 +12,16 @@ vultrino init
 vultrino add --alias github-api --key ghp_xxx
 
 # 3. Start services
-vultrino web &          # Web UI on :7879
-vultrino serve --mcp    # MCP server (stdio)
+vultrino web &          # HTTP API + web UI on :7879
+vultrino mcp            # MCP server (stdio) for AI agents
 ```
 
 ## Running Components
 
-### Web UI Only
+### HTTP API + Web UI
+
+The `web` process serves the JSON API (`/api/v1/…`), the connector routes
+(`/mcp`, `/llm`), and the HTML admin UI on one port:
 
 ```bash
 export VULTRINO_PASSWORD="your-password"
@@ -28,20 +31,15 @@ vultrino web
 
 ### MCP Server Only
 
-For AI agent integration:
+For local AI agent integration over stdio:
 
 ```bash
 export VULTRINO_PASSWORD="your-password"
-vultrino serve --mcp
+vultrino mcp   # equivalently: vultrino serve --mcp
 ```
 
-### HTTP Proxy
-
-```bash
-export VULTRINO_PASSWORD="your-password"
-vultrino serve
-# Proxy on http://127.0.0.1:7878
-```
+> `vultrino serve` on its own does **not** start an API server (it's a stub that
+> redirects you to `vultrino web`). Use `vultrino web` for HTTP.
 
 ## Configuration for Local Use
 
@@ -49,7 +47,6 @@ The default configuration is optimized for local development:
 
 ```toml
 [server]
-bind = "127.0.0.1:7878"  # Localhost only
 mode = "local"
 
 [storage]
@@ -65,7 +62,7 @@ Add to your Claude Desktop MCP configuration (`~/Library/Application Support/Cla
   "mcpServers": {
     "vultrino": {
       "command": "/path/to/vultrino",
-      "args": ["serve", "--mcp"],
+      "args": ["mcp"],
       "env": {
         "VULTRINO_PASSWORD": "your-password"
       }

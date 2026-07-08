@@ -102,14 +102,15 @@ any endpoint (the create response carries metadata only).
 delivered as part of the **signed webhook outbox** (see the events/outbox
 guide), which owns webhook configuration and ordered, replayable delivery.
 
-## Deployment note (vault format v4)
+## Deployment note (vault format)
 
-The admin API stores policies and idempotency records, which bumped the vault
-format from v3 to v4. A v4-aware binary reads v3 vaults fine, but the **first
-admin write upgrades the on-disk vault to v4**, after which any still-running v3
-binary (a not-yet-upgraded MCP or CLI process sharing the same vault) is refused
-the vault entirely. **Upgrade all vultrino processes before issuing admin
-writes** to avoid breaking the un-upgraded enforcement plane.
+The admin API's stored policies and idempotency records live in the encrypted
+vault, whose on-disk format is versioned (`STORAGE_VERSION`, currently **7**). A
+newer binary reads an older vault fine, but the **first write upgrades the on-disk
+format**, after which any still-running older binary (a not-yet-upgraded MCP or
+CLI process sharing the same vault) is refused the vault entirely. **Upgrade all
+vultrino processes before issuing admin writes** to avoid breaking the
+un-upgraded enforcement plane.
 
 ## Example
 

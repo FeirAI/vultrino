@@ -20,7 +20,7 @@
 
 - [CLI Reference](./components/cli.md)
 - [Web UI](./components/web-ui.md)
-- [HTTP Proxy](./components/proxy.md)
+- [HTTP API](./components/proxy.md)
 - [MCP Server](./components/mcp.md)
 
 # Guides

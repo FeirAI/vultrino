@@ -29,7 +29,8 @@ Create `/etc/vultrino/config.toml`:
 
 ```toml
 [server]
-bind = "127.0.0.1:7878"
+# `mode = "server"` enables the stricter server posture. `vultrino web` binds
+# 127.0.0.1:7879 by default (the systemd unit below sets it explicitly with --bind).
 mode = "server"
 
 [storage]
@@ -79,41 +80,16 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 ```
 
-### HTTP Proxy Service
-
-Create `/etc/systemd/system/vultrino-proxy.service`:
-
-```ini
-[Unit]
-Description=Vultrino HTTP Proxy
-After=network.target
-
-[Service]
-Type=simple
-User=vultrino
-Group=vultrino
-Environment="VULTRINO_PASSWORD=your-secure-password"
-Environment="VULTRINO_CONFIG=/etc/vultrino/config.toml"
-ExecStart=/usr/local/bin/vultrino serve --bind 127.0.0.1:7878
-Restart=always
-RestartSec=5
-
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/var/lib/vultrino
-PrivateTmp=yes
-
-[Install]
-WantedBy=multi-user.target
-```
+The single `vultrino web` process serves the HTTP JSON API (`/api/v1/…`), the
+connector routes (`/mcp`, `/llm`), and the admin UI — there is no separate proxy
+service. (`vultrino serve` no longer starts an API server.)
 
 Enable and start:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable vultrino-web vultrino-proxy
-sudo systemctl start vultrino-web vultrino-proxy
+sudo systemctl enable vultrino-web
+sudo systemctl start vultrino-web
 ```
 
 ## Reverse Proxy Setup
@@ -142,20 +118,13 @@ server {
     ssl_certificate /etc/letsencrypt/live/vultrino.yourdomain.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/vultrino.yourdomain.com/privkey.pem;
 
-    # Web UI
+    # Web UI + JSON API (both served by vultrino web on 7879)
     location / {
         proxy_pass http://127.0.0.1:7879;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    # API/Proxy endpoint (optional)
-    location /proxy/ {
-        proxy_pass http://127.0.0.1:7878/;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
     }
 }
 ```
@@ -174,8 +143,7 @@ Create `/etc/caddy/Caddyfile`:
 
 ```
 vultrino.yourdomain.com {
-    reverse_proxy /proxy/* 127.0.0.1:7878
-    reverse_proxy * 127.0.0.1:7879
+    reverse_proxy 127.0.0.1:7879
 }
 ```
 
@@ -216,7 +184,7 @@ sudo -u vultrino VULTRINO_PASSWORD="$VULTRINO_PASSWORD" vultrino add --alias git
 
 ### Check service status
 ```bash
-sudo systemctl status vultrino-web vultrino-proxy
+sudo systemctl status vultrino-web
 ```
 
 ### View logs
@@ -242,5 +210,5 @@ sudo tar -czf vultrino-backup-$(date +%Y%m%d).tar.gz \
 ### Restore
 ```bash
 sudo tar -xzf vultrino-backup-YYYYMMDD.tar.gz -C /
-sudo systemctl restart vultrino-web vultrino-proxy
+sudo systemctl restart vultrino-web
 ```

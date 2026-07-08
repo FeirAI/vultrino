@@ -121,14 +121,16 @@ Navigate to `/credentials` in the web interface for a visual list.
 ### CLI Request
 
 ```bash
-vultrino request -c github-api https://api.github.com/user
+vultrino request github-api https://api.github.com/user
 ```
 
-### HTTP Proxy
+### HTTP API
 
 ```bash
-curl -H "X-Vultrino-Credential: github-api" \
-     http://localhost:7878/https://api.github.com/user
+curl -sX POST http://localhost:7879/api/v1/execute \
+     -H "Authorization: Bearer vk_your_api_key" \
+     -H "Content-Type: application/json" \
+     -d '{"credential": "github-api", "method": "GET", "url": "https://api.github.com/user"}'
 ```
 
 ### MCP (AI Agents)
@@ -143,9 +145,9 @@ AI: "Using github-api to fetch your profile..."
 
 Currently, to update a credential:
 
-1. Delete the old credential:
+1. Remove the old credential:
    ```bash
-   vultrino delete github-api
+   vultrino remove github-api
    ```
 
 2. Add the new one:
@@ -160,13 +162,8 @@ Future versions will support in-place updates.
 ### CLI
 
 ```bash
-vultrino delete old-api-key
-# Confirm deletion? [y/N] y
-```
-
-Force delete without confirmation:
-```bash
-vultrino delete old-api-key --force
+vultrino remove old-api-key
+# Deleted credential: old-api-key
 ```
 
 ### Web UI

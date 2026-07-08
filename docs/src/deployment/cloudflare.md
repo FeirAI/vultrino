@@ -103,9 +103,10 @@ app.post('/login', async (c) => {
   // ...
 });
 
-// Execute request with credential
-app.post('/v1/execute', async (c) => {
-  const { credential, action, params } = await c.req.json();
+// Execute request with credential (mirrors the shipped POST /api/v1/execute:
+// a flat body with credential/method/url, not a nested `params` object)
+app.post('/api/v1/execute', async (c) => {
+  const { credential, method, url, headers, body } = await c.req.json();
 
   // Get encrypted credential from KV
   const encryptedCred = await c.env.CREDENTIALS.get(credential);
@@ -117,7 +118,7 @@ app.post('/v1/execute', async (c) => {
   const cred = await decrypt(encryptedCred, c.env.ENCRYPTION_KEY);
 
   // Execute request with injected auth
-  const response = await executeWithCredential(cred, params);
+  const response = await executeWithCredential(cred, { method, url, headers, body });
 
   return c.json(response);
 });

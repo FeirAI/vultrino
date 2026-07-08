@@ -329,7 +329,7 @@ Rules are evaluated in order. First matching rule determines the action.
 Enable debug logging to see policy evaluation:
 
 ```bash
-RUST_LOG=vultrino=debug vultrino serve
+RUST_LOG=vultrino=debug vultrino web
 ```
 
 Output:
@@ -338,17 +338,6 @@ DEBUG vultrino::policy: Evaluating policy "github-readonly" for credential "gith
 DEBUG vultrino::policy: Rule 1 url_match: matched
 DEBUG vultrino::policy: Rule 2 method_match: GET in [GET, HEAD] = true
 DEBUG vultrino::policy: Result: allow
-```
-
-### Test Policies
-
-Test a policy without making real requests:
-
-```bash
-vultrino policy test --credential github-api \
-  --url "https://api.github.com/user" \
-  --method GET
-# Result: allow (matched rule 1: url_match)
 ```
 
 ### Audit Log
@@ -456,6 +445,8 @@ name = "ai-no-destructive"
 credential_pattern = "ai-*"
 ```
 
-### 5. Test Before Deploying
+### 5. Verify Before Deploying
 
-Use the policy test command to verify behavior before applying in production.
+Confirm a policy behaves as intended before relying on it in production: enable
+debug logging (`RUST_LOG=vultrino=debug`) and exercise the credential, then check
+the evaluation trace and the `policy_denied` events in the audit trail.

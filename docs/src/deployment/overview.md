@@ -52,13 +52,13 @@ Credentials are stored encrypted using AES-256-GCM. Storage options:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        LOCAL                                     │
-│  vultrino serve                                                  │
+│  vultrino web  (+ vultrino mcp for AI agents)                    │
 │  ├── Best for: Personal use, development                        │
 │  ├── Security: Localhost only                                   │
 │  └── Setup: Minimal                                              │
 ├─────────────────────────────────────────────────────────────────┤
 │                        VPS/SERVER                                │
-│  vultrino serve + nginx/caddy                                   │
+│  vultrino web + nginx/caddy                                     │
 │  ├── Best for: Team use, production                             │
 │  ├── Security: TLS, firewall, auth                              │
 │  └── Setup: Moderate (systemd, reverse proxy)                   │

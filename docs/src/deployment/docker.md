@@ -35,7 +35,7 @@ USER vultrino
 WORKDIR /data
 VOLUME ["/data"]
 
-EXPOSE 7878 7879
+EXPOSE 7879
 
 ENTRYPOINT ["vultrino"]
 CMD ["web"]
@@ -65,18 +65,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-
-  vultrino-proxy:
-    image: ghcr.io/vultrino/vultrino:latest
-    command: serve --bind 0.0.0.0:7878
-    ports:
-      - "7878:7878"
-    environment:
-      - VULTRINO_PASSWORD=${VULTRINO_PASSWORD}
-    volumes:
-      - vultrino-data:/data
-      - ./config.toml:/etc/vultrino/config.toml:ro
-    restart: unless-stopped
 
 volumes:
   vultrino-data:
@@ -250,9 +238,9 @@ docker run -it --rm \
 ## Health Checks
 
 ```bash
-# Check web UI
+# Check the web UI
 curl -f http://localhost:7879/login
 
-# Check proxy
-curl -f http://localhost:7878/health
+# Check the JSON API (no auth required)
+curl -f http://localhost:7879/api/v1/health
 ```

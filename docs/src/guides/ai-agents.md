@@ -35,18 +35,23 @@ vultrino mcp
 **Setup:**
 See [MCP Server documentation](../components/mcp.md) for configuration.
 
-### 2. HTTP Proxy
+### 2. HTTP API
 
 For agents that can make HTTP requests:
 
 ```bash
-vultrino serve  # Start proxy on :7878
+vultrino web  # Start the JSON API + admin UI on 127.0.0.1:7879
 ```
 
-The agent makes requests like:
+The agent POSTs the credential alias and target to the execute endpoint (there is
+no credential header and no transparent proxy):
+
 ```
-GET http://vultrino:7878/https://api.github.com/user
-X-Vultrino-Credential: github-api
+POST http://vultrino:7879/api/v1/execute
+Authorization: Bearer vk_your_api_key
+Content-Type: application/json
+
+{"credential": "github-api", "method": "GET", "url": "https://api.github.com/user"}
 ```
 
 **Pros:**
@@ -59,7 +64,7 @@ X-Vultrino-Credential: github-api
 For agents that can execute shell commands:
 
 ```bash
-vultrino request -c github-api https://api.github.com/user
+vultrino request github-api https://api.github.com/user
 ```
 
 **Pros:**

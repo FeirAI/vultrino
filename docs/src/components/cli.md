@@ -109,20 +109,19 @@ vultrino list
 
 ---
 
-### `get`
+### `info`
 
-Get details about a specific credential.
+Show details about a specific credential — metadata only, never the secret.
 
 ```bash
-vultrino get <ALIAS>
-
-Options:
-  --show-secret    Display the secret value (use with caution)
+vultrino info <ALIAS>
 ```
+
+Accepts a credential alias or id.
 
 **Example:**
 ```bash
-vultrino get github-api
+vultrino info github-api
 # Alias: github-api
 # Type: api_key
 # Created: 2024-01-15T10:30:00Z
@@ -131,21 +130,19 @@ vultrino get github-api
 
 ---
 
-### `delete`
+### `remove`
 
 Remove a credential from storage.
 
 ```bash
-vultrino delete <ALIAS>
-
-Options:
-  --force    Skip confirmation prompt
+vultrino remove <ALIAS>
 ```
+
+Accepts a credential alias or id.
 
 **Example:**
 ```bash
-vultrino delete old-api-key
-# Are you sure you want to delete 'old-api-key'? [y/N] y
+vultrino remove old-api-key
 # Deleted credential: old-api-key
 ```
 
@@ -153,34 +150,33 @@ vultrino delete old-api-key
 
 ### `serve`
 
-Start the HTTP proxy server.
+Run the MCP server (with `--mcp`). **`serve` on its own no longer starts an API
+server** — it prints a message directing you to `vultrino web` and exits without
+binding. Use `vultrino web` for the HTTP JSON API and admin UI, and `vultrino mcp`
+(or `vultrino serve --mcp`) for the MCP stdio server.
 
 ```bash
 vultrino serve [OPTIONS]
 
 Options:
-  -b, --bind <ADDR>    Bind address [default: 127.0.0.1:7878]
-  --mcp                Start as MCP server (stdio transport)
+  -b, --bind <ADDR>    Bind address for the legacy stub [default: 127.0.0.1:7878]
+  --mcp                Start as MCP server (stdio transport) — same as `vultrino mcp`
 ```
 
 **Examples:**
 ```bash
-# Start HTTP proxy
-vultrino serve
-# Listening on http://127.0.0.1:7878
-
-# Start on custom port
-vultrino serve --bind 0.0.0.0:8080
-
 # Start MCP server for AI agents
-vultrino serve --mcp
+vultrino serve --mcp   # equivalently: vultrino mcp
+
+# `vultrino serve` alone does NOT serve the API — use `vultrino web` instead
 ```
 
 ---
 
 ### `web`
 
-Start the web administration UI.
+Start the HTTP JSON API and web administration UI (the same process serves both,
+plus the `/mcp` and `/llm` connector routes).
 
 ```bash
 vultrino web [OPTIONS]
@@ -192,7 +188,7 @@ Options:
 **Example:**
 ```bash
 vultrino web
-# Web UI available at http://127.0.0.1:7879
+# API + Web UI available at http://127.0.0.1:7879
 ```
 
 ---
@@ -202,30 +198,33 @@ vultrino web
 Make an authenticated HTTP request.
 
 ```bash
-vultrino request [OPTIONS] <URL>
+vultrino request [OPTIONS] <CREDENTIAL> <URL>
+
+Arguments:
+  <CREDENTIAL>                Credential alias to use for authentication
+  <URL>                       Target URL
 
 Options:
-  -c, --credential <ALIAS>    Credential to use (required)
   -X, --method <METHOD>       HTTP method [default: GET]
   -H, --header <HEADER>       Additional headers (can be repeated)
-  -d, --data <DATA>           Request body
-  --json                      Output response as JSON
+  -d, --data <DATA>           Request body (JSON string, or @filename to read from a file)
+  -q, --quiet                 Output only the response body (no status info)
 ```
 
 **Examples:**
 ```bash
-# Simple GET request
-vultrino request -c github-api https://api.github.com/user
+# Simple GET request (credential alias is the first positional argument)
+vultrino request github-api https://api.github.com/user
 
 # POST with JSON body
-vultrino request -c stripe-api \
+vultrino request stripe-api \
   -X POST \
   -H "Content-Type: application/json" \
   -d '{"amount": 1000, "currency": "usd"}' \
   https://api.stripe.com/v1/charges
 
-# With verbose output
-vultrino request -c api-key https://api.example.com/data --json
+# Body only
+vultrino request api-key https://api.example.com/data --quiet
 ```
 
 ---

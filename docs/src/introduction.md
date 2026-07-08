@@ -60,7 +60,7 @@ vultrino serve --mcp
 |-----------|-------------|
 | **CLI** | Command-line interface for all operations |
 | **Web UI** | Browser-based admin dashboard |
-| **HTTP Proxy** | Makes authenticated requests on behalf of agents |
+| **HTTP API** | `POST /api/v1/execute` runs authenticated requests on behalf of agents (served by `vultrino web`) |
 | **MCP Server** | Model Context Protocol server for LLM integration |
 
 ## Next Steps
