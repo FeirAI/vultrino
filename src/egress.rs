@@ -28,7 +28,9 @@ pub const MIN_REDACT_LEN: usize = 5;
 /// the always-on scrubbing would NOT catch a reflection of it). Used to warn
 /// operators at credential-store time.
 pub fn has_unredactable_secret(secrets: &[Zeroizing<String>]) -> bool {
-    secrets.iter().any(|s| !s.is_empty() && s.len() < MIN_REDACT_LEN)
+    secrets
+        .iter()
+        .any(|s| !s.is_empty() && s.len() < MIN_REDACT_LEN)
 }
 
 /// Build the set of forms to scrub for a credential's secret material: the raw
@@ -238,7 +240,8 @@ pub fn redact_secret_material(
 fn json_escaped_inner(s: &str) -> Option<String> {
     let json = serde_json::to_string(s).ok()?;
     // `to_string` of a string is always `"..."`, so slice off one quote each end.
-    json.get(1..json.len().checked_sub(1)?).map(|s| s.to_string())
+    json.get(1..json.len().checked_sub(1)?)
+        .map(|s| s.to_string())
 }
 
 /// If a response is still compressed (a `Content-Encoding` the HTTP client did
@@ -255,7 +258,8 @@ pub fn block_if_compressed(resp: &mut ExecuteResponse) -> bool {
             b"[vultrino: response withheld - a compressed body could not be scrubbed for secrets]"
                 .to_vec();
         resp.headers.clear();
-        resp.headers.insert("Content-Type".to_string(), "text/plain".to_string());
+        resp.headers
+            .insert("Content-Type".to_string(), "text/plain".to_string());
         return true;
     }
     false
@@ -316,11 +320,13 @@ pub fn apply_egress(
     };
     if rule.block {
         resp.body =
-            b"[vultrino: response body withheld by egress policy (secret-bearing endpoint)]".to_vec();
+            b"[vultrino: response body withheld by egress policy (secret-bearing endpoint)]"
+                .to_vec();
         // Headers can also carry secrets (Set-Cookie, tokens) — drop them too,
         // then label the placeholder body.
         resp.headers.clear();
-        resp.headers.insert("Content-Type".to_string(), "text/plain".to_string());
+        resp.headers
+            .insert("Content-Type".to_string(), "text/plain".to_string());
         return true;
     }
     if rule.redact_patterns.is_empty() {
@@ -654,7 +660,10 @@ mod tests {
     }
 
     fn secrets(items: &[&str]) -> Vec<Zeroizing<String>> {
-        items.iter().map(|s| Zeroizing::new(s.to_string())).collect()
+        items
+            .iter()
+            .map(|s| Zeroizing::new(s.to_string()))
+            .collect()
     }
 
     fn rule(cred: &str, action: &str, block: bool, patterns: &[&str]) -> EgressRule {
@@ -669,8 +678,15 @@ mod tests {
     #[test]
     fn test_redact_secret_material_body_and_headers() {
         let mut r = resp("token is sk-supersecret-123 here");
-        r.headers.insert("X-Echo".to_string(), "Bearer sk-supersecret-123".to_string());
-        assert!(redact_secret_material(&mut r, &secrets(&["sk-supersecret-123"]), "stripe"));
+        r.headers.insert(
+            "X-Echo".to_string(),
+            "Bearer sk-supersecret-123".to_string(),
+        );
+        assert!(redact_secret_material(
+            &mut r,
+            &secrets(&["sk-supersecret-123"]),
+            "stripe"
+        ));
         let body = String::from_utf8_lossy(&r.body);
         assert!(!body.contains("sk-supersecret-123"));
         assert!(body.contains("[REDACTED:stripe]"));
@@ -680,7 +696,11 @@ mod tests {
     #[test]
     fn test_redact_returns_false_when_no_secret_present() {
         let mut r = resp("nothing sensitive here");
-        assert!(!redact_secret_material(&mut r, &secrets(&["sk-supersecret-123"]), "x"));
+        assert!(!redact_secret_material(
+            &mut r,
+            &secrets(&["sk-supersecret-123"]),
+            "x"
+        ));
         assert_eq!(String::from_utf8_lossy(&r.body), "nothing sensitive here");
     }
 
@@ -698,7 +718,10 @@ mod tests {
         let mut r = resp(&format!("echo {}", encoded));
         assert!(redact_secret_material(&mut r, &secrets(&[secret]), "x"));
         let body = String::from_utf8_lossy(&r.body);
-        assert!(!body.contains(&encoded), "percent-encoded secret survived: {body}");
+        assert!(
+            !body.contains(&encoded),
+            "percent-encoded secret survived: {body}"
+        );
         assert!(body.contains("[REDACTED:x]"));
     }
 
@@ -730,7 +753,10 @@ mod tests {
             "composed ensure_ascii+slash secret must be detected"
         );
         let body = String::from_utf8_lossy(&r.body);
-        assert!(!body.contains(composed.as_str()), "composed secret form survived: {body}");
+        assert!(
+            !body.contains(composed.as_str()),
+            "composed secret form survived: {body}"
+        );
         assert!(body.contains("[REDACTED:x]"));
     }
 
@@ -814,36 +840,64 @@ mod tests {
     #[test]
     fn test_strip_content_framing_headers() {
         let mut r = resp("x");
-        r.headers.insert("Content-Length".to_string(), "999".to_string());
-        r.headers.insert("transfer-encoding".to_string(), "chunked".to_string());
-        r.headers.insert("Content-Type".to_string(), "application/json".to_string());
+        r.headers
+            .insert("Content-Length".to_string(), "999".to_string());
+        r.headers
+            .insert("transfer-encoding".to_string(), "chunked".to_string());
+        r.headers
+            .insert("Content-Type".to_string(), "application/json".to_string());
         strip_content_framing_headers(&mut r);
-        assert!(!r.headers.keys().any(|k| k.eq_ignore_ascii_case("content-length")));
-        assert!(!r.headers.keys().any(|k| k.eq_ignore_ascii_case("transfer-encoding")));
+        assert!(!r
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-length")));
+        assert!(!r
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("transfer-encoding")));
         assert!(r.headers.contains_key("Content-Type"));
     }
 
     #[test]
     fn test_egress_block_withholds_body_and_headers() {
         let mut r = resp("{\"downstream_token\":\"abc\"}");
-        r.headers.insert("Set-Cookie".to_string(), "session=zzz".to_string());
-        assert!(apply_egress(&mut r, &[rule("sts-*", "*", true, &[])], "sts-prod", "http.request"));
+        r.headers
+            .insert("Set-Cookie".to_string(), "session=zzz".to_string());
+        assert!(apply_egress(
+            &mut r,
+            &[rule("sts-*", "*", true, &[])],
+            "sts-prod",
+            "http.request"
+        ));
         assert!(String::from_utf8_lossy(&r.body).contains("withheld by egress policy"));
         // The secret header is dropped; only a labelling Content-Type remains.
         assert!(!r.headers.contains_key("Set-Cookie"));
-        assert_eq!(r.headers.get("Content-Type").map(String::as_str), Some("text/plain"));
+        assert_eq!(
+            r.headers.get("Content-Type").map(String::as_str),
+            Some("text/plain")
+        );
     }
 
     #[test]
     fn test_egress_redact_patterns_body_and_headers() {
         let mut r = resp("id=42 secret=DEADBEEFCAFE rest");
-        r.headers.insert("Set-Cookie".to_string(), "session=DEADBEEFCAFE".to_string());
-        let modified = apply_egress(&mut r, &[rule("*", "*", false, &["[A-F0-9]{8,}"])], "any", "http.request");
+        r.headers
+            .insert("Set-Cookie".to_string(), "session=DEADBEEFCAFE".to_string());
+        let modified = apply_egress(
+            &mut r,
+            &[rule("*", "*", false, &["[A-F0-9]{8,}"])],
+            "any",
+            "http.request",
+        );
         assert!(modified);
         let body = String::from_utf8_lossy(&r.body);
         assert!(!body.contains("DEADBEEFCAFE"));
         assert!(body.contains("[REDACTED:egress]"));
-        assert!(!r.headers.get("Set-Cookie").unwrap().contains("DEADBEEFCAFE"));
+        assert!(!r
+            .headers
+            .get("Set-Cookie")
+            .unwrap()
+            .contains("DEADBEEFCAFE"));
     }
 
     #[test]
@@ -856,7 +910,12 @@ mod tests {
             updated_credential: None,
         };
         let before = r.body.clone();
-        apply_egress(&mut r, &[rule("*", "*", false, &["[A-F0-9]{8,}"])], "any", "http.request");
+        apply_egress(
+            &mut r,
+            &[rule("*", "*", false, &["[A-F0-9]{8,}"])],
+            "any",
+            "http.request",
+        );
         assert_eq!(r.body, before, "binary body must be untouched");
     }
 
@@ -869,11 +928,21 @@ mod tests {
             body: vec![0xff, 0xfe, 0x00],
             updated_credential: None,
         };
-        r.headers.insert("Set-Cookie".to_string(), "t=DEADBEEFCAFE".to_string());
+        r.headers
+            .insert("Set-Cookie".to_string(), "t=DEADBEEFCAFE".to_string());
         let before = r.body.clone();
-        let modified = apply_egress(&mut r, &[rule("*", "*", false, &["[A-F0-9]{8,}"])], "a", "http.request");
+        let modified = apply_egress(
+            &mut r,
+            &[rule("*", "*", false, &["[A-F0-9]{8,}"])],
+            "a",
+            "http.request",
+        );
         assert_eq!(r.body, before, "binary body must be untouched");
-        assert!(!r.headers.get("Set-Cookie").unwrap().contains("DEADBEEFCAFE"));
+        assert!(!r
+            .headers
+            .get("Set-Cookie")
+            .unwrap()
+            .contains("DEADBEEFCAFE"));
         assert!(modified);
     }
 
@@ -881,8 +950,15 @@ mod tests {
     fn test_redact_header_only_secret_reports_modified() {
         // Secret only in a header (clean body) → still reports modified=true.
         let mut r = resp("clean body");
-        r.headers.insert("X-Echo".to_string(), "Bearer sk-supersecret-123".to_string());
-        assert!(redact_secret_material(&mut r, &secrets(&["sk-supersecret-123"]), "x"));
+        r.headers.insert(
+            "X-Echo".to_string(),
+            "Bearer sk-supersecret-123".to_string(),
+        );
+        assert!(redact_secret_material(
+            &mut r,
+            &secrets(&["sk-supersecret-123"]),
+            "x"
+        ));
         assert!(r.headers.get("X-Echo").unwrap().contains("[REDACTED:x]"));
         assert_eq!(String::from_utf8_lossy(&r.body), "clean body");
     }
@@ -890,8 +966,8 @@ mod tests {
     #[test]
     fn test_egress_first_matching_rule_wins() {
         let rules = vec![
-            rule("pay-*", "*", true, &[]),                 // block
-            rule("*", "*", false, &["should-not-apply"]),  // would redact
+            rule("pay-*", "*", true, &[]),                // block
+            rule("*", "*", false, &["should-not-apply"]), // would redact
         ];
         let mut r = resp("should-not-apply body");
         apply_egress(&mut r, &rules, "pay-1", "http.request");
@@ -904,11 +980,18 @@ mod tests {
         // A residual non-identity Content-Encoding → body withheld; headers
         // cleared except a labelling Content-Type.
         let mut r = resp("compressed-bytes-with-secret");
-        r.headers.insert("Content-Encoding".to_string(), "zstd".to_string());
+        r.headers
+            .insert("Content-Encoding".to_string(), "zstd".to_string());
         assert!(block_if_compressed(&mut r));
         assert!(String::from_utf8_lossy(&r.body).contains("withheld"));
-        assert_eq!(r.headers.get("Content-Type").map(String::as_str), Some("text/plain"));
-        assert!(!r.headers.keys().any(|k| k.eq_ignore_ascii_case("content-encoding")));
+        assert_eq!(
+            r.headers.get("Content-Type").map(String::as_str),
+            Some("text/plain")
+        );
+        assert!(!r
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-encoding")));
 
         // Case-insensitive, multi-value, and Transfer-Encoding compression block.
         for (hdr, val) in [
@@ -919,11 +1002,17 @@ mod tests {
         ] {
             let mut rr = resp("x");
             rr.headers.insert(hdr.to_string(), val.to_string());
-            assert!(block_if_compressed(&mut rr), "expected block for {hdr}: {val}");
+            assert!(
+                block_if_compressed(&mut rr),
+                "expected block for {hdr}: {val}"
+            );
         }
 
         // identity / chunked-only / absent → not blocked.
-        for (hdr, val) in [("content-encoding", "identity"), ("transfer-encoding", "chunked")] {
+        for (hdr, val) in [
+            ("content-encoding", "identity"),
+            ("transfer-encoding", "chunked"),
+        ] {
             let mut rr = resp("plain");
             rr.headers.insert(hdr.to_string(), val.to_string());
             assert!(!block_if_compressed(&mut rr), "must not block {hdr}: {val}");
@@ -935,23 +1024,47 @@ mod tests {
 
         // A pre-existing Content-Type is replaced (not duplicated) by the label.
         let mut r4 = resp("x");
-        r4.headers.insert("content-type".to_string(), "application/json".to_string());
-        r4.headers.insert("Content-Encoding".to_string(), "br".to_string());
+        r4.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        r4.headers
+            .insert("Content-Encoding".to_string(), "br".to_string());
         assert!(block_if_compressed(&mut r4));
-        let cts: Vec<_> =
-            r4.headers.keys().filter(|k| k.eq_ignore_ascii_case("content-type")).collect();
+        let cts: Vec<_> = r4
+            .headers
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case("content-type"))
+            .collect();
         assert_eq!(cts.len(), 1, "exactly one Content-Type after block");
-        assert_eq!(r4.headers.get("Content-Type").map(String::as_str), Some("text/plain"));
+        assert_eq!(
+            r4.headers.get("Content-Type").map(String::as_str),
+            Some("text/plain")
+        );
     }
 
     #[test]
     fn test_is_compression_edge_tokens() {
         // Real / legacy / unknown codecs are compression (fail-closed).
-        for v in ["gzip", "GZIP", "x-gzip", "zstd", "gzip, br", "identity, gzip", "deflate"] {
+        for v in [
+            "gzip",
+            "GZIP",
+            "x-gzip",
+            "zstd",
+            "gzip, br",
+            "identity, gzip",
+            "deflate",
+        ] {
             assert!(is_compression(v), "{v:?} should count as compression");
         }
         // Framing-only / empty values are not compression.
-        for v in ["", " ", "identity", "chunked", "IDENTITY", "chunked, identity", " , "] {
+        for v in [
+            "",
+            " ",
+            "identity",
+            "chunked",
+            "IDENTITY",
+            "chunked, identity",
+            " , ",
+        ] {
             assert!(!is_compression(v), "{v:?} should NOT count as compression");
         }
     }
@@ -965,41 +1078,75 @@ mod tests {
         //     skipped: a matching block rule does NOT overwrite the compression
         //     placeholder, framing headers are gone, only the label remains.
         let mut r = resp(secret);
-        r.headers.insert("Content-Encoding".to_string(), "gzip".to_string());
-        r.headers.insert("Content-Length".to_string(), "999".to_string());
-        scrub_response(&mut r, &secrets(&[secret]), "sts-prod", &rules, "http.request");
+        r.headers
+            .insert("Content-Encoding".to_string(), "gzip".to_string());
+        r.headers
+            .insert("Content-Length".to_string(), "999".to_string());
+        scrub_response(
+            &mut r,
+            &secrets(&[secret]),
+            "sts-prod",
+            &rules,
+            "http.request",
+        );
         assert!(String::from_utf8_lossy(&r.body).contains("compressed body could not be scrubbed"));
-        assert!(!r.headers.keys().any(|k| k.eq_ignore_ascii_case("content-length")));
-        assert_eq!(r.headers.get("Content-Type").map(String::as_str), Some("text/plain"));
+        assert!(!r
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-length")));
+        assert_eq!(
+            r.headers.get("Content-Type").map(String::as_str),
+            Some("text/plain")
+        );
 
         // (b) Reflected secret in an uncompressed body → scrubbed, and the stale
         //     Content-Length (set before redaction) is stripped.
         let mut r = resp(&format!("echo {secret} back"));
-        r.headers.insert("Content-Length".to_string(), "99".to_string());
+        r.headers
+            .insert("Content-Length".to_string(), "99".to_string());
         scrub_response(&mut r, &secrets(&[secret]), "github-1", &[], "http.request");
         assert!(!String::from_utf8_lossy(&r.body).contains(secret));
         assert!(String::from_utf8_lossy(&r.body).contains("[REDACTED:github-1]"));
-        assert!(!r.headers.keys().any(|k| k.eq_ignore_ascii_case("content-length")));
+        assert!(!r
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-length")));
 
         // (c) Operator block rule on an uncompressed body → body+headers withheld.
         let mut r = resp("downstream secret payload");
-        r.headers.insert("Set-Cookie".to_string(), "session=zzz".to_string());
+        r.headers
+            .insert("Set-Cookie".to_string(), "session=zzz".to_string());
         scrub_response(&mut r, &[], "sts-prod", &rules, "http.request");
         assert!(String::from_utf8_lossy(&r.body).contains("withheld by egress policy"));
         assert!(!r.headers.contains_key("Set-Cookie"));
 
         // (d) Clean body, no rules → untouched, framing preserved.
         let mut r = resp("nothing to see");
-        r.headers.insert("Content-Length".to_string(), "14".to_string());
-        scrub_response(&mut r, &secrets(&["unrelated"]), "github-1", &[], "http.request");
+        r.headers
+            .insert("Content-Length".to_string(), "14".to_string());
+        scrub_response(
+            &mut r,
+            &secrets(&["unrelated"]),
+            "github-1",
+            &[],
+            "http.request",
+        );
         assert_eq!(String::from_utf8_lossy(&r.body), "nothing to see");
-        assert_eq!(r.headers.get("Content-Length").map(String::as_str), Some("14"));
+        assert_eq!(
+            r.headers.get("Content-Length").map(String::as_str),
+            Some("14")
+        );
     }
 
     #[test]
     fn test_egress_no_matching_rule_is_noop() {
         let mut r = resp("hello");
-        assert!(!apply_egress(&mut r, &[rule("other-*", "*", true, &[])], "pay-1", "http.request"));
+        assert!(!apply_egress(
+            &mut r,
+            &[rule("other-*", "*", true, &[])],
+            "pay-1",
+            "http.request"
+        ));
         assert_eq!(String::from_utf8_lossy(&r.body), "hello");
     }
 
@@ -1011,7 +1158,11 @@ mod tests {
         let secs = secrets(secrets_in);
         let mut sc = StreamScrubber::new(&secs, alias, 1 << 20);
         let mut out = Vec::new();
-        let mut points: Vec<usize> = splits.iter().copied().filter(|&p| p <= body.len()).collect();
+        let mut points: Vec<usize> = splits
+            .iter()
+            .copied()
+            .filter(|&p| p <= body.len())
+            .collect();
         points.sort_unstable();
         points.dedup();
         if points.last() != Some(&body.len()) {
@@ -1052,7 +1203,10 @@ mod tests {
         let forms = derive_secret_forms(&secrets(&["a b\"c/d"]));
         assert!(forms.len() >= 2, "expected raw + encoded forms: {forms:?}");
         for w in forms.windows(2) {
-            assert!(w[0].len() >= w[1].len(), "forms must be longest-first: {forms:?}");
+            assert!(
+                w[0].len() >= w[1].len(),
+                "forms must be longest-first: {forms:?}"
+            );
         }
         // A sub-MIN_REDACT_LEN secret contributes no form (matches buffered behavior).
         assert!(derive_secret_forms(&secrets(&["pin"])).is_empty());
@@ -1060,7 +1214,12 @@ mod tests {
 
     #[test]
     fn stream_scrubber_no_split() {
-        let out = run_stream(&["sk-supersecret-123"], "x", b"echo sk-supersecret-123 end", &[]);
+        let out = run_stream(
+            &["sk-supersecret-123"],
+            "x",
+            b"echo sk-supersecret-123 end",
+            &[],
+        );
         let s = String::from_utf8_lossy(&out);
         assert!(!s.contains("sk-supersecret-123"));
         assert!(s.contains("[REDACTED:x]"));
@@ -1083,7 +1242,10 @@ mod tests {
         let body = format!("aa {secret} bb {secret}").into_bytes();
         let by_byte = run_stream(&[secret], "x", &body, &(1..body.len()).collect::<Vec<_>>());
         let buffered = run_buffered(&[secret], "x", &body);
-        assert_eq!(by_byte, buffered, "single-byte chunking must equal buffered redaction");
+        assert_eq!(
+            by_byte, buffered,
+            "single-byte chunking must equal buffered redaction"
+        );
     }
 
     #[test]
@@ -1095,7 +1257,10 @@ mod tests {
         let mut body = b"x ".to_vec();
         body.extend_from_slice(truncated);
         let out = run_stream(&[secret], "x", &body, &[]);
-        assert_eq!(out, body, "a partial (incomplete) secret must pass through unchanged");
+        assert_eq!(
+            out, body,
+            "a partial (incomplete) secret must pass through unchanged"
+        );
     }
 
     #[test]
@@ -1122,14 +1287,22 @@ mod tests {
     #[test]
     fn stream_is_egress_safe_flags_block_and_regex() {
         // A matching block rule OR a non-empty redact_patterns ⇒ NOT stream-safe.
-        assert!(!stream_is_egress_safe(&[rule("pay-*", "*", true, &[])], "pay-1", "http.request"));
+        assert!(!stream_is_egress_safe(
+            &[rule("pay-*", "*", true, &[])],
+            "pay-1",
+            "http.request"
+        ));
         assert!(!stream_is_egress_safe(
             &[rule("*", "*", false, &["[0-9]+"])],
             "any",
             "http.request"
         ));
         // A rule that doesn't match, or no rules, is safe to stream.
-        assert!(stream_is_egress_safe(&[rule("other-*", "*", true, &[])], "pay-1", "http.request"));
+        assert!(stream_is_egress_safe(
+            &[rule("other-*", "*", true, &[])],
+            "pay-1",
+            "http.request"
+        ));
         assert!(stream_is_egress_safe(&[], "any", "http.request"));
     }
 
@@ -1151,9 +1324,15 @@ mod tests {
         // bytes, so StreamScrubber's carry (sized off the longest form) must hold back
         // more than the raw length — the case the proptest below exercises.
         let forms = derive_secret_forms(&secrets(&["SECRET abcdef/1234567890"]));
-        assert!(forms.len() >= 2, "expected raw + percent-encoded forms: {forms:?}");
+        assert!(
+            forms.len() >= 2,
+            "expected raw + percent-encoded forms: {forms:?}"
+        );
         let longest = forms.iter().map(|f| f.len()).max().unwrap();
-        assert!(longest > "SECRET abcdef/1234567890".len(), "encoded form is longer than raw");
+        assert!(
+            longest > "SECRET abcdef/1234567890".len(),
+            "encoded form is longer than raw"
+        );
     }
 
     proptest::proptest! {

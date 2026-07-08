@@ -260,17 +260,17 @@ impl Config {
         let storage = raw.storage.unwrap_or_default().try_into()?;
         let logging = raw.logging.unwrap_or_default().into();
         let mcp = raw.mcp.unwrap_or_default().into();
-        let approval = raw.approvals.map(TryInto::try_into).transpose()?.unwrap_or_default();
+        let approval = raw
+            .approvals
+            .map(TryInto::try_into)
+            .transpose()?
+            .unwrap_or_default();
         let enforcement = raw
             .enforcement
             .map(EnforcementConfig::try_from)
             .transpose()?
             .unwrap_or_default();
-        let spend_extractors = raw
-            .spend_extractors
-            .into_iter()
-            .map(Into::into)
-            .collect();
+        let spend_extractors = raw.spend_extractors.into_iter().map(Into::into).collect();
         let egress = raw
             .egress
             .into_iter()
@@ -332,12 +332,22 @@ impl Config {
             p.validate().map_err(ConfigError::Invalid)?;
         }
 
-        let outbox = raw.outbox.map(TryInto::try_into).transpose()?.unwrap_or_default();
+        let outbox = raw
+            .outbox
+            .map(TryInto::try_into)
+            .transpose()?
+            .unwrap_or_default();
 
         // Per-tenant enforcement mode (V11).
         let mut tenants = std::collections::HashMap::new();
         for t in raw.tenants {
-            let mode = match t.mode.as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            let mode = match t
+                .mode
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
                 Some("observe") => TenantMode::Observe,
                 Some("enforce") | None | Some("") => TenantMode::Enforce,
                 Some(other) => {
@@ -351,7 +361,9 @@ impl Config {
             // principal tenant rather than silently falling back to Enforce.
             let id = t.id.trim().to_string();
             if id.is_empty() {
-                return Err(ConfigError::Invalid("tenant id must not be empty".to_string()));
+                return Err(ConfigError::Invalid(
+                    "tenant id must not be empty".to_string(),
+                ));
             }
             if tenants.insert(id.clone(), mode).is_some() {
                 return Err(ConfigError::Invalid(format!("duplicate tenant '{}'", id)));
@@ -392,10 +404,15 @@ impl Config {
                 if raw_allowed_len > 0 && allowed.is_empty() {
                     return Err(ConfigError::Invalid(
                         "identity.allowed has only blank entries — remove it to accept any, \
-                         or list real trust domains/issuers".to_string(),
+                         or list real trust domains/issuers"
+                            .to_string(),
                     ));
                 }
-                Ok(IdentityConfig { kind, header, allowed })
+                Ok(IdentityConfig {
+                    kind,
+                    header,
+                    allowed,
+                })
             })
             .transpose()?;
 

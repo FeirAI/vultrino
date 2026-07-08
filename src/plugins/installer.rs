@@ -17,7 +17,10 @@ pub enum PluginSource {
     /// Local filesystem path
     LocalPath(PathBuf),
     /// Git repository URL with optional ref (branch/tag/commit)
-    Git { url: String, git_ref: Option<String> },
+    Git {
+        url: String,
+        git_ref: Option<String>,
+    },
     /// URL to a tar.gz archive
     Archive(String),
 }
@@ -42,7 +45,10 @@ impl PluginSource {
         {
             // Parse ref if present (e.g., https://github.com/foo/bar#v1.0.0)
             let (url, git_ref) = if let Some(pos) = source.find('#') {
-                (source[..pos].to_string(), Some(source[pos + 1..].to_string()))
+                (
+                    source[..pos].to_string(),
+                    Some(source[pos + 1..].to_string()),
+                )
             } else {
                 (source.to_string(), None)
             };
@@ -219,9 +225,7 @@ impl PluginInstaller {
 
         // Clone the repository
         let mut cmd = Command::new("git");
-        cmd.arg("clone")
-            .arg("--depth")
-            .arg("1");
+        cmd.arg("clone").arg("--depth").arg("1");
 
         if let Some(r) = git_ref {
             cmd.arg("--branch").arg(r);
@@ -308,7 +312,9 @@ impl PluginInstaller {
             .args(["target", "list", "--installed"])
             .output()
             .await
-            .map_err(|e| PluginError::Installation(format!("Failed to check rustup targets: {}", e)))?;
+            .map_err(|e| {
+                PluginError::Installation(format!("Failed to check rustup targets: {}", e))
+            })?;
 
         let targets = String::from_utf8_lossy(&check_output.stdout);
         if !targets.contains("wasm32-wasip1") {
@@ -317,7 +323,9 @@ impl PluginInstaller {
                 .args(["target", "add", "wasm32-wasip1"])
                 .output()
                 .await
-                .map_err(|e| PluginError::Installation(format!("Failed to install WASM target: {}", e)))?;
+                .map_err(|e| {
+                    PluginError::Installation(format!("Failed to install WASM target: {}", e))
+                })?;
 
             if !install_output.status.success() {
                 let stderr = String::from_utf8_lossy(&install_output.stderr);
@@ -430,14 +438,12 @@ impl PluginInstaller {
             let info_path = entry.path().join(".installed.json");
             if info_path.exists() {
                 match tokio::fs::read_to_string(&info_path).await {
-                    Ok(content) => {
-                        match serde_json::from_str::<InstalledPluginInfo>(&content) {
-                            Ok(info) => plugins.push(info),
-                            Err(e) => {
-                                warn!("Failed to parse plugin info at {:?}: {}", info_path, e);
-                            }
+                    Ok(content) => match serde_json::from_str::<InstalledPluginInfo>(&content) {
+                        Ok(info) => plugins.push(info),
+                        Err(e) => {
+                            warn!("Failed to parse plugin info at {:?}: {}", info_path, e);
                         }
-                    }
+                    },
                     Err(e) => {
                         warn!("Failed to read plugin info at {:?}: {}", info_path, e);
                     }
@@ -456,10 +462,7 @@ impl PluginInstaller {
                             plugins.push(info);
                         }
                         Err(e) => {
-                            warn!(
-                                "Failed to parse manifest at {:?}: {}",
-                                manifest_path, e
-                            );
+                            warn!("Failed to parse manifest at {:?}: {}", manifest_path, e);
                         }
                     }
                 }
@@ -487,8 +490,7 @@ impl PluginInstaller {
             let manifest_path = plugin_dir.join("plugin.toml");
             if manifest_path.exists() {
                 let manifest = PluginManifest::from_file(&manifest_path)?;
-                let info =
-                    InstalledPluginInfo::new(manifest, "unknown".to_string(), plugin_dir);
+                let info = InstalledPluginInfo::new(manifest, "unknown".to_string(), plugin_dir);
                 Ok(Some(info))
             } else {
                 Ok(None)

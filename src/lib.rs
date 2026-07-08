@@ -322,7 +322,10 @@ impl CredentialData {
             CredentialData::ApiKey { key, .. } => vec![z(key.expose().to_string())],
             CredentialData::BasicAuth { username, password } => {
                 let raw = Zeroizing::new(format!("{}:{}", username, password.expose()));
-                vec![z(password.expose().to_string()), z(STANDARD.encode(raw.as_bytes()))]
+                vec![
+                    z(password.expose().to_string()),
+                    z(STANDARD.encode(raw.as_bytes())),
+                ]
             }
             CredentialData::OAuth2 {
                 client_id,
@@ -364,7 +367,10 @@ impl CredentialData {
             }
             CredentialData::SshPassword { password, .. } => vec![z(password.expose().to_string())],
             CredentialData::Postgres { password, .. } => vec![z(password.expose().to_string())],
-            CredentialData::PrivateKey { key_pem, passphrase } => {
+            CredentialData::PrivateKey {
+                key_pem,
+                passphrase,
+            } => {
                 let mut v = vec![z(key_pem.expose().to_string())];
                 if let Some(p) = passphrase {
                     v.push(z(p.expose().to_string()));
@@ -372,7 +378,9 @@ impl CredentialData {
                 v
             }
             CredentialData::Certificate { key_pem, .. } => vec![z(key_pem.expose().to_string())],
-            CredentialData::Custom(map) => map.values().map(|s| z(s.expose().to_string())).collect(),
+            CredentialData::Custom(map) => {
+                map.values().map(|s| z(s.expose().to_string())).collect()
+            }
         }
     }
 
@@ -594,7 +602,9 @@ pub struct StreamingResponse {
     pub headers: HashMap<String, String>,
     /// The upstream response body as a stream of byte chunks. Each item is a
     /// chunk or a transport error; the server's adaptor scrubs + taps these.
-    pub body: std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, plugins::PluginError>> + Send>>,
+    pub body: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<bytes::Bytes, plugins::PluginError>> + Send>,
+    >,
     /// Updated credential data (e.g. after OAuth2 token refresh) — captured before
     /// the body streams, persisted by the server exactly as on the buffered path.
     pub updated_credential: Option<CredentialData>,
@@ -730,7 +740,10 @@ mod tests {
 
         let meta = CredentialMetadata::from(&cred);
         assert_eq!(meta.alias, "test");
-        assert_eq!(meta.metadata.get("description"), Some(&"Test credential".to_string()));
+        assert_eq!(
+            meta.metadata.get("description"),
+            Some(&"Test credential".to_string())
+        );
     }
 
     #[test]
@@ -764,7 +777,11 @@ mod tests {
             token_url: "https://x/token".to_string(),
             scopes: vec![],
         };
-        let mats: Vec<String> = d.secret_material().iter().map(|z| z.as_str().to_string()).collect();
+        let mats: Vec<String> = d
+            .secret_material()
+            .iter()
+            .map(|z| z.as_str().to_string())
+            .collect();
         assert!(mats.iter().any(|m| m == "csecret"));
         assert!(mats.iter().any(|m| m == "atoken"));
         assert!(mats.iter().any(|m| m == "rtoken"));
@@ -778,7 +795,11 @@ mod tests {
             username: "user".to_string(),
             password: Secret::new("p4ssword"),
         };
-        let mats: Vec<String> = d.secret_material().iter().map(|z| z.as_str().to_string()).collect();
+        let mats: Vec<String> = d
+            .secret_material()
+            .iter()
+            .map(|z| z.as_str().to_string())
+            .collect();
         assert!(mats.iter().any(|m| m == "p4ssword"));
         assert!(mats.iter().any(|m| m == &STANDARD.encode("user:p4ssword")));
     }

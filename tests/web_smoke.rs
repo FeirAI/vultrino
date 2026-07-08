@@ -13,7 +13,7 @@ use tempfile::tempdir;
 use tower::ServiceExt;
 
 use vultrino::approval::{ApprovalRequest, NewApproval, RequesterInfo};
-use vultrino::auth::AuthManager;
+use vultrino::auth::{AuthManager, NewUseToken, UseToken};
 use vultrino::config::Config;
 use vultrino::storage::{FileStorage, StorageBackend};
 use vultrino::web::{AdminAuth, WebConfig, WebServer};
@@ -53,6 +53,149 @@ async fn body_string(resp: axum::response::Response) -> String {
         .await
         .unwrap();
     String::from_utf8_lossy(&bytes).to_string()
+}
+
+#[tokio::test]
+async fn workload_grant_delete_revokes_all_bound_exchange_tokens() {
+    let (router, storage, _, key) = build_admin_router().await;
+    let grant = serde_json::json!({
+        "tenant":"t1", "agent_label":"ep_agent", "issuer":"https://issuer",
+        "subject":"workload", "audience":"vultrino", "mcp_credential_scope":"cred-*",
+        "mcp_action_scope":"tool.*", "ttl_secs":300
+    });
+    let response = router
+        .clone()
+        .oneshot(admin_req(
+            "PUT",
+            "/api/v1/workload-grants/ep_agent",
+            &key,
+            grant,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, mut bound) = UseToken::create(NewUseToken {
+        name: "bound".into(),
+        credential_scope: "cred-*".into(),
+        action_scope: Some("tool.*".into()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    bound.tenant = Some("t1".into());
+    bound.agent_label = Some("ep_agent".into());
+    storage.store_use_token(&bound).await.unwrap();
+    let (_, mut foreign) = UseToken::create(NewUseToken {
+        name: "foreign".into(),
+        credential_scope: "cred-*".into(),
+        action_scope: Some("tool.*".into()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    foreign.tenant = Some("t2".into());
+    foreign.agent_label = Some("ep_agent".into());
+    storage.store_use_token(&foreign).await.unwrap();
+
+    let response = router
+        .oneshot(admin_req(
+            "DELETE",
+            "/api/v1/workload-grants/ep_agent?tenant=t1",
+            &key,
+            serde_json::Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        storage
+            .get_use_token(&bound.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked
+    );
+    assert!(
+        !storage
+            .get_use_token(&foreign.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked
+    );
+}
+
+#[tokio::test]
+async fn runtime_control_cancels_after_principal_halt() {
+    let (router, storage, server, _key) = build_admin_router().await;
+    let (plain, mut token) = UseToken::create(NewUseToken {
+        name: "native runtime lease".into(),
+        credential_scope: "cred-*".into(),
+        action_scope: Some("tool.*".into()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.tenant = Some("t1".into());
+    token.agent_label = Some("ep_native".into());
+    storage.store_use_token(&token).await.unwrap();
+    let request = || {
+        Request::builder()
+            .uri("/api/v1/runtime/control")
+            .header("authorization", format!("Bearer {plain}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        router.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    server.halt_agent("ep_native").await.unwrap();
+    assert_eq!(
+        router.oneshot(request()).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn runtime_control_honors_w3_kill_policy_with_still_live_token() {
+    let (router, storage, server, _key) = build_admin_router().await;
+    let (plain, mut token) = UseToken::create(NewUseToken {
+        name: "native runtime lease".into(),
+        credential_scope: "cred-*".into(),
+        action_scope: Some("tool.*".into()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.tenant = Some("t1".into());
+    token.agent_label = Some("ep_w3".into());
+    storage.store_use_token(&token).await.unwrap();
+    storage
+        .store_policy(&vultrino::policy::Policy::kill_switch("kill-w3", "ep_w3"))
+        .await
+        .unwrap();
+    server.reload_policies().await.unwrap();
+    assert!(
+        !storage
+            .get_use_token(&token.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked
+    );
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runtime/control")
+                .header("authorization", format!("Bearer {plain}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 /// Build a router plus a minted admin API key (vk_) the auth manager recognizes,

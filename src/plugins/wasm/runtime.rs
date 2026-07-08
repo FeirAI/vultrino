@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use wasmtime::*;
-use wasmtime_wasi::preview1::{WasiP1Ctx};
+use wasmtime_wasi::preview1::WasiP1Ctx;
 
 /// Wall-clock ceiling for a single WASM plugin call (instantiation + execute).
 /// A plugin that exceeds this is trapped via epoch interruption and its action denied.
@@ -93,7 +93,10 @@ impl EpochTicker {
                 }
             })
             .expect("failed to spawn WASM epoch ticker thread");
-        Self { stop, handle: Some(handle) }
+        Self {
+            stop,
+            handle: Some(handle),
+        }
     }
 }
 
@@ -129,8 +132,7 @@ impl WasmtimeRuntime {
             .map_err(|e| PluginError::Wasm(format!("Engine creation failed: {}", e)))?;
 
         let ticker = EpochTicker::start(&engine, EPOCH_TICK_INTERVAL);
-        let deadline_ticks =
-            (timeout.as_millis() / EPOCH_TICK_INTERVAL.as_millis()).max(1) as u64;
+        let deadline_ticks = (timeout.as_millis() / EPOCH_TICK_INTERVAL.as_millis()).max(1) as u64;
 
         Ok(Self {
             engine,
@@ -171,8 +173,10 @@ impl WasmtimeRuntime {
     /// Create a linker with WASI imports
     fn create_linker(&self) -> Result<Linker<WasmState>, PluginError> {
         let mut linker = Linker::new(&self.engine);
-        wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |state: &mut WasmState| &mut state.wasi)
-            .map_err(|e| PluginError::Wasm(format!("Failed to add WASI to linker: {}", e)))?;
+        wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |state: &mut WasmState| {
+            &mut state.wasi
+        })
+        .map_err(|e| PluginError::Wasm(format!("Failed to add WASI to linker: {}", e)))?;
         Ok(linker)
     }
 
@@ -196,7 +200,11 @@ impl WasmtimeRuntime {
     }
 
     /// Read data from WASM memory
-    fn read_from_wasm(store: &Store<WasmState>, memory: &Memory, ptr: &WasmPtr) -> Result<Vec<u8>, PluginError> {
+    fn read_from_wasm(
+        store: &Store<WasmState>,
+        memory: &Memory,
+        ptr: &WasmPtr,
+    ) -> Result<Vec<u8>, PluginError> {
         let mut buffer = vec![0u8; ptr.len as usize];
         memory
             .read(store, ptr.offset as usize, &mut buffer)
@@ -330,7 +338,8 @@ impl WasmRuntime for WasmtimeRuntime {
             .map_err(|e| PluginError::Wasm(format!("Failed to serialize request: {}", e)))?;
 
         // Write request to WASM memory
-        let request_ptr = Self::write_to_wasm(&mut store, &memory, &alloc_fn, request_json.as_bytes())?;
+        let request_ptr =
+            Self::write_to_wasm(&mut store, &memory, &alloc_fn, request_json.as_bytes())?;
 
         // Call execute
         let result = execute_fn
@@ -369,7 +378,9 @@ impl WasmRuntime for WasmtimeRuntime {
                 updated_credential: None,
             })
         } else {
-            let error_msg = wasm_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = wasm_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             Err(PluginError::ExecutionFailed(error_msg))
         }
     }
@@ -387,10 +398,9 @@ impl WasmRuntime for WasmtimeRuntime {
             .map_err(|e| PluginError::Wasm(format!("Instantiation failed: {}", e)))?;
 
         // Check if validate function exists
-        let validate_fn = match instance.get_typed_func::<(u32, u32, u32, u32), i32>(
-            &mut store,
-            "vultrino_validate_params",
-        ) {
+        let validate_fn = match instance
+            .get_typed_func::<(u32, u32, u32, u32), i32>(&mut store, "vultrino_validate_params")
+        {
             Ok(f) => f,
             Err(_) => return Ok(()), // Validation is optional
         };
@@ -407,20 +417,29 @@ impl WasmRuntime for WasmtimeRuntime {
         let action_ptr = Self::write_to_wasm(&mut store, &memory, &alloc_fn, action.as_bytes())?;
         let params_json = serde_json::to_string(params)
             .map_err(|e| PluginError::Wasm(format!("Failed to serialize params: {}", e)))?;
-        let params_ptr = Self::write_to_wasm(&mut store, &memory, &alloc_fn, params_json.as_bytes())?;
+        let params_ptr =
+            Self::write_to_wasm(&mut store, &memory, &alloc_fn, params_json.as_bytes())?;
 
         // Call validate
         let result = validate_fn
             .call(
                 &mut store,
-                (action_ptr.offset, action_ptr.len, params_ptr.offset, params_ptr.len),
+                (
+                    action_ptr.offset,
+                    action_ptr.len,
+                    params_ptr.offset,
+                    params_ptr.len,
+                ),
             )
             .map_err(|e| PluginError::Wasm(format!("Validate call failed: {}", e)))?;
 
         match result {
             0 => Ok(()),
             -3 => Err(PluginError::InvalidParams("Invalid parameters".to_string())),
-            -2 => Err(PluginError::UnsupportedAction(format!("Unknown action: {}", action))),
+            -2 => Err(PluginError::UnsupportedAction(format!(
+                "Unknown action: {}",
+                action
+            ))),
             _ => Err(PluginError::InvalidParams("Validation failed".to_string())),
         }
     }
@@ -490,12 +509,18 @@ impl Plugin for WasmPlugin {
         self.manifest
             .credential_types
             .iter()
-            .map(|ct| CredentialType::Custom(format!("plugin:{}:{}", self.manifest.plugin.name, ct.name)))
+            .map(|ct| {
+                CredentialType::Custom(format!("plugin:{}:{}", self.manifest.plugin.name, ct.name))
+            })
             .collect()
     }
 
     fn supported_actions(&self) -> Vec<&str> {
-        self.manifest.actions.iter().map(|a| a.name.as_str()).collect()
+        self.manifest
+            .actions
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect()
     }
 
     fn validate_params(&self, action: &str, params: &serde_json::Value) -> Result<(), PluginError> {
@@ -504,8 +529,9 @@ impl Plugin for WasmPlugin {
 
     async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
         // Convert credential to JSON
-        let cred_json = serde_json::to_value(&request.credential.data)
-            .map_err(|e| PluginError::ExecutionFailed(format!("Failed to serialize credential: {}", e)))?;
+        let cred_json = serde_json::to_value(&request.credential.data).map_err(|e| {
+            PluginError::ExecutionFailed(format!("Failed to serialize credential: {}", e))
+        })?;
 
         let runtime = Arc::clone(&self.runtime);
         let action = request.action.clone();
@@ -562,7 +588,9 @@ impl Plugin for WasmPlugin {
             .credential_types
             .iter()
             .find(|ct| ct.name == type_name)
-            .ok_or_else(|| PluginError::InvalidParams(format!("Unknown credential type: {}", type_name)))?;
+            .ok_or_else(|| {
+                PluginError::InvalidParams(format!("Unknown credential type: {}", type_name))
+            })?;
 
         // Validate required fields and build credential data
         let mut secrets = HashMap::new();
@@ -639,7 +667,10 @@ mod tests {
         let res = rt.execute_action("do", &serde_json::json!({}), &serde_json::json!({}));
         let elapsed = start.elapsed();
         assert!(res.is_err(), "a looping plugin must be denied, got {res:?}");
-        assert!(elapsed < Duration::from_secs(5), "must not hang; took {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must not hang; took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -649,6 +680,9 @@ mod tests {
         // so this asserts the StoreLimits cap is actually enforced.
         let rt = runtime_with(MEMHOG_WAT, WASM_CALL_TIMEOUT);
         let res = rt.execute_action("do", &serde_json::json!({}), &serde_json::json!({}));
-        assert!(res.is_err(), "over-cap memory growth must be denied, got {res:?}");
+        assert!(
+            res.is_err(),
+            "over-cap memory growth must be denied, got {res:?}"
+        );
     }
 }

@@ -45,7 +45,9 @@ impl HttpRevocationClient {
         // the shared guarded client (no auto-redirect + connect-time private-IP
         // filter) on top of the request-time validate_token_url_ssrf below — closing
         // both the redirect and the DNS-rebinding vectors for this secret egress.
-        Self { client: crate::plugins::build_guarded_client() }
+        Self {
+            client: crate::plugins::build_guarded_client(),
+        }
     }
 }
 
@@ -179,10 +181,34 @@ mod tests {
         // secret-bearing egress (not just an https scheme check).
         let c = HttpRevocationClient::new();
         // Non-HTTPS is rejected.
-        assert!(c.revoke("http://idp.example.com/revoke", "t", "access_token", "id", "sec").await.is_err());
+        assert!(c
+            .revoke(
+                "http://idp.example.com/revoke",
+                "t",
+                "access_token",
+                "id",
+                "sec"
+            )
+            .await
+            .is_err());
         // Private / internal IP literals are rejected (incl. cloud metadata).
-        assert!(c.revoke("https://127.0.0.1/revoke", "t", "access_token", "id", "sec").await.is_err());
-        assert!(c.revoke("https://10.0.0.5/revoke", "t", "access_token", "id", "sec").await.is_err());
-        assert!(c.revoke("https://169.254.169.254/revoke", "t", "access_token", "id", "sec").await.is_err());
+        assert!(c
+            .revoke("https://127.0.0.1/revoke", "t", "access_token", "id", "sec")
+            .await
+            .is_err());
+        assert!(c
+            .revoke("https://10.0.0.5/revoke", "t", "access_token", "id", "sec")
+            .await
+            .is_err());
+        assert!(c
+            .revoke(
+                "https://169.254.169.254/revoke",
+                "t",
+                "access_token",
+                "id",
+                "sec"
+            )
+            .await
+            .is_err());
     }
 }

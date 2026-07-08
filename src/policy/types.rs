@@ -62,16 +62,10 @@ pub enum PolicyCondition {
     ActionMatch(String),
 
     /// Allow only during specific time window
-    TimeWindow {
-        start: NaiveTime,
-        end: NaiveTime,
-    },
+    TimeWindow { start: NaiveTime, end: NaiveTime },
 
     /// Rate limit (requests per window)
-    RateLimit {
-        max: u32,
-        window_secs: u64,
-    },
+    RateLimit { max: u32, window_secs: u64 },
 
     /// Spend cap (V3): the request's extracted amount (in minor units, e.g.
     /// cents/micros) must be within `per_action_max` for this single call, for the
@@ -199,10 +193,17 @@ impl Policy {
     pub fn validate(&self) -> Result<(), String> {
         let mut uses_spend_cap = false;
         for rule in &self.rules {
-            if let PolicyCondition::SpendCap { asset, per_action_max } = &rule.condition {
+            if let PolicyCondition::SpendCap {
+                asset,
+                per_action_max,
+            } = &rule.condition
+            {
                 uses_spend_cap = true;
                 if asset.trim().is_empty() {
-                    return Err(format!("policy '{}': SpendCap asset must not be empty", self.name));
+                    return Err(format!(
+                        "policy '{}': SpendCap asset must not be empty",
+                        self.name
+                    ));
                 }
                 if *per_action_max == 0 {
                     return Err(format!(
@@ -298,14 +299,13 @@ mod tests {
 
     #[test]
     fn test_policy_builder() {
-        let policy = Policy::deny_all("github-readonly", "github-*")
-            .with_rule(
-                PolicyCondition::and(vec![
-                    PolicyCondition::url("https://api.github.com/*"),
-                    PolicyCondition::read_only(),
-                ]),
-                PolicyAction::Allow,
-            );
+        let policy = Policy::deny_all("github-readonly", "github-*").with_rule(
+            PolicyCondition::and(vec![
+                PolicyCondition::url("https://api.github.com/*"),
+                PolicyCondition::read_only(),
+            ]),
+            PolicyAction::Allow,
+        );
 
         assert_eq!(policy.name, "github-readonly");
         assert_eq!(policy.credential_pattern, "github-*");

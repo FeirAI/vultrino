@@ -1,7 +1,7 @@
 //! Cryptographically verified workload exchange for LangChain runtimes.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -12,9 +12,11 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::fs;
 
 use super::{api::AdminApiAuth, server::AppState};
 use crate::auth::{NewUseToken, UseToken, UseTokenMetadata};
+use crate::policy::Principal;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkloadGrantTemplate {
@@ -25,6 +27,10 @@ pub struct WorkloadGrantTemplate {
     pub audience: String,
     pub mcp_credential_scope: String,
     pub mcp_action_scope: String,
+    #[serde(default)]
+    pub mcp_max_uses: Option<u32>,
+    #[serde(default)]
+    pub mcp_require_approval: bool,
     #[serde(default)]
     pub model_channels: HashMap<String, ChannelGrant>,
     #[serde(default = "default_ttl")]
@@ -52,12 +58,35 @@ struct WorkloadAssertion {
 fn default_ttl() -> i64 {
     300
 }
+
+fn workload_token_request(
+    name: String,
+    credential_scope: String,
+    action_scope: String,
+    max_uses: Option<u32>,
+    require_approval: bool,
+    ttl_secs: i64,
+) -> NewUseToken {
+    NewUseToken {
+        name,
+        credential_scope,
+        action_scope: Some(action_scope),
+        max_uses,
+        require_approval,
+        expires_in: Some(Duration::seconds(ttl_secs)),
+    }
+}
+
 fn grant_key(tenant: &str, agent: &str) -> String {
     format!("{}:{}{}", tenant.len(), tenant, agent)
 }
 
 fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
-    (status, Json(serde_json::json!({"code": code, "error": message.into()}))).into_response()
+    (
+        status,
+        Json(serde_json::json!({"code": code, "error": message.into()})),
+    )
+        .into_response()
 }
 
 pub async fn put_workload_grant(
@@ -83,33 +112,133 @@ pub async fn put_workload_grant(
             "complete identity binding, matching agent label, and ttl 30..3600 are required",
         );
     }
-    let check = |credential_scope: String, action_scope: String| {
-        NewUseToken {
-            name: "validation".into(),
+    let check = |credential_scope: String,
+                 action_scope: String,
+                 max_uses: Option<u32>,
+                 require_approval: bool| {
+        workload_token_request(
+            "validation".into(),
             credential_scope,
-            action_scope: Some(action_scope),
-            max_uses: None,
-            require_approval: false,
-            expires_in: Some(Duration::seconds(template.ttl_secs)),
-        }
+            action_scope,
+            max_uses,
+            require_approval,
+            template.ttl_secs,
+        )
         .validate()
     };
-    if let Err(e) = check(template.mcp_credential_scope.clone(), template.mcp_action_scope.clone()) {
+    if let Err(e) = check(
+        template.mcp_credential_scope.clone(),
+        template.mcp_action_scope.clone(),
+        template.mcp_max_uses,
+        template.mcp_require_approval,
+    ) {
         return error(StatusCode::BAD_REQUEST, "invalid_workload_grant", e);
     }
     for grant in template.model_channels.values() {
-        if let Err(e) = check(grant.credential_scope.clone(), grant.action_scope.clone()) {
+        if let Err(e) = check(
+            grant.credential_scope.clone(),
+            grant.action_scope.clone(),
+            None,
+            false,
+        ) {
             return error(StatusCode::BAD_REQUEST, "invalid_workload_grant", e);
         }
     }
-    state
-        .workload_grants
-        .write()
-        .await
-        .insert(grant_key(&template.tenant, &agent), template);
+    let key = grant_key(&template.tenant, &agent);
+    let value = match serde_json::to_value(&template) {
+        Ok(value) => value,
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "serialization_error",
+                e.to_string(),
+            )
+        }
+    };
+    if let Err(e) = state.storage.store_workload_grant(&key, value).await {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "grant_store_unavailable",
+            e.to_string(),
+        );
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({"stored": true, "agent_label": agent})),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteGrantQuery {
+    tenant: String,
+}
+
+/// Remove the exchange template and revoke every token previously minted from
+/// it. This is idempotent so Govder can safely retry cleanup after a partial
+/// deprovision without leaving a workload able to mint or use residual grants.
+pub async fn delete_workload_grant(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(agent): Path<String>,
+    Query(query): Query<DeleteGrantQuery>,
+) -> Response {
+    if query.tenant.trim().is_empty() || agent.trim().is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workload_grant",
+            "tenant and agent are required",
+        );
+    }
+    let removed = match state
+        .storage
+        .delete_workload_grant(&grant_key(&query.tenant, &agent))
+        .await
+    {
+        Ok(removed) => removed,
+        Err(e) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "grant_store_unavailable",
+                e.to_string(),
+            )
+        }
+    };
+    let mut revoked = 0usize;
+    let mut revoke_failures = 0usize;
+    match state.storage.list_use_tokens().await {
+        Ok(tokens) => {
+            for token in tokens {
+                if token.tenant.as_deref() == Some(query.tenant.as_str())
+                    && token.agent_label.as_deref() == Some(agent.as_str())
+                    && !token.revoked
+                {
+                    if state.storage.set_use_token_revoked(&token.id).await.is_ok() {
+                        revoked += 1;
+                    } else {
+                        revoke_failures += 1;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                e.to_string(),
+            )
+        }
+    }
+    if revoke_failures > 0 {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "token_revocation_incomplete",
+            format!("{} workload token(s) could not be revoked", revoke_failures),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"removed": removed, "revoked_tokens": revoked})),
     )
         .into_response()
 }
@@ -129,7 +258,8 @@ fn verify_assertion(raw: &str, secret: &[u8]) -> Result<WorkloadAssertion, Strin
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| "malformed assertion payload")?;
-    let claims: WorkloadAssertion = serde_json::from_slice(&bytes).map_err(|_| "malformed assertion claims")?;
+    let claims: WorkloadAssertion =
+        serde_json::from_slice(&bytes).map_err(|_| "malformed assertion claims")?;
     if claims.kind != "oidc" && claims.kind != "spiffe" {
         return Err("assertion kind must be oidc|spiffe".into());
     }
@@ -152,9 +282,26 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .map(str::trim)
 }
 
-pub async fn exchange_workload_token(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let enabled =
-        std::env::var("VULTRINO_WORKLOAD_EXCHANGE_ENABLED").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+fn verifier_secret() -> Result<Vec<u8>, &'static str> {
+    let value = match std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET_FILE") {
+        Ok(path) if !path.trim().is_empty() => fs::read_to_string(path)
+            .map_err(|_| "workload assertion verifier file cannot be read")?,
+        _ => std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET")
+            .map_err(|_| "workload assertion verifier is not configured")?,
+    };
+    let secret = value.trim().as_bytes().to_vec();
+    if secret.len() < 32 {
+        return Err("workload assertion verifier must contain at least 32 bytes");
+    }
+    Ok(secret)
+}
+
+pub async fn exchange_workload_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let enabled = std::env::var("VULTRINO_WORKLOAD_EXCHANGE_ENABLED")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     if !enabled {
         return error(
             StatusCode::NOT_FOUND,
@@ -162,32 +309,53 @@ pub async fn exchange_workload_token(State(state): State<AppState>, headers: Hea
             "workload exchange is disabled",
         );
     }
-    let secret = match std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET") {
-        Ok(v) if v.len() >= 32 => v,
-        _ => {
+    let secret = match verifier_secret() {
+        Ok(v) => v,
+        Err(message) => {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "exchange_unconfigured",
-                "workload assertion verifier is not configured",
+                message,
             )
         }
     };
     let assertion = match bearer(&headers)
         .ok_or_else(|| "missing Bearer assertion".to_string())
-        .and_then(|v| verify_assertion(v, secret.as_bytes()))
+        .and_then(|v| verify_assertion(v, &secret))
     {
         Ok(v) => v,
         Err(e) => return error(StatusCode::UNAUTHORIZED, "invalid_workload_identity", e),
     };
+    if let Err(e) = state.storage.reload().await {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "grant_store_unavailable",
+            e.to_string(),
+        );
+    }
     let template = match state
-        .workload_grants
-        .read()
+        .storage
+        .get_workload_grant(&grant_key(&assertion.tenant, &assertion.agent_label))
         .await
-        .get(&grant_key(&assertion.tenant, &assertion.agent_label))
-        .cloned()
     {
-        Some(v) => v,
-        None => {
+        Ok(Some(v)) => match serde_json::from_value::<WorkloadGrantTemplate>(v) {
+            Ok(template) => template,
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid_stored_grant",
+                    e.to_string(),
+                )
+            }
+        },
+        Err(e) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "grant_store_unavailable",
+                e.to_string(),
+            )
+        }
+        Ok(None) => {
             return error(
                 StatusCode::FORBIDDEN,
                 "grant_not_found",
@@ -207,32 +375,57 @@ pub async fn exchange_workload_token(State(state): State<AppState>, headers: Hea
             "issuer, subject, audience, tenant, or agent binding does not match",
         );
     }
-    if !state.workload_jtis.write().await.insert(assertion.jti) {
+    let now = Utc::now().timestamp();
+    let consumed = match state
+        .storage
+        .consume_workload_jti(&assertion.jti, assertion.exp, now)
+        .await
+    {
+        Ok(consumed) => consumed,
+        Err(e) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "replay_store_unavailable",
+                e.to_string(),
+            )
+        }
+    };
+    if !consumed {
         return error(
             StatusCode::CONFLICT,
             "assertion_replay",
             "workload assertion was already exchanged",
         );
     }
-    let mint = |name: String, credential_scope: String, action_scope: String| {
-        UseToken::create(NewUseToken {
+    let mint = |name: String,
+                credential_scope: String,
+                action_scope: String,
+                max_uses: Option<u32>,
+                require_approval: bool| {
+        UseToken::create(workload_token_request(
             name,
             credential_scope,
-            action_scope: Some(action_scope),
-            max_uses: None,
-            require_approval: false,
-            expires_in: Some(Duration::seconds(template.ttl_secs)),
-        })
+            action_scope,
+            max_uses,
+            require_approval,
+            template.ttl_secs,
+        ))
     };
     let (mcp_plain, mut mcp) = mint(
         format!("{} mcp", template.agent_label),
         template.mcp_credential_scope.clone(),
         template.mcp_action_scope.clone(),
+        template.mcp_max_uses,
+        template.mcp_require_approval,
     );
     mcp.agent_label = Some(template.agent_label.clone());
     mcp.tenant = Some(template.tenant.clone());
     if let Err(e) = state.storage.store_use_token(&mcp).await {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string());
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            e.to_string(),
+        );
     }
     let mut model_tokens = HashMap::new();
     let mut metadata = Vec::new();
@@ -242,6 +435,8 @@ pub async fn exchange_workload_token(State(state): State<AppState>, headers: Hea
             format!("{} model {}", template.agent_label, channel),
             grant.credential_scope,
             grant.action_scope,
+            None,
+            false,
         );
         token.agent_label = Some(template.agent_label.clone());
         token.tenant = Some(template.tenant.clone());
@@ -249,7 +444,11 @@ pub async fn exchange_workload_token(State(state): State<AppState>, headers: Hea
             for id in &minted_ids {
                 let _ = state.storage.set_use_token_revoked(id).await;
             }
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", e.to_string());
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                e.to_string(),
+            );
         }
         minted_ids.push(token.id.clone());
         model_tokens.insert(channel, plain);
@@ -261,6 +460,74 @@ pub async fn exchange_workload_token(State(state): State<AppState>, headers: Hea
             "mcp_token": mcp_plain, "model_tokens": model_tokens,
             "expires_at_unix": (Utc::now() + Duration::seconds(template.ttl_secs)).timestamp(),
             "metadata": {"mcp": UseTokenMetadata::from(&mcp), "models": metadata}
+        })),
+    )
+        .into_response()
+}
+
+/// Lightweight non-consuming liveness lease for framework-native execution.
+/// A runtime polls with its MCP use-token. Revocation/expiry (W2) or any matching
+/// authoritative kill policy (W3) returns a non-2xx response, allowing the SDK
+/// to abort cooperative in-process work without granting an admin credential.
+pub async fn runtime_control(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let secret = match bearer(&headers) {
+        Some(value) if UseToken::looks_like_token(value) => value,
+        _ => {
+            return error(
+                StatusCode::UNAUTHORIZED,
+                "missing_runtime_token",
+                "a Bearer use-token is required",
+            )
+        }
+    };
+    let _ = state.storage.reload().await;
+    let token = match state
+        .storage
+        .get_use_token_by_hash(&UseToken::hash(secret))
+        .await
+    {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            return error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_runtime_token",
+                "runtime token is unknown",
+            )
+        }
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "control_store_unavailable",
+                "runtime control state is unavailable",
+            )
+        }
+    };
+    if token.revoked || token.is_expired() {
+        return error(
+            StatusCode::CONFLICT,
+            "runtime_cancelled",
+            "runtime authority was revoked or expired",
+        );
+    }
+    let principal = Principal {
+        id: token.id.clone(),
+        agent_label: token.agent_label.clone(),
+        owner: None,
+        workload_id: None,
+    };
+    if state.server.policy_engine().is_principal_halted(&principal) {
+        return error(
+            StatusCode::CONFLICT,
+            "runtime_cancelled",
+            "runtime principal was halted",
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "active": true,
+            "agent_label": token.agent_label,
+            "tenant": token.tenant,
         })),
     )
         .into_response()
@@ -282,5 +549,21 @@ mod tests {
         );
         assert!(verify_assertion(&token, secret).is_ok());
         assert!(verify_assertion(&token, b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").is_err());
+    }
+
+    #[test]
+    fn workload_mcp_token_preserves_compiled_use_and_approval_limits() {
+        let request = workload_token_request(
+            "agent mcp".into(),
+            "cred-*".into(),
+            "payments.refund".into(),
+            Some(5),
+            true,
+            900,
+        );
+        assert_eq!(request.max_uses, Some(5));
+        assert!(request.require_approval);
+        assert_eq!(request.expires_in, Some(Duration::seconds(900)));
+        assert!(request.validate().is_ok());
     }
 }

@@ -71,7 +71,9 @@ async fn test_credential_scoping() {
     let role = manager
         .create_role(
             "github-only",
-            [Permission::Read, Permission::Execute].into_iter().collect(),
+            [Permission::Read, Permission::Execute]
+                .into_iter()
+                .collect(),
             vec!["github-*".to_string()],
             Some("Access only GitHub credentials".to_string()),
         )
@@ -276,7 +278,9 @@ async fn test_multiple_scoped_keys() {
     let github_role = manager
         .create_role(
             "github-access",
-            [Permission::Read, Permission::Execute].into_iter().collect(),
+            [Permission::Read, Permission::Execute]
+                .into_iter()
+                .collect(),
             vec!["github-*".to_string()],
             None,
         )
@@ -286,7 +290,9 @@ async fn test_multiple_scoped_keys() {
     let aws_role = manager
         .create_role(
             "aws-access",
-            [Permission::Read, Permission::Execute].into_iter().collect(),
+            [Permission::Read, Permission::Execute]
+                .into_iter()
+                .collect(),
             vec!["aws-*".to_string()],
             None,
         )
@@ -391,7 +397,11 @@ async fn test_oauth2_credential_with_token() {
     storage.store(&cred).await.unwrap();
 
     // Retrieve and verify
-    let retrieved = storage.get_by_alias("oauth2-with-token").await.unwrap().unwrap();
+    let retrieved = storage
+        .get_by_alias("oauth2-with-token")
+        .await
+        .unwrap()
+        .unwrap();
     match &retrieved.data {
         CredentialData::OAuth2 {
             access_token,
@@ -460,7 +470,11 @@ async fn test_oauth2_credential_update_after_refresh() {
     assert_eq!(credentials.len(), 1);
 
     // Verify the credential was updated
-    let retrieved = storage.get_by_alias("oauth2-refresh-test").await.unwrap().unwrap();
+    let retrieved = storage
+        .get_by_alias("oauth2-refresh-test")
+        .await
+        .unwrap()
+        .unwrap();
     match &retrieved.data {
         CredentialData::OAuth2 {
             access_token,
@@ -485,7 +499,9 @@ async fn test_oauth2_credential_scoped_access() {
     let role = manager
         .create_role(
             "oauth2-only",
-            [Permission::Read, Permission::Execute].into_iter().collect(),
+            [Permission::Read, Permission::Execute]
+                .into_iter()
+                .collect(),
             vec!["oauth2-*".to_string()],
             Some("Access only OAuth2 credentials".to_string()),
         )

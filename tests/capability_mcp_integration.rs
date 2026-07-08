@@ -47,7 +47,10 @@ fn config_with_policies(policies: Vec<Policy>) -> Config {
 }
 
 /// Register the standard "send_email"-style HTTP capability against a credential.
-async fn register_capability(storage: &Arc<dyn StorageBackend>, credential_ref: &str) -> Capability {
+async fn register_capability(
+    storage: &Arc<dyn StorageBackend>,
+    credential_ref: &str,
+) -> Capability {
     let cap = Capability {
         id: "cap-send-email".to_string(),
         tool_name: "send_email".to_string(),
@@ -129,8 +132,10 @@ fn tools_in(response: &serde_json::Value) -> Vec<String> {
 
 // ---- An allow policy for the credential so the principal is permitted. ----
 fn allow_policy(credential_pattern: &str) -> Policy {
-    Policy::allow_all("allow-cap", credential_pattern)
-        .with_rule(PolicyCondition::UrlMatch("https://*".to_string()), PolicyAction::Allow)
+    Policy::allow_all("allow-cap", credential_pattern).with_rule(
+        PolicyCondition::UrlMatch("https://*".to_string()),
+        PolicyAction::Allow,
+    )
 }
 
 #[tokio::test]
@@ -152,14 +157,26 @@ async fn allowed_principal_sees_capability_in_tools_list() {
     let value = serde_json::to_value(&resp).unwrap();
     let names = tools_in(&value);
 
-    assert!(names.contains(&"send_email".to_string()), "allowed principal must see the named tool: {names:?}");
+    assert!(
+        names.contains(&"send_email".to_string()),
+        "allowed principal must see the named tool: {names:?}"
+    );
     // Connector model: a scoped use-token (vut_) agent sees ONLY its granted named
     // capabilities + the control tool — NOT vultrino's generic built-in tools (the
     // generic surface is for a direct admin/operator vk_ key). The built-ins remain
     // default-deny enforced regardless; this is about not OFFERING them to an agent.
-    assert!(!names.contains(&"http_request".to_string()), "a use-token agent must NOT see generic http_request: {names:?}");
-    assert!(!names.contains(&"list_credentials".to_string()), "a use-token agent must NOT see generic list_credentials");
-    assert!(names.contains(&"check_approval".to_string()), "the control tool stays available to an agent");
+    assert!(
+        !names.contains(&"http_request".to_string()),
+        "a use-token agent must NOT see generic http_request: {names:?}"
+    );
+    assert!(
+        !names.contains(&"list_credentials".to_string()),
+        "a use-token agent must NOT see generic list_credentials"
+    );
+    assert!(
+        names.contains(&"check_approval".to_string()),
+        "the control tool stays available to an agent"
+    );
 
     // The capability tool exposes its schema with the injected api_key field.
     let send_email = value["result"]["tools"]
@@ -196,7 +213,10 @@ async fn denied_principal_does_not_see_capability() {
     // Connector model: a use-token sees no generic built-ins either — only its
     // granted capabilities (none here, since it's scoped to a different credential)
     // plus the control tool.
-    assert!(!names.contains(&"http_request".to_string()), "a use-token agent must NOT see generic http_request");
+    assert!(
+        !names.contains(&"http_request".to_string()),
+        "a use-token agent must NOT see generic http_request"
+    );
     assert!(names.contains(&"check_approval".to_string()));
 }
 
@@ -261,7 +281,10 @@ async fn no_policy_default_deny_blocks_capability_call() {
     });
     let resp = mcp.handle_jsonrpc(&list.to_string()).await.unwrap();
     let value = serde_json::to_value(&resp).unwrap();
-    assert!(!tools_in(&value).contains(&"send_email".to_string()), "default-deny must hide the tool");
+    assert!(
+        !tools_in(&value).contains(&"send_email".to_string()),
+        "default-deny must hide the tool"
+    );
 
     // tools/call: even a forged call is denied (no bypass).
     let call = serde_json::json!({
@@ -275,7 +298,10 @@ async fn no_policy_default_deny_blocks_capability_call() {
     let value = serde_json::to_value(&resp).unwrap();
     assert_eq!(value["result"]["isError"], serde_json::json!(true));
     let text = value["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("denied") || text.contains("no_policy"), "got: {text}");
+    assert!(
+        text.contains("denied") || text.contains("no_policy"),
+        "got: {text}"
+    );
 }
 
 #[tokio::test]
@@ -321,7 +347,10 @@ async fn allowed_tools_call_reaches_execute_past_policy() {
     // It is an error, but a PLUGIN/SSRF error (got past policy into execute), not a
     // policy denial — proving the enforced execute path ran.
     assert_eq!(value["result"]["isError"], serde_json::json!(true));
-    let text = value["result"]["content"][0]["text"].as_str().unwrap().to_lowercase();
+    let text = value["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_lowercase();
     assert!(
         text.contains("private") || text.contains("internal") || text.contains("ssrf"),
         "expected the call to reach the http plugin (SSRF/private rejection), got: {text}"
@@ -357,7 +386,10 @@ async fn generic_tools_still_work() {
     // No error; the listing mentions our credential.
     assert_ne!(value["result"]["isError"], serde_json::json!(true));
     let text = value["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("cred-sendgrid"), "generic list_credentials should still work: {text}");
+    assert!(
+        text.contains("cred-sendgrid"),
+        "generic list_credentials should still work: {text}"
+    );
 }
 
 #[tokio::test]

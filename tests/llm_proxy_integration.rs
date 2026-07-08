@@ -122,7 +122,11 @@ impl Plugin for MockLlmPlugin {
             updated_credential: None,
         })
     }
-    fn validate_params(&self, _action: &str, _params: &serde_json::Value) -> Result<(), PluginError> {
+    fn validate_params(
+        &self,
+        _action: &str,
+        _params: &serde_json::Value,
+    ) -> Result<(), PluginError> {
         Ok(())
     }
 }
@@ -190,15 +194,16 @@ impl Plugin for MockStreamingPlugin {
         ]);
         Ok(vultrino::StreamingResponse {
             status: 200,
-            headers: HashMap::from([(
-                "content-type".to_string(),
-                "text/event-stream".to_string(),
-            )]),
+            headers: HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]),
             body: Box::pin(body),
             updated_credential: None,
         })
     }
-    fn validate_params(&self, _action: &str, _params: &serde_json::Value) -> Result<(), PluginError> {
+    fn validate_params(
+        &self,
+        _action: &str,
+        _params: &serde_json::Value,
+    ) -> Result<(), PluginError> {
         Ok(())
     }
 }
@@ -220,8 +225,10 @@ fn config_with_policies(policies: Vec<Policy>) -> Config {
 /// Allow any http(s) URL for a credential glob (so the metered path isn't denied
 /// by policy and we can observe the meter events / scrub behavior).
 fn allow_policy(credential_pattern: &str) -> Policy {
-    Policy::allow_all("allow-llm", credential_pattern)
-        .with_rule(PolicyCondition::UrlMatch("*".to_string()), PolicyAction::Allow)
+    Policy::allow_all("allow-llm", credential_pattern).with_rule(
+        PolicyCondition::UrlMatch("*".to_string()),
+        PolicyAction::Allow,
+    )
 }
 
 /// Build the router + the shared storage + the shared exec server (so a test can
@@ -229,6 +236,9 @@ fn allow_policy(credential_pattern: &str) -> Policy {
 async fn build_stack(
     config: Config,
 ) -> (axum::Router, Arc<dyn StorageBackend>, Arc<VultrinoServer>) {
+    // The production default is fail-closed. This suite explicitly opts into
+    // the OpenAI wire family it exercises; every test writes the same value.
+    unsafe { std::env::set_var("VULTRINO_PROVIDER_OPENAI_ENABLED", "true") };
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
     std::mem::forget(dir);
@@ -243,12 +253,19 @@ async fn build_stack(
         storage.list_api_keys().await.unwrap(),
     );
     let resolver = CredentialResolver::new(storage.clone());
-    let exec_server = Arc::new(VultrinoServer::new(config.clone(), storage.clone(), resolver));
+    let exec_server = Arc::new(VultrinoServer::new(
+        config.clone(),
+        storage.clone(),
+        resolver,
+    ));
     exec_server.load_plugins().await.unwrap();
     exec_server.reload_policies().await.unwrap();
 
     let server = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         config,
         storage.clone(),
         auth_manager,
@@ -279,7 +296,8 @@ async fn register_llm_capability(
     action: &str,
     provider_base: &str,
 ) {
-    register_llm_capability_models(storage, credential_ref, action, provider_base, Vec::new()).await;
+    register_llm_capability_models(storage, credential_ref, action, provider_base, Vec::new())
+        .await;
 }
 
 /// Register an LLM-proxy capability with a per-model allowlist (empty = any model).
@@ -300,7 +318,12 @@ async fn register_llm_capability_models(
         credential_ref: credential_ref.to_string(),
         input_schema: serde_json::Value::Null,
         reversibility: "reversible".to_string(),
-		llm: Some(LlmProxy { provider_base: provider_base.to_string(), allowed_models, max_output_tokens: None, ..Default::default() }),
+        llm: Some(LlmProxy {
+            provider_base: provider_base.to_string(),
+            allowed_models,
+            max_output_tokens: None,
+            ..Default::default()
+        }),
     };
     cap.validate().unwrap();
     storage.store_capability(&cap).await.unwrap();
@@ -332,11 +355,16 @@ fn llm_req(bearer: Option<&str>, path: &str, body: serde_json::Value) -> Request
     if let Some(token) = bearer {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
-    builder.body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()
+    builder
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
 }
 
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
-    axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
 }
 
 /// All meter.observed payloads currently in the outbox.
@@ -360,10 +388,20 @@ async fn llm_missing_bearer_is_401() {
     let (router, storage, _srv) =
         build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_provider_credential(&storage, "cred-openai").await;
-    register_llm_capability(&storage, "cred-openai", "http.request", "https://api.openai.com").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "http.request",
+        "https://api.openai.com",
+    )
+    .await;
 
     let resp = router
-        .oneshot(llm_req(None, "v1/chat/completions", serde_json::json!({ "model": "gpt-4o-mini" })))
+        .oneshot(llm_req(
+            None,
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini" }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -379,7 +417,11 @@ async fn llm_no_capability_is_403_fail_closed() {
     let token = mint_token(&storage, "cred-openai", Some("http.request")).await;
 
     let resp = router
-        .oneshot(llm_req(Some(&token), "v1/chat/completions", serde_json::json!({ "model": "x" })))
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "x" }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -408,33 +450,63 @@ async fn llm_per_model_allowlist_denies_unlisted_before_upstream() {
     // (a) Disallowed model → 403 permission_error, short-circuited before any upstream call.
     let resp = router
         .clone()
-        .oneshot(llm_req(Some(&token), "v1/chat/completions", serde_json::json!({ "model": "gpt-3.5-turbo" })))
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-3.5-turbo" }),
+        ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a disallowed model must be denied pre-upstream");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a disallowed model must be denied pre-upstream"
+    );
     let body: serde_json::Value =
         serde_json::from_slice(&body_bytes(resp).await).expect("error body is JSON");
-    assert_eq!(body["error"]["type"], "permission_error", "deny shape: {body}");
+    assert_eq!(
+        body["error"]["type"], "permission_error",
+        "deny shape: {body}"
+    );
     assert!(
-        body["error"]["message"].as_str().unwrap_or_default().contains("not permitted"),
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not permitted"),
         "deny message names the model rejection: {body}"
     );
 
     // (b) Missing model with an allowlist set → fail-closed 403 (can't verify the model).
     let resp = router
         .clone()
-        .oneshot(llm_req(Some(&token), "v1/chat/completions", serde_json::json!({ "messages": [] })))
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "messages": [] }),
+        ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a missing model under an allowlist must fail closed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a missing model under an allowlist must fail closed"
+    );
 
     // (c) Allowed model → passes the gate, reaches execute_gated, and the loopback target
     //     502s (the same enforced-path proof as the no-allowlist test) — i.e. NOT short-circuited.
     let resp = router
-        .oneshot(llm_req(Some(&token), "v1/chat/completions", serde_json::json!({ "model": "gpt-4o" })))
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o" }),
+        ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "an allowed model must pass the gate and reach the enforced path");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "an allowed model must pass the gate and reach the enforced path"
+    );
 }
 
 #[tokio::test]
@@ -472,7 +544,10 @@ async fn llm_streamed_per_model_allowlist_denies_unlisted_before_upstream() {
     );
     let body: serde_json::Value =
         serde_json::from_slice(&body_bytes(resp).await).expect("error body is JSON");
-    assert_eq!(body["error"]["type"], "permission_error", "deny shape: {body}");
+    assert_eq!(
+        body["error"]["type"], "permission_error",
+        "deny shape: {body}"
+    );
 
     // A missing model under an allowlist also fails closed on the streaming path.
     let resp = router
@@ -514,7 +589,7 @@ async fn llm_streamed_max_output_tokens_ceiling_clamps_the_forwarded_request() {
             provider_base: "https://api.openai.com".to_string(),
             allowed_models: Vec::new(),
             max_output_tokens: Some(1000),
-			..Default::default()
+            ..Default::default()
         }),
     };
     cap.validate().unwrap();
@@ -557,11 +632,21 @@ async fn llm_resolves_capability_and_runs_enforced_path() {
     let (router, storage, _srv) =
         build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_provider_credential(&storage, "cred-openai").await;
-    register_llm_capability(&storage, "cred-openai", "http.request", "http://127.0.0.1:9").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "http.request",
+        "http://127.0.0.1:9",
+    )
+    .await;
     let token = mint_token(&storage, "cred-openai", Some("http.request")).await;
 
     let resp = router
-        .oneshot(llm_req(Some(&token), "v1/chat/completions", serde_json::json!({ "model": "x" })))
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "x" }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -582,11 +667,21 @@ async fn llm_token_scoped_away_from_credential_is_denied() {
     let (router, storage, _srv) =
         build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_provider_credential(&storage, "cred-openai").await;
-    register_llm_capability(&storage, "cred-openai", "http.request", "https://api.openai.com").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "http.request",
+        "https://api.openai.com",
+    )
+    .await;
     let token = mint_token(&storage, "other-*", Some("http.request")).await;
 
     let resp = router
-        .oneshot(llm_req(Some(&token), "v1/chat/completions", serde_json::json!({ "model": "x" })))
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "x" }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -605,7 +700,13 @@ async fn llm_non_streamed_injects_key_returns_body_meters_tokens_and_scrubs() {
     srv.plugins().register(Arc::new(MockLlmPlugin));
     store_provider_credential(&storage, "cred-openai").await;
     // The capability's action routes to the stub plugin (mockllm.chat).
-    register_llm_capability(&storage, "cred-openai", "mockllm.chat", "https://api.openai.com").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockllm.chat",
+        "https://api.openai.com",
+    )
+    .await;
     let token = mint_token(&storage, "cred-openai", Some("mockllm.chat")).await;
 
     let resp = router
@@ -621,7 +722,10 @@ async fn llm_non_streamed_injects_key_returns_body_meters_tokens_and_scrubs() {
     assert_eq!(resp.status(), StatusCode::OK);
     let raw = body_bytes(resp).await;
     let returned: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-    assert_eq!(returned["id"], "chatcmpl-abc123", "the provider body is returned to the agent");
+    assert_eq!(
+        returned["id"], "chatcmpl-abc123",
+        "the provider body is returned to the agent"
+    );
 
     // (a)+(e) the vault key was injected (the stub echoed what it RECEIVED) AND
     // is scrubbed from the body the agent sees — the agent never holds the key.
@@ -634,19 +738,45 @@ async fn llm_non_streamed_injects_key_returns_body_meters_tokens_and_scrubs() {
     // (c) a non-streamed call emits BOTH the V13a api-calls=1 event and the V13b
     // priced token event (asset=usd + tokens + model_ref).
     let events = meter_events(&storage).await;
-    let api_calls: Vec<_> = events.iter().filter(|p| p["asset"] == "api-calls").collect();
+    let api_calls: Vec<_> = events
+        .iter()
+        .filter(|p| p["asset"] == "api-calls")
+        .collect();
     let token_events: Vec<_> = events.iter().filter(|p| p["asset"] == "usd").collect();
-    assert_eq!(api_calls.len(), 1, "exactly one api-calls=1 event: {events:?}");
+    assert_eq!(
+        api_calls.len(),
+        1,
+        "exactly one api-calls=1 event: {events:?}"
+    );
     assert_eq!(api_calls[0]["amount"], 1);
-    assert_eq!(token_events.len(), 1, "exactly one priced token event: {events:?}");
+    assert_eq!(
+        token_events.len(),
+        1,
+        "exactly one priced token event: {events:?}"
+    );
     let te = token_events[0];
-    assert_eq!(te["tokens"]["input_tokens"], 57, "input tokens from the usage block");
-    assert_eq!(te["tokens"]["output_tokens"], 13, "output tokens from the usage block");
-    assert!(te.get("amount").is_none(), "a priced token event must NOT carry an amount");
-    assert_eq!(te["dims"]["model_ref"], "gpt-4o-mini", "model_ref selects leria's rate card");
+    assert_eq!(
+        te["tokens"]["input_tokens"], 57,
+        "input tokens from the usage block"
+    );
+    assert_eq!(
+        te["tokens"]["output_tokens"], 13,
+        "output tokens from the usage block"
+    );
+    assert!(
+        te.get("amount").is_none(),
+        "a priced token event must NOT carry an amount"
+    );
+    assert_eq!(
+        te["dims"]["model_ref"], "gpt-4o-mini",
+        "model_ref selects leria's rate card"
+    );
     assert_eq!(te["cost_source"], "gateway-observed");
     // The token event shares the occurrence with the api-calls event.
-    assert_eq!(te["correlation_id"], api_calls[0]["correlation_id"], "same occurrence");
+    assert_eq!(
+        te["correlation_id"], api_calls[0]["correlation_id"],
+        "same occurrence"
+    );
 }
 
 #[tokio::test]
@@ -658,14 +788,22 @@ async fn llm_denied_by_govder_grant_policy_shape_without_an_llm_allow_rule() {
     // asks: under vultrino default-deny, is an /llm call authorized? It must NOT be — proving
     // govder does not currently authorize the /llm channel (the companion-blocking finding).
     // (The control is llm_non_streamed_* below, which uses an allow_policy → 200 + metering.)
-    let grant = Policy::deny_all("govder-grant", "cred-*")
-        .with_rule(PolicyCondition::UrlMatch("https://wttr.in/*".to_string()), PolicyAction::Allow);
+    let grant = Policy::deny_all("govder-grant", "cred-*").with_rule(
+        PolicyCondition::UrlMatch("https://wttr.in/*".to_string()),
+        PolicyAction::Allow,
+    );
     let (router, storage, srv) = build_stack(config_with_policies(vec![grant])).await;
     // The mock plugin returns 200 IF reached — so a non-200 result with ZERO meter events
     // proves the POLICY denied the call BEFORE any upstream/plugin execution.
     srv.plugins().register(Arc::new(MockLlmPlugin));
     store_provider_credential(&storage, "cred-openai").await;
-    register_llm_capability(&storage, "cred-openai", "mockllm.chat", "https://api.openai.com").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockllm.chat",
+        "https://api.openai.com",
+    )
+    .await;
     let token = mint_token(&storage, "cred-openai", Some("mockllm.chat")).await;
 
     let resp = router
@@ -700,12 +838,24 @@ async fn llm_authorized_by_grant_policy_action_match_rule() {
     // llm_denied_by_govder_grant_policy_shape_*: same deny-default grant on "cred-*", but WITH
     // the LLM action rule govder now emits.
     let grant = Policy::deny_all("govder-grant", "cred-*")
-        .with_rule(PolicyCondition::UrlMatch("https://wttr.in/*".to_string()), PolicyAction::Allow)
-        .with_rule(PolicyCondition::ActionMatch("mockllm.chat".to_string()), PolicyAction::Allow);
+        .with_rule(
+            PolicyCondition::UrlMatch("https://wttr.in/*".to_string()),
+            PolicyAction::Allow,
+        )
+        .with_rule(
+            PolicyCondition::ActionMatch("mockllm.chat".to_string()),
+            PolicyAction::Allow,
+        );
     let (router, storage, srv) = build_stack(config_with_policies(vec![grant])).await;
     srv.plugins().register(Arc::new(MockLlmPlugin));
     store_provider_credential(&storage, "cred-openai").await;
-    register_llm_capability(&storage, "cred-openai", "mockllm.chat", "https://api.openai.com").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockllm.chat",
+        "https://api.openai.com",
+    )
+    .await;
     let token = mint_token(&storage, "cred-openai", Some("mockllm.chat")).await;
 
     let resp = router
@@ -716,7 +866,11 @@ async fn llm_authorized_by_grant_policy_action_match_rule() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "the LLM action allow rule must authorize /llm");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the LLM action allow rule must authorize /llm"
+    );
     let events = meter_events(&storage).await;
     assert!(
         !events.is_empty(),
@@ -749,7 +903,7 @@ async fn llm_max_output_tokens_ceiling_clamps_the_forwarded_request() {
             provider_base: "https://api.openai.com".to_string(),
             allowed_models: Vec::new(),
             max_output_tokens: Some(1000),
-			..Default::default()
+            ..Default::default()
         }),
     };
     cap.validate().unwrap();
@@ -768,7 +922,11 @@ async fn llm_max_output_tokens_ceiling_clamps_the_forwarded_request() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let returned: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(returned["received_max_tokens"], serde_json::json!(1000), "over-ceiling max_tokens must be clamped to the ceiling");
+    assert_eq!(
+        returned["received_max_tokens"],
+        serde_json::json!(1000),
+        "over-ceiling max_tokens must be clamped to the ceiling"
+    );
 
     // (b) A request that OMITS max_tokens has it SET to the ceiling (so the provider
     //     default can't exceed the per-call bound).
@@ -782,7 +940,11 @@ async fn llm_max_output_tokens_ceiling_clamps_the_forwarded_request() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let returned: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(returned["received_max_tokens"], serde_json::json!(1000), "an omitted max_tokens must be set to the ceiling");
+    assert_eq!(
+        returned["received_max_tokens"],
+        serde_json::json!(1000),
+        "an omitted max_tokens must be set to the ceiling"
+    );
 }
 
 #[tokio::test]
@@ -791,7 +953,13 @@ async fn llm_streamed_emits_api_calls_only_no_token_count() {
         build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
     srv.plugins().register(Arc::new(MockLlmPlugin));
     store_provider_credential(&storage, "cred-openai").await;
-    register_llm_capability(&storage, "cred-openai", "mockllm.chat", "https://api.openai.com").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockllm.chat",
+        "https://api.openai.com",
+    )
+    .await;
     let token = mint_token(&storage, "cred-openai", Some("mockllm.chat")).await;
 
     let resp = router
@@ -805,13 +973,23 @@ async fn llm_streamed_emits_api_calls_only_no_token_count() {
     assert_eq!(resp.status(), StatusCode::OK);
     // The streamed body still comes back (vultrino buffers it; no SSE).
     let raw = body_bytes(resp).await;
-    assert!(!String::from_utf8_lossy(&raw).contains(PROVIDER_KEY), "no key leak on the streamed path");
+    assert!(
+        !String::from_utf8_lossy(&raw).contains(PROVIDER_KEY),
+        "no key leak on the streamed path"
+    );
 
     // Only the V13a api-calls=1 event fires — token counts are non-streaming-only.
     let events = meter_events(&storage).await;
-    let api_calls: Vec<_> = events.iter().filter(|p| p["asset"] == "api-calls").collect();
+    let api_calls: Vec<_> = events
+        .iter()
+        .filter(|p| p["asset"] == "api-calls")
+        .collect();
     let token_events: Vec<_> = events.iter().filter(|p| p["asset"] == "usd").collect();
-    assert_eq!(api_calls.len(), 1, "a streamed call still meters api-calls=1: {events:?}");
+    assert_eq!(
+        api_calls.len(),
+        1,
+        "a streamed call still meters api-calls=1: {events:?}"
+    );
     assert!(
         token_events.is_empty(),
         "a streamed response (no usage trailer) must NOT emit a token event: {events:?}"
@@ -829,7 +1007,13 @@ async fn llm_streamed_real_sse_passthrough_scrubs_split_key() {
     // The streaming stub emits a genuine multi-chunk text/event-stream.
     srv.plugins().register(Arc::new(MockStreamingPlugin));
     store_provider_credential(&storage, "cred-openai").await;
-    register_llm_capability(&storage, "cred-openai", "mockstream.chat", "https://api.openai.com").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockstream.chat",
+        "https://api.openai.com",
+    )
+    .await;
     let token = mint_token(&storage, "cred-openai", Some("mockstream.chat")).await;
 
     let resp = router
@@ -875,16 +1059,42 @@ async fn llm_streamed_real_sse_passthrough_scrubs_split_key() {
     // A real streamed call meters V13a api-calls=1 AND — because chunk 2 carried an
     // OpenAI usage trailer — the V13b priced token event (the limitation removed).
     let events = meter_events(&storage).await;
-    let api_calls: Vec<_> = events.iter().filter(|p| p["asset"] == "api-calls").collect();
+    let api_calls: Vec<_> = events
+        .iter()
+        .filter(|p| p["asset"] == "api-calls")
+        .collect();
     let token_events: Vec<_> = events.iter().filter(|p| p["asset"] == "usd").collect();
-    assert_eq!(api_calls.len(), 1, "a real streamed call meters api-calls=1: {events:?}");
-    assert_eq!(token_events.len(), 1, "a streamed usage trailer now emits V13b: {events:?}");
+    assert_eq!(
+        api_calls.len(),
+        1,
+        "a real streamed call meters api-calls=1: {events:?}"
+    );
+    assert_eq!(
+        token_events.len(),
+        1,
+        "a streamed usage trailer now emits V13b: {events:?}"
+    );
     let te = token_events[0];
-    assert_eq!(te["tokens"]["input_tokens"], 11, "input tokens from the streamed usage chunk");
-    assert_eq!(te["tokens"]["output_tokens"], 22, "output tokens from the streamed usage chunk");
-    assert!(te.get("amount").is_none(), "a priced token event must NOT carry an amount");
-    assert_eq!(te["dims"]["model_ref"], "gpt-4o-mini", "model_ref parsed from the stream");
-    assert_eq!(te["correlation_id"], api_calls[0]["correlation_id"], "same occurrence");
+    assert_eq!(
+        te["tokens"]["input_tokens"], 11,
+        "input tokens from the streamed usage chunk"
+    );
+    assert_eq!(
+        te["tokens"]["output_tokens"], 22,
+        "output tokens from the streamed usage chunk"
+    );
+    assert!(
+        te.get("amount").is_none(),
+        "a priced token event must NOT carry an amount"
+    );
+    assert_eq!(
+        te["dims"]["model_ref"], "gpt-4o-mini",
+        "model_ref parsed from the stream"
+    );
+    assert_eq!(
+        te["correlation_id"], api_calls[0]["correlation_id"],
+        "same occurrence"
+    );
 }
 
 #[tokio::test]
@@ -893,7 +1103,9 @@ async fn llm_streamed_block_egress_rule_falls_back_to_buffered_withhold() {
     // incrementally, so a stream:true request must serve BUFFERED and the block rule
     // withholds the body — never a partial stream of a secret-bearing response.
     let config = Config {
-        enforcement: EnforcementConfig { default_action: EnforcementDefault::Deny },
+        enforcement: EnforcementConfig {
+            default_action: EnforcementDefault::Deny,
+        },
         policies: vec![allow_policy("cred-*")],
         egress: vec![vultrino::egress::EgressRule {
             credential_pattern: glob::Pattern::new("cred-*").unwrap(),
@@ -906,7 +1118,13 @@ async fn llm_streamed_block_egress_rule_falls_back_to_buffered_withhold() {
     let (router, storage, srv) = build_stack(config).await;
     srv.plugins().register(Arc::new(MockStreamingPlugin));
     store_provider_credential(&storage, "cred-openai").await;
-    register_llm_capability(&storage, "cred-openai", "mockstream.chat", "https://api.openai.com").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockstream.chat",
+        "https://api.openai.com",
+    )
+    .await;
     let token = mint_token(&storage, "cred-openai", Some("mockstream.chat")).await;
 
     let resp = router
@@ -926,7 +1144,10 @@ async fn llm_streamed_block_egress_rule_falls_back_to_buffered_withhold() {
         body_str.contains("withheld by egress policy"),
         "a block rule must withhold the buffered fallback body: {body_str}"
     );
-    assert!(!body_str.contains(PROVIDER_KEY), "no key leak on the withheld fallback");
+    assert!(
+        !body_str.contains(PROVIDER_KEY),
+        "no key leak on the withheld fallback"
+    );
 }
 
 // ===========================================================================
@@ -939,11 +1160,24 @@ async fn llm_streamed_halt_cancels_midstream() {
         build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
     srv.plugins().register(Arc::new(MockStreamingPlugin));
     store_provider_credential(&storage, "cred-openai").await;
-    register_llm_capability(&storage, "cred-openai", "mockstream.chat", "https://api.openai.com").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockstream.chat",
+        "https://api.openai.com",
+    )
+    .await;
     let token = mint_token(&storage, "cred-openai", Some("mockstream.chat")).await;
     // The halt target is the in-flight session's principal/token id (the minted
     // token carries no agent label), which `signal_halt` matches.
-    let token_id = storage.list_use_tokens().await.unwrap().into_iter().next().unwrap().id;
+    let token_id = storage
+        .list_use_tokens()
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .id;
 
     let resp = router
         .oneshot(llm_req(
@@ -967,13 +1201,26 @@ async fn llm_streamed_halt_cancels_midstream() {
         body_str.contains("request halted"),
         "a halted stream must emit the terminal halt frame: {body_str}"
     );
-    assert!(!body_str.contains(PROVIDER_KEY), "no key leak on the halted stream");
+    assert!(
+        !body_str.contains(PROVIDER_KEY),
+        "no key leak on the halted stream"
+    );
 
     // A halted streamed call still meters V13a api-calls=1, but NOT V13b (a halted
     // stream has no trustworthy usage trailer — never under-count).
     let events = meter_events(&storage).await;
-    let api_calls: Vec<_> = events.iter().filter(|p| p["asset"] == "api-calls").collect();
+    let api_calls: Vec<_> = events
+        .iter()
+        .filter(|p| p["asset"] == "api-calls")
+        .collect();
     let token_events: Vec<_> = events.iter().filter(|p| p["asset"] == "usd").collect();
-    assert_eq!(api_calls.len(), 1, "a halted streamed call still meters api-calls=1: {events:?}");
-    assert!(token_events.is_empty(), "a halted stream emits no V13b token event: {events:?}");
+    assert_eq!(
+        api_calls.len(),
+        1,
+        "a halted streamed call still meters api-calls=1: {events:?}"
+    );
+    assert!(
+        token_events.is_empty(),
+        "a halted stream emits no V13b token event: {events:?}"
+    );
 }

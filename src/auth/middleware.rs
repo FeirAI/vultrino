@@ -51,7 +51,9 @@ impl AuthResult {
             id: format!("use-token-role:{}", token.id),
             name: format!("use-token:{}", token.name),
             description: Some("Ephemeral grant backing a use token".to_string()),
-            permissions: [Permission::Read, Permission::Execute].into_iter().collect(),
+            permissions: [Permission::Read, Permission::Execute]
+                .into_iter()
+                .collect(),
             credential_scopes: vec![token.credential_scope.clone()],
             created_at: token.created_at,
         };
@@ -148,21 +150,16 @@ pub fn validate_request(
     auth_manager: &AuthManager,
     api_key: &str,
 ) -> Result<AuthResult, AuthError> {
-    let (key, role) = auth_manager
-        .validate_key(api_key)
-        .map_err(|e| match e {
-            super::manager::AuthManagerError::InvalidKey => AuthError::InvalidKey,
-            super::manager::AuthManagerError::KeyExpired => AuthError::KeyExpired,
-            _ => AuthError::InvalidKey,
-        })?;
+    let (key, role) = auth_manager.validate_key(api_key).map_err(|e| match e {
+        super::manager::AuthManagerError::InvalidKey => AuthError::InvalidKey,
+        super::manager::AuthManagerError::KeyExpired => AuthError::KeyExpired,
+        _ => AuthError::InvalidKey,
+    })?;
 
     // Update last used timestamp
     auth_manager.update_key_last_used(&key.key_hash);
 
-    Ok(AuthResult {
-        api_key: key,
-        role,
-    })
+    Ok(AuthResult { api_key: key, role })
 }
 
 /// Full authentication flow: extract key from header and validate
@@ -235,7 +232,9 @@ mod tests {
         let role = manager
             .create_role(
                 "limited",
-                [Permission::Read, Permission::Execute].into_iter().collect(),
+                [Permission::Read, Permission::Execute]
+                    .into_iter()
+                    .collect(),
                 vec!["github-*".to_string()],
                 None,
             )

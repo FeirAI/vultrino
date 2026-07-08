@@ -69,7 +69,9 @@ impl SessionRegistry {
         let session_id = entry.session_id.clone();
         let abort = Arc::new(Notify::new());
         self.sessions.write().insert(session_id.clone(), entry);
-        self.aborts.write().insert(session_id.clone(), Arc::clone(&abort));
+        self.aborts
+            .write()
+            .insert(session_id.clone(), Arc::clone(&abort));
         (
             SessionGuard {
                 registry: Arc::clone(self),
@@ -221,10 +223,22 @@ mod tests {
                 action: "mock.echo".to_string(),
                 started_at: Utc::now(),
             });
-            assert_eq!(reg.for_halt_target("vk_principal").len(), 1, "matched by principal id");
-            assert_eq!(reg.for_halt_target("vut_token").len(), 1, "matched by token id");
+            assert_eq!(
+                reg.for_halt_target("vk_principal").len(),
+                1,
+                "matched by principal id"
+            );
+            assert_eq!(
+                reg.for_halt_target("vut_token").len(),
+                1,
+                "matched by token id"
+            );
             assert_eq!(reg.for_halt_target("bot-7").len(), 1, "matched by label");
-            assert_eq!(reg.for_agent("vk_principal").len(), 0, "for_agent is label-only");
+            assert_eq!(
+                reg.for_agent("vk_principal").len(),
+                0,
+                "for_agent is label-only"
+            );
             drop(by_id);
         }
         // All guards dropped → registry is empty again.
@@ -265,7 +279,11 @@ mod tests {
             .await
             .expect("halt must wake the matched session within 2s")
             .unwrap();
-        assert_eq!(reg.signal_halt("bot-9"), 1, "bot-9 still present + signallable");
+        assert_eq!(
+            reg.signal_halt("bot-9"),
+            1,
+            "bot-9 still present + signallable"
+        );
         let _ = abort2;
     }
 
@@ -276,6 +294,10 @@ mod tests {
         assert_eq!(reg.signal_halt("bot-7"), 1);
         drop(g1);
         // After the guard drops, there is no abort handle left to signal.
-        assert_eq!(reg.signal_halt("bot-7"), 0, "abort handle removed with the session");
+        assert_eq!(
+            reg.signal_halt("bot-7"),
+            0,
+            "abort handle removed with the session"
+        );
     }
 }

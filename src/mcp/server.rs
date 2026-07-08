@@ -20,7 +20,10 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024
 /// narrow, ephemeral use token.
 enum McpPrincipal {
     ApiKey(AuthResult),
-    UseToken { auth: AuthResult, token: Box<UseToken> },
+    UseToken {
+        auth: AuthResult,
+        token: Box<UseToken>,
+    },
 }
 
 impl McpPrincipal {
@@ -78,7 +81,10 @@ impl McpServer {
     /// Check permission for a validated auth
     fn check_permission(auth: &AuthResult, permission: Permission) -> Result<(), String> {
         if !auth.has_permission(permission) {
-            return Err(format!("Permission denied: requires '{}' permission", permission));
+            return Err(format!(
+                "Permission denied: requires '{}' permission",
+                permission
+            ));
         }
         Ok(())
     }
@@ -194,7 +200,10 @@ impl McpServer {
             ToolContent::Text { text } => text,
             _ => return None,
         };
-        let field = |name: &str| text.lines().find_map(|line| line.strip_prefix(name).map(str::trim));
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name).map(str::trim))
+        };
         let approval_id = field("approval_id:")?;
         let status = field("status:").unwrap_or("pending");
         let expires_at = field("expires:");
@@ -202,12 +211,22 @@ impl McpServer {
             .and_then(|v| v.split_once('/'))
             .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
             .unwrap_or((0, 1));
+        let execution_status = match status {
+            "pending" | "escalated" => "not_started",
+            "denied" | "expired" => "blocked",
+            "approved" if text.contains("being executed now") => "running",
+            "approved" if text.contains("failed to execute") => "failed",
+            "approved" if text.contains("has now run") => "completed",
+            "approved" => "running",
+            _ => "unknown",
+        };
         Some(json!({
             "type": "feir.approval.v1",
             "approval_id": approval_id,
             "status": status,
             "expires_at": expires_at,
             "progress": { "completed": completed, "required": required },
+            "execution_status": execution_status,
             "proof_reference": null,
             "execute_at_most_once": true
         }))
@@ -309,7 +328,10 @@ impl McpServer {
     }
 
     /// Handle initialize request
-    async fn handle_initialize(&mut self, request: &JsonRpcRequest) -> Result<serde_json::Value, (i32, String)> {
+    async fn handle_initialize(
+        &mut self,
+        request: &JsonRpcRequest,
+    ) -> Result<serde_json::Value, (i32, String)> {
         let requested = request
             .params
             .as_ref()
@@ -348,7 +370,10 @@ impl McpServer {
     }
 
     /// Handle tools/list request
-    async fn handle_tools_list(&self, request: &JsonRpcRequest) -> Result<serde_json::Value, (i32, String)> {
+    async fn handle_tools_list(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> Result<serde_json::Value, (i32, String)> {
         let mut tools = vec![
             Tool {
                 name: "list_credentials".to_string(),
@@ -503,7 +528,11 @@ impl McpServer {
         let secret = request
             .params
             .as_ref()
-            .and_then(|p| p.get("api_key").or_else(|| p.get("token")).and_then(|v| v.as_str()))?
+            .and_then(|p| {
+                p.get("api_key")
+                    .or_else(|| p.get("token"))
+                    .and_then(|v| v.as_str())
+            })?
             .to_string();
         self.resolve_principal_for_read(&secret).await.ok()
     }
@@ -607,7 +636,10 @@ impl McpServer {
     }
 
     /// Handle tools/call request
-    async fn handle_tools_call(&self, request: &JsonRpcRequest) -> Result<serde_json::Value, (i32, String)> {
+    async fn handle_tools_call(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> Result<serde_json::Value, (i32, String)> {
         let params: ToolCallParams = request
             .params
             .as_ref()
@@ -630,7 +662,11 @@ impl McpServer {
             .map(|k| k.starts_with("vut_"))
             .unwrap_or(false);
         if caller_is_use_token {
-            let is_named_capability = self.vultrino.capability_by_tool_name(&params.name).await.is_some();
+            let is_named_capability = self
+                .vultrino
+                .capability_by_tool_name(&params.name)
+                .await
+                .is_some();
             if params.name != "check_approval" && !is_named_capability {
                 return Err((
                     INVALID_PARAMS,
@@ -658,7 +694,8 @@ impl McpServer {
                     vultrino.capability_by_tool_name(tool).await
                 };
                 if let Some(capability) = capability {
-                    self.tool_call_capability(&capability, params.arguments).await
+                    self.tool_call_capability(&capability, params.arguments)
+                        .await
                 } else if let Some(result) = self.try_plugin_tool(tool, params.arguments).await {
                     // Otherwise check if it's a plugin tool (format: plugin_tool).
                     result
@@ -718,7 +755,11 @@ impl McpServer {
             }
             let short_name = &tool_name[prefix.len()..];
 
-            let mcp_tool = match plugin.mcp_tool_definitions().into_iter().find(|t| t.name == short_name) {
+            let mcp_tool = match plugin
+                .mcp_tool_definitions()
+                .into_iter()
+                .find(|t| t.name == short_name)
+            {
                 Some(t) => t,
                 None => continue,
             };
@@ -842,7 +883,12 @@ impl McpServer {
             }
             // A policy/scope/tenant denial surfaces as an MCP tool error, never a
             // bypass — the agent is told it is not permitted.
-            Err(e) => return Err(format!("Capability '{}' denied or failed: {}", capability.tool_name, e)),
+            Err(e) => {
+                return Err(format!(
+                    "Capability '{}' denied or failed: {}",
+                    capability.tool_name, e
+                ))
+            }
         };
 
         // The body has already been egress-scrubbed inside run_action, so no
@@ -860,7 +906,10 @@ impl McpServer {
     }
 
     /// Handle resources/list request
-    async fn handle_resources_list(&self, request: &JsonRpcRequest) -> Result<serde_json::Value, (i32, String)> {
+    async fn handle_resources_list(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> Result<serde_json::Value, (i32, String)> {
         // Principal-scoped vault enumeration (GLM review #3 + Codex pass 4). This
         // gate lives in the SHARED handler so BOTH stdio and HTTP are covered
         // uniformly (the HTTP transport injects the Bearer into params.api_key):
@@ -881,7 +930,9 @@ impl McpServer {
         }
         let principal = match self.resolve_principal_for_read(api_key).await {
             Ok(p) => p,
-            Err(_) => return serde_json::to_value(empty).map_err(|e| (INTERNAL_ERROR, e.to_string())),
+            Err(_) => {
+                return serde_json::to_value(empty).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+            }
         };
         if matches!(principal, McpPrincipal::UseToken { .. }) {
             return serde_json::to_value(empty).map_err(|e| (INTERNAL_ERROR, e.to_string()));
@@ -911,15 +962,18 @@ impl McpServer {
     }
 
     /// Tool: list_credentials
-    async fn tool_list_credentials(&self, args: serde_json::Value) -> Result<Vec<ToolContent>, String> {
+    async fn tool_list_credentials(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<Vec<ToolContent>, String> {
         #[derive(serde::Deserialize)]
         struct Args {
             api_key: String,
             pattern: Option<String>,
         }
 
-        let args: Args =
-            serde_json::from_value(args).map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
+        let args: Args = serde_json::from_value(args)
+            .map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
         // Authenticate (API key or use token) and check permission.
         let principal = self.resolve_principal(&args.api_key).await?;
@@ -936,7 +990,10 @@ impl McpServer {
         // Filter by pattern if provided
         let filtered: Vec<&CredentialMetadata> = if let Some(pattern) = &args.pattern {
             let glob = Pattern::new(pattern).map_err(|e| format!("Invalid pattern: {}", e))?;
-            credentials.iter().filter(|c| glob.matches(&c.alias)).collect()
+            credentials
+                .iter()
+                .filter(|c| glob.matches(&c.alias))
+                .collect()
         } else {
             credentials.iter().collect()
         };
@@ -958,7 +1015,10 @@ impl McpServer {
                     .get("description")
                     .map(|d| format!(" - {}", d))
                     .unwrap_or_default();
-                lines.push(format!("- {} (type: {}){}", cred.alias, cred.credential_type, desc));
+                lines.push(format!(
+                    "- {} (type: {}){}",
+                    cred.alias, cred.credential_type, desc
+                ));
             }
             lines.join("\n")
         };
@@ -968,8 +1028,8 @@ impl McpServer {
 
     /// Tool: http_request
     async fn tool_http_request(&self, args: serde_json::Value) -> Result<Vec<ToolContent>, String> {
-        let args: HttpRequestArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
+        let args: HttpRequestArgs = serde_json::from_value(args)
+            .map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
         // Resolve the caller (API key or use token) and build the auth context.
         let principal = self.resolve_principal(&args.api_key).await?;
@@ -1007,7 +1067,8 @@ impl McpServer {
         let body_text = String::from_utf8_lossy(&response.body);
 
         // Try to pretty-print JSON
-        let formatted_body = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
+        let formatted_body = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text)
+        {
             serde_json::to_string_pretty(&json).unwrap_or_else(|_| body_text.to_string())
         } else {
             body_text.to_string()
@@ -1022,9 +1083,12 @@ impl McpServer {
     }
 
     /// Tool: get_credential_info
-    async fn tool_get_credential_info(&self, args: serde_json::Value) -> Result<Vec<ToolContent>, String> {
-        let args: GetCredentialInfoArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
+    async fn tool_get_credential_info(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<Vec<ToolContent>, String> {
+        let args: GetCredentialInfoArgs = serde_json::from_value(args)
+            .map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
         // Authenticate (API key or use token) and check permissions.
         let principal = self.resolve_principal(&args.api_key).await?;
@@ -1051,8 +1115,14 @@ impl McpServer {
                     format!("Alias: {}", cred.alias),
                     format!("ID: {}", cred.id),
                     format!("Type: {}", cred.credential_type),
-                    format!("Created: {}", cred.created_at.format("%Y-%m-%d %H:%M:%S UTC")),
-                    format!("Updated: {}", cred.updated_at.format("%Y-%m-%d %H:%M:%S UTC")),
+                    format!(
+                        "Created: {}",
+                        cred.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+                    ),
+                    format!(
+                        "Updated: {}",
+                        cred.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+                    ),
                 ];
 
                 if !cred.metadata.is_empty() {
@@ -1062,7 +1132,9 @@ impl McpServer {
                     }
                 }
 
-                Ok(vec![ToolContent::Text { text: info.join("\n") }])
+                Ok(vec![ToolContent::Text {
+                    text: info.join("\n"),
+                }])
             }
             None => Err(format!("Credential not found: {}", args.credential)),
         }
@@ -1070,14 +1142,21 @@ impl McpServer {
 
     /// Tool: check_approval — poll a pending approval, and run the action once
     /// it has been approved, returning the real result.
-    async fn tool_check_approval(&self, args: serde_json::Value) -> Result<Vec<ToolContent>, String> {
+    async fn tool_check_approval(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<Vec<ToolContent>, String> {
         #[derive(serde::Deserialize)]
         struct Args {
             api_key: String,
             approval_id: String,
         }
-        let args: Args = serde_json::from_value(args)
-            .map_err(|e| format!("Invalid arguments: {}. api_key and approval_id are required.", e))?;
+        let args: Args = serde_json::from_value(args).map_err(|e| {
+            format!(
+                "Invalid arguments: {}. api_key and approval_id are required.",
+                e
+            )
+        })?;
 
         // Authenticate the caller (API key or use token). Polling is a read, so
         // an exhausted/expired use token is still allowed — only revoked is not.
@@ -1095,16 +1174,17 @@ impl McpServer {
         // V12: surface dual-control (M-of-N) progress so an MCP agent knows it's
         // awaiting additional distinct approvers, not stalled (only meaningful
         // while the request is still open — it's only used by the open arms below).
-        let dual_control_note = if approval.status.is_open() && approval.effective_required_approvals() > 1 {
-            format!(
-                " Dual control: {} of {} distinct approvals so far ({} more needed).",
-                approval.signoffs.len(),
-                approval.effective_required_approvals(),
-                approval.approvals_remaining(),
-            )
-        } else {
-            String::new()
-        };
+        let dual_control_note =
+            if approval.status.is_open() && approval.effective_required_approvals() > 1 {
+                format!(
+                    " Dual control: {} of {} distinct approvals so far ({} more needed).",
+                    approval.signoffs.len(),
+                    approval.effective_required_approvals(),
+                    approval.approvals_remaining(),
+                )
+            } else {
+                String::new()
+            };
         let human_text = match approval.status {
             ApprovalStatus::Pending => format!(
                 "\u{23F3} Approval {} is still PENDING. A human has not decided yet.{} Wait about \
@@ -1191,7 +1271,9 @@ mod tests {
     #[test]
     fn pending_approval_has_structured_content() {
         let content = vec![ToolContent::Text {
-            text: "human text\napproval_id: appr_123\nstatus: pending\nexpires: 2030-01-01T00:00:00Z".to_string(),
+            text:
+                "human text\napproval_id: appr_123\nstatus: pending\nexpires: 2030-01-01T00:00:00Z"
+                    .to_string(),
         }];
         let structured = McpServer::structured_approval_content(&content).unwrap();
         assert_eq!(structured["type"], "feir.approval.v1");
@@ -1202,7 +1284,8 @@ mod tests {
     #[test]
     fn jsonrpc_notification_may_omit_id() {
         let request: JsonRpcRequest =
-            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).unwrap();
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .unwrap();
         assert_eq!(request.id, JsonRpcId::Null);
     }
 

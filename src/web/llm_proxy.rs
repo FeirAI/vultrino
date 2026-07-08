@@ -96,13 +96,20 @@ const FORWARDED_PROVIDER_HEADERS: &[&str] = &[
 
 fn provider_feature_enabled(protocol: &str) -> bool {
     let flag = match protocol {
-        "azure-openai" => Some("VULTRINO_PROVIDER_AZURE_OPENAI_ENABLED"),
-        "bedrock-converse" | "bedrock-invoke" => Some("VULTRINO_PROVIDER_BEDROCK_ENABLED"),
-        "gemini" => Some("VULTRINO_PROVIDER_GEMINI_ENABLED"),
-        "vertex-ai" => Some("VULTRINO_PROVIDER_VERTEX_AI_ENABLED"),
-        _ => None,
+        "openai-chat" | "openai-responses" => "VULTRINO_PROVIDER_OPENAI_ENABLED",
+        "azure-openai" => "VULTRINO_PROVIDER_AZURE_OPENAI_ENABLED",
+        "anthropic-messages" => "VULTRINO_PROVIDER_ANTHROPIC_ENABLED",
+        "bedrock-converse" | "bedrock-invoke" => "VULTRINO_PROVIDER_BEDROCK_ENABLED",
+        "gemini" => "VULTRINO_PROVIDER_GEMINI_ENABLED",
+        "vertex-ai" => "VULTRINO_PROVIDER_VERTEX_AI_ENABLED",
+        // FAIL CLOSED on anything unmapped. Capability validation whitelists the six
+        // provider families above plus "observed-only"; an observed-only channel is
+        // telemetry-grade and must never be served credential-injected proxy traffic,
+        // and any future protocol must be wired to an explicit VULTRINO_PROVIDER_*
+        // switch before it can carry traffic.
+        _ => return false,
     };
-    flag.is_none_or(|name| std::env::var(name).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")))
+    std::env::var(flag).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 /// Copy the allowlisted provider-protocol headers from the inbound request into
@@ -162,7 +169,8 @@ fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64) {
     // ceiling cannot be evaded by naming an alternate field: `max_tokens` (OpenAI chat +
     // legacy + Anthropic), `max_completion_tokens` (newer OpenAI chat models), and
     // `max_output_tokens` (OpenAI /v1/responses).
-    const OUTPUT_TOKEN_FIELDS: &[&str] = &["max_tokens", "max_completion_tokens", "max_output_tokens"];
+    const OUTPUT_TOKEN_FIELDS: &[&str] =
+        &["max_tokens", "max_completion_tokens", "max_output_tokens"];
     if let Some(obj) = body.as_object_mut() {
         // Multiplicity controls (`n` choices, legacy `best_of`) multiply TOTAL output, so
         // pin them to 1 (this fn only runs under a configured ceiling). Fail closed: a
@@ -217,7 +225,11 @@ fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64) {
 async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, Response> {
     if UseToken::looks_like_token(secret) {
         let _ = state.storage.reload().await;
-        let token = match state.storage.get_use_token_by_hash(&UseToken::hash(secret)).await {
+        let token = match state
+            .storage
+            .get_use_token_by_hash(&UseToken::hash(secret))
+            .await
+        {
             Ok(Some(t)) => t,
             _ => {
                 return Err(llm_error(
@@ -238,7 +250,10 @@ async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, R
     } else {
         let manager = state.auth_manager.read().await;
         match manager.validate_key(secret) {
-            Ok((key, role)) => Ok(ExecAuth::from_api_key(crate::auth::AuthResult { api_key: key, role })),
+            Ok((key, role)) => Ok(ExecAuth::from_api_key(crate::auth::AuthResult {
+                api_key: key,
+                role,
+            })),
             Err(e) => Err(llm_error(
                 StatusCode::UNAUTHORIZED,
                 "invalid_request_error",
@@ -333,7 +348,10 @@ async fn llm_proxy_impl(
         Ok(c) => c,
         Err(message) => return llm_error(StatusCode::FORBIDDEN, "permission_error", &message),
     };
-    let llm = capability.llm.as_ref().expect("resolved LLM capability has llm config");
+    let llm = capability
+        .llm
+        .as_ref()
+        .expect("resolved LLM capability has llm config");
     if !provider_feature_enabled(&llm.protocol) {
         return llm_error(
             StatusCode::FORBIDDEN,
@@ -345,11 +363,9 @@ async fn llm_proxy_impl(
     let region = llm.region.clone();
     let channel_name = channel.clone().unwrap_or_else(|| capability.id.clone());
 
-    // 3. Build the upstream provider URL (provider_base + inbound path). NOTE (v1):
-    //    the inbound query string is NOT forwarded — axum's {*path} captures only the
-    //    path, and `query` is sent as {} below. (Earlier docs wrongly claimed query
-    //    preservation; corrected per review. Forwarding query is a future enhancement
-    //    and would re-run the same scheme/host/port + prefix containment.)
+    // 3. Build the upstream provider URL (provider_base + inbound path). Provider
+    // query parameters are copied into this already-validated URL below; they
+    // cannot alter its scheme, authority, or bounded path prefix.
     let mut upstream = match capability.llm_upstream_url(&path) {
         Some(u) => u,
         None => {
@@ -364,6 +380,27 @@ async fn llm_proxy_impl(
     // are preserved. The capability still fixes scheme/host/path prefix, so a
     // query can never redirect the request to another origin.
     if !query.is_empty() {
+        const AUTH_QUERY_KEYS: &[&str] = &[
+            "key",
+            "api_key",
+            "apikey",
+            "access_token",
+            "token",
+            "sig",
+            "signature",
+            "x-goog-api-key",
+        ];
+        if let Some(key) = query.keys().find(|key| {
+            AUTH_QUERY_KEYS
+                .iter()
+                .any(|blocked| key.eq_ignore_ascii_case(blocked))
+        }) {
+            return llm_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("credential-like query parameter '{}' is not allowed; Vultrino injects provider credentials", key),
+            );
+        }
         if let Ok(mut parsed) = url::Url::parse(&upstream) {
             {
                 let mut pairs = parsed.query_pairs_mut();
@@ -461,7 +498,10 @@ async fn llm_proxy_impl(
     // maybe_inject_stream_usage overwrites a client false. Anthropic `/v1/messages` and
     // OpenAI `/v1/responses` report usage natively, so they are excluded (an unknown
     // `stream_options` field could be rejected).
-    if use_streaming && state.config.llm_proxy.inject_stream_usage && is_openai_chat_endpoint(&upstream) {
+    if use_streaming
+        && state.config.llm_proxy.inject_stream_usage
+        && is_openai_chat_endpoint(&upstream)
+    {
         if let Some(b) = request_body.as_mut() {
             crate::outbox::maybe_inject_stream_usage(b);
         }
@@ -499,7 +539,11 @@ async fn llm_proxy_impl(
     // 6. Streaming path: forward the upstream SSE body incrementally. The gate is
     //    identical to the buffered path; only the response body delivery differs.
     if use_streaming {
-        return match state.server.execute_gated_streaming(execute_request, exec_auth).await {
+        return match state
+            .server
+            .execute_gated_streaming(execute_request, exec_auth)
+            .await
+        {
             Ok(crate::server::StreamingOutcome::Streaming(exec)) => {
                 let status = StatusCode::from_u16(exec.status).unwrap_or(StatusCode::BAD_GATEWAY);
                 // Preserve the provider Content-Type (e.g. text/event-stream) so the
@@ -560,7 +604,12 @@ async fn llm_proxy_impl(
                 .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                 .map(|(_, v)| v.clone())
                 .unwrap_or_else(|| "application/json".to_string());
-            (status, [(header::CONTENT_TYPE, content_type)], response.body).into_response()
+            (
+                status,
+                [(header::CONTENT_TYPE, content_type)],
+                response.body,
+            )
+                .into_response()
         }
         // An LLM call should never be approval-gated in practice, but if a policy
         // routes it to approval, surface that honestly rather than silently
@@ -602,8 +651,20 @@ async fn llm_proxy_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_max_output_tokens, is_openai_chat_endpoint};
+    use super::{clamp_max_output_tokens, is_openai_chat_endpoint, provider_feature_enabled};
     use serde_json::json;
+
+    #[test]
+    fn provider_gate_fails_closed_for_unmapped_protocols() {
+        // No VULTRINO_PROVIDER_* switch maps these, so they must be DENIED even though
+        // "observed-only" passes capability validation. Uses protocols whose env flags
+        // no other test touches, to stay race-free under parallel test execution.
+        assert!(!provider_feature_enabled("observed-only"));
+        assert!(!provider_feature_enabled("openai_chat")); // typo'd / unknown
+        assert!(!provider_feature_enabled(""));
+        // A mapped protocol whose switch is unset is also denied (default-deny).
+        assert!(!provider_feature_enabled("vertex-ai"));
+    }
 
     #[test]
     fn clamps_an_over_ceiling_request_down() {
@@ -629,7 +690,8 @@ mod tests {
         assert_eq!(body["max_output_tokens"], json!(1000));
         assert!(body.get("max_tokens").is_none());
         // All present → all clamped.
-        let mut body = json!({ "max_tokens": 9000, "max_completion_tokens": 8000, "max_output_tokens": 7000 });
+        let mut body =
+            json!({ "max_tokens": 9000, "max_completion_tokens": 8000, "max_output_tokens": 7000 });
         clamp_max_output_tokens(&mut body, 1000);
         assert_eq!(body["max_tokens"], json!(1000));
         assert_eq!(body["max_completion_tokens"], json!(1000));
@@ -669,7 +731,11 @@ mod tests {
         // count * per_prompt <= ceiling.
         let mut body = json!({ "prompt": ["a", "b", "c", "d"], "max_tokens": 1000 });
         clamp_max_output_tokens(&mut body, 1000);
-        assert_eq!(body["max_tokens"], json!(250), "1000 / 4 prompts = 250 per prompt");
+        assert_eq!(
+            body["max_tokens"],
+            json!(250),
+            "1000 / 4 prompts = 250 per prompt"
+        );
         // A scalar prompt is one unit (full ceiling).
         let mut body = json!({ "prompt": "just one", "max_tokens": 5000 });
         clamp_max_output_tokens(&mut body, 1000);
@@ -685,15 +751,25 @@ mod tests {
         // A bare POST /llm has an empty inbound path; the gate must key on the RESOLVED
         // upstream URL so include_usage injection still applies when provider_base IS the
         // chat-completions endpoint.
-        assert!(is_openai_chat_endpoint("https://api.openai.com/v1/chat/completions"));
-        assert!(is_openai_chat_endpoint("https://api.openai.com/v1/completions")); // legacy
+        assert!(is_openai_chat_endpoint(
+            "https://api.openai.com/v1/chat/completions"
+        ));
+        assert!(is_openai_chat_endpoint(
+            "https://api.openai.com/v1/completions"
+        )); // legacy
         assert!(is_openai_chat_endpoint(
             "https://api.openai.com/v1/chat/completions?x=1"
         ));
-        assert!(is_openai_chat_endpoint("https://api.openai.com/v1/chat/completions/"));
+        assert!(is_openai_chat_endpoint(
+            "https://api.openai.com/v1/chat/completions/"
+        ));
         // Native-usage endpoints must NOT match (they'd reject stream_options).
-        assert!(!is_openai_chat_endpoint("https://api.openai.com/v1/responses"));
-        assert!(!is_openai_chat_endpoint("https://api.anthropic.com/v1/messages"));
+        assert!(!is_openai_chat_endpoint(
+            "https://api.openai.com/v1/responses"
+        ));
+        assert!(!is_openai_chat_endpoint(
+            "https://api.anthropic.com/v1/messages"
+        ));
     }
 
     #[test]

@@ -200,21 +200,35 @@ impl Capability {
             }
         }
         if let Some(glob) = &self.target.url_glob {
-            glob::Pattern::new(glob)
-                .map_err(|e| format!("capability target.url_glob '{}' is not a valid glob: {}", glob, e))?;
+            glob::Pattern::new(glob).map_err(|e| {
+                format!(
+                    "capability target.url_glob '{}' is not a valid glob: {}",
+                    glob, e
+                )
+            })?;
         }
         if let Some(llm) = &self.llm {
             match llm.protocol.as_str() {
-                "openai-chat" | "openai-responses" | "azure-openai" | "anthropic-messages" | "bedrock-converse"
-                | "bedrock-invoke" | "gemini" | "vertex-ai" | "observed-only" => {}
-                other => return Err(format!("capability llm.protocol '{}' is not supported", other)),
+                "openai-chat" | "openai-responses" | "azure-openai" | "anthropic-messages"
+                | "bedrock-converse" | "bedrock-invoke" | "gemini" | "vertex-ai"
+                | "observed-only" => {}
+                other => {
+                    return Err(format!(
+                        "capability llm.protocol '{}' is not supported",
+                        other
+                    ))
+                }
             }
             let base = llm.provider_base.trim();
             if base.is_empty() {
                 return Err("capability llm.provider_base must not be empty".to_string());
             }
-            let parsed = url::Url::parse(base)
-                .map_err(|e| format!("capability llm.provider_base '{}' is not a valid URL: {}", base, e))?;
+            let parsed = url::Url::parse(base).map_err(|e| {
+                format!(
+                    "capability llm.provider_base '{}' is not a valid URL: {}",
+                    base, e
+                )
+            })?;
             if parsed.scheme() != "http" && parsed.scheme() != "https" {
                 return Err(format!(
                     "capability llm.provider_base '{}' must use http or https",
@@ -233,7 +247,10 @@ impl Capability {
             // subset of the execute-time check) while breaking the only end-to-end
             // test that drives the real http plugin through the proxy.
             if let Some(host) = parsed.host_str() {
-                let h = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+                let h = host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_ascii_lowercase();
                 if h.starts_with("169.254.") {
                     return Err(format!(
                         "capability llm.provider_base '{}' points at the link-local / cloud-metadata range (SSRF)",
@@ -354,8 +371,11 @@ impl Capability {
         };
         // Ensure a properties map exists, then add the auth field.
         let obj = schema.as_object_mut().expect("schema is an object");
-        obj.entry("type").or_insert_with(|| serde_json::json!("object"));
-        let props = obj.entry("properties").or_insert_with(|| serde_json::json!({}));
+        obj.entry("type")
+            .or_insert_with(|| serde_json::json!("object"));
+        let props = obj
+            .entry("properties")
+            .or_insert_with(|| serde_json::json!({}));
         if let Some(props) = props.as_object_mut() {
             props.insert(
                 "api_key".to_string(),
@@ -366,7 +386,9 @@ impl Capability {
             );
         }
         // Require api_key.
-        let required = obj.entry("required").or_insert_with(|| serde_json::json!([]));
+        let required = obj
+            .entry("required")
+            .or_insert_with(|| serde_json::json!([]));
         if let Some(arr) = required.as_array_mut() {
             if !arr.iter().any(|v| v.as_str() == Some("api_key")) {
                 arr.insert(0, serde_json::json!("api_key"));
@@ -430,7 +452,11 @@ impl From<&Capability> for CapabilityMetadata {
 ///
 /// The caller is responsible for having stripped the `api_key` from `args`
 /// before this (it must never reach a plugin).
-pub fn build_action_params(capability: &Capability, plugin_name: &str, args: &serde_json::Value) -> serde_json::Value {
+pub fn build_action_params(
+    capability: &Capability,
+    plugin_name: &str,
+    args: &serde_json::Value,
+) -> serde_json::Value {
     let args_obj = args.as_object().cloned().unwrap_or_default();
 
     if plugin_name == "http" {
@@ -617,7 +643,8 @@ mod tests {
     #[test]
     fn test_llm_model_allowed_enforces_allowlist() {
         let mut c = llm_cap("https://api.openai.com");
-        c.llm.as_mut().unwrap().allowed_models = vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()];
+        c.llm.as_mut().unwrap().allowed_models =
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()];
         // Exact match on a listed model passes.
         assert!(c.llm_model_allowed(Some("gpt-4o")));
         assert!(c.llm_model_allowed(Some("gpt-4o-mini")));
@@ -674,7 +701,10 @@ mod tests {
         // rejected at config time (defense-in-depth before the execute-time check).
         let meta = llm_cap("http://169.254.169.254/latest/meta-data");
         let err = meta.validate().unwrap_err();
-        assert!(err.contains("link-local") || err.contains("metadata"), "got: {err}");
+        assert!(
+            err.contains("link-local") || err.contains("metadata"),
+            "got: {err}"
+        );
 
         // Loopback + RFC1918 are LEGITIMATE self-hosted model-gateway addresses (the
         // operator-fixed host is agent-untouchable). They VALIDATE at config; the
@@ -718,7 +748,10 @@ mod tests {
             Some("https://gateway.internal/openai/v1/chat/completions")
         );
         // Empty path → the base itself.
-        assert_eq!(c.llm_upstream_url("").as_deref(), Some("https://api.openai.com"));
+        assert_eq!(
+            c.llm_upstream_url("").as_deref(),
+            Some("https://api.openai.com")
+        );
     }
 
     #[test]
@@ -744,8 +777,8 @@ mod tests {
         ];
         for path in attacks {
             if let Some(upstream) = c.llm_upstream_url(path) {
-                let parsed =
-                    url::Url::parse(&upstream).unwrap_or_else(|e| panic!("upstream for {path:?} must parse: {e}"));
+                let parsed = url::Url::parse(&upstream)
+                    .unwrap_or_else(|e| panic!("upstream for {path:?} must parse: {e}"));
                 assert_eq!(
                     parsed.host_str(),
                     Some("api.openai.com"),
@@ -802,7 +835,9 @@ mod tests {
     #[test]
     fn test_llm_upstream_url_none_for_non_llm_capability() {
         // A plain (non-LLM) capability has no upstream URL.
-        assert!(cap("send_email").llm_upstream_url("/v1/chat/completions").is_none());
+        assert!(cap("send_email")
+            .llm_upstream_url("/v1/chat/completions")
+            .is_none());
     }
 
     #[test]
@@ -813,7 +848,10 @@ mod tests {
         c.target = CapabilityTarget {
             url_glob: None,
             methods: vec![],
-            plugin_params: serde_json::json!({ "database": "prod" }).as_object().unwrap().clone(),
+            plugin_params: serde_json::json!({ "database": "prod" })
+                .as_object()
+                .unwrap()
+                .clone(),
         };
         // The agent tries to override the pinned database; the capability wins.
         let args = serde_json::json!({ "sql": "SELECT 1", "database": "evil" });

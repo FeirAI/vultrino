@@ -43,10 +43,7 @@ impl PluginLoader {
                     loaded += 1;
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to load plugin {}: {}",
-                        info.manifest.plugin.name, e
-                    );
+                    warn!("Failed to load plugin {}: {}", info.manifest.plugin.name, e);
                 }
             }
         }
@@ -64,11 +61,7 @@ impl PluginLoader {
     }
 
     /// Reload a specific plugin by name
-    pub async fn reload(
-        &self,
-        name: &str,
-        registry: &PluginRegistry,
-    ) -> Result<(), PluginError> {
+    pub async fn reload(&self, name: &str, registry: &PluginRegistry) -> Result<(), PluginError> {
         // Get plugin info
         let info = self
             .installer

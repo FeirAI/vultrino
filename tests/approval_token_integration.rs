@@ -283,11 +283,24 @@ async fn test_token_action_scope_enforced_at_server() {
     storage.store_use_token(&token).await.unwrap();
 
     let err = server
-        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .execute_gated(
+            echo_request("api-cred"),
+            ExecAuth::from_use_token(token.clone()),
+        )
         .await
         .unwrap_err();
-    assert!(format!("{}", err).to_lowercase().contains("not scoped to action"));
-    assert_eq!(storage.get_use_token(&token.id).await.unwrap().unwrap().uses, 0);
+    assert!(format!("{}", err)
+        .to_lowercase()
+        .contains("not scoped to action"));
+    assert_eq!(
+        storage
+            .get_use_token(&token.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .uses,
+        0
+    );
 
     // An in-scope glob action is allowed and consumes.
     let (_f2, ok_token) = UseToken::create(NewUseToken {
@@ -300,14 +313,25 @@ async fn test_token_action_scope_enforced_at_server() {
     });
     storage.store_use_token(&ok_token).await.unwrap();
     match server
-        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(ok_token.clone()))
+        .execute_gated(
+            echo_request("api-cred"),
+            ExecAuth::from_use_token(ok_token.clone()),
+        )
         .await
         .unwrap()
     {
         ExecutionOutcome::Completed(_) => {}
         _ => panic!("expected completed"),
     }
-    assert_eq!(storage.get_use_token(&ok_token.id).await.unwrap().unwrap().uses, 1);
+    assert_eq!(
+        storage
+            .get_use_token(&ok_token.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .uses,
+        1
+    );
 }
 
 // ==================== Approvals ====================
@@ -330,17 +354,25 @@ async fn test_credential_flag_gates_then_executes_on_approval() {
     assert_eq!(approval.action, "mock.echo");
 
     // Polling before a decision keeps it pending.
-    let polled = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let polled = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert_eq!(polled.status, ApprovalStatus::Pending);
     assert!(!polled.executed);
 
     // 2. A human approves (as the admin panel / CLI would).
     let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    stored.approve(Decision::new("admin panel", "secops")).unwrap();
+    stored
+        .approve(Decision::new("admin panel", "secops"))
+        .unwrap();
     storage.update_approval(&stored).await.unwrap();
 
     // 3. The agent's next poll runs the action and returns the real result.
-    let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert_eq!(resumed.status, ApprovalStatus::Approved);
     assert!(resumed.executed);
     assert_eq!(resumed.result_status, Some(200));
@@ -348,7 +380,10 @@ async fn test_credential_flag_gates_then_executes_on_approval() {
     assert!(resumed.result_error.is_none());
 
     // 4. Re-polling is idempotent — it does not re-run the action.
-    let again = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let again = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert!(again.executed);
     assert_eq!(again.result_status, Some(200));
 }
@@ -402,10 +437,15 @@ async fn test_denied_approval_never_executes() {
     };
 
     let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    stored.deny(Decision::new("admin panel", "secops").with_note(Some("not allowed".to_string()))).unwrap();
+    stored
+        .deny(Decision::new("admin panel", "secops").with_note(Some("not allowed".to_string())))
+        .unwrap();
     storage.update_approval(&stored).await.unwrap();
 
-    let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert_eq!(resumed.status, ApprovalStatus::Denied);
     assert!(!resumed.executed);
     assert!(resumed.result_status.is_none());
@@ -451,14 +491,22 @@ async fn test_token_force_approval_consumes_on_resume() {
     };
     assert_eq!(approval.use_token_id.as_deref(), Some(token.id.as_str()));
     let mid = storage.get_use_token(&token.id).await.unwrap().unwrap();
-    assert_eq!(mid.uses, 0, "token must not be consumed until the action runs");
+    assert_eq!(
+        mid.uses, 0,
+        "token must not be consumed until the action runs"
+    );
 
     // Approve, then resume runs the action and consumes the token.
     let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    stored.approve(Decision::new("admin panel", "secops")).unwrap();
+    stored
+        .approve(Decision::new("admin panel", "secops"))
+        .unwrap();
     storage.update_approval(&stored).await.unwrap();
 
-    let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert!(resumed.executed);
     assert_eq!(resumed.result_status, Some(200));
 
@@ -486,17 +534,25 @@ async fn test_single_use_token_pending_approval_bounded() {
 
     // First open succeeds (one pending approval reserves the single use).
     let first = server
-        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .execute_gated(
+            echo_request("api-cred"),
+            ExecAuth::from_use_token(token.clone()),
+        )
         .await
         .unwrap();
     assert!(matches!(first, ExecutionOutcome::Pending(_)));
 
     // Second open is refused — no remaining capacity.
     let err = server
-        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .execute_gated(
+            echo_request("api-cred"),
+            ExecAuth::from_use_token(token.clone()),
+        )
         .await
         .unwrap_err();
-    assert!(format!("{}", err).to_lowercase().contains("no remaining capacity"));
+    assert!(format!("{}", err)
+        .to_lowercase()
+        .contains("no remaining capacity"));
 }
 
 /// The bound is `uses + pending < max_uses`, so a `max_uses = 2` token may have
@@ -519,7 +575,10 @@ async fn test_pending_bound_allows_up_to_max_uses() {
     // Two opens succeed (two pending approvals reserve the two uses).
     for _ in 0..2 {
         let outcome = server
-            .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+            .execute_gated(
+                echo_request("api-cred"),
+                ExecAuth::from_use_token(token.clone()),
+            )
             .await
             .unwrap();
         assert!(matches!(outcome, ExecutionOutcome::Pending(_)));
@@ -527,10 +586,15 @@ async fn test_pending_bound_allows_up_to_max_uses() {
 
     // The third open is refused — capacity is fully reserved.
     let err = server
-        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .execute_gated(
+            echo_request("api-cred"),
+            ExecAuth::from_use_token(token.clone()),
+        )
         .await
         .unwrap_err();
-    assert!(format!("{}", err).to_lowercase().contains("no remaining capacity"));
+    assert!(format!("{}", err)
+        .to_lowercase()
+        .contains("no remaining capacity"));
 }
 
 /// Concurrency: two opens racing on a single-use token must not both slip past
@@ -557,7 +621,8 @@ async fn test_concurrent_pending_opens_are_bounded() {
         let s = server.clone();
         let t = token.clone();
         handles.push(tokio::spawn(async move {
-            s.execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(t)).await
+            s.execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(t))
+                .await
         }));
     }
 
@@ -570,7 +635,10 @@ async fn test_concurrent_pending_opens_are_bounded() {
             Ok(other) => panic!("unexpected outcome: {:?}", other),
         }
     }
-    assert_eq!(pending, 1, "exactly one pending approval may open for a single-use token");
+    assert_eq!(
+        pending, 1,
+        "exactly one pending approval may open for a single-use token"
+    );
     assert_eq!(denied, 7);
 
     // Storage agrees: precisely one pending approval is bound to the token.
@@ -599,7 +667,10 @@ async fn test_approved_action_executes_despite_rate_limit() {
         credential_pattern: "*".to_string(),
         principal_pattern: None,
         rules: vec![PolicyRule {
-            condition: PolicyCondition::RateLimit { max: 1, window_secs: 3600 },
+            condition: PolicyCondition::RateLimit {
+                max: 1,
+                window_secs: 3600,
+            },
             action: PolicyAction::Allow,
         }],
         default_action: PolicyAction::Deny,
@@ -620,7 +691,10 @@ async fn test_approved_action_executes_despite_rate_limit() {
 
     // Open the approval. This counts the single rate-limit unit at request time.
     let approval = match server
-        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .execute_gated(
+            echo_request("api-cred"),
+            ExecAuth::from_use_token(token.clone()),
+        )
         .await
         .unwrap()
     {
@@ -630,12 +704,20 @@ async fn test_approved_action_executes_despite_rate_limit() {
 
     // Human approves out of band.
     let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    stored.approve(Decision::new("admin panel", "secops")).unwrap();
+    stored
+        .approve(Decision::new("admin panel", "secops"))
+        .unwrap();
     storage.update_approval(&stored).await.unwrap();
 
     // Resume must NOT be denied by the now-exhausted rate budget — it executes.
-    let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
-    assert!(resumed.executed, "approved action should execute despite the rate limit");
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
+    assert!(
+        resumed.executed,
+        "approved action should execute despite the rate limit"
+    );
     assert_eq!(resumed.result_status, Some(200));
     assert!(resumed.result_error.is_none());
 }
@@ -659,7 +741,10 @@ async fn test_approval_expires_when_undecided() {
     stored.expires_at = chrono::Utc::now() - Duration::minutes(1);
     storage.update_approval(&stored).await.unwrap();
 
-    let polled = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let polled = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert_eq!(polled.status, ApprovalStatus::Expired);
     assert!(!polled.executed);
 }
@@ -692,7 +777,9 @@ async fn test_single_use_atomic_across_instances() {
     let mut handles = Vec::new();
     for s in [s1.clone(), s2.clone(), s1.clone(), s2.clone()] {
         let id = id.clone();
-        handles.push(tokio::spawn(async move { s.consume_use_token(&id).await.is_ok() }));
+        handles.push(tokio::spawn(async move {
+            s.consume_use_token(&id).await.is_ok()
+        }));
     }
     let mut successes = 0;
     for h in handles {
@@ -700,7 +787,10 @@ async fn test_single_use_atomic_across_instances() {
             successes += 1;
         }
     }
-    assert_eq!(successes, 1, "exactly one consume may succeed for a single-use token");
+    assert_eq!(
+        successes, 1,
+        "exactly one consume may succeed for a single-use token"
+    );
 }
 
 /// A non-owner principal must not be able to trigger (or read) another
@@ -730,7 +820,19 @@ async fn test_ownership_check_blocks_foreign_principal() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "test", "secops", false, None, None, None).await.unwrap();
+    storage
+        .decide_approval(
+            &approval.id,
+            true,
+            "test",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
     // Foreign principal: rejected, and the action must NOT have run.
     let err = server
@@ -782,12 +884,21 @@ async fn test_preflight_failure_is_retryable_and_does_not_burn_token() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None, None).await.unwrap();
+    storage
+        .decide_approval(&approval.id, true, "t", "secops", false, None, None, None)
+        .await
+        .unwrap();
 
-    let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert!(!resumed.executed, "preflight failure must remain retryable");
     let tok = storage.get_use_token(&token.id).await.unwrap().unwrap();
-    assert_eq!(tok.uses, 0, "a preflight failure must not consume the token");
+    assert_eq!(
+        tok.uses, 0,
+        "a preflight failure must not consume the token"
+    );
 }
 
 /// A stale execution claim (crashed worker) must be reclaimable after the
@@ -805,7 +916,10 @@ async fn test_stale_execution_claim_recovers() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None, None).await.unwrap();
+    storage
+        .decide_approval(&approval.id, true, "t", "secops", false, None, None, None)
+        .await
+        .unwrap();
 
     // Simulate a crashed worker holding a stale claim.
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -814,7 +928,10 @@ async fn test_stale_execution_claim_recovers() {
     storage.update_approval(&a).await.unwrap();
 
     // A fresh poll reclaims and runs it.
-    let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert!(resumed.executed);
     assert_eq!(resumed.result_status, Some(200));
 }
@@ -835,10 +952,16 @@ async fn test_heartbeat_prevents_stale_reclaim() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None, None).await.unwrap();
+    storage
+        .decide_approval(&approval.id, true, "t", "secops", false, None, None, None)
+        .await
+        .unwrap();
 
     // Worker A claims, then its claim ages past the stale window...
-    let claimed = storage.claim_approval_for_execution(&approval.id).await.unwrap();
+    let claimed = storage
+        .claim_approval_for_execution(&approval.id)
+        .await
+        .unwrap();
     assert!(claimed.is_some(), "first claim should succeed");
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
     a.executing_since = Some(chrono::Utc::now() - Duration::seconds(300));
@@ -846,8 +969,14 @@ async fn test_heartbeat_prevents_stale_reclaim() {
 
     // ...but a heartbeat refreshes it, so a competing claim is refused.
     storage.heartbeat_approval(&approval.id).await.unwrap();
-    let reclaim = storage.claim_approval_for_execution(&approval.id).await.unwrap();
-    assert!(reclaim.is_none(), "a heartbeated (live) claim must not be re-taken");
+    let reclaim = storage
+        .claim_approval_for_execution(&approval.id)
+        .await
+        .unwrap();
+    assert!(
+        reclaim.is_none(),
+        "a heartbeated (live) claim must not be re-taken"
+    );
 }
 
 /// A use-token-gated approval whose token has become unusable by the time it is
@@ -869,20 +998,32 @@ async fn test_resume_with_unusable_token_is_terminal() {
     storage.store_use_token(&token).await.unwrap();
 
     let approval = match server
-        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(token.clone()))
+        .execute_gated(
+            echo_request("api-cred"),
+            ExecAuth::from_use_token(token.clone()),
+        )
         .await
         .unwrap()
     {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
-    storage.decide_approval(&approval.id, true, "t", "secops", false, None, None, None).await.unwrap();
+    storage
+        .decide_approval(&approval.id, true, "t", "secops", false, None, None, None)
+        .await
+        .unwrap();
 
     // Token is revoked after approval but before the agent polls to execute.
     storage.set_use_token_revoked(&token.id).await.unwrap();
 
-    let resumed = server.check_and_resume_approval(&approval.id, None).await.unwrap();
-    assert!(resumed.executed, "an unusable-token resume must be terminal, not retryable");
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
+    assert!(
+        resumed.executed,
+        "an unusable-token resume must be terminal, not retryable"
+    );
     assert!(resumed.result_status.is_none());
     let err = resumed.result_error.unwrap().to_lowercase();
     assert!(err.contains("use token") || err.contains("revoked"));
@@ -898,8 +1039,8 @@ async fn test_approvals_disabled_denies_gated_action() {
         Arc::new(FileStorage::new(&path, &password).await.unwrap());
 
     let mut config = Config::default(); // approvals disabled by default
-    // Opt into fail-open so the request reaches the approval gate (this test is
-    // about approvals-disabled, not engine default-deny).
+                                        // Opt into fail-open so the request reaches the approval gate (this test is
+                                        // about approvals-disabled, not engine default-deny).
     config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
@@ -927,7 +1068,10 @@ async fn test_default_deny_denies_unpolicied_credential() {
         .unwrap_err();
     match err {
         vultrino::VultrinoError::PolicyDenied(reason) => {
-            assert!(reason.contains("no_policy"), "expected no_policy reason, got: {reason}");
+            assert!(
+                reason.contains("no_policy"),
+                "expected no_policy reason, got: {reason}"
+            );
         }
         other => panic!("expected PolicyDenied, got {other:?}"),
     }
@@ -953,20 +1097,30 @@ async fn test_refresh_policies_once_picks_up_cross_process_write() {
     let engine = PolicyEngine::new();
     engine.set_default_deny(true);
 
-    writer.store_policy(&Policy::allow_all("pushed", "x-*")).await.unwrap();
+    writer
+        .store_policy(&Policy::allow_all("pushed", "x-*"))
+        .await
+        .unwrap();
     // The reader's in-memory cache is still stale (it loaded before the write).
     assert!(reader.list_stored_policies().await.unwrap().is_empty());
 
     refresh_policies_once(&reader, &engine, &[]).await.unwrap();
     assert!(engine.list_policies().iter().any(|p| p.name == "pushed"));
     assert_eq!(
-        engine.evaluate("x-1", Some("https://x"), Some("GET"), &RequestContext::new()),
+        engine.evaluate(
+            "x-1",
+            Some("https://x"),
+            Some("GET"),
+            &RequestContext::new()
+        ),
         PolicyDecision::Allow
     );
 
     // With a non-empty config too, the refresh→merge→engine path surfaces both.
     let cfg = Policy::allow_all("cfg-base", "c-*");
-    refresh_policies_once(&reader, &engine, std::slice::from_ref(&cfg)).await.unwrap();
+    refresh_policies_once(&reader, &engine, std::slice::from_ref(&cfg))
+        .await
+        .unwrap();
     let names: Vec<String> = engine.list_policies().into_iter().map(|p| p.name).collect();
     assert!(names.contains(&"cfg-base".to_string()), "{names:?}");
     assert!(names.contains(&"pushed".to_string()), "{names:?}");
@@ -1039,14 +1193,32 @@ async fn test_deny_pushed_after_approval_blocks_resume() {
         ExecutionOutcome::Pending(a) => a.id,
         other => panic!("expected Pending, got {other:?}"),
     };
-    storage.decide_approval(&approval_id, true, "approver", "secops", false, None, None, None).await.unwrap();
+    storage
+        .decide_approval(
+            &approval_id,
+            true,
+            "approver",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
     // Emergency Deny pushed (evaluated after the allow policy, which defaults to
     // Allow → continue → the Deny policy denies).
-    storage.store_policy(&Policy::deny_all("kill", "gated-*")).await.unwrap();
+    storage
+        .store_policy(&Policy::deny_all("kill", "gated-*"))
+        .await
+        .unwrap();
     server.reload_policies().await.unwrap();
 
-    let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
+    let resumed = server
+        .check_and_resume_approval(&approval_id, None)
+        .await
+        .unwrap();
     assert!(
         resumed.result_error.is_some(),
         "a Deny pushed between approval and resume must block the approved action"
@@ -1056,9 +1228,11 @@ async fn test_deny_pushed_after_approval_blocks_resume() {
     // — an incident first caught at resume must not be invisible to MTTD.
     let events = storage.list_events_after(0, 100).await.unwrap();
     assert!(
-        events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_POLICY_DENIED
-            && e.payload["kind"] == "policy_resume"
-            && e.payload["credential"] == "gated-cred"),
+        events
+            .iter()
+            .any(|e| e.event_type == vultrino::outbox::EVENT_POLICY_DENIED
+                && e.payload["kind"] == "policy_resume"
+                && e.payload["credential"] == "gated-cred"),
         "a Deny re-fired at resume must emit a policy.denied detect event"
     );
 }
@@ -1085,8 +1259,14 @@ async fn test_reload_policies_merges_config_and_stored() {
         .into_iter()
         .map(|p| p.name)
         .collect();
-    assert!(names.contains(&"from-config".to_string()), "config policy missing: {names:?}");
-    assert!(names.contains(&"from-admin".to_string()), "stored policy missing: {names:?}");
+    assert!(
+        names.contains(&"from-config".to_string()),
+        "config policy missing: {names:?}"
+    );
+    assert!(
+        names.contains(&"from-admin".to_string()),
+        "stored policy missing: {names:?}"
+    );
 
     // Deleting the stored policy and reloading drops it but keeps config.
     storage.delete_policy(&stored_id).await.unwrap();
@@ -1125,7 +1305,16 @@ async fn test_default_deny_approved_action_still_resumes() {
     };
 
     storage
-        .decide_approval(&approval_id, true, "test approver", "secops", false, None, None, None)
+        .decide_approval(
+            &approval_id,
+            true,
+            "test approver",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -1203,12 +1392,18 @@ async fn test_spend_cap_enforced_end_to_end() {
 
     // Within per-action cap → runs.
     assert!(matches!(
-        server.execute_gated(req(100), ExecAuth::default()).await.unwrap(),
+        server
+            .execute_gated(req(100), ExecAuth::default())
+            .await
+            .unwrap(),
         ExecutionOutcome::Completed(_)
     ));
     // Over per-action cap → denied (action did not run).
     assert!(matches!(
-        server.execute_gated(req(101), ExecAuth::default()).await.unwrap_err(),
+        server
+            .execute_gated(req(101), ExecAuth::default())
+            .await
+            .unwrap_err(),
         vultrino::VultrinoError::PolicyDenied(_)
     ));
     // No extractable amount under a SpendCap policy → fail closed (denied).
@@ -1218,7 +1413,10 @@ async fn test_spend_cap_enforced_end_to_end() {
         params: serde_json::json!({ "hello": "world" }),
     };
     assert!(matches!(
-        server.execute_gated(no_amt, ExecAuth::default()).await.unwrap_err(),
+        server
+            .execute_gated(no_amt, ExecAuth::default())
+            .await
+            .unwrap_err(),
         vultrino::VultrinoError::PolicyDenied(_)
     ));
 }
@@ -1250,7 +1448,10 @@ async fn test_per_agent_deny_end_to_end() {
     // The targeted agent is denied...
     assert!(matches!(
         server
-            .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(bot_token))
+            .execute_gated(
+                echo_request("api-cred"),
+                ExecAuth::from_use_token(bot_token)
+            )
             .await
             .unwrap_err(),
         vultrino::VultrinoError::PolicyDenied(_)
@@ -1258,7 +1459,10 @@ async fn test_per_agent_deny_end_to_end() {
     // ...while another agent on the same credential is unaffected.
     assert!(matches!(
         server
-            .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(other_token))
+            .execute_gated(
+                echo_request("api-cred"),
+                ExecAuth::from_use_token(other_token)
+            )
             .await
             .unwrap(),
         ExecutionOutcome::Completed(_)
@@ -1286,7 +1490,10 @@ async fn test_per_agent_deny_refires_at_resume() {
     storage.store_use_token(&tok).await.unwrap();
 
     let approval_id = match server
-        .execute_gated(echo_request("api-cred"), ExecAuth::from_use_token(tok.clone()))
+        .execute_gated(
+            echo_request("api-cred"),
+            ExecAuth::from_use_token(tok.clone()),
+        )
         .await
         .unwrap()
     {
@@ -1299,11 +1506,29 @@ async fn test_per_agent_deny_refires_at_resume() {
     };
 
     // Push a per-agent Deny and approve; the resume must be blocked.
-    storage.store_policy(&Policy::deny_all("kill-bot", "api-*").with_principal("refund-bot")).await.unwrap();
+    storage
+        .store_policy(&Policy::deny_all("kill-bot", "api-*").with_principal("refund-bot"))
+        .await
+        .unwrap();
     server.reload_policies().await.unwrap();
-    storage.decide_approval(&approval_id, true, "approver", "secops", false, None, None, None).await.unwrap();
+    storage
+        .decide_approval(
+            &approval_id,
+            true,
+            "approver",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
-    let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
+    let resumed = server
+        .check_and_resume_approval(&approval_id, None)
+        .await
+        .unwrap();
     assert!(
         resumed.result_error.is_some(),
         "a per-agent Deny pushed before resume must block the approved action"
@@ -1358,7 +1583,11 @@ async fn test_spend_capped_approval_resumes_without_recheck() {
         action: "mock.echo".to_string(),
         params: serde_json::json!({ "amount": 60 }),
     };
-    let approval_id = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+    let approval_id = match server
+        .execute_gated(req, ExecAuth::default())
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Pending(a) => a.id,
         other => panic!("expected Pending, got {other:?}"),
     };
@@ -1369,19 +1598,45 @@ async fn test_spend_capped_approval_resumes_without_recheck() {
         action: "mock.echo".to_string(),
         params: serde_json::json!({ "amount": 101 }),
     };
-    match server.execute_gated(over, ExecAuth::default()).await.unwrap_err() {
+    match server
+        .execute_gated(over, ExecAuth::default())
+        .await
+        .unwrap_err()
+    {
         vultrino::VultrinoError::PolicyDenied(reason) => {
-            assert!(reason.contains("pay-cap"), "expected spend-cap deny, got: {reason}");
+            assert!(
+                reason.contains("pay-cap"),
+                "expected spend-cap deny, got: {reason}"
+            );
         }
         other => panic!("expected PolicyDenied, got {other:?}"),
     }
 
-    storage.decide_approval(&approval_id, true, "approver", "secops", false, None, None, None).await.unwrap();
+    storage
+        .decide_approval(
+            &approval_id,
+            true,
+            "approver",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
     // Resume must succeed (read-only spend check treats it as already-admitted).
-    let resumed = server.check_and_resume_approval(&approval_id, None).await.unwrap();
+    let resumed = server
+        .check_and_resume_approval(&approval_id, None)
+        .await
+        .unwrap();
     assert!(resumed.executed);
-    assert!(resumed.result_error.is_none(), "spend-capped approval must resume: {:?}", resumed.result_error);
+    assert!(
+        resumed.result_error.is_none(),
+        "spend-capped approval must resume: {:?}",
+        resumed.result_error
+    );
 }
 
 /// A plugin that reflects the injected credential's secret back in its response
@@ -1408,7 +1663,12 @@ impl Plugin for SecretReflectorPlugin {
             "X-Echoed-Auth".to_string(),
             format!("Bearer {}", strs.first().copied().unwrap_or_default()),
         );
-        Ok(ExecuteResponse { status: 200, headers, body, updated_credential: None })
+        Ok(ExecuteResponse {
+            status: 200,
+            headers,
+            body,
+            updated_credential: None,
+        })
     }
     fn validate_params(&self, _a: &str, _p: &serde_json::Value) -> Result<(), PluginError> {
         Ok(())
@@ -1434,15 +1694,26 @@ async fn test_egress_redacts_reflected_secret_end_to_end() {
         action: "reflect.echo_secret".to_string(),
         params: serde_json::json!({}),
     };
-    let resp = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+    let resp = match server
+        .execute_gated(req, ExecAuth::default())
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Completed(r) => r,
         other => panic!("expected Completed, got {other:?}"),
     };
     let body = String::from_utf8_lossy(&resp.body);
-    assert!(!body.contains("super-secret-value"), "secret leaked in body: {body}");
+    assert!(
+        !body.contains("super-secret-value"),
+        "secret leaked in body: {body}"
+    );
     assert!(body.contains("[REDACTED:api-cred]"));
     // Header reflection is scrubbed too.
-    assert!(!resp.headers.get("X-Echoed-Auth").unwrap().contains("super-secret-value"));
+    assert!(!resp
+        .headers
+        .get("X-Echoed-Auth")
+        .unwrap()
+        .contains("super-secret-value"));
 }
 
 #[tokio::test]
@@ -1473,7 +1744,11 @@ async fn test_egress_block_withholds_response_end_to_end() {
         action: "mock.echo".to_string(),
         params: serde_json::json!({"downstream_token": "abc123"}),
     };
-    let resp = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+    let resp = match server
+        .execute_gated(req, ExecAuth::default())
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Completed(r) => r,
         other => panic!("expected Completed, got {other:?}"),
     };
@@ -1530,7 +1805,11 @@ async fn test_action_label_token_scope_and_approval_summary() {
     // Canonical action recorded; the approver sees the govder business verb.
     assert_eq!(approval.action, "mock.echo");
     assert_eq!(approval.action_label.as_deref(), Some("payments.refund"));
-    assert!(approval.summary.contains("payments.refund"), "summary: {}", approval.summary);
+    assert!(
+        approval.summary.contains("payments.refund"),
+        "summary: {}",
+        approval.summary
+    );
 }
 
 #[tokio::test]
@@ -1600,7 +1879,10 @@ async fn test_action_label_scope_isolation() {
         vultrino::VultrinoError::PolicyDenied(reason) => {
             // The diagnostic surfaces both the presented label and its canonical.
             assert!(reason.contains("payments.charge"), "reason: {reason}");
-            assert!(reason.contains("resolved to"), "reason should show both forms: {reason}");
+            assert!(
+                reason.contains("resolved to"),
+                "reason should show both forms: {reason}"
+            );
         }
         other => panic!("expected PolicyDenied, got {other:?}"),
     }
@@ -1656,7 +1938,10 @@ async fn test_v5_criticality_sla_escalation_then_expiry() {
         }];
         a.sla_overrides = std::collections::HashMap::from([(
             CriticalityClass::Critical,
-            CriticalitySla { escalate_after_secs: 100, escalate_window_secs: 100 },
+            CriticalitySla {
+                escalate_after_secs: 100,
+                escalate_window_secs: 100,
+            },
         )]);
     })
     .await;
@@ -1668,20 +1953,33 @@ async fn test_v5_criticality_sla_escalation_then_expiry() {
         action: "mock.echo".to_string(),
         params: serde_json::json!({ "x": 1 }),
     };
-    let approval = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+    let approval = match server
+        .execute_gated(req, ExecAuth::default())
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Pending(a) => a,
         other => panic!("expected Pending, got {other:?}"),
     };
     assert_eq!(approval.criticality, CriticalityClass::Critical);
-    assert_eq!((approval.escalate_at - approval.created_at).num_seconds(), 100);
-    assert_eq!((approval.expires_at - approval.created_at).num_seconds(), 200);
+    assert_eq!(
+        (approval.escalate_at - approval.created_at).num_seconds(),
+        100
+    );
+    assert_eq!(
+        (approval.expires_at - approval.created_at).num_seconds(),
+        200
+    );
 
     // Back-date the first window → the SLA sweep escalates it (window 1 elapsed).
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
     a.escalate_at = chrono::Utc::now() - chrono::Duration::seconds(1);
     storage.update_approval(&a).await.unwrap();
     let sweep = server.sweep_approvals_once().await.unwrap();
-    assert!(sweep.escalated.iter().any(|x| x.id == approval.id), "should escalate");
+    assert!(
+        sweep.escalated.iter().any(|x| x.id == approval.id),
+        "should escalate"
+    );
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
     assert_eq!(a.status, ApprovalStatus::Escalated);
     assert!(a.escalated_at.is_some());
@@ -1691,7 +1989,10 @@ async fn test_v5_criticality_sla_escalation_then_expiry() {
     a.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
     storage.update_approval(&a).await.unwrap();
     let sweep = server.sweep_approvals_once().await.unwrap();
-    assert!(sweep.expired.iter().any(|id| id == &approval.id), "should expire");
+    assert!(
+        sweep.expired.iter().any(|id| id == &approval.id),
+        "should expire"
+    );
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
     assert_eq!(a.status, ApprovalStatus::Expired);
 }
@@ -1727,21 +2028,48 @@ async fn test_v5_approver_identity_recorded_and_sod_computable() {
 
     // A blank approver identity is rejected (every decision must be attributable).
     let err = storage
-        .decide_approval(&approval.id, true, "admin panel", "  ", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "  ",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap_err();
-    assert!(format!("{err}").to_lowercase().contains("approver identity"), "got: {err}");
+    assert!(
+        format!("{err}")
+            .to_lowercase()
+            .contains("approver identity"),
+        "got: {err}"
+    );
 
     // Self-approval (approver == requester owner) records the identity and is a
     // computable SoD violation.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "agent-x", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "agent-x",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
     assert_eq!(a.approver_identity.as_deref(), Some("agent-x"));
     assert_eq!(a.decided_by.as_deref(), Some("admin panel"));
-    assert_eq!(a.violates_sod(), Some(true), "approver == requester → SoD violation");
+    assert_eq!(
+        a.violates_sod(),
+        Some(true),
+        "approver == requester → SoD violation"
+    );
 }
 
 #[tokio::test]
@@ -1772,11 +2100,24 @@ async fn test_v5_distinct_approver_satisfies_sod() {
         other => panic!("expected Pending, got {other:?}"),
     };
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops-oncall", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "secops-oncall",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(a.violates_sod(), Some(false), "distinct approver satisfies SoD");
+    assert_eq!(
+        a.violates_sod(),
+        Some(false),
+        "distinct approver satisfies SoD"
+    );
 }
 
 #[tokio::test]
@@ -1795,14 +2136,27 @@ async fn test_v5_reauth_lapse_expires_on_poll() {
         action: "mock.echo".to_string(),
         params: serde_json::json!({ "x": 1 }),
     };
-    let approval = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+    let approval = match server
+        .execute_gated(req, ExecAuth::default())
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Pending(a) => a,
         other => panic!("expected Pending, got {other:?}"),
     };
 
     // Approve it, then back-date the decision so the reauth window has lapsed.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -1811,12 +2165,23 @@ async fn test_v5_reauth_lapse_expires_on_poll() {
 
     // Poll: the stale grant is expired (re-auth lapsed), not executed; the
     // original approver attribution is preserved and the lapse is noted.
-    let polled = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let polled = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert_eq!(polled.status, ApprovalStatus::Expired);
     assert!(!polled.executed, "a lapsed grant must not run");
-    assert_eq!(polled.approver_identity.as_deref(), Some("secops"), "approver preserved");
+    assert_eq!(
+        polled.approver_identity.as_deref(),
+        Some("secops"),
+        "approver preserved"
+    );
     assert!(
-        polled.decision_note.as_deref().unwrap_or("").contains("re-authorization"),
+        polled
+            .decision_note
+            .as_deref()
+            .unwrap_or("")
+            .contains("re-authorization"),
         "lapse recorded in note, got: {:?}",
         polled.decision_note
     );
@@ -1857,16 +2222,39 @@ async fn test_v5_enforce_sod_rejects_self_approval_end_to_end() {
 
     // Self-approval is rejected (SoD enforced).
     let err = storage
-        .decide_approval(&approval.id, true, "admin panel", "agent-x", true, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "agent-x",
+            true,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap_err();
-    assert!(format!("{err}").to_lowercase().contains("separation of duty"), "got: {err}");
+    assert!(
+        format!("{err}")
+            .to_lowercase()
+            .contains("separation of duty"),
+        "got: {err}"
+    );
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
     assert_eq!(a.status, ApprovalStatus::Pending, "must stay undecided");
 
     // A distinct approver succeeds even with enforcement on.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops-oncall", true, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "secops-oncall",
+            true,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -1886,7 +2274,11 @@ async fn test_v5_decide_past_deadline_is_rejected() {
         action: "mock.echo".to_string(),
         params: serde_json::json!({ "x": 1 }),
     };
-    let approval = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+    let approval = match server
+        .execute_gated(req, ExecAuth::default())
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Pending(a) => a,
         other => panic!("expected Pending, got {other:?}"),
     };
@@ -1900,12 +2292,28 @@ async fn test_v5_decide_past_deadline_is_rejected() {
     // never approved. (The rejected transaction isn't persisted, so the record
     // stays open until the next poll/sweep expires it — which we then confirm.)
     let err = storage
-        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap_err();
-    assert!(format!("{err}").to_lowercase().contains("expire"), "got: {err}");
+    assert!(
+        format!("{err}").to_lowercase().contains("expire"),
+        "got: {err}"
+    );
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_ne!(a.status, ApprovalStatus::Approved, "a past-deadline request must never approve");
+    assert_ne!(
+        a.status,
+        ApprovalStatus::Approved,
+        "a past-deadline request must never approve"
+    );
     // A subsequent atomic refresh expires it.
     let refreshed = storage.poll_refresh_approval(&approval.id).await.unwrap();
     assert_eq!(refreshed.status, ApprovalStatus::Expired);
@@ -1924,14 +2332,27 @@ async fn test_v5_poll_refresh_does_not_clobber_a_decision() {
         action: "mock.echo".to_string(),
         params: serde_json::json!({ "x": 1 }),
     };
-    let approval = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+    let approval = match server
+        .execute_gated(req, ExecAuth::default())
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Pending(a) => a,
         other => panic!("expected Pending, got {other:?}"),
     };
 
     // Decide it (Approved).
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -1943,7 +2364,11 @@ async fn test_v5_poll_refresh_does_not_clobber_a_decision() {
     storage.update_approval(&a).await.unwrap();
 
     let refreshed = storage.poll_refresh_approval(&approval.id).await.unwrap();
-    assert_eq!(refreshed.status, ApprovalStatus::Approved, "a decision must survive a poll");
+    assert_eq!(
+        refreshed.status,
+        ApprovalStatus::Approved,
+        "a decision must survive a poll"
+    );
     assert_eq!(refreshed.approver_identity.as_deref(), Some("secops"));
 }
 
@@ -1964,14 +2389,27 @@ async fn test_v5_sweep_expires_reauth_lapsed_grant_preserving_approver() {
         action: "mock.echo".to_string(),
         params: serde_json::json!({ "x": 1 }),
     };
-    let approval = match server.execute_gated(req, ExecAuth::default()).await.unwrap() {
+    let approval = match server
+        .execute_gated(req, ExecAuth::default())
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Pending(a) => a,
         other => panic!("expected Pending, got {other:?}"),
     };
 
     // Approve as alice, then back-date the decision past the reauth window.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "alice", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "alice",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -1980,14 +2418,28 @@ async fn test_v5_sweep_expires_reauth_lapsed_grant_preserving_approver() {
 
     // The sweep (not a poll) expires it.
     let sweep = server.sweep_approvals_once().await.unwrap();
-    assert!(sweep.expired.iter().any(|id| id == &approval.id), "sweep should expire it");
+    assert!(
+        sweep.expired.iter().any(|id| id == &approval.id),
+        "sweep should expire it"
+    );
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
     assert_eq!(a.status, ApprovalStatus::Expired);
     // Approver attribution preserved; lapse recorded in the note.
-    assert_eq!(a.decided_by.as_deref(), Some("admin panel"), "original channel kept");
-    assert_eq!(a.approver_identity.as_deref(), Some("alice"), "original approver kept");
+    assert_eq!(
+        a.decided_by.as_deref(),
+        Some("admin panel"),
+        "original channel kept"
+    );
+    assert_eq!(
+        a.approver_identity.as_deref(),
+        Some("alice"),
+        "original approver kept"
+    );
     assert!(
-        a.decision_note.as_deref().unwrap_or("").contains("re-authorization"),
+        a.decision_note
+            .as_deref()
+            .unwrap_or("")
+            .contains("re-authorization"),
         "lapse should be recorded in the note, got: {:?}",
         a.decision_note
     );
@@ -2006,7 +2458,10 @@ impl vultrino::session::HaltCallback for RecordingHaltCallback {
         "recording"
     }
     async fn on_halt(&self, agent_label: &str, in_flight: &[vultrino::session::SessionEntry]) {
-        self.hits.lock().unwrap().push((agent_label.to_string(), in_flight.len()));
+        self.hits
+            .lock()
+            .unwrap()
+            .push((agent_label.to_string(), in_flight.len()));
     }
 }
 
@@ -2037,13 +2492,18 @@ async fn test_v6_halt_revokes_tokens_installs_kill_and_fires_callback() {
     };
 
     // Before halt: the agent can execute.
-    let outcome = server.execute_gated(echo_request("api-cred"), auth()).await.unwrap();
+    let outcome = server
+        .execute_gated(echo_request("api-cred"), auth())
+        .await
+        .unwrap();
     assert!(matches!(outcome, ExecutionOutcome::Completed(_)));
 
     // Register a recording callback and pin an in-flight session for bot-7 so the
     // halt has something to report/abort.
     let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    server.register_halt_callback(std::sync::Arc::new(RecordingHaltCallback { hits: hits.clone() }));
+    server.register_halt_callback(std::sync::Arc::new(RecordingHaltCallback {
+        hits: hits.clone(),
+    }));
     let _inflight = server.sessions().begin(SessionEntry {
         session_id: "sess-1".to_string(),
         agent_label: Some("bot-7".to_string()),
@@ -2057,11 +2517,21 @@ async fn test_v6_halt_revokes_tokens_installs_kill_and_fires_callback() {
     // Halt the agent.
     let outcome = server.halt_agent("bot-7").await.unwrap();
     assert_eq!(outcome.agent_label, "bot-7");
-    assert!(outcome.revoked_tokens.contains(&token.id), "agent's token revoked");
+    assert!(
+        outcome.revoked_tokens.contains(&token.id),
+        "agent's token revoked"
+    );
     assert_eq!(outcome.deny_policy_id, "halt:bot-7");
-    assert!(outcome.policy_active, "kill policy active in the live engine");
+    assert!(
+        outcome.policy_active,
+        "kill policy active in the live engine"
+    );
     assert_eq!(outcome.callbacks_fired, 1);
-    assert_eq!(outcome.in_flight.len(), 1, "the in-flight session is reported");
+    assert_eq!(
+        outcome.in_flight.len(),
+        1,
+        "the in-flight session is reported"
+    );
 
     // The callback was fired with the agent + its one in-flight session.
     let recorded = hits.lock().unwrap().clone();
@@ -2073,7 +2543,10 @@ async fn test_v6_halt_revokes_tokens_installs_kill_and_fires_callback() {
 
     // After halt: the agent's next gated call is DENIED by the kill policy, even
     // though the credential is otherwise allowed (allow mode).
-    let err = server.execute_gated(echo_request("api-cred"), auth()).await.unwrap_err();
+    let err = server
+        .execute_gated(echo_request("api-cred"), auth())
+        .await
+        .unwrap_err();
     match err {
         vultrino::VultrinoError::PolicyDenied(r) => assert!(r.contains("halt"), "reason: {r}"),
         other => panic!("expected PolicyDenied by kill switch, got {other:?}"),
@@ -2098,8 +2571,14 @@ async fn test_v6_halt_revokes_tokens_installs_kill_and_fires_callback() {
         force_approval: false,
         requester: RequesterInfo::default(),
     };
-    let outcome = server.execute_gated(echo_request("api-cred"), auth2).await.unwrap();
-    assert!(matches!(outcome, ExecutionOutcome::Completed(_)), "halt lifted → executes again");
+    let outcome = server
+        .execute_gated(echo_request("api-cred"), auth2)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, ExecutionOutcome::Completed(_)),
+        "halt lifted → executes again"
+    );
 }
 
 #[tokio::test]
@@ -2127,7 +2606,11 @@ async fn test_v6_halt_denies_approved_action_on_resume() {
         force_approval: false,
         requester: RequesterInfo::default(),
     };
-    let approval = match server.execute_gated(echo_request("api-cred"), auth).await.unwrap() {
+    let approval = match server
+        .execute_gated(echo_request("api-cred"), auth)
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Pending(a) => a,
         other => panic!("expected Pending, got {other:?}"),
     };
@@ -2135,20 +2618,40 @@ async fn test_v6_halt_denies_approved_action_on_resume() {
 
     // Approve it, then halt the agent before it polls to execute.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     server.halt_agent("bot-7").await.unwrap();
 
     // The resume re-evaluates policy and is denied by the kill switch; the action
     // does not run.
-    let polled = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let polled = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert!(
-        polled.result_error.as_deref().unwrap_or("").to_lowercase().contains("halt"),
+        polled
+            .result_error
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("halt"),
         "resume should be denied by the halt, got: {:?}",
         polled.result_error
     );
-    assert!(polled.result_status.is_none(), "the action must not have produced a result");
+    assert!(
+        polled.result_status.is_none(),
+        "the action must not have produced a result"
+    );
 }
 
 #[tokio::test]
@@ -2177,7 +2680,9 @@ async fn test_v6_halt_by_principal_id_for_labelless_agent() {
 
     // A registered callback + an in-flight session keyed only by id (no label).
     let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    server.register_halt_callback(std::sync::Arc::new(RecordingHaltCallback { hits: hits.clone() }));
+    server.register_halt_callback(std::sync::Arc::new(RecordingHaltCallback {
+        hits: hits.clone(),
+    }));
     let _inflight = server.sessions().begin(vultrino::session::SessionEntry {
         session_id: "by-id-sess".to_string(),
         agent_label: None,
@@ -2192,12 +2697,32 @@ async fn test_v6_halt_by_principal_id_for_labelless_agent() {
     // itself is revoked (leg 1 matches by id), AND the by-id session is reported
     // to the abort callback (leg 3 matches by id, not just label).
     let outcome = server.halt_agent(&token.id).await.unwrap();
-    assert!(outcome.revoked_tokens.contains(&token.id), "by-id halt revokes that token");
-    assert!(storage.get_use_token(&token.id).await.unwrap().unwrap().revoked);
+    assert!(
+        outcome.revoked_tokens.contains(&token.id),
+        "by-id halt revokes that token"
+    );
+    assert!(
+        storage
+            .get_use_token(&token.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked
+    );
     assert_eq!(outcome.in_flight.len(), 1, "by-id session reported");
-    assert_eq!(hits.lock().unwrap().as_slice(), &[(token.id.clone(), 1)], "leg 3 fired for by-id");
-    let err = server.execute_gated(echo_request("api-cred"), auth()).await.unwrap_err();
-    assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)), "labelless agent halted by id");
+    assert_eq!(
+        hits.lock().unwrap().as_slice(),
+        &[(token.id.clone(), 1)],
+        "leg 3 fired for by-id"
+    );
+    let err = server
+        .execute_gated(echo_request("api-cred"), auth())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, vultrino::VultrinoError::PolicyDenied(_)),
+        "labelless agent halted by id"
+    );
 }
 
 #[tokio::test]
@@ -2227,7 +2752,10 @@ async fn test_v12a_enforce_denial_emits_timestamped_detect_event() {
     };
 
     // An unauthorized (default-deny) call is DENIED in enforce mode.
-    let err = server.execute_gated(echo_request("api-cred"), auth).await.unwrap_err();
+    let err = server
+        .execute_gated(echo_request("api-cred"), auth)
+        .await
+        .unwrap_err();
     assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)));
 
     // A timestamped policy.denied DETECT event was emitted, subject = agent label.
@@ -2254,7 +2782,10 @@ async fn test_v12a_enforce_denial_emits_timestamped_detect_event() {
 
     // detect↔contain pair on subject, and detection precedes containment (MTTD/MTTC).
     assert_eq!(detect.subject, contain.subject);
-    assert!(detected_at <= contained_at, "detected_at must not be after contained_at");
+    assert!(
+        detected_at <= contained_at,
+        "detected_at must not be after contained_at"
+    );
 }
 
 #[tokio::test]
@@ -2262,7 +2793,7 @@ async fn test_v12a_cross_tenant_isolation_emits_detect_event() {
     // R3: the cross-tenant isolation deny site also emits a timestamped detect
     // event (kind = cross_tenant_isolation), not just the policy-Deny site.
     let (server, storage) = setup_tenants(false, vec![]).await; // allow mode; tenants default Enforce
-    // A credential tagged to team-a.
+                                                                // A credential tagged to team-a.
     let cred = Credential::new(
         "pay-cred".to_string(),
         CredentialData::ApiKey {
@@ -2286,14 +2817,19 @@ async fn test_v12a_cross_tenant_isolation_emits_detect_event() {
         action: "mock.echo".to_string(),
         params: serde_json::json!({}),
     };
-    let err = server.execute_gated(req, tenant_auth(&token)).await.unwrap_err();
+    let err = server
+        .execute_gated(req, tenant_auth(&token))
+        .await
+        .unwrap_err();
     assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)));
 
     let events = storage.list_events_after(0, 100).await.unwrap();
     let detect = events
         .iter()
-        .find(|e| e.event_type == vultrino::outbox::EVENT_POLICY_DENIED
-            && e.payload["kind"] == "cross_tenant_isolation")
+        .find(|e| {
+            e.event_type == vultrino::outbox::EVENT_POLICY_DENIED
+                && e.payload["kind"] == "cross_tenant_isolation"
+        })
         .expect("cross-tenant isolation must emit a policy.denied detect event");
     assert_eq!(detect.payload["credential"], "pay-cred");
     assert_eq!(detect.payload["tenant"], "team-b");
@@ -2332,9 +2868,14 @@ async fn test_v12a_detect_events_coalesced_per_subject() {
     let events = storage.list_events_after(0, 100).await.unwrap();
     let n = events
         .iter()
-        .filter(|e| e.event_type == vultrino::outbox::EVENT_POLICY_DENIED && e.subject == "bot-storm")
+        .filter(|e| {
+            e.event_type == vultrino::outbox::EVENT_POLICY_DENIED && e.subject == "bot-storm"
+        })
         .count();
-    assert_eq!(n, 1, "detect events must coalesce per subject within the window");
+    assert_eq!(
+        n, 1,
+        "detect events must coalesce per subject within the window"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -2363,7 +2904,11 @@ async fn test_v6_hanging_halt_callback_does_not_block() {
 
     let outcome = server.halt_agent("bot-7").await.unwrap();
     assert_eq!(outcome.callbacks_fired, 2);
-    assert_eq!(fast_hits.lock().unwrap().len(), 1, "the fast callback still ran");
+    assert_eq!(
+        fast_hits.lock().unwrap().len(),
+        1,
+        "the fast callback still ran"
+    );
 }
 
 #[tokio::test]
@@ -2390,7 +2935,10 @@ async fn test_v6_kill_policy_survives_cross_process_refresh() {
 
     let (_server, storage) = setup().await;
     storage
-        .store_policy(&vultrino::policy::Policy::kill_switch("halt:bot-7", "bot-7"))
+        .store_policy(&vultrino::policy::Policy::kill_switch(
+            "halt:bot-7",
+            "bot-7",
+        ))
         .await
         .unwrap();
 
@@ -2402,18 +2950,30 @@ async fn test_v6_kill_policy_survives_cross_process_refresh() {
         .await
         .unwrap();
     assert!(
-        engine.list_policies().iter().any(|p| p.id == "halt:bot-7" && p.kill),
+        engine
+            .list_policies()
+            .iter()
+            .any(|p| p.id == "halt:bot-7" && p.kill),
         "kill flag must survive the storage round-trip"
     );
-    let halted = Principal { id: "k1".to_string(), agent_label: Some("bot-7".to_string()) , owner: None, workload_id: None };
+    let halted = Principal {
+        id: "k1".to_string(),
+        agent_label: Some("bot-7".to_string()),
+        owner: None,
+        workload_id: None,
+    };
     let decision = engine.evaluate_full(&EvalInput {
         credential_alias: "anything",
         url: None,
-        method: None, action: None,
+        method: None,
+        action: None,
         principal: Some(&halted),
         spend: None,
     });
-    assert!(matches!(decision, PolicyDecision::Deny(_)), "reloaded kill is authoritative");
+    assert!(
+        matches!(decision, PolicyDecision::Deny(_)),
+        "reloaded kill is authoritative"
+    );
 }
 
 #[tokio::test]
@@ -2439,7 +2999,11 @@ async fn test_v9_lifecycle_events_emitted_to_outbox() {
         force_approval: false,
         requester: RequesterInfo::default(),
     };
-    let approval = match server.execute_gated(echo_request("pay-cred"), auth).await.unwrap() {
+    let approval = match server
+        .execute_gated(echo_request("pay-cred"), auth)
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Pending(a) => a,
         other => panic!("expected Pending, got {other:?}"),
     };
@@ -2447,22 +3011,37 @@ async fn test_v9_lifecycle_events_emitted_to_outbox() {
     // approval.requested emitted, keyed by the approval id.
     let events = storage.list_events_after(0, 100).await.unwrap();
     assert!(
-        events.iter().any(|e| e.event_type == "approval.requested" && e.subject == approval.id),
+        events
+            .iter()
+            .any(|e| e.event_type == "approval.requested" && e.subject == approval.id),
         "approval.requested emitted"
     );
 
     // Decide → approval.approved emitted atomically with the decision.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "secops", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let events = storage.list_events_after(0, 100).await.unwrap();
-    assert!(events.iter().any(|e| e.event_type == "approval.approved" && e.subject == approval.id));
+    assert!(events
+        .iter()
+        .any(|e| e.event_type == "approval.approved" && e.subject == approval.id));
 
     // Halt → agent.halted emitted, keyed by the agent label.
     server.halt_agent("bot-7").await.unwrap();
     let events = storage.list_events_after(0, 100).await.unwrap();
-    assert!(events.iter().any(|e| e.event_type == "agent.halted" && e.subject == "bot-7"));
+    assert!(events
+        .iter()
+        .any(|e| e.event_type == "agent.halted" && e.subject == "bot-7"));
 
     // Sequences are strictly increasing and unique across all emitted events.
     let seqs: Vec<u64> = events.iter().map(|e| e.sequence).collect();
@@ -2496,15 +3075,31 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
         force_approval: false,
         requester: RequesterInfo::default(),
     };
-    let approval = match server.execute_gated(echo_request("pay-cred"), auth).await.unwrap() {
+    let approval = match server
+        .execute_gated(echo_request("pay-cred"), auth)
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Pending(a) => a,
         other => panic!("expected Pending, got {other:?}"),
     };
-    assert_eq!(approval.required_approvals, 2, "dual control needs 2 approvers");
+    assert_eq!(
+        approval.required_approvals, 2,
+        "dual control needs 2 approvers"
+    );
 
     // First approver → still pending (1 of 2), action must NOT run.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "alice", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "alice",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
@@ -2513,26 +3108,55 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
 
     // The same approver can't satisfy the second sign-off.
     let err = storage
-        .decide_approval(&approval.id, true, "admin panel", "alice", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "alice",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap_err();
-    assert!(format!("{err}").to_lowercase().contains("already signed off"), "got: {err}");
+    assert!(
+        format!("{err}")
+            .to_lowercase()
+            .contains("already signed off"),
+        "got: {err}"
+    );
 
     // A polling agent sees it's still pending (not executed).
-    let polled = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let polled = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert_eq!(polled.status, ApprovalStatus::Pending);
     assert!(!polled.executed);
 
     // A second DISTINCT approver meets the threshold → Approved → runs on next poll.
     storage
-        .decide_approval(&approval.id, true, "admin panel", "bob", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "admin panel",
+            "bob",
+            false,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
     assert_eq!(a.status, ApprovalStatus::Approved);
     assert_eq!(a.signoffs.len(), 2);
 
-    let polled = server.check_and_resume_approval(&approval.id, None).await.unwrap();
+    let polled = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
     assert!(polled.executed, "executes once both approvers signed off");
     assert_eq!(polled.result_status, Some(200));
 }
@@ -2563,12 +3187,19 @@ async fn test_v12_dual_control_forces_gating_on_allow_path() {
         requester: RequesterInfo::default(),
     };
     // Despite Allow + no require_approval, dual_control gates it.
-    let outcome = server.execute_gated(echo_request("pay-cred"), auth).await.unwrap();
+    let outcome = server
+        .execute_gated(echo_request("pay-cred"), auth)
+        .await
+        .unwrap();
     let approval = match outcome {
         ExecutionOutcome::Pending(a) => a,
         other => panic!("dual_control must gate even on Allow, got {other:?}"),
     };
-    assert_eq!(approval.effective_required_approvals(), 2, "dual control needs 2 approvers");
+    assert_eq!(
+        approval.effective_required_approvals(),
+        2,
+        "dual control needs 2 approvers"
+    );
     assert!(approval.status.is_open());
 }
 
@@ -2624,28 +3255,45 @@ fn tenant_auth(token: &UseToken) -> ExecAuth {
 #[tokio::test]
 async fn test_v11_observe_mode_downgrades_deny_to_allow() {
     // One team observe-only, another enforcing, on the same vultrino.
-    let (server, storage) =
-        setup_tenants(true, vec![("team-observe", vultrino::config::TenantMode::Observe)]).await;
+    let (server, storage) = setup_tenants(
+        true,
+        vec![("team-observe", vultrino::config::TenantMode::Observe)],
+    )
+    .await;
     store_credential(&storage, "api-cred", false).await; // un-policied → no_policy deny
 
     // team-observe: the no_policy deny is downgraded — the action RUNS.
     let tb = tenant_token("team-observe");
     storage.store_use_token(&tb).await.unwrap();
-    let outcome = server.execute_gated(echo_request("api-cred"), tenant_auth(&tb)).await.unwrap();
-    assert!(matches!(outcome, ExecutionOutcome::Completed(_)), "observe tenant runs despite deny");
+    let outcome = server
+        .execute_gated(echo_request("api-cred"), tenant_auth(&tb))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, ExecutionOutcome::Completed(_)),
+        "observe tenant runs despite deny"
+    );
 
     // An observed-denial event was emitted for visibility.
     let events = storage.list_events_after(0, 100).await.unwrap();
     assert!(
-        events.iter().any(|e| e.event_type == "policy.observed_denial" && e.subject == "team-observe"),
+        events
+            .iter()
+            .any(|e| e.event_type == "policy.observed_denial" && e.subject == "team-observe"),
         "observe-mode denial emitted to the outbox"
     );
 
     // team-enforce (default, not listed): the same deny BLOCKS.
     let ta = tenant_token("team-enforce");
     storage.store_use_token(&ta).await.unwrap();
-    let err = server.execute_gated(echo_request("api-cred"), tenant_auth(&ta)).await.unwrap_err();
-    assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)), "enforce tenant is blocked");
+    let err = server
+        .execute_gated(echo_request("api-cred"), tenant_auth(&ta))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, vultrino::VultrinoError::PolicyDenied(_)),
+        "enforce tenant is blocked"
+    );
 }
 
 #[tokio::test]
@@ -2676,21 +3324,30 @@ async fn test_v11_cross_tenant_credential_isolation() {
     // team-b → denied access to team-a's credential (cross-tenant isolation).
     let tb = tenant_token("team-b");
     storage.store_use_token(&tb).await.unwrap();
-    let err = server.execute_gated(req("team-a-cred"), tenant_auth(&tb)).await.unwrap_err();
+    let err = server
+        .execute_gated(req("team-a-cred"), tenant_auth(&tb))
+        .await
+        .unwrap_err();
     match err {
         vultrino::VultrinoError::PolicyDenied(r) => assert!(r.contains("tenant"), "reason: {r}"),
         other => panic!("expected cross-tenant denial, got {other:?}"),
     }
     // team-b → CAN use the shared (untenanted) credential.
     assert!(matches!(
-        server.execute_gated(req("shared-cred"), tenant_auth(&tb)).await.unwrap(),
+        server
+            .execute_gated(req("shared-cred"), tenant_auth(&tb))
+            .await
+            .unwrap(),
         ExecutionOutcome::Completed(_)
     ));
     // team-a → CAN use its own credential.
     let ta = tenant_token("team-a");
     storage.store_use_token(&ta).await.unwrap();
     assert!(matches!(
-        server.execute_gated(req("team-a-cred"), tenant_auth(&ta)).await.unwrap(),
+        server
+            .execute_gated(req("team-a-cred"), tenant_auth(&ta))
+            .await
+            .unwrap(),
         ExecutionOutcome::Completed(_)
     ));
 }
@@ -2700,8 +3357,11 @@ async fn test_v11_halt_is_not_downgraded_by_observe_mode() {
     // V11 critical: a V6 halt/kill switch is a security override, NOT a per-tenant
     // policy — observe mode must NOT downgrade it. A halted agent in an observe
     // tenant stays blocked.
-    let (server, storage) =
-        setup_tenants(false, vec![("team-observe", vultrino::config::TenantMode::Observe)]).await;
+    let (server, storage) = setup_tenants(
+        false,
+        vec![("team-observe", vultrino::config::TenantMode::Observe)],
+    )
+    .await;
     store_credential(&storage, "api-cred", false).await;
 
     let mut token = tenant_token("team-observe");
@@ -2710,7 +3370,10 @@ async fn test_v11_halt_is_not_downgraded_by_observe_mode() {
 
     // Sanity: without a halt, the observe tenant runs (allow mode → Allow).
     assert!(matches!(
-        server.execute_gated(echo_request("api-cred"), tenant_auth(&token)).await.unwrap(),
+        server
+            .execute_gated(echo_request("api-cred"), tenant_auth(&token))
+            .await
+            .unwrap(),
         ExecutionOutcome::Completed(_)
     ));
 
@@ -2720,10 +3383,16 @@ async fn test_v11_halt_is_not_downgraded_by_observe_mode() {
         .add_policy(vultrino::policy::Policy::kill_switch("halt:bot-x", "bot-x"));
 
     // Even in an observe tenant, the halt is enforced — NOT observed-away.
-    let err = server.execute_gated(echo_request("api-cred"), tenant_auth(&token)).await.unwrap_err();
+    let err = server
+        .execute_gated(echo_request("api-cred"), tenant_auth(&token))
+        .await
+        .unwrap_err();
     match err {
         vultrino::VultrinoError::PolicyDenied(r) => {
-            assert!(r.contains("halt"), "halt must block in observe mode, got: {r}")
+            assert!(
+                r.contains("halt"),
+                "halt must block in observe mode, got: {r}"
+            )
         }
         other => panic!("a halted agent must be blocked even in an observe tenant, got {other:?}"),
     }
@@ -2736,11 +3405,19 @@ async fn test_v11_halt_not_downgraded_for_api_key_principal() {
     // must not downgrade it.
     use vultrino::auth::{ApiKey, AuthResult, Permission, Role};
 
-    let (server, storage) =
-        setup_tenants(false, vec![("team-observe", vultrino::config::TenantMode::Observe)]).await;
+    let (server, storage) = setup_tenants(
+        false,
+        vec![("team-observe", vultrino::config::TenantMode::Observe)],
+    )
+    .await;
     store_credential(&storage, "api-cred", false).await;
 
-    let role = Role::new("exec", [Permission::Read, Permission::Execute].into_iter().collect());
+    let role = Role::new(
+        "exec",
+        [Permission::Read, Permission::Execute]
+            .into_iter()
+            .collect(),
+    );
     let api_key = ApiKey {
         id: "vk_bot".to_string(),
         key_prefix: "vk_bot".to_string(),
@@ -2756,7 +3433,10 @@ async fn test_v11_halt_not_downgraded_for_api_key_principal() {
         workload_id: None,
     };
     let auth = || ExecAuth {
-        auth: Some(AuthResult { api_key: api_key.clone(), role: role.clone() }),
+        auth: Some(AuthResult {
+            api_key: api_key.clone(),
+            role: role.clone(),
+        }),
         use_token: None,
         force_approval: false,
         requester: RequesterInfo::default(),
@@ -2764,15 +3444,24 @@ async fn test_v11_halt_not_downgraded_for_api_key_principal() {
 
     // Without a halt, the observe tenant runs (allow mode).
     assert!(matches!(
-        server.execute_gated(echo_request("api-cred"), auth()).await.unwrap(),
+        server
+            .execute_gated(echo_request("api-cred"), auth())
+            .await
+            .unwrap(),
         ExecutionOutcome::Completed(_)
     ));
 
     // Halt the API key by its id; observe must NOT downgrade it.
     server
         .policy_engine()
-        .add_policy(vultrino::policy::Policy::kill_switch("halt:vk_bot", "vk_bot"));
-    let err = server.execute_gated(echo_request("api-cred"), auth()).await.unwrap_err();
+        .add_policy(vultrino::policy::Policy::kill_switch(
+            "halt:vk_bot",
+            "vk_bot",
+        ));
+    let err = server
+        .execute_gated(echo_request("api-cred"), auth())
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, vultrino::VultrinoError::PolicyDenied(_)),
         "API-key agent halted by id must stay blocked in an observe tenant, got {err:?}"
@@ -2785,24 +3474,38 @@ async fn test_v11_observe_does_not_downgrade_resource_guards() {
     // NOT downgrade a denial for a credential under such a guard.
     use vultrino::policy::{Policy, PolicyAction, PolicyCondition};
 
-    let (server, storage) =
-        setup_tenants(false, vec![("team-observe", vultrino::config::TenantMode::Observe)]).await;
+    let (server, storage) = setup_tenants(
+        false,
+        vec![("team-observe", vultrino::config::TenantMode::Observe)],
+    )
+    .await;
     store_credential(&storage, "api-cred", false).await;
     // A rate-limited policy: 1 request / hour, else deny (fail-closed default).
-    server.policy_engine().add_policy(
-        Policy::deny_all("rl", "*")
-            .with_rule(PolicyCondition::RateLimit { max: 1, window_secs: 3600 }, PolicyAction::Allow),
-    );
+    server
+        .policy_engine()
+        .add_policy(Policy::deny_all("rl", "*").with_rule(
+            PolicyCondition::RateLimit {
+                max: 1,
+                window_secs: 3600,
+            },
+            PolicyAction::Allow,
+        ));
 
     let token = tenant_token("team-observe");
     storage.store_use_token(&token).await.unwrap();
     // First call is within the rate limit → allowed.
     assert!(matches!(
-        server.execute_gated(echo_request("api-cred"), tenant_auth(&token)).await.unwrap(),
+        server
+            .execute_gated(echo_request("api-cred"), tenant_auth(&token))
+            .await
+            .unwrap(),
         ExecutionOutcome::Completed(_)
     ));
     // Second call exceeds the limit → DENIED even in observe (resource guard).
-    let err = server.execute_gated(echo_request("api-cred"), tenant_auth(&token)).await.unwrap_err();
+    let err = server
+        .execute_gated(echo_request("api-cred"), tenant_auth(&token))
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, vultrino::VultrinoError::PolicyDenied(_)),
         "a rate-limit denial must hold in observe mode, got {err:?}"
@@ -2842,7 +3545,10 @@ async fn test_v11_observe_does_not_downgrade_spend_cap() {
         asset: Some("usd".to_string()),
         asset_pointer: None,
     }];
-    config.tenants.insert("team-observe".to_string(), vultrino::config::TenantMode::Observe);
+    config.tenants.insert(
+        "team-observe".to_string(),
+        vultrino::config::TenantMode::Observe,
+    );
 
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
@@ -2863,11 +3569,17 @@ async fn test_v11_observe_does_not_downgrade_spend_cap() {
 
     // Within cap → runs.
     assert!(matches!(
-        server.execute_gated(req(100), tenant_auth(&token)).await.unwrap(),
+        server
+            .execute_gated(req(100), tenant_auth(&token))
+            .await
+            .unwrap(),
         ExecutionOutcome::Completed(_)
     ));
     // Over the per-action cap → DENIED even in observe (resource guard, not posture).
-    let err = server.execute_gated(req(500), tenant_auth(&token)).await.unwrap_err();
+    let err = server
+        .execute_gated(req(500), tenant_auth(&token))
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, vultrino::VultrinoError::PolicyDenied(_)),
         "an over-cap spend denial must hold in observe mode, got {err:?}"
@@ -2900,27 +3612,63 @@ async fn test_v11_approvals_are_tenant_scoped() {
     storage.store_use_token(&ta).await.unwrap();
     storage.store_use_token(&tb).await.unwrap();
 
-    let a_id = match server.execute_gated(echo_request("api-cred"), tenant_auth(&ta)).await.unwrap() {
+    let a_id = match server
+        .execute_gated(echo_request("api-cred"), tenant_auth(&ta))
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Pending(a) => a.id,
         other => panic!("expected Pending, got {other:?}"),
     };
-    let b_id = match server.execute_gated(echo_request("api-cred"), tenant_auth(&tb)).await.unwrap() {
+    let b_id = match server
+        .execute_gated(echo_request("api-cred"), tenant_auth(&tb))
+        .await
+        .unwrap()
+    {
         ExecutionOutcome::Pending(a) => a.id,
         other => panic!("expected Pending, got {other:?}"),
     };
 
     // Each approval is tagged with its opener's tenant.
-    assert_eq!(storage.get_approval(&a_id).await.unwrap().unwrap().tenant.as_deref(), Some("team-a"));
-    assert_eq!(storage.get_approval(&b_id).await.unwrap().unwrap().tenant.as_deref(), Some("team-b"));
+    assert_eq!(
+        storage
+            .get_approval(&a_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .tenant
+            .as_deref(),
+        Some("team-a")
+    );
+    assert_eq!(
+        storage
+            .get_approval(&b_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .tenant
+            .as_deref(),
+        Some("team-b")
+    );
 
     // Visibility: each tenant sees only its own; a global admin sees both.
-    let a_view = server.list_approvals_for_tenant(Some("team-a")).await.unwrap();
+    let a_view = server
+        .list_approvals_for_tenant(Some("team-a"))
+        .await
+        .unwrap();
     assert_eq!(a_view.len(), 1, "team-a sees only its own approval");
     assert_eq!(a_view[0].id, a_id);
-    let b_view = server.list_approvals_for_tenant(Some("team-b")).await.unwrap();
+    let b_view = server
+        .list_approvals_for_tenant(Some("team-b"))
+        .await
+        .unwrap();
     assert_eq!(b_view.len(), 1, "team-b sees only its own approval");
     assert_eq!(b_view[0].id, b_id);
-    assert_eq!(server.list_approvals_for_tenant(None).await.unwrap().len(), 2, "global admin sees both");
+    assert_eq!(
+        server.list_approvals_for_tenant(None).await.unwrap().len(),
+        2,
+        "global admin sees both"
+    );
 
     // Decision scoping rests on the visible_to_tenant primitive (the gate a
     // tenant-scoped admin surface uses): team-a can act on its own approval but not
@@ -2928,9 +3676,18 @@ async fn test_v11_approvals_are_tenant_scoped() {
     let a = storage.get_approval(&a_id).await.unwrap().unwrap();
     let b = storage.get_approval(&b_id).await.unwrap().unwrap();
     assert!(a.visible_to_tenant(Some("team-a")), "team-a sees its own");
-    assert!(!b.visible_to_tenant(Some("team-a")), "team-a must NOT see team-b's approval");
-    assert!(!a.visible_to_tenant(Some("team-b")), "team-b must NOT see team-a's approval");
-    assert!(a.visible_to_tenant(None) && b.visible_to_tenant(None), "global admin sees both");
+    assert!(
+        !b.visible_to_tenant(Some("team-a")),
+        "team-a must NOT see team-b's approval"
+    );
+    assert!(
+        !a.visible_to_tenant(Some("team-b")),
+        "team-b must NOT see team-a's approval"
+    );
+    assert!(
+        a.visible_to_tenant(None) && b.visible_to_tenant(None),
+        "global admin sees both"
+    );
     // An untenanted (shared) approval is visible to every admin.
     let shared = ApprovalRequest::open(NewApproval {
         credential: "api-cred".to_string(),
@@ -2945,7 +3702,7 @@ async fn test_v11_approvals_are_tenant_scoped() {
         action_label: None,
         dual_control: false,
         criticality: vultrino::approval::CriticalityClass::Medium,
-            trusted_irreversible: None,
+        trusted_irreversible: None,
         escalate_after: Duration::minutes(30),
         escalate_window: Duration::minutes(30),
         oob_identity: None,
@@ -3038,13 +3795,19 @@ async fn test_v7_oauth_rotation_emits_credential_rotated_event() {
 
     // An expired token → the plugin rotates → credential.rotated emitted.
     let past = chrono::Utc::now() - Duration::hours(1);
-    storage.store(&oauth_credential("oauth-cred", Some(past))).await.unwrap();
+    storage
+        .store(&oauth_credential("oauth-cred", Some(past)))
+        .await
+        .unwrap();
     let req = ExecuteRequest {
         credential: "oauth-cred".to_string(),
         action: "oauthmock.refresh".to_string(),
         params: serde_json::json!({}),
     };
-    let outcome = server.execute_gated(req, ExecAuth::default()).await.unwrap();
+    let outcome = server
+        .execute_gated(req, ExecAuth::default())
+        .await
+        .unwrap();
     assert!(matches!(outcome, ExecutionOutcome::Completed(_)));
 
     let events = storage.list_events_after(0, 100).await.unwrap();
@@ -3066,17 +3829,25 @@ async fn test_v7_oauth_rotation_emits_credential_rotated_event() {
 
     // A still-valid token → no refresh → no new rotation event.
     let future = chrono::Utc::now() + Duration::hours(2);
-    storage.store(&oauth_credential("oauth-valid", Some(future))).await.unwrap();
+    storage
+        .store(&oauth_credential("oauth-valid", Some(future)))
+        .await
+        .unwrap();
     let req2 = ExecuteRequest {
         credential: "oauth-valid".to_string(),
         action: "oauthmock.refresh".to_string(),
         params: serde_json::json!({}),
     };
-    server.execute_gated(req2, ExecAuth::default()).await.unwrap();
+    server
+        .execute_gated(req2, ExecAuth::default())
+        .await
+        .unwrap();
     let events = storage.list_events_after(0, 100).await.unwrap();
     assert!(
-        !events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_CREDENTIAL_ROTATED
-            && e.subject == "oauth-valid"),
+        !events.iter().any(
+            |e| e.event_type == vultrino::outbox::EVENT_CREDENTIAL_ROTATED
+                && e.subject == "oauth-valid"
+        ),
         "a still-valid token must not emit a rotation event"
     );
 }
@@ -3117,7 +3888,9 @@ async fn test_v7_revoke_propagation_calls_endpoint_and_emits_event() {
     let storage: Arc<dyn StorageBackend> =
         Arc::new(FileStorage::new(&path, &password).await.unwrap());
 
-    let revoker = RecordingRevoker { calls: std::sync::Mutex::new(Vec::new()) };
+    let revoker = RecordingRevoker {
+        calls: std::sync::Mutex::new(Vec::new()),
+    };
 
     // A credential WITH a revocation endpoint → both tokens propagated + event.
     let cred = oauth_credential("oauth-prod", Some(chrono::Utc::now()))
@@ -3127,7 +3900,9 @@ async fn test_v7_revoke_propagation_calls_endpoint_and_emits_event() {
 
     let calls = revoker.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 2, "both access and refresh tokens revoked");
-    assert!(calls.iter().all(|(url, _, _)| url == "https://idp.example.com/revoke"));
+    assert!(calls
+        .iter()
+        .all(|(url, _, _)| url == "https://idp.example.com/revoke"));
     let hints: Vec<&str> = calls.iter().map(|(_, _, h)| h.as_str()).collect();
     assert!(hints.contains(&"access_token") && hints.contains(&"refresh_token"));
     assert!(calls.iter().any(|(_, tok, _)| tok == "stale-access"));
@@ -3141,15 +3916,22 @@ async fn test_v7_revoke_propagation_calls_endpoint_and_emits_event() {
     assert_eq!(revoked[0].subject, "oauth-prod");
 
     // A credential WITHOUT a revocation endpoint → nothing propagated, no event.
-    let revoker2 = RecordingRevoker { calls: std::sync::Mutex::new(Vec::new()) };
+    let revoker2 = RecordingRevoker {
+        calls: std::sync::Mutex::new(Vec::new()),
+    };
     let plain = oauth_credential("oauth-noendpoint", Some(chrono::Utc::now()));
     storage.store(&plain).await.unwrap();
     vultrino::revocation::propagate_revoke(&revoker2, &*storage, &plain).await;
-    assert!(revoker2.calls.lock().unwrap().is_empty(), "no endpoint → no revoke call");
+    assert!(
+        revoker2.calls.lock().unwrap().is_empty(),
+        "no endpoint → no revoke call"
+    );
     let events = storage.list_events_after(0, 100).await.unwrap();
     assert!(
-        !events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_CREDENTIAL_REVOKED
-            && e.subject == "oauth-noendpoint"),
+        !events.iter().any(
+            |e| e.event_type == vultrino::outbox::EVENT_CREDENTIAL_REVOKED
+                && e.subject == "oauth-noendpoint"
+        ),
         "no endpoint → no credential.revoked event"
     );
 }
@@ -3165,9 +3947,7 @@ async fn test_v7_revoke_propagation_calls_endpoint_and_emits_event() {
 // gated `api_list_events` handler serves (it is a thin pass-through to this call).
 
 /// Collect every `meter.observed` event currently in the outbox.
-async fn meter_events(
-    storage: &Arc<dyn StorageBackend>,
-) -> Vec<vultrino::outbox::OutboxEvent> {
+async fn meter_events(storage: &Arc<dyn StorageBackend>) -> Vec<vultrino::outbox::OutboxEvent> {
     storage
         .list_events_after(0, 1000)
         .await
@@ -3243,7 +4023,11 @@ async fn test_v13a_admitted_execute_emits_one_meter_observed() {
     };
 
     let metered = meter_events(&storage).await;
-    assert_eq!(metered.len(), 1, "exactly one meter.observed per admitted action");
+    assert_eq!(
+        metered.len(),
+        1,
+        "exactly one meter.observed per admitted action"
+    );
     let e = &metered[0];
     // The subject (outbox ordering key) is the principal — the V4 agent label.
     assert_eq!(e.subject, "agent_refund_bot_v3");
@@ -3258,12 +4042,21 @@ async fn test_v13a_admitted_execute_emits_one_meter_observed() {
     let req_id = p["event_id"].as_str().unwrap();
     assert!(!req_id.is_empty(), "event_id must be the request id");
     assert_eq!(p["correlation_id"].as_str().unwrap(), req_id);
-    assert!(p["occurred_at"].is_string(), "occurred_at is the action timestamp");
+    assert!(
+        p["occurred_at"].is_string(),
+        "occurred_at is the action timestamp"
+    );
     // dims carries the credential alias; tenant omitted when the credential is
     // untenanted (no phantom keys).
     assert_eq!(p["dims"]["credential"], "api-cred");
-    assert!(p["dims"].get("tenant").is_none(), "untenanted → no tenant dim");
-    assert!(p["dims"].get("model").is_none(), "V13a does not parse the body → no model");
+    assert!(
+        p["dims"].get("tenant").is_none(),
+        "untenanted → no tenant dim"
+    );
+    assert!(
+        p["dims"].get("model").is_none(),
+        "V13a does not parse the body → no model"
+    );
 
     // The action itself still succeeded.
     assert_eq!(resp.status, 200);
@@ -3305,7 +4098,10 @@ async fn test_v13a_denied_action_emits_no_meter_observed() {
         .unwrap_err();
     assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)));
 
-    assert!(meter_events(&storage).await.is_empty(), "denied → no meter.observed");
+    assert!(
+        meter_events(&storage).await.is_empty(),
+        "denied → no meter.observed"
+    );
 }
 
 #[tokio::test]
@@ -3321,15 +4117,24 @@ async fn test_v13a_replay_dedups_by_event_id() {
     store_tenanted_credential(&storage, "api-cred", None).await;
 
     let auth1 = auth_for_agent(&storage, "agent_a", None).await;
-    server.execute_gated(echo_request("api-cred"), auth1).await.unwrap();
+    server
+        .execute_gated(echo_request("api-cred"), auth1)
+        .await
+        .unwrap();
     let auth2 = auth_for_agent(&storage, "agent_a", None).await;
-    server.execute_gated(echo_request("api-cred"), auth2).await.unwrap();
+    server
+        .execute_gated(echo_request("api-cred"), auth2)
+        .await
+        .unwrap();
 
     let metered = meter_events(&storage).await;
     assert_eq!(metered.len(), 2, "two distinct calls → two occurrences");
     let key1 = metered[0].payload["event_id"].as_str().unwrap();
     let key2 = metered[1].payload["event_id"].as_str().unwrap();
-    assert_ne!(key1, key2, "distinct calls → distinct event_id keys (no collision)");
+    assert_ne!(
+        key1, key2,
+        "distinct calls → distinct event_id keys (no collision)"
+    );
     // Within one event, the dedup handle IS the per-occurrence id (== correlation_id
     // == the /execute request id), so leria dedups a re-arrival of the SAME request
     // id and threads the SAME occurrence across sources.
@@ -3478,9 +4283,15 @@ async fn test_v13a_meter_observed_retrievable_via_poll_path() {
     store_tenanted_credential(&storage, "api-cred", Some("acme")).await;
 
     let auth1 = auth_for_agent(&storage, "agent_a", Some("acme")).await;
-    server.execute_gated(echo_request("api-cred"), auth1).await.unwrap();
+    server
+        .execute_gated(echo_request("api-cred"), auth1)
+        .await
+        .unwrap();
     let auth2 = auth_for_agent(&storage, "agent_b", Some("acme")).await;
-    server.execute_gated(echo_request("api-cred"), auth2).await.unwrap();
+    server
+        .execute_gated(echo_request("api-cred"), auth2)
+        .await
+        .unwrap();
 
     // leria's first poll: from cursor 0.
     let page1 = storage.list_events_after(0, 1000).await.unwrap();
@@ -3578,7 +4389,11 @@ async fn test_v13b_openai_usage_emits_token_event_alongside_api_calls() {
 
     let all = meter_events(&storage).await;
     // Two meter events for the one call: the V13a api-calls=1 and the V13b token.
-    assert_eq!(all.len(), 2, "one admitted LLM call → V13a + V13b meter events");
+    assert_eq!(
+        all.len(),
+        2,
+        "one admitted LLM call → V13a + V13b meter events"
+    );
     let api = all
         .iter()
         .find(|e| e.payload["asset"] == "api-calls")
@@ -3663,7 +4478,11 @@ async fn test_v13b_no_usage_block_emits_only_api_calls() {
         .unwrap();
 
     let all = meter_events(&storage).await;
-    assert_eq!(all.len(), 1, "no usage block → only the V13a api-calls event");
+    assert_eq!(
+        all.len(),
+        1,
+        "no usage block → only the V13a api-calls event"
+    );
     assert_eq!(all[0].payload["asset"], "api-calls");
     assert!(
         !all.iter().any(is_token_event),
@@ -3721,7 +4540,10 @@ async fn test_v13b_token_read_is_from_raw_body_before_egress_redaction() {
         agent_body.contains("[REDACTED:egress]"),
         "the egress rule must have redacted the agent-visible body: {agent_body}"
     );
-    assert!(!agent_body.contains("1200"), "the original count is redacted from the agent body");
+    assert!(
+        !agent_body.contains("1200"),
+        "the original count is redacted from the agent body"
+    );
 
     // The meter event nonetheless carries the CORRECT pre-scrub counts.
     let tok = meter_events(&storage)
@@ -3807,7 +4629,10 @@ async fn test_v13b_token_event_decodes_into_leria_wire_shape() {
     let wire: WireEventMirror = serde_json::from_value(tok.payload.clone())
         .expect("token payload decodes into leria's WireEvent token path");
     assert_eq!(wire.asset, "usd", "leria prices tokens only when asset=usd");
-    assert_eq!(wire.amount, 0, "a priced token event leaves amount zero (omitted)");
+    assert_eq!(
+        wire.amount, 0,
+        "a priced token event leaves amount zero (omitted)"
+    );
     assert_eq!(wire.tokens.input_tokens, 1200);
     assert_eq!(wire.tokens.output_tokens, 345);
     assert_eq!(wire.cost_source, "gateway-observed");

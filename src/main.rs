@@ -517,10 +517,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(
-            EnvFilter::from_default_env()
-                .add_directive(log_level.into()),
-        )
+        .with(EnvFilter::from_default_env().add_directive(log_level.into()))
         .init();
 
     // Load configuration
@@ -667,7 +664,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Commands::Key { command } => match command {
-            KeyCommands::Create { name, role, expires } => {
+            KeyCommands::Create {
+                name,
+                role,
+                expires,
+            } => {
                 create_api_key(config, name, role, expires).await?;
             }
             KeyCommands::List { format } => {
@@ -685,7 +686,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             headers,
             quiet,
         } => {
-            make_request(config, credential, url, method, data, headers, quiet, cli.key).await?;
+            make_request(
+                config, credential, url, method, data, headers, quiet, cli.key,
+            )
+            .await?;
         }
         Commands::Action {
             credential,
@@ -735,8 +739,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 expires,
                 require_approval,
             } => {
-                create_use_token(config, name, credential, action, uses, expires, require_approval)
-                    .await?;
+                create_use_token(
+                    config,
+                    name,
+                    credential,
+                    action,
+                    uses,
+                    expires,
+                    require_approval,
+                )
+                .await?;
             }
             TokenCommands::List { format } => {
                 list_use_tokens(config, format).await?;
@@ -781,20 +793,11 @@ fn get_storage_password() -> Result<SecretString, Box<dyn std::error::Error>> {
 
     if let Ok(path) = std::env::var("VULTRINO_PASSWORD_FILE") {
         let path = std::path::PathBuf::from(path);
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
-            format!(
-                "VULTRINO_PASSWORD_FILE {}: {}",
-                path.display(),
-                e
-            )
-        })?;
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("VULTRINO_PASSWORD_FILE {}: {}", path.display(), e))?;
         let password = raw.trim_end_matches(['\n', '\r']).to_string();
         if password.is_empty() {
-            return Err(format!(
-                "VULTRINO_PASSWORD_FILE {} is empty",
-                path.display()
-            )
-            .into());
+            return Err(format!("VULTRINO_PASSWORD_FILE {} is empty", path.display()).into());
         }
 
         #[cfg(unix)]
@@ -822,7 +825,9 @@ fn get_storage_password() -> Result<SecretString, Box<dyn std::error::Error>> {
 }
 
 /// Initialize storage backend
-async fn init_storage(config: &Config) -> Result<Arc<dyn StorageBackend>, Box<dyn std::error::Error>> {
+async fn init_storage(
+    config: &Config,
+) -> Result<Arc<dyn StorageBackend>, Box<dyn std::error::Error>> {
     let password = get_storage_password()?;
 
     match config.storage.backend {
@@ -856,7 +861,10 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     // Load auth manager for API key validation
     let stored_roles = storage.list_roles().await?;
     let stored_keys = storage.list_api_keys().await?;
-    let auth_manager = Arc::new(RwLock::new(AuthManager::from_data(stored_roles, stored_keys)));
+    let auth_manager = Arc::new(RwLock::new(AuthManager::from_data(
+        stored_roles,
+        stored_keys,
+    )));
 
     let config_policies = config.policies.clone();
     // Capture the approval + outbox config before `config` moves into the server.
@@ -1014,10 +1022,16 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
     ));
 
     info!(bind = %web_server.bind_address(), "Starting Vultrino Web UI");
-    println!("Vultrino Web UI running at http://{}", web_server.bind_address());
+    println!(
+        "Vultrino Web UI running at http://{}",
+        web_server.bind_address()
+    );
     println!("Press Ctrl+C to stop");
 
-    web_server.run().await.map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })
+    web_server
+        .run()
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })
 }
 
 /// Load admin auth from storage or prompt for setup
@@ -1077,7 +1091,10 @@ fn read_secret_env(var: &str) -> Option<String> {
             }
         }
     }
-    std::env::var(var).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    std::env::var(var)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Save admin auth to storage
@@ -1169,8 +1186,12 @@ async fn add_credential(
             }
         }
         "oauth2" => {
-            let client_id = args.client_id.ok_or("Client ID is required (--client-id)")?;
-            let token_url = args.token_url.ok_or("Token URL is required (--token-url)")?;
+            let client_id = args
+                .client_id
+                .ok_or("Client ID is required (--client-id)")?;
+            let token_url = args
+                .token_url
+                .ok_or("Token URL is required (--token-url)")?;
 
             // Validate token URL is HTTPS
             if !token_url.starts_with("https://") {
@@ -1186,8 +1207,14 @@ async fn add_credential(
             };
 
             // Parse scopes
-            let scopes_vec: Vec<String> = args.scopes
-                .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            let scopes_vec: Vec<String> = args
+                .scopes
+                .map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
                 .unwrap_or_default();
 
             CredentialData::OAuth2 {
@@ -1201,7 +1228,9 @@ async fn add_credential(
             }
         }
         "hmac_api_key" => {
-            let api_key = args.hmac_key.ok_or("HMAC API key is required (--hmac-key)")?;
+            let api_key = args
+                .hmac_key
+                .ok_or("HMAC API key is required (--hmac-key)")?;
             let api_secret = if let Some(s) = args.hmac_secret {
                 s
             } else {
@@ -1255,11 +1284,15 @@ async fn add_credential(
             }
         }
         "postgres" => {
-            let host = args.pg_host.ok_or("Postgres host is required (--pg-host)")?;
+            let host = args
+                .pg_host
+                .ok_or("Postgres host is required (--pg-host)")?;
             let database = args
                 .pg_database
                 .ok_or("Postgres database is required (--pg-database)")?;
-            let user = args.pg_user.ok_or("Postgres user is required (--pg-user)")?;
+            let user = args
+                .pg_user
+                .ok_or("Postgres user is required (--pg-user)")?;
             let password = if let Some(p) = args.pg_password {
                 p
             } else {
@@ -1296,7 +1329,10 @@ async fn add_credential(
 }
 
 /// List stored credentials
-async fn list_credentials(config: Config, format: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn list_credentials(
+    config: Config,
+    format: String,
+) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
     let credentials = storage.list().await?;
 
@@ -1322,10 +1358,7 @@ async fn list_credentials(config: Config, format: String) -> Result<(), Box<dyn 
                     .unwrap_or("-");
                 println!(
                     "{:<20} {:<15} {:<36} {}",
-                    cred.alias,
-                    cred.credential_type,
-                    cred.id,
-                    desc
+                    cred.alias, cred.credential_type, cred.id, desc
                 );
             }
         }
@@ -1335,7 +1368,10 @@ async fn list_credentials(config: Config, format: String) -> Result<(), Box<dyn 
 }
 
 /// Remove a credential
-async fn remove_credential(config: Config, alias: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn remove_credential(
+    config: Config,
+    alias: String,
+) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
 
     // Resolve by alias OR by id — so revoke-propagation fires regardless of which
@@ -1345,7 +1381,10 @@ async fn remove_credential(config: Config, alias: String) -> Result<(), Box<dyn 
         Some(c) => Some(c),
         None => storage.get(&alias).await?,
     };
-    let id = credential.as_ref().map(|c| c.id.clone()).unwrap_or_else(|| alias.clone());
+    let id = credential
+        .as_ref()
+        .map(|c| c.id.clone())
+        .unwrap_or_else(|| alias.clone());
 
     // R5/V7: propagate a downstream revoke (OAuth2/STS revocation endpoint) before
     // deleting, so an already-issued token is actively revoked, not left to expire.
@@ -1365,7 +1404,10 @@ async fn remove_credential(config: Config, alias: String) -> Result<(), Box<dyn 
 }
 
 /// Show credential info (without secrets)
-async fn show_credential_info(config: Config, alias: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn show_credential_info(
+    config: Config,
+    alias: String,
+) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
 
     // Try to find by alias first
@@ -1379,8 +1421,14 @@ async fn show_credential_info(config: Config, alias: String) -> Result<(), Box<d
             println!("Alias:      {}", cred.alias);
             println!("ID:         {}", cred.id);
             println!("Type:       {}", cred.credential_type);
-            println!("Created:    {}", cred.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
-            println!("Updated:    {}", cred.updated_at.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!(
+                "Created:    {}",
+                cred.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+            println!(
+                "Updated:    {}",
+                cred.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+            );
 
             if !cred.metadata.is_empty() {
                 println!("\nMetadata:");
@@ -1459,10 +1507,7 @@ async fn metadata_unset(
     Ok(())
 }
 
-async fn metadata_list(
-    config: Config,
-    alias: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn metadata_list(config: Config, alias: String) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
     let credential = load_credential_mut(&storage, &alias).await?;
 
@@ -1579,7 +1624,11 @@ transport = "stdio"
     let mut username = String::new();
     io::stdin().read_line(&mut username)?;
     let username = username.trim();
-    let username = if username.is_empty() { "admin" } else { username };
+    let username = if username.is_empty() {
+        "admin"
+    } else {
+        username
+    };
 
     // Get password
     eprint!("Admin password: ");
@@ -1708,7 +1757,10 @@ async fn list_roles(config: Config, format: String) -> Result<(), Box<dyn std::e
                 } else {
                     role.credential_scopes.join(",")
                 };
-                let predefined = if matches!(role.name.as_str(), ROLE_ADMIN | ROLE_READ_ONLY | ROLE_EXECUTOR) {
+                let predefined = if matches!(
+                    role.name.as_str(),
+                    ROLE_ADMIN | ROLE_READ_ONLY | ROLE_EXECUTOR
+                ) {
                     " (built-in)"
                 } else {
                     ""
@@ -1783,7 +1835,10 @@ async fn show_role_info(config: Config, name: String) -> Result<(), Box<dyn std:
         role.created_at.format("%Y-%m-%d %H:%M:%S UTC")
     );
 
-    let is_builtin = matches!(role.name.as_str(), ROLE_ADMIN | ROLE_READ_ONLY | ROLE_EXECUTOR);
+    let is_builtin = matches!(
+        role.name.as_str(),
+        ROLE_ADMIN | ROLE_READ_ONLY | ROLE_EXECUTOR
+    );
     if is_builtin {
         println!("Type:        Built-in (cannot be deleted)");
     }
@@ -1810,7 +1865,10 @@ fn parse_expiration(s: &str) -> Result<Option<Duration>, String> {
     } else if s.ends_with('m') {
         (&s[..s.len() - 1], "m")
     } else {
-        return Err(format!("Invalid duration format: {}. Use format like '30d', '24h', '1w'", s));
+        return Err(format!(
+            "Invalid duration format: {}. Use format like '30d', '24h', '1w'",
+            s
+        ));
     };
 
     let num: i64 = num_str
@@ -1979,7 +2037,12 @@ fn parse_token_expiration(s: &str) -> Result<Option<Duration>, String> {
         "h" => Duration::hours(n),
         "d" => Duration::days(n),
         "w" => Duration::weeks(n),
-        _ => return Err(format!("Invalid duration unit in '{}'. Use s, m, h, d, or w.", s)),
+        _ => {
+            return Err(format!(
+                "Invalid duration unit in '{}'. Use s, m, h, d, or w.",
+                s
+            ))
+        }
     };
     if d <= Duration::zero() {
         return Err("Duration must be positive".to_string());
@@ -2198,7 +2261,10 @@ async fn approval_status(
                 };
                 println!("Status:  {}", label);
                 println!("Summary: {}", approval.summary);
-                println!("Expires: {}", approval.expires_at.format("%Y-%m-%d %H:%M UTC"));
+                println!(
+                    "Expires: {}",
+                    approval.expires_at.format("%Y-%m-%d %H:%M UTC")
+                );
                 println!("\nWaiting on a human decision. Approve in the admin panel, or run:");
                 println!("  vultrino approval approve {}", approval.id);
             }
@@ -2284,7 +2350,10 @@ async fn decide_approval(
         .map_err(|e| format!("Could not update approval: {}", e))?;
 
     if approve {
-        println!("Approval '{}' approved. The agent will run the action on its next check.", id);
+        println!(
+            "Approval '{}' approved. The agent will run the action on its next check.",
+            id
+        );
     } else {
         println!("Approval '{}' denied. The action will not run.", id);
     }
@@ -2325,7 +2394,9 @@ async fn make_request(
             Some(serde_json::from_str(&content)?)
         } else {
             // Parse as JSON or treat as string
-            serde_json::from_str(data_str).ok().or_else(|| Some(serde_json::Value::String(data_str.clone())))
+            serde_json::from_str(data_str)
+                .ok()
+                .or_else(|| Some(serde_json::Value::String(data_str.clone())))
         }
     } else {
         None
@@ -2333,7 +2404,17 @@ async fn make_request(
 
     // If API key is provided, use HTTP API (no password needed)
     if let Some(key) = api_key {
-        return make_request_via_api(&config, &credential, &url, &method, headers_map, body, quiet, &key).await;
+        return make_request_via_api(
+            &config,
+            &credential,
+            &url,
+            &method,
+            headers_map,
+            body,
+            quiet,
+            &key,
+        )
+        .await;
     }
 
     // Otherwise, use direct storage access (requires password)
@@ -2380,8 +2461,8 @@ async fn make_request_via_api(
     api_key: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Determine API server address (default to web server port)
-    let api_url = std::env::var("VULTRINO_API_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:7879".to_string());
+    let api_url =
+        std::env::var("VULTRINO_API_URL").unwrap_or_else(|_| "http://127.0.0.1:7879".to_string());
 
     // Build the API request
     let client = reqwest::Client::new();
@@ -2448,7 +2529,13 @@ async fn make_request_via_api(
 }
 
 /// Output response to console
-fn output_response(method: &str, url: &str, status: u16, body: &[u8], quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn output_response(
+    method: &str,
+    url: &str,
+    status: u16,
+    body: &[u8],
+    quiet: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if quiet {
         // Just the body
         let body_text = String::from_utf8_lossy(body);
@@ -2463,7 +2550,13 @@ fn output_response(method: &str, url: &str, status: u16, body: &[u8], quiet: boo
             ">"
         };
 
-        eprintln!("[{}] {} {} -> {}", status_emoji, method.to_uppercase(), url, status);
+        eprintln!(
+            "[{}] {} {} -> {}",
+            status_emoji,
+            method.to_uppercase(),
+            url,
+            status
+        );
 
         // Pretty print JSON if possible
         let body_text = String::from_utf8_lossy(body);
@@ -2625,10 +2718,7 @@ async fn list_plugins(format: String) -> Result<(), Box<dyn std::error::Error>> 
                 };
                 println!(
                     "{:<20} {:<10} {:<30} {}",
-                    plugin.manifest.plugin.name,
-                    plugin.manifest.plugin.version,
-                    source,
-                    cred_types
+                    plugin.manifest.plugin.name, plugin.manifest.plugin.version, source, cred_types
                 );
             }
         }
@@ -2682,7 +2772,10 @@ async fn show_plugin_info(name: String) -> Result<(), Box<dyn std::error::Error>
         println!("Homepage:    {}", homepage);
     }
     println!("Source:      {}", info.source);
-    println!("Installed:   {}", info.installed_at.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!(
+        "Installed:   {}",
+        info.installed_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
     println!("Enabled:     {}", if info.enabled { "yes" } else { "no" });
     println!("Location:    {}", info.directory.display());
 
@@ -2697,7 +2790,10 @@ async fn show_plugin_info(name: String) -> Result<(), Box<dyn std::error::Error>
             for field in &ct.fields {
                 let req = if field.required { "*" } else { "" };
                 let secret = if field.secret { " [secret]" } else { "" };
-                println!("      - {}{}: {:?}{}", field.name, req, field.field_type, secret);
+                println!(
+                    "      - {}{}: {:?}{}",
+                    field.name, req, field.field_type, secret
+                );
             }
         }
     }

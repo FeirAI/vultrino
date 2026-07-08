@@ -73,9 +73,8 @@ impl EcdsaPlugin {
     fn parse_private_key(key_str: &str) -> Result<SigningKey, PluginError> {
         let key_hex = key_str.strip_prefix("0x").unwrap_or(key_str);
 
-        let key_bytes = hex::decode(key_hex).map_err(|e| {
-            PluginError::InvalidParams(format!("Invalid private key hex: {}", e))
-        })?;
+        let key_bytes = hex::decode(key_hex)
+            .map_err(|e| PluginError::InvalidParams(format!("Invalid private key hex: {}", e)))?;
 
         if key_bytes.len() != 32 {
             return Err(PluginError::InvalidParams(format!(
@@ -84,9 +83,8 @@ impl EcdsaPlugin {
             )));
         }
 
-        SigningKey::from_slice(&key_bytes).map_err(|e| {
-            PluginError::InvalidParams(format!("Invalid private key: {}", e))
-        })
+        SigningKey::from_slice(&key_bytes)
+            .map_err(|e| PluginError::InvalidParams(format!("Invalid private key: {}", e)))
     }
 
     /// Get Ethereum address from public key
@@ -206,11 +204,17 @@ impl EcdsaPlugin {
             r: format!("0x{}", hex::encode(r_bytes)),
             s: format!("0x{}", hex::encode(s_bytes)),
             v: recovery_id,
-            signature: format!("0x{}{}{:02x}", hex::encode(r_bytes), hex::encode(s_bytes), recovery_id),
+            signature: format!(
+                "0x{}{}{:02x}",
+                hex::encode(r_bytes),
+                hex::encode(s_bytes),
+                recovery_id
+            ),
         };
 
-        let body = serde_json::to_vec(&response)
-            .map_err(|e| PluginError::ExecutionFailed(format!("Failed to serialize response: {}", e)))?;
+        let body = serde_json::to_vec(&response).map_err(|e| {
+            PluginError::ExecutionFailed(format!("Failed to serialize response: {}", e))
+        })?;
 
         Ok(ExecuteResponse {
             status: 200,
@@ -225,14 +229,13 @@ impl EcdsaPlugin {
     }
 
     /// Get Ethereum address from private key
-    fn get_address(
-        &self,
-        cred_data: &CredentialData,
-    ) -> Result<ExecuteResponse, PluginError> {
+    fn get_address(&self, cred_data: &CredentialData) -> Result<ExecuteResponse, PluginError> {
         let (private_key, api_address) = match cred_data {
-            CredentialData::EcdsaKey { private_key, api_address, .. } => {
-                (private_key.expose(), api_address.clone())
-            }
+            CredentialData::EcdsaKey {
+                private_key,
+                api_address,
+                ..
+            } => (private_key.expose(), api_address.clone()),
             _ => {
                 return Err(PluginError::UnsupportedCredentialType(
                     "ECDSA plugin requires EcdsaKey credential".to_string(),
@@ -252,8 +255,9 @@ impl EcdsaPlugin {
             public_key: public_key_hex,
         };
 
-        let body = serde_json::to_vec(&response)
-            .map_err(|e| PluginError::ExecutionFailed(format!("Failed to serialize response: {}", e)))?;
+        let body = serde_json::to_vec(&response).map_err(|e| {
+            PluginError::ExecutionFailed(format!("Failed to serialize response: {}", e))
+        })?;
 
         Ok(ExecuteResponse {
             status: 200,
@@ -318,13 +322,15 @@ impl Plugin for EcdsaPlugin {
 
                 self.sign_data(params, &request.credential.data)
             }
-            "get_address" => {
-                self.get_address(&request.credential.data)
-            }
+            "get_address" => self.get_address(&request.credential.data),
             "sign_message" => {
-                let message = request.params.get("message")
+                let message = request
+                    .params
+                    .get("message")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| PluginError::InvalidParams("Missing 'message' parameter".to_string()))?;
+                    .ok_or_else(|| {
+                        PluginError::InvalidParams("Missing 'message' parameter".to_string())
+                    })?;
 
                 self.sign_message(message, &request.credential.data)
             }
@@ -332,11 +338,7 @@ impl Plugin for EcdsaPlugin {
         }
     }
 
-    fn validate_params(
-        &self,
-        action: &str,
-        params: &serde_json::Value,
-    ) -> Result<(), PluginError> {
+    fn validate_params(&self, action: &str, params: &serde_json::Value) -> Result<(), PluginError> {
         match action {
             "sign" => {
                 let obj = params
@@ -344,7 +346,9 @@ impl Plugin for EcdsaPlugin {
                     .ok_or_else(|| PluginError::InvalidParams("Expected object".to_string()))?;
 
                 if !obj.contains_key("data") {
-                    return Err(PluginError::InvalidParams("Missing 'data' field".to_string()));
+                    return Err(PluginError::InvalidParams(
+                        "Missing 'data' field".to_string(),
+                    ));
                 }
 
                 Ok(())
@@ -359,7 +363,9 @@ impl Plugin for EcdsaPlugin {
                     .ok_or_else(|| PluginError::InvalidParams("Expected object".to_string()))?;
 
                 if !obj.contains_key("message") {
-                    return Err(PluginError::InvalidParams("Missing 'message' field".to_string()));
+                    return Err(PluginError::InvalidParams(
+                        "Missing 'message' field".to_string(),
+                    ));
                 }
 
                 Ok(())
@@ -375,7 +381,8 @@ mod tests {
     use crate::Secret;
 
     // Known test private key (DO NOT USE IN PRODUCTION)
-    const TEST_PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const TEST_PRIVATE_KEY: &str =
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     // Expected address for the test key (Hardhat account #0)
     const TEST_ADDRESS: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 
@@ -426,8 +433,14 @@ mod tests {
     fn test_checksum_address() {
         // Test vectors from EIP-55
         let tests = [
-            ("5aaeb6053f3e94c9b9a09f33669435e7ef1beaed", "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"),
-            ("fb6916095ca1df60bb79ce92ce3ea74c37c5d359", "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"),
+            (
+                "5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+                "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            ),
+            (
+                "fb6916095ca1df60bb79ce92ce3ea74c37c5d359",
+                "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+            ),
         ];
 
         for (input, expected) in tests {

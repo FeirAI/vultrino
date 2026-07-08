@@ -60,9 +60,7 @@ impl PostgresPlugin {
         Self
     }
 
-    fn extract_postgres_credential(
-        data: &CredentialData,
-    ) -> Result<PgConn, PluginError> {
+    fn extract_postgres_credential(data: &CredentialData) -> Result<PgConn, PluginError> {
         match data {
             CredentialData::Postgres {
                 host,
@@ -191,14 +189,17 @@ impl PostgresPlugin {
             .and_then(|v| v.as_bool())
             .unwrap_or_else(|| Self::metadata_bool(metadata, "run_sql.transaction", true));
 
-        let statement_timeout_ms =
-            Self::metadata_u64(metadata, "run_sql.statement_timeout_ms", 0);
+        let statement_timeout_ms = Self::metadata_u64(metadata, "run_sql.statement_timeout_ms", 0);
 
         let wall_timeout_secs = param_obj
             .and_then(|o| o.get("timeout_secs"))
             .and_then(|v| v.as_u64())
             .unwrap_or_else(|| {
-                Self::metadata_u64(metadata, "run_sql.timeout_secs", DEFAULT_RUN_SQL_TIMEOUT_SECS)
+                Self::metadata_u64(
+                    metadata,
+                    "run_sql.timeout_secs",
+                    DEFAULT_RUN_SQL_TIMEOUT_SECS,
+                )
             });
 
         Self::check_binary_available("psql").await?;
@@ -308,7 +309,11 @@ impl PostgresPlugin {
         });
 
         Ok(ExecuteResponse {
-            status: if exit_code == 0 && !timed_out { 200 } else { 500 },
+            status: if exit_code == 0 && !timed_out {
+                200
+            } else {
+                500
+            },
             headers: HashMap::new(),
             body: serde_json::to_vec(&body).unwrap_or_default(),
             updated_credential: None,
@@ -443,7 +448,11 @@ impl PostgresPlugin {
         });
 
         Ok(ExecuteResponse {
-            status: if exit_code == 0 && !timed_out { 200 } else { 500 },
+            status: if exit_code == 0 && !timed_out {
+                200
+            } else {
+                500
+            },
             headers: HashMap::new(),
             body: serde_json::to_vec(&body).unwrap_or_default(),
             updated_credential: None,
@@ -508,11 +517,7 @@ impl Plugin for PostgresPlugin {
         }
     }
 
-    fn validate_params(
-        &self,
-        action: &str,
-        params: &serde_json::Value,
-    ) -> Result<(), PluginError> {
+    fn validate_params(&self, action: &str, params: &serde_json::Value) -> Result<(), PluginError> {
         if !params.is_null() && !params.is_object() {
             return Err(PluginError::InvalidParams(
                 "params must be a JSON object or null".to_string(),
@@ -777,7 +782,9 @@ mod tests {
     #[test]
     fn test_validate_unknown_action() {
         let p = PostgresPlugin::new();
-        assert!(p.validate_params("restore", &serde_json::json!({})).is_err());
+        assert!(p
+            .validate_params("restore", &serde_json::json!({}))
+            .is_err());
     }
 
     #[tokio::test]
@@ -792,10 +799,7 @@ mod tests {
     async fn test_run_sql_override_locked_by_default() {
         let p = PostgresPlugin::new();
         let mut meta = HashMap::new();
-        meta.insert(
-            "run_sql.sql".to_string(),
-            "SELECT 1;".to_string(),
-        );
+        meta.insert("run_sql.sql".to_string(), "SELECT 1;".to_string());
         let req = mk_request(
             "run_sql",
             serde_json::json!({"sql": "DROP TABLE users;"}),

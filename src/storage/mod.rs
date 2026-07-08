@@ -108,6 +108,7 @@ pub struct ApprovalSweep {
 
 /// Trait for credential storage backends
 #[async_trait]
+#[allow(clippy::too_many_arguments)] // transactional approval methods keep their commit inputs explicit
 pub trait StorageBackend: Send + Sync {
     /// Store a credential
     async fn store(&self, credential: &Credential) -> Result<(), StorageError>;
@@ -231,6 +232,46 @@ pub trait StorageBackend: Send + Sync {
     /// Atomically mark a use token revoked, returning the updated token.
     async fn set_use_token_revoked(&self, _id: &str) -> Result<UseToken, StorageError> {
         Err(StorageError::UseTokenNotFound(_id.to_string()))
+    }
+
+    /// Atomically consume a workload-identity assertion JTI. Returns false for
+    /// a replay. Implementations must persist unexpired JTIs across restarts and
+    /// coordinate across processes sharing the backend.
+    async fn consume_workload_jti(
+        &self,
+        _jti: &str,
+        _expires_at: i64,
+        _now: i64,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::Unavailable(
+            "durable workload replay protection is not supported by this storage backend"
+                .to_string(),
+        ))
+    }
+
+    async fn store_workload_grant(
+        &self,
+        _key: &str,
+        _grant: serde_json::Value,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable(
+            "durable workload grants are not supported by this storage backend".to_string(),
+        ))
+    }
+
+    async fn get_workload_grant(
+        &self,
+        _key: &str,
+    ) -> Result<Option<serde_json::Value>, StorageError> {
+        Err(StorageError::Unavailable(
+            "durable workload grants are not supported by this storage backend".to_string(),
+        ))
+    }
+
+    async fn delete_workload_grant(&self, _key: &str) -> Result<bool, StorageError> {
+        Err(StorageError::Unavailable(
+            "durable workload grants are not supported by this storage backend".to_string(),
+        ))
     }
 
     // ==================== Approval Token Storage ====================

@@ -157,14 +157,20 @@ pub fn meter_observed_payload(
     let mut dims = serde_json::Map::new();
     // Omit keys we don't have (no phantom dims), per leria's schema.
     if let Some(t) = tenant {
-        dims.insert("tenant".to_string(), serde_json::Value::String(t.to_string()));
+        dims.insert(
+            "tenant".to_string(),
+            serde_json::Value::String(t.to_string()),
+        );
     }
     dims.insert(
         "credential".to_string(),
         serde_json::Value::String(credential_alias.to_string()),
     );
     if let Some(m) = model {
-        dims.insert("model".to_string(), serde_json::Value::String(m.to_string()));
+        dims.insert(
+            "model".to_string(),
+            serde_json::Value::String(m.to_string()),
+        );
     }
     serde_json::json!({
         "event_id": request_id,
@@ -230,8 +236,12 @@ pub fn parse_token_usage(raw_body: &[u8]) -> Option<TokenUsage> {
 
     // Gemini API / Vertex AI generateContent.
     if let Some(usage) = json.get("usageMetadata").and_then(|v| v.as_object()) {
-        let input = usage.get("promptTokenCount").and_then(serde_json::Value::as_u64);
-        let output = usage.get("candidatesTokenCount").and_then(serde_json::Value::as_u64);
+        let input = usage
+            .get("promptTokenCount")
+            .and_then(serde_json::Value::as_u64);
+        let output = usage
+            .get("candidatesTokenCount")
+            .and_then(serde_json::Value::as_u64);
         if let (Some(input_tokens), Some(output_tokens)) = (input, output) {
             return Some(TokenUsage {
                 input_tokens,
@@ -286,7 +296,12 @@ pub fn extract_model(raw_body: &[u8], request_params: &serde_json::Value) -> Opt
                 .and_then(|m| m.as_str())
                 .map(str::to_string)
         });
-    from_response.or_else(|| request_params.get("model").and_then(|m| m.as_str()).map(str::to_string))
+    from_response.or_else(|| {
+        request_params
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+    })
 }
 
 /// Force `stream_options.include_usage = true` on an OpenAI-chat streaming request
@@ -308,7 +323,9 @@ pub fn maybe_inject_stream_usage(body: &mut serde_json::Value) -> bool {
     if obj.get("stream").and_then(serde_json::Value::as_bool) != Some(true) {
         return false;
     }
-    let so = obj.entry("stream_options").or_insert_with(|| serde_json::json!({}));
+    let so = obj
+        .entry("stream_options")
+        .or_insert_with(|| serde_json::json!({}));
     if !so.is_object() {
         // A non-object stream_options is invalid for OpenAI; the gateway owns the usage
         // trailer, so replace it with a well-formed object that forces include_usage.
@@ -324,7 +341,10 @@ pub fn maybe_inject_stream_usage(body: &mut serde_json::Value) -> bool {
             return true;
         }
     };
-    let already_true = so_obj.get("include_usage").and_then(serde_json::Value::as_bool) == Some(true);
+    let already_true = so_obj
+        .get("include_usage")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
     // FORCE true even over an explicit client false — the client cannot disable metering.
     so_obj.insert("include_usage".to_string(), serde_json::Value::Bool(true));
     !already_true
@@ -457,8 +477,16 @@ impl UsageAccumulator {
             let model = v
                 .get("model")
                 .and_then(|m| m.as_str())
-                .or_else(|| v.get("message").and_then(|m| m.get("model")).and_then(|m| m.as_str()))
-                .or_else(|| v.get("response").and_then(|r| r.get("model")).and_then(|m| m.as_str()))
+                .or_else(|| {
+                    v.get("message")
+                        .and_then(|m| m.get("model"))
+                        .and_then(|m| m.as_str())
+                })
+                .or_else(|| {
+                    v.get("response")
+                        .and_then(|r| r.get("model"))
+                        .and_then(|m| m.as_str())
+                })
                 .or_else(|| v.get("modelVersion").and_then(|m| m.as_str()));
             if let Some(m) = model {
                 self.model = Some(m.to_string());
@@ -481,18 +509,25 @@ impl UsageAccumulator {
             if self.input_tokens.is_none() {
                 if let Some(p) = obj.get("prompt_tokens").and_then(serde_json::Value::as_u64) {
                     self.input_tokens = Some(p);
-                } else if let Some(i) = obj.get("input_tokens").and_then(serde_json::Value::as_u64) {
+                } else if let Some(i) = obj.get("input_tokens").and_then(serde_json::Value::as_u64)
+                {
                     self.input_tokens = Some(i);
                 } else if let Some(i) = obj.get("inputTokens").and_then(serde_json::Value::as_u64) {
                     self.input_tokens = Some(i);
-                } else if let Some(i) = obj.get("promptTokenCount").and_then(serde_json::Value::as_u64) {
+                } else if let Some(i) = obj
+                    .get("promptTokenCount")
+                    .and_then(serde_json::Value::as_u64)
+                {
                     self.input_tokens = Some(i);
                 }
             }
             // OUTPUT tokens: LAST-wins. Anthropic's `output_tokens` is cumulative
             // across `message_delta` events, so the final value is authoritative
             // (never summed); OpenAI reports it once.
-            if let Some(c) = obj.get("completion_tokens").and_then(serde_json::Value::as_u64) {
+            if let Some(c) = obj
+                .get("completion_tokens")
+                .and_then(serde_json::Value::as_u64)
+            {
                 self.output_tokens = Some(c);
             }
             if let Some(o) = obj.get("output_tokens").and_then(serde_json::Value::as_u64) {
@@ -501,7 +536,10 @@ impl UsageAccumulator {
             if let Some(o) = obj.get("outputTokens").and_then(serde_json::Value::as_u64) {
                 self.output_tokens = Some(o);
             }
-            if let Some(o) = obj.get("candidatesTokenCount").and_then(serde_json::Value::as_u64) {
+            if let Some(o) = obj
+                .get("candidatesTokenCount")
+                .and_then(serde_json::Value::as_u64)
+            {
                 self.output_tokens = Some(o);
             }
         }
@@ -549,7 +587,10 @@ pub fn meter_tokens_payload(
 ) -> serde_json::Value {
     let mut dims = serde_json::Map::new();
     if let Some(t) = tenant {
-        dims.insert("tenant".to_string(), serde_json::Value::String(t.to_string()));
+        dims.insert(
+            "tenant".to_string(),
+            serde_json::Value::String(t.to_string()),
+        );
     }
     dims.insert(
         "credential".to_string(),
@@ -558,7 +599,10 @@ pub fn meter_tokens_payload(
     // leria selects the rate card by `dims.model_ref` (it also accepts `model`);
     // emit the canonical `model_ref`. Omitted when unknown (no phantom dim).
     if let Some(m) = model {
-        dims.insert("model_ref".to_string(), serde_json::Value::String(m.to_string()));
+        dims.insert(
+            "model_ref".to_string(),
+            serde_json::Value::String(m.to_string()),
+        );
     }
     // DISTINCT dedup key from the V13a api-calls event (which uses request_id as its
     // event_id). The two events share the same OCCURRENCE via correlation_id, but a
@@ -601,7 +645,8 @@ impl OutboxEvent {
 /// raw body bytes with the shared secret to verify authenticity.
 pub fn sign_body(secret: &str, body: &[u8]) -> String {
     // `new_from_slice` accepts any key length for HMAC, so this never errors.
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(body);
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
@@ -630,7 +675,10 @@ impl std::fmt::Debug for OutboxConfig {
             .field("enabled", &self.enabled)
             .field("url", &self.url)
             // Never print the signing secret; only whether one is set.
-            .field("hmac_secret", &self.hmac_secret.as_ref().map(|_| "<redacted>"))
+            .field(
+                "hmac_secret",
+                &self.hmac_secret.as_ref().map(|_| "<redacted>"),
+            )
             .field("max_attempts", &self.max_attempts)
             .field("retention_secs", &self.retention_secs)
             .finish()
@@ -667,7 +715,10 @@ mod tests {
         // Matches an independent HMAC-SHA256 computation.
         let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
         mac.update(body);
-        assert_eq!(a, format!("sha256={}", hex::encode(mac.finalize().into_bytes())));
+        assert_eq!(
+            a,
+            format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+        );
     }
 
     #[test]
@@ -697,7 +748,14 @@ mod tests {
         // V13a: the MeterEvent body matches leria's ingest schema, carries ids +
         // a count of 1 only, and omits dims it doesn't have (no phantom keys).
         let ts = "2026-06-19T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let p = super::meter_observed_payload("req-123", "agent_refund_bot_v3", ts, Some("acme"), "vk_prod", None);
+        let p = super::meter_observed_payload(
+            "req-123",
+            "agent_refund_bot_v3",
+            ts,
+            Some("acme"),
+            "vk_prod",
+            None,
+        );
         assert_eq!(p["event_id"], "req-123");
         assert_eq!(p["correlation_id"], "req-123");
         assert_eq!(p["principal"], "agent_refund_bot_v3");
@@ -716,7 +774,10 @@ mod tests {
 
         // Untenanted → tenant key omitted entirely.
         let p2 = super::meter_observed_payload("r", "id", ts, None, "cred", None);
-        assert!(p2["dims"].get("tenant").is_none(), "no tenant ⇒ omit the key");
+        assert!(
+            p2["dims"].get("tenant").is_none(),
+            "no tenant ⇒ omit the key"
+        );
         // model present when known.
         let p3 = super::meter_observed_payload("r", "id", ts, None, "cred", Some("gpt-4o"));
         assert_eq!(p3["dims"]["model"], "gpt-4o");
@@ -735,7 +796,8 @@ mod tests {
     #[test]
     fn test_parse_token_usage_anthropic_style() {
         // Anthropic-style: usage.{input_tokens, output_tokens} (no total).
-        let body = br#"{"id":"msg_1","model":"claude-opus-4","content":[{"type":"text","text":"hi"}],
+        let body =
+            br#"{"id":"msg_1","model":"claude-opus-4","content":[{"type":"text","text":"hi"}],
             "usage":{"input_tokens":2048,"output_tokens":512}}"#;
         let u = super::parse_token_usage(body).expect("anthropic usage parses");
         assert_eq!(u.input_tokens, 2048);
@@ -780,8 +842,14 @@ mod tests {
         // A usage block missing a recognized count pair → None (no half-counts).
         assert!(super::parse_token_usage(br#"{"usage":{"total_tokens":10}}"#).is_none());
         // Negative / float counts are rejected by as_u64 → None.
-        assert!(super::parse_token_usage(br#"{"usage":{"prompt_tokens":-1,"completion_tokens":2}}"#).is_none());
-        assert!(super::parse_token_usage(br#"{"usage":{"prompt_tokens":1.5,"completion_tokens":2}}"#).is_none());
+        assert!(super::parse_token_usage(
+            br#"{"usage":{"prompt_tokens":-1,"completion_tokens":2}}"#
+        )
+        .is_none());
+        assert!(super::parse_token_usage(
+            br#"{"usage":{"prompt_tokens":1.5,"completion_tokens":2}}"#
+        )
+        .is_none());
     }
 
     #[test]
@@ -800,7 +868,10 @@ mod tests {
         let resp = br#"{"model":"gpt-4o-2024","usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
         let req = serde_json::json!({"model": "gpt-4o-alias"});
         // Response model wins (the model the provider actually served).
-        assert_eq!(super::extract_model(resp, &req).as_deref(), Some("gpt-4o-2024"));
+        assert_eq!(
+            super::extract_model(resp, &req).as_deref(),
+            Some("gpt-4o-2024")
+        );
         // No response model → fall back to the request model.
         let resp_no_model = br#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
         assert_eq!(
@@ -835,7 +906,10 @@ mod tests {
             p["event_id"], "req-123:tokens",
             "distinct dedup key from the api-calls event"
         );
-        assert_eq!(p["correlation_id"], "req-123", "same correlation_id as the V13a event");
+        assert_eq!(
+            p["correlation_id"], "req-123",
+            "same correlation_id as the V13a event"
+        );
         assert_eq!(p["principal"], "agent_refund_bot_v3");
         // The pricing trigger: asset=usd + a tokens split (NOT asset=tokens).
         assert_eq!(p["asset"], "usd");
@@ -872,8 +946,14 @@ mod tests {
                 output_tokens: 2,
             },
         );
-        assert!(p2["dims"].get("model_ref").is_none(), "no model ⇒ omit model_ref");
-        assert!(p2["dims"].get("tenant").is_none(), "no tenant ⇒ omit the key");
+        assert!(
+            p2["dims"].get("model_ref").is_none(),
+            "no model ⇒ omit model_ref"
+        );
+        assert!(
+            p2["dims"].get("tenant").is_none(),
+            "no tenant ⇒ omit the key"
+        );
         assert_eq!(p2["tokens"]["input_tokens"], 1);
     }
 
@@ -1022,7 +1102,9 @@ mod tests {
         let mut acc = super::UsageAccumulator::new(1 << 20);
         acc.push(b"data: {\"model\":\"gpt-4o\",\"choices\":[]}\n\n");
         assert!(acc.snapshot().is_none(), "no trailer yet → None");
-        acc.push(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\n");
+        acc.push(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\n",
+        );
         let (usage, model) = acc.snapshot().expect("complete trailer → Some");
         assert_eq!(usage.input_tokens, 11);
         assert_eq!(usage.output_tokens, 22);
@@ -1045,11 +1127,13 @@ mod tests {
     fn inject_forces_include_usage_true_over_client_false() {
         // GATEWAY-OWNED: an explicit client `false` is OVERWRITTEN to true (a client must
         // not be able to opt out of the V13b token trailer and evade metering).
-        let mut body = serde_json::json!({ "stream": true, "stream_options": { "include_usage": false } });
+        let mut body =
+            serde_json::json!({ "stream": true, "stream_options": { "include_usage": false } });
         assert!(super::maybe_inject_stream_usage(&mut body)); // changed false -> true
         assert_eq!(body["stream_options"]["include_usage"], true);
         // Explicit true is already correct → left as-is, reports no change.
-        let mut body2 = serde_json::json!({ "stream": true, "stream_options": { "include_usage": true } });
+        let mut body2 =
+            serde_json::json!({ "stream": true, "stream_options": { "include_usage": true } });
         assert!(!super::maybe_inject_stream_usage(&mut body2));
         assert_eq!(body2["stream_options"]["include_usage"], true);
     }

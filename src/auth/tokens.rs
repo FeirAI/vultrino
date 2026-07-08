@@ -133,7 +133,9 @@ impl NewUseToken {
     ///   degrade to exact-string match and never match anything).
     pub fn validate(&self) -> Result<(), String> {
         if self.credential_scope.trim().is_empty() {
-            return Err("credential scope must not be empty (use '*' for any credential)".to_string());
+            return Err(
+                "credential scope must not be empty (use '*' for any credential)".to_string(),
+            );
         }
         if self.max_uses == Some(0) {
             return Err("max uses must be at least 1".to_string());
@@ -142,7 +144,10 @@ impl NewUseToken {
             return Err("expiry must be positive (a non-positive lifetime would mint an already-expired token)".to_string());
         }
         glob::Pattern::new(&self.credential_scope).map_err(|e| {
-            format!("invalid credential scope pattern '{}': {}", self.credential_scope, e)
+            format!(
+                "invalid credential scope pattern '{}': {}",
+                self.credential_scope, e
+            )
         })?;
         if let Some(action) = &self.action_scope {
             glob::Pattern::new(action)
@@ -317,7 +322,9 @@ pub fn validate_agent_label(label: &str) -> Result<(), String> {
         return Err("agent_label must not be empty".to_string());
     }
     if label.len() > MAX_AGENT_LABEL_LEN {
-        return Err(format!("agent_label must be at most {MAX_AGENT_LABEL_LEN} bytes"));
+        return Err(format!(
+            "agent_label must be at most {MAX_AGENT_LABEL_LEN} bytes"
+        ));
     }
     if !label
         .chars()

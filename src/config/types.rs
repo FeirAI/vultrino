@@ -70,7 +70,10 @@ impl std::fmt::Debug for RawOutboxConfig {
         f.debug_struct("RawOutboxConfig")
             .field("enabled", &self.enabled)
             .field("url", &self.url)
-            .field("hmac_secret", &self.hmac_secret.as_ref().map(|_| "<redacted>"))
+            .field(
+                "hmac_secret",
+                &self.hmac_secret.as_ref().map(|_| "<redacted>"),
+            )
             .field("max_attempts", &self.max_attempts)
             .field("retention_secs", &self.retention_secs)
             .finish()
@@ -102,8 +105,14 @@ impl TryFrom<RawOutboxConfig> for crate::outbox::OutboxConfig {
             enabled,
             url: raw.url.filter(|s| !s.trim().is_empty()),
             hmac_secret: raw.hmac_secret.filter(|s| !s.trim().is_empty()),
-            max_attempts: raw.max_attempts.filter(|m| *m > 0).unwrap_or(defaults.max_attempts),
-            retention_secs: raw.retention_secs.filter(|r| *r > 0).unwrap_or(defaults.retention_secs),
+            max_attempts: raw
+                .max_attempts
+                .filter(|m| *m > 0)
+                .unwrap_or(defaults.max_attempts),
+            retention_secs: raw
+                .retention_secs
+                .filter(|r| *r > 0)
+                .unwrap_or(defaults.retention_secs),
         })
     }
 }
@@ -297,9 +306,9 @@ impl TryFrom<RawStorageConfig> for StorageConfig {
         let vault = raw.vault.map(|v| VaultConfig {
             address: v.address,
             auth_method: match v.auth_method.as_deref() {
-                Some("token") => VaultAuthMethod::Token(secrecy::SecretString::from(
-                    v.token.unwrap_or_default(),
-                )),
+                Some("token") => {
+                    VaultAuthMethod::Token(secrecy::SecretString::from(v.token.unwrap_or_default()))
+                }
                 _ => VaultAuthMethod::AppRole {
                     role_id: v.role_id.unwrap_or_default(),
                     secret_id: secrecy::SecretString::from(v.secret_id.unwrap_or_default()),
@@ -551,10 +560,18 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
             .into_iter()
             .map(|r| {
                 Ok(crate::approval::CriticalityRule {
-                    credential_pattern: glob::Pattern::new(&r.credential_pattern)
-                        .map_err(|e| ConfigError::Invalid(format!("criticality_rules credential_pattern '{}': {}", r.credential_pattern, e)))?,
-                    action_pattern: glob::Pattern::new(&r.action_pattern)
-                        .map_err(|e| ConfigError::Invalid(format!("criticality_rules action_pattern '{}': {}", r.action_pattern, e)))?,
+                    credential_pattern: glob::Pattern::new(&r.credential_pattern).map_err(|e| {
+                        ConfigError::Invalid(format!(
+                            "criticality_rules credential_pattern '{}': {}",
+                            r.credential_pattern, e
+                        ))
+                    })?,
+                    action_pattern: glob::Pattern::new(&r.action_pattern).map_err(|e| {
+                        ConfigError::Invalid(format!(
+                            "criticality_rules action_pattern '{}': {}",
+                            r.action_pattern, e
+                        ))
+                    })?,
                     class: parse_criticality(&r.class)?,
                 })
             })
@@ -660,27 +677,13 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum RawPolicyCondition {
-    UrlMatch {
-        url_match: String,
-    },
-    MethodMatch {
-        method_match: Vec<String>,
-    },
-    ActionMatch {
-        action_match: String,
-    },
-    RateLimit {
-        rate_limit: RawRateLimit,
-    },
-    SpendCap {
-        spend_cap: RawSpendCap,
-    },
-    And {
-        and: Vec<RawPolicyCondition>,
-    },
-    Or {
-        or: Vec<RawPolicyCondition>,
-    },
+    UrlMatch { url_match: String },
+    MethodMatch { method_match: Vec<String> },
+    ActionMatch { action_match: String },
+    RateLimit { rate_limit: RawRateLimit },
+    SpendCap { spend_cap: RawSpendCap },
+    And { and: Vec<RawPolicyCondition> },
+    Or { or: Vec<RawPolicyCondition> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -809,7 +812,10 @@ action = "deny"
         .unwrap();
         assert_eq!(
             cfg.resolve_action("payments.refund"),
-            ("http.request".to_string(), Some("payments.refund".to_string()))
+            (
+                "http.request".to_string(),
+                Some("payments.refund".to_string())
+            )
         );
         // A canonical (non-label) action passes through unchanged.
         assert_eq!(
@@ -820,9 +826,8 @@ action = "deny"
 
     #[test]
     fn test_action_label_validation() {
-        let label = |l: &str, a: &str| {
-            format!("[[action_labels]]\nlabel = \"{l}\"\naction = \"{a}\"")
-        };
+        let label =
+            |l: &str, a: &str| format!("[[action_labels]]\nlabel = \"{l}\"\naction = \"{a}\"");
         // Valid mapping parses.
         assert!(Config::parse(&label("payments.refund", "http.request")).is_ok());
         // Empty label or action is rejected.
@@ -834,11 +839,14 @@ action = "deny"
         // A label equal to its own target is rejected.
         assert!(Config::parse(&label("http.request", "http.request")).is_err());
         // Duplicate labels are rejected (no silent last-wins).
-        let dup = format!("{}\n{}", label("pay.x", "http.request"), label("pay.x", "mock.echo"));
+        let dup = format!(
+            "{}\n{}",
+            label("pay.x", "http.request"),
+            label("pay.x", "mock.echo")
+        );
         assert!(Config::parse(&dup).is_err());
         // A label that is also another mapping's canonical target is rejected.
-        let shadow =
-            format!("{}\n{}", label("a.b", "mock.echo"), label("c.d", "a.b"));
+        let shadow = format!("{}\n{}", label("a.b", "mock.echo"), label("c.d", "a.b"));
         assert!(Config::parse(&shadow).is_err());
     }
 
@@ -852,7 +860,10 @@ action = "deny"
             retention_secs: Some(10),
         };
         let dbg = format!("{raw:?}");
-        assert!(!dbg.contains("top-secret-key"), "raw secret must not appear: {dbg}");
+        assert!(
+            !dbg.contains("top-secret-key"),
+            "raw secret must not appear: {dbg}"
+        );
         assert!(dbg.contains("redacted"));
     }
 
@@ -882,7 +893,10 @@ action = "deny"
         )
         .unwrap();
         assert!(cfg.outbox.enabled);
-        assert_eq!(cfg.outbox.url.as_deref(), Some("https://hooks.example.com/v"));
+        assert_eq!(
+            cfg.outbox.url.as_deref(),
+            Some("https://hooks.example.com/v")
+        );
         assert_eq!(cfg.outbox.max_attempts, 4);
 
         // Enabled (a url present) without a signing secret is rejected — deliveries
@@ -893,7 +907,9 @@ action = "deny"
         // No [outbox] section → disabled default.
         assert!(!Config::parse("").unwrap().outbox.enabled);
         // enabled = false explicitly → disabled even with a url.
-        let off = Config::parse("[outbox]\nenabled = false\nurl = \"https://x\"\nhmac_secret = \"s\"").unwrap();
+        let off =
+            Config::parse("[outbox]\nenabled = false\nurl = \"https://x\"\nhmac_secret = \"s\"")
+                .unwrap();
         assert!(!off.outbox.enabled);
     }
 
@@ -947,22 +963,34 @@ action = "deny"
 
         // OIDC is also wireable.
         let cfg = Config::parse("[identity]\nkind = \"oidc\"\nheader = \"x-oidc-claims\"").unwrap();
-        assert_eq!(cfg.identity.unwrap().kind, crate::config::IdentityResolverKind::Oidc);
+        assert_eq!(
+            cfg.identity.unwrap().kind,
+            crate::config::IdentityResolverKind::Oidc
+        );
 
         // A non-wireable kind (cloud-IAM claim adapter) is rejected.
         assert!(Config::parse("[identity]\nkind = \"aws_iam\"\nheader = \"x-aws\"").is_err());
         // A blank header is rejected (fail-fast, not a silently-never-matching one).
         assert!(Config::parse("[identity]\nkind = \"spiffe\"\nheader = \"  \"").is_err());
         // No [identity] → no resolver wired.
-        assert!(Config::parse("[approvals]\nenabled = true").unwrap().identity.is_none());
+        assert!(Config::parse("[approvals]\nenabled = true")
+            .unwrap()
+            .identity
+            .is_none());
         // allowed entries are trimmed + blanks dropped (exact match would otherwise miss).
         let cfg = Config::parse(
             "[identity]\nkind = \"spiffe\"\nheader = \"x-id\"\nallowed = [\" a.org \", \"\", \"b.org\"]",
         )
         .unwrap();
-        assert_eq!(cfg.identity.unwrap().allowed, vec!["a.org".to_string(), "b.org".to_string()]);
+        assert_eq!(
+            cfg.identity.unwrap().allowed,
+            vec!["a.org".to_string(), "b.org".to_string()]
+        );
         // An allowlist of only blanks is a misconfiguration → rejected (not silently any).
-        assert!(Config::parse("[identity]\nkind = \"spiffe\"\nheader = \"x-id\"\nallowed = [\"  \"]").is_err());
+        assert!(Config::parse(
+            "[identity]\nkind = \"spiffe\"\nheader = \"x-id\"\nallowed = [\"  \"]"
+        )
+        .is_err());
     }
 
     #[test]
@@ -973,13 +1001,19 @@ action = "deny"
         // Notifier present, no identity → rejected.
         assert!(Config::parse(tg).is_err());
         // Notifier present, blank identity → rejected (blank normalizes to unset).
-        assert!(Config::parse(&format!("[approvals]\noob_approver_identity = \"  \"\n{tg}")).is_err());
+        assert!(Config::parse(&format!(
+            "[approvals]\noob_approver_identity = \"  \"\n{tg}"
+        ))
+        .is_err());
         // Notifier present, named identity → ok.
         let ok = Config::parse(&format!(
             "[approvals]\noob_approver_identity = \"oncall@example.com\"\n{tg}"
         ))
         .unwrap();
-        assert_eq!(ok.approval.oob_approver_identity.as_deref(), Some("oncall@example.com"));
+        assert_eq!(
+            ok.approval.oob_approver_identity.as_deref(),
+            Some("oncall@example.com")
+        );
         // A webhook notifier is gated identically.
         let wh = "[approvals.webhook]\nurl = \"https://h.example/x\"";
         assert!(Config::parse(wh).is_err());
@@ -994,10 +1028,18 @@ action = "deny"
         // A no-op rule (neither blocks nor redacts) is rejected.
         assert!(Config::parse("[[egress]]\ncredential_pattern = \"x\"").is_err());
         // A malformed glob fails at load (no silent degrade to exact-match).
-        assert!(Config::parse("[[egress]]\ncredential_pattern = \"[unclosed\"\nblock = true").is_err());
-        assert!(Config::parse("[[egress]]\ncredential_pattern = \"sts-*\"\naction_pattern = \"[bad\"\nblock = true").is_err());
+        assert!(
+            Config::parse("[[egress]]\ncredential_pattern = \"[unclosed\"\nblock = true").is_err()
+        );
+        assert!(Config::parse(
+            "[[egress]]\ncredential_pattern = \"sts-*\"\naction_pattern = \"[bad\"\nblock = true"
+        )
+        .is_err());
         // A bad redact regex fails at load.
-        assert!(Config::parse("[[egress]]\ncredential_pattern = \"*\"\nredact_patterns = [\"(unclosed\"]").is_err());
+        assert!(Config::parse(
+            "[[egress]]\ncredential_pattern = \"*\"\nredact_patterns = [\"(unclosed\"]"
+        )
+        .is_err());
         // A valid block rule parses.
         assert!(Config::parse("[[egress]]\ncredential_pattern = \"sts-*\"\nblock = true").is_ok());
     }

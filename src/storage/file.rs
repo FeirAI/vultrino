@@ -230,6 +230,13 @@ struct StorageCache {
     /// Use tokens by ID
     #[serde(default)]
     use_tokens: HashMap<String, UseToken>,
+    /// Consumed workload assertion JTIs and their expiry. This is security
+    /// state, not a cache: it is encrypted and mutated under the cross-process
+    /// vault lock so a restart cannot reopen a replay window.
+    #[serde(default)]
+    workload_jtis: HashMap<String, i64>,
+    #[serde(default)]
+    workload_grants: HashMap<String, serde_json::Value>,
     /// Approval tokens by ID (delegate-agent authority, plan 031).
     #[serde(default)]
     approval_tokens: HashMap<String, ApprovalToken>,
@@ -1077,6 +1084,47 @@ impl StorageBackend for FileStorage {
             Ok(token.clone())
         })
         .await
+    }
+
+    async fn consume_workload_jti(
+        &self,
+        jti: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        self.locked_mutate(|cache| {
+            cache.workload_jtis.retain(|_, expiry| *expiry > now);
+            if cache.workload_jtis.contains_key(jti) {
+                return Ok(false);
+            }
+            cache.workload_jtis.insert(jti.to_string(), expires_at);
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn store_workload_grant(
+        &self,
+        key: &str,
+        grant: serde_json::Value,
+    ) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            cache.workload_grants.insert(key.to_string(), grant);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_workload_grant(
+        &self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, StorageError> {
+        Ok(self.cache.read().workload_grants.get(key).cloned())
+    }
+
+    async fn delete_workload_grant(&self, key: &str) -> Result<bool, StorageError> {
+        self.locked_mutate(|cache| Ok(cache.workload_grants.remove(key).is_some()))
+            .await
     }
 
     // ==================== Approval Token Storage ====================
@@ -2391,6 +2439,37 @@ mod tests {
                 .unwrap(),
             IdempotencyState::Pending,
             "a stale completion must not turn the live reservation into a Done replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_jti_replay_state_survives_reopen_and_expires() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let password = SecretString::from("test-password");
+        let storage = FileStorage::new(&path, &password).await.unwrap();
+        assert!(storage
+            .consume_workload_jti("jti-1", 200, 100)
+            .await
+            .unwrap());
+        storage
+            .store_workload_grant("t:a", serde_json::json!({"tenant":"t"}))
+            .await
+            .unwrap();
+        drop(storage);
+
+        let reopened = FileStorage::new(&path, &password).await.unwrap();
+        assert!(!reopened
+            .consume_workload_jti("jti-1", 200, 101)
+            .await
+            .unwrap());
+        assert!(reopened
+            .consume_workload_jti("jti-1", 300, 201)
+            .await
+            .unwrap());
+        assert_eq!(
+            reopened.get_workload_grant("t:a").await.unwrap().unwrap()["tenant"],
+            "t"
         );
     }
 }

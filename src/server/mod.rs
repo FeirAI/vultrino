@@ -2,14 +2,18 @@
 //!
 //! Provides JSON API mode for execute requests.
 
-use crate::approval::{ApprovalLinks, ApprovalNotifier, ApprovalRequest, ApprovalStatus, NewApproval, RequesterInfo};
+use crate::approval::{
+    ApprovalLinks, ApprovalNotifier, ApprovalRequest, ApprovalStatus, NewApproval, RequesterInfo,
+};
 use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
 use crate::config::Config;
 use crate::plugins::PluginRegistry;
 use crate::policy::PolicyEngine;
 use crate::router::CredentialResolver;
 use crate::storage::StorageBackend;
-use crate::{Credential, ExecuteRequest, ExecuteResponse, ExecutionOutcome, RequestContext, VultrinoError};
+use crate::{
+    Credential, ExecuteRequest, ExecuteResponse, ExecutionOutcome, RequestContext, VultrinoError,
+};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
@@ -157,7 +161,10 @@ struct RunError {
 impl RunError {
     /// A transient preflight failure (e.g. plugin not loaded) — safe to retry.
     fn retryable(error: VultrinoError) -> Self {
-        Self { retryable: true, error }
+        Self {
+            retryable: true,
+            error,
+        }
     }
     /// A permanent preflight failure (unusable token, bad params, missing
     /// credential) — nothing ran, but retrying won't help.
@@ -247,7 +254,10 @@ async fn emit_meter(
     model: Option<&str>,
 ) {
     let add_dimensions = |mut payload: serde_json::Value| {
-        if let Some(dims) = payload.get_mut("dims").and_then(serde_json::Value::as_object_mut) {
+        if let Some(dims) = payload
+            .get_mut("dims")
+            .and_then(serde_json::Value::as_object_mut)
+        {
             for (name, value) in [
                 ("provider", attr.provider.as_ref()),
                 ("region", attr.region.as_ref()),
@@ -314,12 +324,16 @@ fn buffered_as_stream(resp: ExecuteResponse) -> StreamingExecution {
         body,
         ..
     } = resp;
-    headers.retain(|k, _| !k.eq_ignore_ascii_case("content-length") && !k.eq_ignore_ascii_case("transfer-encoding"));
+    headers.retain(|k, _| {
+        !k.eq_ignore_ascii_case("content-length") && !k.eq_ignore_ascii_case("transfer-encoding")
+    });
     let chunk = Bytes::from(body);
     StreamingExecution {
         status,
         headers,
-        body: Box::pin(futures::stream::once(async move { Ok::<Bytes, std::io::Error>(chunk) })),
+        body: Box::pin(futures::stream::once(async move {
+            Ok::<Bytes, std::io::Error>(chunk)
+        })),
     }
 }
 
@@ -393,7 +407,9 @@ impl Drop for StreamFinalizer {
                     Some((u, m)) => (Some(u), m),
                     None => (None, None),
                 };
-                handle.spawn(async move { emit_meter(&storage, &attribution, usage, model.as_deref()).await });
+                handle.spawn(async move {
+                    emit_meter(&storage, &attribution, usage, model.as_deref()).await
+                });
             }
         }
     }
@@ -450,7 +466,11 @@ struct InboundIdentity {
 
 impl VultrinoServer {
     /// Create a new Vultrino server
-    pub fn new(config: Config, storage: Arc<dyn StorageBackend>, resolver: CredentialResolver) -> Self {
+    pub fn new(
+        config: Config,
+        storage: Arc<dyn StorageBackend>,
+        resolver: CredentialResolver,
+    ) -> Self {
         let plugins = Arc::new(PluginRegistry::new());
         let policy_engine = Arc::new(PolicyEngine::new());
         let auth_manager = Arc::new(AuthManager::new());
@@ -470,7 +490,9 @@ impl VultrinoServer {
         // since either is almost always a misconfiguration that would otherwise
         // be discovered only via behavior (a flood of denials, or — worse —
         // silent fail-open).
-        if let Some(msg) = zero_policy_enforcement_warning(default_deny, !config.policies.is_empty()) {
+        if let Some(msg) =
+            zero_policy_enforcement_warning(default_deny, !config.policies.is_empty())
+        {
             warn!("{}", msg);
         }
 
@@ -568,10 +590,9 @@ impl VultrinoServer {
         use crate::plugins::{PluginInstaller, PluginLoader};
 
         let installer = PluginInstaller::default();
-        let installed = installer
-            .list()
-            .await
-            .map_err(|e| VultrinoError::Plugin(crate::plugins::PluginError::Installation(e.to_string())))?;
+        let installed = installer.list().await.map_err(|e| {
+            VultrinoError::Plugin(crate::plugins::PluginError::Installation(e.to_string()))
+        })?;
 
         let loader = PluginLoader::default();
 
@@ -617,7 +638,10 @@ impl VultrinoServer {
             Some(a) => ExecAuth::from_api_key(a.clone()),
             None => ExecAuth::default(),
         };
-        Ok(self.execute_gated(request, exec_auth).await?.into_response())
+        Ok(self
+            .execute_gated(request, exec_auth)
+            .await?
+            .into_response())
     }
 
     /// Run the full gating decision for a request **without** running the action.
@@ -652,7 +676,9 @@ impl VultrinoServer {
             context = context.with_auth(auth_result);
 
             if !auth_result.has_permission(Permission::Execute) {
-                return Err(VultrinoError::PolicyDenied("Missing 'execute' permission".to_string()));
+                return Err(VultrinoError::PolicyDenied(
+                    "Missing 'execute' permission".to_string(),
+                ));
             }
             if !auth_result.can_access_credential(&request.credential) {
                 return Err(VultrinoError::PolicyDenied(format!(
@@ -701,7 +727,10 @@ impl VultrinoServer {
         // tenant; an untenanted credential is shared. A credential is tenant-tagged
         // via its `tenant` metadata. Cross-tenant access is denied regardless of
         // the tenant's enforce/observe mode (isolation is not observable-away).
-        let principal_tenant = exec_auth.auth.as_ref().and_then(|a| a.api_key.tenant.clone());
+        let principal_tenant = exec_auth
+            .auth
+            .as_ref()
+            .and_then(|a| a.api_key.tenant.clone());
         // Trim the credential's tenant tag and treat blank as untenanted (shared),
         // symmetric with the trimmed-at-mint principal tenant.
         let cred_tenant = credential
@@ -770,7 +799,11 @@ impl VultrinoServer {
         // V12: a dual-control token forces the action through the approval flow
         // (M-of-N), even when policy would Allow it and the credential doesn't
         // require approval — dual control must not be bypassable on the Allow path.
-        let dual_control = exec_auth.use_token.as_ref().map(|t| t.dual_control).unwrap_or(false);
+        let dual_control = exec_auth
+            .use_token
+            .as_ref()
+            .map(|t| t.dual_control)
+            .unwrap_or(false);
         let mut needs_approval = exec_auth.force_approval || dual_control;
         match decision {
             crate::policy::PolicyDecision::Allow => {}
@@ -782,7 +815,8 @@ impl VultrinoServer {
                 // vultrino. NEVER downgraded (security/financial boundaries hold
                 // even in observe): cross-tenant isolation (above), a V6 halt/kill
                 // switch, and SpendCap/RateLimit resource guards.
-                if self.config.tenant_mode(principal_tenant.as_deref()) == crate::config::TenantMode::Observe
+                if self.config.tenant_mode(principal_tenant.as_deref())
+                    == crate::config::TenantMode::Observe
                     && !self.policy_engine.is_halted(&eval_input)
                     && !self.policy_engine.has_resource_guard(&eval_input)
                 {
@@ -852,7 +886,9 @@ impl VultrinoServer {
             // Open an approval request. The use token is NOT consumed yet — it is
             // reserved when the approved action actually runs. The criticality
             // class (V5) drives the escalation/expiry SLA windows.
-            let criticality = self.approval_config.criticality_for(&credential.alias, &full_action);
+            let criticality = self
+                .approval_config
+                .criticality_for(&credential.alias, &full_action);
             let sla = self.approval_config.sla_for(criticality);
             // V10: record the requester's IdP-resolvable owner (if bound) on the
             // approval so separation-of-duty compares the approver against the
@@ -895,7 +931,9 @@ impl VultrinoServer {
             // Spend is extracted by the trusted policy layer above. Stamp it only
             // after opening so requester-authored params can never supply these
             // grant-cap facts.
-            approval.trusted_spend_amount_minor = spend.as_ref().map(|s| i64::try_from(s.amount).unwrap_or(i64::MAX));
+            approval.trusted_spend_amount_minor = spend
+                .as_ref()
+                .map(|s| i64::try_from(s.amount).unwrap_or(i64::MAX));
             approval.trusted_spend_asset = spend.as_ref().map(|s| s.asset.clone());
 
             // Bound the number of *pending* approvals a use token can open: each
@@ -923,7 +961,8 @@ impl VultrinoServer {
                 }
                 None => self.storage.store_approval(&approval).await?,
             }
-            self.dispatch_notifications(&approval, &decision_token).await;
+            self.dispatch_notifications(&approval, &decision_token)
+                .await;
             // V9: emit the requested event to the signed outbox.
             self.emit_event(
                 &approval.id,
@@ -1030,9 +1069,9 @@ impl VultrinoServer {
         // A not-loaded plugin is *transient* (it may load later → retryable);
         // invalid params are *permanent* (a retry can't fix them → terminal).
         let plugin = self.plugins.get(plugin_name).ok_or_else(|| {
-            RunError::retryable(VultrinoError::Plugin(crate::plugins::PluginError::NotFound(
-                plugin_name.to_string(),
-            )))
+            RunError::retryable(VultrinoError::Plugin(
+                crate::plugins::PluginError::NotFound(plugin_name.to_string()),
+            ))
         })?;
         plugin
             .validate_params(action_name, &params)
@@ -1044,7 +1083,10 @@ impl VultrinoServer {
         // approval finalizes with the error rather than retrying forever.
         if let Some(tid) = use_token_id {
             self.storage.consume_use_token(tid).await.map_err(|e| {
-                RunError::terminal(VultrinoError::PolicyDenied(format!("Use token cannot be used: {}", e)))
+                RunError::terminal(VultrinoError::PolicyDenied(format!(
+                    "Use token cannot be used: {}",
+                    e
+                )))
             })?;
         }
 
@@ -1084,8 +1126,14 @@ impl VultrinoServer {
             .get("_feir_provider")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        let meter_region = params.get("_feir_region").and_then(|v| v.as_str()).map(str::to_string);
-        let meter_channel = params.get("_feir_channel").and_then(|v| v.as_str()).map(str::to_string);
+        let meter_region = params
+            .get("_feir_region")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let meter_channel = params
+            .get("_feir_channel")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         // Capture the credential's secret material before it moves into the
         // plugin request, so we can scrub it from the response (V7 egress).
         let secret_material = credential.data.secret_material();
@@ -1206,7 +1254,13 @@ impl VultrinoServer {
             region: meter_region,
             channel: meter_channel,
         };
-        emit_meter(&self.storage, &attribution, meter_token_usage, meter_model.as_deref()).await;
+        emit_meter(
+            &self.storage,
+            &attribution,
+            meter_token_usage,
+            meter_model.as_deref(),
+        )
+        .await;
 
         // NOTE: rate-limit slots are charged ONCE at admission — the live policy
         // evaluation (evaluate_full, record=true) calls check_rate_limit when a
@@ -1256,7 +1310,11 @@ impl VultrinoServer {
                 // (credential, action) can't be honored incrementally, so serve
                 // BUFFERED (full whole-body egress runs) as a single chunk — a safe,
                 // documented fallback rather than a partial scrub.
-                if !crate::egress::stream_is_egress_safe(&self.config.egress, &credential.alias, &full_action) {
+                if !crate::egress::stream_is_egress_safe(
+                    &self.config.egress,
+                    &credential.alias,
+                    &full_action,
+                ) {
                     let response = self
                         .run_action(
                             credential,
@@ -1310,9 +1368,9 @@ impl VultrinoServer {
     ) -> Result<StreamingExecution, RunError> {
         // Preflight (no side effects, no token consumed): resolve + validate.
         let plugin = self.plugins.get(plugin_name).ok_or_else(|| {
-            RunError::retryable(VultrinoError::Plugin(crate::plugins::PluginError::NotFound(
-                plugin_name.to_string(),
-            )))
+            RunError::retryable(VultrinoError::Plugin(
+                crate::plugins::PluginError::NotFound(plugin_name.to_string()),
+            ))
         })?;
         plugin
             .validate_params(action_name, &params)
@@ -1322,7 +1380,10 @@ impl VultrinoServer {
         // the point of no return, identical to the buffered path.
         if let Some(tid) = use_token_id {
             self.storage.consume_use_token(tid).await.map_err(|e| {
-                RunError::terminal(VultrinoError::PolicyDenied(format!("Use token cannot be used: {}", e)))
+                RunError::terminal(VultrinoError::PolicyDenied(format!(
+                    "Use token cannot be used: {}",
+                    e
+                )))
             })?;
         }
 
@@ -1351,8 +1412,14 @@ impl VultrinoServer {
                 .get("_feir_provider")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
-            region: params.get("_feir_region").and_then(|v| v.as_str()).map(str::to_string),
-            channel: params.get("_feir_channel").and_then(|v| v.as_str()).map(str::to_string),
+            region: params
+                .get("_feir_region")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            channel: params
+                .get("_feir_channel")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         };
         // Capture the request-side model BEFORE `params` moves into the plugin
         // request, mirroring the buffered path. The streamed usage tap prefers the
@@ -1417,7 +1484,10 @@ impl VultrinoServer {
             );
             return Ok(StreamingExecution {
                 status,
-                headers: std::collections::HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+                headers: std::collections::HashMap::from([(
+                    "content-type".to_string(),
+                    "text/plain".to_string(),
+                )]),
                 // Move the V6 guard into the (single-chunk) body so the in-flight
                 // session deregisters when the placeholder is drained, not at this
                 // early return — symmetric with the main streaming path.
@@ -1461,8 +1531,10 @@ impl VultrinoServer {
         let mut headers = streaming.headers;
         let forms = crate::egress::derive_secret_forms(&secret_material);
         crate::egress::scrub_headers(&mut headers, &forms, &credential_alias);
-        headers
-            .retain(|k, _| !k.eq_ignore_ascii_case("content-length") && !k.eq_ignore_ascii_case("transfer-encoding"));
+        headers.retain(|k, _| {
+            !k.eq_ignore_ascii_case("content-length")
+                && !k.eq_ignore_ascii_case("transfer-encoding")
+        });
         drop(forms);
 
         info!(
@@ -1480,8 +1552,8 @@ impl VultrinoServer {
         let caps = &self.config.llm_proxy;
         let max_line = caps.stream_max_line_bytes;
         let max_bytes = caps.stream_max_bytes;
-        let idle =
-            (caps.stream_idle_timeout_secs > 0).then(|| std::time::Duration::from_secs(caps.stream_idle_timeout_secs));
+        let idle = (caps.stream_idle_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(caps.stream_idle_timeout_secs));
         let total = (caps.stream_total_timeout_secs > 0)
             .then(|| std::time::Duration::from_secs(caps.stream_total_timeout_secs));
         let upstream = streaming.body;
@@ -1619,7 +1691,10 @@ impl VultrinoServer {
 
     /// Run a previously-approved action. Builds the request from the stored
     /// approval and executes it (consuming the use token, if any).
-    async fn resume_approved(&self, approval: &ApprovalRequest) -> Result<ExecuteResponse, RunError> {
+    async fn resume_approved(
+        &self,
+        approval: &ApprovalRequest,
+    ) -> Result<ExecuteResponse, RunError> {
         // V11 note: cross-tenant credential isolation is enforced at request time
         // in `execute_gated` (before an approval is ever opened), so a cross-tenant
         // request can't create an approval to resume. The resume re-evaluates
@@ -1640,7 +1715,8 @@ impl VultrinoServer {
             .resolve(&approval.credential)
             .await
             .map_err(RunError::terminal)?;
-        let (plugin_name, action_name) = parse_action(&approval.action).map_err(RunError::terminal)?;
+        let (plugin_name, action_name) =
+            parse_action(&approval.action).map_err(RunError::terminal)?;
         let context = RequestContext::new();
 
         // Re-evaluate policy at execution time so the deferred path still
@@ -1696,8 +1772,9 @@ impl VultrinoServer {
         // so no spend attempt is needed. A spend cap *changed* after the approval
         // opened therefore does not re-bind to this in-flight action; an operator
         // who needs to stop such an in-flight approval should push an explicit Deny.
-        if let crate::policy::PolicyDecision::Deny(reason) =
-            self.policy_engine.evaluate_readonly_full(&crate::policy::EvalInput {
+        if let crate::policy::PolicyDecision::Deny(reason) = self
+            .policy_engine
+            .evaluate_readonly_full(&crate::policy::EvalInput {
                 credential_alias: &credential.alias,
                 url,
                 method,
@@ -1759,11 +1836,10 @@ impl VultrinoServer {
         // Best-effort: pick up cross-process decisions.
         let _ = self.storage.reload().await;
 
-        let approval = self
-            .storage
-            .get_approval(id)
-            .await?
-            .ok_or_else(|| VultrinoError::InvalidRequest(format!("Approval not found: {}", id)))?;
+        let approval =
+            self.storage.get_approval(id).await?.ok_or_else(|| {
+                VultrinoError::InvalidRequest(format!("Approval not found: {}", id))
+            })?;
 
         // Ownership check BEFORE any side effect: a non-owner must not be able to
         // trigger execution of someone else's approved action.
@@ -1867,7 +1943,11 @@ impl VultrinoServer {
         if self.notifiers.is_empty() {
             return;
         }
-        let base = self.approval_config.public_base_url.as_deref().unwrap_or("");
+        let base = self
+            .approval_config
+            .public_base_url
+            .as_deref()
+            .unwrap_or("");
         let links = approval.links(base, decision_token);
         for notifier in &self.notifiers {
             if let Err(e) = notifier.notify(approval, &links).await {
@@ -1884,7 +1964,9 @@ impl VultrinoServer {
     /// One iteration of the approval SLA sweep (V5): re-read the vault, advance
     /// every open request through its lifecycle (escalate / expire), and re-ping
     /// the notifiers for those that escalated. Returns the sweep result.
-    pub async fn sweep_approvals_once(&self) -> Result<crate::storage::ApprovalSweep, crate::storage::StorageError> {
+    pub async fn sweep_approvals_once(
+        &self,
+    ) -> Result<crate::storage::ApprovalSweep, crate::storage::StorageError> {
         run_approval_sweep(
             &self.storage,
             &self.notifiers,
@@ -1917,14 +1999,19 @@ impl VultrinoServer {
 
     /// Count of unauthorized (policy-denied) tool-call attempts since start (V12).
     pub fn unauthorized_attempts(&self) -> u64 {
-        self.unauthorized_attempts.load(std::sync::atomic::Ordering::Relaxed)
+        self.unauthorized_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Best-effort append of an event to the signed outbox (V9). Never fails the
     /// calling operation — an event-log problem must not block the action it
     /// describes (the action's own success is the source of truth).
     pub async fn emit_event(&self, subject: &str, event_type: &str, payload: serde_json::Value) {
-        if let Err(e) = self.storage.append_event(subject, event_type, payload).await {
+        if let Err(e) = self
+            .storage
+            .append_event(subject, event_type, payload)
+            .await
+        {
             warn!(error = %e, event_type, "failed to append outbox event");
         }
     }
@@ -1991,7 +2078,10 @@ impl VultrinoServer {
     /// tenant-scoped admin metrics read-back; the primitive is
     /// [`ApprovalRequest::visible_to_tenant`], which any future tenant-scoped
     /// decision surface gates on (the web panel is a global console).
-    pub async fn list_approvals_for_tenant(&self, acting: Option<&str>) -> Result<Vec<ApprovalRequest>, VultrinoError> {
+    pub async fn list_approvals_for_tenant(
+        &self,
+        acting: Option<&str>,
+    ) -> Result<Vec<ApprovalRequest>, VultrinoError> {
         let mut approvals = self.storage.list_approvals().await?;
         approvals.retain(|a| a.visible_to_tenant(acting));
         Ok(approvals)
@@ -2068,17 +2158,19 @@ impl VultrinoServer {
         // gated allow rule can match at list time.
         let url = capability.target.url_glob.as_deref();
         let method = capability.target.methods.first().map(|m| m.as_str());
-        let decision = self.policy_engine.evaluate_readonly_full(&crate::policy::EvalInput {
-            credential_alias: &credential.alias,
-            url,
-            method,
-            // The cap's own action label, so its ActionMatch rule matches and the
-            // granted cap remains listable (without it the connector dimension would
-            // hide every granted capability at tools/list).
-            action: Some(capability.action.as_str()),
-            principal: principal.as_ref(),
-            spend: None,
-        });
+        let decision = self
+            .policy_engine
+            .evaluate_readonly_full(&crate::policy::EvalInput {
+                credential_alias: &credential.alias,
+                url,
+                method,
+                // The cap's own action label, so its ActionMatch rule matches and the
+                // granted cap remains listable (without it the connector dimension would
+                // hide every granted capability at tools/list).
+                action: Some(capability.action.as_str()),
+                principal: principal.as_ref(),
+                spend: None,
+            });
         // A `Prompt` (approval-gated) capability is still listable — the agent can
         // call it and will be told to await approval, exactly like a generic gated
         // tool. Only an outright `Deny` hides it.
@@ -2087,7 +2179,11 @@ impl VultrinoServer {
 
     /// Trusted irreversibility for D3 floors: resolve from stored capability metadata
     /// (not requester-authored params). Matches canonical action or govder label.
-    async fn trusted_irreversible_for_action(&self, canonical_action: &str, action_label: Option<&str>) -> bool {
+    async fn trusted_irreversible_for_action(
+        &self,
+        canonical_action: &str,
+        action_label: Option<&str>,
+    ) -> bool {
         let _ = self.storage.reload().await;
         let caps = match self.storage.list_capabilities().await {
             Ok(caps) => caps,
@@ -2113,9 +2209,9 @@ impl VultrinoServer {
                 })
                 .collect();
             if !exact.is_empty() {
-                return exact
-                    .iter()
-                    .any(|cap| crate::approval::reversibility_requires_human_floor(&cap.reversibility));
+                return exact.iter().any(|cap| {
+                    crate::approval::reversibility_requires_human_floor(&cap.reversibility)
+                });
             }
         }
 
@@ -2136,7 +2232,10 @@ impl VultrinoServer {
     /// List the capabilities a principal is permitted to see (connector M1). The
     /// MCP server turns each into a named tool. Storage is reloaded first so a
     /// capability created via the admin API (another process) is visible.
-    pub async fn list_capabilities_for(&self, auth: Option<&AuthResult>) -> Vec<crate::capability::Capability> {
+    pub async fn list_capabilities_for(
+        &self,
+        auth: Option<&AuthResult>,
+    ) -> Vec<crate::capability::Capability> {
         let _ = self.storage.reload().await;
         let all = self.storage.list_capabilities().await.unwrap_or_default();
         let mut allowed = Vec::new();
@@ -2157,7 +2256,10 @@ impl VultrinoServer {
     /// The legacy resolver succeeds only when exactly one channel is allowed.
     /// Selecting the first storage row would make cross-provider fallback use a
     /// nondeterministic credential, so ambiguity now fails closed.
-    pub async fn resolve_llm_proxy_for(&self, auth: Option<&AuthResult>) -> Option<crate::capability::Capability> {
+    pub async fn resolve_llm_proxy_for(
+        &self,
+        auth: Option<&AuthResult>,
+    ) -> Option<crate::capability::Capability> {
         let _ = self.storage.reload().await;
         let all = self.storage.list_capabilities().await.unwrap_or_default();
         let mut matched = Vec::new();
@@ -2197,14 +2299,21 @@ impl VultrinoServer {
                 .find(|c| c.id == name || c.tool_name == name)
                 .ok_or_else(|| format!("Model channel '{name}' is not granted")),
             None if allowed.len() == 1 => Ok(allowed.remove(0)),
-            None if allowed.is_empty() => Err("No LLM-proxy capability is provisioned for this principal".to_string()),
-            None => Err("Multiple model channels are granted; use /llm/channels/{channel}".to_string()),
+            None if allowed.is_empty() => {
+                Err("No LLM-proxy capability is provisioned for this principal".to_string())
+            }
+            None => {
+                Err("Multiple model channels are granted; use /llm/channels/{channel}".to_string())
+            }
         }
     }
 
     /// Look up a stored capability by its MCP tool name (connector M1). Reloads
     /// storage first to pick up a capability registered by another process.
-    pub async fn capability_by_tool_name(&self, tool_name: &str) -> Option<crate::capability::Capability> {
+    pub async fn capability_by_tool_name(
+        &self,
+        tool_name: &str,
+    ) -> Option<crate::capability::Capability> {
         let _ = self.storage.reload().await;
         self.storage
             .list_capabilities()
@@ -2451,7 +2560,9 @@ pub async fn deliver_outbox_once(
     // subject). Cost is one extra lock acquisition per event vs a batch — fine for
     // an outbox where the network POST dominates.
     for _ in 0..OUTBOX_BATCH {
-        let mut claimed = storage.claim_deliverable_events(1, OUTBOX_LEASE_SECS).await?;
+        let mut claimed = storage
+            .claim_deliverable_events(1, OUTBOX_LEASE_SECS)
+            .await?;
         debug_assert!(claimed.len() <= 1, "claim(1) must return at most one event");
         let Some(event) = claimed.pop() else {
             break;
@@ -2522,7 +2633,10 @@ pub async fn deliver_outbox_periodically(
 /// is delivered within seconds rather than only at the next restart. A no-op (early in-memory return)
 /// when nothing is staged, so it is cheap to run every tick. Safe to run in more than one process:
 /// the drain is idempotent (each staged event carries a dedup_id; append_deduped won't duplicate).
-pub async fn drain_pending_events_periodically(storage: Arc<dyn StorageBackend>, interval: std::time::Duration) {
+pub async fn drain_pending_events_periodically(
+    storage: Arc<dyn StorageBackend>,
+    interval: std::time::Duration,
+) {
     loop {
         tokio::time::sleep(interval).await;
         if let Err(e) = storage.reconcile_pending_events().await {
@@ -2829,7 +2943,10 @@ mod tests {
     async fn trusted_irreversibility_uses_strictest_canonical_match_and_fails_unknown_closed() {
         use crate::capability::{Capability, CapabilityTarget};
         let (server, storage) = irreversibility_test_server().await;
-        for (id, reversibility) in [("a-reversible", "reversible"), ("b-irreversible", "irreversible")] {
+        for (id, reversibility) in [
+            ("a-reversible", "reversible"),
+            ("b-irreversible", "irreversible"),
+        ] {
             storage
                 .store_capability(&Capability {
                     id: id.to_string(),
@@ -2846,7 +2963,15 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(server.trusted_irreversible_for_action("http.request", None).await);
-        assert!(server.trusted_irreversible_for_action("unknown.action", None).await);
+        assert!(
+            server
+                .trusted_irreversible_for_action("http.request", None)
+                .await
+        );
+        assert!(
+            server
+                .trusted_irreversible_for_action("unknown.action", None)
+                .await
+        );
     }
 }

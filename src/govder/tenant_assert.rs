@@ -16,6 +16,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// into the MAC so a tampered jti invalidates it; two identical requests produce
 /// distinct assertions. Govder atomically consumes each `(tenant, jti)` through
 /// expiry, so an exact captured request cannot be replayed.
+#[allow(clippy::too_many_arguments)] // the signed wire tuple is deliberately explicit and order-sensitive
 pub fn sign_tenant_assertion(
     secret: &str,
     tenant: &str,

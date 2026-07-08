@@ -104,7 +104,9 @@ impl PluginManifest {
     /// Validate the manifest
     pub fn validate(&self) -> Result<(), ManifestError> {
         if self.plugin.name.is_empty() {
-            return Err(ManifestError::Invalid("Plugin name is required".to_string()));
+            return Err(ManifestError::Invalid(
+                "Plugin name is required".to_string(),
+            ));
         }
 
         if self.plugin.version.is_empty() {
@@ -191,11 +193,7 @@ impl CredentialTypeDefinition {
         }
 
         // Validate name format
-        if !self
-            .name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_')
-        {
+        if !self.name.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return Err(ManifestError::Invalid(
                 "Credential type name must only contain alphanumeric characters and underscores"
                     .to_string(),
@@ -306,11 +304,7 @@ impl CredentialFieldDefinition {
         }
 
         // Validate name format
-        if !self
-            .name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_')
-        {
+        if !self.name.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return Err(ManifestError::Invalid(
                 "Field name must only contain alphanumeric characters and underscores".to_string(),
             ));
@@ -360,11 +354,7 @@ impl ActionDefinition {
         }
 
         // Validate name format
-        if !self
-            .name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_')
-        {
+        if !self.name.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return Err(ManifestError::Invalid(
                 "Action name must only contain alphanumeric characters and underscores".to_string(),
             ));
@@ -731,7 +721,13 @@ format = "wasm"
         assert!(schema["properties"]["credential"].is_object());
         assert!(schema["properties"]["data"].is_object());
         assert!(schema["properties"]["armor"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("credential")));
-        assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("data")));
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("credential")));
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("data")));
     }
 }

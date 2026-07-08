@@ -61,18 +61,13 @@ pub struct JsonRpcNotification {
 }
 
 /// JSON-RPC ID (can be string, number, or null)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum JsonRpcId {
     String(String),
     Number(i64),
+    #[default]
     Null,
-}
-
-impl Default for JsonRpcId {
-    fn default() -> Self {
-        Self::Null
-    }
 }
 
 /// JSON-RPC error
@@ -297,7 +292,8 @@ mod tests {
 
     #[test]
     fn test_jsonrpc_response_success() {
-        let response = JsonRpcResponse::success(JsonRpcId::Number(1), serde_json::json!({"status": "ok"}));
+        let response =
+            JsonRpcResponse::success(JsonRpcId::Number(1), serde_json::json!({"status": "ok"}));
 
         assert!(response.error.is_none());
         assert!(response.result.is_some());

@@ -1,8 +1,8 @@
 //! Askama HTML templates for the web UI
 
-use askama::Template;
 use crate::auth::Role;
 use crate::plugins::CredentialTypeDefinition;
+use askama::Template;
 
 /// Flash message for displaying notifications
 #[derive(Debug, Clone)]
@@ -73,7 +73,11 @@ impl From<&crate::CredentialMetadata> for CredentialDisplay {
             id: cred.id.clone(),
             alias: cred.alias.clone(),
             credential_type: cred.credential_type.to_string(),
-            description: cred.metadata.get("description").cloned().unwrap_or_else(|| "-".to_string()),
+            description: cred
+                .metadata
+                .get("description")
+                .cloned()
+                .unwrap_or_else(|| "-".to_string()),
             created_at: cred.created_at.format("%Y-%m-%d").to_string(),
         }
     }
@@ -226,7 +230,9 @@ impl ApiKeyDisplay {
             id: key.id.clone(),
             name: key.name.clone(),
             key_prefix: format!("{}...", key.key_prefix),
-            role_name: role.map(|r| r.name.clone()).unwrap_or_else(|| key.role_id.clone()),
+            role_name: role
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| key.role_id.clone()),
             expires: key
                 .expires_at
                 .map(|e| e.format("%Y-%m-%d").to_string())
@@ -316,7 +322,10 @@ impl From<&crate::auth::UseToken> for UseTokenDisplay {
             name: t.name.clone(),
             token_prefix: format!("{}...", t.token_prefix),
             credential_scope: t.credential_scope.clone(),
-            action_scope: t.action_scope.clone().unwrap_or_else(|| "any action".to_string()),
+            action_scope: t
+                .action_scope
+                .clone()
+                .unwrap_or_else(|| "any action".to_string()),
             uses_display,
             require_approval: t.require_approval,
             expires: t

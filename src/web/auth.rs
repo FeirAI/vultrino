@@ -158,9 +158,7 @@ impl LoginRateLimiter {
 
         // Clean up old lockouts
         let mut lockouts = self.lockouts.write().await;
-        lockouts.retain(|_, lockout_start| {
-            lockout_start.elapsed() < lockout_duration
-        });
+        lockouts.retain(|_, lockout_start| lockout_start.elapsed() < lockout_duration);
     }
 }
 
@@ -273,16 +271,10 @@ where
         // Get the session
         let session = Session::from_request_parts(parts, state)
             .await
-            .map_err(|_| {
-                Redirect::to("/login").into_response()
-            })?;
+            .map_err(|_| Redirect::to("/login").into_response())?;
 
         // Check for valid session data
-        let web_session: Option<WebSession> = session
-            .get(SESSION_KEY)
-            .await
-            .ok()
-            .flatten();
+        let web_session: Option<WebSession> = session.get(SESSION_KEY).await.ok().flatten();
 
         match web_session {
             Some(ws) if ws.is_valid() => Ok(RequireAuth { session: ws }),
@@ -309,7 +301,10 @@ pub async fn set_authenticated_session(
 
 /// Helper to clear the session on logout
 pub async fn clear_session(session: &Session) -> Result<(), StatusCode> {
-    session.flush().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    session
+        .flush()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(())
 }
 
@@ -395,7 +390,9 @@ mod tests {
         // Base64 URL-safe encoding of 32 bytes = 43 characters
         assert_eq!(token.len(), 43);
         // Should only contain URL-safe characters
-        assert!(token.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
+        assert!(token
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[tokio::test]

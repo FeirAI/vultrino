@@ -186,7 +186,7 @@ impl PolicyEngine {
         let principal = context.api_key_id.as_ref().map(|id| Principal {
             id: id.clone(),
             agent_label: context.agent_label.clone(),
-            owner: None, // legacy path: owner is used for SoD, not policy matching
+            owner: None,       // legacy path: owner is used for SoD, not policy matching
             workload_id: None, // legacy 4-arg path has no resolved workload identity
         });
         let input = EvalInput {
@@ -217,6 +217,17 @@ impl PolicyEngine {
                 && credential_matches(&p.credential_pattern, input.credential_alias)
                 && principal_matches(p.principal_pattern.as_deref(), input.principal)
         })
+    }
+
+    /// Whether any authoritative kill policy targets this principal, independent
+    /// of credential or action shape. Runtime control polling uses this so Govder's
+    /// W3 kill leg can preempt native framework work even when W2 token revocation
+    /// is delayed or unavailable.
+    pub fn is_principal_halted(&self, principal: &Principal) -> bool {
+        let policies = self.policies.read();
+        policies
+            .iter()
+            .any(|p| p.kill && principal_matches(p.principal_pattern.as_deref(), Some(principal)))
     }
 
     /// Whether a matching policy carries a **resource guard** — a `SpendCap` or
@@ -266,7 +277,14 @@ impl PolicyEngine {
         url: Option<&str>,
         method: Option<&str>,
     ) -> PolicyDecision {
-        let input = EvalInput { credential_alias, url, method, action: None, principal: None, spend: None };
+        let input = EvalInput {
+            credential_alias,
+            url,
+            method,
+            action: None,
+            principal: None,
+            spend: None,
+        };
         self.evaluate_inner(&input, false)
     }
 
@@ -327,7 +345,10 @@ impl PolicyEngine {
                     // NOT as a side effect of the recursive boolean walk. Nested
                     // SpendCap is rejected by Policy::validate at config/admin load.
                     let matched = match &rule.condition {
-                        PolicyCondition::SpendCap { asset, per_action_max } => {
+                        PolicyCondition::SpendCap {
+                            asset,
+                            per_action_max,
+                        } => {
                             self.spend_within_cap(
                                 input.spend,
                                 asset,
@@ -417,7 +438,10 @@ impl PolicyEngine {
                 }
             }
 
-            PolicyCondition::SpendCap { asset, per_action_max } => {
+            PolicyCondition::SpendCap {
+                asset,
+                per_action_max,
+            } => {
                 // Reached only if a SpendCap is (mis)nested inside and/or/not,
                 // which Policy::validate rejects at load. Evaluate it purely as a
                 // safety net — the authoritative check is a top-level SpendCap rule
@@ -555,8 +579,12 @@ fn principal_matches(pattern: Option<&str>, principal: Option<&Principal>) -> bo
             None => false,
             Some(p) => {
                 glob_matches(pat, &p.id)
-                    || p.agent_label.as_deref().is_some_and(|l| glob_matches(pat, l))
-                    || p.workload_id.as_deref().is_some_and(|w| glob_matches(pat, w))
+                    || p.agent_label
+                        .as_deref()
+                        .is_some_and(|l| glob_matches(pat, l))
+                    || p.workload_id
+                        .as_deref()
+                        .is_some_and(|w| glob_matches(pat, w))
             }
         },
     }
@@ -588,7 +616,9 @@ impl SpendExtractor {
     /// Extract a [`SpendAttempt`] from params, or `None` if the amount/asset
     /// can't be read (which the caller treats as fail-closed for SpendCap).
     pub fn extract(&self, params: &serde_json::Value) -> Option<SpendAttempt> {
-        let amount = params.pointer(&self.amount_pointer).and_then(|v| v.as_u64())?;
+        let amount = params
+            .pointer(&self.amount_pointer)
+            .and_then(|v| v.as_u64())?;
         let asset = match (&self.asset_pointer, &self.asset) {
             (Some(ptr), _) => params.pointer(ptr).and_then(|v| v.as_str())?.to_string(),
             (None, Some(lit)) => lit.clone(),
@@ -640,7 +670,12 @@ mod tests {
         // new() is fail-closed by default now; opt into legacy fail-open here.
         let engine = PolicyEngine::new();
         engine.set_default_deny(false);
-        let decision = engine.evaluate("github-api", Some("https://api.github.com"), Some("GET"), &make_context());
+        let decision = engine.evaluate(
+            "github-api",
+            Some("https://api.github.com"),
+            Some("GET"),
+            &make_context(),
+        );
         assert_eq!(decision, PolicyDecision::Allow);
     }
 
@@ -663,8 +698,12 @@ mod tests {
 
         // A credential with no matching policy is denied, with the distinct
         // machine-greppable `no_policy` reason.
-        let decision =
-            engine.evaluate("unpolicied", Some("https://api.example.com"), Some("GET"), &make_context());
+        let decision = engine.evaluate(
+            "unpolicied",
+            Some("https://api.example.com"),
+            Some("GET"),
+            &make_context(),
+        );
         match decision {
             PolicyDecision::Deny(reason) => assert!(
                 reason.starts_with("no_policy:"),
@@ -676,14 +715,24 @@ mod tests {
         // An explicit allow policy still admits the request even in deny mode.
         engine.add_policy(Policy::allow_all("allow-it", "unpolicied"));
         assert_eq!(
-            engine.evaluate("unpolicied", Some("https://api.example.com"), Some("GET"), &make_context()),
+            engine.evaluate(
+                "unpolicied",
+                Some("https://api.example.com"),
+                Some("GET"),
+                &make_context()
+            ),
             PolicyDecision::Allow
         );
 
         // A credential matched by an explicit deny policy reports that policy's
         // reason, not the no_policy fallback.
         engine.add_policy(Policy::deny_all("block", "blocked-cred"));
-        match engine.evaluate("blocked-cred", Some("https://x"), Some("GET"), &make_context()) {
+        match engine.evaluate(
+            "blocked-cred",
+            Some("https://x"),
+            Some("GET"),
+            &make_context(),
+        ) {
             PolicyDecision::Deny(reason) => assert!(
                 !reason.starts_with("no_policy:"),
                 "an explicitly-denied credential should not use the no_policy reason: {reason}"
@@ -709,7 +758,8 @@ mod tests {
         let input = EvalInput {
             credential_alias: "c",
             url: None,
-            method: None, action: None,
+            method: None,
+            action: None,
             principal: None,
             spend: None,
         };
@@ -720,10 +770,13 @@ mod tests {
         // A RateLimit rule (action Allow — the common admit-within-limit pattern)
         // is still detected as a guard.
         let e_rl = PolicyEngine::new();
-        e_rl.add_policy(
-            Policy::deny_all("rl", "*")
-                .with_rule(PolicyCondition::RateLimit { max: 1, window_secs: 60 }, PolicyAction::Allow),
-        );
+        e_rl.add_policy(Policy::deny_all("rl", "*").with_rule(
+            PolicyCondition::RateLimit {
+                max: 1,
+                window_secs: 60,
+            },
+            PolicyAction::Allow,
+        ));
         assert!(e_rl.has_resource_guard(&input));
 
         // A SpendCap nested inside And[...] is detected (recursion).
@@ -742,18 +795,21 @@ mod tests {
 
         // A non-guard policy (URL only) is NOT a resource guard.
         let e_url = PolicyEngine::new();
-        e_url.add_policy(
-            Policy::allow_all("u", "*")
-                .with_rule(PolicyCondition::UrlMatch("*".to_string()), PolicyAction::Allow),
-        );
+        e_url.add_policy(Policy::allow_all("u", "*").with_rule(
+            PolicyCondition::UrlMatch("*".to_string()),
+            PolicyAction::Allow,
+        ));
         assert!(!e_url.has_resource_guard(&input));
 
         // A guard scoped to a different credential does NOT match this input.
         let e_other = PolicyEngine::new();
-        e_other.add_policy(
-            Policy::deny_all("rl", "other-*")
-                .with_rule(PolicyCondition::RateLimit { max: 1, window_secs: 60 }, PolicyAction::Allow),
-        );
+        e_other.add_policy(Policy::deny_all("rl", "other-*").with_rule(
+            PolicyCondition::RateLimit {
+                max: 1,
+                window_secs: 60,
+            },
+            PolicyAction::Allow,
+        ));
         assert!(!e_other.has_resource_guard(&input));
     }
 
@@ -765,18 +821,24 @@ mod tests {
         let engine = PolicyEngine::new();
         engine.set_default_deny(false);
         // Ordered FIRST: a broad allow with an explicit allow rule.
-        engine.add_policy(
-            Policy::allow_all("allow-all", "*")
-                .with_rule(PolicyCondition::UrlMatch("*".to_string()), PolicyAction::Allow),
-        );
+        engine.add_policy(Policy::allow_all("allow-all", "*").with_rule(
+            PolicyCondition::UrlMatch("*".to_string()),
+            PolicyAction::Allow,
+        ));
         // Then a kill policy scoped to agent "bot-7".
         engine.add_policy(Policy::kill_switch("halt:bot-7", "bot-7"));
 
-        let halted = Principal { id: "k1".to_string(), agent_label: Some("bot-7".to_string()), owner: None, workload_id: None };
+        let halted = Principal {
+            id: "k1".to_string(),
+            agent_label: Some("bot-7".to_string()),
+            owner: None,
+            workload_id: None,
+        };
         let decision = engine.evaluate_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
-            method: Some("GET"), action: None,
+            method: Some("GET"),
+            action: None,
             principal: Some(&halted),
             spend: None,
         });
@@ -786,25 +848,39 @@ mod tests {
         }
 
         // A different agent is unaffected → the allow rule applies.
-        let other = Principal { id: "k2".to_string(), agent_label: Some("bot-9".to_string()), owner: None, workload_id: None };
+        let other = Principal {
+            id: "k2".to_string(),
+            agent_label: Some("bot-9".to_string()),
+            owner: None,
+            workload_id: None,
+        };
         let decision = engine.evaluate_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
-            method: Some("GET"), action: None,
+            method: Some("GET"),
+            action: None,
             principal: Some(&other),
             spend: None,
         });
-        assert_eq!(decision, PolicyDecision::Allow, "non-halted agent still allowed");
+        assert_eq!(
+            decision,
+            PolicyDecision::Allow,
+            "non-halted agent still allowed"
+        );
 
         // The kill is also authoritative on the read-only resume path.
         let resume = engine.evaluate_readonly_full(&EvalInput {
             credential_alias: "github-prod",
             url: Some("https://api.github.com/x"),
-            method: Some("GET"), action: None,
+            method: Some("GET"),
+            action: None,
             principal: Some(&halted),
             spend: None,
         });
-        assert!(matches!(resume, PolicyDecision::Deny(_)), "kill applies on resume too");
+        assert!(
+            matches!(resume, PolicyDecision::Deny(_)),
+            "kill applies on resume too"
+        );
     }
 
     #[test]
@@ -856,12 +932,19 @@ mod tests {
         let input = EvalInput {
             credential_alias: "any",
             url: None,
-            method: None, action: None,
+            method: None,
+            action: None,
             principal: Some(&p),
             spend: None,
         };
-        assert!(engine.is_halted(&input), "halt on the credential id holds despite a workload identity");
-        assert!(matches!(engine.evaluate_full(&input), PolicyDecision::Deny(_)));
+        assert!(
+            engine.is_halted(&input),
+            "halt on the credential id holds despite a workload identity"
+        );
+        assert!(matches!(
+            engine.evaluate_full(&input),
+            PolicyDecision::Deny(_)
+        ));
     }
 
     #[test]
@@ -870,18 +953,42 @@ mod tests {
         // workload_id; a request that doesn't present it isn't caught by that policy.
         let engine = PolicyEngine::new();
         engine.set_default_deny(false);
-        engine.add_policy(Policy::deny_all("block-svid", "*").with_principal("spiffe://example.org/*"));
+        engine.add_policy(
+            Policy::deny_all("block-svid", "*").with_principal("spiffe://example.org/*"),
+        );
         let with_svid = Principal {
             id: "vk_keyX".to_string(),
             agent_label: None,
             owner: None,
             workload_id: Some("spiffe://example.org/ns/prod/sa/agent".to_string()),
         };
-        let input = EvalInput { credential_alias: "any", url: None, method: None, action: None, principal: Some(&with_svid), spend: None };
-        assert!(matches!(engine.evaluate_full(&input), PolicyDecision::Deny(_)), "policy targets the resolved SVID");
+        let input = EvalInput {
+            credential_alias: "any",
+            url: None,
+            method: None,
+            action: None,
+            principal: Some(&with_svid),
+            spend: None,
+        };
+        assert!(
+            matches!(engine.evaluate_full(&input), PolicyDecision::Deny(_)),
+            "policy targets the resolved SVID"
+        );
         // The same credential WITHOUT presenting the SVID is not caught by the SVID policy.
-        let without = Principal { id: "vk_keyX".to_string(), agent_label: None, owner: None, workload_id: None };
-        let input2 = EvalInput { credential_alias: "any", url: None, method: None, action: None, principal: Some(&without), spend: None };
+        let without = Principal {
+            id: "vk_keyX".to_string(),
+            agent_label: None,
+            owner: None,
+            workload_id: None,
+        };
+        let input2 = EvalInput {
+            credential_alias: "any",
+            url: None,
+            method: None,
+            action: None,
+            principal: Some(&without),
+            spend: None,
+        };
         assert_eq!(engine.evaluate_full(&input2), PolicyDecision::Allow);
     }
 
@@ -893,12 +1000,10 @@ mod tests {
             name: "github-readonly".to_string(),
             credential_pattern: "github-*".to_string(),
             principal_pattern: None,
-            rules: vec![
-                PolicyRule {
-                    condition: PolicyCondition::UrlMatch("https://api.github.com/*".to_string()),
-                    action: PolicyAction::Allow,
-                },
-            ],
+            rules: vec![PolicyRule {
+                condition: PolicyCondition::UrlMatch("https://api.github.com/*".to_string()),
+                action: PolicyAction::Allow,
+            }],
             default_action: PolicyAction::Deny,
             kill: false,
         });
@@ -930,20 +1035,31 @@ mod tests {
             name: "readonly".to_string(),
             credential_pattern: "*".to_string(),
             principal_pattern: None,
-            rules: vec![
-                PolicyRule {
-                    condition: PolicyCondition::MethodMatch(vec!["GET".to_string(), "HEAD".to_string()]),
-                    action: PolicyAction::Allow,
-                },
-            ],
+            rules: vec![PolicyRule {
+                condition: PolicyCondition::MethodMatch(vec![
+                    "GET".to_string(),
+                    "HEAD".to_string(),
+                ]),
+                action: PolicyAction::Allow,
+            }],
             default_action: PolicyAction::Deny,
             kill: false,
         });
 
-        let decision = engine.evaluate("any", Some("https://api.example.com"), Some("GET"), &make_context());
+        let decision = engine.evaluate(
+            "any",
+            Some("https://api.example.com"),
+            Some("GET"),
+            &make_context(),
+        );
         assert_eq!(decision, PolicyDecision::Allow);
 
-        let decision = engine.evaluate("any", Some("https://api.example.com"), Some("POST"), &make_context());
+        let decision = engine.evaluate(
+            "any",
+            Some("https://api.example.com"),
+            Some("POST"),
+            &make_context(),
+        );
         assert!(matches!(decision, PolicyDecision::Deny(_)));
     }
 
@@ -965,27 +1081,35 @@ mod tests {
             name: "rate-limit".to_string(),
             credential_pattern: "*".to_string(),
             principal_pattern: None,
-            rules: vec![
-                PolicyRule {
-                    condition: PolicyCondition::RateLimit {
-                        max: 3,
-                        window_secs: 60,
-                    },
-                    action: PolicyAction::Allow,
+            rules: vec![PolicyRule {
+                condition: PolicyCondition::RateLimit {
+                    max: 3,
+                    window_secs: 60,
                 },
-            ],
+                action: PolicyAction::Allow,
+            }],
             default_action: PolicyAction::Deny,
             kill: false,
         });
 
         // First 3 requests should succeed
         for _ in 0..3 {
-            let decision = engine.evaluate("test", Some("https://api.example.com"), Some("GET"), &make_context());
+            let decision = engine.evaluate(
+                "test",
+                Some("https://api.example.com"),
+                Some("GET"),
+                &make_context(),
+            );
             assert_eq!(decision, PolicyDecision::Allow);
         }
 
         // 4th request should be denied (rate limit exceeded)
-        let decision = engine.evaluate("test", Some("https://api.example.com"), Some("GET"), &make_context());
+        let decision = engine.evaluate(
+            "test",
+            Some("https://api.example.com"),
+            Some("GET"),
+            &make_context(),
+        );
         assert!(matches!(decision, PolicyDecision::Deny(_)));
     }
 
@@ -1020,7 +1144,12 @@ mod tests {
 
         // The one *real* request still goes through (budget was untouched)...
         assert_eq!(
-            engine.evaluate("test", Some("https://api.example.com"), Some("GET"), &make_context()),
+            engine.evaluate(
+                "test",
+                Some("https://api.example.com"),
+                Some("GET"),
+                &make_context()
+            ),
             PolicyDecision::Allow
         );
         // ...and a read-only check after the budget is spent still passes,
@@ -1034,13 +1163,23 @@ mod tests {
     // ==================== V4: principal dimension ====================
 
     fn input_spend<'a>(alias: &'a str, spend: &'a SpendAttempt) -> EvalInput<'a> {
-        EvalInput { credential_alias: alias, url: None, method: None, action: None, principal: None, spend: Some(spend) }
+        EvalInput {
+            credential_alias: alias,
+            url: None,
+            method: None,
+            action: None,
+            principal: None,
+            spend: Some(spend),
+        }
     }
 
     fn spend_policy(asset: &str, per_action_max: u64) -> Policy {
         let mut p = Policy::deny_all("spend", "pay-*");
         p.rules = vec![PolicyRule {
-            condition: PolicyCondition::SpendCap { asset: asset.to_string(), per_action_max },
+            condition: PolicyCondition::SpendCap {
+                asset: asset.to_string(),
+                per_action_max,
+            },
             action: PolicyAction::Allow,
         }];
         p
@@ -1050,16 +1189,51 @@ mod tests {
     fn test_principal_pattern_scopes_policy() {
         let engine = PolicyEngine::new();
         engine.set_default_deny(false); // isolate: unmatched → allow
-        // Per-agent Deny for "refund-bot" only (kill-leg W3).
-        engine.add_policy(Policy::deny_all("kill-refund-bot", "pay-*").with_principal("refund-bot"));
+                                        // Per-agent Deny for "refund-bot" only (kill-leg W3).
+        engine
+            .add_policy(Policy::deny_all("kill-refund-bot", "pay-*").with_principal("refund-bot"));
 
-        let bot = Principal { id: "tok1".to_string(), agent_label: Some("refund-bot".to_string()), owner: None, workload_id: None };
-        let other = Principal { id: "tok2".to_string(), agent_label: Some("other-bot".to_string()), owner: None, workload_id: None };
-        let bot_in = EvalInput { credential_alias: "pay-1", url: None, method: None, action: None, principal: Some(&bot), spend: None };
-        let other_in = EvalInput { credential_alias: "pay-1", url: None, method: None, action: None, principal: Some(&other), spend: None };
-        let none_in = EvalInput { credential_alias: "pay-1", url: None, method: None, action: None, principal: None, spend: None };
+        let bot = Principal {
+            id: "tok1".to_string(),
+            agent_label: Some("refund-bot".to_string()),
+            owner: None,
+            workload_id: None,
+        };
+        let other = Principal {
+            id: "tok2".to_string(),
+            agent_label: Some("other-bot".to_string()),
+            owner: None,
+            workload_id: None,
+        };
+        let bot_in = EvalInput {
+            credential_alias: "pay-1",
+            url: None,
+            method: None,
+            action: None,
+            principal: Some(&bot),
+            spend: None,
+        };
+        let other_in = EvalInput {
+            credential_alias: "pay-1",
+            url: None,
+            method: None,
+            action: None,
+            principal: Some(&other),
+            spend: None,
+        };
+        let none_in = EvalInput {
+            credential_alias: "pay-1",
+            url: None,
+            method: None,
+            action: None,
+            principal: None,
+            spend: None,
+        };
         // refund-bot is denied; other agents and principal-less requests are not.
-        assert!(matches!(engine.evaluate_full(&bot_in), PolicyDecision::Deny(_)));
+        assert!(matches!(
+            engine.evaluate_full(&bot_in),
+            PolicyDecision::Deny(_)
+        ));
         assert_eq!(engine.evaluate_full(&other_in), PolicyDecision::Allow);
         assert_eq!(engine.evaluate_full(&none_in), PolicyDecision::Allow);
     }
@@ -1091,9 +1265,21 @@ mod tests {
         let engine = PolicyEngine::new();
         engine.set_default_deny(false);
         engine.add_policy(Policy::deny_all("kill-by-id", "*").with_principal("tok-*"));
-        let p = Principal { id: "tok-abc".to_string(), agent_label: None, owner: None, workload_id: None };
+        let p = Principal {
+            id: "tok-abc".to_string(),
+            agent_label: None,
+            owner: None,
+            workload_id: None,
+        };
         assert!(matches!(
-            engine.evaluate_full(&EvalInput { credential_alias: "any", url: None, method: None, action: None, principal: Some(&p), spend: None }),
+            engine.evaluate_full(&EvalInput {
+                credential_alias: "any",
+                url: None,
+                method: None,
+                action: None,
+                principal: Some(&p),
+                spend: None
+            }),
             PolicyDecision::Deny(_)
         ));
     }
@@ -1104,10 +1290,22 @@ mod tests {
     fn test_spend_cap_per_action() {
         let engine = PolicyEngine::new();
         engine.add_policy(spend_policy("usd", 5000));
-        let within = SpendAttempt { asset: "usd".to_string(), amount: 5000 };
-        let over = SpendAttempt { asset: "usd".to_string(), amount: 5001 };
-        assert_eq!(engine.evaluate_full(&input_spend("pay-1", &within)), PolicyDecision::Allow);
-        assert!(matches!(engine.evaluate_full(&input_spend("pay-1", &over)), PolicyDecision::Deny(_)));
+        let within = SpendAttempt {
+            asset: "usd".to_string(),
+            amount: 5000,
+        };
+        let over = SpendAttempt {
+            asset: "usd".to_string(),
+            amount: 5001,
+        };
+        assert_eq!(
+            engine.evaluate_full(&input_spend("pay-1", &within)),
+            PolicyDecision::Allow
+        );
+        assert!(matches!(
+            engine.evaluate_full(&input_spend("pay-1", &over)),
+            PolicyDecision::Deny(_)
+        ));
     }
 
     #[test]
@@ -1115,11 +1313,27 @@ mod tests {
         let engine = PolicyEngine::new();
         engine.add_policy(spend_policy("usd", 100));
         // No spend attempt extracted → SpendCap false → default Deny.
-        let no_spend = EvalInput { credential_alias: "pay-1", url: None, method: None, action: None, principal: None, spend: None };
-        assert!(matches!(engine.evaluate_full(&no_spend), PolicyDecision::Deny(_)));
+        let no_spend = EvalInput {
+            credential_alias: "pay-1",
+            url: None,
+            method: None,
+            action: None,
+            principal: None,
+            spend: None,
+        };
+        assert!(matches!(
+            engine.evaluate_full(&no_spend),
+            PolicyDecision::Deny(_)
+        ));
         // Wrong asset also doesn't satisfy the cap → deny.
-        let eur = SpendAttempt { asset: "eur".to_string(), amount: 1 };
-        assert!(matches!(engine.evaluate_full(&input_spend("pay-1", &eur)), PolicyDecision::Deny(_)));
+        let eur = SpendAttempt {
+            asset: "eur".to_string(),
+            amount: 1,
+        };
+        assert!(matches!(
+            engine.evaluate_full(&input_spend("pay-1", &eur)),
+            PolicyDecision::Deny(_)
+        ));
     }
 
     #[test]
@@ -1129,14 +1343,32 @@ mod tests {
         // over-cap denial leaves no residue that affects a later in-cap call.
         let engine = PolicyEngine::new();
         engine.add_policy(spend_policy("usd", 100));
-        let eighty = SpendAttempt { asset: "usd".to_string(), amount: 80 };
-        let over = SpendAttempt { asset: "usd".to_string(), amount: 101 };
+        let eighty = SpendAttempt {
+            asset: "usd".to_string(),
+            amount: 80,
+        };
+        let over = SpendAttempt {
+            asset: "usd".to_string(),
+            amount: 101,
+        };
         for _ in 0..5 {
-            assert_eq!(engine.evaluate_full(&input_spend("pay-1", &eighty)), PolicyDecision::Allow);
-            assert_eq!(engine.evaluate_readonly_full(&input_spend("pay-1", &eighty)), PolicyDecision::Allow);
+            assert_eq!(
+                engine.evaluate_full(&input_spend("pay-1", &eighty)),
+                PolicyDecision::Allow
+            );
+            assert_eq!(
+                engine.evaluate_readonly_full(&input_spend("pay-1", &eighty)),
+                PolicyDecision::Allow
+            );
         }
-        assert!(matches!(engine.evaluate_full(&input_spend("pay-1", &over)), PolicyDecision::Deny(_)));
-        assert_eq!(engine.evaluate_full(&input_spend("pay-1", &eighty)), PolicyDecision::Allow);
+        assert!(matches!(
+            engine.evaluate_full(&input_spend("pay-1", &over)),
+            PolicyDecision::Deny(_)
+        ));
+        assert_eq!(
+            engine.evaluate_full(&input_spend("pay-1", &eighty)),
+            PolicyDecision::Allow
+        );
     }
 
     #[test]
@@ -1148,7 +1380,9 @@ mod tests {
             asset: Some("usd".to_string()),
             asset_pointer: None,
         };
-        let got = ext.extract(&serde_json::json!({"body": {"amount": 4200}})).unwrap();
+        let got = ext
+            .extract(&serde_json::json!({"body": {"amount": 4200}}))
+            .unwrap();
         assert_eq!(got.amount, 4200);
         assert_eq!(got.asset, "usd");
         // Missing amount → None (fail-closed upstream).
@@ -1170,7 +1404,13 @@ mod tests {
         assert_eq!(attempt.amount, 7);
         assert_eq!(attempt.asset, "eur");
         // A non-matching action yields no extractor → None.
-        assert!(extract_spend(std::slice::from_ref(&by_ptr), "postgres.run_sql", "stripe-prod", &serde_json::json!({})).is_none());
+        assert!(extract_spend(
+            std::slice::from_ref(&by_ptr),
+            "postgres.run_sql",
+            "stripe-prod",
+            &serde_json::json!({})
+        )
+        .is_none());
     }
 
     #[test]
@@ -1188,7 +1428,10 @@ mod tests {
         nested.rules = vec![PolicyRule {
             condition: PolicyCondition::And(vec![
                 PolicyCondition::url("https://x/*"),
-                PolicyCondition::SpendCap { asset: "usd".into(), per_action_max: 1 },
+                PolicyCondition::SpendCap {
+                    asset: "usd".into(),
+                    per_action_max: 1,
+                },
             ]),
             action: PolicyAction::Allow,
         }];

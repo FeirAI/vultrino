@@ -74,10 +74,10 @@ impl CredentialResolver {
 mod tests {
     use super::*;
     use crate::auth::{ApiKey, Role};
+    use crate::Secret;
     use crate::{CredentialData, CredentialMetadata};
     use async_trait::async_trait;
     use parking_lot::RwLock;
-    use crate::Secret;
     use std::collections::HashMap;
 
     /// Mock storage for testing
@@ -152,7 +152,10 @@ mod tests {
             Ok(None)
         }
 
-        async fn get_role_by_name(&self, _name: &str) -> Result<Option<Role>, crate::storage::StorageError> {
+        async fn get_role_by_name(
+            &self,
+            _name: &str,
+        ) -> Result<Option<Role>, crate::storage::StorageError> {
             Ok(None)
         }
 
@@ -168,7 +171,10 @@ mod tests {
             Ok(())
         }
 
-        async fn get_api_key_by_hash(&self, _hash: &str) -> Result<Option<ApiKey>, crate::storage::StorageError> {
+        async fn get_api_key_by_hash(
+            &self,
+            _hash: &str,
+        ) -> Result<Option<ApiKey>, crate::storage::StorageError> {
             Ok(None)
         }
 
@@ -180,7 +186,10 @@ mod tests {
             Ok(())
         }
 
-        async fn update_api_key_last_used(&self, _id: &str) -> Result<(), crate::storage::StorageError> {
+        async fn update_api_key_last_used(
+            &self,
+            _id: &str,
+        ) -> Result<(), crate::storage::StorageError> {
             Ok(())
         }
     }

@@ -48,6 +48,7 @@ use axum::{
     Json,
 };
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 use crate::auth::UseToken;
 use crate::mcp::McpServer;
@@ -136,7 +137,10 @@ fn inject_bearer(message: &mut serde_json::Value, secret: &str) {
             // empty for a use-token, role-filtered for an API key); inject the Bearer
             // so the handler can resolve the principal over HTTP too.
             if let Some(params) = ensure_object(message, "params") {
-                params.insert("api_key".to_string(), serde_json::Value::String(secret.to_string()));
+                params.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String(secret.to_string()),
+                );
             }
         }
         "tools/call" => {
@@ -148,7 +152,10 @@ fn inject_bearer(message: &mut serde_json::Value, secret: &str) {
                     *args = serde_json::Value::Object(Default::default());
                 }
                 if let Some(obj) = args.as_object_mut() {
-                    obj.insert("api_key".to_string(), serde_json::Value::String(secret.to_string()));
+                    obj.insert(
+                        "api_key".to_string(),
+                        serde_json::Value::String(secret.to_string()),
+                    );
                 }
             }
         }
@@ -194,6 +201,100 @@ fn unauthorized(id: serde_json::Value, reason: &str) -> Response {
         .into_response()
 }
 
+fn transport_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "jsonrpc": "2.0", "id": null,
+            "error": { "code": -32600, "message": message }
+        })),
+    )
+        .into_response()
+}
+
+fn validate_transport_headers(headers: &HeaderMap) -> Result<(), Box<Response>> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if content_type
+        .split(';')
+        .next()
+        .is_none_or(|v| v.trim() != "application/json")
+    {
+        return Err(Box::new(transport_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "MCP POST requires Content-Type: application/json",
+        )));
+    }
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if !accept.contains("application/json") || !accept.contains("text/event-stream") {
+        return Err(Box::new(transport_error(
+            StatusCode::NOT_ACCEPTABLE,
+            "MCP POST Accept must include application/json and text/event-stream",
+        )));
+    }
+    if let Some(version) = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok())
+    {
+        if !matches!(version, "2025-06-18" | "2025-03-26" | "2024-11-05") {
+            return Err(Box::new(transport_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported MCP-Protocol-Version",
+            )));
+        }
+    }
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let same_host = url::Url::parse(origin)
+            .ok()
+            .and_then(|url| {
+                url.host_str().map(|host| match url.port() {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.to_string(),
+                })
+            })
+            .zip(
+                headers
+                    .get(header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+            )
+            .is_some_and(|(origin_host, request_host)| {
+                origin_host.eq_ignore_ascii_case(&request_host)
+            });
+        let explicitly_allowed = std::env::var("VULTRINO_MCP_ALLOWED_ORIGINS")
+            .ok()
+            .is_some_and(|allowed| allowed.split(',').any(|v| v.trim() == origin));
+        if !same_host && !explicitly_allowed {
+            return Err(Box::new(transport_error(
+                StatusCode::FORBIDDEN,
+                "MCP Origin is not allowed",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn request_key(secret: &str, id: &serde_json::Value) -> String {
+    format!("{}:{}", UseToken::hash(secret), id)
+}
+
+async fn abort_tracked_request(
+    requests: &tokio::sync::RwLock<std::collections::HashMap<String, tokio::task::AbortHandle>>,
+    key: &str,
+) -> bool {
+    if let Some(handle) = requests.write().await.remove(key) {
+        handle.abort();
+        true
+    } else {
+        false
+    }
+}
+
 /// `POST /mcp` — the networked JSON-RPC MCP endpoint.
 ///
 /// Authenticates the caller via the `Authorization: Bearer …` header, scopes the
@@ -206,6 +307,9 @@ pub async fn mcp_jsonrpc(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    if let Err(response) = validate_transport_headers(&headers) {
+        return *response;
+    }
     // Parse the JSON-RPC envelope first so we can echo its id on an auth error.
     let mut message: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -232,7 +336,10 @@ pub async fn mcp_jsonrpc(
         )
             .into_response();
     }
-    let id = message.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let id = message
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     // Authenticate the inbound Bearer at the transport boundary (401 gate).
     let secret = match extract_bearer(&headers) {
@@ -248,6 +355,13 @@ pub async fn mcp_jsonrpc(
         return unauthorized(id, reason);
     }
 
+    if message.get("method").and_then(|v| v.as_str()) == Some("notifications/cancelled") {
+        if let Some(cancelled_id) = message.pointer("/params/requestId") {
+            abort_tracked_request(&state.mcp_requests, &request_key(&secret, cancelled_id)).await;
+        }
+        return StatusCode::ACCEPTED.into_response();
+    }
+
     // Scope the call to this principal: the header token is authoritative and
     // overwrites any token the agent put in the body.
     inject_bearer(&mut message, &secret);
@@ -260,9 +374,53 @@ pub async fn mcp_jsonrpc(
     // execution server. `McpServer` is a cheap wrapper over the shared `Arc`s, so
     // building one per request is fine; the only mutable state it carries is the
     // `initialized` handshake flag, which the HTTP transport does not rely on.
-    let mut mcp = McpServer::new(Arc::clone(&state.server), Arc::clone(&state.auth_manager));
     let message_str = message.to_string();
-    match mcp.handle_jsonrpc(&message_str).await {
+    let method = message
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let tracked = id != serde_json::Value::Null && method != "initialize" && method != "ping";
+    let response = if tracked {
+        let key = request_key(&secret, &id);
+        let (start_tx, start_rx) = oneshot::channel();
+        let requests = Arc::clone(&state.mcp_requests);
+        let server = Arc::clone(&state.server);
+        let auth = Arc::clone(&state.auth_manager);
+        let task_key = key.clone();
+        let task = tokio::spawn(async move {
+            let _ = start_rx.await;
+            let mut mcp = McpServer::new(server, auth);
+            let result = mcp.handle_jsonrpc(&message_str).await;
+            requests.write().await.remove(&task_key);
+            result
+        });
+        let abort = task.abort_handle();
+        if state
+            .mcp_requests
+            .write()
+            .await
+            .insert(key, abort)
+            .is_some()
+        {
+            task.abort();
+            return transport_error(StatusCode::CONFLICT, "duplicate in-flight MCP request id");
+        }
+        let _ = start_tx.send(());
+        match task.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => return StatusCode::NO_CONTENT.into_response(),
+            Err(_) => {
+                return transport_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "MCP request task failed",
+                )
+            }
+        }
+    } else {
+        let mut mcp = McpServer::new(Arc::clone(&state.server), Arc::clone(&state.auth_manager));
+        mcp.handle_jsonrpc(&message_str).await
+    };
+    match response {
         // A normal JSON-RPC response (success OR a JSON-RPC error like a denied
         // tools/call) is HTTP 200 with the JSON-RPC body — the transport
         // succeeded; the JSON-RPC layer carries the per-call outcome.
@@ -270,5 +428,26 @@ pub async fn mcp_jsonrpc(
         // A notification (e.g. `initialized`) produces no response — 202 Accepted
         // with an empty body, per JSON-RPC-over-HTTP convention.
         None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn cancellation_aborts_and_removes_the_exact_tracked_request() {
+        let requests = RwLock::new(HashMap::new());
+        let task = tokio::spawn(async { std::future::pending::<()>().await });
+        requests
+            .write()
+            .await
+            .insert("principal:1".into(), task.abort_handle());
+        assert!(!abort_tracked_request(&requests, "principal:2").await);
+        assert!(abort_tracked_request(&requests, "principal:1").await);
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(requests.read().await.is_empty());
     }
 }

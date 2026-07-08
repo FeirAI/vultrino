@@ -63,11 +63,14 @@ use crate::plugins::PluginInstaller;
 use crate::{Credential, CredentialData, Secret};
 
 use super::api::refresh_auth_data;
-use super::auth::{clear_session, get_or_create_csrf_token, regenerate_csrf_token, set_authenticated_session, validate_csrf_token, RequireAuth};
+use super::auth::{
+    clear_session, get_or_create_csrf_token, regenerate_csrf_token, set_authenticated_session,
+    validate_csrf_token, RequireAuth,
+};
 use super::server::AppState;
 use super::templates::{
-    ApprovalConfirmTemplate, ApprovalDecidedTemplate, ApprovalDisplay, ApprovalsListTemplate,
-    AuditLogTemplate, ApiKeyDisplay, CredentialDisplay, CredentialNewTemplate,
+    ApiKeyDisplay, ApprovalConfirmTemplate, ApprovalDecidedTemplate, ApprovalDisplay,
+    ApprovalsListTemplate, AuditLogTemplate, CredentialDisplay, CredentialNewTemplate,
     CredentialsListTemplate, DashboardStats, DashboardTemplate, FlashKind, FlashMessage,
     KeyNewTemplate, KeysListTemplate, LoginTemplate, PluginCredentialType, RoleDisplay,
     RoleNewTemplate, RoleOption, RolesListTemplate, UseTokenDisplay, UseTokenNewTemplate,
@@ -78,7 +81,11 @@ use super::templates::{
 
 pub async fn login_page() -> impl IntoResponse {
     let template = LoginTemplate { error: None };
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 #[derive(Deserialize)]
@@ -102,15 +109,26 @@ pub async fn login_submit(
     if let Err(remaining_secs) = rate_limiter.check_rate_limit(&client_ip).await {
         let minutes = remaining_secs / 60;
         let error_msg = if minutes > 0 {
-            format!("Too many login attempts. Please try again in {} minute(s).", minutes + 1)
+            format!(
+                "Too many login attempts. Please try again in {} minute(s).",
+                minutes + 1
+            )
         } else {
-            format!("Too many login attempts. Please try again in {} seconds.", remaining_secs)
+            format!(
+                "Too many login attempts. Please try again in {} seconds.",
+                remaining_secs
+            )
         };
 
         let template = LoginTemplate {
             error: Some(error_msg),
         };
-        return Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e))).into_response();
+        return Html(
+            template
+                .render()
+                .unwrap_or_else(|e| format!("Template error: {}", e)),
+        )
+        .into_response();
     }
 
     let admin_auth = &state.admin_auth;
@@ -118,14 +136,18 @@ pub async fn login_submit(
     // Verify credentials using constant-time comparison to prevent timing attacks
     // Always verify password regardless of username match to prevent username enumeration
     let password_valid = admin_auth.verify_password(&form.password);
-    let username_valid = constant_time_eq(form.username.as_bytes(), admin_auth.username().as_bytes());
+    let username_valid =
+        constant_time_eq(form.username.as_bytes(), admin_auth.username().as_bytes());
 
     if username_valid && password_valid {
         // Clear rate limit attempts on successful login
         rate_limiter.clear_attempts(&client_ip).await;
 
         // Set session
-        if set_authenticated_session(&session, &form.username).await.is_ok() {
+        if set_authenticated_session(&session, &form.username)
+            .await
+            .is_ok()
+        {
             return Redirect::to("/dashboard").into_response();
         }
     }
@@ -137,7 +159,12 @@ pub async fn login_submit(
     let template = LoginTemplate {
         error: Some("Invalid username or password".to_string()),
     };
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e))).into_response()
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
+    .into_response()
 }
 
 pub async fn logout(session: Session) -> impl IntoResponse {
@@ -147,10 +174,7 @@ pub async fn logout(session: Session) -> impl IntoResponse {
 
 // ============== Dashboard ==============
 
-pub async fn dashboard(
-    State(state): State<AppState>,
-    auth: RequireAuth,
-) -> impl IntoResponse {
+pub async fn dashboard(State(state): State<AppState>, auth: RequireAuth) -> impl IntoResponse {
     let storage = &state.storage;
 
     // Get stats
@@ -171,7 +195,11 @@ pub async fn dashboard(
         flash: None,
     };
 
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 // ============== Credentials ==============
@@ -182,7 +210,8 @@ pub async fn credentials_list(
     auth: RequireAuth,
 ) -> impl IntoResponse {
     let credentials = state.storage.list().await.unwrap_or_default();
-    let credential_displays: Vec<CredentialDisplay> = credentials.iter().map(|c| c.into()).collect();
+    let credential_displays: Vec<CredentialDisplay> =
+        credentials.iter().map(|c| c.into()).collect();
 
     let csrf_token = get_or_create_csrf_token(&session).await.unwrap_or_default();
 
@@ -193,7 +222,11 @@ pub async fn credentials_list(
         csrf_token,
     };
 
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 pub async fn credential_new(session: Session, auth: RequireAuth) -> impl IntoResponse {
@@ -209,7 +242,11 @@ pub async fn credential_new(session: Session, auth: RequireAuth) -> impl IntoRes
         csrf_token,
     };
 
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 /// Get all credential types defined by installed plugins
@@ -274,9 +311,13 @@ pub async fn credential_create(
 ) -> Response {
     // Validate CSRF token
     if !validate_csrf_token(&session, &form.csrf_token).await {
-        return render_credential_new_error_with_session(&session, auth, "Invalid security token. Please try again.")
-            .await
-            .into_response();
+        return render_credential_new_error_with_session(
+            &session,
+            auth,
+            "Invalid security token. Please try again.",
+        )
+        .await
+        .into_response();
     }
     // Build credential data based on type
     let data = match form.credential_type.as_str() {
@@ -284,14 +325,20 @@ pub async fn credential_create(
             let key = match form.api_key {
                 Some(k) if !k.is_empty() => k,
                 _ => {
-                    return render_credential_new_error_with_session(&session, auth, "API key is required")
-                        .await
-                        .into_response();
+                    return render_credential_new_error_with_session(
+                        &session,
+                        auth,
+                        "API key is required",
+                    )
+                    .await
+                    .into_response();
                 }
             };
             CredentialData::ApiKey {
                 key: Secret::new(key),
-                header_name: form.header_name.unwrap_or_else(|| "Authorization".to_string()),
+                header_name: form
+                    .header_name
+                    .unwrap_or_else(|| "Authorization".to_string()),
                 header_prefix: form.header_prefix.unwrap_or_else(|| "Bearer ".to_string()),
             }
         }
@@ -299,17 +346,25 @@ pub async fn credential_create(
             let username = match form.username {
                 Some(u) if !u.is_empty() => u,
                 _ => {
-                    return render_credential_new_error_with_session(&session, auth, "Username is required")
-                        .await
-                        .into_response();
+                    return render_credential_new_error_with_session(
+                        &session,
+                        auth,
+                        "Username is required",
+                    )
+                    .await
+                    .into_response();
                 }
             };
             let password = match form.password {
                 Some(p) if !p.is_empty() => p,
                 _ => {
-                    return render_credential_new_error_with_session(&session, auth, "Password is required")
-                        .await
-                        .into_response();
+                    return render_credential_new_error_with_session(
+                        &session,
+                        auth,
+                        "Password is required",
+                    )
+                    .await
+                    .into_response();
                 }
             };
             CredentialData::BasicAuth {
@@ -321,44 +376,68 @@ pub async fn credential_create(
             let client_id = match form.client_id {
                 Some(id) if !id.is_empty() => id,
                 _ => {
-                    return render_credential_new_error_with_session(&session, auth, "Client ID is required")
-                        .await
-                        .into_response();
+                    return render_credential_new_error_with_session(
+                        &session,
+                        auth,
+                        "Client ID is required",
+                    )
+                    .await
+                    .into_response();
                 }
             };
             let client_secret = match form.client_secret {
                 Some(s) if !s.is_empty() => s,
                 _ => {
-                    return render_credential_new_error_with_session(&session, auth, "Client Secret is required")
-                        .await
-                        .into_response();
+                    return render_credential_new_error_with_session(
+                        &session,
+                        auth,
+                        "Client Secret is required",
+                    )
+                    .await
+                    .into_response();
                 }
             };
             let token_url = match form.token_url {
                 Some(url) if !url.is_empty() => {
                     // Validate token URL - must be https for security
                     if !url.starts_with("https://") {
-                        return render_credential_new_error_with_session(&session, auth, "Token URL must use HTTPS")
-                            .await
-                            .into_response();
+                        return render_credential_new_error_with_session(
+                            &session,
+                            auth,
+                            "Token URL must use HTTPS",
+                        )
+                        .await
+                        .into_response();
                     }
                     url
                 }
                 _ => {
-                    return render_credential_new_error_with_session(&session, auth, "Token URL is required")
-                        .await
-                        .into_response();
+                    return render_credential_new_error_with_session(
+                        &session,
+                        auth,
+                        "Token URL is required",
+                    )
+                    .await
+                    .into_response();
                 }
             };
 
             // Parse scopes from comma-separated string
             let scopes: Vec<String> = form
                 .scopes
-                .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                .map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
                 .unwrap_or_default();
 
             // Optional refresh token (some providers give it upfront)
-            let refresh_token = form.refresh_token.filter(|s| !s.is_empty()).map(Secret::new);
+            let refresh_token = form
+                .refresh_token
+                .filter(|s| !s.is_empty())
+                .map(Secret::new);
 
             CredentialData::OAuth2 {
                 client_id,
@@ -374,20 +453,30 @@ pub async fn credential_create(
             let api_key = match form.hmac_api_key {
                 Some(k) if !k.is_empty() => k,
                 _ => {
-                    return render_credential_new_error_with_session(&session, auth, "API Key is required")
-                        .await
-                        .into_response();
+                    return render_credential_new_error_with_session(
+                        &session,
+                        auth,
+                        "API Key is required",
+                    )
+                    .await
+                    .into_response();
                 }
             };
             let api_secret = match form.hmac_api_secret {
                 Some(s) if !s.is_empty() => s,
                 _ => {
-                    return render_credential_new_error_with_session(&session, auth, "API Secret is required")
-                        .await
-                        .into_response();
+                    return render_credential_new_error_with_session(
+                        &session,
+                        auth,
+                        "API Secret is required",
+                    )
+                    .await
+                    .into_response();
                 }
             };
-            let header_name = form.hmac_header_name.unwrap_or_else(|| "X-MBX-APIKEY".to_string());
+            let header_name = form
+                .hmac_header_name
+                .unwrap_or_else(|| "X-MBX-APIKEY".to_string());
             let recv_window: u64 = form
                 .hmac_recv_window
                 .and_then(|s| s.parse().ok())
@@ -404,13 +493,20 @@ pub async fn credential_create(
             let private_key = match form.ecdsa_private_key {
                 Some(k) if !k.is_empty() => k,
                 _ => {
-                    return render_credential_new_error_with_session(&session, auth, "Private Key is required")
-                        .await
-                        .into_response();
+                    return render_credential_new_error_with_session(
+                        &session,
+                        auth,
+                        "Private Key is required",
+                    )
+                    .await
+                    .into_response();
                 }
             };
             let api_address = form.ecdsa_api_address.filter(|s| !s.is_empty());
-            let testnet = form.ecdsa_testnet.map(|s| s == "true" || s == "1" || s == "on").unwrap_or(false);
+            let testnet = form
+                .ecdsa_testnet
+                .map(|s| s == "true" || s == "1" || s == "on")
+                .unwrap_or(false);
 
             CredentialData::EcdsaKey {
                 private_key: Secret::new(private_key),
@@ -423,14 +519,20 @@ pub async fn credential_create(
             match parse_plugin_credential(&form).await {
                 Ok(data) => data,
                 Err(e) => {
-                    return render_credential_new_error_with_session(&session, auth, &e).await.into_response();
+                    return render_credential_new_error_with_session(&session, auth, &e)
+                        .await
+                        .into_response();
                 }
             }
         }
         _ => {
-            return render_credential_new_error_with_session(&session, auth, "Invalid credential type")
-                .await
-                .into_response();
+            return render_credential_new_error_with_session(
+                &session,
+                auth,
+                "Invalid credential type",
+            )
+            .await
+            .into_response();
         }
     };
 
@@ -448,9 +550,13 @@ pub async fn credential_create(
     }
 
     if let Err(e) = state.storage.store(&credential).await {
-        return render_credential_new_error_with_session(&session, auth, &format!("Failed to save: {}", e))
-            .await
-            .into_response();
+        return render_credential_new_error_with_session(
+            &session,
+            auth,
+            &format!("Failed to save: {}", e),
+        )
+        .await
+        .into_response();
     }
 
     Redirect::to("/credentials").into_response()
@@ -490,7 +596,10 @@ async fn parse_plugin_credential(form: &CredentialForm) -> Result<CredentialData
     // Validate required fields
     for field in cred_type.required_fields() {
         if !plugin_fields.contains_key(&field.name)
-            || plugin_fields.get(&field.name).map(|v| v.is_empty()).unwrap_or(true)
+            || plugin_fields
+                .get(&field.name)
+                .map(|v| v.is_empty())
+                .unwrap_or(true)
         {
             return Err(format!("Missing required field: {}", field.label));
         }
@@ -509,7 +618,11 @@ async fn parse_plugin_credential(form: &CredentialForm) -> Result<CredentialData
     Ok(CredentialData::Custom(data))
 }
 
-async fn render_credential_new_error_with_session(session: &Session, auth: RequireAuth, error: &str) -> impl IntoResponse {
+async fn render_credential_new_error_with_session(
+    session: &Session,
+    auth: RequireAuth,
+    error: &str,
+) -> impl IntoResponse {
     let plugin_types = get_plugin_credential_types().await;
     let csrf_token = get_or_create_csrf_token(session).await.unwrap_or_default();
     let template = CredentialNewTemplate {
@@ -518,7 +631,11 @@ async fn render_credential_new_error_with_session(session: &Session, auth: Requi
         plugin_types,
         csrf_token,
     };
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 #[derive(Deserialize)]
@@ -550,7 +667,9 @@ pub async fn credential_delete(
             .await;
         }
         Ok(None) => {}
-        Err(e) => tracing::warn!(error = %e, credential_id = %id, "could not load credential for revoke-propagation before delete"),
+        Err(e) => {
+            tracing::warn!(error = %e, credential_id = %id, "could not load credential for revoke-propagation before delete")
+        }
     }
     // Surface a failed delete instead of reporting success: a secret that looks deleted but persists is
     // a fail-open for the PEP console. Log (observable) + return an error rather than a success redirect.
@@ -596,7 +715,11 @@ pub async fn roles_list(
         csrf_token,
     };
 
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 pub async fn role_new(session: Session, auth: RequireAuth) -> impl IntoResponse {
@@ -607,7 +730,11 @@ pub async fn role_new(session: Session, auth: RequireAuth) -> impl IntoResponse 
         csrf_token,
     };
 
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 #[derive(Deserialize)]
@@ -627,7 +754,13 @@ pub async fn role_create(
 ) -> Response {
     // Validate CSRF token
     if !validate_csrf_token(&session, &form.csrf_token).await {
-        return render_role_new_error_with_session(&session, auth, "Invalid security token. Please try again.").await.into_response();
+        return render_role_new_error_with_session(
+            &session,
+            auth,
+            "Invalid security token. Please try again.",
+        )
+        .await
+        .into_response();
     }
 
     // Parse permissions
@@ -645,27 +778,55 @@ pub async fn role_create(
         .collect();
 
     if permissions.is_empty() {
-        return render_role_new_error_with_session(&session, auth, "At least one permission is required").await.into_response();
+        return render_role_new_error_with_session(
+            &session,
+            auth,
+            "At least one permission is required",
+        )
+        .await
+        .into_response();
     }
 
     // Parse scopes
     let credential_scopes: Vec<String> = form
         .scopes
-        .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
 
     // Create the role
     let auth_manager = state.auth_manager.write().await;
-    let role = match auth_manager.create_role(&form.name, permissions, credential_scopes, form.description) {
+    let role = match auth_manager.create_role(
+        &form.name,
+        permissions,
+        credential_scopes,
+        form.description,
+    ) {
         Ok(r) => r,
         Err(e) => {
-            return render_role_new_error_with_session(&session, auth, &format!("Failed to create role: {}", e)).await.into_response();
+            return render_role_new_error_with_session(
+                &session,
+                auth,
+                &format!("Failed to create role: {}", e),
+            )
+            .await
+            .into_response();
         }
     };
 
     // Store the role
     if let Err(e) = state.storage.store_role(&role).await {
-        return render_role_new_error_with_session(&session, auth, &format!("Failed to save: {}", e)).await.into_response();
+        return render_role_new_error_with_session(
+            &session,
+            auth,
+            &format!("Failed to save: {}", e),
+        )
+        .await
+        .into_response();
     }
 
     // Refresh auth data to update the cached AuthManager
@@ -674,14 +835,22 @@ pub async fn role_create(
     Redirect::to("/roles").into_response()
 }
 
-async fn render_role_new_error_with_session(session: &Session, auth: RequireAuth, error: &str) -> impl IntoResponse {
+async fn render_role_new_error_with_session(
+    session: &Session,
+    auth: RequireAuth,
+    error: &str,
+) -> impl IntoResponse {
     let csrf_token = get_or_create_csrf_token(session).await.unwrap_or_default();
     let template = RoleNewTemplate {
         username: auth.session.username,
         error: Some(error.to_string()),
         csrf_token,
     };
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 pub async fn role_delete(
@@ -749,7 +918,11 @@ pub async fn keys_list(
         csrf_token,
     };
 
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 pub async fn key_new(
@@ -779,7 +952,11 @@ pub async fn key_new(
         csrf_token,
     };
 
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 #[derive(Deserialize)]
@@ -798,45 +975,68 @@ pub async fn key_create(
 ) -> Response {
     // Validate CSRF token
     if !validate_csrf_token(&session, &form.csrf_token).await {
-        return render_key_new_error_with_session(&state, &session, auth, "Invalid security token. Please try again.").await.into_response();
+        return render_key_new_error_with_session(
+            &state,
+            &session,
+            auth,
+            "Invalid security token. Please try again.",
+        )
+        .await
+        .into_response();
     }
     // Parse expiration
     let expires_in = match form.expires.as_deref() {
         Some("never") | Some("") | None => None,
-        Some(s) => {
-            match parse_duration(s) {
-                Ok(d) => d,
-                Err(e) => {
-                    return render_key_new_error_with_session(&state, &session, auth, &e).await.into_response();
-                }
+        Some(s) => match parse_duration(s) {
+            Ok(d) => d,
+            Err(e) => {
+                return render_key_new_error_with_session(&state, &session, auth, &e)
+                    .await
+                    .into_response();
             }
-        }
+        },
     };
 
     let auth_manager = state.auth_manager.write().await;
 
     // Verify role exists
     if auth_manager.get_role_by_name(&form.role).is_none() {
-        return render_key_new_error_with_session(&state, &session, auth, &format!("Role '{}' not found", form.role))
-            .await
-            .into_response();
+        return render_key_new_error_with_session(
+            &state,
+            &session,
+            auth,
+            &format!("Role '{}' not found", form.role),
+        )
+        .await
+        .into_response();
     }
 
     // Create the key
-    let (full_key, api_key) = match auth_manager.create_api_key(&form.name, &form.role, expires_in) {
+    let (full_key, api_key) = match auth_manager.create_api_key(&form.name, &form.role, expires_in)
+    {
         Ok(k) => k,
         Err(e) => {
-            return render_key_new_error_with_session(&state, &session, auth, &format!("Failed to create key: {}", e))
-                .await
-                .into_response();
+            return render_key_new_error_with_session(
+                &state,
+                &session,
+                auth,
+                &format!("Failed to create key: {}", e),
+            )
+            .await
+            .into_response();
         }
     };
 
     // Store the key
     if let Err(e) = state.storage.store_api_key(&api_key).await {
-        return render_key_new_error_with_session(&state, &session, auth, &format!("Failed to save: {}", e))
-            .await
-            .into_response();
+        return render_key_new_error_with_session(
+            &state,
+            &session,
+            auth,
+            &format!("Failed to save: {}", e),
+        )
+        .await
+        .into_response();
     }
 
     // Refresh auth data to update the cached AuthManager
@@ -868,10 +1068,20 @@ pub async fn key_create(
         csrf_token,
     };
 
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e))).into_response()
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
+    .into_response()
 }
 
-async fn render_key_new_error_with_session(state: &AppState, session: &Session, auth: RequireAuth, error: &str) -> impl IntoResponse {
+async fn render_key_new_error_with_session(
+    state: &AppState,
+    session: &Session,
+    auth: RequireAuth,
+    error: &str,
+) -> impl IntoResponse {
     let auth_manager = state.auth_manager.read().await;
     let mut roles = auth_manager.list_roles();
 
@@ -892,7 +1102,11 @@ async fn render_key_new_error_with_session(state: &AppState, session: &Session, 
         error: Some(error.to_string()),
         csrf_token,
     };
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 pub async fn key_revoke(
@@ -932,7 +1146,11 @@ pub async fn audit_log(auth: RequireAuth) -> impl IntoResponse {
         flash: None,
     };
 
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 // ============== Use Tokens ==============
@@ -959,7 +1177,11 @@ async fn render_tokens_list(
         new_token,
         csrf_token,
     };
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 pub async fn tokens_list(
@@ -977,7 +1199,11 @@ pub async fn token_new(session: Session, auth: RequireAuth) -> impl IntoResponse
         error: None,
         csrf_token,
     };
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1005,40 +1231,67 @@ pub async fn token_create(
 
     let name = form.name.trim().to_string();
     if name.is_empty() {
-        return render_token_new_error(&session, auth, "Name is required").await.into_response();
+        return render_token_new_error(&session, auth, "Name is required")
+            .await
+            .into_response();
     }
     let credential_scope = form.credential_scope.trim().to_string();
     if credential_scope.is_empty() {
-        return render_token_new_error(&session, auth, "Credential scope is required (use * for any)")
-            .await
-            .into_response();
+        return render_token_new_error(
+            &session,
+            auth,
+            "Credential scope is required (use * for any)",
+        )
+        .await
+        .into_response();
     }
     let action_scope = form
         .action_scope
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let max_uses = match form.max_uses.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let max_uses = match form
+        .max_uses
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         None => None,
         Some(s) => match s.parse::<u32>() {
             Ok(n) if n >= 1 => Some(n),
             _ => {
-                return render_token_new_error(&session, auth, "Max uses must be a positive whole number")
-                    .await
-                    .into_response();
+                return render_token_new_error(
+                    &session,
+                    auth,
+                    "Max uses must be a positive whole number",
+                )
+                .await
+                .into_response();
             }
         },
     };
 
-    let expires_in = match form.expires.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let expires_in = match form
+        .expires
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         None => None,
         Some(s) => match parse_short_duration(s) {
             Ok(d) => d,
-            Err(e) => return render_token_new_error(&session, auth, &e).await.into_response(),
+            Err(e) => {
+                return render_token_new_error(&session, auth, &e)
+                    .await
+                    .into_response()
+            }
         },
     };
 
-    let require_approval = matches!(form.require_approval.as_deref(), Some("true") | Some("on") | Some("1"));
+    let require_approval = matches!(
+        form.require_approval.as_deref(),
+        Some("true") | Some("on") | Some("1")
+    );
 
     let params = NewUseToken {
         name,
@@ -1049,7 +1302,9 @@ pub async fn token_create(
         expires_in,
     };
     if let Err(e) = params.validate() {
-        return render_token_new_error(&session, auth, &e).await.into_response();
+        return render_token_new_error(&session, auth, &e)
+            .await
+            .into_response();
     }
     let (full_token, token) = UseToken::create(params);
 
@@ -1073,14 +1328,22 @@ pub async fn token_create(
     .into_response()
 }
 
-async fn render_token_new_error(session: &Session, auth: RequireAuth, error: &str) -> impl IntoResponse {
+async fn render_token_new_error(
+    session: &Session,
+    auth: RequireAuth,
+    error: &str,
+) -> impl IntoResponse {
     let csrf_token = get_or_create_csrf_token(session).await.unwrap_or_default();
     let template = UseTokenNewTemplate {
         username: auth.session.username,
         error: Some(error.to_string()),
         csrf_token,
     };
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 pub async fn token_revoke(
@@ -1118,7 +1381,11 @@ pub async fn approvals_list(
     // R4: the panel admin is a global console (no tenant) so it lists every
     // tenant's approvals; routing through the scoped method keeps the partition
     // mechanism uniform (a future tenant-scoped session would pass its tenant).
-    let mut approvals = state.server.list_approvals_for_tenant(None).await.unwrap_or_default();
+    let mut approvals = state
+        .server
+        .list_approvals_for_tenant(None)
+        .await
+        .unwrap_or_default();
     // Pending first, then most recent.
     approvals.sort_by(|a, b| {
         let pending = |s: &ApprovalStatus| *s == ApprovalStatus::Pending;
@@ -1126,7 +1393,8 @@ pub async fn approvals_list(
             .cmp(&pending(&a.status))
             .then(b.created_at.cmp(&a.created_at))
     });
-    let approval_displays: Vec<ApprovalDisplay> = approvals.iter().map(ApprovalDisplay::from).collect();
+    let approval_displays: Vec<ApprovalDisplay> =
+        approvals.iter().map(ApprovalDisplay::from).collect();
     let csrf_token = get_or_create_csrf_token(&session).await.unwrap_or_default();
 
     let template = ApprovalsListTemplate {
@@ -1135,7 +1403,11 @@ pub async fn approvals_list(
         flash: None,
         csrf_token,
     };
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e)))
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
 }
 
 pub async fn approval_approve(
@@ -1157,14 +1429,27 @@ pub async fn approval_approve(
     // tenant-scoped admin surface gates on (metrics already scopes by the key tenant).
     let result = state
         .storage
-        .decide_approval(&id, true, "admin panel", &auth.session.username, enforce_sod, None, None, None)
+        .decide_approval(
+            &id,
+            true,
+            "admin panel",
+            &auth.session.username,
+            enforce_sod,
+            None,
+            None,
+            None,
+        )
         .await;
     let _ = regenerate_csrf_token(&session).await;
     // Surface a rejected decision (e.g. a separation-of-duty self-approval, or an
     // already-decided/expired request) rather than silently redirecting (V5).
     match result {
         Ok(_) => Redirect::to("/approvals").into_response(),
-        Err(e) => render_decided("Could not approve", &format!("The approval was not recorded: {}", e), false),
+        Err(e) => render_decided(
+            "Could not approve",
+            &format!("The approval was not recorded: {}", e),
+            false,
+        ),
     }
 }
 
@@ -1185,12 +1470,25 @@ pub async fn approval_deny(
     // tenant-scoping rationale).
     let result = state
         .storage
-        .decide_approval(&id, false, "admin panel", &auth.session.username, enforce_sod, None, None, None)
+        .decide_approval(
+            &id,
+            false,
+            "admin panel",
+            &auth.session.username,
+            enforce_sod,
+            None,
+            None,
+            None,
+        )
         .await;
     let _ = regenerate_csrf_token(&session).await;
     match result {
         Ok(_) => Redirect::to("/approvals").into_response(),
-        Err(e) => render_decided("Could not deny", &format!("The denial was not recorded: {}", e), false),
+        Err(e) => render_decided(
+            "Could not deny",
+            &format!("The denial was not recorded: {}", e),
+            false,
+        ),
     }
 }
 
@@ -1207,7 +1505,12 @@ fn render_decided(title: &str, message: &str, ok: bool) -> Response {
         message: message.to_string(),
         ok,
     };
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e))).into_response()
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
+    .into_response()
 }
 
 /// GET handler for the Telegram/webhook/email approve|deny link. To prevent a
@@ -1224,7 +1527,11 @@ pub async fn approval_decide_confirm(
         _ => return render_decided("Not found", "No such approval request.", false),
     };
     if !approval.verify_decision_token(&params.token) {
-        return render_decided("Invalid link", "This approval link is invalid or has been tampered with.", false);
+        return render_decided(
+            "Invalid link",
+            "This approval link is invalid or has been tampered with.",
+            false,
+        );
     }
     if params.decision != "approve" && params.decision != "deny" {
         return render_decided("Invalid decision", "Unknown decision.", false);
@@ -1234,10 +1541,19 @@ pub async fn approval_decide_confirm(
         id,
         token: params.token,
         decision: params.decision.clone(),
-        decision_word: if params.decision == "approve" { "Approve".to_string() } else { "Deny".to_string() },
+        decision_word: if params.decision == "approve" {
+            "Approve".to_string()
+        } else {
+            "Deny".to_string()
+        },
         summary: approval.summary.clone(),
     };
-    Html(template.render().unwrap_or_else(|e| format!("Template error: {}", e))).into_response()
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
+    .into_response()
 }
 
 /// POST handler that actually records the out-of-band decision, authorized by
@@ -1253,7 +1569,11 @@ pub async fn approval_decide_submit(
         _ => return render_decided("Not found", "No such approval request.", false),
     };
     if !approval.verify_decision_token(&params.token) {
-        return render_decided("Invalid link", "This approval link is invalid or has been tampered with.", false);
+        return render_decided(
+            "Invalid link",
+            "This approval link is invalid or has been tampered with.",
+            false,
+        );
     }
     let approve = match params.decision.as_str() {
         "approve" => true,
@@ -1286,7 +1606,16 @@ pub async fn approval_decide_submit(
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
     match state
         .storage
-        .decide_approval(&id, approve, "out-of-band link", approver_identity, enforce_sod, None, None, None)
+        .decide_approval(
+            &id,
+            approve,
+            "out-of-band link",
+            approver_identity,
+            enforce_sod,
+            None,
+            None,
+            None,
+        )
         .await
     {
         Ok(_) => {
@@ -1297,19 +1626,24 @@ pub async fn approval_decide_submit(
                     true,
                 )
             } else {
-                render_decided("Denied", "The action has been denied and will not run.", true)
+                render_decided(
+                    "Denied",
+                    "The action has been denied and will not run.",
+                    true,
+                )
             }
         }
-        Err(e) => render_decided("Already decided", &format!("This request could not be updated: {}", e), false),
+        Err(e) => render_decided(
+            "Already decided",
+            &format!("This request could not be updated: {}", e),
+            false,
+        ),
     }
 }
 
 // ============== API Endpoints ==============
 
-pub async fn api_stats(
-    State(state): State<AppState>,
-    _auth: RequireAuth,
-) -> impl IntoResponse {
+pub async fn api_stats(State(state): State<AppState>, _auth: RequireAuth) -> impl IntoResponse {
     let credentials = state.storage.list().await.unwrap_or_default();
     let roles = state.storage.list_roles().await.unwrap_or_default();
     let api_keys = state.storage.list_api_keys().await.unwrap_or_default();
@@ -1349,7 +1683,12 @@ fn parse_short_duration(s: &str) -> Result<Option<chrono::Duration>, String> {
         "h" => chrono::Duration::try_hours(n),
         "d" => chrono::Duration::try_days(n),
         "w" => chrono::Duration::try_weeks(n),
-        _ => return Err(format!("Invalid duration unit in '{}'. Use s, m, h, d, or w.", s)),
+        _ => {
+            return Err(format!(
+                "Invalid duration unit in '{}'. Use s, m, h, d, or w.",
+                s
+            ))
+        }
     }
     .ok_or_else(|| format!("Duration '{}' is out of range", s))?;
     if duration <= chrono::Duration::zero() {
@@ -1375,7 +1714,10 @@ fn parse_duration(s: &str) -> Result<Option<chrono::Duration>, String> {
     } else if s.ends_with('y') {
         (&s[..s.len() - 1], "y")
     } else {
-        return Err(format!("Invalid duration format: {}. Use '30d', '24h', '1w'", s));
+        return Err(format!(
+            "Invalid duration format: {}. Use '30d', '24h', '1w'",
+            s
+        ));
     };
 
     let num: i64 = num_str
@@ -1455,7 +1797,10 @@ mod tests {
             "999999999999999999m",
             "999999999999999999y",
         ] {
-            assert!(parse_duration(s).is_err(), "parse_duration({s}) must be Err, not panic");
+            assert!(
+                parse_duration(s).is_err(),
+                "parse_duration({s}) must be Err, not panic"
+            );
         }
         for s in ["9223372036854775807w", "999999999999999999d"] {
             assert!(

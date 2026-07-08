@@ -47,8 +47,10 @@ fn config_with_policies(policies: Vec<Policy>) -> Config {
 
 /// An allow policy admitting a credential glob for any https URL.
 fn allow_policy(credential_pattern: &str) -> Policy {
-    Policy::allow_all("allow-cap", credential_pattern)
-        .with_rule(PolicyCondition::UrlMatch("https://*".to_string()), PolicyAction::Allow)
+    Policy::allow_all("allow-cap", credential_pattern).with_rule(
+        PolicyCondition::UrlMatch("https://*".to_string()),
+        PolicyAction::Allow,
+    )
 }
 
 /// Build a web router whose shared exec server has plugins loaded and the given
@@ -68,12 +70,19 @@ async fn build_router_with(config: Config) -> (axum::Router, Arc<dyn StorageBack
         storage.list_api_keys().await.unwrap(),
     );
     let resolver = CredentialResolver::new(storage.clone());
-    let exec_server = Arc::new(VultrinoServer::new(config.clone(), storage.clone(), resolver));
+    let exec_server = Arc::new(VultrinoServer::new(
+        config.clone(),
+        storage.clone(),
+        resolver,
+    ));
     exec_server.load_plugins().await.unwrap();
     exec_server.reload_policies().await.unwrap();
 
     let server = WebServer::new(
-        WebConfig { bind: "127.0.0.1:0".to_string(), enabled: true },
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
         config,
         storage.clone(),
         auth_manager,
@@ -147,16 +156,52 @@ fn mcp_req(bearer: Option<&str>, message: serde_json::Value) -> Request<Body> {
     let mut builder = Request::builder()
         .method("POST")
         .uri("/mcp")
-        .header("content-type", "application/json");
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
     if let Some(token) = bearer {
         builder = builder.header("authorization", format!("Bearer {}", token));
     }
-    builder.body(Body::from(serde_json::to_vec(&message).unwrap())).unwrap()
+    builder
+        .body(Body::from(serde_json::to_vec(&message).unwrap()))
+        .unwrap()
 }
 
 async fn body_value(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+#[tokio::test]
+async fn http_rejects_unsupported_protocol_version_and_cross_origin_requests() {
+    let (router, _) = build_router_with(config_with_policies(vec![])).await;
+    let mut bad_version = mcp_req(
+        None,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+    );
+    bad_version
+        .headers_mut()
+        .insert("mcp-protocol-version", "2099-01-01".parse().unwrap());
+    assert_eq!(
+        router.clone().oneshot(bad_version).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let mut hostile_origin = mcp_req(
+        None,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+    );
+    hostile_origin
+        .headers_mut()
+        .insert("host", "127.0.0.1:7879".parse().unwrap());
+    hostile_origin
+        .headers_mut()
+        .insert("origin", "https://attacker.example".parse().unwrap());
+    assert_eq!(
+        router.oneshot(hostile_origin).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
 }
 
 fn tool_names(value: &serde_json::Value) -> Vec<String> {
@@ -174,7 +219,8 @@ fn tool_names(value: &serde_json::Value) -> Vec<String> {
 
 #[tokio::test]
 async fn http_tools_list_with_valid_token_returns_principal_tools() {
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_credential(&storage, "cred-sendgrid").await;
     register_send_email(&storage, "cred-sendgrid").await;
     let token = mint_token(&storage, "cred-sendgrid", Some("http.request"), None, None).await;
@@ -197,14 +243,24 @@ async fn http_tools_list_with_valid_token_returns_principal_tools() {
     // Connector model: a scoped use-token (vut_) agent sees ONLY its granted named
     // capabilities (+ check_approval) over the networked transport — NOT the generic
     // built-in tools.
-    assert!(!names.contains(&"http_request".to_string()), "a use-token agent must NOT see generic http_request: {names:?}");
-    assert!(!names.contains(&"list_credentials".to_string()), "a use-token agent must NOT see generic list_credentials");
-    assert!(names.contains(&"check_approval".to_string()), "the control tool stays available");
+    assert!(
+        !names.contains(&"http_request".to_string()),
+        "a use-token agent must NOT see generic http_request: {names:?}"
+    );
+    assert!(
+        !names.contains(&"list_credentials".to_string()),
+        "a use-token agent must NOT see generic list_credentials"
+    );
+    assert!(
+        names.contains(&"check_approval".to_string()),
+        "the control tool stays available"
+    );
 }
 
 #[tokio::test]
 async fn http_missing_token_is_401() {
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_credential(&storage, "cred-sendgrid").await;
     register_send_email(&storage, "cred-sendgrid").await;
 
@@ -215,15 +271,27 @@ async fn http_missing_token_is_401() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "no Authorization header must be 401");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "no Authorization header must be 401"
+    );
     let value = body_value(resp).await;
-    assert_eq!(value["id"], serde_json::json!(7), "the request id is echoed on the 401");
-    assert!(value["error"]["message"].as_str().unwrap().contains("Unauthorized"));
+    assert_eq!(
+        value["id"],
+        serde_json::json!(7),
+        "the request id is echoed on the 401"
+    );
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Unauthorized"));
 }
 
 #[tokio::test]
 async fn http_invalid_token_is_401_not_bypassed() {
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_credential(&storage, "cred-sendgrid").await;
     register_send_email(&storage, "cred-sendgrid").await;
 
@@ -237,7 +305,8 @@ async fn http_invalid_token_is_401_not_bypassed() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     // A garbage non-vut secret is treated as an API key and also rejected.
-    let (router2, _storage2) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router2, _storage2) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     let resp = router2
         .oneshot(mcp_req(
             Some("definitely-not-a-key"),
@@ -250,7 +319,8 @@ async fn http_invalid_token_is_401_not_bypassed() {
 
 #[tokio::test]
 async fn http_expired_token_is_401() {
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_credential(&storage, "cred-sendgrid").await;
     register_send_email(&storage, "cred-sendgrid").await;
     // Already-expired token (negative TTL).
@@ -270,14 +340,22 @@ async fn http_expired_token_is_401() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "an expired token must be 401");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "an expired token must be 401"
+    );
     let value = body_value(resp).await;
-    assert!(value["error"]["message"].as_str().unwrap().contains("expired"));
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("expired"));
 }
 
 #[tokio::test]
 async fn http_revoked_token_is_401() {
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_credential(&storage, "cred-sendgrid").await;
     register_send_email(&storage, "cred-sendgrid").await;
     let token = mint_token(&storage, "cred-sendgrid", Some("http.request"), None, None).await;
@@ -297,9 +375,16 @@ async fn http_revoked_token_is_401() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "a revoked token must be 401");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a revoked token must be 401"
+    );
     let value = body_value(resp).await;
-    assert!(value["error"]["message"].as_str().unwrap().contains("revoked"));
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("revoked"));
 }
 
 #[tokio::test]
@@ -308,7 +393,8 @@ async fn http_tools_call_runs_enforced_path() {
     // point the capability at a private URL so the SSRF guard rejects it
     // deterministically offline — proving the request ran through execute_gated
     // (not a policy denial, not a bypass).
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_credential(&storage, "cred-internal").await;
     let cap = Capability {
         id: "cap-internal".to_string(),
@@ -361,7 +447,8 @@ async fn http_tools_call_runs_enforced_path() {
 #[tokio::test]
 async fn http_denied_principal_tools_call_is_rejected_not_bypassed() {
     // A token scoped to a different credential glob → execute_gated denies.
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_credential(&storage, "cred-sendgrid").await;
     register_send_email(&storage, "cred-sendgrid").await;
     let token = mint_token(&storage, "other-*", Some("http.request"), None, None).await;
@@ -378,7 +465,11 @@ async fn http_denied_principal_tools_call_is_rejected_not_bypassed() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let value = body_value(resp).await;
-    assert_eq!(value["result"]["isError"], serde_json::json!(true), "denied call must be a tool error, not a result");
+    assert_eq!(
+        value["result"]["isError"],
+        serde_json::json!(true),
+        "denied call must be a tool error, not a result"
+    );
 }
 
 #[tokio::test]
@@ -387,7 +478,8 @@ async fn http_header_token_is_authoritative_over_body_token() {
     // cred-sendgrid). It tries to smuggle a more-privileged token in the JSON body
     // to widen scope. The header token must win: the body token is overwritten, so
     // the call is gated by the header principal (denied), never the body one.
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_credential(&storage, "cred-sendgrid").await;
     register_send_email(&storage, "cred-sendgrid").await;
 
@@ -434,7 +526,8 @@ async fn http_header_token_is_authoritative_over_body_token() {
     assert_eq!(resp.status(), StatusCode::OK);
     let value = body_value(resp).await;
     assert_eq!(
-        value["result"]["isError"], serde_json::json!(true),
+        value["result"]["isError"],
+        serde_json::json!(true),
         "the call must be gated by the header principal (denied), not the smuggled body token"
     );
 }
@@ -458,9 +551,18 @@ async fn http_no_capabilities_for_unprivileged_default_deny() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let names = tool_names(&body_value(resp).await);
-    assert!(!names.contains(&"send_email".to_string()), "default-deny must hide the capability");
-    assert!(!names.contains(&"http_request".to_string()), "a use-token agent must NOT see generic built-ins");
-    assert!(names.contains(&"check_approval".to_string()), "the control tool stays available");
+    assert!(
+        !names.contains(&"send_email".to_string()),
+        "default-deny must hide the capability"
+    );
+    assert!(
+        !names.contains(&"http_request".to_string()),
+        "a use-token agent must NOT see generic built-ins"
+    );
+    assert!(
+        names.contains(&"check_approval".to_string()),
+        "the control tool stays available"
+    );
 }
 
 #[tokio::test]
@@ -468,7 +570,8 @@ async fn http_resources_list_blocked_for_use_token() {
     // A use-token must NOT enumerate the credential vault via resources/list
     // (GLM review #3). The handler had no principal/scope filter; the HTTP
     // transport now returns an empty resource set for a vut_.
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_credential(&storage, "cred-sendgrid").await;
     store_credential(&storage, "cred-other-secret").await; // must NOT be enumerable
     register_send_email(&storage, "cred-sendgrid").await;
@@ -483,7 +586,10 @@ async fn http_resources_list_blocked_for_use_token() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let value = body_value(resp).await;
-    let resources = value["result"]["resources"].as_array().cloned().unwrap_or_default();
+    let resources = value["result"]["resources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         resources.is_empty(),
         "a use-token must not enumerate the vault via resources/list: {value:?}"
@@ -494,7 +600,8 @@ async fn http_resources_list_blocked_for_use_token() {
 async fn http_tools_call_generic_builtin_blocked_for_use_token() {
     // A use-token surfaces only its named tools at LIST; it must also be unable to
     // CALL a generic built-in by name (GLM review #1 defense-in-depth).
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_credential(&storage, "cred-sendgrid").await;
     register_send_email(&storage, "cred-sendgrid").await;
     let token = mint_token(&storage, "cred-sendgrid", Some("http.request"), None, None).await;
@@ -528,12 +635,18 @@ async fn http_tools_call_plugin_tool_name_blocked_for_use_token() {
     // its granted named capabilities. A raw plugin tool name (e.g. ssh_run,
     // postgres_run_sql) that is NOT a denylisted built-in must still be rejected —
     // it must not fall through to try_plugin_tool.
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     store_credential(&storage, "cred-sendgrid").await;
     register_send_email(&storage, "cred-sendgrid").await;
     let token = mint_token(&storage, "cred-sendgrid", Some("http.request"), None, None).await;
 
-    for tool in ["ssh_run", "postgres_run_sql", "ssh_deploy", "totally_made_up"] {
+    for tool in [
+        "ssh_run",
+        "postgres_run_sql",
+        "ssh_deploy",
+        "totally_made_up",
+    ] {
         let resp = router
             .clone()
             .oneshot(mcp_req(
@@ -558,20 +671,34 @@ async fn http_tools_call_plugin_tool_name_blocked_for_use_token() {
 
 #[tokio::test]
 async fn official_client_handshake_shape_negotiates_and_accepts_notification_without_id() {
-    let (router, storage) = build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
     let token = mint_token(&storage, "cred-*", Some("http.request"), None, None).await;
-    let response = router.clone().oneshot(mcp_req(Some(&token), serde_json::json!({
-        "jsonrpc":"2.0", "id":0, "method":"initialize", "params":{
-            "protocolVersion":"2025-06-18", "capabilities":{},
-            "clientInfo":{"name":"langchain-mcp-adapters","version":"1.x"}
-        }
-    }))).await.unwrap();
+    let response = router
+        .clone()
+        .oneshot(mcp_req(
+            Some(&token),
+            serde_json::json!({
+                "jsonrpc":"2.0", "id":0, "method":"initialize", "params":{
+                    "protocolVersion":"2025-06-18", "capabilities":{},
+                    "clientInfo":{"name":"langchain-mcp-adapters","version":"1.x"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_value(response).await;
     assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
 
-    let notification = router.oneshot(mcp_req(Some(&token), serde_json::json!({
-        "jsonrpc":"2.0", "method":"notifications/initialized"
-    }))).await.unwrap();
+    let notification = router
+        .oneshot(mcp_req(
+            Some(&token),
+            serde_json::json!({
+                "jsonrpc":"2.0", "method":"notifications/initialized"
+            }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(notification.status(), StatusCode::ACCEPTED);
 }

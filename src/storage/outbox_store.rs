@@ -118,7 +118,13 @@ impl OutboxStore {
             {
                 return Ok(e.sequence); // already drained → idempotent no-op
             }
-            Ok(push_event(c, &subject, &event_type, payload, Some(dedup_id)))
+            Ok(push_event(
+                c,
+                &subject,
+                &event_type,
+                payload,
+                Some(dedup_id),
+            ))
         })
         .await
     }
@@ -181,7 +187,12 @@ impl OutboxStore {
     pub async fn deliverable(&self, limit: usize) -> Result<Vec<OutboxEvent>, StorageError> {
         self.reload().await?;
         let c = self.cache.read();
-        Ok(earliest_pending_per_subject(&c.outbox, limit, false, Utc::now()))
+        Ok(earliest_pending_per_subject(
+            &c.outbox,
+            limit,
+            false,
+            Utc::now(),
+        ))
     }
 
     /// Claim the earliest-pending event per subject for delivery, stamping a lease so a sibling
@@ -437,7 +448,8 @@ impl OutboxStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data = serde_json::to_vec(cache).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data =
+            serde_json::to_vec(cache).map_err(|e| StorageError::Serialization(e.to_string()))?;
         let encrypted = encrypt(&data, &self.master_key)?;
         let file = OutboxFile {
             version: OUTBOX_FILE_VERSION,
@@ -588,23 +600,45 @@ mod tests {
     async fn monotonic_append_gapfree_replay_and_survives_reopen() {
         let (s, dir) = store();
         let key = Arc::new(MasterKey::from_bytes(vec![7u8; 32]).unwrap());
-        let s1 = s.append("a", "t", serde_json::json!({"n": 1})).await.unwrap();
-        let s2 = s.append("b", "t", serde_json::json!({"n": 2})).await.unwrap();
-        let s3 = s.append("a", "t", serde_json::json!({"n": 3})).await.unwrap();
+        let s1 = s
+            .append("a", "t", serde_json::json!({"n": 1}))
+            .await
+            .unwrap();
+        let s2 = s
+            .append("b", "t", serde_json::json!({"n": 2}))
+            .await
+            .unwrap();
+        let s3 = s
+            .append("a", "t", serde_json::json!({"n": 3}))
+            .await
+            .unwrap();
         assert_eq!((s1, s2, s3), (1, 2, 3));
         assert_eq!(
-            s.list_after(0, 100).await.unwrap().iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            s.list_after(0, 100)
+                .await
+                .unwrap()
+                .iter()
+                .map(|e| e.sequence)
+                .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
         assert_eq!(
-            s.list_after(2, 100).await.unwrap().iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            s.list_after(2, 100)
+                .await
+                .unwrap()
+                .iter()
+                .map(|e| e.sequence)
+                .collect::<Vec<_>>(),
             vec![3]
         );
         assert_eq!(s.list_after(0, 1).await.unwrap().len(), 1);
         // A FRESH store on the SAME file (restart) replays everything — the seq does not rewind.
         let s2store = OutboxStore::new(dir.path().join("outbox.enc"), key);
         assert_eq!(s2store.list_after(0, 100).await.unwrap().len(), 3);
-        let s4 = s2store.append("c", "t", serde_json::json!({})).await.unwrap();
+        let s4 = s2store
+            .append("c", "t", serde_json::json!({}))
+            .await
+            .unwrap();
         assert_eq!(s4, 4, "seq continues monotonically after a reopen");
     }
 
@@ -616,7 +650,11 @@ mod tests {
         s.append("A", "t", serde_json::json!({})).await.unwrap(); // A's 2nd, withheld
         let d = s.deliverable(10).await.unwrap();
         let subjects: Vec<_> = d.iter().map(|e| e.subject.as_str()).collect();
-        assert_eq!(subjects, vec!["A", "B"], "one per subject; A's 2nd withheld");
+        assert_eq!(
+            subjects,
+            vec!["A", "B"],
+            "one per subject; A's 2nd withheld"
+        );
         assert_eq!(d[0].sequence, 1);
     }
 
@@ -638,12 +676,22 @@ mod tests {
         // record_delivery targets by sequence + acts on any Pending event (it does NOT consult the
         // backoff lease), so 3 straight failures reach DeadLettered with no lease-clearing needed.
         for _ in 0..3 {
-            s.record_delivery(seq, false, Some("boom".into()), 3).await.unwrap();
+            s.record_delivery(seq, false, Some("boom".into()), 3)
+                .await
+                .unwrap();
         }
-        assert_eq!(s.list_dead_letter(10).await.unwrap().len(), 1, "dead-lettered after 3 attempts");
+        assert_eq!(
+            s.list_dead_letter(10).await.unwrap().len(),
+            1,
+            "dead-lettered after 3 attempts"
+        );
         assert!(s.replay_dead_letter(seq).await.unwrap());
         assert_eq!(s.list_dead_letter(10).await.unwrap().len(), 0);
-        assert_eq!(s.deliverable(10).await.unwrap().len(), 1, "replayed → pending again");
+        assert_eq!(
+            s.deliverable(10).await.unwrap().len(),
+            1,
+            "replayed → pending again"
+        );
     }
 
     #[tokio::test]
@@ -651,9 +699,15 @@ mod tests {
         let (s, _d) = store();
         let seq = s.append("A", "t", serde_json::json!({})).await.unwrap();
         s.record_delivery(seq, true, None, 8).await.unwrap();
-        assert_eq!(s.deliverable(10).await.unwrap().len(), 0, "delivered → not deliverable");
+        assert_eq!(
+            s.deliverable(10).await.unwrap().len(),
+            0,
+            "delivered → not deliverable"
+        );
         // A late duplicate outcome cannot un-deliver it.
-        s.record_delivery(seq, false, Some("late".into()), 8).await.unwrap();
+        s.record_delivery(seq, false, Some("late".into()), 8)
+            .await
+            .unwrap();
         assert_eq!(s.list_dead_letter(10).await.unwrap().len(), 0);
     }
 
@@ -662,7 +716,11 @@ mod tests {
         let (s, _d) = store();
         s.append("A", "t", serde_json::json!({})).await.unwrap();
         s.append("B", "t", serde_json::json!({})).await.unwrap();
-        assert_eq!(s.gc(0, &HashSet::new()).await.unwrap(), 2, "retention 0 prunes all");
+        assert_eq!(
+            s.gc(0, &HashSet::new()).await.unwrap(),
+            2,
+            "retention 0 prunes all"
+        );
         assert_eq!(s.list_after(0, 100).await.unwrap().len(), 0);
     }
 
@@ -673,16 +731,36 @@ mod tests {
         // keeping the retained suffix gap-free.
         let (s, _d) = store();
         s.append("A", "t", serde_json::json!({})).await.unwrap(); // seq 1, no dedup
-        s.append_deduped("d2", "B", "t", serde_json::json!({})).await.unwrap(); // seq 2, dedup d2
+        s.append_deduped("d2", "B", "t", serde_json::json!({}))
+            .await
+            .unwrap(); // seq 2, dedup d2
         s.append("C", "t", serde_json::json!({})).await.unwrap(); // seq 3, no dedup
         let mut protected = HashSet::new();
         protected.insert("d2".to_string());
         // retention 0 would prune all, but d2 (seq 2) is protected → only seq 1 prunes.
-        assert_eq!(s.gc(0, &protected).await.unwrap(), 1, "prune stops below the protected event");
-        let remaining: Vec<u64> = s.list_after(0, 100).await.unwrap().iter().map(|e| e.sequence).collect();
-        assert_eq!(remaining, vec![2, 3], "protected event + suffix retained, gap-free");
+        assert_eq!(
+            s.gc(0, &protected).await.unwrap(),
+            1,
+            "prune stops below the protected event"
+        );
+        let remaining: Vec<u64> = s
+            .list_after(0, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![2, 3],
+            "protected event + suffix retained, gap-free"
+        );
         // Once the intent clears (no longer protected), the next GC prunes it.
-        assert_eq!(s.gc(0, &HashSet::new()).await.unwrap(), 2, "unprotected → pruned");
+        assert_eq!(
+            s.gc(0, &HashSet::new()).await.unwrap(),
+            2,
+            "unprotected → pruned"
+        );
     }
 
     #[tokio::test]
@@ -707,7 +785,10 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].sequence, 42);
         // A new append continues AFTER the migrated max, never re-using a migrated seq.
-        assert_eq!(s.append("new", "t", serde_json::json!({})).await.unwrap(), 43);
+        assert_eq!(
+            s.append("new", "t", serde_json::json!({})).await.unwrap(),
+            43
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -715,13 +796,23 @@ mod tests {
         // Exercise the block_in_place arm of locked_mutate/reload (the other tests run on the
         // current-thread runtime, which takes the inline arm).
         let (s, _d) = store();
-        s.append("A", "t", serde_json::json!({"n": 1})).await.unwrap();
-        s.append("A", "t", serde_json::json!({"n": 2})).await.unwrap();
+        s.append("A", "t", serde_json::json!({"n": 1}))
+            .await
+            .unwrap();
+        s.append("A", "t", serde_json::json!({"n": 2}))
+            .await
+            .unwrap();
         assert_eq!(s.list_after(0, 10).await.unwrap().len(), 2);
         let claimed = s.claim(10, 30).await.unwrap();
         assert_eq!(claimed.len(), 1);
-        s.record_delivery(claimed[0].sequence, true, None, 8).await.unwrap();
-        assert_eq!(s.deliverable(10).await.unwrap().len(), 1, "A's 2nd is now deliverable");
+        s.record_delivery(claimed[0].sequence, true, None, 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.deliverable(10).await.unwrap().len(),
+            1,
+            "A's 2nd is now deliverable"
+        );
     }
 
     #[tokio::test]
@@ -730,7 +821,9 @@ mod tests {
         // the raw file bytes (and the file must NOT be a readable JSON of the cache).
         let (s, dir) = store();
         let marker = "PLAINTEXT_MARKER_e9f1c2";
-        s.append("subj", "t", serde_json::json!({ "secretish": marker })).await.unwrap();
+        s.append("subj", "t", serde_json::json!({ "secretish": marker }))
+            .await
+            .unwrap();
         let raw = std::fs::read(dir.path().join("outbox.enc")).unwrap();
         assert!(
             !raw.windows(marker.len()).any(|w| w == marker.as_bytes()),
@@ -747,18 +840,43 @@ mod tests {
     async fn append_deduped_is_idempotent_on_redrain() {
         let (s, _d) = store();
         // First drain of intent "evt-abc" inserts a new event.
-        let s1 = s.append_deduped("evt-abc", "appr-1", "approval.approved", serde_json::json!({"x": 1}))
+        let s1 = s
+            .append_deduped(
+                "evt-abc",
+                "appr-1",
+                "approval.approved",
+                serde_json::json!({"x": 1}),
+            )
             .await
             .unwrap();
         // A re-drain (crash between the append and clearing the vault intent) returns the SAME seq,
         // does NOT insert a duplicate.
-        let s2 = s.append_deduped("evt-abc", "appr-1", "approval.approved", serde_json::json!({"x": 1}))
+        let s2 = s
+            .append_deduped(
+                "evt-abc",
+                "appr-1",
+                "approval.approved",
+                serde_json::json!({"x": 1}),
+            )
             .await
             .unwrap();
-        assert_eq!(s1, s2, "re-drain of the same dedup_id must return the original seq");
-        assert_eq!(s.list_after(0, 100).await.unwrap().len(), 1, "no duplicate event");
+        assert_eq!(
+            s1, s2,
+            "re-drain of the same dedup_id must return the original seq"
+        );
+        assert_eq!(
+            s.list_after(0, 100).await.unwrap().len(),
+            1,
+            "no duplicate event"
+        );
         // A DIFFERENT dedup id is a distinct event.
-        let s3 = s.append_deduped("evt-def", "appr-2", "approval.denied", serde_json::json!({}))
+        let s3 = s
+            .append_deduped(
+                "evt-def",
+                "appr-2",
+                "approval.denied",
+                serde_json::json!({}),
+            )
             .await
             .unwrap();
         assert_ne!(s1, s3);
@@ -771,7 +889,8 @@ mod tests {
         s.append("A", "t", serde_json::json!({})).await.unwrap();
         // Hand-write a future-version envelope; a downgrade must refuse it.
         let p = dir.path().join("outbox.enc");
-        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         v["version"] = serde_json::json!(OUTBOX_FILE_VERSION + 1);
         std::fs::write(&p, serde_json::to_string(&v).unwrap()).unwrap();
         let key = Arc::new(MasterKey::from_bytes(vec![7u8; 32]).unwrap());

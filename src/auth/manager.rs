@@ -279,9 +279,7 @@ impl AuthManager {
         let key_hash = Self::hash_key(key);
 
         let by_hash = self.keys_by_hash.read();
-        let api_key = by_hash
-            .get(&key_hash)
-            .ok_or(AuthManagerError::InvalidKey)?;
+        let api_key = by_hash.get(&key_hash).ok_or(AuthManagerError::InvalidKey)?;
 
         // Check expiration
         if api_key.is_expired() {
@@ -415,7 +413,9 @@ mod tests {
         let role = manager
             .create_role(
                 "github-executor",
-                [Permission::Read, Permission::Execute].into_iter().collect(),
+                [Permission::Read, Permission::Execute]
+                    .into_iter()
+                    .collect(),
                 vec!["github-*".to_string()],
                 Some("Execute GitHub credentials".to_string()),
             )
@@ -483,7 +483,9 @@ mod tests {
     fn test_revoke_api_key() {
         let manager = AuthManager::new();
 
-        let (full_key, key_meta) = manager.create_api_key("to-revoke", ROLE_ADMIN, None).unwrap();
+        let (full_key, key_meta) = manager
+            .create_api_key("to-revoke", ROLE_ADMIN, None)
+            .unwrap();
 
         // Key should be valid
         assert!(manager.validate_key(&full_key).is_ok());

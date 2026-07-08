@@ -87,7 +87,9 @@ pub struct SpiffeResolver {
 
 impl SpiffeResolver {
     pub fn new(allowed_trust_domains: Vec<String>) -> Self {
-        Self { allowed_trust_domains }
+        Self {
+            allowed_trust_domains,
+        }
     }
 
     /// Parse a SPIFFE ID into `(trust_domain, workload_path)`. Validates the
@@ -123,7 +125,10 @@ impl IdentityResolver for SpiffeResolver {
         // Trust domains are DNS names — compare case-insensitively so a
         // case-variant can't slip past the allowlist.
         if !self.allowed_trust_domains.is_empty()
-            && !self.allowed_trust_domains.iter().any(|d| d.eq_ignore_ascii_case(&trust_domain))
+            && !self
+                .allowed_trust_domains
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&trust_domain))
         {
             return Err(IdentityError::UntrustedDomain(trust_domain));
         }
@@ -162,18 +167,20 @@ impl IdentityResolver for OidcResolver {
     }
 
     fn resolve(&self, claims_json: &str) -> Result<WorkloadIdentity, IdentityError> {
-        let claims: serde_json::Value = serde_json::from_str(claims_json).map_err(|e| {
-            IdentityError::Malformed {
+        let claims: serde_json::Value =
+            serde_json::from_str(claims_json).map_err(|e| IdentityError::Malformed {
                 kind: IdentityKind::Oidc,
                 detail: format!("claims are not valid JSON: {e}"),
-            }
-        })?;
+            })?;
         let sub = claims
             .get("sub")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .ok_or_else(|| IdentityError::MissingClaim("sub".to_string()))?;
-        let iss = claims.get("iss").and_then(|v| v.as_str()).map(str::to_string);
+        let iss = claims
+            .get("iss")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         // Enforce the issuer allowlist unconditionally: a token with NO `iss` must
         // NOT bypass the allowlist (fail-closed — the allowlist is the resolver's
         // only trust boundary).
@@ -227,18 +234,26 @@ pub fn resolve_cloud_iam(
     kind: IdentityKind,
     claims_json: &str,
 ) -> Result<WorkloadIdentity, IdentityError> {
-    let claims: serde_json::Value = serde_json::from_str(claims_json).map_err(|e| {
-        IdentityError::Malformed { kind, detail: format!("claims are not valid JSON: {e}") }
-    })?;
+    let claims: serde_json::Value =
+        serde_json::from_str(claims_json).map_err(|e| IdentityError::Malformed {
+            kind,
+            detail: format!("claims are not valid JSON: {e}"),
+        })?;
     let (subject, trust_domain) = match kind {
         IdentityKind::AwsIam => (require_str_claim(&claims, "arn")?, Some("aws".to_string())),
         IdentityKind::GcpWorkload => (
             require_str_claim(&claims, "email")?,
-            claims.get("iss").and_then(|v| v.as_str()).map(str::to_string),
+            claims
+                .get("iss")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         ),
         IdentityKind::EntraWorkload => (
             require_str_claim(&claims, "oid")?,
-            claims.get("tid").and_then(|v| v.as_str()).map(str::to_string),
+            claims
+                .get("tid")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         ),
         other => {
             return Err(IdentityError::Malformed {
@@ -265,7 +280,8 @@ mod tests {
 
     #[test]
     fn test_spiffe_parse_and_resolve() {
-        let (td, path) = SpiffeResolver::parse_spiffe_id("spiffe://example.org/ns/prod/sa/api").unwrap();
+        let (td, path) =
+            SpiffeResolver::parse_spiffe_id("spiffe://example.org/ns/prod/sa/api").unwrap();
         assert_eq!(td, "example.org");
         assert_eq!(path, "/ns/prod/sa/api");
 
@@ -289,15 +305,23 @@ mod tests {
         let err = r.resolve("spiffe://evil.org/sa/x").unwrap_err();
         assert_eq!(err, IdentityError::UntrustedDomain("evil.org".to_string()));
         // Trust domains are DNS names → case-insensitive allowlist match.
-        assert!(r.resolve("spiffe://TRUSTED.ORG/sa/x").is_ok(), "case variant of a trusted domain");
-        assert!(r.resolve("spiffe://Evil.org/sa/x").is_err(), "case variant of an untrusted domain");
+        assert!(
+            r.resolve("spiffe://TRUSTED.ORG/sa/x").is_ok(),
+            "case variant of a trusted domain"
+        );
+        assert!(
+            r.resolve("spiffe://Evil.org/sa/x").is_err(),
+            "case variant of an untrusted domain"
+        );
     }
 
     #[test]
     fn test_oidc_resolve_subject_issuer_owner() {
         let r = OidcResolver::default();
         let id = r
-            .resolve(r#"{"sub":"user-123","iss":"https://idp.example.com","email":"alice@example.com"}"#)
+            .resolve(
+                r#"{"sub":"user-123","iss":"https://idp.example.com","email":"alice@example.com"}"#,
+            )
             .unwrap();
         assert_eq!(id.subject, "user-123");
         assert_eq!(id.trust_domain.as_deref(), Some("https://idp.example.com"));
@@ -306,7 +330,10 @@ mod tests {
         // Missing sub → error; a machine token (no human claim) has NO owner.
         assert!(r.resolve(r#"{"iss":"x"}"#).is_err());
         let id = r.resolve(r#"{"sub":"svc-1"}"#).unwrap();
-        assert_eq!(id.owner, None, "no email/preferred_username → no human owner");
+        assert_eq!(
+            id.owner, None,
+            "no email/preferred_username → no human owner"
+        );
 
         // Issuer allowlist enforced — and a token with NO iss must NOT bypass it.
         let r = OidcResolver::new(vec!["https://good".to_string()]);
@@ -319,7 +346,9 @@ mod tests {
         // With no allowlist, an iss-less token is accepted (owner falls through).
         assert!(OidcResolver::default().resolve(r#"{"sub":"a"}"#).is_ok());
         // An empty email claim is not a valid owner.
-        let id = OidcResolver::default().resolve(r#"{"sub":"x","email":""}"#).unwrap();
+        let id = OidcResolver::default()
+            .resolve(r#"{"sub":"x","email":""}"#)
+            .unwrap();
         assert_eq!(id.owner, None, "empty email is not an owner");
     }
 

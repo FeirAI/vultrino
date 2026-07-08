@@ -55,7 +55,9 @@ impl HmacPlugin {
         // Same secret-bearing-egress SSRF guards as the HTTP plugin (no auto-redirect
         // + connect-time private-IP filter); an HMAC-signed request must not follow a
         // 3xx or a rebinding host into an internal target.
-        Self { client: super::build_guarded_client() }
+        Self {
+            client: super::build_guarded_client(),
+        }
     }
 
     /// Get current timestamp in milliseconds
@@ -97,9 +99,9 @@ impl HmacPlugin {
             ));
         }
 
-        let host = url.host_str().ok_or_else(|| {
-            PluginError::InvalidParams("URL must have a host".to_string())
-        })?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| PluginError::InvalidParams("URL must have a host".to_string()))?;
 
         // Check for IP address literals (these never reach the connect-time DNS
         // resolver, so the literal guard must catch them). Use the SHARED HTTP-plugin
@@ -160,8 +162,9 @@ impl HmacPlugin {
         let validated_url = Self::validate_url_ssrf(&params.url)?;
 
         // Parse method
-        let method = Method::from_str(&params.method.to_uppercase())
-            .map_err(|_| PluginError::InvalidParams(format!("Invalid HTTP method: {}", params.method)))?;
+        let method = Method::from_str(&params.method.to_uppercase()).map_err(|_| {
+            PluginError::InvalidParams(format!("Invalid HTTP method: {}", params.method))
+        })?;
 
         // Build query parameters with timestamp and recvWindow
         let mut query_params = params.query.clone();
@@ -187,12 +190,7 @@ impl HmacPlugin {
         let signature = Self::compute_signature(&string_to_sign, &api_secret)?;
 
         // Build final URL with signature
-        let final_url = format!(
-            "{}?{}&signature={}",
-            validated_url,
-            query_string,
-            signature
-        );
+        let final_url = format!("{}?{}&signature={}", validated_url, query_string, signature);
 
         // Build request
         let mut request = self.client.request(method, &final_url);
@@ -299,9 +297,13 @@ impl Plugin for HmacPlugin {
                 self.execute_request(params, &request.credential.data).await
             }
             "sign" => {
-                let data = request.params.get("data")
+                let data = request
+                    .params
+                    .get("data")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| PluginError::InvalidParams("Missing 'data' parameter".to_string()))?;
+                    .ok_or_else(|| {
+                        PluginError::InvalidParams("Missing 'data' parameter".to_string())
+                    })?;
 
                 self.sign_data(data, &request.credential.data)
             }
@@ -309,11 +311,7 @@ impl Plugin for HmacPlugin {
         }
     }
 
-    fn validate_params(
-        &self,
-        action: &str,
-        params: &serde_json::Value,
-    ) -> Result<(), PluginError> {
+    fn validate_params(&self, action: &str, params: &serde_json::Value) -> Result<(), PluginError> {
         match action {
             "request" => {
                 let obj = params
@@ -321,23 +319,28 @@ impl Plugin for HmacPlugin {
                     .ok_or_else(|| PluginError::InvalidParams("Expected object".to_string()))?;
 
                 if !obj.contains_key("method") {
-                    return Err(PluginError::InvalidParams("Missing 'method' field".to_string()));
+                    return Err(PluginError::InvalidParams(
+                        "Missing 'method' field".to_string(),
+                    ));
                 }
 
                 if !obj.contains_key("url") {
-                    return Err(PluginError::InvalidParams("Missing 'url' field".to_string()));
+                    return Err(PluginError::InvalidParams(
+                        "Missing 'url' field".to_string(),
+                    ));
                 }
 
-                let method = obj["method"]
-                    .as_str()
-                    .ok_or_else(|| PluginError::InvalidParams("'method' must be a string".to_string()))?;
+                let method = obj["method"].as_str().ok_or_else(|| {
+                    PluginError::InvalidParams("'method' must be a string".to_string())
+                })?;
 
-                Method::from_str(&method.to_uppercase())
-                    .map_err(|_| PluginError::InvalidParams(format!("Invalid HTTP method: {}", method)))?;
+                Method::from_str(&method.to_uppercase()).map_err(|_| {
+                    PluginError::InvalidParams(format!("Invalid HTTP method: {}", method))
+                })?;
 
-                let url = obj["url"]
-                    .as_str()
-                    .ok_or_else(|| PluginError::InvalidParams("'url' must be a string".to_string()))?;
+                let url = obj["url"].as_str().ok_or_else(|| {
+                    PluginError::InvalidParams("'url' must be a string".to_string())
+                })?;
 
                 Self::validate_url_ssrf(url)?;
 
@@ -349,7 +352,9 @@ impl Plugin for HmacPlugin {
                     .ok_or_else(|| PluginError::InvalidParams("Expected object".to_string()))?;
 
                 if !obj.contains_key("data") {
-                    return Err(PluginError::InvalidParams("Missing 'data' field".to_string()));
+                    return Err(PluginError::InvalidParams(
+                        "Missing 'data' field".to_string(),
+                    ));
                 }
 
                 Ok(())
@@ -442,7 +447,10 @@ mod tests {
             "https://[::ffff:169.254.169.254]/latest/meta-data",
         ] {
             let result = HmacPlugin::validate_url_ssrf(url);
-            assert!(result.is_err(), "{url} must be rejected as private/internal");
+            assert!(
+                result.is_err(),
+                "{url} must be rejected as private/internal"
+            );
             assert!(result.unwrap_err().to_string().contains("private"));
         }
     }

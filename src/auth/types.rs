@@ -292,7 +292,9 @@ pub fn read_only_role() -> Role {
 pub fn executor_role() -> Role {
     Role::new(
         ROLE_EXECUTOR,
-        [Permission::Read, Permission::Execute].into_iter().collect(),
+        [Permission::Read, Permission::Execute]
+            .into_iter()
+            .collect(),
     )
     .with_id(ROLE_EXECUTOR) // Use name as stable ID
     .with_description("Execute credentials without management access")
@@ -320,7 +322,12 @@ mod tests {
 
     #[test]
     fn test_role_permissions() {
-        let role = Role::new("test", [Permission::Read, Permission::Execute].into_iter().collect());
+        let role = Role::new(
+            "test",
+            [Permission::Read, Permission::Execute]
+                .into_iter()
+                .collect(),
+        );
         assert!(role.has_permission(Permission::Read));
         assert!(role.has_permission(Permission::Execute));
         assert!(!role.has_permission(Permission::Write));

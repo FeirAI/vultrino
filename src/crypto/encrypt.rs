@@ -166,9 +166,11 @@ pub fn decrypt(encrypted: &EncryptedData, key: &MasterKey) -> Result<Vec<u8>, Cr
     let cipher = Aes256Gcm::new_from_slice(key.as_bytes())
         .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
 
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext.as_slice())
-        .map_err(|_| CryptoError::DecryptionFailed("Decryption failed - invalid key or corrupted data".to_string()))?;
+    let plaintext = cipher.decrypt(nonce, ciphertext.as_slice()).map_err(|_| {
+        CryptoError::DecryptionFailed(
+            "Decryption failed - invalid key or corrupted data".to_string(),
+        )
+    })?;
 
     Ok(plaintext)
 }

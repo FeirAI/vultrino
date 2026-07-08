@@ -167,8 +167,7 @@ impl SshPlugin {
         }
 
         let source_dir = if allow_override {
-            param("source_dir")
-                .or_else(|| metadata.get("deploy.source_dir").cloned())
+            param("source_dir").or_else(|| metadata.get("deploy.source_dir").cloned())
         } else {
             metadata.get("deploy.source_dir").cloned()
         }
@@ -312,7 +311,11 @@ impl SshPlugin {
         });
 
         Ok(ExecuteResponse {
-            status: if exit_code == 0 && !timed_out { 200 } else { 500 },
+            status: if exit_code == 0 && !timed_out {
+                200
+            } else {
+                500
+            },
             headers: HashMap::new(),
             body: serde_json::to_vec(&body).unwrap_or_default(),
             updated_credential: None,
@@ -403,8 +406,7 @@ impl SshPlugin {
             cmd.kill_on_drop(true);
 
             let started = Instant::now();
-            let output_result =
-                timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
+            let output_result = timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
             let duration_ms = started.elapsed().as_millis() as u64;
 
             let (exit_code, stdout, stderr, timed_out) = match output_result {
@@ -501,11 +503,7 @@ impl Plugin for SshPlugin {
         }
     }
 
-    fn validate_params(
-        &self,
-        action: &str,
-        params: &serde_json::Value,
-    ) -> Result<(), PluginError> {
+    fn validate_params(&self, action: &str, params: &serde_json::Value) -> Result<(), PluginError> {
         if !params.is_null() && !params.is_object() {
             return Err(PluginError::InvalidParams(
                 "params must be a JSON object or null".to_string(),
@@ -753,11 +751,7 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert("deploy.source_dir".to_string(), "/src".to_string());
         meta.insert("deploy.dest_dir".to_string(), "/dest".to_string());
-        let req = mk_request(
-            "deploy",
-            serde_json::json!({"source_dir": "/evil"}),
-            meta,
-        );
+        let req = mk_request("deploy", serde_json::json!({"source_dir": "/evil"}), meta);
         let err = p.execute(req).await.unwrap_err();
         assert!(err.to_string().contains("allow_override"));
     }
@@ -774,15 +768,8 @@ mod tests {
     async fn test_run_override_locked_by_default() {
         let p = SshPlugin::new();
         let mut meta = HashMap::new();
-        meta.insert(
-            "run.commands".to_string(),
-            r#"["echo safe"]"#.to_string(),
-        );
-        let req = mk_request(
-            "run",
-            serde_json::json!({"commands": ["rm -rf /"]}),
-            meta,
-        );
+        meta.insert("run.commands".to_string(), r#"["echo safe"]"#.to_string());
+        let req = mk_request("run", serde_json::json!({"commands": ["rm -rf /"]}), meta);
         let err = p.execute(req).await.unwrap_err();
         assert!(err.to_string().contains("allow_override"));
     }
@@ -821,10 +808,7 @@ mod tests {
     #[test]
     fn test_base_ssh_args_uses_metadata_host_key() {
         let mut m = HashMap::new();
-        m.insert(
-            "ssh.strict_host_key_checking".to_string(),
-            "no".to_string(),
-        );
+        m.insert("ssh.strict_host_key_checking".to_string(), "no".to_string());
         let args = SshPlugin::base_ssh_args(2222, &m);
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"2222".to_string()));
@@ -835,9 +819,7 @@ mod tests {
     fn test_base_ssh_args_default_host_key_is_accept_new() {
         let m = HashMap::new();
         let args = SshPlugin::base_ssh_args(22, &m);
-        assert!(args
-            .iter()
-            .any(|a| a == "StrictHostKeyChecking=accept-new"));
+        assert!(args.iter().any(|a| a == "StrictHostKeyChecking=accept-new"));
     }
 
     #[test]

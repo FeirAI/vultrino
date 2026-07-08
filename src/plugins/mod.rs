@@ -9,24 +9,24 @@
 //! and dynamically loaded WASM plugins installed from git repos,
 //! local paths, or URLs.
 
-mod http;
-mod hmac;
 mod ecdsa;
-mod postgres;
-mod ssh;
+mod hmac;
+mod http;
 pub mod installer;
 pub mod loader;
+mod postgres;
+mod ssh;
 pub mod types;
 pub mod wasm;
 
-pub use http::HttpPlugin;
-pub(crate) use http::build_guarded_client;
-pub use hmac::HmacPlugin;
 pub use ecdsa::EcdsaPlugin;
-pub use postgres::PostgresPlugin;
-pub use ssh::SshPlugin;
+pub use hmac::HmacPlugin;
+pub(crate) use http::build_guarded_client;
+pub use http::HttpPlugin;
 pub use installer::PluginInstaller;
 pub use loader::{PluginLoader, PluginRegistryExt};
+pub use postgres::PostgresPlugin;
+pub use ssh::SshPlugin;
 pub use types::{
     ActionDefinition, ActionParameterDefinition, CredentialFieldDefinition,
     CredentialTypeDefinition, FieldType, InstalledPluginInfo, McpToolDefinition, PluginFormat,
@@ -124,11 +124,7 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Validate that params are correct for this action
-    fn validate_params(
-        &self,
-        action: &str,
-        params: &serde_json::Value,
-    ) -> Result<(), PluginError>;
+    fn validate_params(&self, action: &str, params: &serde_json::Value) -> Result<(), PluginError>;
 
     /// URL patterns this plugin can auto-match (for route-based detection)
     fn url_patterns(&self) -> Vec<&str> {
@@ -341,9 +337,9 @@ impl PluginRegistry {
 
         // Find the plugin that handles this credential type
         let plugin = if let Some(name) = plugin_name {
-            plugins.get(name).ok_or_else(|| {
-                PluginError::NotFound(format!("Plugin not found: {}", name))
-            })?
+            plugins
+                .get(name)
+                .ok_or_else(|| PluginError::NotFound(format!("Plugin not found: {}", name)))?
         } else {
             plugins
                 .values()
@@ -362,7 +358,9 @@ impl PluginRegistry {
     /// Check if any plugin handles a credential type
     pub fn has_credential_type(&self, type_name: &str) -> bool {
         let plugins = self.plugins.read();
-        plugins.values().any(|p| p.handles_credential_type(type_name))
+        plugins
+            .values()
+            .any(|p| p.handles_credential_type(type_name))
     }
 }
 
