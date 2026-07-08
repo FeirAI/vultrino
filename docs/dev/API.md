@@ -241,6 +241,24 @@ must be in **30..3600** and the `{agent}` path segment must equal `agent_label`
 minted for `(tenant, agent_label)`** and removes the template; it is idempotent so a
 decision plane can safely retry deprovision cleanup.
 
+### `GET /api/v1/approvals` — list approvals (product aggregator, A3)
+
+Admin-gated **and** tenant-scoped: the acting key must carry a `tenant` — a
+global (untenanted) admin key gets `403 tenant_required` and must use the HTML
+admin console instead. Returns the requests visible to the acting key's tenant
+(own + untenanted/shared), pending first then most recent, matching the panel's
+ordering. Optional `?status=` filter (`pending` | `escalated` | `approved` |
+`denied` | `expired`; an unrecognized value matches nothing).
+
+```json
+{ "approvals": [ { "id": "appr_…", "status": "pending", … } ], "truncated": false, "returned": 3 }
+```
+
+Each item is an `ApprovalSummary` (see [Objects](#objects)). The list is capped
+at `MAX_APPROVALS_LIST` (500) after sorting, so the cap keeps the most relevant
+rows; `truncated: true` means more exist than were returned (narrow by
+`?status=` or page as the API grows pagination).
+
 ### Metrics (V12)
 
 `GET /api/v1/metrics` → point-in-time, per-process read-back:
@@ -297,6 +315,64 @@ client can retry. Records are retained 24h.
 > window) re-runs the operation. It is exactly-once only absent a mid-op crash.
 > A replayed token mint returns metadata + a note, **not** the plaintext (the
 > vault never retains it).
+
+### `POST /api/v1/approvals/{id}/decision` — approve or deny over JSON (admin `vk_`)
+
+The JSON counterpart to the HTML console decision (A4), for the per-tenant product
+aggregator. Authenticate with an admin `vk_` key. Body: `{ "approve": true|false, "note": "…" }`.
+
+It is **tenant-partitioned**: the approval must be `visible_to_tenant` for the acting
+key's tenant or the route returns `404` (never revealing a cross-tenant approval's
+existence), and a **global (untenanted) admin key is rejected `403`** before any lookup —
+it has no business deciding a specific tenant's approval. The decision goes through the
+same atomic `decide_approval` verb the HTML handlers use (dual-control `M`-of-`N` still
+applies). See `src/web/api.rs` `api_decide_approval`.
+
+## Delegate approval decisions (plan 031)
+
+A delegate agent decides an approval it was granted authority over via a `vap_`
+approval token, minted from a govder `DelegationGrant` — a separate bearer
+scheme from the admin `vk_` decision route above.
+
+### `POST /api/v1/approvals/{id}/delegate-decision` — approve or deny via a `vap_` token
+
+Authenticate with `Authorization: Bearer vap_…`. Body:
+
+```json
+{ "approve": true, "note": "optional free-text" }
+```
+
+The request is evaluated against govder's D3 human floors
+(`evaluate_delegate_decision`) before the decision is recorded — vultrino never
+decides delegate authority locally. On success the sign-off records
+`approver_kind = delegate-agent` and the token's `delegation_grant_ref`; an
+approval within the grant's veto window carries `veto_until` (a human may still
+veto it before that deadline elapses).
+
+**Response `200`:**
+
+```json
+{
+  "id": "appr_…",
+  "status": "Approved",
+  "executed": false,
+  "required_approvals": 1,
+  "approvals_received": 1,
+  "delegation_grant_ref": "grant_…",
+  "veto_until": "2026-07-08T00:05:00Z"
+}
+```
+
+**Errors:** `401 missing_token` / `invalid_token`; `403 not_approval_token`
+(bearer isn't `vap_`); `403 token_unusable` (revoked/expired token);
+`404 approval_not_found`; `409 approval_not_decidable` (already decided);
+`403 tenant_required` / `403 requester_required` (approval/token missing tenant
+or the requester's `agent_label`, both fail-closed); `403
+delegate_decision_denied` (govder's D3 floors rejected the verdict — e.g. an
+irreversible action, which is human-only); `503 govder_not_configured` (govder
+integration not set up — see [CONFIGURATION.md](CONFIGURATION.md)); `503
+govder_unavailable` / `govder_invalid_response` (govder call failed or returned
+an out-of-bounds veto window — fail-closed).
 
 ## Workload token exchange (connector M1)
 
@@ -414,6 +490,31 @@ Config/wire action: `allow` | `deny` | `prompt`. Engine decision:
 ### `ApprovalStatus`
 
 `Pending`, `Escalated`, `Approved`, `Denied`, `Expired`.
+
+### `ApprovalSummary` (`GET /api/v1/approvals`, `src/web/api.rs`)
+
+The reduced, machine-friendly projection of an approval for the JSON list API
+(ISO-8601 timestamps; no internal params/token bookkeeping).
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | string | `appr_<uuid>`. |
+| `status` | string | lowercase `ApprovalStatus`. |
+| `summary` | string | Human one-liner describing the gated action. |
+| `action` | string | Business-verb label (V8) when present, else the canonical `plugin.action`. |
+| `credential` | string | Credential alias the action would use. |
+| `agent_label` | string? | Requesting principal's agent label, if any. |
+| `requested_by` | string | e.g. `api key "deploy-agent"`. |
+| `created_at` / `expires_at` | string | RFC-3339. |
+| `required_approvals` / `approvals_received` | u32 | Dual-control (M-of-N) progress. |
+| `is_open` | bool | Still pending/escalated and within TTL — a decision can still be recorded. |
+| `tenant` | string? | `null` = untenanted (shared, visible to every admin). |
+| `approver_kind` | string? | `human` or `delegate-agent` once a terminal decision is recorded. |
+| `delegation_grant_ref` | string? | Govder `DelegationGrant` id when decided by a delegate agent. |
+| `decided_by` | string? | Channel/identity that decided the approval. |
+| `veto_until` | string? | RFC-3339 end of the delegate-decision veto window, when open. |
+| `risk_tier` | string | Govder risk tier (`Low`\|`Medium`\|`High`\|`Extreme`) from the same mapping the delegate-decide D3 floor evaluates against. Always emitted. |
+| `irreversible` | bool | Trusted irreversibility stamp (D3 floor input). Always emitted. |
 
 ### Event types (`src/outbox.rs`)
 

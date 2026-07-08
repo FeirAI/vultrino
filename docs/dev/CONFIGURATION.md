@@ -29,6 +29,9 @@ below — Vultrino prefers a loud config error to a silent misconfiguration.
 | `VULTRINO_PROVIDER_GEMINI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `gemini` protocol. |
 | `VULTRINO_PROVIDER_VERTEX_AI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `vertex-ai` protocol. |
 | `VULTRINO_MCP_ALLOWED_ORIGINS` | `web` (MCP transport) | unset | — | Comma-separated `Origin` allowlist for browser MCP requests. A request's `Origin` must equal the request `Host` **or** an entry here, else `403`. |
+| `GOVDER_BASE_URL` | `web` (govder delegate-decision client) | — | Yes, to enable delegate approvals | Base URL of the govder decide-plane. Read at startup (`GovderConfig::from_env`), **not** a `config.toml` key. Unset (or blank) → `state.govder` is `None` and `POST /api/v1/approvals/{id}/delegate-decision` fails closed with `503 govder_not_configured`. |
+| `GOVDER_TENANT_ASSERTION_SECRET` | `web` (govder delegate-decision client) | — | Yes, to enable delegate approvals | HMAC key vultrino signs the outbound `X-Govder-Tenant-Assertion` with on every govder call. Unset (or blank) → same fail-closed `503 govder_not_configured` as a missing `GOVDER_BASE_URL`. |
+| `GOVDER_ASSERTION_TTL_SECS` | `web` (govder delegate-decision client) | `90` | — | TTL of the outbound tenant assertion. A non-positive or unparseable value falls back to the default. |
 
 > **Provider protocol gate is default-deny (fail-closed).** Each `VULTRINO_PROVIDER_*_ENABLED`
 > switch accepts `1`/`true` to turn its family on; anything else (including any

@@ -186,6 +186,10 @@ lifecycle: a **lazy** advance on each agent poll, and a **background sweep**
 (`APPROVAL_SWEEP_SECS = 15`) so requests nobody is polling still escalate/expire.
 Dual-control (V12) requires *M* distinct approvers (default 2). Decisions are made
 in the admin panel, via a signed out-of-band link (Telegram/webhook), or the CLI.
+A delegate agent can also decide via a `vap_` token at
+`POST /api/v1/approvals/{id}/delegate-decision`, gated by govder-evaluated D3
+floors (irreversible => human-only, Medium risk => veto window); the sign-off
+records `approver_kind = delegate-agent` plus a `delegation_grant_ref`.
 Self-approval (separation of duty) is recorded and, if
 `enforce_separation_of_duty`, rejected.
 
