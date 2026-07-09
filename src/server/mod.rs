@@ -18,7 +18,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// The body stream of a streaming execution: scrubbed byte chunks delivered to
 /// the agent. The error type is `io::Error` so axum's `Body::from_stream` accepts
@@ -415,6 +415,65 @@ impl Drop for StreamFinalizer {
     }
 }
 
+/// Outbox delivery counters (observability item 4 / #3). Per-process,
+/// in-memory (resets on restart) — the same idiom as
+/// [`VultrinoServer::unauthorized_attempts`]. Held behind an `Arc` (rather than
+/// as a plain field read only through `&VultrinoServer`) because the
+/// background delivery loop (`deliver_outbox_once`/`deliver_outbox_periodically`)
+/// is a free function spawned in `main.rs` from `storage` + `config` alone —
+/// it runs before, and independently of, any `Arc<VultrinoServer>` wrapping —
+/// so the counters are threaded to it explicitly via `VultrinoServer::outbox_metrics()`
+/// rather than through `&self`.
+#[derive(Default)]
+pub struct OutboxMetrics {
+    delivered: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+    dead_lettered: std::sync::atomic::AtomicU64,
+    /// Sequence of the most recently *successfully* delivered event. 0 (a
+    /// sequence no real event ever has — sequences start at 1) until the first
+    /// success.
+    last_delivered_sequence: std::sync::atomic::AtomicU64,
+}
+
+/// Point-in-time snapshot of [`OutboxMetrics`] for the JSON metrics read-back.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct OutboxMetricsSnapshot {
+    pub delivered: u64,
+    pub failed: u64,
+    pub dead_lettered: u64,
+    pub last_delivered_sequence: u64,
+}
+
+impl OutboxMetrics {
+    fn record_delivered(&self, sequence: u64) {
+        self.delivered
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.last_delivered_sequence
+            .store(sequence, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_failed(&self) {
+        self.failed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_dead_lettered(&self) {
+        self.dead_lettered
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Snapshot the counters for the JSON `/api/v1/metrics` read-back.
+    pub fn snapshot(&self) -> OutboxMetricsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        OutboxMetricsSnapshot {
+            delivered: self.delivered.load(Relaxed),
+            failed: self.failed.load(Relaxed),
+            dead_lettered: self.dead_lettered.load(Relaxed),
+            last_delivered_sequence: self.last_delivered_sequence.load(Relaxed),
+        }
+    }
+}
+
 /// Main Vultrino server
 pub struct VultrinoServer {
     /// Configuration
@@ -453,6 +512,10 @@ pub struct VultrinoServer {
     /// subject per window. The always-on atomic counter still counts every attempt,
     /// and MTTD only needs the first detection in the window.
     detect_emit_gate: parking_lot::RwLock<std::collections::HashMap<String, std::time::Instant>>,
+    /// Outbox delivery counters (observability item 4 / #3). `Arc`-shared with
+    /// the free-standing `deliver_outbox_periodically` background loop (see
+    /// [`OutboxMetrics`]'s doc) via [`Self::outbox_metrics`].
+    outbox_metrics: Arc<OutboxMetrics>,
 }
 
 /// A wired inbound workload-identity resolver (V10/R6): the request header to
@@ -548,6 +611,7 @@ impl VultrinoServer {
             unauthorized_attempts: std::sync::atomic::AtomicU64::new(0),
             inbound_identity,
             detect_emit_gate: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            outbox_metrics: Arc::new(OutboxMetrics::default()),
         }
     }
 
@@ -2059,6 +2123,14 @@ impl VultrinoServer {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Shared outbox delivery counters (observability item 4 / #3) — cloned
+    /// (cheap, `Arc`) so callers (the JSON metrics read-back, and `main.rs`
+    /// wiring the background delivery loop) can hold it independently of
+    /// `&VultrinoServer`.
+    pub fn outbox_metrics(&self) -> Arc<OutboxMetrics> {
+        self.outbox_metrics.clone()
+    }
+
     /// Best-effort append of an event to the signed outbox (V9). Never fails the
     /// calling operation — an event-log problem must not block the action it
     /// describes (the action's own success is the source of truth).
@@ -2643,10 +2715,17 @@ const OUTBOX_LEASE_SECS: u64 = 30;
 /// subject (per-subject ordering preserved), each signed with the shared HMAC
 /// secret, recording success / failure (→ retry → dead-letter). A no-op when no
 /// URL/secret is configured (events are still appended + replayable via the API).
+///
+/// `metrics` (observability item 4 / #3) is updated for every attempt: a
+/// failed delivery attempt is `warn!`-logged (subject/sequence/attempts/error)
+/// and counted; a delivery that exhausts `max_attempts` and transitions to
+/// `DeadLettered` is additionally `error!`-logged (previously fully silent —
+/// the only prior log was on a *recording* failure, not a *delivery* failure).
 pub async fn deliver_outbox_once(
     storage: &Arc<dyn StorageBackend>,
     config: &crate::outbox::OutboxConfig,
     client: &reqwest::Client,
+    metrics: &OutboxMetrics,
 ) -> Result<(), crate::storage::StorageError> {
     let (Some(url), Some(secret)) = (config.url.as_deref(), config.hmac_secret.as_deref()) else {
         return Ok(());
@@ -2684,13 +2763,42 @@ pub async fn deliver_outbox_once(
             // Strip the URL from the transport error so it never logs a secret.
             Err(e) => (false, Some(e.without_url().to_string())),
         };
+        if success {
+            metrics.record_delivered(event.sequence);
+        } else {
+            metrics.record_failed();
+            // Previously silent: a misaligned HMAC secret (401) or a dead consumer
+            // (connection refused) produced no log at all until (if ever) the event
+            // was dead-lettered. `error` was already redacted above (no URL/secret).
+            warn!(
+                status = "failed",
+                subject = %event.subject,
+                sequence = event.sequence,
+                attempts = event.attempts,
+                error = error.as_deref().unwrap_or("unknown"),
+                "outbox delivery attempt failed"
+            );
+        }
         // A record failure must not abort the whole pass (the POST may have
         // succeeded; bailing here would leave it leased and re-deliver later).
-        if let Err(e) = storage
+        match storage
             .record_event_delivery(event.sequence, success, error, config.max_attempts)
             .await
         {
-            warn!(error = %e, sequence = event.sequence, "failed to record outbox delivery outcome");
+            Ok(true) => {
+                // Previously fully silent (no log, no metric, no counter).
+                metrics.record_dead_lettered();
+                error!(
+                    subject = %event.subject,
+                    sequence = event.sequence,
+                    attempts = event.attempts + 1,
+                    "outbox event dead-lettered after exhausting delivery attempts"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = %e, sequence = event.sequence, "failed to record outbox delivery outcome");
+            }
         }
     }
     Ok(())
@@ -2705,6 +2813,7 @@ pub async fn deliver_outbox_periodically(
     storage: Arc<dyn StorageBackend>,
     config: crate::outbox::OutboxConfig,
     interval: std::time::Duration,
+    metrics: Arc<OutboxMetrics>,
 ) {
     // A per-request timeout so one slow consumer can't stall the whole pass; the
     // lease (re-claimable once stale) covers an event whose POST times out.
@@ -2715,7 +2824,7 @@ pub async fn deliver_outbox_periodically(
     let mut ticks: u64 = 0;
     loop {
         tokio::time::sleep(interval).await;
-        if let Err(e) = deliver_outbox_once(&storage, &config, &client).await {
+        if let Err(e) = deliver_outbox_once(&storage, &config, &client, &metrics).await {
             warn!(error = %e, "outbox delivery pass failed");
         }
         ticks = ticks.wrapping_add(1);

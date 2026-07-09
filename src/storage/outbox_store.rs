@@ -235,38 +235,43 @@ impl OutboxStore {
     /// Record a delivery attempt: success → Delivered; failure → retry-with-backoff or dead-letter at
     /// max_attempts. Only a Pending (claimed) event accepts an outcome (Delivered/DeadLettered are
     /// terminal — a late/duplicate outcome can't un-deliver or resurrect them).
+    ///
+    /// Returns whether THIS call transitioned the event to `DeadLettered` (observability item 4 / #3),
+    /// so the caller can log the terminal state exactly once, at the call site, without re-deriving the
+    /// max-attempts arithmetic (keeps logging out of the storage layer per that item's design).
     pub async fn record_delivery(
         &self,
         sequence: u64,
         success: bool,
         error: Option<String>,
         max_attempts: u32,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         self.locked_mutate(move |c| {
-            if let Some(e) = c.outbox.get_mut(&sequence) {
-                if e.delivery != DeliveryState::Pending {
-                    return Ok(());
-                }
-                e.attempts += 1;
-                e.last_attempt_at = Some(Utc::now());
-                if success {
-                    e.delivery = DeliveryState::Delivered;
-                    e.leased_until = None;
-                    e.last_error = None;
-                } else {
-                    e.last_error = error;
-                    if e.attempts >= max_attempts {
-                        e.delivery = DeliveryState::DeadLettered;
-                        e.leased_until = None;
-                    } else {
-                        // Exponential-ish backoff lease, capped at 5 min (same as v6).
-                        let backoff = (10u64.saturating_mul(1 << e.attempts.min(5))).min(300);
-                        e.leased_until =
-                            Some(Utc::now() + chrono::Duration::seconds(backoff as i64));
-                    }
-                }
+            let Some(e) = c.outbox.get_mut(&sequence) else {
+                return Ok(false);
+            };
+            if e.delivery != DeliveryState::Pending {
+                return Ok(false);
             }
-            Ok(())
+            e.attempts += 1;
+            e.last_attempt_at = Some(Utc::now());
+            if success {
+                e.delivery = DeliveryState::Delivered;
+                e.leased_until = None;
+                e.last_error = None;
+                return Ok(false);
+            }
+            e.last_error = error;
+            if e.attempts >= max_attempts {
+                e.delivery = DeliveryState::DeadLettered;
+                e.leased_until = None;
+                Ok(true)
+            } else {
+                // Exponential-ish backoff lease, capped at 5 min (same as v6).
+                let backoff = (10u64.saturating_mul(1 << e.attempts.min(5))).min(300);
+                e.leased_until = Some(Utc::now() + chrono::Duration::seconds(backoff as i64));
+                Ok(false)
+            }
         })
         .await
     }
@@ -675,10 +680,18 @@ mod tests {
         let seq = s.append("A", "t", serde_json::json!({})).await.unwrap();
         // record_delivery targets by sequence + acts on any Pending event (it does NOT consult the
         // backoff lease), so 3 straight failures reach DeadLettered with no lease-clearing needed.
-        for _ in 0..3 {
-            s.record_delivery(seq, false, Some("boom".into()), 3)
+        // Its bool return (observability item 4 / #3) is false for the first two (still retrying)
+        // and true only on the call that actually transitions to DeadLettered.
+        for i in 0..3 {
+            let dead_lettered = s
+                .record_delivery(seq, false, Some("boom".into()), 3)
                 .await
                 .unwrap();
+            assert_eq!(
+                dead_lettered,
+                i == 2,
+                "dead-letter transition reported only on the 3rd (max-attempts) call"
+            );
         }
         assert_eq!(
             s.list_dead_letter(10).await.unwrap().len(),

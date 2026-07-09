@@ -427,8 +427,9 @@ async fn delegate_decision_delivers_signed_webhook_to_govder_consumer() {
     assert_eq!(decide_resp.status(), StatusCode::OK);
 
     let client = reqwest::Client::new();
+    let metrics = vultrino::server::OutboxMetrics::default();
     for _ in 0..8 {
-        vultrino::server::deliver_outbox_once(&storage, &config.outbox, &client)
+        vultrino::server::deliver_outbox_once(&storage, &config.outbox, &client, &metrics)
             .await
             .unwrap();
     }
@@ -564,8 +565,9 @@ async fn delegate_decision_cross_plane_to_govder() {
         retention_secs: 3600,
     };
     let client = reqwest::Client::new();
+    let metrics = vultrino::server::OutboxMetrics::default();
     for _ in 0..8 {
-        vultrino::server::deliver_outbox_once(&storage, &outbox_cfg, &client)
+        vultrino::server::deliver_outbox_once(&storage, &outbox_cfg, &client, &metrics)
             .await
             .unwrap();
     }

@@ -601,14 +601,20 @@ pub trait StorageBackend: Send + Sync {
     /// duplicate outcome can't corrupt it). On success → `Delivered`; on failure →
     /// increment attempts, set a backoff lease (so it isn't immediately re-tried),
     /// and dead-letter once `>= max_attempts`.
+    ///
+    /// Returns whether **this call** transitioned the event to `DeadLettered`
+    /// (observability item 4 / #3), so the caller can log/count that terminal
+    /// state without duplicating the max-attempts logic outside the storage
+    /// layer. `false` for every other outcome (success, retry-with-backoff, a
+    /// late outcome against an already-terminal event, or an unknown sequence).
     async fn record_event_delivery(
         &self,
         _sequence: u64,
         _success: bool,
         _error: Option<String>,
         _max_attempts: u32,
-    ) -> Result<(), StorageError> {
-        Ok(())
+    ) -> Result<bool, StorageError> {
+        Ok(false)
     }
 
     /// Dead-lettered events (V9), ascending by sequence, up to `limit`.

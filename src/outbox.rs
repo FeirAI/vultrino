@@ -38,8 +38,30 @@ pub const EVENT_CAPABILITY_CHANGED: &str = "capability.changed";
 pub const EVENT_CREDENTIAL_ROTATED: &str = "credential.rotated";
 /// A credential revoke that was **propagated** to the resource side (R5/V7): an
 /// OAuth2 credential's access/refresh token was revoked at its RFC 7009
-/// revocation endpoint on delete, not just left to expire.
+/// revocation endpoint on delete, not just left to expire. Fires only for that
+/// narrower OAuth2 case (see [`crate::revocation::propagate_revoke`]) — it is
+/// NOT the general "a credential was deleted" audit event; that is
+/// [`EVENT_CREDENTIAL_DELETED`], which fires on every delete regardless of
+/// whether a downstream propagation happened too.
 pub const EVENT_CREDENTIAL_REVOKED: &str = "credential.revoked";
+/// Admin audit (observability item 4 / #17): a credential was created via the
+/// admin API. Ids-only payload — see [`admin_audit_payload`].
+pub const EVENT_CREDENTIAL_CREATED: &str = "credential.created";
+/// Admin audit (observability item 4 / #17): a credential was deleted via the
+/// admin API — unconditional, unlike [`EVENT_CREDENTIAL_REVOKED`] (which only
+/// fires for a propagated OAuth2 downstream revoke). Ids-only payload.
+pub const EVENT_CREDENTIAL_DELETED: &str = "credential.deleted";
+/// Admin audit (observability item 4 / #17): a role was created, replaced
+/// (upsert), or deleted via the admin API. The `verb` field in the ids-only
+/// payload (see [`admin_audit_payload`]) distinguishes which.
+pub const EVENT_ROLE_CHANGED: &str = "role.changed";
+/// Admin audit (observability item 4 / #17): a use-token (`vut_`) was minted or
+/// revoked via the admin API. `verb` distinguishes created/revoked.
+pub const EVENT_TOKEN_CHANGED: &str = "token.changed";
+/// Admin audit (observability item 4 / #17): an admin API key (`vk_`) was
+/// minted or revoked via the web admin panel. `verb` distinguishes
+/// created/revoked.
+pub const EVENT_KEY_CHANGED: &str = "key.changed";
 /// A policy denial that an observe-only tenant did NOT enforce (V11).
 pub const EVENT_POLICY_OBSERVED_DENIAL: &str = "policy.observed_denial";
 /// An enforce-mode denial — a DETECT signal (R3/V12a). Its `created_at` is the
@@ -182,6 +204,22 @@ pub fn meter_observed_payload(
         "confidence": "low",
         "occurred_at": occurred_at,
         "dims": serde_json::Value::Object(dims),
+    })
+}
+
+/// Build an admin-audit event payload (observability item 4 / #17): ids-only,
+/// no secrets — mirrors [`meter_observed_payload`]'s no-secret discipline.
+/// `actor` is the acting admin's identifier (an admin API key id, or an admin
+/// session username for the session-authenticated web routes — never the key
+/// material itself); `target_id` is the affected resource's id/name/alias;
+/// `verb` is the action taken (e.g. "created", "replaced", "deleted",
+/// "revoked"). Never includes credential secrets, role permissions, or token
+/// scopes — just enough for a durable "who did what to which id" audit trail.
+pub fn admin_audit_payload(actor: &str, target_id: &str, verb: &str) -> serde_json::Value {
+    serde_json::json!({
+        "actor": actor,
+        "target_id": target_id,
+        "verb": verb,
     })
 }
 

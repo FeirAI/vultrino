@@ -278,9 +278,15 @@ async fn test_signed_delivery_end_to_end_and_marks_delivered() {
 
     // One delivery pass.
     let client = reqwest::Client::new();
-    vultrino::server::deliver_outbox_once(&storage, &config, &client)
+    let metrics = vultrino::server::OutboxMetrics::default();
+    vultrino::server::deliver_outbox_once(&storage, &config, &client, &metrics)
         .await
         .unwrap();
+    // Outbox delivery counters (observability item 4 / #3) reflect the success.
+    let snap = metrics.snapshot();
+    assert_eq!(snap.delivered, 1, "one successful delivery counted");
+    assert_eq!(snap.failed, 0);
+    assert_eq!(snap.last_delivered_sequence, seq);
 
     // The consumer received exactly one delivery; the signature verifies under the
     // shared secret over the exact body bytes.
@@ -336,9 +342,10 @@ async fn test_failed_delivery_is_recorded_and_backed_off() {
         .unwrap();
 
     let client = reqwest::Client::new();
+    let metrics = vultrino::server::OutboxMetrics::default();
     // One pass: claims + POSTs once → a 500 records a failed attempt and a backoff
     // lease, so it is NOT re-attempted on the next immediate pass (no hammering).
-    vultrino::server::deliver_outbox_once(&storage, &config, &client)
+    vultrino::server::deliver_outbox_once(&storage, &config, &client, &metrics)
         .await
         .unwrap();
     let after = storage.list_events_after(0, 10).await.unwrap();
@@ -350,6 +357,12 @@ async fn test_failed_delivery_is_recorded_and_backed_off() {
         "not yet dead-lettered"
     );
     assert!(after[0].last_error.is_some(), "failure recorded");
+    // Outbox delivery counters (observability item 4 / #3): a failed attempt that
+    // doesn't (yet) dead-letter counts as failed but not dead_lettered.
+    let snap = metrics.snapshot();
+    assert_eq!(snap.failed, 1);
+    assert_eq!(snap.delivered, 0);
+    assert_eq!(snap.dead_lettered, 0);
     // The backoff lease withholds it from the next immediate claim.
     assert!(
         storage
@@ -358,6 +371,55 @@ async fn test_failed_delivery_is_recorded_and_backed_off() {
             .unwrap()
             .is_empty(),
         "backed off"
+    );
+}
+
+#[tokio::test]
+async fn test_dead_letter_via_deliver_outbox_once_increments_counter() {
+    // Observability item 4 / #3: a failed delivery is counted (outbox_failed) and,
+    // when it exhausts max_attempts, ALSO counted as dead-lettered — previously
+    // both were fully silent (no log, no metric). max_attempts=1 dead-letters on
+    // the very first failed attempt, avoiding a dependence on the real backoff
+    // lease timer (which would make a rapid multi-tick e2e nondeterministic/slow).
+    let storage = storage().await;
+    let app = Router::new().route(
+        "/hook",
+        post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let config = OutboxConfig {
+        enabled: true,
+        url: Some(format!("http://{addr}/hook")),
+        hmac_secret: Some("s".to_string()),
+        max_attempts: 1,
+        retention_secs: 3600,
+    };
+    storage
+        .append_event("A", "e", serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let metrics = vultrino::server::OutboxMetrics::default();
+    vultrino::server::deliver_outbox_once(&storage, &config, &client, &metrics)
+        .await
+        .unwrap();
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.failed, 1, "the failed delivery attempt is counted");
+    assert_eq!(
+        snap.dead_lettered, 1,
+        "max_attempts=1 dead-letters on the first failure"
+    );
+    assert_eq!(snap.delivered, 0);
+    assert_eq!(
+        storage.list_dead_letter_events(10).await.unwrap().len(),
+        1
     );
 }
 

@@ -399,6 +399,88 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
+async fn test_ready_endpoint_healthy() {
+    // Observability item 4 / #5: a healthy process reports 200 + "ready", with no
+    // failing_components key (omitted, not an empty array — see ReadyResponse's
+    // skip_serializing_if) and the outbox_pending backlog (0 for a fresh vault).
+    let (router, _storage) = build_router().await;
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "ready");
+    assert!(
+        body.get("failing_components").is_none(),
+        "no failing_components key on a healthy ready response"
+    );
+    assert_eq!(body["outbox_pending"], 0);
+}
+
+#[tokio::test]
+async fn test_ready_endpoint_reports_not_ready_on_broken_storage() {
+    // Observability item 4 / #5: storage.health_check() failing (here: the vault
+    // file itself is gone) must fail the probe CLOSED — 503, naming "storage" as
+    // the failing component — never fail-open. /api/v1/health (liveness), by
+    // contrast, stays a hardcoded constant and would still report 200 in this
+    // same scenario (that split is the whole point of the two endpoints).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let server = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        Config::default(),
+        storage.clone(),
+        AuthManager::new(),
+        admin,
+        exec_server,
+    );
+    let router = server.into_router();
+
+    // Break storage read-only, without any vault WRITE — deleting the file
+    // underneath the process (a stand-in for the file becoming unreadable/gone).
+    std::fs::remove_file(&path).unwrap();
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "not_ready");
+    let failing = body["failing_components"].as_array().unwrap();
+    assert!(
+        failing.iter().any(|c| c.as_str().unwrap().starts_with("storage")),
+        "expected a storage failure named in failing_components, got {failing:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_login_page_renders() {
     let (router, _) = build_router().await;
     let resp = router
@@ -862,6 +944,138 @@ async fn test_admin_role_create_and_credential_delete_and_put_policy() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     assert!(storage.get_by_alias("c1").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_admin_crud_emits_audit_events() {
+    // Observability item 4 / #17: a successful admin create/delete/revoke emits a
+    // signed-outbox audit event — ids-only payload {actor, target_id, verb} (no
+    // secret, no role permissions, no token scope) — previously these admin
+    // mutations emitted NOTHING to the outbox (a durable audit-completeness gap).
+    let (router, storage, _server, key) = build_admin_router().await;
+
+    // Credential create -> credential.created; delete -> credential.deleted.
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/credentials",
+            &key,
+            serde_json::json!({"alias":"audit-cred","data":{"type":"api_key","key":"k","header_name":"Authorization","header_prefix":"Bearer "}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let cred: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let cred_id = cred["id"].as_str().unwrap().to_string();
+
+    let events = storage.list_events_after(0, 1000).await.unwrap();
+    let created = events
+        .iter()
+        .find(|e| e.event_type == vultrino::outbox::EVENT_CREDENTIAL_CREATED)
+        .expect("credential.created emitted on successful create");
+    assert_eq!(created.subject, "audit-cred");
+    assert_eq!(created.payload["target_id"], cred_id);
+    assert_eq!(created.payload["verb"], "created");
+    assert!(
+        created.payload["actor"].is_string() && !created.payload["actor"].as_str().unwrap().is_empty(),
+        "actor is the acting admin key id, not empty/absent"
+    );
+    // Ids-only payload (item 4 / #17's contract): exactly {actor, target_id,
+    // verb} — no `data`/secret field, no role permissions, no token scope.
+    assert_eq!(
+        created
+            .payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<String>>(),
+        ["actor", "target_id", "verb"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::HashSet<String>>()
+    );
+
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "DELETE",
+            &format!("/api/v1/credentials/{}", cred_id),
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let events = storage.list_events_after(0, 1000).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type
+            == vultrino::outbox::EVENT_CREDENTIAL_DELETED
+            && e.subject == cred_id
+            && e.payload["verb"] == "deleted"),
+        "credential.deleted emitted on successful delete"
+    );
+
+    // Role create -> role.changed{verb=created}.
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/roles",
+            &key,
+            serde_json::json!({"name":"audit-role","permissions":["read"],"credential_scopes":["*"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let events = storage.list_events_after(0, 1000).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_ROLE_CHANGED
+            && e.subject == "audit-role"
+            && e.payload["verb"] == "created"),
+        "role.changed(created) emitted on successful role create"
+    );
+
+    // Use-token create -> token.changed{verb=created}; revoke -> {verb=revoked}.
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/tokens",
+            &key,
+            serde_json::json!({"name":"audit-token","credential_scope":"*"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let tok: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let token_id = tok["metadata"]["id"].as_str().unwrap().to_string();
+    let events = storage.list_events_after(0, 1000).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_TOKEN_CHANGED
+            && e.subject == token_id
+            && e.payload["verb"] == "created"),
+        "token.changed(created) emitted on successful token mint"
+    );
+
+    let r = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/tokens/{}/revoke", token_id),
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let events = storage.list_events_after(0, 1000).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_TOKEN_CHANGED
+            && e.subject == token_id
+            && e.payload["verb"] == "revoked"),
+        "token.changed(revoked) emitted on successful token revoke"
+    );
 }
 
 #[tokio::test]
@@ -1668,6 +1882,74 @@ async fn test_admin_event_replay_api() {
 }
 
 #[tokio::test]
+async fn test_admin_bulk_dead_letter_replay() {
+    // Observability item 4 / #3: POST /api/v1/events/dead/replay requeues EVERY
+    // currently dead-lettered event in one call. This also proves the new
+    // literal "dead" path segment routes correctly alongside (doesn't collide
+    // with) the existing "/api/v1/events/{sequence}/replay" param route.
+    let (router, storage, _server, key) = build_admin_router().await;
+
+    // Dead-letter two events directly at the storage layer (bypassing the
+    // network-delivery path is timing-independent — see
+    // test_dead_letters_after_max_via_record in outbox_integration.rs for why).
+    let seq1 = storage
+        .append_event("A", "e", serde_json::json!({}))
+        .await
+        .unwrap();
+    let seq2 = storage
+        .append_event("B", "e", serde_json::json!({}))
+        .await
+        .unwrap();
+    storage
+        .record_event_delivery(seq1, false, Some("boom".to_string()), 1)
+        .await
+        .unwrap();
+    storage
+        .record_event_delivery(seq2, false, Some("boom".to_string()), 1)
+        .await
+        .unwrap();
+    assert_eq!(storage.list_dead_letter_events(100).await.unwrap().len(), 2);
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/events/dead/replay",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["total"], 2);
+    assert_eq!(
+        body["requeued"].as_array().unwrap().len(),
+        2,
+        "both dead-lettered events requeued"
+    );
+    assert!(body["failed"].as_array().unwrap().is_empty());
+    assert_eq!(
+        storage.list_dead_letter_events(100).await.unwrap().len(),
+        0,
+        "no longer dead-lettered after bulk replay"
+    );
+
+    // Admin-only, and unaffected by having zero dead letters left.
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events/dead/replay")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn test_admin_metrics_readback() {
     // V12: the metrics endpoint returns the structured read-back, admin-only.
     let (router, _storage, _server, key) = build_admin_router().await;
@@ -1686,6 +1968,11 @@ async fn test_admin_metrics_readback() {
     assert_eq!(body["unauthorized_attempts"], 0);
     assert_eq!(body["approvals"]["total"], 0);
     assert!(body["approval_latency_secs"]["count"].is_u64());
+    // Observability item 4 / #3: outbox delivery counters, all zero pre-delivery.
+    assert_eq!(body["outbox"]["delivered"], 0);
+    assert_eq!(body["outbox"]["failed"], 0);
+    assert_eq!(body["outbox"]["dead_lettered"], 0);
+    assert_eq!(body["outbox"]["last_delivered_sequence"], 0);
 
     // Admin-only.
     let resp = router
@@ -1700,6 +1987,61 @@ async fn test_admin_metrics_readback() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_admin_metrics_reflects_outbox_delivery_counters() {
+    // Observability item 4 / #3: a successful delivery pass against the SAME
+    // VultrinoServer the router shares (`exec_server`, cloned into AppState by
+    // WebServer::new) is reflected in the JSON /api/v1/metrics read-back — the
+    // counters are shared (Arc) between the background delivery loop and the
+    // metrics handler, not two independent copies.
+    let (router, storage, exec_server, key) = build_admin_router().await;
+
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(|| async { StatusCode::OK }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let seq = storage
+        .append_event("A", "e", serde_json::json!({}))
+        .await
+        .unwrap();
+    let outbox_cfg = vultrino::outbox::OutboxConfig {
+        enabled: true,
+        url: Some(format!("http://{addr}/hook")),
+        hmac_secret: Some("s".to_string()),
+        max_attempts: 3,
+        retention_secs: 3600,
+    };
+    let client = reqwest::Client::new();
+    vultrino::server::deliver_outbox_once(
+        &storage,
+        &outbox_cfg,
+        &client,
+        &exec_server.outbox_metrics(),
+    )
+    .await
+    .unwrap();
+
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/metrics",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["outbox"]["delivered"], 1);
+    assert_eq!(body["outbox"]["last_delivered_sequence"], seq);
 }
 
 /// Helper: open and store a real approval, optionally tenant-tagged, returning its id.

@@ -42,8 +42,31 @@ a `422` body error.
 
 ### `GET /api/v1/health` — no auth
 
+Cheap, static liveness check — hardcoded, no dependency probe. This is what the
+k8s **startup** probe's vault-decrypt boot gate depends on; it deliberately stays
+dependency-free so a transient dependency blip can't restart a singleton pod.
+
 ```json
 { "status": "ok", "version": "0.1.0" }
+```
+
+### `GET /api/v1/ready` — no auth
+
+Dependency-aware **readiness** probe, distinct from `/api/v1/health` above: a
+short (3s) per-check timeout, checking `storage.health_check()` (vault
+readable), the outbox intent-staging backlog (`pending_event_count` — a HARD
+read failure fails closed; a nonzero backlog is reported but is the documented
+*degraded*, not down, signal and does not alone 503), and that the `AuthManager`
+lock is acquirable. All checks are read-only — no vault WRITE probe (that would
+contend with the fd-locked vault). `200` takes the pod in; `503` takes it out of
+the Service's endpoints (without restarting it, unlike a failing liveness check).
+
+```json
+{ "status": "ready", "outbox_pending": 0 }
+```
+
+```json
+{ "status": "not_ready", "failing_components": ["storage: Storage file does not exist"] }
 ```
 
 ### `POST /api/v1/execute` — the credential broker (API key or use token)
@@ -284,13 +307,17 @@ rows; `truncated: true` means more exist than were returned (narrow by
   "unauthorized_attempts": 3,
   "tenant_scope": "team-a",
   "approvals": { "total": 12, "by_status": {"Pending": 2, "Approved": 9, "Denied": 1}, "dual_control_awaiting": 1 },
-  "approval_latency_secs": { "count": 10, "avg": 45, "p50": 30, "p95": 120, "max": 300 }
+  "approval_latency_secs": { "count": 10, "avg": 45, "p50": 30, "p95": 120, "max": 300 },
+  "outbox": { "delivered": 41, "failed": 2, "dead_lettered": 0, "last_delivered_sequence": 41 }
 }
 ```
 
 Approval counts are scoped to the acting admin key's tenant (a tenant admin sees
 its own + untenanted; a global admin sees all). The durable history is the event
-outbox, not this snapshot.
+outbox, not this snapshot. `outbox.*` are per-process, in-memory delivery
+counters (reset on restart), incremented by the background delivery loop — a
+failed delivery attempt now also `warn!`-logs (subject/sequence/attempts/error)
+and a dead-letter transition `error!`-logs, both previously silent.
 
 ### Event outbox replay (V9)
 
@@ -299,6 +326,7 @@ outbox, not this snapshot.
 | `GET` | `/api/v1/events?after=N&limit=M` | Events with `sequence > after`, in order, gap-free. `limit` default 100, capped 1000. |
 | `GET` | `/api/v1/events/dead` | The dead-letter queue (up to 1000). |
 | `POST` | `/api/v1/events/{sequence}/replay` | Requeue a dead-lettered event; `200 {requeued}` / `404 not_dead_lettered`. |
+| `POST` | `/api/v1/events/dead/replay` | Bulk-requeue EVERY currently dead-lettered event (up to the same 1000-event page); best-effort per event. `200 {requeued: [seq, …], failed: [seq, …], total: N}`. |
 
 `/events` response (each event carries the same `delivery_body` envelope a push
 delivery uses, plus its `Govder-Signature` when a signing secret is configured):
@@ -535,9 +563,19 @@ The reduced, machine-friendly projection of an approval for the JSON list API
 ### Event types (`src/outbox.rs`)
 
 `approval.requested`, `approval.approved`, `approval.denied`, `approval.escalated`,
-`approval.expired`, `agent.halted`, `policy.changed`, `policy.denied`,
-`policy.observed_denial`, `credential.rotated`, `credential.revoked`,
-`meter.observed`.
+`approval.expired`, `agent.halted`, `policy.changed`, `capability.changed`,
+`policy.denied`, `policy.observed_denial`, `credential.rotated`,
+`credential.revoked`, `meter.observed`.
+
+Admin audit (observability item 4 / #17) — ids-only `{actor, target_id, verb}`
+payload (see `admin_audit_payload`), emitted best-effort after a successful
+admin mutation (never fails the mutation itself): `credential.created`,
+`credential.deleted` (distinct from `credential.revoked` above, which fires
+only for a propagated OAuth2 downstream revoke, not every delete),
+`role.changed` (`verb`: created/replaced/deleted), `token.changed` (`verb`:
+created/revoked, use-tokens), `key.changed` (`verb`: created/revoked, admin API
+keys — emitted by the session-authenticated `/keys` web routes, since there is
+no JSON `/api/v1/keys` admin surface).
 
 ## Error response format
 

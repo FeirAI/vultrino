@@ -208,6 +208,11 @@ impl WebServer {
             .route("/api/stats", get(routes::api_stats))
             // JSON API endpoints (API key auth for CLI/external apps)
             .route("/api/v1/health", get(api::api_health))
+            // Dependency-aware readiness probe (observability item 4 / #5) —
+            // distinct from the cheap, static /api/v1/health above (which the
+            // k8s startup probe's vault-decrypt boot gate depends on and which
+            // must NOT become dependency-aware). Unauthenticated, additive.
+            .route("/api/v1/ready", get(api::api_ready))
             .route(
                 "/api/v1/credentials",
                 get(api::api_list_credentials).post(api::api_create_credential),
@@ -284,6 +289,14 @@ impl WebServer {
             .route(
                 "/api/v1/events/{sequence}/replay",
                 post(api::api_replay_dead_letter),
+            )
+            // Bulk dead-letter replay (observability item 4 / #3): requeue every
+            // currently dead-lettered event in one call. A literal path segment
+            // ("dead") takes priority over the "{sequence}" param route above, so
+            // this does not collide with it.
+            .route(
+                "/api/v1/events/dead/replay",
+                post(api::api_replay_all_dead_letters),
             )
             // Networked MCP transport (connector M1): a remote agent harness
             // reaches vultrino's MCP over JSON-RPC here, authed + scoped by a

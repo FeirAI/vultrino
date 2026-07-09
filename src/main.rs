@@ -917,11 +917,13 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
             std::time::Duration::from_secs(vultrino::server::APPROVAL_SWEEP_SECS),
         ));
     }
-    // Deliver + GC the signed event outbox (V9).
+    // Deliver + GC the signed event outbox (V9). Counters (observability item 4 / #3) are
+    // shared with this process's VultrinoServer so the JSON metrics read-back sees them too.
     tokio::spawn(vultrino::server::deliver_outbox_periodically(
         server.storage().clone(),
         outbox_cfg.clone(),
         std::time::Duration::from_secs(vultrino::server::OUTBOX_DELIVERY_SECS),
+        server.outbox_metrics(),
     ));
     // Reconcile any intent-staged events an inline drain left behind (D1 safety net) so a committed
     // approval decision's signed event is delivered within a tick, not only on the next restart.
@@ -986,11 +988,13 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
             std::time::Duration::from_secs(vultrino::server::APPROVAL_SWEEP_SECS),
         ));
     }
-    // Deliver + GC the signed event outbox (V9).
+    // Deliver + GC the signed event outbox (V9). Counters (observability item 4 / #3) are
+    // shared with this process's VultrinoServer so the JSON metrics read-back sees them too.
     tokio::spawn(vultrino::server::deliver_outbox_periodically(
         exec_server.storage().clone(),
         config.outbox.clone(),
         std::time::Duration::from_secs(vultrino::server::OUTBOX_DELIVERY_SECS),
+        exec_server.outbox_metrics(),
     ));
     // Reconcile any intent-staged events an inline drain left behind (D1 safety net).
     tokio::spawn(vultrino::server::drain_pending_events_periodically(

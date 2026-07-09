@@ -1024,6 +1024,102 @@ pub async fn api_health() -> impl IntoResponse {
     })
 }
 
+// ============== Readiness Probe ==============
+
+/// Per-probe timeout (observability item 4 / #5): short enough that a hung
+/// dependency reports not-ready promptly rather than hanging the k8s readiness
+/// probe itself (which would eventually time out anyway, just slower and
+/// noisier). Deliberately NOT shared with `/api/v1/health`, which stays a
+/// zero-dependency constant — see `api_health` above and its doc note.
+const READY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[derive(Serialize)]
+pub struct ReadyResponse {
+    pub status: &'static str,
+    /// Present (and non-empty) only when `status == "not_ready"`: the
+    /// dependency name(s) that failed the probe, e.g. `"storage"`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failing_components: Vec<String>,
+    /// Outbox intent-staging backlog (see
+    /// [`crate::storage::StorageBackend::pending_event_count`]) — reported for
+    /// operator visibility even when it doesn't (by itself) fail the probe.
+    /// `None` when the read itself failed (that case already 503s via
+    /// `failing_components`, so there's nothing meaningful to report here).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbox_pending: Option<usize>,
+}
+
+/// Readiness probe (observability item 4 / #5): dependency-aware, SHORT-timeout
+/// (`READY_PROBE_TIMEOUT`) check — deliberately distinct from the cheap, static
+/// `/api/v1/health` above, which the k8s **startup** probe's ~150s vault-decrypt
+/// boot gate depends on and which must stay dependency-free (a transient dep
+/// blip must not restart a singleton pod via a failing *liveness*-shaped check).
+/// This is the **readiness** gate: 503 takes the pod out of the Service's
+/// endpoint list without restarting it.
+///
+/// Checks, all read-only (no vault WRITE probe — a write would re-take the
+/// fd-locked vault's exclusive lock, which could contend with or stall a live
+/// mutation; see the storage layer's `locked_mutate`):
+///   - `storage.health_check()` — the vault file exists and is statable.
+///   - `storage.pending_event_count()` — the outbox-writability proxy. Per its
+///     doc, a persistent nonzero count is the DEGRADED signal (events staged
+///     but the outbox store is unwritable) — reported in `outbox_pending` for
+///     visibility, but does NOT by itself 503 the probe (a backlog is
+///     degraded, not down). A HARD READ FAILURE, in contrast, fails closed:
+///     it can't be distinguished from "storage is actually broken" and IS
+///     treated as not-ready.
+///   - The `AuthManager` lock is acquirable (not stuck) — cheap, in-process;
+///     the manager itself is always populated after startup, so this checks
+///     liveness of the lock rather than its absence.
+///
+/// Unauthenticated and additive (mirrors `/api/v1/health`) — never touches the
+/// enforcement/execute path.
+pub async fn api_ready(State(state): State<AppState>) -> impl IntoResponse {
+    let mut failing = Vec::new();
+
+    match tokio::time::timeout(READY_PROBE_TIMEOUT, state.storage.health_check()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => failing.push(format!("storage: {e}")),
+        Err(_) => failing.push("storage: health check timed out".to_string()),
+    }
+
+    let mut outbox_pending = None;
+    match tokio::time::timeout(READY_PROBE_TIMEOUT, state.storage.pending_event_count()).await {
+        Ok(Ok(n)) => outbox_pending = Some(n),
+        // A hard read failure is fail-closed not-ready; a nonzero backlog value
+        // (the Ok(n) arm above) is NOT — it's the documented degraded signal.
+        Ok(Err(e)) => failing.push(format!("outbox: {e}")),
+        Err(_) => failing.push("outbox: pending-event read timed out".to_string()),
+    }
+
+    match tokio::time::timeout(READY_PROBE_TIMEOUT, state.auth_manager.read()).await {
+        Ok(_guard) => {}
+        Err(_) => failing.push("auth_manager: lock acquire timed out".to_string()),
+    }
+
+    if failing.is_empty() {
+        (
+            StatusCode::OK,
+            Json(ReadyResponse {
+                status: "ready",
+                failing_components: Vec::new(),
+                outbox_pending,
+            }),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadyResponse {
+                status: "not_ready",
+                failing_components: failing,
+                outbox_pending,
+            }),
+        )
+            .into_response()
+    }
+}
+
 // ============================================================================
 // Admin API (V1) — runtime config-write surface for the enforcement plane.
 //
@@ -1930,6 +2026,8 @@ pub async fn api_create_token(
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
+    // Admin audit (item 4 / #17): the acting admin key id, never the key material.
+    let actor = admin.0.api_key.id.clone();
     idempotent(&state, key, body_hash, move || async move {
         // Bound the raw seconds before converting, so a huge value can't panic
         // chrono's Duration::seconds (admin-triggerable). NewUseToken::validate
@@ -1995,6 +2093,14 @@ pub async fn api_create_token(
                 serde_json::json!({"code": "storage_error", "error": e.to_string()}),
             );
         }
+        // Admin audit (item 4 / #17): best-effort, ids-only — never fails the mint.
+        st.server
+            .emit_event(
+                &token.id,
+                crate::outbox::EVENT_TOKEN_CHANGED,
+                crate::outbox::admin_audit_payload(&actor, &token.id, "created"),
+            )
+            .await;
         (
             StatusCode::CREATED,
             serde_json::json!({
@@ -2018,14 +2124,25 @@ pub async fn api_revoke_token(
     // under the storage lock. An operator key (tenant None) is unrestricted.
     let acting = admin.0.api_key.tenant.as_deref();
     match state.storage.set_use_token_revoked_scoped(&id, acting).await {
-        Ok(token) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-            "revoked": true,
-            "metadata": UseTokenMetadata::from(&token),
-            })),
-        )
-            .into_response(),
+        Ok(token) => {
+            // Admin audit (item 4 / #17): best-effort, ids-only — never fails the revoke.
+            state
+                .server
+                .emit_event(
+                    &token.id,
+                    crate::outbox::EVENT_TOKEN_CHANGED,
+                    crate::outbox::admin_audit_payload(&admin.0.api_key.id, &token.id, "revoked"),
+                )
+                .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                "revoked": true,
+                "metadata": UseTokenMetadata::from(&token),
+                })),
+            )
+                .into_response()
+        }
         Err(crate::storage::StorageError::UseTokenNotFound(_)) => error_response(
             StatusCode::NOT_FOUND,
             "token_not_found",
@@ -2749,6 +2866,11 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
         Some(latencies_secs.iter().sum::<i64>() / latencies_secs.len() as i64)
     };
 
+    // Outbox delivery counters (observability item 4 / #3) — per-process,
+    // in-memory, like `unauthorized_attempts` above; shared with the
+    // background delivery loop via `VultrinoServer::outbox_metrics()`.
+    let outbox = state.server.outbox_metrics().snapshot();
+
     let body = serde_json::json!({
         "unauthorized_attempts": state.server.unauthorized_attempts(),
         "tenant_scope": acting_tenant,
@@ -2763,6 +2885,12 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
             "p50": pct(50.0),
             "p95": pct(95.0),
             "max": latencies_secs.last().copied(),
+        },
+        "outbox": {
+            "delivered": outbox.delivered,
+            "failed": outbox.failed,
+            "dead_lettered": outbox.dead_lettered,
+            "last_delivered_sequence": outbox.last_delivered_sequence,
         },
     });
     (StatusCode::OK, Json(body)).into_response()
@@ -2886,6 +3014,63 @@ pub async fn api_replay_dead_letter(
     }
 }
 
+/// `POST /api/v1/events/dead/replay` — requeue EVERY currently dead-lettered
+/// event for re-delivery in one call (observability item 4 / #3): an operator
+/// remediating (e.g.) a misconfigured HMAC secret or a temporarily-down
+/// consumer would otherwise have to replay each sequence one at a time via
+/// `api_replay_dead_letter`. Best-effort per event — one event's replay failing
+/// (already gone, storage hiccup) does not abort the batch; the response
+/// reports exactly which sequences were requeued vs skipped/failed, so the
+/// caller can retry only what didn't succeed. Bounded by the same 1000-event
+/// page `api_list_dead_letters` uses (the DLQ itself is retention-bounded, so
+/// this is not an unbounded replay).
+pub async fn api_replay_all_dead_letters(
+    admin: AdminApiAuth,
+    State(state): State<AppState>,
+) -> Response {
+    // Operator-only (#0): shared cross-tenant outbox — see `api_list_events`.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
+    let dead = match state.storage.list_dead_letter_events(1000).await {
+        Ok(events) => events,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                e.to_string(),
+            )
+        }
+    };
+    let mut requeued = Vec::new();
+    let mut failed = Vec::new();
+    for event in &dead {
+        match state.storage.replay_dead_letter_event(event.sequence).await {
+            Ok(true) => requeued.push(event.sequence),
+            // Ok(false) (already requeued/resolved by a racing caller) or a storage
+            // error are both reported the same way here: not requeued by THIS call.
+            Ok(false) => failed.push(event.sequence),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    sequence = event.sequence,
+                    "bulk dead-letter replay: failed to requeue one event"
+                );
+                failed.push(event.sequence);
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "requeued": requeued,
+            "failed": failed,
+            "total": dead.len(),
+        })),
+    )
+        .into_response()
+}
+
 // -------- Roles --------
 
 #[derive(Serialize, Deserialize)]
@@ -2914,6 +3099,8 @@ pub async fn api_create_role(
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
+    // Admin audit (item 4 / #17): the acting admin key id, never the key material.
+    let actor = admin.0.api_key.id.clone();
     idempotent(&state, key, body_hash, move || async move {
         if req.name.trim().is_empty() {
             return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_role","error":"role name must not be empty"}));
@@ -2947,6 +3134,14 @@ pub async fn api_create_role(
         }
         // Make the new role visible to this process's auth manager immediately.
         let _ = refresh_auth_data(&st).await;
+        // Admin audit (item 4 / #17): best-effort, ids-only — never fails the create.
+        st.server
+            .emit_event(
+                &role.name,
+                crate::outbox::EVENT_ROLE_CHANGED,
+                crate::outbox::admin_audit_payload(&actor, &role.name, "created"),
+            )
+            .await;
         (StatusCode::CREATED, serde_json::to_value(&role).unwrap_or_default())
     })
     .await
@@ -2984,6 +3179,8 @@ pub async fn api_upsert_role(
     // replayed as the first.
     let body_hash = idempotency_body_hash(&(name.as_str(), &req));
     let st = state.clone();
+    // Admin audit (item 4 / #17): the acting admin key id, never the key material.
+    let actor = admin.0.api_key.id.clone();
     idempotent(&state, key, body_hash, move || async move {
         if name.trim().is_empty() {
             return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_role","error":"role name must not be empty"}));
@@ -3007,6 +3204,7 @@ pub async fn api_upsert_role(
                 return (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({"code":"storage_error","error":e.to_string()}));
             }
         };
+        let replaced = existing.is_some();
         let mut role = Role::new(name.clone(), perms).with_scopes(req.credential_scopes);
         if let Some(desc) = req.description {
             role = role.with_description(desc);
@@ -3031,6 +3229,18 @@ pub async fn api_upsert_role(
         }
         // Make the updated role visible to this process's auth manager immediately.
         let _ = refresh_auth_data(&st).await;
+        // Admin audit (item 4 / #17): best-effort, ids-only — never fails the upsert.
+        st.server
+            .emit_event(
+                &role.name,
+                crate::outbox::EVENT_ROLE_CHANGED,
+                crate::outbox::admin_audit_payload(
+                    &actor,
+                    &role.name,
+                    if replaced { "replaced" } else { "created" },
+                ),
+            )
+            .await;
         (StatusCode::OK, serde_json::to_value(&role).unwrap_or_default())
     })
     .await
@@ -3059,6 +3269,15 @@ pub async fn api_delete_role(
     match state.storage.delete_role_if_unreferenced(&id).await {
         Ok(()) => {
             let _ = refresh_auth_data(&state).await;
+            // Admin audit (item 4 / #17): best-effort, ids-only — never fails the delete.
+            state
+                .server
+                .emit_event(
+                    &id,
+                    crate::outbox::EVENT_ROLE_CHANGED,
+                    crate::outbox::admin_audit_payload(&admin.0.api_key.id, &id, "deleted"),
+                )
+                .await;
             (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response()
         }
         Err(crate::storage::StorageError::Conflict(msg)) => {
@@ -3114,6 +3333,8 @@ pub async fn api_create_credential(
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
+    // Admin audit (item 4 / #17): the acting admin key id, never the key material.
+    let actor = admin.0.api_key.id.clone();
     idempotent(&state, key, body_hash, move || async move {
         if req.alias.trim().is_empty() {
             return (
@@ -3145,6 +3366,15 @@ pub async fn api_create_credential(
                 serde_json::json!({"code":"storage_error","error":e.to_string()}),
             );
         }
+        // Admin audit (item 4 / #17): best-effort, ids-only (alias, not the secret) —
+        // never fails the create.
+        st.server
+            .emit_event(
+                &cred.alias,
+                crate::outbox::EVENT_CREDENTIAL_CREATED,
+                crate::outbox::admin_audit_payload(&actor, &cred.id, "created"),
+            )
+            .await;
         // Return metadata only — never the secret.
         (
             StatusCode::CREATED,
@@ -3200,7 +3430,20 @@ pub async fn api_delete_credential(
         }
     }
     match state.storage.delete_scoped(&id, acting).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response(),
+        Ok(()) => {
+            // Admin audit (item 4 / #17): best-effort, ids-only — never fails the delete.
+            // Distinct from EVENT_CREDENTIAL_REVOKED above, which fires only for a
+            // propagated OAuth2 downstream revoke, not every delete.
+            state
+                .server
+                .emit_event(
+                    &id,
+                    crate::outbox::EVENT_CREDENTIAL_DELETED,
+                    crate::outbox::admin_audit_payload(&admin.0.api_key.id, &id, "deleted"),
+                )
+                .await;
+            (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response()
+        }
         Err(crate::storage::StorageError::NotFound(_)) => error_response(
             StatusCode::NOT_FOUND,
             "credential_not_found",

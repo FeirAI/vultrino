@@ -1039,6 +1039,18 @@ pub async fn key_create(
         .into_response();
     }
 
+    // Admin audit (item 4 / #17): best-effort, ids-only (key id, never the key
+    // material) — never fails the create. `actor` is the session username (this
+    // route is session-authenticated, unlike the JSON admin API's key ids).
+    state
+        .server
+        .emit_event(
+            &api_key.id,
+            crate::outbox::EVENT_KEY_CHANGED,
+            crate::outbox::admin_audit_payload(&auth.session.username, &api_key.id, "created"),
+        )
+        .await;
+
     // Refresh auth data to update the cached AuthManager
     let _ = refresh_auth_data(&state).await;
 
@@ -1112,7 +1124,7 @@ async fn render_key_new_error_with_session(
 pub async fn key_revoke(
     State(state): State<AppState>,
     session: Session,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     Path(id): Path<String>,
     Form(form): Form<DeleteForm>,
 ) -> impl IntoResponse {
@@ -1128,6 +1140,16 @@ pub async fn key_revoke(
         )
             .into_response();
     }
+
+    // Admin audit (item 4 / #17): best-effort, ids-only — never fails the revoke.
+    state
+        .server
+        .emit_event(
+            &id,
+            crate::outbox::EVENT_KEY_CHANGED,
+            crate::outbox::admin_audit_payload(&auth.session.username, &id, "revoked"),
+        )
+        .await;
 
     // Refresh auth data to update the cached AuthManager
     let _ = refresh_auth_data(&state).await;

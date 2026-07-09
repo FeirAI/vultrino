@@ -1653,7 +1653,7 @@ impl StorageBackend for FileStorage {
         success: bool,
         error: Option<String>,
         max_attempts: u32,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         self.outbox
             .record_delivery(sequence, success, error, max_attempts)
             .await
