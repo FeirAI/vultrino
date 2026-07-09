@@ -1170,6 +1170,107 @@ async fn test_admin_delete_role_in_use_conflict() {
 }
 
 #[tokio::test]
+async fn test_admin_put_role_upserts_in_place_and_post_still_conflicts() {
+    let (router, storage, _server, key) = build_admin_router().await;
+
+    // Create a role with a narrow credential scope (simulates the provisioner
+    // seeding an agent's executor role for its first capability).
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/roles",
+            &key,
+            serde_json::json!({"name":"govder-exec-agent1","permissions":["read","execute"],"credential_scopes":["github-*"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let original_id = created["id"].as_str().unwrap().to_string();
+
+    // A second POST create with the same name still 409s — POST-create
+    // semantics are unchanged by adding the PUT upsert.
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/roles",
+            &key,
+            serde_json::json!({"name":"govder-exec-agent1","permissions":["read","execute"],"credential_scopes":["github-*","slack-*"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    assert!(body_string(r).await.contains("role_exists"));
+
+    // Granting a second capability widens the credential_scopes union. The
+    // provisioner now does this via PUT (create-or-replace by name) instead
+    // of POST, so it succeeds instead of 409ing.
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "PUT",
+            "/api/v1/roles/govder-exec-agent1",
+            &key,
+            serde_json::json!({"name":"govder-exec-agent1","permissions":["read","execute"],"credential_scopes":["github-*","slack-*"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let updated: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(
+        updated["id"].as_str().unwrap(),
+        original_id,
+        "upsert must reuse the existing role's id, not mint a new one"
+    );
+    assert_eq!(
+        updated["credential_scopes"],
+        serde_json::json!(["github-*", "slack-*"])
+    );
+
+    // The storage-level view (and hence get_role_by_name / list_roles, which
+    // is what the auth manager and any subsequent GET use) reflects the
+    // widened scopes in place, still under the same id — no duplicate role
+    // was created alongside the original.
+    let stored = storage
+        .get_role_by_name("govder-exec-agent1")
+        .await
+        .unwrap()
+        .expect("role still present");
+    assert_eq!(stored.id, original_id);
+    assert_eq!(stored.credential_scopes, vec!["github-*", "slack-*"]);
+    assert_eq!(
+        storage
+            .list_roles()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.name == "govder-exec-agent1")
+            .count(),
+        1,
+        "no duplicate role rows for the same name"
+    );
+
+    // PUTting a brand-new name (no prior role) behaves like a create.
+    let r = router
+        .oneshot(admin_req(
+            "PUT",
+            "/api/v1/roles/govder-exec-agent2",
+            &key,
+            serde_json::json!({"name":"govder-exec-agent2","permissions":["read"],"credential_scopes":["aws-*"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(storage
+        .get_role_by_name("govder-exec-agent2")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
 async fn test_admin_cannot_delete_builtin_role() {
     let (router, _storage, _server, key) = build_admin_router().await;
     let resp = router

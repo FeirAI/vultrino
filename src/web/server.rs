@@ -266,7 +266,10 @@ impl WebServer {
                 post(api::api_revoke_approval_token),
             )
             .route("/api/v1/roles", post(api::api_create_role))
-            .route("/api/v1/roles/{id}", delete(api::api_delete_role))
+            .route(
+                "/api/v1/roles/{id}",
+                delete(api::api_delete_role).put(api::api_upsert_role),
+            )
             // Kill/halt + session registry (V6).
             .route(
                 "/api/v1/agents/{label}/halt",

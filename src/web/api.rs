@@ -2822,6 +2822,86 @@ pub async fn api_create_role(
     .await
 }
 
+/// `PUT /api/v1/roles/{name}` — create-or-replace a role by NAME.
+///
+/// Unlike `POST /api/v1/roles` (create-only, 409s on an existing name), this
+/// is an idempotent upsert: if a role with this name already exists, its
+/// `id` is reused so `store_role`'s same-id check treats the write as a
+/// REPLACE (updated permissions/credential_scopes/description) rather than a
+/// name collision. This is what lets a provisioner widen an existing role's
+/// credential_scopes (e.g. granting a second capability to an agent) without
+/// hitting `role_exists`. If no role with this name exists yet, a fresh id is
+/// minted and this behaves like a create.
+///
+/// The `name` field of the request body, if present, is ignored in favor of
+/// the path segment — the path is the source of truth for which role is
+/// being written.
+pub async fn api_upsert_role(
+    _admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(mut req): Json<RoleCreateRequest>,
+) -> Response {
+    req.name = name.clone();
+    let key = extract_idempotency_key(&headers);
+    // Bind the hash to the path name (same pattern as api_put_capability) so
+    // the same body PUT to a different name under one Idempotency-Key isn't
+    // replayed as the first.
+    let body_hash = idempotency_body_hash(&(name.as_str(), &req));
+    let st = state.clone();
+    idempotent(&state, key, body_hash, move || async move {
+        if name.trim().is_empty() {
+            return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_role","error":"role name must not be empty"}));
+        }
+        let mut perms = std::collections::HashSet::new();
+        for p in &req.permissions {
+            match Permission::parse(p) {
+                Some(perm) => {
+                    perms.insert(perm);
+                }
+                None => {
+                    return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_permission","error":format!("unknown permission '{}'", p)}));
+                }
+            }
+        }
+        // Reuse the existing role's id (if any) so store_role's same-id check
+        // treats this as an update instead of a name collision.
+        let existing = match st.storage.get_role_by_name(&name).await {
+            Ok(existing) => existing,
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({"code":"storage_error","error":e.to_string()}));
+            }
+        };
+        let mut role = Role::new(name.clone(), perms).with_scopes(req.credential_scopes);
+        if let Some(desc) = req.description {
+            role = role.with_description(desc);
+        }
+        if let Some(existing) = existing {
+            role = role.with_id(existing.id);
+        }
+        // store_role enforces name uniqueness atomically under the storage lock;
+        // since we reused the existing id (when present), a same-name write
+        // is a REPLACE, not a RoleAlreadyExists conflict. A genuine race where
+        // a role with this name is created concurrently, between our lookup
+        // and the write, is still caught (different id -> 409) rather than
+        // silently overwritten.
+        match st.storage.store_role(&role).await {
+            Ok(()) => {}
+            Err(crate::storage::StorageError::RoleAlreadyExists(_)) => {
+                return (StatusCode::CONFLICT, serde_json::json!({"code":"role_exists","error":format!("a role named '{}' already exists", role.name)}));
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({"code":"storage_error","error":e.to_string()}));
+            }
+        }
+        // Make the updated role visible to this process's auth manager immediately.
+        let _ = refresh_auth_data(&st).await;
+        (StatusCode::OK, serde_json::to_value(&role).unwrap_or_default())
+    })
+    .await
+}
+
 /// `DELETE /api/v1/roles/{id}` — delete a custom role.
 pub async fn api_delete_role(
     _admin: AdminApiAuth,
