@@ -1889,11 +1889,40 @@ impl VultrinoServer {
         // double-run if two polls race).
         if approval.status == ApprovalStatus::Approved && !approval.executed {
             match self.storage.claim_approval_for_execution(id).await? {
-                Some(mut claimed) => {
-                    // Run the (possibly slow) action while heartbeating the claim,
-                    // so a live worker's claim is never judged stale and re-run by
-                    // another process. Resume against a clone so `claimed` stays
-                    // free to mutate with the result. The select cancels the
+                Some(claim) => {
+                    let epoch = claim.epoch;
+                    let mut claimed = claim.approval;
+
+                    // FAIL-CLOSED at-most-once (#8): a STALE re-take means the
+                    // original worker set `executing` and then vanished (crashed
+                    // mid-flight). Its side effect may ALREADY have fired, so we must
+                    // NOT re-run `resume_approved` — that would risk a duplicate
+                    // effect. Finalize the grant TERMINALLY as "outcome unknown"; the
+                    // requester must re-approve to retry (an idempotency decision it
+                    // now owns, rather than us silently double-firing).
+                    if claim.stale_retake {
+                        claimed.result_status = None;
+                        claimed.result_body = None;
+                        claimed.result_error = Some(
+                            "outcome unknown — original worker lost mid-execution; \
+                             re-approve to retry"
+                                .to_string(),
+                        );
+                        claimed.executed = true;
+                        claimed.executing = false;
+                        claimed.executing_since = None;
+                        // Commit under the epoch CAS; if yet another claim raced in,
+                        // return the authoritative state rather than clobbering it.
+                        if self.storage.finalize_execution(id, epoch, &claimed).await? {
+                            return Ok(claimed);
+                        }
+                        return Ok(self.storage.get_approval(id).await?.unwrap_or(claimed));
+                    }
+
+                    // Fresh claim. Run the (possibly slow) action while heartbeating
+                    // the claim, so a live worker's claim is never judged stale and
+                    // re-run by another process. Resume against a clone so `claimed`
+                    // stays free to mutate with the result. The select cancels the
                     // heartbeat loop as soon as the action finishes.
                     let resume_input = claimed.clone();
                     let hb_storage = self.storage.clone();
@@ -1945,8 +1974,15 @@ impl VultrinoServer {
                             ));
                         }
                     }
-                    self.storage.update_approval(&claimed).await?;
-                    return Ok(claimed);
+                    // At-most-once commit under the epoch CAS (#8), replacing the
+                    // former blind `update_approval`. If this claim was superseded
+                    // (we stalled past the stale window despite heartbeating and were
+                    // re-taken), refuse to overwrite the re-taker's terminal outcome
+                    // and surface the authoritative state instead.
+                    if self.storage.finalize_execution(id, epoch, &claimed).await? {
+                        return Ok(claimed);
+                    }
+                    return Ok(self.storage.get_approval(id).await?.unwrap_or(claimed));
                 }
                 None => {
                     // Another worker owns/owned execution; return the latest.

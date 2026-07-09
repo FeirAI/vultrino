@@ -106,6 +106,20 @@ pub struct ApprovalSweep {
     pub expired: Vec<String>,
 }
 
+/// A successful execution claim (#8). Carries the claimed request plus the
+/// `epoch` stamped under the storage lock (the fence a later [`finalize_execution`]
+/// compare-and-sets against) and whether this was a **stale re-take** — a claim
+/// seized from a worker that set `executing` but never finalized (it likely
+/// crashed mid-execution). A stale re-take must be finalized TERMINALLY without
+/// re-running the side effect: the crashed attempt's outcome is unknown, so
+/// re-running would risk a duplicate side effect.
+#[derive(Debug, Clone)]
+pub struct ExecutionClaim {
+    pub approval: ApprovalRequest,
+    pub epoch: u64,
+    pub stale_retake: bool,
+}
+
 /// Trait for credential storage backends
 #[async_trait]
 #[allow(clippy::too_many_arguments)] // transactional approval methods keep their commit inputs explicit
@@ -124,6 +138,26 @@ pub trait StorageBackend: Send + Sync {
 
     /// Delete a credential by ID
     async fn delete(&self, id: &str) -> Result<(), StorageError>;
+
+    /// Tenant-scoped delete (#0): delete a credential ONLY if the acting admin's
+    /// tenant may act on it (a credential's tenant is its `tenant` metadata; see
+    /// [`crate::approval::tenant_may_act`]), re-checked under the lock to close the
+    /// read-then-delete TOCTOU. A cross-tenant (or missing) target is reported as
+    /// [`StorageError::NotFound`] — no existence oracle. `acting_tenant == None`
+    /// (operator) is unrestricted. The default is fail-closed: an operator key
+    /// delegates to the unscoped [`Self::delete`], but a tenant-scoped key on a
+    /// backend that cannot partition credentials is DENIED (never a cross-tenant
+    /// delete). Real multi-tenant backends override this with an under-lock check.
+    async fn delete_scoped(
+        &self,
+        id: &str,
+        acting_tenant: Option<&str>,
+    ) -> Result<(), StorageError> {
+        match acting_tenant {
+            None => self.delete(id).await,
+            Some(_) => Err(StorageError::NotFound(id.to_string())),
+        }
+    }
 
     /// Update an existing credential
     async fn update(&self, credential: &Credential) -> Result<(), StorageError>;
@@ -234,6 +268,19 @@ pub trait StorageBackend: Send + Sync {
         Err(StorageError::UseTokenNotFound(_id.to_string()))
     }
 
+    /// Tenant-scoped revoke (#0): atomically mark a use token revoked ONLY if the
+    /// acting admin's tenant may act on it (see [`crate::approval::tenant_may_act`]),
+    /// re-checked under the lock to close the read-then-revoke TOCTOU. A
+    /// cross-tenant target is reported as [`StorageError::UseTokenNotFound`] — no
+    /// existence oracle. `acting_tenant == None` (operator) is unrestricted.
+    async fn set_use_token_revoked_scoped(
+        &self,
+        _id: &str,
+        _acting_tenant: Option<&str>,
+    ) -> Result<UseToken, StorageError> {
+        Err(StorageError::UseTokenNotFound(_id.to_string()))
+    }
+
     /// Atomically consume a workload-identity assertion JTI. Returns false for
     /// a replay. Implementations must persist unexpired JTIs across restarts and
     /// coordinate across processes sharing the backend.
@@ -302,6 +349,18 @@ pub trait StorageBackend: Send + Sync {
 
     /// Atomically mark an approval token revoked, returning the updated token.
     async fn set_approval_token_revoked(&self, _id: &str) -> Result<ApprovalToken, StorageError> {
+        Err(StorageError::ApprovalTokenNotFound(_id.to_string()))
+    }
+
+    /// Tenant-scoped revoke (#0): the approval-token analogue of
+    /// [`Self::set_use_token_revoked_scoped`] — revoke ONLY if the acting admin's
+    /// tenant may act on it, re-checked under the lock; a cross-tenant target is
+    /// [`StorageError::ApprovalTokenNotFound`] (no oracle). Operator: unrestricted.
+    async fn set_approval_token_revoked_scoped(
+        &self,
+        _id: &str,
+        _acting_tenant: Option<&str>,
+    ) -> Result<ApprovalToken, StorageError> {
         Err(StorageError::ApprovalTokenNotFound(_id.to_string()))
     }
 
@@ -453,15 +512,37 @@ pub trait StorageBackend: Send + Sync {
         Err(StorageError::ApprovalNotFound(_id.to_string()))
     }
 
-    /// Atomically claim an approved request for execution. Returns the request
-    /// (with `executing` set) only if it is `Approved` and not yet executing or
-    /// executed; otherwise returns `None`. This keeps two concurrent agent polls
-    /// from running the same approved action twice.
+    /// Atomically claim an approved request for execution (#8). Returns an
+    /// [`ExecutionClaim`] (with `executing` set and the fence `epoch` advanced)
+    /// only if it is `Approved` and not yet executing or executed, OR its prior
+    /// claim has gone stale (a crashed worker); otherwise returns `None`. This
+    /// keeps two concurrent agent polls from running the same approved action
+    /// twice; the returned `stale_retake` flag tells the caller a re-taken claim
+    /// must be finalized terminally rather than re-run.
     async fn claim_approval_for_execution(
         &self,
         _id: &str,
-    ) -> Result<Option<ApprovalRequest>, StorageError> {
+    ) -> Result<Option<ExecutionClaim>, StorageError> {
         Ok(None)
+    }
+
+    /// Compare-and-set finalize of an execution claim (#8): commit the terminal
+    /// result fields ONLY if the on-disk `execution_epoch` still equals `epoch`
+    /// (the value stamped when the caller claimed). Returns `true` when committed,
+    /// `false` when the epoch has advanced — meaning the claim was superseded by a
+    /// stale re-take, so this (crashed-then-recovered) worker must NOT overwrite
+    /// the re-taker's outcome. Unlike `update_approval`'s blind insert, this is the
+    /// authoritative at-most-once commit; the default is fail-closed (backends on
+    /// the default `claim_approval_for_execution` never claim, so never finalize).
+    async fn finalize_execution(
+        &self,
+        _id: &str,
+        _epoch: u64,
+        _result: &ApprovalRequest,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::Unavailable(
+            "approval execution finalize not supported by this storage backend".to_string(),
+        ))
     }
 
     // ==================== Event outbox (V9) ====================

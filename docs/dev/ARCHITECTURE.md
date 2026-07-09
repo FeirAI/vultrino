@@ -114,7 +114,13 @@ triggered when the requester polls the approval after a human decides. The resum
 re-evaluates policy **read-only** (it re-enforces hard `Deny`/kill gates — a
 policy revoked or a kill pushed mid-flight stops the action — but does not
 re-charge the rate limiter or re-prompt). Execution is claimed under the storage
-lock so two concurrent polls can't double-run, and the action runs **at most once**.
+lock and fenced by a monotonic `execution_epoch`, so the action runs **at most
+once**: two concurrent polls can't double-run, and a worker that crashes
+mid-flight is NOT re-run — because its side effect may already have fired, the
+stale claim is finalized terminally as `outcome unknown` (the requester
+re-approves to retry) rather than re-executed. The terminal write is a
+compare-and-set on the epoch (`finalize_execution`), so a recovered-but-superseded
+worker can never overwrite the re-taker's outcome.
 
 ## Core algorithms
 

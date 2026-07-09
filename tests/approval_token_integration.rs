@@ -54,6 +54,49 @@ impl Plugin for MockPlugin {
     }
 }
 
+/// A plugin that counts how many times `execute` is invoked, so a double-run is
+/// directly observable (#8 at-most-once).
+struct CountingPlugin {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Plugin for CountingPlugin {
+    fn name(&self) -> &str {
+        "count"
+    }
+
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["run"]
+    }
+
+    async fn execute(&self, _request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ExecuteResponse::success(b"ran".to_vec()))
+    }
+
+    fn validate_params(
+        &self,
+        _action: &str,
+        _params: &serde_json::Value,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+/// An execute request routed to [`CountingPlugin`] (`count.run`).
+fn count_request(credential: &str) -> ExecuteRequest {
+    ExecuteRequest {
+        credential: credential.to_string(),
+        action: "count.run".to_string(),
+        params: serde_json::json!({}),
+    }
+}
+
 /// Build a server backed by fresh encrypted storage, with the mock plugin
 /// registered and approvals enabled.
 async fn setup() -> (VultrinoServer, Arc<dyn StorageBackend>) {
@@ -901,15 +944,23 @@ async fn test_preflight_failure_is_retryable_and_does_not_burn_token() {
     );
 }
 
-/// A stale execution claim (crashed worker) must be reclaimable after the
-/// timeout so an approved action is never stuck forever.
+/// A stale execution claim (a worker that set `executing` then crashed mid-flight)
+/// must be recovered FAIL-CLOSED (#8): because the crashed attempt's side effect
+/// may already have fired, the stale re-take must NOT re-run the action — it
+/// finalizes the grant TERMINALLY as "outcome unknown", which the requester must
+/// re-approve to retry. A counting plugin proves the action runs 0 additional
+/// times, so at-most-once holds on the resume path even across a crash.
 #[tokio::test]
-async fn test_stale_execution_claim_recovers() {
+async fn test_stale_execution_claim_is_terminal_not_rerun() {
     let (server, storage) = setup().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server
+        .plugins()
+        .register(Arc::new(CountingPlugin { calls: calls.clone() }));
     store_credential(&storage, "gated-cred", true).await;
 
     let approval = match server
-        .execute_gated(echo_request("gated-cred"), ExecAuth::default())
+        .execute_gated(count_request("gated-cred"), ExecAuth::default())
         .await
         .unwrap()
     {
@@ -921,19 +972,42 @@ async fn test_stale_execution_claim_recovers() {
         .await
         .unwrap();
 
-    // Simulate a crashed worker holding a stale claim.
+    // Simulate a worker that claimed then crashed mid-execution: `executing` set,
+    // its claim aged past STALE_EXECUTING_SECS (120s), and it never finalized.
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
     a.executing = true;
-    a.executing_since = Some(chrono::Utc::now() - Duration::seconds(300));
+    a.executing_since = Some(chrono::Utc::now() - Duration::seconds(121));
+    a.executed = false;
     storage.update_approval(&a).await.unwrap();
 
-    // A fresh poll reclaims and runs it.
     let resumed = server
         .check_and_resume_approval(&approval.id, None)
         .await
         .unwrap();
-    assert!(resumed.executed);
-    assert_eq!(resumed.result_status, Some(200));
+
+    // The action must NOT re-run — its prior (crashed) outcome is unknown.
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a stale (crashed-worker) claim must NOT re-run the approved action"
+    );
+    // The grant is finalized TERMINALLY (not left executing, not a fabricated 200),
+    // with an outcome-unknown error that steers the operator to re-approve.
+    assert!(resumed.executed, "the stale grant is finalized (terminal)");
+    assert!(!resumed.executing, "the stale claim is cleared");
+    assert_eq!(
+        resumed.result_status, None,
+        "no fresh success may be fabricated for an unknown outcome"
+    );
+    assert!(
+        resumed
+            .result_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("outcome unknown"),
+        "the terminal error must explain the outcome is unknown; got {:?}",
+        resumed.result_error
+    );
 }
 
 /// A heartbeat on an in-flight claim refreshes executing_since, so a claim that

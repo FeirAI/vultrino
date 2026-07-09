@@ -90,11 +90,21 @@ fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response
 }
 
 pub async fn put_workload_grant(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(agent): Path<String>,
     Json(template): Json<WorkloadGrantTemplate>,
 ) -> Response {
+    // Tenant partition (#0): a tenant-scoped admin key may provision a workload
+    // grant only for its OWN tenant — never for another tenant (which would let it
+    // mint that tenant's exchange tokens). Operator key (tenant None): unrestricted.
+    if !crate::approval::tenant_may_act(admin.0.api_key.tenant.as_deref(), Some(&template.tenant)) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "cross_tenant_denied",
+            "A tenant-scoped admin key may only provision workload grants in its own tenant.",
+        );
+    }
     if agent != template.agent_label
         || [
             template.tenant.as_str(),
@@ -178,7 +188,7 @@ pub struct DeleteGrantQuery {
 /// it. This is idempotent so Govder can safely retry cleanup after a partial
 /// deprovision without leaving a workload able to mint or use residual grants.
 pub async fn delete_workload_grant(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(agent): Path<String>,
     Query(query): Query<DeleteGrantQuery>,
@@ -188,6 +198,17 @@ pub async fn delete_workload_grant(
             StatusCode::BAD_REQUEST,
             "invalid_workload_grant",
             "tenant and agent are required",
+        );
+    }
+    // Tenant partition (#0): a tenant-scoped admin key may deprovision only its OWN
+    // tenant's grant — never another tenant's (which would delete that tenant's
+    // grant AND revoke its bound tokens, a cross-tenant DoS). Operator: unrestricted.
+    if !crate::approval::tenant_may_act(admin.0.api_key.tenant.as_deref(), Some(query.tenant.as_str()))
+    {
+        return error(
+            StatusCode::FORBIDDEN,
+            "cross_tenant_denied",
+            "A tenant-scoped admin key may only deprovision workload grants in its own tenant.",
         );
     }
     let removed = match state

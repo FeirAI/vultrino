@@ -51,7 +51,10 @@ WASM plugin you install.
 5. **An approval is not a policy bypass.** The deferred post-approval path
    re-evaluates policy read-only and re-enforces hard `Deny`/kill gates — a policy
    revoked or a Deny pushed between approval and execution stops the action. An
-   approved action runs **at most once** across all polls (claimed under the lock).
+   approved action runs **at most once** across all polls: execution is claimed
+   under the lock and fenced by a monotonic `execution_epoch`, and a worker that
+   crashes mid-flight is finalized terminally as `outcome unknown` (re-approve to
+   retry) rather than re-run — the crash cannot cause a duplicate side effect.
 6. **Security/financial boundaries hold even in observe mode.** Cross-tenant
    isolation, halts, and SpendCap/RateLimit resource guards always enforce; only
    ordinary policy denials are observable-away.
@@ -61,6 +64,26 @@ WASM plugin you install.
 8. **The admin surface is API-key-only.** Use tokens can never reach the admin API
    (`403 not_admin`), and admin authentication is checked before the request body
    is parsed.
+9. **A tenant-scoped admin key is partitioned; it can never act on another tenant.**
+   An admin key is either **global** (operator/root, `tenant == None`) or
+   **tenant-scoped** (`tenant == Some(t)`; e.g. a product aggregator like
+   feir-os). A tenant-scoped key is confined to its own tenant on every admin
+   surface:
+   - **Operator-only surfaces** — resources with no tenant field (policy CRUD,
+     role CRUD, the shared signed event outbox: list/dead-letters/replay) and the
+     label-addressed kill switch (agent `halt`/`unhalt`) — reject a tenant-scoped
+     key with `403 operator_key_required`. They require the global operator key.
+   - **Tenant-scoped surfaces** — resources that carry a tenant (use-token revoke,
+     approval-token revoke, credential create/delete, and token/credential mint) —
+     let a tenant-scoped key self-serve its OWN tenant (or an untenanted/shared
+     resource) but return `404` for a cross-tenant id (no existence oracle) and
+     `403 cross_tenant_denied` when minting for a different tenant. The tenant is
+     re-checked **under the storage lock** (no read-then-act TOCTOU). A use token's
+     `tenant` resolves to that tenant's principal at execution, so cross-tenant mint
+     is blocked to prevent cross-tenant credential access.
+   - The **global operator key is unrestricted** (govder's cross-plane kill/revoke
+     and the operator console depend on this). The tenant partition is the same
+     `tenant_may_act` primitive the approvals JSON API uses.
 
 ## Authentication & authorization
 

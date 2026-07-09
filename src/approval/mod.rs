@@ -450,6 +450,30 @@ pub struct ApprovalRequest {
     pub result_body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_error: Option<String>,
+    /// Monotonic execution-claim fence (#8). Incremented under the storage lock on
+    /// every claim (fresh OR stale re-take), so a terminal write can be committed
+    /// with a compare-and-set: a worker whose claim was superseded (it crashed and
+    /// was re-taken) finds the epoch advanced and its blind finalize is rejected
+    /// rather than overwriting the re-taker's outcome.
+    #[serde(default)]
+    pub execution_epoch: u64,
+}
+
+/// The tenant partition primitive (V11/R4): whether an admin acting in tenant
+/// `acting` may see or act on a resource tagged `resource_tenant`. A **global**
+/// (operator) admin — `acting == None` — acts on everything; an **untenanted**
+/// (shared) resource — `resource_tenant == None` — is actable by anyone;
+/// otherwise the tenants must match exactly. This is the single source of truth
+/// the admin API and the storage-lock re-checks reuse, so approval / token /
+/// credential scoping can never drift apart.
+pub fn tenant_may_act(acting: Option<&str>, resource_tenant: Option<&str>) -> bool {
+    match acting {
+        None => true,
+        Some(a) => match resource_tenant {
+            None => true,
+            Some(t) => t == a,
+        },
+    }
 }
 
 impl ApprovalRequest {
@@ -504,6 +528,7 @@ impl ApprovalRequest {
             result_status: None,
             result_body: None,
             result_error: None,
+            execution_epoch: 0,
         };
 
         (request, decision_token)
@@ -518,13 +543,7 @@ impl ApprovalRequest {
     /// - otherwise the acting tenant must match the approval's tenant, so an admin
     ///   in tenant A can never see or decide tenant B's approval.
     pub fn visible_to_tenant(&self, acting: Option<&str>) -> bool {
-        match acting {
-            None => true,
-            Some(a) => match self.tenant.as_deref() {
-                None => true,
-                Some(t) => t == a,
-            },
-        }
+        tenant_may_act(acting, self.tenant.as_deref())
     }
 
     /// Whether the final deadline has elapsed (independent of stored status).

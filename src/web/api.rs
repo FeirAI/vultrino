@@ -599,6 +599,51 @@ async fn require_tenant_scoped(admin: &AdminApiAuth) -> Result<&str, Response> {
     })
 }
 
+/// Require the acting admin key to be **global** (operator/root, `tenant == None`)
+/// — the INVERSE of [`require_tenant_scoped`]. It refuses a TENANT-scoped admin key
+/// (403) on operator-only surfaces: those acting on a resource that carries no
+/// tenant field and has no O(1) tenant partition (policy CRUD, role CRUD, the
+/// shared signed outbox) or that is addressed only by a label with no clean
+/// label→tenant lookup (the agent halt/unhalt kill switch). A tenant-scoped
+/// aggregator key must NEVER halt, tamper with, or read another tenant's state
+/// through these, so it is denied entirely and forced through the global operator
+/// key (which govder and the operator console hold). The message reveals nothing
+/// about any resource's existence.
+// `async` for the same reason as `require_tenant_scoped` above (dodges clippy's
+// `result_large_err` on the immediate `Result<_, Response>` return).
+async fn require_global_admin(admin: &AdminApiAuth) -> Result<(), Response> {
+    if admin.0.api_key.tenant.is_some() {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "operator_key_required",
+            "This endpoint is operator-only; it requires a global (untenanted) admin \
+             key. A tenant-scoped key cannot act on cross-tenant or shared resources here.",
+        ));
+    }
+    Ok(())
+}
+
+/// Constrain a CREATE that carries a caller-supplied tenant tag to the acting
+/// key's own tenant. A tenant-scoped key (`acting == Some`) may create a resource
+/// that is untenanted (shared) OR tagged with its OWN tenant, but never one tagged
+/// for a DIFFERENT tenant — otherwise it could mint a use token / credential in
+/// another tenant's partition (and a use token's `tenant` resolves to that
+/// tenant's principal at execution, i.e. cross-tenant credential access). A global
+/// operator key (`acting == None`) is unrestricted. Returns 403 — the client
+/// supplied the tenant, so there is no existence to enumerate.
+// `async` for the clippy `result_large_err` reason noted above.
+async fn require_tenant_create(acting: Option<&str>, requested: Option<&str>) -> Result<(), Response> {
+    match (acting, requested) {
+        (None, _) | (Some(_), None) => Ok(()),
+        (Some(a), Some(r)) if a == r => Ok(()),
+        (Some(_), Some(_)) => Err(error_response(
+            StatusCode::FORBIDDEN,
+            "cross_tenant_denied",
+            "A tenant-scoped admin key may only create resources in its own tenant.",
+        )),
+    }
+}
+
 /// `GET /api/v1/approvals` — list approvals visible to the acting admin's tenant
 /// (A3). Admin-gated; tenant-partitioned by the SAME verb the HTML list and
 /// `api_metrics` use (`list_approvals_for_tenant`), so vultrino enforces the
@@ -1496,11 +1541,16 @@ pub async fn api_list_policies(_read: ReadApiAuth, State(state): State<AppState>
 
 /// `POST /api/v1/policies` — create a policy (id generated if omitted).
 pub async fn api_create_policy(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<PolicyUpsertRequest>,
 ) -> Response {
+    // Operator-only (#0): policies carry no tenant field, so a tenant-scoped key
+    // could otherwise write/replace a rule protecting another tenant.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
@@ -1518,12 +1568,16 @@ pub async fn api_create_policy(
 
 /// `PUT /api/v1/policies/{id}` — create or replace the policy with this id.
 pub async fn api_put_policy(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
     Json(req): Json<PolicyUpsertRequest>,
 ) -> Response {
+    // Operator-only (#0): policies carry no tenant field. See `api_create_policy`.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     let key = extract_idempotency_key(&headers);
     // Bind the hash to the path id, so the same body PUT to a *different* id
     // under the same Idempotency-Key isn't replayed as the first id's result.
@@ -1543,10 +1597,15 @@ pub async fn api_put_policy(
 
 /// `DELETE /api/v1/policies/{id}` — remove a stored (admin-managed) policy.
 pub async fn api_delete_policy(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
+    // Operator-only (#0): policies carry no tenant field, so a tenant-scoped key
+    // could otherwise delete a global Deny protecting another tenant.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     match state.storage.delete_policy(&id).await {
         Ok(()) => {
             if let Err(e) = state.server.reload_policies().await {
@@ -1848,11 +1907,26 @@ pub async fn api_list_tokens(_read: ReadApiAuth, State(state): State<AppState>) 
 
 /// `POST /api/v1/tokens` — mint a use token; the plaintext is returned once.
 pub async fn api_create_token(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<TokenCreateRequest>,
 ) -> Response {
+    // Tenant-scoped create (#0): a tenant-scoped key may mint only its own tenant's
+    // (or an untenanted) token — never one tagged for a DIFFERENT tenant, since a
+    // use token's `tenant` resolves to that tenant's principal at execution (i.e.
+    // it would grant cross-tenant credential access). Operator: unrestricted.
+    {
+        let acting = admin.0.api_key.tenant.as_deref();
+        let requested = req
+            .tenant
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Err(resp) = require_tenant_create(acting, requested).await {
+            return resp;
+        }
+    }
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
@@ -1935,11 +2009,15 @@ pub async fn api_create_token(
 
 /// `POST /api/v1/tokens/{id}/revoke` — revoke a use token.
 pub async fn api_revoke_token(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.storage.set_use_token_revoked(&id).await {
+    // Tenant-scoped (#0): a tenant-scoped key may revoke only its own tenant's (or
+    // an untenanted/shared) token; a cross-tenant id is 404 (no oracle), re-checked
+    // under the storage lock. An operator key (tenant None) is unrestricted.
+    let acting = admin.0.api_key.tenant.as_deref();
+    match state.storage.set_use_token_revoked_scoped(&id, acting).await {
         Ok(token) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -2173,11 +2251,25 @@ pub struct ApprovalTokenCreateRequest {
 
 /// `POST /api/v1/approval-tokens` — mint an approval token; plaintext returned once.
 pub async fn api_create_approval_token(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<ApprovalTokenCreateRequest>,
 ) -> Response {
+    // Tenant-scoped create (#0): a tenant-scoped key may mint only its own tenant's
+    // approval token — never one tagged for a DIFFERENT tenant (which would let it
+    // decide that tenant's approvals). Operator: unrestricted.
+    {
+        let acting = admin.0.api_key.tenant.as_deref();
+        let requested = req
+            .tenant
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Err(resp) = require_tenant_create(acting, requested).await {
+            return resp;
+        }
+    }
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
@@ -2292,11 +2384,18 @@ pub async fn api_create_approval_token(
 
 /// `POST /api/v1/approval-tokens/{id}/revoke` — revoke an approval token.
 pub async fn api_revoke_approval_token(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.storage.set_approval_token_revoked(&id).await {
+    // Tenant-scoped (#0): mirror `api_revoke_token` — own-tenant/shared only, a
+    // cross-tenant id is 404, re-checked under the lock; operator is unrestricted.
+    let acting = admin.0.api_key.tenant.as_deref();
+    match state
+        .storage
+        .set_approval_token_revoked_scoped(&id, acting)
+        .await
+    {
         Ok(token) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -2537,11 +2636,18 @@ pub async fn api_delegate_decide_approval(
 /// tokens, install an authoritative per-agent kill policy, and fire abort
 /// callbacks for its in-flight sessions. Idempotent under the storage lock.
 pub async fn api_halt_agent(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(label): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    // Operator-only (#0): `halt_agent` is addressed by label with no O(1)
+    // label→tenant lookup, and it revokes tokens + installs a kill policy. A
+    // tenant-scoped key must not be able to halt another tenant's agent (a
+    // cross-tenant DoS), so halting requires the global operator key.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&label);
     let st = state.clone();
@@ -2563,10 +2669,15 @@ pub async fn api_halt_agent(
 /// `DELETE /api/v1/agents/{label}/halt` — lift a halt (remove the kill policy).
 /// Already-revoked tokens stay revoked.
 pub async fn api_unhalt_agent(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(label): Path<String>,
 ) -> Response {
+    // Operator-only (#0): symmetric with `api_halt_agent` — label-addressed, no
+    // O(1) tenant lookup; lifting another tenant's halt must require the operator key.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     match state.server.unhalt_agent(&label).await {
         Ok(removed) => (
             StatusCode::OK,
@@ -2673,10 +2784,16 @@ pub struct EventsQuery {
 /// in monotonic sequence order, gap-free (V9). A consumer that dropped offline
 /// resumes from its last-seen `sequence` with no gaps and no dupes.
 pub async fn api_list_events(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Query(q): Query<EventsQuery>,
 ) -> Response {
+    // Operator-only (#0): the signed outbox is a single shared, cross-tenant log —
+    // `OutboxEvent` carries no tenant field, so a tenant-scoped key must not be
+    // able to read every tenant's event stream through it.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     let limit = q.limit.unwrap_or(100).min(1000);
     match state.storage.list_events_after(q.after, limit).await {
         Ok(events) => {
@@ -2718,9 +2835,13 @@ pub async fn api_list_events(
 /// `GET /api/v1/events/dead` — the dead-letter queue (events that exhausted their
 /// delivery retries) (V9).
 pub async fn api_list_dead_letters(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
 ) -> Response {
+    // Operator-only (#0): shared cross-tenant outbox — see `api_list_events`.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     match state.storage.list_dead_letter_events(1000).await {
         Ok(events) => (
             StatusCode::OK,
@@ -2738,10 +2859,14 @@ pub async fn api_list_dead_letters(
 /// `POST /api/v1/events/{sequence}/replay` — requeue a dead-lettered event for
 /// re-delivery (V9).
 pub async fn api_replay_dead_letter(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(sequence): Path<u64>,
 ) -> Response {
+    // Operator-only (#0): shared cross-tenant outbox — see `api_list_events`.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     match state.storage.replay_dead_letter_event(sequence).await {
         Ok(true) => (
             StatusCode::OK,
@@ -2776,11 +2901,16 @@ pub struct RoleCreateRequest {
 
 /// `POST /api/v1/roles` — create a role.
 pub async fn api_create_role(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<RoleCreateRequest>,
 ) -> Response {
+    // Operator-only (#0): roles carry no tenant field and govern permissions /
+    // credential scopes globally, so a tenant-scoped key must not mint or widen them.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
@@ -2837,12 +2967,16 @@ pub async fn api_create_role(
 /// the path segment — the path is the source of truth for which role is
 /// being written.
 pub async fn api_upsert_role(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(name): Path<String>,
     headers: axum::http::HeaderMap,
     Json(mut req): Json<RoleCreateRequest>,
 ) -> Response {
+    // Operator-only (#0): roles carry no tenant field. See `api_create_role`.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     req.name = name.clone();
     let key = extract_idempotency_key(&headers);
     // Bind the hash to the path name (same pattern as api_put_capability) so
@@ -2904,10 +3038,14 @@ pub async fn api_upsert_role(
 
 /// `DELETE /api/v1/roles/{id}` — delete a custom role.
 pub async fn api_delete_role(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
+    // Operator-only (#0): roles carry no tenant field. See `api_create_role`.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     // Never delete a predefined role (consistency with the web UI and CLI guards).
     if matches!(id.as_str(), ROLE_ADMIN | ROLE_READ_ONLY | ROLE_EXECUTOR) {
         return error_response(
@@ -2954,11 +3092,25 @@ pub struct CredentialCreateRequest {
 /// `POST /api/v1/credentials` — store a credential. The response carries only
 /// metadata; the secret material is never echoed back.
 pub async fn api_create_credential(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<CredentialCreateRequest>,
 ) -> Response {
+    // Tenant-scoped create (#0): a credential's tenant is its `tenant` metadata. A
+    // tenant-scoped key may create only its own tenant's (or an untenanted/shared)
+    // credential — never one tagged for a DIFFERENT tenant. Operator: unrestricted.
+    {
+        let acting = admin.0.api_key.tenant.as_deref();
+        let requested = req
+            .metadata
+            .get("tenant")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        if let Err(resp) = require_tenant_create(acting, requested).await {
+            return resp;
+        }
+    }
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
@@ -3004,16 +3156,37 @@ pub async fn api_create_credential(
 
 /// `DELETE /api/v1/credentials/{id}` — delete a credential by id.
 pub async fn api_delete_credential(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
+    // Tenant-scoped (#0): a credential's tenant is its `tenant` metadata. A
+    // tenant-scoped key may delete only its own tenant's (or an untenanted/shared)
+    // credential; a cross-tenant id is 404 (no oracle), re-checked under the lock
+    // in `delete_scoped`. An operator key (tenant None) is unrestricted.
+    let acting = admin.0.api_key.tenant.as_deref();
     // R5/V7: propagate a downstream revoke before deleting an OAuth2 credential
     // that exposes a revocation endpoint, so an already-issued token is actively
     // revoked at the provider rather than left to expire. Best-effort, but a read
     // error is logged (not silently swallowed) so a skipped propagation is visible.
     match state.storage.get(&id).await {
         Ok(Some(cred)) => {
+            // Gate revoke-propagation on the tenant partition too: a tenant-scoped
+            // key must not even learn a cross-tenant credential exists, let alone
+            // trigger a downstream revoke against it. (The authoritative delete
+            // re-checks under the lock below.)
+            let cred_tenant = cred
+                .metadata
+                .get("tenant")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            if !crate::approval::tenant_may_act(acting, cred_tenant) {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "credential_not_found",
+                    format!("No credential with id '{}'", id),
+                );
+            }
             crate::revocation::propagate_revoke(
                 &crate::revocation::HttpRevocationClient::new(),
                 &*state.storage,
@@ -3026,7 +3199,7 @@ pub async fn api_delete_credential(
             tracing::warn!(error = %e, credential_id = %id, "could not load credential for revoke-propagation before delete")
         }
     }
-    match state.storage.delete(&id).await {
+    match state.storage.delete_scoped(&id, acting).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"deleted": id}))).into_response(),
         Err(crate::storage::StorageError::NotFound(_)) => error_response(
             StatusCode::NOT_FOUND,

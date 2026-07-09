@@ -3,8 +3,8 @@
 //! Stores credentials in an encrypted JSON file on disk.
 
 use super::outbox_store::OutboxStore;
-use super::{IdempotencyState, StorageBackend, StorageError};
-use crate::approval::ApprovalRequest;
+use super::{ExecutionClaim, IdempotencyState, StorageBackend, StorageError};
+use crate::approval::{tenant_may_act, ApprovalRequest};
 use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
 use crate::capability::Capability;
 use crate::crypto::{decrypt, derive_key, encrypt, generate_salt, EncryptedData, MasterKey};
@@ -853,6 +853,40 @@ impl StorageBackend for FileStorage {
         .await
     }
 
+    async fn delete_scoped(
+        &self,
+        id: &str,
+        acting_tenant: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.locked_mutate(|cache| {
+            // Tenant partition, re-checked UNDER the lock (#0): a tenant-scoped key
+            // may delete only a credential in its own tenant (or an untenanted /
+            // shared one). A credential's tenant is its `tenant` metadata. A
+            // cross-tenant (or missing) target is reported as NotFound — no oracle.
+            let allowed = match cache.credentials.get(id) {
+                Some(cred) => {
+                    let cred_tenant = cred
+                        .metadata
+                        .get("tenant")
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty());
+                    tenant_may_act(acting_tenant, cred_tenant)
+                }
+                None => return Err(StorageError::NotFound(id.to_string())),
+            };
+            if !allowed {
+                return Err(StorageError::NotFound(id.to_string()));
+            }
+            let cred = cache
+                .credentials
+                .remove(id)
+                .ok_or_else(|| StorageError::NotFound(id.to_string()))?;
+            cache.alias_index.remove(&cred.alias);
+            Ok(())
+        })
+        .await
+    }
+
     async fn update(&self, credential: &Credential) -> Result<(), StorageError> {
         self.locked_mutate(|cache| {
             let old_cred = cache
@@ -1086,6 +1120,34 @@ impl StorageBackend for FileStorage {
         .await
     }
 
+    async fn set_use_token_revoked_scoped(
+        &self,
+        id: &str,
+        acting_tenant: Option<&str>,
+    ) -> Result<UseToken, StorageError> {
+        self.locked_mutate(|cache| {
+            let token = cache
+                .use_tokens
+                .get_mut(id)
+                .ok_or_else(|| StorageError::UseTokenNotFound(id.to_string()))?;
+            // Tenant partition, re-checked UNDER the lock (#0): a tenant-scoped key
+            // may revoke only a token in its own tenant (or an untenanted/shared
+            // one). A cross-tenant target is indistinguishable from a missing one —
+            // no existence oracle.
+            let tok_tenant = token
+                .tenant
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if !tenant_may_act(acting_tenant, tok_tenant) {
+                return Err(StorageError::UseTokenNotFound(id.to_string()));
+            }
+            token.revoked = true;
+            Ok(token.clone())
+        })
+        .await
+    }
+
     async fn consume_workload_jti(
         &self,
         jti: &str,
@@ -1165,6 +1227,32 @@ impl StorageBackend for FileStorage {
                 .approval_tokens
                 .get_mut(id)
                 .ok_or_else(|| StorageError::ApprovalTokenNotFound(id.to_string()))?;
+            token.revoked = true;
+            Ok(token.clone())
+        })
+        .await
+    }
+
+    async fn set_approval_token_revoked_scoped(
+        &self,
+        id: &str,
+        acting_tenant: Option<&str>,
+    ) -> Result<ApprovalToken, StorageError> {
+        self.locked_mutate(|cache| {
+            let token = cache
+                .approval_tokens
+                .get_mut(id)
+                .ok_or_else(|| StorageError::ApprovalTokenNotFound(id.to_string()))?;
+            // Tenant partition, re-checked UNDER the lock (#0) — cross-tenant is
+            // reported as NotFound (no oracle), mirroring the use-token path.
+            let tok_tenant = token
+                .tenant
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if !tenant_may_act(acting_tenant, tok_tenant) {
+                return Err(StorageError::ApprovalTokenNotFound(id.to_string()));
+            }
             token.revoked = true;
             Ok(token.clone())
         })
@@ -1432,7 +1520,7 @@ impl StorageBackend for FileStorage {
     async fn claim_approval_for_execution(
         &self,
         id: &str,
-    ) -> Result<Option<ApprovalRequest>, StorageError> {
+    ) -> Result<Option<ExecutionClaim>, StorageError> {
         use crate::approval::ApprovalStatus;
         self.locked_mutate(|cache| {
             let approval = match cache.approvals.get_mut(id) {
@@ -1457,10 +1545,56 @@ impl StorageBackend for FileStorage {
             {
                 Ok(None)
             } else {
+                // A re-take of a stale in-flight claim: the prior worker set
+                // `executing` but never finalized (it likely crashed mid-flight).
+                // The caller must finalize this TERMINALLY without re-running — the
+                // crashed attempt's side effect may already have fired.
+                let stale_retake = approval.executing && stale;
+                // Fence every claim (fresh OR re-take): a superseded worker that
+                // comes back finds the epoch advanced and its finalize-CAS fails,
+                // so it can't overwrite this claim's outcome (#8).
+                approval.execution_epoch = approval.execution_epoch.wrapping_add(1);
                 approval.executing = true;
                 approval.executing_since = Some(Utc::now());
-                Ok(Some(approval.clone()))
+                let epoch = approval.execution_epoch;
+                Ok(Some(ExecutionClaim {
+                    approval: approval.clone(),
+                    epoch,
+                    stale_retake,
+                }))
             }
+        })
+        .await
+    }
+
+    async fn finalize_execution(
+        &self,
+        id: &str,
+        epoch: u64,
+        result: &ApprovalRequest,
+    ) -> Result<bool, StorageError> {
+        self.locked_mutate(|cache| {
+            let approval = match cache.approvals.get_mut(id) {
+                Some(a) => a,
+                None => return Err(StorageError::ApprovalNotFound(id.to_string())),
+            };
+            // Compare-and-set on the execution fence: only commit if this claim is
+            // still the current one. A mismatch means the claim was re-taken (this
+            // worker was judged crashed) — refuse the write so we never overwrite
+            // the re-taker's terminal state (#8). Fail-closed: report "not
+            // committed" and let the caller surface the authoritative state.
+            if approval.execution_epoch != epoch {
+                return Ok(false);
+            }
+            // Commit ONLY the execution-result fields; the epoch is preserved so a
+            // subsequent claim continues to advance it monotonically.
+            approval.executed = result.executed;
+            approval.executing = result.executing;
+            approval.executing_since = result.executing_since;
+            approval.result_status = result.result_status;
+            approval.result_body = result.result_body.clone();
+            approval.result_error = result.result_error.clone();
+            Ok(true)
         })
         .await
     }

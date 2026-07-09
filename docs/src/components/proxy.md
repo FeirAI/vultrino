@@ -97,7 +97,10 @@ after egress scrub):
 ```
 
 Poll `GET /api/v1/approvals/{id}` with the **same** bearer; the action runs at
-most once, on the first poll after a human approves.
+most once, on the first poll after a human approves. If the serving process
+crashes mid-execution, recovery is fail-closed — the action is not silently
+re-run; the approval is finalized as `outcome unknown` and must be re-approved to
+retry.
 
 ## Injection by credential type
 

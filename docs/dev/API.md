@@ -136,6 +136,22 @@ tokens are rejected with `403 not_admin`. Create/mint routes honor an optional
 `404` (no such resource), `409` (duplicate / in-flight idempotency / body
 mismatch), `201`/`200` on success.
 
+**Tenant partition of admin keys.** An admin key is either **global** (operator,
+`tenant == None`) or **tenant-scoped** (`tenant == Some(t)`). A tenant-scoped key
+is confined to its own tenant:
+
+- **Operator-only routes** — no tenant field on the resource, or a label-addressed
+  action: policy CRUD, role CRUD, the event outbox (`/events`, `/events/dead`,
+  `/events/{seq}/replay`), and agent `halt`/`unhalt`. A tenant-scoped key gets
+  `403 operator_key_required`; use the global operator key.
+- **Tenant-scoped routes** — resource carries a tenant: use-token revoke,
+  approval-token revoke, credential create/delete, and token/credential/approval-
+  token mint. A tenant-scoped key self-serves its **own** tenant (or an
+  untenanted/shared resource); a cross-tenant id returns `404` (no oracle) and a
+  mint for a **different** tenant returns `403 cross_tenant_denied`. The tenant is
+  re-checked under the storage lock.
+- The **global operator key is unrestricted** across tenants.
+
 ### Policies
 
 | Method | Path | Body / result |

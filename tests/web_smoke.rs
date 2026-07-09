@@ -2037,6 +2037,232 @@ async fn test_json_approvals_reject_untenanted_key() {
     );
 }
 
+/// Helper: mint a use token bound to `agent_label` in `tenant`, persist it, and
+/// return its id.
+async fn store_tenant_use_token(
+    storage: &Arc<dyn StorageBackend>,
+    name: &str,
+    agent_label: &str,
+    tenant: Option<&str>,
+) -> String {
+    let (_plain, mut token) = UseToken::create(NewUseToken {
+        name: name.to_string(),
+        credential_scope: "cred-*".into(),
+        action_scope: Some("tool.*".into()),
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.tenant = tenant.map(|t| t.to_string());
+    token.agent_label = Some(agent_label.to_string());
+    storage.store_use_token(&token).await.unwrap();
+    token.id
+}
+
+/// SECURITY (#0): a TENANT-scoped admin key must never halt, tamper with, or read
+/// ANOTHER tenant's state through the admin API. Operator-only surfaces (halt,
+/// policy CRUD — no tenant field) reject it 403; tenant-carrying surfaces
+/// (use-token revoke) return 404 for a cross-tenant id and leave the resource
+/// UNTOUCHED, while self-service on the key's OWN tenant still works. Mirrors the
+/// cross-tenant-decide 404 shape.
+#[tokio::test]
+async fn test_admin_cross_tenant_denied_for_tenant_key() {
+    let (router, storage, team_a_key) = build_tenant_admin_router("team-a").await;
+
+    // Seed team-B and team-A resources in the same store the team-A router uses.
+    let b_token = store_tenant_use_token(&storage, "b-tok", "ep_team_b", Some("team-b")).await;
+    let a_token = store_tenant_use_token(&storage, "a-tok", "ep_team_a", Some("team-a")).await;
+    storage
+        .store_policy(&vultrino::policy::Policy::kill_switch("kill-b", "ep_team_b"))
+        .await
+        .unwrap();
+
+    // Halt of a team-B agent → 403 operator_key_required (halt is operator-only).
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/agents/ep_team_b/halt",
+            &team_a_key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a tenant-scoped key must not halt any agent"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "operator_key_required");
+    // The team-B token is UNTOUCHED (the halt did not run and revoke it).
+    assert!(
+        !storage
+            .get_use_token(&b_token)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked,
+        "a refused halt must not revoke the target tenant's token"
+    );
+
+    // Delete of a global policy → 403 (policies carry no tenant field).
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "DELETE",
+            "/api/v1/policies/kill-b",
+            &team_a_key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a tenant-scoped key must not delete a policy"
+    );
+    // The policy survives.
+    assert!(
+        storage
+            .list_stored_policies()
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.id == "kill-b"),
+        "a refused policy delete must leave the policy in place"
+    );
+
+    // Revoke of a team-B token → 404 (no oracle), token UNTOUCHED.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/tokens/{}/revoke", b_token),
+            &team_a_key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "cross-tenant token revoke must be 404 (no oracle)"
+    );
+    assert!(
+        !storage
+            .get_use_token(&b_token)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked,
+        "a refused cross-tenant revoke must leave the token unrevoked"
+    );
+
+    // Cross-tenant workload-grant deprovision → 403 (it would delete team-B's grant
+    // and revoke its bound tokens). The guard fires before any store lookup.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "DELETE",
+            "/api/v1/workload-grants/ep_team_b?tenant=team-b",
+            &team_a_key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a tenant-scoped key must not deprovision another tenant's workload grant"
+    );
+
+    // Self-service on the key's OWN tenant still works → 200, token revoked.
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/tokens/{}/revoke", a_token),
+            &team_a_key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a tenant key may revoke its OWN tenant's token"
+    );
+    assert!(
+        storage
+            .get_use_token(&a_token)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked,
+        "own-tenant revoke takes effect"
+    );
+}
+
+/// SECURITY (#0): the GLOBAL operator key (tenant None) is UNAFFECTED by the
+/// partition — it still halts, deletes policies, and revokes tokens across
+/// tenants (govder's cross-plane kill/revoke path depends on this).
+#[tokio::test]
+async fn test_admin_global_key_unrestricted_across_tenants() {
+    let (router, storage, _server, op_key) = build_admin_router().await;
+
+    let b_token = store_tenant_use_token(&storage, "b-tok", "ep_team_b", Some("team-b")).await;
+    storage
+        .store_policy(&vultrino::policy::Policy::kill_switch("kill-b", "ep_team_b"))
+        .await
+        .unwrap();
+
+    // Operator revokes a tenant-B token → 200.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/tokens/{}/revoke", b_token),
+            &op_key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "operator revokes any tenant");
+    assert!(
+        storage
+            .get_use_token(&b_token)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked
+    );
+
+    // Operator deletes a policy → 200.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "DELETE",
+            "/api/v1/policies/kill-b",
+            &op_key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "operator deletes any policy");
+
+    // Operator halts a tenant-B agent → 200.
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/agents/ep_team_b/halt",
+            &op_key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "operator halts any agent");
+}
+
 #[tokio::test]
 async fn test_json_decision_is_idempotent_on_retry() {
     // #4: a retried decision (same operator, same approve/deny outcome) on an
