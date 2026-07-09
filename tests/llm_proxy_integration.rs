@@ -380,6 +380,54 @@ async fn meter_events(storage: &Arc<dyn StorageBackend>) -> Vec<serde_json::Valu
         .collect()
 }
 
+/// V13b golden-vector canonicalization (integration#7). `event_id`/`correlation_id`
+/// thread the request's UUID, `occurred_at` is wall-clock, and `principal` is this
+/// test's minted use-token id (`ut_<uuid>` — the token carries no `agent_label`,
+/// so `meter_principal` falls back to the token id, which `UseToken::create` mints
+/// fresh every run) — all four differ every run. Replace them with fixed
+/// placeholders so a structural comparison against the committed golden pins the
+/// payload's SHAPE plus every OTHER (stable) value, while never flagging the
+/// genuinely volatile fields. leria and govder pin byte-identical copies of the
+/// same golden — see tests/golden/README.md for the three-copy map + regen command.
+fn canonicalize_v13b_golden(te: &serde_json::Value) -> serde_json::Value {
+    let mut canonical = te.clone();
+    let obj = canonical
+        .as_object_mut()
+        .expect("V13b token payload must be a JSON object");
+    let correlation_id = obj
+        .get("correlation_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("correlation_id must be a string")
+        .to_string();
+    let event_id = obj
+        .get("event_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("event_id must be a string")
+        .to_string();
+    // Ties the two placeholders together — a builder change that decouples
+    // event_id from correlation_id (see meter_tokens_payload) fails here, before
+    // canonicalization can paper over it.
+    assert_eq!(
+        event_id,
+        format!("{correlation_id}:tokens"),
+        "event_id must be '<correlation_id>:tokens' (meter_tokens_payload) before canonicalization"
+    );
+    obj.insert(
+        "event_id".to_string(),
+        serde_json::json!("<REQUEST_ID>:tokens"),
+    );
+    obj.insert(
+        "correlation_id".to_string(),
+        serde_json::json!("<REQUEST_ID>"),
+    );
+    obj.insert(
+        "occurred_at".to_string(),
+        serde_json::json!("<OCCURRED_AT>"),
+    );
+    obj.insert("principal".to_string(), serde_json::json!("<PRINCIPAL>"));
+    canonical
+}
+
 // ===========================================================================
 // Layer 1 — endpoint / wiring
 // ===========================================================================
@@ -778,6 +826,36 @@ async fn llm_non_streamed_injects_key_returns_body_meters_tokens_and_scrubs() {
     assert_eq!(
         te["correlation_id"], api_calls[0]["correlation_id"],
         "same occurrence"
+    );
+
+    // V13b golden-vector contract (integration#7): this IS the real end-to-end
+    // emitted payload (HTTP -> policy -> plugin -> parse -> emit_meter -> storage,
+    // no network hop — MockLlmPlugin runs in-process). Canonicalize the volatile
+    // fields and (a) dump it to V13B_ARTIFACT_PATH when set — the cross-repo
+    // regen-and-diff test (leria) and manual regen both use this — and (b) ALWAYS
+    // compare it against the committed golden so a lone `cargo test` in vultrino's
+    // own CI also catches drift.
+    let canonical = canonicalize_v13b_golden(te);
+    let canonical_bytes =
+        serde_json::to_vec_pretty(&canonical).expect("canonical V13b payload serializes");
+    if let Ok(artifact_path) = std::env::var("V13B_ARTIFACT_PATH") {
+        std::fs::write(&artifact_path, &canonical_bytes)
+            .unwrap_or_else(|e| panic!("write V13B_ARTIFACT_PATH={artifact_path}: {e}"));
+    }
+    let golden_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/v13b_meter_tokens.json");
+    let golden_bytes = std::fs::read(golden_path)
+        .unwrap_or_else(|e| panic!("read committed golden {golden_path}: {e}"));
+    let golden: serde_json::Value =
+        serde_json::from_slice(&golden_bytes).expect("committed golden must be valid JSON");
+    assert_eq!(
+        canonical, golden,
+        "V13b payload shape/values drifted from the committed golden at {golden_path} \
+         (integration#7 — a field rename, re-nesting, or stable-value change must fail loudly). \
+         To regenerate ALL THREE pinned copies after an INTENTIONAL change, run:\n  \
+         V13B_ARTIFACT_PATH=tests/golden/v13b_meter_tokens.json cargo test --test llm_proxy_integration \
+         llm_non_streamed_injects_key_returns_body_meters_tokens_and_scrubs\n  \
+         then copy that file byte-for-byte over leria/testdata/v13b_meter_tokens.json and \
+         govder/e2e/testdata/v13b_meter_tokens.json (see tests/golden/README.md)."
     );
 }
 

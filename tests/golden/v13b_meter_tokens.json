@@ -1,0 +1,19 @@
+{
+  "asset": "usd",
+  "confidence": "low",
+  "correlation_id": "<REQUEST_ID>",
+  "cost_source": "gateway-observed",
+  "dims": {
+    "channel": "cap-llm",
+    "credential": "cred-openai",
+    "model_ref": "gpt-4o-mini",
+    "provider": "openai-chat"
+  },
+  "event_id": "<REQUEST_ID>:tokens",
+  "occurred_at": "<OCCURRED_AT>",
+  "principal": "<PRINCIPAL>",
+  "tokens": {
+    "input_tokens": 57,
+    "output_tokens": 13
+  }
+}
