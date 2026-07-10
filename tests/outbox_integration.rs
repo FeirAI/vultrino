@@ -207,14 +207,18 @@ async fn test_dead_letter_after_max_attempts_then_replay() {
 #[tokio::test]
 async fn test_gc_prunes_old_events() {
     let storage = storage().await;
-    storage
+    let a = storage
         .append_event("A", "e", serde_json::json!({}))
         .await
         .unwrap();
-    storage
+    let b = storage
         .append_event("A", "e", serde_json::json!({}))
         .await
         .unwrap();
+    // GC prunes only DELIVERED events now — an undelivered event is retained past the window
+    // (fail-closed, vultrino#4). Mark both delivered so they are eligible.
+    storage.record_event_delivery(a, true, None, 8).await.unwrap();
+    storage.record_event_delivery(b, true, None, 8).await.unwrap();
     // retention 0 → cutoff is "now", and these were created strictly before → pruned.
     let pruned = storage.gc_outbox(0).await.unwrap();
     assert_eq!(pruned, 2);

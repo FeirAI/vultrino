@@ -4,7 +4,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+use argon2::{password_hash::SaltString, Algorithm, Argon2, Params, PasswordHasher, Version};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::{rngs::OsRng, RngCore};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -90,13 +90,59 @@ impl EncryptedData {
     }
 }
 
-/// Derive a master key from a password using Argon2
-pub fn derive_key(password: &SecretString, salt: &[u8]) -> Result<MasterKey, CryptoError> {
+/// Argon2 key-derivation cost parameters, PINNED and persisted alongside each vault (in the
+/// `StorageFile` header). Vultrino historically derived its master key with `Argon2::default()`,
+/// whose `m`/`t`/`p` are a *crate default* — a minor (or RUSTSEC-forced) argon2 bump that changed
+/// those defaults would derive a DIFFERENT AES key from the same password and make every already
+/// deployed vault undecryptable. Persisting the params breaks that coupling: a vault always opens
+/// with the params it was created with, regardless of the crate's current default.
+///
+/// FAIL-CLOSED / MIGRATION TRAP: a vault written before this field existed carries NO params on
+/// disk, so it serde-defaults to [`KdfParams::default`]. That default MUST therefore stay pinned to
+/// the argon2 0.5 `Argon2::default()` values the vault was actually created with — do NOT "track"
+/// a future crate default here, or the field addition would brick every deployed vault. The
+/// `default_kdf_params_match_argon2_crate_default` test guards this equality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KdfParams {
+    /// Argon2 memory cost, in KiB.
+    pub m_cost: u32,
+    /// Argon2 time cost (number of iterations).
+    pub t_cost: u32,
+    /// Argon2 degree of parallelism (lanes).
+    pub p_cost: u32,
+}
+
+impl Default for KdfParams {
+    fn default() -> Self {
+        // Snapshot of argon2 0.5's `Params::DEFAULT` (m = 19 MiB, t = 2, p = 1). Load-bearing: a
+        // vault with no persisted `kdf` field derives its key from THIS, so it must reproduce the
+        // key that `Argon2::default()` produced when the vault was created. See the type doc.
+        Self {
+            m_cost: 19 * 1024,
+            t_cost: 2,
+            p_cost: 1,
+        }
+    }
+}
+
+/// Derive a master key from a password using Argon2 with the given (pinned, persisted) cost
+/// parameters. Passing [`KdfParams::default`] reproduces the historical `Argon2::default()`
+/// derivation byte-for-byte (output length 32), so existing vaults keep opening.
+pub fn derive_key(
+    password: &SecretString,
+    salt: &[u8],
+    params: KdfParams,
+) -> Result<MasterKey, CryptoError> {
     // Use a fixed salt string for Argon2 (the actual salt is in the data)
     let salt_string = SaltString::encode_b64(salt)
         .map_err(|e| CryptoError::KeyDerivationFailed(e.to_string()))?;
 
-    let argon2 = Argon2::default();
+    // Pin the cost params explicitly instead of relying on `Argon2::default()` (whose values are a
+    // crate default that can shift under a version bump). `output_len: None` matches `Params::DEFAULT`
+    // exactly, so the derived key is identical to the pre-pinning derivation for the default params.
+    let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, None)
+        .map_err(|e| CryptoError::KeyDerivationFailed(e.to_string()))?;
+    let argon2 = Argon2::new(Algorithm::default(), Version::default(), argon_params);
 
     // Hash the password
     let hash = argon2
@@ -186,7 +232,7 @@ mod tests {
     fn test_encrypt_decrypt_roundtrip() {
         let password = SecretString::from("test-password-123");
         let salt = generate_salt();
-        let key = derive_key(&password, &salt).unwrap();
+        let key = derive_key(&password, &salt, KdfParams::default()).unwrap();
 
         let plaintext = b"Hello, Vultrino!";
         let encrypted = encrypt(plaintext, &key).unwrap();
@@ -201,8 +247,8 @@ mod tests {
         let password2 = SecretString::from("password2");
         let salt = generate_salt();
 
-        let key1 = derive_key(&password1, &salt).unwrap();
-        let key2 = derive_key(&password2, &salt).unwrap();
+        let key1 = derive_key(&password1, &salt, KdfParams::default()).unwrap();
+        let key2 = derive_key(&password2, &salt, KdfParams::default()).unwrap();
 
         let encrypted = encrypt(b"secret", &key1).unwrap();
         let result = decrypt(&encrypted, &key2);
@@ -214,7 +260,7 @@ mod tests {
     fn test_encrypted_data_serialization() {
         let password = SecretString::from("test");
         let salt = generate_salt();
-        let key = derive_key(&password, &salt).unwrap();
+        let key = derive_key(&password, &salt, KdfParams::default()).unwrap();
 
         let encrypted = encrypt(b"test data", &key).unwrap();
         let serialized = encrypted.encode();
@@ -226,5 +272,43 @@ mod tests {
         // Verify we can still decrypt
         let decrypted = decrypt(&parsed, &key).unwrap();
         assert_eq!(decrypted, b"test data");
+    }
+
+    #[test]
+    fn default_kdf_params_match_argon2_crate_default() {
+        // Fail-closed pin guard (#12): a vault written before KDF params were persisted derives its
+        // key from `KdfParams::default()`. That default MUST reproduce the key the OLD code path
+        // (`Argon2::default()`) produced, or adding the persisted field would brick every deployed
+        // vault. Assert byte-for-byte key equality.
+        let password = SecretString::from("some-vault-password");
+        let salt = generate_salt();
+
+        let pinned = derive_key(&password, &salt, KdfParams::default()).unwrap();
+
+        // Reproduce the pre-pinning derivation independently: Argon2::default() + first 32 bytes.
+        let salt_string = SaltString::encode_b64(&salt).unwrap();
+        let hash = Argon2::default()
+            .hash_password(password.expose_secret().as_bytes(), &salt_string)
+            .unwrap();
+        let legacy_key = hash.hash.unwrap().as_bytes()[..KEY_SIZE].to_vec();
+
+        assert_eq!(
+            pinned.as_bytes(),
+            legacy_key.as_slice(),
+            "pinned default params must derive the same key as the historical Argon2::default()"
+        );
+    }
+
+    #[test]
+    fn key_roundtrips_through_persisted_params() {
+        // A vault created with the pinned default params must decrypt when reopened with the SAME
+        // params (the create → save → load round-trip in FileStorage).
+        let password = SecretString::from("pw");
+        let salt = generate_salt();
+        let params = KdfParams::default();
+        let k1 = derive_key(&password, &salt, params).unwrap();
+        let ct = encrypt(b"secret", &k1).unwrap();
+        let k2 = derive_key(&password, &salt, params).unwrap();
+        assert_eq!(decrypt(&ct, &k2).unwrap(), b"secret");
     }
 }

@@ -48,6 +48,18 @@ const STALE_IDEMPOTENCY_RESERVATION_SECS: i64 = 60;
 /// opportunistically so the map can't grow without bound.
 const IDEMPOTENCY_RETENTION_SECS: i64 = 24 * 60 * 60;
 
+/// A terminal (executed) approval keeps its captured `result_body` (up to
+/// [`crate::server`]'s 64 KiB cap) for this long after the decision, for audit/debugging; past it
+/// the body is shed while the audit row (status, approver, result_status/error) is kept, so a
+/// long-lived vault isn't dominated by stored response bodies (#2). 7 days.
+const TERMINAL_APPROVAL_BODY_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// A dead use token (revoked / expired / exhausted) is dropped from the vault this long after it
+/// last mattered, so spent tokens can't accumulate without bound (#2). The grace keeps a
+/// just-dead token around briefly (it may still be referenced inside a replay/idempotency window).
+/// Fail-closed: a still-usable token is NEVER pruned. 24 hours.
+const DEAD_USE_TOKEN_GRACE_SECS: i64 = 24 * 60 * 60;
+
 /// Whether an approval has a pending SLA/reauth transition at `now` (V5): an open
 /// request past its final deadline (expire) or, when Pending, past its first
 /// window (escalate); or an approved-but-unrun grant whose reauth window lapsed.
@@ -60,6 +72,37 @@ fn approval_is_due(a: &ApprovalRequest, now: DateTime<Utc>) -> bool {
     (a.status.is_open()
         && (now >= a.expires_at || (a.status == ApprovalStatus::Pending && now >= a.escalate_at)))
         || a.needs_reauth()
+}
+
+/// Whether a terminal approval's stored `result_body` can be shed (#2): the action has RUN (a body
+/// is present), the request is no longer open or mid-execution, and its decision is older than the
+/// body-retention window. Only the (large) body is dropped — the audit row is kept. Shared by the
+/// vault-GC pre-check and the under-lock prune so the two stay in lock-step.
+fn approval_result_body_prunable(a: &ApprovalRequest, now: DateTime<Utc>) -> bool {
+    a.executed
+        && a.result_body.is_some()
+        && !a.status.is_open()
+        && !a.executing
+        && a.decided_at
+            .map(|t| (now - t).num_seconds() > TERMINAL_APPROVAL_BODY_RETENTION_SECS)
+            .unwrap_or(false)
+}
+
+/// Whether a dead use token can be dropped from the vault (#2), fail-closed: a still-usable token is
+/// NEVER a candidate. A revoked/expired/exhausted token is pruned only once the last moment it could
+/// have mattered — its last use, its creation, or (if time-expired) its expiry — is older than the
+/// grace, so a token still inside a live replay/idempotency window is retained.
+fn use_token_prunable(t: &UseToken, now: DateTime<Utc>) -> bool {
+    if t.check_usable().is_ok() {
+        return false;
+    }
+    let mut reference = t.last_used_at.unwrap_or(t.created_at).max(t.created_at);
+    if let Some(exp) = t.expires_at {
+        if now >= exp {
+            reference = reference.max(exp);
+        }
+    }
+    (now - reference).num_seconds() > DEAD_USE_TOKEN_GRACE_SECS
 }
 
 /// Upper bound on the vault's staged-but-undrained outbox intents. If the split outbox file is
@@ -168,6 +211,9 @@ pub struct FileStorage {
     cache: RwLock<StorageCache>,
     /// Salt used for key derivation (stored in file)
     salt: Vec<u8>,
+    /// Pinned Argon2 KDF params the master key was derived with (#12), re-written on every save so
+    /// the vault always reopens with the params it was created with — never a shifted crate default.
+    kdf: crate::crypto::KdfParams,
     /// Change token (mtime, len) of the on-disk vault as of the last decrypt INTO
     /// `cache` by THIS process. `reload` skips the (expensive) whole-vault decrypt when
     /// the file is byte-unchanged since then — so a broker poll that finds no new outbox
@@ -351,6 +397,14 @@ struct StorageFile {
     version: u32,
     /// Salt for key derivation
     salt: String,
+    /// Argon2 KDF cost params this vault's key was derived with (#12). Persisted so a future
+    /// argon2 default-param change can't silently derive a different key and brick the vault.
+    /// `#[serde(default)]` = the argon2 0.5 defaults, so a vault written BEFORE this field (no
+    /// `kdf` key on disk) derives the identical key and still opens. Not gated by a version bump:
+    /// the persisted value equals what a v7 binary would derive anyway, so no read incompatibility
+    /// is introduced. See [`crate::crypto::KdfParams`].
+    #[serde(default)]
+    kdf: crate::crypto::KdfParams,
     /// Encrypted data (credentials, roles, api_keys)
     #[serde(alias = "credentials")]
     data: EncryptedData,
@@ -382,7 +436,9 @@ impl FileStorage {
     /// Create a new storage file
     async fn create(path: PathBuf, password: &SecretString) -> Result<Self, StorageError> {
         let salt = generate_salt();
-        let master_key = Arc::new(derive_key(password, &salt)?);
+        // Pin today's params on a fresh vault (persisted in the header, re-read on every open).
+        let kdf = crate::crypto::KdfParams::default();
+        let master_key = Arc::new(derive_key(password, &salt, kdf)?);
         let outbox = OutboxStore::new(outbox_path(&path), Arc::clone(&master_key));
 
         let storage = Self {
@@ -391,6 +447,7 @@ impl FileStorage {
             outbox,
             cache: RwLock::new(StorageCache::default()),
             salt,
+            kdf,
             last_loaded: parking_lot::Mutex::new(None),
         };
 
@@ -414,8 +471,11 @@ impl FileStorage {
         )
         .map_err(|e| StorageError::Serialization(format!("Invalid salt: {}", e)))?;
 
-        // Derive key from password
-        let master_key = Arc::new(derive_key(password, &salt)?);
+        // Derive key from password using the params PERSISTED with this vault (#12). A vault written
+        // before the field existed has no `kdf` key on disk → serde-default = the argon2 0.5 defaults
+        // it was actually created with, so it derives the identical key and opens.
+        let kdf = storage_file.kdf;
+        let master_key = Arc::new(derive_key(password, &salt, kdf)?);
 
         // Decrypt + parse (tolerates the legacy credentials-only format)
         let decrypted = decrypt(&storage_file.data, &master_key)?;
@@ -428,6 +488,7 @@ impl FileStorage {
             outbox,
             cache: RwLock::new(cache),
             salt,
+            kdf,
             last_loaded: parking_lot::Mutex::new(None),
         };
         // Seed the change token so the first reload can skip a redundant decrypt of the
@@ -632,6 +693,8 @@ impl FileStorage {
         let storage_file = StorageFile {
             version: STORAGE_VERSION,
             salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &self.salt),
+            // Re-persist the pinned KDF params on every save (write-on-save, per #12).
+            kdf: self.kdf,
             data: encrypted,
         };
         let content = serde_json::to_string_pretty(&storage_file)
@@ -1687,6 +1750,58 @@ impl StorageBackend for FileStorage {
         self.outbox.gc(retention_secs, &protected).await
     }
 
+    async fn gc_vault(&self) -> Result<(usize, usize), StorageError> {
+        // Cheap cross-process pre-check (mirrors sweep_approval_lifecycle's `any_due`): reload so a
+        // SIBLING process's terminal approvals / dead tokens are visible (web + MCP share the vault),
+        // then scan the in-memory cache. If nothing is prunable, skip the lock + re-encrypt + write
+        // entirely so an idle vault is never churned. The authoritative prune re-checks under the lock.
+        self.reload().await?;
+        let now = Utc::now();
+        let any_prunable = {
+            let c = self.cache.read();
+            c.approvals
+                .values()
+                .any(|a| approval_result_body_prunable(a, now))
+                || c.use_tokens.values().any(|t| use_token_prunable(t, now))
+        };
+        if !any_prunable {
+            return Ok((0, 0));
+        }
+        self.locked_mutate(|cache| {
+            let now = Utc::now();
+            // Shed the large result_body of terminal approvals past the window (keep the audit row).
+            let mut bodies_shed = 0usize;
+            for a in cache.approvals.values_mut() {
+                if approval_result_body_prunable(a, now) {
+                    a.result_body = None;
+                    bodies_shed += 1;
+                }
+            }
+            // Drop dead use tokens past the grace, keeping the hash index consistent (mirrors
+            // delete_use_token). Collect ids first to avoid borrowing the map while removing.
+            let dead: Vec<(String, String)> = cache
+                .use_tokens
+                .values()
+                .filter(|t| use_token_prunable(t, now))
+                .map(|t| (t.id.clone(), t.token_hash.clone()))
+                .collect();
+            for (id, hash) in &dead {
+                cache.use_tokens.remove(id);
+                cache.use_token_hash_index.remove(hash);
+            }
+            let tokens_dropped = dead.len();
+            if bodies_shed > 0 || tokens_dropped > 0 {
+                tracing::info!(
+                    bodies_shed,
+                    tokens_dropped,
+                    "vault GC shed terminal approval result bodies / dropped dead use tokens"
+                );
+            }
+            Ok((bodies_shed, tokens_dropped))
+        })
+        .await
+    }
+
     /// Periodic safety-net reconcile of intent-staged events (D1) — delegates to the inherent
     /// drain_pending_events. Bounds an orphaned intent's lifetime to one tick when an inline drain
     /// failed, so a committed approval decision's signed event is delivered without waiting for a
@@ -1895,6 +2010,18 @@ mod tests {
     use crate::{CredentialData, Secret};
     use std::collections::HashSet;
     use tempfile::tempdir;
+
+    /// A minimal API-key credential for storage round-trip tests.
+    fn test_credential(alias: &str) -> Credential {
+        Credential::new(
+            alias.to_string(),
+            CredentialData::ApiKey {
+                key: Secret::new("secret".to_string()),
+                header_name: "Authorization".to_string(),
+                header_prefix: "Bearer ".to_string(),
+            },
+        )
+    }
 
     #[test]
     fn approval_event_payload_carries_tenant() {
@@ -2123,16 +2250,21 @@ mod tests {
         // Sanity: the v6 bytes parse via the same path load() uses (serde defaults fill the new fields).
         FileStorage::parse_cache(&bytes).unwrap();
 
-        // Encrypt + write a StorageFile stamped version:6 (the actual on-disk envelope).
+        // Encrypt + write a StorageFile stamped version:6 (the actual on-disk envelope). v6 predates
+        // the persisted `kdf` header field, so it was created with the argon2 defaults — encrypt with
+        // KdfParams::default() and strip the `kdf` key so the on-disk shape is authentically v6.
         let salt = generate_salt();
-        let master_key = derive_key(&pw, &salt).unwrap();
+        let master_key = derive_key(&pw, &salt, crate::crypto::KdfParams::default()).unwrap();
         let encrypted = encrypt(&bytes, &master_key).unwrap();
         let file = StorageFile {
             version: 6,
             salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &salt),
+            kdf: crate::crypto::KdfParams::default(),
             data: encrypted,
         };
-        std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+        let mut file_json = serde_json::to_value(&file).unwrap();
+        file_json.as_object_mut().unwrap().remove("kdf"); // v6 predates the persisted KDF params
+        std::fs::write(&path, serde_json::to_string_pretty(&file_json).unwrap()).unwrap();
 
         // Open via the real load path → check_version(6) accepts + migrate_v6_outbox runs.
         let s = FileStorage::new(&path, &pw).await.unwrap();
@@ -2171,6 +2303,219 @@ mod tests {
                 .await
                 .unwrap(),
             6
+        );
+    }
+
+    #[tokio::test]
+    async fn opens_a_vault_written_without_a_kdf_header_field() {
+        // #12 fail-closed migration: a vault created before the persisted `kdf` field has no `kdf`
+        // key on disk. It MUST still open — the serde default has to equal the argon2 defaults it was
+        // created with. Round-trip a real vault, strip `kdf` from the header bytes, and reopen.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let pw = SecretString::from("pw");
+        {
+            let s = FileStorage::new(&path, &pw).await.unwrap();
+            s.store(&test_credential("alias-x")).await.unwrap();
+        }
+        // Strip the `kdf` header key to mimic a pre-#12 on-disk vault (still stamped its real version).
+        let mut header: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            header.get("kdf").is_some(),
+            "a freshly written vault persists its kdf params"
+        );
+        header.as_object_mut().unwrap().remove("kdf");
+        std::fs::write(&path, serde_json::to_string_pretty(&header).unwrap()).unwrap();
+
+        // Reopen: derive_key must fall back to KdfParams::default() and decrypt the vault.
+        let s2 = FileStorage::new(&path, &pw).await.unwrap();
+        let cred = s2.get_by_alias("alias-x").await.unwrap();
+        assert!(
+            cred.is_some(),
+            "a vault with no persisted kdf field must still open with the default params"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_vault_persists_and_round_trips_pinned_kdf_params() {
+        // #12: a fresh vault writes the pinned params to the header and reopens with them.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let pw = SecretString::from("pw");
+        {
+            let s = FileStorage::new(&path, &pw).await.unwrap();
+            s.store(&test_credential("alias-y")).await.unwrap();
+        }
+        let header: StorageFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            header.kdf,
+            crate::crypto::KdfParams::default(),
+            "a new vault persists the pinned KDF params"
+        );
+        // Reopen derives the same key from the persisted params and decrypts.
+        let s2 = FileStorage::new(&path, &pw).await.unwrap();
+        assert!(s2.get_by_alias("alias-y").await.unwrap().is_some());
+    }
+
+    /// Build a stored-ready approval; caller mutates status/executed/result_body/decided_at.
+    fn mk_approval(id_suffix: &str) -> ApprovalRequest {
+        use crate::approval::{CriticalityClass, NewApproval, RequesterInfo};
+        let (mut req, _tok) = ApprovalRequest::open(NewApproval {
+            credential: "cred".to_string(),
+            action: "http.request".to_string(),
+            params: serde_json::json!({}),
+            requester: RequesterInfo {
+                principal_kind: "api_key".to_string(),
+                principal_id: Some("k1".to_string()),
+                principal_name: Some("agent".to_string()),
+                role: None,
+                owner: None,
+            },
+            use_token_id: None,
+            principal_id: Some("k1".to_string()),
+            agent_label: None,
+            tenant: None,
+            workload_id: None,
+            preview: None,
+            action_label: None,
+            dual_control: false,
+            criticality: CriticalityClass::Medium,
+            trusted_irreversible: None,
+            escalate_after: chrono::Duration::minutes(30),
+            escalate_window: chrono::Duration::minutes(30),
+            oob_identity: None,
+            reauth_interval_secs: None,
+            required_approvals: 1,
+        });
+        req.id = format!("appr_{id_suffix}");
+        req
+    }
+
+    #[tokio::test]
+    async fn vault_gc_sheds_only_old_terminal_result_bodies() {
+        // #2: a terminal (executed) approval past the body-retention window has its 64 KiB result_body
+        // shed (audit row kept); a recently-decided terminal approval keeps its body; an open one is
+        // untouched.
+        use crate::approval::ApprovalStatus;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let s = FileStorage::new(&path, &SecretString::from("pw"))
+            .await
+            .unwrap();
+
+        // Old terminal: decided 8 days ago, executed, has a body → prunable.
+        let mut old = mk_approval("old");
+        old.status = ApprovalStatus::Approved;
+        old.executed = true;
+        old.result_body = Some("x".repeat(2000));
+        old.decided_at = Some(Utc::now() - chrono::Duration::days(8));
+        s.store_approval(&old).await.unwrap();
+
+        // Recent terminal: decided just now, executed, has a body → NOT prunable (inside window).
+        let mut recent = mk_approval("recent");
+        recent.status = ApprovalStatus::Approved;
+        recent.executed = true;
+        recent.result_body = Some("y".repeat(2000));
+        recent.decided_at = Some(Utc::now());
+        s.store_approval(&recent).await.unwrap();
+
+        // Open request (no body): must be untouched.
+        let open = mk_approval("open");
+        s.store_approval(&open).await.unwrap();
+
+        let (bodies_shed, tokens_dropped) = s.gc_vault().await.unwrap();
+        assert_eq!(bodies_shed, 1, "only the old terminal body is shed");
+        assert_eq!(tokens_dropped, 0);
+
+        // The old approval's audit ROW survives, only its body is gone.
+        let got_old = s.get_approval("appr_old").await.unwrap().unwrap();
+        assert!(got_old.result_body.is_none(), "old terminal body shed");
+        assert_eq!(
+            got_old.status,
+            ApprovalStatus::Approved,
+            "audit row (status) kept"
+        );
+        // The recent one keeps its body.
+        let got_recent = s.get_approval("appr_recent").await.unwrap().unwrap();
+        assert!(
+            got_recent.result_body.is_some(),
+            "recent terminal body kept (inside window)"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_gc_drops_dead_use_tokens_but_keeps_usable_ones() {
+        // #2: a revoked token past the grace is dropped (and unindexed); a still-usable token is kept.
+        use crate::auth::NewUseToken;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let s = FileStorage::new(&path, &SecretString::from("pw"))
+            .await
+            .unwrap();
+
+        // Dead: revoked, last activity long ago → prunable.
+        let (_p, mut dead) = UseToken::create(NewUseToken {
+            name: "dead".into(),
+            credential_scope: "*".into(),
+            action_scope: None,
+            max_uses: Some(1),
+            require_approval: false,
+            expires_in: None,
+        });
+        dead.revoked = true;
+        dead.created_at = Utc::now() - chrono::Duration::days(3);
+        let dead_hash = dead.token_hash.clone();
+        s.store_use_token(&dead).await.unwrap();
+
+        // Usable: fresh, never used → must be kept even though the pre-check runs.
+        let (_p2, live) = UseToken::create(NewUseToken {
+            name: "live".into(),
+            credential_scope: "*".into(),
+            action_scope: None,
+            max_uses: Some(5),
+            require_approval: false,
+            expires_in: None,
+        });
+        let live_id = live.id.clone();
+        s.store_use_token(&live).await.unwrap();
+
+        let (bodies_shed, tokens_dropped) = s.gc_vault().await.unwrap();
+        assert_eq!(bodies_shed, 0);
+        assert_eq!(tokens_dropped, 1, "the dead revoked token is dropped");
+
+        assert!(
+            s.get_use_token(&dead.id).await.unwrap().is_none(),
+            "dead token removed"
+        );
+        assert!(
+            s.get_use_token_by_hash(&dead_hash).await.unwrap().is_none(),
+            "hash index cleaned up"
+        );
+        assert!(
+            s.get_use_token(&live_id).await.unwrap().is_some(),
+            "usable token kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_gc_is_a_noop_write_when_nothing_prunable() {
+        // #2: an idle vault (nothing terminal-past-window, no dead tokens) must not be rewritten — the
+        // pre-check skips the lock + re-encrypt. Byte-equality of credentials.enc proves no write.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let s = FileStorage::new(&path, &SecretString::from("pw"))
+            .await
+            .unwrap();
+        s.store(&test_credential("a")).await.unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let (bodies, tokens) = s.gc_vault().await.unwrap();
+        assert_eq!((bodies, tokens), (0, 0));
+        assert_eq!(
+            before,
+            std::fs::read(&path).unwrap(),
+            "a no-op vault GC must not rewrite credentials.enc"
         );
     }
 

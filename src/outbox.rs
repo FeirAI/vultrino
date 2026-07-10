@@ -702,8 +702,13 @@ pub struct OutboxConfig {
     pub hmac_secret: Option<String>,
     /// Max delivery attempts before an event is dead-lettered.
     pub max_attempts: u32,
-    /// Retention for **delivered** events, in seconds (replay window). Pending and
-    /// dead-lettered events are retained until resolved.
+    /// Retention window for **delivered** events, in seconds (the replay window). GC prunes only the
+    /// contiguous delivered prefix older than this; Pending and dead-lettered events are retained
+    /// until they resolve (enforced fail-closed by the GC — see `OutboxStore::gc`), so this bounds
+    /// steady-state log size but never drops an unshipped signed event. Operator-tunable
+    /// (`outbox.retention_secs` in config); the default is deliberately modest because every append
+    /// re-encrypts the whole retention-bounded log — a shorter window is a smaller per-append cost.
+    /// Lower it for tighter storage, raise it for a longer replay window for a slow/offline consumer.
     pub retention_secs: u64,
 }
 
@@ -730,7 +735,11 @@ impl Default for OutboxConfig {
             url: None,
             hmac_secret: None,
             max_attempts: 8,
-            retention_secs: 7 * 24 * 3600, // 7 days
+            // 2 days (was 7): a tighter default replay window bounds the whole-file re-encrypt cost
+            // that every append pays, while still tolerating a ~2-day consumer outage. Undelivered
+            // events are never pruned (fail-closed), so this only trims the delivered replay tail;
+            // operators needing a longer window raise `outbox.retention_secs` in config.
+            retention_secs: 2 * 24 * 3600, // 2 days
         }
     }
 }

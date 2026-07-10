@@ -6,5 +6,5 @@
 mod encrypt;
 
 pub use encrypt::{
-    decrypt, derive_key, encrypt, generate_salt, CryptoError, EncryptedData, MasterKey,
+    decrypt, derive_key, encrypt, generate_salt, CryptoError, EncryptedData, KdfParams, MasterKey,
 };

@@ -2832,6 +2832,12 @@ pub async fn deliver_outbox_periodically(
             if let Err(e) = storage.gc_outbox(config.retention_secs).await {
                 warn!(error = %e, "outbox GC failed");
             }
+            // Same tick: bound the vault's unbounded maps (#2) — shed terminal approval result
+            // bodies past their window and drop dead use tokens past the grace. Cheap no-op (no
+            // write) when nothing is prunable, so it is safe on every GC tick.
+            if let Err(e) = storage.gc_vault().await {
+                warn!(error = %e, "vault GC failed");
+            }
         }
     }
 }

@@ -642,6 +642,17 @@ pub trait StorageBackend: Send + Sync {
         Ok(0)
     }
 
+    /// Opportunistically bound the two vault maps that otherwise grow without limit (#2): shed the
+    /// large `result_body` of terminal (executed) approvals past a retention window — keeping the
+    /// audit row — and drop dead (revoked/expired/exhausted) use tokens past a grace. Runs on the
+    /// periodic outbox-GC tick. Fail-closed: a still-open/executing approval's body and a still-usable
+    /// token are never touched. Returns `(approval bodies shed, use tokens dropped)`. Default no-op:
+    /// only the file backend has an on-disk vault that grows. A cheap in-memory pre-check should skip
+    /// the write entirely when nothing is prunable.
+    async fn gc_vault(&self) -> Result<(usize, usize), StorageError> {
+        Ok((0, 0))
+    }
+
     /// Reconcile any intent-staged events (D1 transactional outbox) that an inline drain left behind,
     /// moving them to the outbox store IDEMPOTENTLY. Coupled emits drain inline right after committing
     /// and startup reconciles once; this is the periodic safety net so an orphaned intent (e.g. an

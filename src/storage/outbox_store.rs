@@ -89,7 +89,8 @@ impl OutboxStore {
     ) -> Result<u64, StorageError> {
         let subject = subject.to_string();
         let event_type = event_type.to_string();
-        self.locked_mutate(move |c| Ok(push_event(c, &subject, &event_type, payload, None)))
+        // A fresh append always mutates.
+        self.locked_mutate(move |c| Ok((push_event(c, &subject, &event_type, payload, None), true)))
             .await
     }
 
@@ -116,14 +117,11 @@ impl OutboxStore {
                 .values()
                 .find(|e| e.dedup_id.as_deref() == Some(dedup_id.as_str()))
             {
-                return Ok(e.sequence); // already drained → idempotent no-op
+                return Ok((e.sequence, false)); // already drained → idempotent no-op, no write
             }
-            Ok(push_event(
-                c,
-                &subject,
-                &event_type,
-                payload,
-                Some(dedup_id),
+            Ok((
+                push_event(c, &subject, &event_type, payload, Some(dedup_id)),
+                true,
             ))
         })
         .await
@@ -136,7 +134,8 @@ impl OutboxStore {
         self.locked_mutate(move |c| {
             c.outbox_seq = c.outbox_seq.max(event.sequence);
             c.outbox.entry(event.sequence).or_insert(event);
-            Ok(())
+            // Migration/idempotent insert — persist unconditionally (safe over-report of dirty).
+            Ok(((), true))
         })
         .await
     }
@@ -163,7 +162,8 @@ impl OutboxStore {
             for ev in events {
                 c.outbox.entry(ev.sequence).or_insert(ev);
             }
-            Ok(())
+            // Migration batch (guarded by the empty-check above) — always persist.
+            Ok(((), true))
         })
         .await
     }
@@ -205,6 +205,9 @@ impl OutboxStore {
         self.locked_mutate(move |c| {
             let now = Utc::now();
             let claimed = earliest_pending_per_subject(&c.outbox, limit, true, now);
+            // No claim → no lease stamped → nothing mutated → skip the file write (vultrino#1: the
+            // common every-5s delivery-tick no-op on an empty/all-delivered outbox).
+            let dirty = !claimed.is_empty();
             // Floor at 1s + CLAMP, never panic (mirror gc's overflow-safe pattern): a 0 lease would stamp
             // leased_until==now, which earliest_pending_per_subject (t > now) treats as already-expired →
             // a sibling re-claims the same event = double delivery. A huge lease_secs must NOT panic
@@ -221,13 +224,14 @@ impl OutboxStore {
                 }
             }
             // Return the claimed events with the lease reflected (callers don't re-read the lease).
-            Ok(claimed
+            let out: Vec<OutboxEvent> = claimed
                 .into_iter()
                 .map(|mut e| {
                     e.leased_until = Some(lease_until);
                     e
                 })
-                .collect())
+                .collect();
+            Ok((out, dirty))
         })
         .await
     }
@@ -247,11 +251,12 @@ impl OutboxStore {
         max_attempts: u32,
     ) -> Result<bool, StorageError> {
         self.locked_mutate(move |c| {
+            // Not found, or a late outcome against an already-terminal event → no mutation, no write.
             let Some(e) = c.outbox.get_mut(&sequence) else {
-                return Ok(false);
+                return Ok((false, false));
             };
             if e.delivery != DeliveryState::Pending {
-                return Ok(false);
+                return Ok((false, false));
             }
             e.attempts += 1;
             e.last_attempt_at = Some(Utc::now());
@@ -259,18 +264,18 @@ impl OutboxStore {
                 e.delivery = DeliveryState::Delivered;
                 e.leased_until = None;
                 e.last_error = None;
-                return Ok(false);
+                return Ok((false, true));
             }
             e.last_error = error;
             if e.attempts >= max_attempts {
                 e.delivery = DeliveryState::DeadLettered;
                 e.leased_until = None;
-                Ok(true)
+                Ok((true, true))
             } else {
                 // Exponential-ish backoff lease, capped at 5 min (same as v6).
                 let backoff = (10u64.saturating_mul(1 << e.attempts.min(5))).min(300);
                 e.leased_until = Some(Utc::now() + chrono::Duration::seconds(backoff as i64));
-                Ok(false)
+                Ok((false, true))
             }
         })
         .await
@@ -296,9 +301,10 @@ impl OutboxStore {
                 e.attempts = 0;
                 e.last_error = None;
                 e.leased_until = None;
-                Ok(true)
+                Ok((true, true))
             }
-            _ => Ok(false),
+            // Not dead-lettered (or absent) → no change, no write.
+            _ => Ok((false, false)),
         })
         .await
     }
@@ -329,49 +335,76 @@ impl OutboxStore {
         // Clone into the (move) closure; the protected set is small (only undrained intents, normally 0).
         let protected = protected_dedup_ids.clone();
         self.locked_mutate(move |c| {
-            // Stop the prefix prune at the first event that is either young OR still protected by a
-            // staged intent, keeping the retained suffix gap-free AND the dedup record alive.
+            // Stop the prefix prune at the first event that is young, NOT YET DELIVERED, or still
+            // protected by a staged intent — keeping the retained suffix gap-free, the dedup record
+            // alive, AND (vultrino#4, fail-closed) never dropping an undelivered event. retention is
+            // the *delivered*-replay window: a Pending/DeadLettered event carries an unshipped signed
+            // billing/audit record, so pruning it on age would LOSE data. It survives until it
+            // resolves (delivered or operator-replayed then delivered), matching the OutboxConfig
+            // doc contract. Trade-off: a stalled delivery pipeline lets the log grow past retention
+            // — surfaced below so the growth is observable rather than silent.
             let prune_below = c
                 .outbox
                 .iter()
                 .take_while(|(_, e)| {
                     e.created_at < cutoff
+                        && e.delivery == DeliveryState::Delivered
                         && !e.dedup_id.as_deref().is_some_and(|d| protected.contains(d))
                 })
                 .map(|(seq, _)| *seq)
                 .last();
+
+            // Bounded-growth alarm: count events retained PAST the window solely because they are
+            // undelivered. A persistent non-zero count means delivery is stalled and the outbox is
+            // growing — alertable, so this fail-closed retention can't silently reintroduce the
+            // write-amplification the split was meant to bound.
+            let stuck_undelivered = c
+                .outbox
+                .values()
+                .filter(|e| e.created_at < cutoff && e.delivery != DeliveryState::Delivered)
+                .count();
+            if stuck_undelivered > 0 {
+                tracing::warn!(
+                    count = stuck_undelivered,
+                    "outbox retains events older than the retention window because they are undelivered \
+                     (pending/dead-lettered); delivery may be stalled and the log will grow until they resolve"
+                );
+            }
+
             let Some(prune_below) = prune_below else {
-                return Ok(0);
+                return Ok((0usize, false));
             };
             let mut pruned = 0usize;
-            let mut undelivered_dropped = 0usize;
-            c.outbox.retain(|seq, e| {
+            c.outbox.retain(|seq, _| {
                 if *seq <= prune_below {
                     pruned += 1;
-                    if e.delivery != DeliveryState::Delivered {
-                        undelivered_dropped += 1;
-                    }
                     false
                 } else {
                     true
                 }
             });
-            if undelivered_dropped > 0 {
-                tracing::warn!(
-                    count = undelivered_dropped,
-                    "outbox GC dropped events that were never delivered (older than the retention window)"
-                );
-            }
-            Ok(pruned)
+            // Only the prune mutated the map; a tick with nothing to prune returned above (no write).
+            Ok((pruned, pruned > 0))
         })
         .await
     }
 
     // ---- internal persistence (mirrors FileStorage's locked_mutate / reload on the outbox file) ----
 
+    /// The closure returns `(value, dirty)`: `dirty` MUST be true whenever it mutated the cache in a
+    /// way that needs persisting, and may be false for a genuine no-op (nothing claimed / pruned /
+    /// found). Only a dirty result writes the file — this kills the every-tick no-op whole-file
+    /// re-encrypt+fsync that claim()/gc() otherwise did each delivery/GC pass with nothing to do
+    /// (vultrino#1 stopgap). Over-reporting dirty is always safe (a redundant durable write);
+    /// under-reporting would silently drop a mutation, so any uncertain path returns `true`.
+    ///
+    /// This is a STOPGAP for the whole-file write amplification, NOT the O(1) append: a real append
+    /// still re-encrypts the entire retention-bounded outbox. True per-row append is a deferred
+    /// design item — it re-opens the settled D2 "outbox.enc, not per-row/SQLite" decision (see
+    /// docs/dev/OUTBOX-OUT-OF-VAULT-MIGRATION.md §D2), so it is an architecture change, not this fix.
     async fn locked_mutate<T>(
         &self,
-        f: impl FnOnce(&mut OutboxCache) -> Result<T, StorageError>,
+        f: impl FnOnce(&mut OutboxCache) -> Result<(T, bool), StorageError>,
     ) -> Result<T, StorageError> {
         use tokio::runtime::{Handle, RuntimeFlavor};
         match Handle::current().runtime_flavor() {
@@ -382,13 +415,18 @@ impl OutboxStore {
 
     fn locked_mutate_blocking<T>(
         &self,
-        f: impl FnOnce(&mut OutboxCache) -> Result<T, StorageError>,
+        f: impl FnOnce(&mut OutboxCache) -> Result<(T, bool), StorageError>,
     ) -> Result<T, StorageError> {
         let mut flock = self.lock_file_exclusive()?;
         let _guard = flock.write().map_err(StorageError::Io)?;
         let mut cache = self.read_from_disk()?;
-        let result = f(&mut cache)?;
-        self.write_to_disk(&cache)?;
+        let (result, dirty) = f(&mut cache)?;
+        // Skip the write ENTIRELY on a no-op (no re-encrypt, no tmp+fsync, no rename) — a real
+        // mutation still takes the full crash-durable write path below. The in-memory cache is
+        // refreshed either way (we just re-read authoritative disk state under the lock).
+        if dirty {
+            self.write_to_disk(&cache)?;
+        }
         *self.cache.write() = cache;
         *self.last_loaded.lock() = self.file_change_token();
         Ok(result)
@@ -727,12 +765,15 @@ mod tests {
     #[tokio::test]
     async fn gc_prunes_old_prefix() {
         let (s, _d) = store();
-        s.append("A", "t", serde_json::json!({})).await.unwrap();
-        s.append("B", "t", serde_json::json!({})).await.unwrap();
+        let a = s.append("A", "t", serde_json::json!({})).await.unwrap();
+        let b = s.append("B", "t", serde_json::json!({})).await.unwrap();
+        // Deliver both: retention only prunes DELIVERED events now (undelivered are kept, #4).
+        s.record_delivery(a, true, None, 8).await.unwrap();
+        s.record_delivery(b, true, None, 8).await.unwrap();
         assert_eq!(
             s.gc(0, &HashSet::new()).await.unwrap(),
             2,
-            "retention 0 prunes all"
+            "retention 0 prunes all delivered"
         );
         assert_eq!(s.list_after(0, 100).await.unwrap().len(), 0);
     }
@@ -743,11 +784,17 @@ mod tests {
         // after the prune would duplicate it). The prefix prune stops BELOW the first protected event,
         // keeping the retained suffix gap-free.
         let (s, _d) = store();
-        s.append("A", "t", serde_json::json!({})).await.unwrap(); // seq 1, no dedup
-        s.append_deduped("d2", "B", "t", serde_json::json!({}))
+        let s1 = s.append("A", "t", serde_json::json!({})).await.unwrap(); // seq 1, no dedup
+        let s2 = s
+            .append_deduped("d2", "B", "t", serde_json::json!({}))
             .await
             .unwrap(); // seq 2, dedup d2
-        s.append("C", "t", serde_json::json!({})).await.unwrap(); // seq 3, no dedup
+        let s3 = s.append("C", "t", serde_json::json!({})).await.unwrap(); // seq 3, no dedup
+        // Deliver all three so age-based pruning is eligible (undelivered are never pruned, #4); the
+        // protected-dedup stop is orthogonal to delivery state.
+        s.record_delivery(s1, true, None, 8).await.unwrap();
+        s.record_delivery(s2, true, None, 8).await.unwrap();
+        s.record_delivery(s3, true, None, 8).await.unwrap();
         let mut protected = HashSet::new();
         protected.insert("d2".to_string());
         // retention 0 would prune all, but d2 (seq 2) is protected → only seq 1 prunes.
@@ -773,6 +820,96 @@ mod tests {
             s.gc(0, &HashSet::new()).await.unwrap(),
             2,
             "unprotected → pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_never_prunes_an_undelivered_pending_event() {
+        // vultrino#4 (fail-closed): retention is the DELIVERED replay window. An old still-Pending
+        // event carries an unshipped signed record, so the prefix prune must STOP below it — and the
+        // gap-free suffix behind it (even later delivered events) is retained too.
+        let (s, _d) = store();
+        let s1 = s.append("A", "t", serde_json::json!({})).await.unwrap(); // seq 1
+        let s2 = s.append("B", "t", serde_json::json!({})).await.unwrap(); // seq 2 (stays pending)
+        let s3 = s.append("C", "t", serde_json::json!({})).await.unwrap(); // seq 3
+        s.record_delivery(s1, true, None, 8).await.unwrap(); // seq 1 delivered
+        s.record_delivery(s3, true, None, 8).await.unwrap(); // seq 3 delivered
+        // retention 0 would prune all by age, but the prune stops below the undelivered seq 2.
+        let pruned = s.gc(0, &HashSet::new()).await.unwrap();
+        assert_eq!(pruned, 1, "only the delivered head (seq 1) prunes; seq 2 blocks the rest");
+        let remaining: Vec<u64> = s
+            .list_after(0, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![2, 3],
+            "undelivered seq 2 survives GC + the gap-free suffix (seq 3) is retained"
+        );
+        let _ = s2;
+    }
+
+    #[tokio::test]
+    async fn gc_never_prunes_a_dead_lettered_event() {
+        // vultrino#4: a dead-lettered event is also "undelivered" — it must survive GC so an operator
+        // can still replay it, even past the retention window.
+        let (s, _d) = store();
+        let s1 = s.append("A", "t", serde_json::json!({})).await.unwrap();
+        let s2 = s.append("B", "t", serde_json::json!({})).await.unwrap();
+        s.record_delivery(s1, true, None, 8).await.unwrap(); // delivered
+        s.record_delivery(s2, false, Some("boom".into()), 1)
+            .await
+            .unwrap(); // max_attempts=1 → dead-lettered
+        assert_eq!(s.list_dead_letter(10).await.unwrap().len(), 1);
+        let pruned = s.gc(0, &HashSet::new()).await.unwrap();
+        assert_eq!(pruned, 1, "the delivered head prunes; the dead-lettered event is kept");
+        let remaining: Vec<u64> = s
+            .list_after(0, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(remaining, vec![2], "dead-lettered seq 2 survives GC");
+    }
+
+    #[tokio::test]
+    async fn noop_claim_and_gc_do_not_rewrite_the_file() {
+        // vultrino#1: a delivery/GC tick that claims/prunes NOTHING must not re-encrypt+rewrite the
+        // whole outbox file. Every real write uses a fresh nonce, so byte-equality of outbox.enc is a
+        // deterministic (mtime-granularity-immune) proof that no write happened.
+        let (s, dir) = store();
+        let path = dir.path().join("outbox.enc");
+        let seq = s.append("A", "t", serde_json::json!({})).await.unwrap();
+        s.record_delivery(seq, true, None, 8).await.unwrap(); // nothing left pending to claim
+
+        let before = std::fs::read(&path).unwrap();
+        let claimed = s.claim(10, 30).await.unwrap();
+        assert!(claimed.is_empty(), "nothing is pending");
+        assert_eq!(
+            before,
+            std::fs::read(&path).unwrap(),
+            "a no-op claim must not rewrite outbox.enc"
+        );
+
+        // A GC with a huge retention finds nothing old enough to prune → also a no-op.
+        let pruned = s.gc(1_000_000, &HashSet::new()).await.unwrap();
+        assert_eq!(pruned, 0);
+        assert_eq!(
+            before,
+            std::fs::read(&path).unwrap(),
+            "a no-op GC must not rewrite outbox.enc"
+        );
+
+        // Positive control: a REAL append DOES rewrite the file (proves the check can detect a write).
+        s.append("B", "t", serde_json::json!({})).await.unwrap();
+        assert_ne!(
+            before,
+            std::fs::read(&path).unwrap(),
+            "a genuine append must rewrite outbox.enc"
         );
     }
 
