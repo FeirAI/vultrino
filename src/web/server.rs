@@ -113,6 +113,22 @@ impl WebServer {
         let trust_forwarded_for = std::env::var("VULTRINO_TRUST_FORWARDED_FOR")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        // In server mode vultrino is typically fronted by a reverse proxy, so every
+        // request arrives from the proxy's socket address. With XFF untrusted, the
+        // per-client login brute-force throttle then keys ALL logins on that single
+        // proxy IP — collapsing to one shared lockout bucket (coarse throttle; one
+        // client's failures can lock out others). Warn loudly so the operator either
+        // sets VULTRINO_TRUST_FORWARDED_FOR=1 (only when a trusted proxy sets XFF) or
+        // accepts the shared-bucket behavior knowingly. (We do NOT default XFF to
+        // trusted: that would let an attacker spoof a fresh bucket per request.)
+        if vultrino_config.server.mode == ServerMode::Server && !trust_forwarded_for {
+            tracing::warn!(
+                "running in server mode without VULTRINO_TRUST_FORWARDED_FOR=1: the admin-login \
+                 brute-force throttle keys on the socket peer, so behind a reverse proxy every \
+                 client shares ONE lockout bucket. Set VULTRINO_TRUST_FORWARDED_FOR=1 ONLY if a \
+                 trusted proxy sets X-Forwarded-For (an untrusted network makes it spoofable)."
+            );
+        }
         let govder =
             vultrino_config
                 .govder
@@ -144,11 +160,13 @@ impl WebServer {
         // Session store for login sessions
         let session_store = MemoryStore::default();
 
-        // Determine if we should use secure cookies and HSTS:
-        // - TLS is configured, OR
-        // - Running in Server mode (likely behind a reverse proxy with TLS)
-        let use_secure_mode = self.app_state.config.server.tls.is_some()
-            || self.app_state.config.server.mode == ServerMode::Server;
+        // Determine if we should use secure cookies and HSTS. vultrino has NO
+        // built-in TLS acceptor (it serves plaintext HTTP), and `[server.tls]` is
+        // rejected at config load, so the ONLY signal is `mode = "server"` — which
+        // declares "I'm fronted by a TLS-terminating reverse proxy", the deployment
+        // where Secure-cookie + HSTS are correct. Local mode stays plaintext-friendly
+        // so localhost HTTP login works without a Secure cookie being dropped.
+        let use_secure_mode = self.app_state.config.server.mode == ServerMode::Server;
 
         let session_layer = SessionManagerLayer::new(session_store)
             // Secure flag - only send cookies over HTTPS

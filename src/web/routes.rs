@@ -1851,5 +1851,22 @@ mod tests {
             get_client_ip(&headers, &socket, true),
             IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))
         );
+
+        // X-Real-IP is honored as a fallback ONLY when trusted and no usable XFF.
+        let mut real = HeaderMap::new();
+        real.insert(
+            axum::http::HeaderName::from_static("x-real-ip"),
+            axum::http::HeaderValue::from_static("9.9.9.9"),
+        );
+        // Untrusted → still the socket peer (X-Real-IP is client-controlled too).
+        assert_eq!(
+            get_client_ip(&real, &socket, false),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))
+        );
+        // Trusted → the proxy-supplied X-Real-IP.
+        assert_eq!(
+            get_client_ip(&real, &socket, true),
+            IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))
+        );
     }
 }

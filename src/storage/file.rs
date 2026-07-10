@@ -704,7 +704,12 @@ impl FileStorage {
         // else a power-loss can expose the rename while the bytes are unflushed, corrupting the vault
         // (catastrophic: every subsequent read fails). Lock-step with OutboxStore::write_to_disk.
         {
-            let f = std::fs::File::create(&temp_path)?;
+            // 0600: the vault holds the cleartext KDF salt (offline Argon2 target) and
+            // the encrypted secret material — it must not be group/world-readable under
+            // a permissive umask. Creating the temp at 0600 means the final vault file
+            // inherits it through the rename below (which carries the temp's mode),
+            // tightening even a pre-existing loose vault on the next save.
+            let f = super::outbox_store::create_private_file(&temp_path)?;
             use std::io::Write;
             let mut w = std::io::BufWriter::new(f);
             w.write_all(content.as_bytes())?;
@@ -755,12 +760,15 @@ impl FileStorage {
     /// serialized against each other.
     fn lock_file_exclusive(&self) -> Result<fd_lock::RwLock<std::fs::File>, StorageError> {
         let lock_path = self.path.with_extension("lock");
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).read(true).write(true).truncate(false);
+        // Owner-only sidecar (0600), consistent with the vault file it guards.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let lock_file = opts.open(&lock_path)?;
         Ok(fd_lock::RwLock::new(lock_file))
     }
 

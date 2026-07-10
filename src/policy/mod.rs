@@ -92,12 +92,39 @@ pub struct EvalInput<'a> {
     pub spend: Option<&'a SpendAttempt>,
 }
 
-/// Rate limiter state for a credential
+/// Rate limiter state for a single (rule, credential, principal) counter.
 struct RateLimitState {
     /// Requests in current window
     count: u32,
     /// Window start time
     window_start: Instant,
+}
+
+/// Build the composite key a [`RateLimitState`] is stored under. Keying on the
+/// rule discriminator `(max, window_secs)` AND the credential alias AND the
+/// principal id keeps distinct caps and distinct principals from sharing one
+/// counter:
+/// - **per-rule:** a `10/min` cap and a `1000/day` cap on the same credential no
+///   longer collide on a single counter (the previous alias-only key let the
+///   minute counter's fills bleed into the day cap and vice-versa);
+/// - **per-principal:** two agents sharing one credential each get their own
+///   budget instead of draining a shared pool (the main under-count — one noisy
+///   agent could exhaust another's allowance, or evade its own by riding a quiet
+///   sibling's counter).
+///
+/// A `None` principal (an unauthenticated/local caller, or the dead
+/// `record_request` path) keys on the empty string, so principal-less traffic on a
+/// credential still shares one counter — the correct behavior when there is no
+/// principal to isolate. The unit separator (`\x1f`) can't appear in an alias or
+/// principal id, so the parts can't be confused.
+fn rate_limit_key(credential_alias: &str, principal_id: Option<&str>, max: u32, window_secs: u64) -> String {
+    format!(
+        "{}\x1f{}\x1f{}\x1f{}",
+        credential_alias,
+        principal_id.unwrap_or(""),
+        max,
+        window_secs
+    )
 }
 
 /// Policy engine that evaluates access decisions
@@ -331,6 +358,17 @@ impl PolicyEngine {
         // Stored policies originate in a HashMap, so their iteration order cannot
         // determine authorization. Explicit decisions use fail-closed precedence:
         // Deny > Prompt > Allow. Defaults apply only if no explicit rule matched.
+        //
+        // KNOWN LIMITATION (layered RateLimit — bounded): the FIRST matching Allow
+        // rule short-circuits and returns Allow, so if a credential/principal has
+        // two Allow-`RateLimit` rules (e.g. a per-minute AND a per-day cap), only the
+        // first-iterated one is charged+enforced per request; the second is not
+        // conjunctively evaluated. Each cap now has its OWN counter (see
+        // `rate_limit_key`), so they no longer corrupt each other — but "all caps
+        // must pass" is not enforced for layered Allow-RateLimit rules. To enforce a
+        // hard ceiling today, express it as a single rule, or as a Deny rule (Deny is
+        // evaluated first and is authoritative). Making layered RateLimit Allow rules
+        // conjunctive is tracked in LIMITATIONS.md.
         for wanted in [
             PolicyAction::Deny,
             PolicyAction::Prompt,
@@ -424,12 +462,28 @@ impl PolicyEngine {
 
             PolicyCondition::TimeWindow { start, end } => {
                 let now = chrono::Local::now().time();
-                now >= *start && now <= *end
+                // Support wrap-around (overnight) windows. A window with
+                // `start <= end` is a same-day range (`[start, end]`); a window with
+                // `start > end` spans midnight (e.g. 22:00→06:00), matching when
+                // `now >= start` OR `now <= end`. Without this, an overnight window
+                // could NEVER match, silently failing an overnight Deny **open** —
+                // the dangerous direction. `start == end` is rejected at load
+                // (`Policy::validate`) as ambiguous (empty vs. all-day).
+                if start <= end {
+                    now >= *start && now <= *end
+                } else {
+                    now >= *start || now <= *end
+                }
             }
 
             PolicyCondition::RateLimit { max, window_secs } => {
                 if record {
-                    self.check_rate_limit(input.credential_alias, *max, *window_secs)
+                    self.check_rate_limit(
+                        input.credential_alias,
+                        input.principal.map(|p| p.id.as_str()),
+                        *max,
+                        *window_secs,
+                    )
                 } else {
                     // Deferred (post-approval) evaluation: the slot was taken when
                     // the request first opened the approval; re-applying the limit
@@ -498,14 +552,20 @@ impl PolicyEngine {
         spend.amount <= per_action_max
     }
 
-    /// Check and update rate limit
-    fn check_rate_limit(&self, credential_alias: &str, max: u32, window_secs: u64) -> bool {
+    /// Check and update rate limit for one `(rule, credential, principal)` counter.
+    fn check_rate_limit(
+        &self,
+        credential_alias: &str,
+        principal_id: Option<&str>,
+        max: u32,
+        window_secs: u64,
+    ) -> bool {
         let mut limits = self.rate_limits.write();
         let now = Instant::now();
         let window = Duration::from_secs(window_secs);
 
         let state = limits
-            .entry(credential_alias.to_string())
+            .entry(rate_limit_key(credential_alias, principal_id, max, window_secs))
             .or_insert_with(|| RateLimitState {
                 count: 0,
                 window_start: now,
@@ -524,7 +584,14 @@ impl PolicyEngine {
         }
     }
 
-    /// Record a request for rate limiting
+    /// Record a request for rate limiting.
+    ///
+    /// NOTE: the live admission path charges the rate limit inline (via
+    /// `evaluate` with `record=true`), so this standalone helper is no longer on
+    /// any hot path (a post-execution second charge was removed to stop
+    /// double-counting). It keys on `None` principal — a credential-wide touch —
+    /// so callers that lack a resolved principal don't fabricate a per-principal
+    /// counter that the admission path would never hit.
     pub fn record_request(&self, credential_alias: &str) {
         let policies = self.policies.read();
 
@@ -537,7 +604,7 @@ impl PolicyEngine {
             for rule in &policy.rules {
                 if let PolicyCondition::RateLimit { max, window_secs } = &rule.condition {
                     // Touch the rate limiter to record the request
-                    self.check_rate_limit(credential_alias, *max, *window_secs);
+                    self.check_rate_limit(credential_alias, None, *max, *window_secs);
                 }
             }
         }
@@ -1498,5 +1565,165 @@ mod tests {
         // a missing per_action_max would #[serde(default)] to 0: validate runs on
         // create, so a fresh 0 cap (explicit or defaulted) can't be stored.
         assert!(spend_policy("usd", 0).validate().is_err());
+    }
+
+    // ==================== TimeWindow (wrap-around) ====================
+
+    fn secs(x: i64) -> chrono::NaiveTime {
+        chrono::NaiveTime::from_num_seconds_from_midnight_opt(x as u32, 0).unwrap()
+    }
+
+    fn tw_policy(
+        start: chrono::NaiveTime,
+        end: chrono::NaiveTime,
+        action: PolicyAction,
+        default_action: PolicyAction,
+    ) -> Policy {
+        Policy {
+            id: "tw".to_string(),
+            name: "tw".to_string(),
+            credential_pattern: "*".to_string(),
+            principal_pattern: None,
+            rules: vec![PolicyRule {
+                condition: PolicyCondition::TimeWindow { start, end },
+                action,
+            }],
+            default_action,
+            kill: false,
+        }
+    }
+
+    #[test]
+    fn test_time_window_overnight_wraps_deny_and_allow() {
+        use chrono::Timelike;
+        let s = chrono::Local::now().time().num_seconds_from_midnight() as i64;
+        // Skip only the ~10 min/day at the midnight seam, where an offset-from-now
+        // window would wrap the clock and flip start/end. This is a SKIP, never a
+        // spurious failure — the offsets below stay on one side of midnight.
+        if !(300..=86_099).contains(&s) {
+            return;
+        }
+
+        // A genuine overnight window (start > end) that CONTAINS `now`: its coverage
+        // runs from `start` forward through midnight to `end`, and `now >= start`
+        // puts it in range. Pre-fix (`now >= start && now <= end`) this could NEVER
+        // match — an overnight Deny silently failed OPEN.
+        let (start, end) = (secs(s - 100), secs(s - 200));
+        assert!(start > end, "window must be overnight (start > end)");
+
+        // Overnight DENY must fire.
+        let engine = PolicyEngine::new();
+        engine.add_policy(tw_policy(start, end, PolicyAction::Deny, PolicyAction::Allow));
+        assert!(
+            matches!(
+                engine.evaluate("c", None, None, &make_context()),
+                PolicyDecision::Deny(_)
+            ),
+            "an overnight Deny window covering now must deny"
+        );
+
+        // Overnight ALLOW must admit (otherwise default-deny).
+        let engine = PolicyEngine::new();
+        engine.add_policy(tw_policy(start, end, PolicyAction::Allow, PolicyAction::Deny));
+        assert_eq!(
+            engine.evaluate("c", None, None, &make_context()),
+            PolicyDecision::Allow,
+            "an overnight Allow window covering now must allow"
+        );
+
+        // An overnight window whose GAP covers now must NOT match (falls through to
+        // the default). Here `now` sits strictly inside the uncovered `(end, start)`.
+        let (gstart, gend) = (secs(s + 100), secs(s - 100));
+        assert!(gstart > gend);
+        let engine = PolicyEngine::new();
+        engine.add_policy(tw_policy(gstart, gend, PolicyAction::Allow, PolicyAction::Deny));
+        assert!(
+            matches!(
+                engine.evaluate("c", None, None, &make_context()),
+                PolicyDecision::Deny(_)
+            ),
+            "now inside the overnight window's gap must fall through to default deny"
+        );
+    }
+
+    #[test]
+    fn test_degenerate_time_window_rejected_at_load() {
+        let noon = secs(12 * 3600);
+        // start == end (top-level) → rejected as ambiguous.
+        let p = tw_policy(noon, noon, PolicyAction::Deny, PolicyAction::Allow);
+        assert!(
+            p.validate().is_err(),
+            "a start == end TimeWindow must be rejected at load"
+        );
+        // Nested inside And → also rejected.
+        let mut nested = Policy::deny_all("nested-tw", "*");
+        nested.rules = vec![PolicyRule {
+            condition: PolicyCondition::And(vec![
+                PolicyCondition::url("https://x/*"),
+                PolicyCondition::TimeWindow {
+                    start: noon,
+                    end: noon,
+                },
+            ]),
+            action: PolicyAction::Allow,
+        }];
+        assert!(nested.validate().is_err());
+        // A real span validates fine.
+        let ok = tw_policy(
+            secs(9 * 3600),
+            secs(17 * 3600),
+            PolicyAction::Deny,
+            PolicyAction::Allow,
+        );
+        assert!(ok.validate().is_ok());
+    }
+
+    // ==================== RateLimit per-principal keying ====================
+
+    #[test]
+    fn test_rate_limit_is_per_principal() {
+        let engine = PolicyEngine::new();
+        engine.add_policy(Policy {
+            id: "rl".to_string(),
+            name: "rl".to_string(),
+            credential_pattern: "*".to_string(),
+            principal_pattern: None,
+            rules: vec![PolicyRule {
+                condition: PolicyCondition::RateLimit {
+                    max: 1,
+                    window_secs: 60,
+                },
+                action: PolicyAction::Allow,
+            }],
+            default_action: PolicyAction::Deny,
+            kill: false,
+        });
+        let ctx = |p: &str| {
+            let mut c = RequestContext::new();
+            c.api_key_id = Some(p.to_string());
+            c
+        };
+
+        // agent-a spends its single slot, then is denied.
+        assert_eq!(
+            engine.evaluate("shared-cred", None, None, &ctx("agent-a")),
+            PolicyDecision::Allow
+        );
+        assert!(matches!(
+            engine.evaluate("shared-cred", None, None, &ctx("agent-a")),
+            PolicyDecision::Deny(_)
+        ));
+
+        // agent-b on the SAME credential still has its OWN budget — the counters are
+        // no longer shared (the pre-fix under-count let one agent drain another's).
+        assert_eq!(
+            engine.evaluate("shared-cred", None, None, &ctx("agent-b")),
+            PolicyDecision::Allow,
+            "a second principal on the same credential must not share the first's counter"
+        );
+        assert!(matches!(
+            engine.evaluate("shared-cred", None, None, &ctx("agent-b")),
+            PolicyDecision::Deny(_)
+        ));
     }
 }

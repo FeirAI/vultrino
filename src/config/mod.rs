@@ -256,7 +256,7 @@ impl Config {
 
     /// Convert from raw TOML config to validated config
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
-        let server = raw.server.unwrap_or_default().into();
+        let server = raw.server.unwrap_or_default().try_into()?;
         let storage = raw.storage.unwrap_or_default().try_into()?;
         let logging = raw.logging.unwrap_or_default().into();
         let mcp = raw.mcp.unwrap_or_default().into();

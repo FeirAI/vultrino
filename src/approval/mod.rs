@@ -34,6 +34,17 @@ use thiserror::Error;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use sha2::{Digest, Sha256};
 
+/// Fallback execute-by window for an approved-but-unrun grant when no explicit
+/// continuous re-authorization interval is configured (24h). An `Approved` request
+/// is not `is_open()`, so its `expires_at` guard stops firing the moment it is
+/// approved — leaving `needs_reauth` as the ONLY bound on how long a granted-but-
+/// never-executed action stays runnable. Without this, an unexecuted grant would be
+/// executable forever. Generous by design: it must not clip a legitimately
+/// long-lived approval, only ensure a forgotten one lapses *observably* (it emits
+/// the same `EVENT_APPROVAL_EXPIRED` audit as a re-auth lapse). An operator who
+/// wants a tighter window sets `reauth_interval_secs`.
+pub const DEFAULT_UNRUN_GRANT_WINDOW_SECS: u64 = 24 * 60 * 60;
+
 /// Lifecycle state of an approval request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -789,20 +800,30 @@ impl ApprovalRequest {
     }
 
     /// Continuous re-authorization check (V5): whether an approved-but-not-yet-run
-    /// grant has gone stale — i.e. more than `reauth_interval_secs` elapsed since
-    /// the decision — and so must be re-approved before it may execute. `false`
-    /// when no interval is configured or the grant is fresh.
+    /// grant has gone stale — i.e. more than its effective execute-by window elapsed
+    /// since the decision — and so must be re-approved before it may execute. `false`
+    /// when the grant is fresh, already executed, or not approved.
+    ///
+    /// The effective window is the configured `reauth_interval_secs` when set to a
+    /// positive value, otherwise [`DEFAULT_UNRUN_GRANT_WINDOW_SECS`]. Bounding the
+    /// unset case matters because an `Approved` request is not `is_open()`, so
+    /// `advance_lifecycle`'s `expires_at` guard never re-fires once approved — this is
+    /// the sole bound on an approved-but-unrun grant, and an unbounded one would stay
+    /// executable forever. A stored `Some(0)` (e.g. a pre-fix vault record) is treated
+    /// as "disabled" and likewise falls back to the default, so it can never render a
+    /// grant stale ~1s after approval.
     pub fn needs_reauth(&self) -> bool {
-        let Some(interval) = self.reauth_interval_secs else {
-            return false;
-        };
         if self.status != ApprovalStatus::Approved || self.executed {
             return false;
         }
         let Some(decided_at) = self.decided_at else {
             return false;
         };
-        (Utc::now() - decided_at).num_seconds() > interval as i64
+        let window = self
+            .reauth_interval_secs
+            .filter(|&s| s > 0)
+            .unwrap_or(DEFAULT_UNRUN_GRANT_WINDOW_SECS);
+        (Utc::now() - decided_at).num_seconds() > window as i64
     }
 
     /// A delegate approval is intentionally non-executable until the delegator's
@@ -1872,6 +1893,48 @@ mod tests {
         // Once executed, it's spent → no reauth.
         a.executed = true;
         assert!(!a.needs_reauth());
+    }
+
+    #[test]
+    fn test_needs_reauth_bounds_unrun_grant_without_interval() {
+        // With NO configured interval, an approved-but-unrun grant is still bounded
+        // by the default execute-by window — otherwise it stays runnable forever
+        // (Approved is not is_open(), so expires_at stops firing once approved).
+        let (mut a, _) = new_approval();
+        a.reauth_interval_secs = None;
+        a.approve(Decision::new("admin panel", "alice")).unwrap();
+        // Fresh, well within the window → still runnable.
+        assert!(!a.needs_reauth());
+        // Just inside the default window → still runnable.
+        a.decided_at =
+            Some(Utc::now() - chrono::Duration::seconds(DEFAULT_UNRUN_GRANT_WINDOW_SECS as i64 - 60));
+        assert!(!a.needs_reauth());
+        // Past the default window → lapsed (must be re-approved).
+        a.decided_at =
+            Some(Utc::now() - chrono::Duration::seconds(DEFAULT_UNRUN_GRANT_WINDOW_SECS as i64 + 60));
+        assert!(
+            a.needs_reauth(),
+            "an unrun grant past the default execute-by window must lapse even with no interval"
+        );
+    }
+
+    #[test]
+    fn test_needs_reauth_treats_zero_interval_as_disabled() {
+        // A stored `Some(0)` (e.g. a pre-fix vault record) must NOT make the grant
+        // stale ~1s after approval — it is treated as "disabled" and falls back to
+        // the generous default window, not a 0-second one.
+        let (mut a, _) = new_approval();
+        a.reauth_interval_secs = Some(0);
+        a.approve(Decision::new("admin panel", "alice")).unwrap();
+        a.decided_at = Some(Utc::now() - chrono::Duration::seconds(5));
+        assert!(
+            !a.needs_reauth(),
+            "reauth_interval_secs = 0 must be disabled, not a 0-second window"
+        );
+        // But the default execute-by bound still applies.
+        a.decided_at =
+            Some(Utc::now() - chrono::Duration::seconds(DEFAULT_UNRUN_GRANT_WINDOW_SECS as i64 + 60));
+        assert!(a.needs_reauth());
     }
 
     #[test]

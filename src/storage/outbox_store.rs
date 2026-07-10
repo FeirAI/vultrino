@@ -459,12 +459,15 @@ impl OutboxStore {
 
     fn lock_file_exclusive(&self) -> Result<fd_lock::RwLock<std::fs::File>, StorageError> {
         let lock_path = self.path.with_extension("lock");
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).read(true).write(true).truncate(false);
+        // Owner-only sidecar (0600), consistent with the data file it guards.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let lock_file = opts.open(&lock_path)?;
         Ok(fd_lock::RwLock::new(lock_file))
     }
 
@@ -507,7 +510,10 @@ impl OutboxStore {
         // are not yet flushed, leaving a corrupt outbox.enc. This path runs on EVERY append, so the crash
         // window matters here far more than for the rare vault writes.
         {
-            let f = std::fs::File::create(&temp_path)?;
+            // 0600: the outbox is encrypted but is a sensitive signed record — don't
+            // leave it group/world-readable. The temp's mode carries to the final file
+            // through the rename below.
+            let f = create_private_file(&temp_path)?;
             use std::io::Write;
             let mut w = std::io::BufWriter::new(f);
             w.write_all(content.as_bytes())?;
@@ -568,6 +574,28 @@ pub(super) fn fsync_parent_dir(path: &Path) -> Result<(), StorageError> {
         }
         Err(e) => Err(StorageError::Io(e)),
     }
+}
+
+/// Create (or truncate) `path` for writing with **owner-only** permissions
+/// (`0600`) on Unix, so the encrypted vault (`credentials.enc` — holds the salt
+/// for offline Argon2 attack) and the signed outbox (`outbox.enc`) are never
+/// left group/world-readable under a permissive umask (022 → 0644). The mode is
+/// applied at CREATE time via `OpenOptions.mode`, so the bits are correct from the
+/// first byte written — there is no window where a fresh file exists world-readable
+/// before a later chmod. Because these files are persisted via a temp-file +
+/// atomic rename, the renamed temp's `0600` becomes the final file's mode (rename
+/// carries the source inode's perms), tightening even a pre-existing loose file on
+/// the next save. On non-Unix platforms this is a plain create (Windows ACLs are
+/// not modeled here). Semantics otherwise match `std::fs::File::create`.
+pub(super) fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
 }
 
 /// Increment the sequence and insert a fresh Pending event (with an optional intent-drain dedup id).

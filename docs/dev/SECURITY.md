@@ -97,10 +97,14 @@ WASM plugin you install.
 - **Use tokens (`vut_`):** hashed at rest; carry their own credential glob, action
   scope, use count, expiry, and optional `agent_label`/`owner`/`tenant`. Backed by
   an ephemeral `read`+`execute` grant scoped to the token's credential.
-- **Web admin login:** username + bcrypt password hash (`admin.json`), constant-
-  time comparison, username-enumeration-resistant, rate-limited per client IP
-  (honoring `X-Forwarded-For`/`X-Real-IP`), CSRF-protected write forms,
-  session cookies.
+- **Web admin login:** username + bcrypt password hash (`admin.json`, stored
+  `0600`), constant-time comparison, username-enumeration-resistant, rate-limited
+  per client IP, CSRF-protected write forms, session cookies. The throttle keys on
+  the **socket peer** by default; it honors `X-Forwarded-For`/`X-Real-IP` (rightmost
+  hop) **only** when `VULTRINO_TRUST_FORWARDED_FOR=1` — because those headers are
+  client-controlled, trusting them without a trusted proxy in front lets an attacker
+  mint a fresh bucket per request. In server mode without that flag, all logins
+  behind a proxy share one bucket (a startup warning is emitted).
 - **Out-of-band approval links:** authorized by a high-entropy **random capability
   token** in the link (`OsRng`-generated). The server stores only the token's
   **hash** and verifies a presented token by hashing it and **constant-time

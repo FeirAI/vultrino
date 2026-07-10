@@ -558,6 +558,90 @@ async fn test_token_force_approval_consumes_on_resume() {
     assert!(after.is_exhausted());
 }
 
+/// A resumed approval must meter against the requesting AGENT, not the shared
+/// credential alias. On the resume path the request context is rebuilt from the
+/// stored approval; if its identity isn't seeded, `run_action` falls back to the
+/// credential alias as the meter subject and per-agent leria budgets never see the
+/// approval-gated spend (an under-count — the dangerous direction).
+#[tokio::test]
+async fn test_resumed_approval_meters_against_agent_not_credential() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred", false).await;
+
+    // A require_approval token bound to a named agent. The approval snapshots this
+    // label at open; the resume must attribute the meter to it.
+    let (_full, mut token) = UseToken::create(NewUseToken {
+        name: "refund-token".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: Some(1),
+        require_approval: true,
+        expires_in: None,
+    });
+    token.agent_label = Some("refund-bot".to_string());
+    storage.store_use_token(&token).await.unwrap();
+
+    // Open the approval (nothing runs yet).
+    let approval = match server
+        .execute_gated(
+            echo_request("api-cred"),
+            ExecAuth::from_use_token(token.clone()),
+        )
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected pending, got {other:?}"),
+    };
+    assert_eq!(
+        approval.agent_label.as_deref(),
+        Some("refund-bot"),
+        "the approval must snapshot the requesting agent label at open"
+    );
+
+    // Human approves, agent polls → the action runs and the meter is emitted.
+    let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    stored
+        .approve(Decision::new("admin panel", "secops"))
+        .unwrap();
+    storage.update_approval(&stored).await.unwrap();
+
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed);
+    assert_eq!(resumed.result_status, Some(200));
+
+    // The meter.observed event(s) from this resume must be attributed to the AGENT,
+    // never to the credential alias.
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    let meters: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == vultrino::outbox::EVENT_METER_OBSERVED)
+        .collect();
+    assert!(
+        !meters.is_empty(),
+        "the resumed action must emit at least one meter.observed event"
+    );
+    for m in &meters {
+        assert_eq!(
+            m.subject, "refund-bot",
+            "meter subject must be the agent label, not the credential alias; got {:?}",
+            m.subject
+        );
+        assert_eq!(
+            m.payload["principal"], "refund-bot",
+            "meter payload principal must be the agent label; got {:?}",
+            m.payload["principal"]
+        );
+        assert_ne!(
+            m.subject, "api-cred",
+            "meter must NOT be attributed to the credential alias (the pre-fix bug)"
+        );
+    }
+}
+
 /// A single-use require_approval token may have at most one *pending* approval
 /// outstanding — a second open is refused, so it can't flood the approval queue.
 #[tokio::test]

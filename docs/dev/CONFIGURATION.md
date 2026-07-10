@@ -29,6 +29,7 @@ below — Vultrino prefers a loud config error to a silent misconfiguration.
 | `VULTRINO_PROVIDER_GEMINI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `gemini` protocol. |
 | `VULTRINO_PROVIDER_VERTEX_AI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `vertex-ai` protocol. |
 | `VULTRINO_MCP_ALLOWED_ORIGINS` | `web` (MCP transport) | unset | — | Comma-separated `Origin` allowlist for browser MCP requests. A request's `Origin` must equal the request `Host` **or** an entry here, else `403`. |
+| `VULTRINO_TRUST_FORWARDED_FOR` | `web` (admin-login throttle) | `false` | — | When `1`/`true`, the admin-login brute-force throttle keys on the **rightmost** `X-Forwarded-For` (else `X-Real-IP`) hop instead of the socket peer. Set this **only** behind a trusted reverse proxy that sets the header — those headers are client-controlled, so trusting them on an untrusted network lets an attacker spoof a fresh lockout bucket per request (defeating the throttle). Fail-safe default is untrusted. In `mode = "server"` without this flag, every client behind the proxy shares **one** lockout bucket (a startup warning is emitted). |
 | `GOVDER_BASE_URL` | `web` (govder delegate-decision client) | — | Yes, to enable delegate approvals | Base URL of the govder decide-plane. Read at startup (`GovderConfig::from_env`), **not** a `config.toml` key. Unset (or blank) → `state.govder` is `None` and `POST /api/v1/approvals/{id}/delegate-decision` fails closed with `503 govder_not_configured`. |
 | `GOVDER_TENANT_ASSERTION_SECRET` | `web` (govder delegate-decision client) | — | Yes, to enable delegate approvals | HMAC key vultrino signs the outbound `X-Govder-Tenant-Assertion` with on every govder call. Unset (or blank) → same fail-closed `503 govder_not_configured` as a missing `GOVDER_BASE_URL`. |
 | `GOVDER_ASSERTION_TTL_SECS` | `web` (govder delegate-decision client) | `90` | — | TTL of the outbound tenant assertion. A non-positive or unparseable value falls back to the default. |
@@ -238,7 +239,7 @@ enabled                     = true   # default: true if a notifier is configured
 ttl_secs                    = 3600   # default 3600
 public_base_url             = "https://vultrino.example.com"  # for approve/deny links
 oob_approver_identity       = "oncall@example.com"  # REQUIRED if a notifier is set
-reauth_interval_secs        = 0      # continuous re-auth window (optional)
+reauth_interval_secs        = 900    # continuous re-auth window, seconds (optional; 0/absent = off)
 enforce_separation_of_duty  = false  # hard-reject self-approvals (default false: record only)
 dual_control_approvers      = 2      # distinct approvers for a dual-control request (min/default 2)
 
@@ -266,6 +267,15 @@ class              = "high"
 unattributable — separation of duty requires an attributable approver); an SLA
 with a zero window, a duplicate SLA class, an unknown criticality class, or a
 malformed criticality-rule glob are all rejected.
+
+**`reauth_interval_secs` (continuous re-auth / execute-by window):** when set to a
+positive value, an approved action must run within that many seconds of the
+decision or it lapses (`approval.expired`) and must be re-approved. `0` (or absent)
+disables *explicit* continuous re-auth — it is treated as "off", **not** a
+0-second window. Note that an approved-but-unrun grant is still bounded even with
+re-auth off: it lapses after a generous default execute-by window (24h) so a
+forgotten grant can't stay executable indefinitely. Set a positive
+`reauth_interval_secs` when you need a tighter bound.
 
 ### `[identity]` — inbound workload-identity resolution (V10/R6)
 

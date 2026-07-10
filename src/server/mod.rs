@@ -1794,7 +1794,7 @@ impl VultrinoServer {
             .map_err(RunError::terminal)?;
         let (plugin_name, action_name) =
             parse_action(&approval.action).map_err(RunError::terminal)?;
-        let context = RequestContext::new();
+        let mut context = RequestContext::new();
 
         // Re-evaluate policy at execution time so the deferred path still
         // enforces hard *deny* gates — a human approval is not a policy bypass.
@@ -1832,6 +1832,19 @@ impl VultrinoServer {
             .as_ref()
             .or(approval.requester.principal_id.as_ref())
             .cloned();
+        // V13a metering attribution (fix): seed the meter/in-flight-session identity
+        // from the approval record BEFORE `run_action` derives `meter_principal`.
+        // `run_action` resolves the meter subject as
+        // `context.agent_label → context.api_key_id → credential_alias`; on the empty
+        // resume context it fell all the way back to the CREDENTIAL ALIAS, so every
+        // approval-gated call was metered against the shared credential instead of the
+        // requesting AGENT — a per-agent under-count (leria budgets never saw the
+        // approval-gated spend). Attribution ONLY: rate limits are deliberately NOT
+        // re-charged on resume (the RateLimit condition runs read-only here,
+        // record=false), so this changes who the spend is attributed to, not whether
+        // any limit is re-consumed.
+        context.agent_label = approval.agent_label.clone();
+        context.api_key_id = principal_id.clone();
         let principal = principal_id.map(|id| crate::policy::Principal {
             id,
             agent_label: approval.agent_label.clone(),

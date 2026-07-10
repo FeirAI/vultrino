@@ -1120,6 +1120,15 @@ async fn save_admin_auth(admin_auth: &AdminAuth) -> Result<(), Box<dyn std::erro
     });
 
     tokio::fs::write(&auth_path, serde_json::to_string_pretty(&data)?).await?;
+    // admin.json holds the bcrypt admin password hash — keep it owner-only (0600)
+    // so a permissive umask can't leave the hash group/world-readable. Applied
+    // right after the write (idempotent) so it also tightens a pre-existing loose
+    // file. Unix-only: Windows ACLs are not modeled here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
     Ok(())
 }
 

@@ -64,7 +64,19 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   pass the verified document in the configured header.
 - **In-memory, per-process state resets on restart.** Rate-limit counters, the
   unauthorized-attempt metric, and the in-flight session registry are per-process
-  and reset on restart. The durable history is the signed outbox.
+  and reset on restart. The durable history is the signed outbox. Rate-limit
+  counters are keyed per `(rule, credential, principal)` — distinct caps and
+  distinct principals each get their own counter (so two agents sharing a
+  credential no longer drain one shared budget).
+- **Layered `RateLimit` Allow rules are first-match-wins, not conjunctive.** If a
+  credential/principal matches more than one Allow-`RateLimit` rule (e.g. a
+  per-minute AND a per-day cap), only the first-iterated rule is charged and
+  enforced on a given request — the evaluator short-circuits on the first matching
+  Allow (`Deny > Prompt > Allow` precedence is preserved). Each cap still has its
+  own counter (they don't corrupt each other), but "every layered cap must pass"
+  is not enforced for Allow-`RateLimit` rules. Express a hard ceiling as a single
+  rule, or as a `Deny` rule (Deny is evaluated first and is authoritative). Making
+  layered Allow-`RateLimit` rules conjunctive is a deferred follow-up.
 - **No built-in TLS / network hardening.** The server speaks plaintext HTTP;
   terminate TLS at a reverse proxy and bind to localhost unless fronted.
 - **Audit-to-file is not implemented.** `[logging] audit_file` is parsed but unused;

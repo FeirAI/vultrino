@@ -217,6 +217,18 @@ impl Policy {
                     self.name
                 ));
             }
+            // Reject an ambiguous `start == end` TimeWindow (top-level or nested):
+            // it can't be told apart from an empty window vs. an all-day one, and the
+            // wrap-around evaluator would treat it as a single instant. Fail loudly at
+            // load rather than silently mis-gating. (For "always" use `Always`; for a
+            // near-instant window use a 1-minute span.)
+            if let Some((start, end)) = condition_degenerate_time_window(&rule.condition) {
+                return Err(format!(
+                    "policy '{}': TimeWindow start ({}) must not equal end ({}) — \
+                     use a real span, or `Always` for all-day",
+                    self.name, start, end
+                ));
+            }
         }
         if uses_spend_cap && self.default_action != PolicyAction::Deny {
             return Err(format!(
@@ -244,6 +256,20 @@ fn contains_spend_cap(c: &PolicyCondition) -> bool {
         PolicyCondition::And(cs) | PolicyCondition::Or(cs) => cs.iter().any(contains_spend_cap),
         PolicyCondition::Not(inner) => contains_spend_cap(inner),
         _ => false,
+    }
+}
+
+/// Find a degenerate (`start == end`) `TimeWindow` anywhere in a condition tree,
+/// returning its `(start, end)` for the error message. Recurses through and/or/not
+/// so a nested window is caught too.
+fn condition_degenerate_time_window(c: &PolicyCondition) -> Option<(NaiveTime, NaiveTime)> {
+    match c {
+        PolicyCondition::TimeWindow { start, end } if start == end => Some((*start, *end)),
+        PolicyCondition::And(cs) | PolicyCondition::Or(cs) => {
+            cs.iter().find_map(condition_degenerate_time_window)
+        }
+        PolicyCondition::Not(inner) => condition_degenerate_time_window(inner),
+        _ => None,
     }
 }
 

@@ -245,19 +245,39 @@ pub struct RawServerConfig {
     pub tls: Option<RawTlsConfig>,
 }
 
-impl From<RawServerConfig> for ServerConfig {
-    fn from(raw: RawServerConfig) -> Self {
-        Self {
+impl TryFrom<RawServerConfig> for ServerConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawServerConfig) -> Result<Self, Self::Error> {
+        // `[server.tls]` is a PHANTOM flag: vultrino has no built-in TLS acceptor —
+        // it binds a plaintext `TcpListener` and serves over `axum::serve`. Setting
+        // `[server.tls]` used to SILENTLY flip the Secure-cookie + HSTS flags (in
+        // web/server.rs) while the transport stayed plaintext, which both lies about
+        // TLS being on AND breaks non-localhost HTTP login (a Secure cookie is never
+        // sent over plaintext). Fail loudly at load instead of serving a false sense
+        // of security: terminate TLS at a reverse proxy (nginx/caddy/envoy) and set
+        // `[server] mode = "server"`, which enables Secure-cookie + HSTS on the
+        // assumption the proxy terminates TLS in front. (See SECURITY.md "No built-in
+        // TLS".)
+        if raw.tls.is_some() {
+            return Err(ConfigError::Invalid(
+                "[server.tls] is not supported: vultrino has no built-in TLS acceptor and \
+                 serves plaintext HTTP. Remove [server.tls] and terminate TLS at a reverse \
+                 proxy (nginx/caddy/envoy), then set `[server] mode = \"server\"` so \
+                 Secure-cookie + HSTS are enabled."
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
             bind: raw.bind.unwrap_or_else(|| "127.0.0.1:7878".to_string()),
             mode: match raw.mode.as_deref() {
                 Some("server") => ServerMode::Server,
                 _ => ServerMode::Local,
             },
-            tls: raw.tls.map(|t| TlsConfig {
-                cert_path: PathBuf::from(t.cert_path),
-                key_path: PathBuf::from(t.key_path),
-            }),
-        }
+            // Always None: a set-but-unbuilt TLS config is rejected above, so this can
+            // never carry a phantom-TLS marker that flips the Secure cookie.
+            tls: None,
+        })
     }
 }
 
@@ -592,7 +612,14 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
             sla_overrides,
             criticality_rules,
             oob_approver_identity,
-            reauth_interval_secs: raw.reauth_interval_secs,
+            // Treat `reauth_interval_secs = 0` as "disabled" rather than a 0-second
+            // window: an unfiltered 0 made every approval stale ~1s after the decision
+            // (needs_reauth: `elapsed > 0`), silently rendering all approvals
+            // unusable. `filter(|&s| s > 0)` mirrors the sibling `dual_control_approvers`
+            // guard below and matches the documented "0 = off" convention. (The
+            // absent-interval case is separately bounded by a generous execute-by
+            // window in `needs_reauth`.)
+            reauth_interval_secs: raw.reauth_interval_secs.filter(|&s| s > 0),
             enforce_separation_of_duty: raw.enforce_separation_of_duty.unwrap_or(false),
             dual_control_approvers: raw.dual_control_approvers.filter(|m| *m >= 2).unwrap_or(2),
         })
@@ -784,6 +811,24 @@ action = "deny"
         let toml = "";
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.server.bind, "127.0.0.1:7878");
+    }
+
+    #[test]
+    fn test_server_tls_is_rejected_at_load() {
+        // [server.tls] is a phantom flag (no built-in TLS acceptor exists); setting it
+        // used to silently flip the Secure-cookie + HSTS flags while serving plaintext.
+        // It must now be a HARD load error, not a silent behavior change.
+        let toml = "[server.tls]\ncert_path = \"/etc/tls/cert.pem\"\nkey_path = \"/etc/tls/key.pem\"";
+        let err = Config::parse(toml).unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("server.tls") && msg.contains("proxy"),
+            "the error must name [server.tls] and direct to a TLS-terminating proxy; got: {err}"
+        );
+        // A server config WITHOUT tls still parses (and mode=server is honored).
+        let ok = Config::parse("[server]\nmode = \"server\"").unwrap();
+        assert_eq!(ok.server.mode, ServerMode::Server);
+        assert!(ok.server.tls.is_none());
     }
 
     #[test]
