@@ -867,6 +867,90 @@ impl FileStorage {
             _ => tokio::task::block_in_place(|| self.reload_blocking()),
         }
     }
+
+    /// Re-key the vault to a NEW master password (offline, single-sided — the vault master password
+    /// unlocks only vultrino's own store, so it does NOT overlap like a shared HMAC; it needs a
+    /// decrypt-old / re-encrypt-new rotation, not a dual-secret accept window).
+    ///
+    /// Under the vault fd-lock: decrypt the secrets vault AND the split outbox file with the CURRENT
+    /// master key, derive a fresh key from `new_password` + a NEW salt using the SAME pinned KDF params
+    /// (#12 — never reset/bump: a shifted param would derive a different key and brick the vault), then
+    /// re-encrypt and atomically swap BOTH files. [`STORAGE_VERSION`] and the outbox file version are
+    /// PRESERVED — a re-key rotates the key, not the on-disk format (so this is a no-op on the data).
+    ///
+    /// TWO-FILE NON-ATOMICITY: the vault and outbox are separate files with separate renames sharing one
+    /// key. Both tmp files are written + fsynced BEFORE either rename, and the two renames run
+    /// back-to-back (outbox FIRST, vault LAST) so the crash window is only the gap between two rename
+    /// syscalls. The vault (the salt/KDF anchor + the secrets) is swapped LAST, so a crash mid-swap
+    /// leaves the AUTHORITATIVE vault OLD and intact — fail-closed: never a half-re-keyed vault, and no
+    /// secret is lost. Even so, RUN THIS OFFLINE (service stopped): a crash strictly between the two
+    /// renames leaves outbox=new-key / vault=old-key, and the next open (old password → old vault → old
+    /// key) can't decrypt the new-key outbox until the re-key is re-run to completion. The fd-lock also
+    /// keeps a live server from racing the swap. On any step error the operation aborts leaving the old
+    /// files intact.
+    ///
+    /// This finalizes the on-disk vault but does NOT rotate this in-memory handle's key; the caller is
+    /// an offline one-shot (`vultrino rekey`) that exits, and must re-open with the new password to use
+    /// the vault again.
+    pub async fn rekey(&self, new_password: &SecretString) -> Result<(), StorageError> {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        match Handle::current().runtime_flavor() {
+            RuntimeFlavor::CurrentThread => self.rekey_blocking(new_password),
+            _ => tokio::task::block_in_place(|| self.rekey_blocking(new_password)),
+        }
+    }
+
+    /// Blocking body of [`Self::rekey`]. Holds the vault fd-lock for the whole re-key; the nested
+    /// outbox fd-lock (taken inside [`OutboxStore::rekey_prepare`]) follows the same vault→outbox lock
+    /// ordering the drain path uses, so it cannot deadlock.
+    fn rekey_blocking(&self, new_password: &SecretString) -> Result<(), StorageError> {
+        let mut flock = self.lock_file_exclusive()?;
+        let _guard = flock.write().map_err(StorageError::Io)?;
+
+        // 1. Decrypt the vault with the CURRENT master key (authoritative on-disk state; fails closed
+        //    on a newer-version vault via check_version).
+        let cache = self.read_cache_from_disk_sync()?;
+
+        // 2. Derive a fresh key: NEW password + NEW salt, SAME pinned KDF params (never reset — #12).
+        let new_salt = generate_salt();
+        let new_key = derive_key(new_password, &new_salt, self.kdf)?;
+
+        // 3. Prepare the vault tmp (re-encrypted with the new key + new salt), fsynced, NOT yet renamed.
+        let data =
+            serde_json::to_vec(&cache).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let encrypted = encrypt(&data, &new_key)?;
+        let storage_file = StorageFile {
+            version: STORAGE_VERSION, // PRESERVED — key rotates, format does not
+            salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &new_salt),
+            kdf: self.kdf, // SAME pinned params
+            data: encrypted,
+        };
+        let content = serde_json::to_string_pretty(&storage_file)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let vault_tmp = self.path.with_extension("rekey.tmp");
+        {
+            let f = super::outbox_store::create_private_file(&vault_tmp)?;
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(f);
+            w.write_all(content.as_bytes())?;
+            w.flush()?;
+            w.into_inner()
+                .map_err(|e| StorageError::Io(e.into_error()))?
+                .sync_all()?;
+        }
+
+        // 4. Prepare the outbox tmp likewise (Ok(None) if no outbox file exists yet).
+        let outbox_tmp = self.outbox.rekey_prepare(&new_key)?;
+
+        // 5. Commit with both tmps already durable: rename the outbox FIRST, then the vault LAST (see the
+        //    two-file note above) so a crash mid-swap leaves the authoritative vault old-and-intact.
+        if let Some(tmp) = &outbox_tmp {
+            self.outbox.rekey_commit(tmp)?;
+        }
+        std::fs::rename(&vault_tmp, &self.path)?;
+        super::outbox_store::fsync_parent_dir(&self.path)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -2959,5 +3043,68 @@ mod tests {
             reopened.get_workload_grant("t:a").await.unwrap().unwrap()["tenant"],
             "t"
         );
+    }
+
+    #[tokio::test]
+    async fn rekey_rotates_the_master_password_preserving_data_version_and_kdf() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let old_pw = SecretString::from("old-master-password");
+        let new_pw = SecretString::from("new-master-password");
+
+        // Create the vault under the OLD password: a secret + a signed outbox event (its own file).
+        let storage = FileStorage::new(&path, &old_pw).await.unwrap();
+        storage.store(&test_credential("stripe")).await.unwrap();
+        storage
+            .append_event("subj", "evt", serde_json::json!({"n": 1}))
+            .await
+            .unwrap();
+        assert!(
+            path.with_file_name("outbox.enc").exists(),
+            "the append created the split outbox file"
+        );
+        // Capture the on-disk vault header BEFORE the re-key (salt/version/kdf).
+        let before: StorageFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        // Re-key to the NEW password (offline; the process would exit after this in the CLI).
+        storage.rekey(&new_pw).await.unwrap();
+        drop(storage);
+
+        // The OLD password no longer opens the vault — the key rotated.
+        assert!(
+            FileStorage::new(&path, &old_pw).await.is_err(),
+            "the old password must fail after a re-key"
+        );
+
+        // The NEW password opens it; the secret AND the outbox event survive (both re-encrypted).
+        let reopened = FileStorage::new(&path, &new_pw).await.unwrap();
+        assert!(
+            reopened.get_by_alias("stripe").await.unwrap().is_some(),
+            "the credential survives the re-key"
+        );
+        let events = reopened.list_events_after(0, 100).await.unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "the outbox event is still decryptable under the new key"
+        );
+        assert_eq!(events[0].payload["n"], 1);
+
+        // The on-disk vault header: a FRESH salt, but the SAME version + pinned KDF params (never
+        // reset/bumped — a shifted param would derive a different key and brick the vault).
+        let after: StorageFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_ne!(after.salt, before.salt, "the re-key must generate a new salt");
+        assert_eq!(
+            after.version, before.version,
+            "STORAGE_VERSION is preserved across a re-key"
+        );
+        assert_eq!(after.version, STORAGE_VERSION);
+        assert_eq!(
+            after.kdf, before.kdf,
+            "the pinned KDF params are preserved across a re-key"
+        );
+        assert_eq!(after.kdf, crate::crypto::KdfParams::default());
     }
 }

@@ -264,7 +264,7 @@ pub async fn delete_workload_grant(
         .into_response()
 }
 
-fn verify_assertion(raw: &str, secret: &[u8]) -> Result<WorkloadAssertion, String> {
+fn verify_assertion(raw: &str, secrets: &[Vec<u8>]) -> Result<WorkloadAssertion, String> {
     let raw = raw
         .strip_prefix("vwa_")
         .ok_or("expected a vwa_ verified-workload assertion")?;
@@ -272,10 +272,21 @@ fn verify_assertion(raw: &str, secret: &[u8]) -> Result<WorkloadAssertion, Strin
     let sig = URL_SAFE_NO_PAD
         .decode(signature)
         .map_err(|_| "malformed assertion signature")?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret).map_err(|_| "invalid verifier key")?;
-    mac.update(payload.as_bytes());
-    mac.verify_slice(&sig)
-        .map_err(|_| "workload assertion signature invalid")?;
+    // Dual-secret overlap (rotation): the external OIDC/SPIFFE edge SIGNS, vultrino VERIFIES. Try each
+    // configured verifier secret and accept on the first constant-time match (`verify_slice` is
+    // constant-time; a miss falls through to the next candidate). A single-element list is exactly the
+    // pre-rotation behavior; an empty list (fail-closed at `verifier_secrets`) never reaches here.
+    let verified = secrets.iter().any(|secret| {
+        Hmac::<Sha256>::new_from_slice(secret)
+            .map(|mut mac| {
+                mac.update(payload.as_bytes());
+                mac.verify_slice(&sig).is_ok()
+            })
+            .unwrap_or(false)
+    });
+    if !verified {
+        return Err("workload assertion signature invalid".into());
+    }
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| "malformed assertion payload")?;
@@ -303,18 +314,30 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .map(str::trim)
 }
 
-fn verifier_secret() -> Result<Vec<u8>, &'static str> {
+fn verifier_secrets() -> Result<Vec<Vec<u8>>, &'static str> {
     let value = match std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET_FILE") {
         Ok(path) if !path.trim().is_empty() => fs::read_to_string(path)
             .map_err(|_| "workload assertion verifier file cannot be read")?,
         _ => std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET")
             .map_err(|_| "workload assertion verifier is not configured")?,
     };
-    let secret = value.trim().as_bytes().to_vec();
-    if secret.len() < 32 {
+    // A comma-separated LIST of verifier secrets (dual-secret overlap for rotation); a single value is a
+    // 1-element list = the pre-rotation behavior. Each non-blank entry is trimmed and must be >= 32
+    // bytes. An all-blank/empty configuration yields no secrets → fail closed (never verify against no
+    // key). Element 0 is the primary; verify accepts a match against ANY listed secret.
+    let secrets: Vec<Vec<u8>> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    if secrets.is_empty() {
+        return Err("workload assertion verifier is not configured");
+    }
+    if secrets.iter().any(|s| s.len() < 32) {
         return Err("workload assertion verifier must contain at least 32 bytes");
     }
-    Ok(secret)
+    Ok(secrets)
 }
 
 pub async fn exchange_workload_token(
@@ -330,7 +353,7 @@ pub async fn exchange_workload_token(
             "workload exchange is disabled",
         );
     }
-    let secret = match verifier_secret() {
+    let secrets = match verifier_secrets() {
         Ok(v) => v,
         Err(message) => {
             return error(
@@ -342,7 +365,7 @@ pub async fn exchange_workload_token(
     };
     let assertion = match bearer(&headers)
         .ok_or_else(|| "missing Bearer assertion".to_string())
-        .and_then(|v| verify_assertion(v, &secret))
+        .and_then(|v| verify_assertion(v, &secrets))
     {
         Ok(v) => v,
         Err(e) => return error(StatusCode::UNAUTHORIZED, "invalid_workload_identity", e),
@@ -568,8 +591,25 @@ mod tests {
             payload,
             URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
         );
-        assert!(verify_assertion(&token, secret).is_ok());
-        assert!(verify_assertion(&token, b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").is_err());
+        // A one-element list is the pre-rotation behavior: the matching secret verifies, a wrong one
+        // does not.
+        assert!(verify_assertion(&token, &[secret.to_vec()]).is_ok());
+        assert!(verify_assertion(&token, &[b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_vec()]).is_err());
+        // Dual-secret overlap: the token verifies as long as its signing secret is ANYWHERE in the
+        // list (here the second, rotated-in secret), while a list of only wrong secrets still fails.
+        assert!(verify_assertion(
+            &token,
+            &[b"wrongwrongwrongwrongwrongwrongww".to_vec(), secret.to_vec()]
+        )
+        .is_ok());
+        assert!(verify_assertion(
+            &token,
+            &[
+                b"wrongwrongwrongwrongwrongwrongww".to_vec(),
+                b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_vec()
+            ]
+        )
+        .is_err());
     }
 
     #[test]

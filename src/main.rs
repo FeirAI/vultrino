@@ -210,6 +210,14 @@ enum Commands {
         force: bool,
     },
 
+    /// Re-key the vault to a new master password (offline — run with the service STOPPED).
+    ///
+    /// Decrypts the vault + its outbox with the current password (VULTRINO_PASSWORD / _FILE /
+    /// prompt) and re-encrypts both with a fresh key derived from the new password
+    /// (VULTRINO_NEW_PASSWORD / _FILE / prompt), preserving the vault version and the pinned
+    /// KDF params. Distinct from shared-HMAC secret rotation (which is a config repoint).
+    Rekey,
+
     /// Run the MCP server (for LLM integration)
     Mcp,
 
@@ -646,6 +654,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Init { force } => {
             init_config(force).await?;
         }
+        Commands::Rekey => {
+            rekey_vault(config).await?;
+        }
         Commands::Mcp => {
             run_mcp_server(config).await?;
         }
@@ -828,6 +839,93 @@ fn get_storage_password() -> Result<SecretString, Box<dyn std::error::Error>> {
     io::stderr().flush()?;
     let password = rpassword::read_password()?;
     Ok(SecretString::from(password))
+}
+
+/// Resolve the NEW vault master password for `rekey`, mirroring [`get_storage_password`]'s precedence
+/// so the offline re-key can run non-interactively in CI/agents:
+///   1. `VULTRINO_NEW_PASSWORD`      — password inline in env
+///   2. `VULTRINO_NEW_PASSWORD_FILE` — path to a file whose contents are the password
+///   3. Interactive prompt (entered twice; the two entries must match)
+///
+/// An empty new password is refused (it would leave the vault trivially unlockable).
+fn get_new_storage_password() -> Result<SecretString, Box<dyn std::error::Error>> {
+    if let Ok(password) = std::env::var("VULTRINO_NEW_PASSWORD") {
+        if password.is_empty() {
+            return Err("VULTRINO_NEW_PASSWORD is empty".into());
+        }
+        return Ok(SecretString::from(password));
+    }
+
+    if let Ok(path) = std::env::var("VULTRINO_NEW_PASSWORD_FILE") {
+        let path = std::path::PathBuf::from(path);
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("VULTRINO_NEW_PASSWORD_FILE {}: {}", path.display(), e))?;
+        let password = raw.trim_end_matches(['\n', '\r']).to_string();
+        if password.is_empty() {
+            return Err(format!("VULTRINO_NEW_PASSWORD_FILE {} is empty", path.display()).into());
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    eprintln!(
+                        "warning: {} has permissions {:o} (should be 600); this file is your new vault encryption key",
+                        path.display(),
+                        mode
+                    );
+                }
+            }
+        }
+
+        return Ok(SecretString::from(password));
+    }
+
+    eprint!("Enter NEW storage password: ");
+    io::stderr().flush()?;
+    let first = rpassword::read_password()?;
+    if first.is_empty() {
+        return Err("new storage password is empty".into());
+    }
+    eprint!("Confirm NEW storage password: ");
+    io::stderr().flush()?;
+    let second = rpassword::read_password()?;
+    if first != second {
+        return Err("new storage passwords do not match".into());
+    }
+    Ok(SecretString::from(first))
+}
+
+/// Re-key the file-backed vault to a new master password (offline, single-sided). Opens the vault with
+/// the CURRENT password (a wrong current password fails HERE, before any write), then re-encrypts the
+/// vault + outbox with a key derived from the new password. Only the `File` backend supports re-keying.
+async fn rekey_vault(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    match config.storage.backend {
+        StorageBackendType::File => {
+            let path = config
+                .storage
+                .file_path
+                .clone()
+                .unwrap_or_else(Config::default_storage_path);
+            if !path.exists() {
+                return Err(format!("no vault at {} to re-key", path.display()).into());
+            }
+            let current = get_storage_password()?;
+            let new = get_new_storage_password()?;
+            // Opening with the CURRENT password validates it (decrypt) before we touch anything.
+            let storage = FileStorage::new(&path, &current).await?;
+            storage.rekey(&new).await?;
+            println!(
+                "vault re-keyed: {} (and its outbox). Restart the service with the new password.",
+                path.display()
+            );
+            Ok(())
+        }
+        StorageBackendType::Keychain => Err("Keychain storage does not support re-keying".into()),
+        StorageBackendType::Vault => Err("Vault storage does not support re-keying".into()),
+    }
 }
 
 /// Initialize storage backend

@@ -256,6 +256,80 @@ async fn feature_disabled_is_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// A verifier configured with a COMMA-LIST of secrets (dual-secret overlap for rotation) accepts an
+/// assertion signed with EITHER the primary or the secondary — the try-each verify loop matches on the
+/// second candidate. The external edge signs; vultrino verifies. A single-element list stays exactly
+/// the pre-rotation behavior (the other tests here cover that).
+#[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
+async fn dual_secret_list_accepts_either_secret() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("VULTRINO_WORKLOAD_EXCHANGE_ENABLED", "1");
+        // PRIMARY (VERIFIER_SECRET) + SECONDARY (a different 32-byte key) as a comma-list.
+        std::env::set_var(
+            "VULTRINO_WORKLOAD_ASSERTION_SECRET",
+            format!(
+                "{},{}",
+                String::from_utf8_lossy(VERIFIER_SECRET),
+                String::from_utf8_lossy(WRONG_SECRET)
+            ),
+        );
+        std::env::remove_var("VULTRINO_WORKLOAD_ASSERTION_SECRET_FILE");
+    }
+    let (router, _storage, admin_key) = build_router().await;
+    author_grant(&router, &admin_key).await;
+
+    // Signed with the SECONDARY secret — accepted because it is now in the verifier list.
+    let assertion = mint_assertion(WRONG_SECRET, valid_claims("jti-rot-secondary"));
+    let resp = router
+        .clone()
+        .oneshot(exchange_req(&assertion))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an assertion signed with the secondary secret must be accepted"
+    );
+
+    // And the PRIMARY still verifies (fresh jti so it is not a replay).
+    let assertion2 = mint_assertion(VERIFIER_SECRET, valid_claims("jti-rot-primary"));
+    let resp2 = router.oneshot(exchange_req(&assertion2)).await.unwrap();
+    assert_eq!(
+        resp2.status(),
+        StatusCode::OK,
+        "an assertion signed with the primary secret must still be accepted"
+    );
+}
+
+/// A secret NOT in the verifier list is still rejected 401 — the list widens the accept set to exactly
+/// the configured secrets, no further (the overlap is a bounded, temporary rotation window).
+#[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
+async fn secret_outside_the_list_is_still_401() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("VULTRINO_WORKLOAD_EXCHANGE_ENABLED", "1");
+        // Only the PRIMARY is configured; WRONG_SECRET is NOT in the list.
+        std::env::set_var(
+            "VULTRINO_WORKLOAD_ASSERTION_SECRET",
+            String::from_utf8_lossy(VERIFIER_SECRET).to_string(),
+        );
+        std::env::remove_var("VULTRINO_WORKLOAD_ASSERTION_SECRET_FILE");
+    }
+    let (router, _storage, admin_key) = build_router().await;
+    author_grant(&router, &admin_key).await;
+
+    let assertion = mint_assertion(WRONG_SECRET, valid_claims("jti-not-listed"));
+    let resp = router.oneshot(exchange_req(&assertion)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// Enabled but with NO verifier secret configured, the endpoint refuses 503
 /// (`exchange_unconfigured`) — it fails closed rather than trusting assertions
 /// against a missing/short key.

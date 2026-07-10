@@ -534,6 +534,59 @@ impl OutboxStore {
         let meta = std::fs::metadata(&self.path).ok()?;
         Some((meta.modified().ok()?, meta.len()))
     }
+
+    // ---- offline vault re-key (FileStorage::rekey delegates the outbox half here) ----
+
+    /// Prepare the outbox half of an offline vault re-key: under the outbox fd-lock, decrypt the file
+    /// with the CURRENT (shared) master key and write a `.rekey.tmp` re-encrypted with `new_key`,
+    /// fsynced but NOT yet renamed. Returns the tmp path for the caller to commit (via
+    /// [`Self::rekey_commit`]) so the vault + outbox renames run back-to-back — shrinking the two-file
+    /// non-atomicity window. Returns `Ok(None)` when no outbox file exists yet (nothing to re-encrypt).
+    /// [`OUTBOX_FILE_VERSION`] is PRESERVED — a re-key rotates the key, never the format. On any error
+    /// the live outbox file is left untouched (fail-closed).
+    pub(super) fn rekey_prepare(
+        &self,
+        new_key: &MasterKey,
+    ) -> Result<Option<PathBuf>, StorageError> {
+        let mut flock = self.lock_file_exclusive()?;
+        let _guard = flock.write().map_err(StorageError::Io)?;
+        if !self.path.exists() {
+            return Ok(None); // no outbox yet → nothing to re-encrypt
+        }
+        // Decrypt with the OLD (shared) master key still held by this process.
+        let cache = self.read_from_disk()?;
+        let data =
+            serde_json::to_vec(&cache).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let encrypted = encrypt(&data, new_key)?;
+        let file = OutboxFile {
+            version: OUTBOX_FILE_VERSION, // PRESERVED — key changes, format does not
+            data: encrypted,
+        };
+        let content = serde_json::to_string_pretty(&file)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let tmp = self.path.with_extension("rekey.tmp");
+        // fsync the tmp BEFORE returning so the re-encrypted bytes are durable before the caller's
+        // rename makes them visible (same crash discipline as write_to_disk).
+        {
+            let f = create_private_file(&tmp)?;
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(f);
+            w.write_all(content.as_bytes())?;
+            w.flush()?;
+            w.into_inner()
+                .map_err(|e| StorageError::Io(e.into_error()))?
+                .sync_all()?;
+        }
+        Ok(Some(tmp))
+    }
+
+    /// Commit the outbox half of an offline vault re-key: atomically rename the `.rekey.tmp` from
+    /// [`Self::rekey_prepare`] over the live outbox file and fsync the parent directory.
+    pub(super) fn rekey_commit(&self, tmp: &Path) -> Result<(), StorageError> {
+        std::fs::rename(tmp, &self.path)?;
+        fsync_parent_dir(&self.path)?;
+        Ok(())
+    }
 }
 
 /// fsync the parent directory of `path` after an atomic rename, making the new directory entry
