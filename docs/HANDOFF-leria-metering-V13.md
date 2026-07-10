@@ -6,7 +6,8 @@ a *new* capability the metering plane (**leria**) depends on. It does **not** to
 contract.
 
 **Authoritative spec (read this — it's verified against vultrino source, with file:line):**
-[`/Users/dzcodes/Projects/feir-ai/leria/docs/_meta/vultrino-integration-handoff.md`](/Users/dzcodes/Projects/feir-ai/leria/docs/_meta/vultrino-integration-handoff.md).
+the leria repo's `docs/_meta/vultrino-integration-handoff.md` (`<workspace>/leria/docs/_meta/vultrino-integration-handoff.md`
+in a four-plane workspace checkout).
 This doc is the vultrino-team summary; that doc is the detail.
 
 ## Why

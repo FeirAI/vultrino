@@ -62,8 +62,8 @@ switch, spend caps), `src/egress.rs` (secret scrubbing), `src/config/types.rs`
 ## The four-plane end-to-end harness
 
 The capstone harness that runs Vultrino against the real sibling-plane binaries
-lives in the govder repo at `/Users/dzcodes/Projects/feir-ai/govder/e2e` (Go,
-`//go:build e2e`). It is the **authoritative reference for how `vultrino` is
+lives in the govder repo at `e2e/` (`<workspace>/govder/e2e` in a four-plane
+workspace checkout; Go, `//go:build e2e`). It is the **authoritative reference for how `vultrino` is
 actually built, configured, and run** in a realistic deployment — this dev set's
 build/run commands and the minimal config in [QUICKSTART.md](QUICKSTART.md) are
 drawn from it. It builds Vultrino with `cargo build` (debug), provisions an
@@ -73,7 +73,7 @@ isolated vault + `admin.json`, mints a `vk_` admin key via the CLI, and starts
 Run it from the govder repo:
 
 ```bash
-cd /Users/dzcodes/Projects/feir-ai/govder
+cd <workspace>/govder   # the govder checkout, sibling to this vultrino repo
 go test -tags e2e ./e2e/ -timeout 600s -v -run TestFourPlaneE2E
 ```
 

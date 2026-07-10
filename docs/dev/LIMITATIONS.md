@@ -5,9 +5,6 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 
 ## v1 limitations (real, in the code today)
 
-- **`vultrino serve` is a stub.** It loads storage + plugins, prints "server
-  running", and blocks — it does **not** serve the JSON API (the source comment is
-  `// TODO: Implement JSON API server`). Use `vultrino web` for the HTTP API.
 - **Only the file storage backend is implemented.** `[storage] backend =
   "keychain"` and `"vault"` parse but error at runtime ("not yet implemented").
   The encrypted file vault is the only working backend.

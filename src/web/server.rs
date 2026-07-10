@@ -12,7 +12,6 @@ use axum::{
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
@@ -23,6 +22,23 @@ use super::llm_proxy;
 use super::mcp_http;
 use super::routes;
 use super::workload_exchange;
+
+/// The admin console stylesheet, EMBEDDED into the binary at compile time — mirroring the
+/// compiled-in askama templates — so `/static/css/style.css` resolves regardless of the process
+/// working directory. The previous `ServeDir::new("static")` was CWD-relative, so the distroless
+/// container image (which ships no `static/` dir) and every bare-metal run started outside the
+/// repo root 404'd it and rendered the console unstyled (vultrino#19).
+const STYLE_CSS: &str = include_str!("../../static/css/style.css");
+
+/// Serve the embedded admin console stylesheet with an explicit `text/css` content type (the
+/// bare `&str` body would otherwise default to `text/plain`, which browsers ignore for a
+/// stylesheet link).
+async fn serve_style_css() -> impl axum::response::IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        STYLE_CSS,
+    )
+}
 
 /// Web server configuration
 #[derive(Debug, Clone)]
@@ -177,9 +193,6 @@ impl WebServer {
             .with_same_site(tower_sessions::cookie::SameSite::Strict)
             // Session expiry - 24 hours for admin sessions
             .with_expiry(Expiry::OnInactivity(time::Duration::hours(24)));
-
-        // Static files (CSS, JS, images)
-        let static_dir = ServeDir::new("static");
 
         // Build base router with routes
         let mut router = Router::new()
@@ -363,8 +376,13 @@ impl WebServer {
                 "/llm/{*path}",
                 post(llm_proxy::llm_proxy).layer(DefaultBodyLimit::max(LLM_MAX_BODY_BYTES)),
             )
-            // Static files
-            .nest_service("/static", static_dir);
+            // Static files — served from bytes EMBEDDED into the binary (like the askama
+            // templates), NOT a CWD-relative `ServeDir`. The canonical distroless container image
+            // ships no `static/` dir, and any bare-metal run started outside the repo root would
+            // otherwise 404 every `/static` request and render the admin console unstyled
+            // (vultrino#19). New static assets must be embedded + routed here, same as the
+            // compiled-in templates.
+            .route("/static/css/style.css", get(serve_style_css));
 
         // Add HSTS header only in secure mode (TLS or behind proxy)
         if use_secure_mode {

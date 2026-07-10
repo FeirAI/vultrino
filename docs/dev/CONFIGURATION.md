@@ -16,6 +16,8 @@ below — Vultrino prefers a loud config error to a silent misconfiguration.
 |----------|---------|---------|----------|----------|
 | `VULTRINO_PASSWORD` | every vault-touching command | — | Yes (one of these or the prompt) | The vault encryption password. First in precedence. |
 | `VULTRINO_PASSWORD_FILE` | every vault-touching command | — | — | Path to a file whose contents are the password (trailing `\n`/`\r` trimmed; empty file is an error). Warns on Unix if the file is group/world-readable (`chmod 600`). Used only if `VULTRINO_PASSWORD` is unset. |
+| `VULTRINO_NEW_PASSWORD` | `vultrino rekey` | — | — | The **new** vault master password for an offline re-key (run with the service stopped). First in precedence over `VULTRINO_NEW_PASSWORD_FILE` and the interactive double-entry prompt. Empty is refused (would leave the vault trivially unlockable). |
+| `VULTRINO_NEW_PASSWORD_FILE` | `vultrino rekey` | — | — | Path to a file whose (trimmed) contents are the new master password. Used only if `VULTRINO_NEW_PASSWORD` is unset. Warns on Unix if the file is group/world-readable. Empty file is refused. |
 | `VULTRINO_API_URL` | `vultrino request --key …` | `http://127.0.0.1:7879` | — | Base URL the CLI's `--key` mode posts `/api/v1/execute` to (connect to a running `web` server instead of opening the vault directly). |
 | `RUST_LOG` | tracing (`EnvFilter::from_default_env`) | derived from `-v` flags | — | Standard `tracing` filter. The `-v`/`-vv`/`-vvv` global CLI flags raise the base level (INFO → DEBUG → TRACE). |
 | `USER` / `LOGNAME` | `vultrino approval approve/deny` | `cli` | — | The local OS user recorded as the approver identity (`cli:<user>`) for a CLI approval decision. |
@@ -23,6 +25,7 @@ below — Vultrino prefers a loud config error to a silent misconfiguration.
 | `VULTRINO_WORKLOAD_ASSERTION_SECRET` | `web` (workload exchange) | — | Yes, when exchange is enabled | HMAC-SHA256 verifier key for inbound `vwa_` assertions. **Must be ≥32 bytes**; a shorter/absent value fails the exchange closed with `503 exchange_unconfigured`. |
 | `VULTRINO_WORKLOAD_ASSERTION_SECRET_FILE` | `web` (workload exchange) | — | — | Path to a file whose (trimmed) contents are the verifier key. Takes precedence over `VULTRINO_WORKLOAD_ASSERTION_SECRET` when set to a non-blank path; same ≥32-byte requirement. |
 | `VULTRINO_PROVIDER_OPENAI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `openai-chat` / `openai-responses` provider protocols on `POST /llm`. |
+| `VULTRINO_PROVIDER_NVIDIA_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `nvidia` protocol. NVIDIA's `integrate.api.nvidia.com` is OpenAI-wire-compatible and rides the same transparent-proxy path as `openai-chat`, but on its own switch — an operator can run NVIDIA (e.g. Nemotron) without enabling the generic OpenAI provider. Capability validation pins an `nvidia` channel's `provider_base` to an `*.nvidia.com` host. |
 | `VULTRINO_PROVIDER_AZURE_OPENAI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `azure-openai` protocol. |
 | `VULTRINO_PROVIDER_ANTHROPIC_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `anthropic-messages` protocol. |
 | `VULTRINO_PROVIDER_BEDROCK_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `bedrock-converse` / `bedrock-invoke` protocols. |
@@ -33,6 +36,7 @@ below — Vultrino prefers a loud config error to a silent misconfiguration.
 | `GOVDER_BASE_URL` | `web` (govder delegate-decision client) | — | Yes, to enable delegate approvals | Base URL of the govder decide-plane. Read at startup (`GovderConfig::from_env`), **not** a `config.toml` key. Unset (or blank) → `state.govder` is `None` and `POST /api/v1/approvals/{id}/delegate-decision` fails closed with `503 govder_not_configured`. |
 | `GOVDER_TENANT_ASSERTION_SECRET` | `web` (govder delegate-decision client) | — | Yes, to enable delegate approvals | HMAC key vultrino signs the outbound `X-Govder-Tenant-Assertion` with on every govder call. Unset (or blank) → same fail-closed `503 govder_not_configured` as a missing `GOVDER_BASE_URL`. |
 | `GOVDER_ASSERTION_TTL_SECS` | `web` (govder delegate-decision client) | `90` | — | TTL of the outbound tenant assertion. A non-positive or unparseable value falls back to the default. |
+| `VULTRINO_POLICY_HASH_SECRET` | `web` (policy inventory / create / replace) | unset | — | Server-held key for the policy `content_hash` (D2): the hash emitted is **HMAC-SHA256(secret, canonical-policy-bytes)**, not a bare digest, so a compromised read-only key cannot brute-force the reduced DTO back into the full enforcement topology offline. Sourced from the environment at startup, never parsed from `config.toml` (so a config dump never carries it). **Must be stable across restarts** — a per-process random salt would make every authored hash mismatch on restart, a false drift signal to govder. Unset/blank ⇒ `content_hash` is emitted **empty** (no oracle; govder skips drift detection on an empty hash) — never falls back to a bare unkeyed digest. |
 
 > **Provider protocol gate is default-deny (fail-closed).** Each `VULTRINO_PROVIDER_*_ENABLED`
 > switch accepts `1`/`true` to turn its family on; anything else (including any
@@ -56,7 +60,7 @@ mode = "local"            # "local" | "server"
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `bind` | `127.0.0.1:7878` | Used by `serve`. **`vultrino web` defaults to `127.0.0.1:7879`** and `mcp` is stdio; the `--bind` flag overrides. |
+| `bind` | `127.0.0.1:7878` | **Parsed but not wired to any run mode.** `vultrino web` binds its own `--bind` CLI flag (default `127.0.0.1:7879`), not this key; `mcp` is stdio; bare `vultrino serve` (no `--mcp`) refuses to start rather than binding anything (see [ARCHITECTURE.md](ARCHITECTURE.md)). Set `--bind` on `vultrino web` directly to change its listen address. |
 | `mode` | `local` | `server` sets `require_auth = true` on the PEP (JSON API auth is always enforced regardless; `mode` controls the in-process default). Any value other than `"server"` parses as `local`. |
 | `[server.tls]` | none | `cert_path` + `key_path`. Parsed into config; TLS termination is expected at the edge (see [SECURITY.md](SECURITY.md)). |
 

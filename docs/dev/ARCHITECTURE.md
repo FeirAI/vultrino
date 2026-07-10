@@ -14,12 +14,12 @@ that *run a process* are:
 |------------|--------------|-----------------------|
 | `vultrino web` | `127.0.0.1:7879` | The **HTTP server**: admin panel (HTML) **and** the JSON API under `/api/v1/`. This is the process that serves `/api/v1/execute`, the admin/kill/policy surface, and the signed-outbox replay endpoints. It also runs the background outbox-delivery, policy-refresh, and approval-sweep loops. |
 | `vultrino mcp` (or `vultrino serve --mcp`) | n/a (stdio) | The **MCP server** for LLM tool integration over stdio. Also runs the policy-refresh, approval-sweep, and outbox-delivery loops. |
-| `vultrino serve` | `127.0.0.1:7878` | **Stub.** `run_server` in `src/main.rs` loads storage + plugins, prints "server running", and blocks on Ctrl-C. The inline comment is `// TODO: Implement JSON API server`. **It does not serve the JSON API.** Use `vultrino web` for the API. |
+| `vultrino serve` (bare, no `--mcp`) | n/a | **Refuses to start.** The former fail-open stub (`run_server` printed "server running" and bound nothing — a footgun: an operator could point agents at a port that silently refused everything) was removed. Bare `serve` now exits immediately with an error naming `serve --mcp` (MCP stdio) and `vultrino web` (JSON API) as the real surfaces; `--bind` is rejected as inapplicable outside `web`. |
 
 > **Accuracy note.** Older guide docs (`docs/src/components/proxy.md`,
 > `docs/src/api/http.md`) describe a header-driven proxy on port 7878 served by
 > `vultrino serve` and a `GET /api/v1/credentials/{alias}` route. Those do not
-> match the current code: `serve` is the stub above, and the JSON API is served
+> match the current code: bare `serve` now errors loudly (row above) instead of stubbing, and the JSON API is served
 > by `vultrino web` on 7879 (routes in `src/web/server.rs::build_router`). This
 > dev set documents the shipped routes — see [API.md](API.md).
 

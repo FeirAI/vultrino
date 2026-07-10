@@ -194,10 +194,11 @@ every turn with `[llm_proxy] streaming_enabled = false`. See
   (an unsigned/undeliverable outbox is rejected).
 - A halt label must be a literal id (no glob), so a halt can't deny a fleet.
 - The metered LLM proxy's provider-protocol gate is **default-deny**: each of the
-  six provider families requires its explicit `VULTRINO_PROVIDER_*_ENABLED` switch,
-  and any unmapped protocol — including the validated `observed-only` telemetry
-  protocol — fails closed, so no credential-injected proxy traffic flows for a
-  protocol an operator hasn't turned on.
+  seven provider families (openai, nvidia, azure-openai, anthropic-messages,
+  bedrock, gemini, vertex-ai) requires its explicit `VULTRINO_PROVIDER_*_ENABLED`
+  switch, and any unmapped protocol — including the validated `observed-only`
+  telemetry protocol — fails closed, so no credential-injected proxy traffic
+  flows for a protocol an operator hasn't turned on.
 - A browser-originated MCP request's `Origin` must match the request `Host` or an
   entry in `VULTRINO_MCP_ALLOWED_ORIGINS`, else the MCP transport rejects it (`403`).
 
