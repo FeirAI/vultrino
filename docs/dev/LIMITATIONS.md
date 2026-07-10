@@ -121,3 +121,14 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 - Keychain and HashiCorp Vault storage backends.
 - Outbox push fan-out (today a single push subscriber; additional consumers poll).
 - A transactional storage layer for exactly-once idempotency.
+
+## Rate-limit windows are per-process and per-replica (vultrino#6)
+
+RateLimit rule state (the fixed-window counter) is in-memory and per-process: it resets on restart and
+does NOT coordinate across HA replicas, so a rate cap of N/window effectively becomes N*(replica count)
+across a horizontally-scaled deployment. RateLimit is a coarse abuse/burst guard, NOT a hard financial
+ceiling. For a hard global cap either run vultrino single-replica, front it with a shared external
+rate limiter, or rely on the per-agent BUDGET (leria/govder, which IS global and durable) as the
+authoritative spend boundary. (Item-6 vultrino#10 fixed the separate bug where layered/per-principal
+rules shared ONE counter — they are now keyed per (rule, alias, principal); this bound is the
+remaining per-replica multiplication, which is inherent to in-process counters.)
