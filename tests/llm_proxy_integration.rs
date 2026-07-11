@@ -842,7 +842,10 @@ async fn llm_non_streamed_injects_key_returns_body_meters_tokens_and_scrubs() {
         std::fs::write(&artifact_path, &canonical_bytes)
             .unwrap_or_else(|e| panic!("write V13B_ARTIFACT_PATH={artifact_path}: {e}"));
     }
-    let golden_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/v13b_meter_tokens.json");
+    let golden_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/golden/v13b_meter_tokens.json"
+    );
     let golden_bytes = std::fs::read(golden_path)
         .unwrap_or_else(|e| panic!("read committed golden {golden_path}: {e}"));
     let golden: serde_json::Value =

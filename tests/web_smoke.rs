@@ -475,7 +475,9 @@ async fn test_ready_endpoint_reports_not_ready_on_broken_storage() {
     assert_eq!(body["status"], "not_ready");
     let failing = body["failing_components"].as_array().unwrap();
     assert!(
-        failing.iter().any(|c| c.as_str().unwrap().starts_with("storage")),
+        failing
+            .iter()
+            .any(|c| c.as_str().unwrap().starts_with("storage")),
         "expected a storage failure named in failing_components, got {failing:?}"
     );
 }
@@ -978,7 +980,8 @@ async fn test_admin_crud_emits_audit_events() {
     assert_eq!(created.payload["target_id"], cred_id);
     assert_eq!(created.payload["verb"], "created");
     assert!(
-        created.payload["actor"].is_string() && !created.payload["actor"].as_str().unwrap().is_empty(),
+        created.payload["actor"].is_string()
+            && !created.payload["actor"].as_str().unwrap().is_empty(),
         "actor is the acting admin key id, not empty/absent"
     );
     // Ids-only payload (item 4 / #17's contract): exactly {actor, target_id,
@@ -1010,10 +1013,11 @@ async fn test_admin_crud_emits_audit_events() {
     assert_eq!(r.status(), StatusCode::OK);
     let events = storage.list_events_after(0, 1000).await.unwrap();
     assert!(
-        events.iter().any(|e| e.event_type
-            == vultrino::outbox::EVENT_CREDENTIAL_DELETED
-            && e.subject == cred_id
-            && e.payload["verb"] == "deleted"),
+        events.iter().any(
+            |e| e.event_type == vultrino::outbox::EVENT_CREDENTIAL_DELETED
+                && e.subject == cred_id
+                && e.payload["verb"] == "deleted"
+        ),
         "credential.deleted emitted on successful delete"
     );
 
@@ -1031,9 +1035,11 @@ async fn test_admin_crud_emits_audit_events() {
     assert_eq!(r.status(), StatusCode::CREATED);
     let events = storage.list_events_after(0, 1000).await.unwrap();
     assert!(
-        events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_ROLE_CHANGED
-            && e.subject == "audit-role"
-            && e.payload["verb"] == "created"),
+        events
+            .iter()
+            .any(|e| e.event_type == vultrino::outbox::EVENT_ROLE_CHANGED
+                && e.subject == "audit-role"
+                && e.payload["verb"] == "created"),
         "role.changed(created) emitted on successful role create"
     );
 
@@ -1053,9 +1059,11 @@ async fn test_admin_crud_emits_audit_events() {
     let token_id = tok["metadata"]["id"].as_str().unwrap().to_string();
     let events = storage.list_events_after(0, 1000).await.unwrap();
     assert!(
-        events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_TOKEN_CHANGED
-            && e.subject == token_id
-            && e.payload["verb"] == "created"),
+        events
+            .iter()
+            .any(|e| e.event_type == vultrino::outbox::EVENT_TOKEN_CHANGED
+                && e.subject == token_id
+                && e.payload["verb"] == "created"),
         "token.changed(created) emitted on successful token mint"
     );
 
@@ -1071,9 +1079,11 @@ async fn test_admin_crud_emits_audit_events() {
     assert_eq!(r.status(), StatusCode::OK);
     let events = storage.list_events_after(0, 1000).await.unwrap();
     assert!(
-        events.iter().any(|e| e.event_type == vultrino::outbox::EVENT_TOKEN_CHANGED
-            && e.subject == token_id
-            && e.payload["verb"] == "revoked"),
+        events
+            .iter()
+            .any(|e| e.event_type == vultrino::outbox::EVENT_TOKEN_CHANGED
+                && e.subject == token_id
+                && e.payload["verb"] == "revoked"),
         "token.changed(revoked) emitted on successful token revoke"
     );
 }
@@ -1998,10 +2008,7 @@ async fn test_admin_metrics_reflects_outbox_delivery_counters() {
     // metrics handler, not two independent copies.
     let (router, storage, exec_server, key) = build_admin_router().await;
 
-    let app = axum::Router::new().route(
-        "/hook",
-        axum::routing::post(|| async { StatusCode::OK }),
-    );
+    let app = axum::Router::new().route("/hook", axum::routing::post(|| async { StatusCode::OK }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -2415,7 +2422,10 @@ async fn test_admin_cross_tenant_denied_for_tenant_key() {
     let b_token = store_tenant_use_token(&storage, "b-tok", "ep_team_b", Some("team-b")).await;
     let a_token = store_tenant_use_token(&storage, "a-tok", "ep_team_a", Some("team-a")).await;
     storage
-        .store_policy(&vultrino::policy::Policy::kill_switch("kill-b", "ep_team_b"))
+        .store_policy(&vultrino::policy::Policy::kill_switch(
+            "kill-b",
+            "ep_team_b",
+        ))
         .await
         .unwrap();
 
@@ -2554,7 +2564,10 @@ async fn test_admin_global_key_unrestricted_across_tenants() {
 
     let b_token = store_tenant_use_token(&storage, "b-tok", "ep_team_b", Some("team-b")).await;
     storage
-        .store_policy(&vultrino::policy::Policy::kill_switch("kill-b", "ep_team_b"))
+        .store_policy(&vultrino::policy::Policy::kill_switch(
+            "kill-b",
+            "ep_team_b",
+        ))
         .await
         .unwrap();
 
@@ -4257,10 +4270,7 @@ async fn test_admin_list_tokens_is_non_secret() {
 /// Store a minimal `vap_` approval token directly in storage (bypassing the
 /// `POST /api/v1/approval-tokens` mint route, which itself requires govder —
 /// these tests need a *usable* token while govder is absent/unreachable).
-async fn store_delegate_token(
-    storage: &Arc<dyn StorageBackend>,
-    tenant: Option<&str>,
-) -> String {
+async fn store_delegate_token(storage: &Arc<dyn StorageBackend>, tenant: Option<&str>) -> String {
     let (plaintext, token) = ApprovalToken::create(NewApprovalToken {
         delegation_grant_ref: "grant_test_001".to_string(),
         grant_scope: DelegationGrantScope::default(),
@@ -4347,12 +4357,13 @@ async fn test_delegate_decide_503s_when_govder_not_configured() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/v1/approvals/{}/delegate-decision", approval.id))
+                .uri(format!(
+                    "/api/v1/approvals/{}/delegate-decision",
+                    approval.id
+                ))
                 .header("authorization", format!("Bearer {}", vap_secret))
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({"approve": true}).to_string(),
-                ))
+                .body(Body::from(serde_json::json!({"approve": true}).to_string()))
                 .unwrap(),
         )
         .await
@@ -4388,12 +4399,13 @@ async fn test_delegate_decide_503s_when_govder_unreachable() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/v1/approvals/{}/delegate-decision", approval.id))
+                .uri(format!(
+                    "/api/v1/approvals/{}/delegate-decision",
+                    approval.id
+                ))
                 .header("authorization", format!("Bearer {}", vap_secret))
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({"approve": true}).to_string(),
-                ))
+                .body(Body::from(serde_json::json!({"approve": true}).to_string()))
                 .unwrap(),
         )
         .await
@@ -4401,4 +4413,344 @@ async fn test_delegate_decide_503s_when_govder_unreachable() {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["code"], "govder_unavailable");
+}
+
+// -------- Tenant enforcement-mode read (shadow onboarding phase A) --------
+
+/// Like [`build_tenant_admin_router`] but with tenant modes configured, so the
+/// tenant-mode read endpoint has real Observe/Enforce entries to report.
+async fn build_tenant_admin_router_with_modes(
+    tenant: &str,
+    config: Config,
+) -> (axum::Router, String) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let seed = AuthManager::new();
+    let (admin_key_plain, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some(tenant.to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        config,
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+    (router, admin_key_plain)
+}
+
+fn observe_config(tenant: &str) -> Config {
+    let mut cfg = Config::default();
+    cfg.tenants
+        .insert(tenant.to_string(), vultrino::config::TenantMode::Observe);
+    cfg.tenants.insert(
+        "team-enforce".to_string(),
+        vultrino::config::TenantMode::Enforce,
+    );
+    cfg
+}
+
+#[tokio::test]
+async fn test_tenant_mode_observe_for_own_tenant() {
+    let (router, key) =
+        build_tenant_admin_router_with_modes("team-a", observe_config("team-a")).await;
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/tenant-mode",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["tenant"], "team-a");
+    assert_eq!(body["mode"], "observe");
+    assert_eq!(body["source"], "startup-config");
+    assert!(body["loaded_at"].as_str().unwrap().contains('T'));
+    // Exactly the four contract fields — never a config dump.
+    assert_eq!(body.as_object().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn test_tenant_mode_explicit_and_default_enforce() {
+    // Explicit Enforce entry, read by a global (untenanted) admin key.
+    let (router, _storage, _srv, key) = build_admin_router().await;
+    // build_admin_router uses Config::default() (no tenants) — every tenant
+    // defaults to enforce, including unlisted ones.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/tenant-mode?tenant=unlisted-team",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["tenant"], "unlisted-team");
+    assert_eq!(body["mode"], "enforce"); // fail-closed default
+
+    // A global key must NAME the tenant.
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/tenant-mode",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_tenant_mode_requires_auth() {
+    let (router, _) = build_router().await;
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/tenant-mode?tenant=team-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_tenant_mode_cross_tenant_denied() {
+    let (router, key) =
+        build_tenant_admin_router_with_modes("team-a", observe_config("team-a")).await;
+    // A team-a key asking about team-enforce is flatly denied.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/tenant-mode?tenant=team-enforce",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // Naming its OWN tenant explicitly is fine.
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/tenant-mode?tenant=team-a",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_tenant_mode_rejects_bad_tenant_ids() {
+    let (router, _storage, _srv, key) = build_admin_router().await;
+    for bad in ["team%20a!", "a/b", "x%00y"] {
+        let resp = router
+            .clone()
+            .oneshot(admin_req(
+                "GET",
+                &format!("/api/v1/tenant-mode?tenant={}", bad),
+                &key,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "tenant id {:?}",
+            bad
+        );
+    }
+}
+
+// -------- Would-deny reports (shadow onboarding phase B) --------
+
+/// Seed observe-mode denial events for two tenants plus an unrelated event, then
+/// assert the tenant-scoped read returns ONLY the caller's redacted reports.
+#[tokio::test]
+async fn test_would_deny_reports_tenant_filtered_and_redacted() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    // Tenant-scoped key for team-a.
+    let seed = AuthManager::new();
+    let (key, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some("team-a".to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    // Two would-deny events for team-a, one for team-b, one unrelated event.
+    for (tenant, action) in [
+        ("team-a", "db.write"),
+        ("team-a", "email.send"),
+        ("team-b", "money.payout"),
+    ] {
+        storage
+            .append_event(
+                "obs",
+                "policy.observed_denial",
+                serde_json::json!({
+                    "tenant": tenant,
+                    "credential": "super-secret-alias",
+                    "action": action,
+                    "reason": "policy denies this action",
+                    "would_have": "deny",
+                    "outcome": "allowed_observe_mode",
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    storage
+        .append_event(
+            "appr_1",
+            "approval.approved",
+            serde_json::json!({"tenant": "team-a"}),
+        )
+        .await
+        .unwrap();
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        Config::default(),
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/would-deny-reports",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = body_string(resp).await;
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(body["tenant"], "team-a");
+    let reports = body["reports"].as_array().unwrap();
+    assert_eq!(reports.len(), 2, "only team-a's would-deny events: {}", raw);
+    assert_eq!(reports[0]["action"], "db.write");
+    assert_eq!(reports[1]["action"], "email.send");
+    // Redaction: the credential alias and other tenants never cross the wire.
+    assert!(
+        !raw.contains("super-secret-alias"),
+        "credential alias leaked"
+    );
+    assert!(!raw.contains("team-b"), "another tenant's data leaked");
+    assert!(
+        !raw.contains("money.payout"),
+        "another tenant's action leaked"
+    );
+    // Bounded-retention metadata + cursor are present.
+    assert!(body["retention_secs"].as_u64().unwrap() > 0);
+    assert!(body["next_after"].as_u64().unwrap() >= 4);
+    assert_eq!(body["truncated"], false);
+
+    // Cursor replay: after the last sequence there is nothing new.
+    let next = body["next_after"].as_u64().unwrap();
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "GET",
+            &format!("/api/v1/would-deny-reports?after={}", next),
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["reports"].as_array().unwrap().len(), 0);
+
+    // Cross-tenant request is flatly denied.
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/would-deny-reports?tenant=team-b",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_would_deny_reports_requires_auth_and_tenant() {
+    let (router, _) = build_router().await;
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/would-deny-reports")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // A global key must name the tenant.
+    let (router, _storage, _srv, key) = build_admin_router().await;
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/would-deny-reports",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

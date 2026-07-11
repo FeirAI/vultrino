@@ -970,11 +970,7 @@ impl VultrinoServer {
             // capability declares no `approval_preview` spec (unchanged fallback
             // to `summary`).
             let preview = self
-                .approval_preview_for_action(
-                    &full_action,
-                    action_label.as_deref(),
-                    &request.params,
-                )
+                .approval_preview_for_action(&full_action, action_label.as_deref(), &request.params)
                 .await;
             let (mut approval, decision_token) = ApprovalRequest::open(NewApproval {
                 credential: credential.alias.clone(),
@@ -1878,7 +1874,12 @@ impl VultrinoServer {
                 // Using the canonical action here would fall through to default-deny for
                 // every label-mapped action after approval. Dispatch still uses the
                 // canonical `approval.action` (parse_action above).
-                action: Some(approval.action_label.as_deref().unwrap_or(approval.action.as_str())),
+                action: Some(
+                    approval
+                        .action_label
+                        .as_deref()
+                        .unwrap_or(approval.action.as_str()),
+                ),
                 principal: principal.as_ref(),
                 spend: None,
             })

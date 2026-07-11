@@ -21,6 +21,29 @@ The flow is designed so the agent clearly understands it is *waiting*, not faili
 
 Execution happens lazily on that poll, so no background worker is required and the result is delivered the moment the agent next checks.
 
+## Action detail — what the approver sees (`approval_preview`)
+
+A human should approve on the *substance* of an action, not just its verb: **who** the money goes to and **why**, or the **actual message** and its **recipient** — not merely "send a payout" or "send a message". Each capability declares which of its call params are worth showing, with an `approval_preview` spec. Vultrino extracts those field **values** at approval-open (from the exact params that will execute) and surfaces them on the approval; the operator console and the feir-os Approvals inbox render them under **"Requested action details."**
+
+Declare it per capability (in the capability upsert, or in feir-os `deploy/connectors/capabilities.yaml`, which govder carries here verbatim):
+
+```yaml
+approval_preview:
+  title: Payout                                 # heading for the detail block
+  fields:
+    - { label: "To",     path: body.to }        # inline value (default)
+    - { label: "Amount", path: body.amount }
+    - { label: "Memo",   path: body.memo, format: text }   # wrapped block (a body)
+```
+
+- **`path`** is a dot-path into the tool's call params — `body.to` reads `params["body"]["to"]`. Only scalar leaves (string / number / bool) are shown; objects, arrays, and missing keys are skipped, and arrays are never indexed into.
+- **`format`** is `text` for a wrapped block (a message body, a reason) or omitted / `inline` for a one-line value. Fields render in the order listed.
+- Omit the block entirely and the approval falls back to its one-line summary — no change from today.
+
+**What is and isn't exposed.** The preview carries **only the declared field values** — never the raw `params` blob, and never the credential (the machine `GET /api/v1/approvals` JSON deliberately withholds `params`; only the operator HTML console dumps the full blob). Field values are **agent-authored and untrusted** — an agent controls what ends up in a message body — so every consumer escapes them and keeps them visually distinct from the trusted risk / spend / identity facts. Only name paths to fields that are safe to show a human; **never** point a path at a secret, token, or `api_key`. When in doubt, show less — the operator can always open the full record.
+
+No code changes are needed to give a new action type its detail view: declaring the fields is the whole job. See `PreviewFieldSpec` / `extract_preview` in `src/capability/mod.rs`.
+
 ## Configuration
 
 Enable approvals and configure out-of-band notifiers under `[approvals]` in `config.toml`:

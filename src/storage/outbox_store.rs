@@ -871,8 +871,8 @@ mod tests {
             .await
             .unwrap(); // seq 2, dedup d2
         let s3 = s.append("C", "t", serde_json::json!({})).await.unwrap(); // seq 3, no dedup
-        // Deliver all three so age-based pruning is eligible (undelivered are never pruned, #4); the
-        // protected-dedup stop is orthogonal to delivery state.
+                                                                           // Deliver all three so age-based pruning is eligible (undelivered are never pruned, #4); the
+                                                                           // protected-dedup stop is orthogonal to delivery state.
         s.record_delivery(s1, true, None, 8).await.unwrap();
         s.record_delivery(s2, true, None, 8).await.unwrap();
         s.record_delivery(s3, true, None, 8).await.unwrap();
@@ -915,9 +915,12 @@ mod tests {
         let s3 = s.append("C", "t", serde_json::json!({})).await.unwrap(); // seq 3
         s.record_delivery(s1, true, None, 8).await.unwrap(); // seq 1 delivered
         s.record_delivery(s3, true, None, 8).await.unwrap(); // seq 3 delivered
-        // retention 0 would prune all by age, but the prune stops below the undelivered seq 2.
+                                                             // retention 0 would prune all by age, but the prune stops below the undelivered seq 2.
         let pruned = s.gc(0, &HashSet::new()).await.unwrap();
-        assert_eq!(pruned, 1, "only the delivered head (seq 1) prunes; seq 2 blocks the rest");
+        assert_eq!(
+            pruned, 1,
+            "only the delivered head (seq 1) prunes; seq 2 blocks the rest"
+        );
         let remaining: Vec<u64> = s
             .list_after(0, 100)
             .await
@@ -946,7 +949,10 @@ mod tests {
             .unwrap(); // max_attempts=1 → dead-lettered
         assert_eq!(s.list_dead_letter(10).await.unwrap().len(), 1);
         let pruned = s.gc(0, &HashSet::new()).await.unwrap();
-        assert_eq!(pruned, 1, "the delivered head prunes; the dead-lettered event is kept");
+        assert_eq!(
+            pruned, 1,
+            "the delivered head prunes; the dead-lettered event is kept"
+        );
         let remaining: Vec<u64> = s
             .list_after(0, 100)
             .await

@@ -117,7 +117,12 @@ struct RateLimitState {
 /// credential still shares one counter — the correct behavior when there is no
 /// principal to isolate. The unit separator (`\x1f`) can't appear in an alias or
 /// principal id, so the parts can't be confused.
-fn rate_limit_key(credential_alias: &str, principal_id: Option<&str>, max: u32, window_secs: u64) -> String {
+fn rate_limit_key(
+    credential_alias: &str,
+    principal_id: Option<&str>,
+    max: u32,
+    window_secs: u64,
+) -> String {
     format!(
         "{}\x1f{}\x1f{}\x1f{}",
         credential_alias,
@@ -565,7 +570,12 @@ impl PolicyEngine {
         let window = Duration::from_secs(window_secs);
 
         let state = limits
-            .entry(rate_limit_key(credential_alias, principal_id, max, window_secs))
+            .entry(rate_limit_key(
+                credential_alias,
+                principal_id,
+                max,
+                window_secs,
+            ))
             .or_insert_with(|| RateLimitState {
                 count: 0,
                 window_start: now,
@@ -1613,7 +1623,12 @@ mod tests {
 
         // Overnight DENY must fire.
         let engine = PolicyEngine::new();
-        engine.add_policy(tw_policy(start, end, PolicyAction::Deny, PolicyAction::Allow));
+        engine.add_policy(tw_policy(
+            start,
+            end,
+            PolicyAction::Deny,
+            PolicyAction::Allow,
+        ));
         assert!(
             matches!(
                 engine.evaluate("c", None, None, &make_context()),
@@ -1624,7 +1639,12 @@ mod tests {
 
         // Overnight ALLOW must admit (otherwise default-deny).
         let engine = PolicyEngine::new();
-        engine.add_policy(tw_policy(start, end, PolicyAction::Allow, PolicyAction::Deny));
+        engine.add_policy(tw_policy(
+            start,
+            end,
+            PolicyAction::Allow,
+            PolicyAction::Deny,
+        ));
         assert_eq!(
             engine.evaluate("c", None, None, &make_context()),
             PolicyDecision::Allow,
@@ -1636,7 +1656,12 @@ mod tests {
         let (gstart, gend) = (secs(s + 100), secs(s - 100));
         assert!(gstart > gend);
         let engine = PolicyEngine::new();
-        engine.add_policy(tw_policy(gstart, gend, PolicyAction::Allow, PolicyAction::Deny));
+        engine.add_policy(tw_policy(
+            gstart,
+            gend,
+            PolicyAction::Allow,
+            PolicyAction::Deny,
+        ));
         assert!(
             matches!(
                 engine.evaluate("c", None, None, &make_context()),

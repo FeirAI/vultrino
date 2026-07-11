@@ -203,8 +203,10 @@ pub async fn delete_workload_grant(
     // Tenant partition (#0): a tenant-scoped admin key may deprovision only its OWN
     // tenant's grant — never another tenant's (which would delete that tenant's
     // grant AND revoke its bound tokens, a cross-tenant DoS). Operator: unrestricted.
-    if !crate::approval::tenant_may_act(admin.0.api_key.tenant.as_deref(), Some(query.tenant.as_str()))
-    {
+    if !crate::approval::tenant_may_act(
+        admin.0.api_key.tenant.as_deref(),
+        Some(query.tenant.as_str()),
+    ) {
         return error(
             StatusCode::FORBIDDEN,
             "cross_tenant_denied",
@@ -599,7 +601,10 @@ mod tests {
         // list (here the second, rotated-in secret), while a list of only wrong secrets still fails.
         assert!(verify_assertion(
             &token,
-            &[b"wrongwrongwrongwrongwrongwrongww".to_vec(), secret.to_vec()]
+            &[
+                b"wrongwrongwrongwrongwrongwrongww".to_vec(),
+                secret.to_vec()
+            ]
         )
         .is_ok());
         assert!(verify_assertion(

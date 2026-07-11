@@ -632,7 +632,10 @@ async fn require_global_admin(admin: &AdminApiAuth) -> Result<(), Response> {
 /// operator key (`acting == None`) is unrestricted. Returns 403 — the client
 /// supplied the tenant, so there is no existence to enumerate.
 // `async` for the clippy `result_large_err` reason noted above.
-async fn require_tenant_create(acting: Option<&str>, requested: Option<&str>) -> Result<(), Response> {
+async fn require_tenant_create(
+    acting: Option<&str>,
+    requested: Option<&str>,
+) -> Result<(), Response> {
     match (acting, requested) {
         (None, _) | (Some(_), None) => Ok(()),
         (Some(a), Some(r)) if a == r => Ok(()),
@@ -2123,7 +2126,11 @@ pub async fn api_revoke_token(
     // an untenanted/shared) token; a cross-tenant id is 404 (no oracle), re-checked
     // under the storage lock. An operator key (tenant None) is unrestricted.
     let acting = admin.0.api_key.tenant.as_deref();
-    match state.storage.set_use_token_revoked_scoped(&id, acting).await {
+    match state
+        .storage
+        .set_use_token_revoked_scoped(&id, acting)
+        .await
+    {
         Ok(token) => {
             // Admin audit (item 4 / #17): best-effort, ids-only — never fails the revoke.
             state
@@ -2816,6 +2823,189 @@ pub async fn api_list_sessions(_admin: AdminApiAuth, State(state): State<AppStat
         .into_response()
 }
 
+// -------- Tenant enforcement-mode read (shadow onboarding phase A) --------
+
+/// Query shape for [`api_tenant_mode`].
+#[derive(Deserialize)]
+pub struct TenantModeQuery {
+    pub tenant: Option<String>,
+}
+
+/// `GET /api/v1/tenant-mode` — the authoritative per-tenant enforcement-mode
+/// READ (feir-os plan 077 / shadow-onboarding phase A). Admin-gated: a
+/// tenant-scoped key reads its OWN tenant's mode (an explicit `?tenant=` must
+/// match it); a global key must name the tenant. Returns exactly
+/// `{tenant, mode, source, loaded_at}` — never a config dump — and mirrors
+/// [`Config::tenant_mode`] exactly: unlisted tenants and typos default to
+/// `enforce` (fail-closed), so a read can never claim observe-mode by accident.
+/// There is deliberately NO write counterpart: tenant modes come from the
+/// startup TOML, and runtime mutation stays out of scope until a durable,
+/// restart-safe, audited mode store exists.
+pub async fn api_tenant_mode(
+    admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Query(q): Query<TenantModeQuery>,
+) -> Response {
+    let acting = admin.0.api_key.tenant.as_deref();
+    let requested = q.tenant.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let tenant = match (acting, requested) {
+        // A tenant-scoped key reads its own tenant; naming it explicitly is
+        // allowed only when it matches. Cross-tenant reads are flatly denied —
+        // the error reveals nothing about the other tenant's existence or mode.
+        (Some(own), None) => own,
+        (Some(own), Some(req)) if req == own => own,
+        (Some(_), Some(_)) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "cross_tenant_denied",
+                "A tenant-scoped admin key may only read its own tenant's mode.",
+            )
+        }
+        (None, Some(req)) => req,
+        (None, None) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "tenant_required",
+                "Name the tenant to read: ?tenant=<id>.",
+            )
+        }
+    };
+    // Tenant ids are short config identifiers — reject anything else before it
+    // reaches logs or the response.
+    if tenant.is_empty()
+        || tenant.len() > 128
+        || !tenant
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant",
+            "Tenant ids are short identifiers: letters, digits, '-', '_', '.'.",
+        );
+    }
+    let mode = match state.config.tenant_mode(Some(tenant)) {
+        crate::config::TenantMode::Enforce => "enforce",
+        crate::config::TenantMode::Observe => "observe",
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "tenant": tenant,
+            "mode": mode,
+            "source": "startup-config",
+            "loaded_at": state.config_loaded_at.to_rfc3339(),
+        })),
+    )
+        .into_response()
+}
+
+// -------- Would-deny reports (shadow onboarding phase B) --------
+
+/// Query shape for [`api_would_deny_reports`].
+#[derive(Deserialize)]
+pub struct WouldDenyQuery {
+    pub tenant: Option<String>,
+    /// Replay cursor: return reports with `sequence > after` (default 0).
+    pub after: Option<u64>,
+}
+
+/// How many raw outbox events one request scans (a single storage page) and
+/// how many redacted reports it returns at most. Consumers page via
+/// `next_after`; `truncated` says a full page was scanned so more may exist.
+const WOULD_DENY_SCAN_LIMIT: usize = 1000;
+const WOULD_DENY_REPORT_CAP: usize = 200;
+
+/// `GET /api/v1/would-deny-reports` — tenant-scoped read of observe-mode
+/// would-deny events (feir-os plan 077 / shadow-onboarding phase B). Key rules
+/// mirror [`api_tenant_mode`]: a tenant-scoped key reads its OWN tenant's
+/// reports; a global key must name the tenant. Rows are REDACTED at the source:
+/// only `sequence`, `created_at`, `action`, and `reason` cross the wire — the
+/// credential alias and raw payload never leave vultrino, and another tenant's
+/// events are filtered out here rather than trusting any downstream filter.
+/// The signed outbox prunes delivered events past `outbox.retention_secs`, so
+/// the response carries that bound — a consumer must present totals as
+/// "over the retention window", never as all-time.
+pub async fn api_would_deny_reports(
+    admin: AdminApiAuth,
+    State(state): State<AppState>,
+    Query(q): Query<WouldDenyQuery>,
+) -> Response {
+    let acting = admin.0.api_key.tenant.as_deref();
+    let requested = q.tenant.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let tenant = match (acting, requested) {
+        (Some(own), None) => own,
+        (Some(own), Some(req)) if req == own => own,
+        (Some(_), Some(_)) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "cross_tenant_denied",
+                "A tenant-scoped admin key may only read its own tenant's reports.",
+            )
+        }
+        (None, Some(req)) => req,
+        (None, None) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "tenant_required",
+                "Name the tenant to read: ?tenant=<id>.",
+            )
+        }
+    };
+    let after = q.after.unwrap_or(0);
+    let events = match state
+        .storage
+        .list_events_after(after, WOULD_DENY_SCAN_LIMIT)
+        .await
+    {
+        Ok(events) => events,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                &format!("Failed to read events: {}", e),
+            )
+        }
+    };
+    let scanned_full_page = events.len() >= WOULD_DENY_SCAN_LIMIT;
+    let next_after = events.last().map(|e| e.sequence).unwrap_or(after);
+
+    let mut reports = Vec::new();
+    let mut report_capped = false;
+    for e in &events {
+        if e.event_type != crate::outbox::EVENT_POLICY_OBSERVED_DENIAL {
+            continue;
+        }
+        // Exact tenant attribution comes from the event payload the enforcement
+        // path stamped; anything else is not this tenant's report.
+        if e.payload.get("tenant").and_then(|t| t.as_str()) != Some(tenant) {
+            continue;
+        }
+        if reports.len() >= WOULD_DENY_REPORT_CAP {
+            report_capped = true;
+            break;
+        }
+        reports.push(serde_json::json!({
+            "sequence": e.sequence,
+            "created_at": e.created_at,
+            "action": e.payload.get("action").and_then(|v| v.as_str()).unwrap_or(""),
+            "reason": e.payload.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
+        }));
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "tenant": tenant,
+            "reports": reports,
+            "next_after": next_after,
+            "truncated": scanned_full_page || report_capped,
+            "retention_secs": state.config.outbox.retention_secs,
+        })),
+    )
+        .into_response()
+}
+
 // -------- Metrics read-back (V12) --------
 
 /// `GET /api/v1/metrics` — structured read-back of the metrics govder computes
@@ -2962,10 +3152,7 @@ pub async fn api_list_events(
 
 /// `GET /api/v1/events/dead` — the dead-letter queue (events that exhausted their
 /// delivery retries) (V9).
-pub async fn api_list_dead_letters(
-    admin: AdminApiAuth,
-    State(state): State<AppState>,
-) -> Response {
+pub async fn api_list_dead_letters(admin: AdminApiAuth, State(state): State<AppState>) -> Response {
     // Operator-only (#0): shared cross-tenant outbox — see `api_list_events`.
     if let Err(resp) = require_global_admin(&admin).await {
         return resp;
@@ -3509,8 +3696,7 @@ mod tests {
     /// stable, always-present shape.
     #[test]
     fn test_approval_summary_emits_risk_tier_and_irreversible() {
-        let low_reversible =
-            sample_approval(crate::approval::CriticalityClass::Low, false);
+        let low_reversible = sample_approval(crate::approval::CriticalityClass::Low, false);
         let summary = ApprovalSummary::from(&low_reversible);
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["risk_tier"], "Low");
@@ -3521,8 +3707,7 @@ mod tests {
         assert!(json.get("risk_tier").is_some());
         assert!(json.get("irreversible").is_some());
 
-        let high_irreversible =
-            sample_approval(crate::approval::CriticalityClass::Critical, true);
+        let high_irreversible = sample_approval(crate::approval::CriticalityClass::Critical, true);
         let summary = ApprovalSummary::from(&high_irreversible);
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["risk_tier"], "Extreme");

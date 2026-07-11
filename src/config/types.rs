@@ -818,7 +818,8 @@ action = "deny"
         // [server.tls] is a phantom flag (no built-in TLS acceptor exists); setting it
         // used to silently flip the Secure-cookie + HSTS flags while serving plaintext.
         // It must now be a HARD load error, not a silent behavior change.
-        let toml = "[server.tls]\ncert_path = \"/etc/tls/cert.pem\"\nkey_path = \"/etc/tls/key.pem\"";
+        let toml =
+            "[server.tls]\ncert_path = \"/etc/tls/cert.pem\"\nkey_path = \"/etc/tls/key.pem\"";
         let err = Config::parse(toml).unwrap_err();
         let msg = format!("{err}").to_lowercase();
         assert!(

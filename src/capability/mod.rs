@@ -378,8 +378,7 @@ impl Capability {
                 // so an operator can run NVIDIA without enabling the generic OpenAI
                 // provider. Pin its provider_base to NVIDIA hosts so a nvidia-labeled
                 // channel can never be aimed at a different provider's endpoint.
-                if llm.protocol == "nvidia" && !(h == "nvidia.com" || h.ends_with(".nvidia.com"))
-                {
+                if llm.protocol == "nvidia" && !(h == "nvidia.com" || h.ends_with(".nvidia.com")) {
                     return Err(format!(
                         "capability llm.protocol 'nvidia' requires an NVIDIA provider_base host (*.nvidia.com); got '{}'",
                         base
@@ -718,11 +717,15 @@ mod tests {
     #[test]
     fn nvidia_channel_accepts_nvidia_host_only() {
         // The real NVIDIA OpenAI-compatible endpoint is accepted.
-        assert!(nvidia_cap("https://integrate.api.nvidia.com/v1").validate().is_ok());
+        assert!(nvidia_cap("https://integrate.api.nvidia.com/v1")
+            .validate()
+            .is_ok());
         // A nvidia-labeled channel pointed at another provider is rejected (least
         // privilege: "nvidia" means NVIDIA, so the generic OpenAI switch can stay off).
         assert!(nvidia_cap("https://api.openai.com/v1").validate().is_err());
-        assert!(nvidia_cap("https://evil.example.com/v1").validate().is_err());
+        assert!(nvidia_cap("https://evil.example.com/v1")
+            .validate()
+            .is_err());
     }
 
     #[test]

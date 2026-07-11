@@ -21,8 +21,8 @@ pub mod wasm;
 
 pub use ecdsa::EcdsaPlugin;
 pub use hmac::HmacPlugin;
-pub(crate) use http::{build_guarded_client, read_body_capped, REQUEST_TIMEOUT};
 pub use http::HttpPlugin;
+pub(crate) use http::{build_guarded_client, read_body_capped, REQUEST_TIMEOUT};
 pub use installer::PluginInstaller;
 pub use loader::{PluginLoader, PluginRegistryExt};
 pub use postgres::PostgresPlugin;

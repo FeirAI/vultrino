@@ -596,9 +596,7 @@ impl HttpPlugin {
         // compare scheme/host — do NOT include the substituted string in any
         // error here, it now contains the secret.
         let after = url::Url::parse(&substituted).map_err(|_| {
-            PluginError::InvalidParams(
-                "URL is invalid after credential substitution".to_string(),
-            )
+            PluginError::InvalidParams("URL is invalid after credential substitution".to_string())
         })?;
 
         if after.scheme() != before.scheme() || after.host_str() != before.host_str() {
@@ -1092,7 +1090,9 @@ mod tests {
     #[tokio::test]
     async fn read_body_capped_allows_within_limit() {
         let body = vec![7u8; 4096];
-        let got = read_body_capped(resp_with_body(body.clone())).await.unwrap();
+        let got = read_body_capped(resp_with_body(body.clone()))
+            .await
+            .unwrap();
         assert_eq!(got, body);
     }
 
@@ -1297,10 +1297,8 @@ mod tests {
     #[test]
     fn test_substitute_url_token_fails_closed_without_placeholder() {
         let token = Secret::new("some-secret-token");
-        let result = HttpPlugin::substitute_url_token(
-            "https://api.telegram.org/sendMessage",
-            &token,
-        );
+        let result =
+            HttpPlugin::substitute_url_token("https://api.telegram.org/sendMessage", &token);
         assert!(matches!(result, Err(PluginError::InvalidParams(_))));
     }
 
@@ -1314,8 +1312,7 @@ mod tests {
         // restricts schemes to http/https; this proves the guard's own logic holds
         // independent of that separate defense.
         let token = Secret::new("evil.example.com");
-        let result =
-            HttpPlugin::substitute_url_token("myapp://api.{credential}/path", &token);
+        let result = HttpPlugin::substitute_url_token("myapp://api.{credential}/path", &token);
         assert!(matches!(result, Err(PluginError::InvalidParams(_))));
     }
 
@@ -1333,8 +1330,7 @@ mod tests {
             body: None,
         };
 
-        let (request_builder, _updated) =
-            plugin.prepare_request(params, &cred_data).await.unwrap();
+        let (request_builder, _updated) = plugin.prepare_request(params, &cred_data).await.unwrap();
         let request = request_builder.build().unwrap();
 
         assert_eq!(

@@ -274,7 +274,9 @@ impl AuthManager {
             last_used_at: None,
             agent_label: None,
             owner_identity: None,
-            tenant: tenant.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+            tenant: tenant
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty()),
             workload_id: None,
         };
 

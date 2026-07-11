@@ -1038,9 +1038,9 @@ async fn test_preflight_failure_is_retryable_and_does_not_burn_token() {
 async fn test_stale_execution_claim_is_terminal_not_rerun() {
     let (server, storage) = setup().await;
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    server
-        .plugins()
-        .register(Arc::new(CountingPlugin { calls: calls.clone() }));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
     store_credential(&storage, "gated-cred", true).await;
 
     let approval = match server

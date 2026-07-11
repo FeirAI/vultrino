@@ -217,8 +217,14 @@ async fn test_gc_prunes_old_events() {
         .unwrap();
     // GC prunes only DELIVERED events now — an undelivered event is retained past the window
     // (fail-closed, vultrino#4). Mark both delivered so they are eligible.
-    storage.record_event_delivery(a, true, None, 8).await.unwrap();
-    storage.record_event_delivery(b, true, None, 8).await.unwrap();
+    storage
+        .record_event_delivery(a, true, None, 8)
+        .await
+        .unwrap();
+    storage
+        .record_event_delivery(b, true, None, 8)
+        .await
+        .unwrap();
     // retention 0 → cutoff is "now", and these were created strictly before → pruned.
     let pruned = storage.gc_outbox(0).await.unwrap();
     assert_eq!(pruned, 2);
@@ -421,10 +427,7 @@ async fn test_dead_letter_via_deliver_outbox_once_increments_counter() {
         "max_attempts=1 dead-letters on the first failure"
     );
     assert_eq!(snap.delivered, 0);
-    assert_eq!(
-        storage.list_dead_letter_events(10).await.unwrap().len(),
-        1
-    );
+    assert_eq!(storage.list_dead_letter_events(10).await.unwrap().len(), 1);
 }
 
 #[tokio::test]

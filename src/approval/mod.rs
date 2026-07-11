@@ -1906,12 +1906,14 @@ mod tests {
         // Fresh, well within the window → still runnable.
         assert!(!a.needs_reauth());
         // Just inside the default window → still runnable.
-        a.decided_at =
-            Some(Utc::now() - chrono::Duration::seconds(DEFAULT_UNRUN_GRANT_WINDOW_SECS as i64 - 60));
+        a.decided_at = Some(
+            Utc::now() - chrono::Duration::seconds(DEFAULT_UNRUN_GRANT_WINDOW_SECS as i64 - 60),
+        );
         assert!(!a.needs_reauth());
         // Past the default window → lapsed (must be re-approved).
-        a.decided_at =
-            Some(Utc::now() - chrono::Duration::seconds(DEFAULT_UNRUN_GRANT_WINDOW_SECS as i64 + 60));
+        a.decided_at = Some(
+            Utc::now() - chrono::Duration::seconds(DEFAULT_UNRUN_GRANT_WINDOW_SECS as i64 + 60),
+        );
         assert!(
             a.needs_reauth(),
             "an unrun grant past the default execute-by window must lapse even with no interval"
@@ -1932,8 +1934,9 @@ mod tests {
             "reauth_interval_secs = 0 must be disabled, not a 0-second window"
         );
         // But the default execute-by bound still applies.
-        a.decided_at =
-            Some(Utc::now() - chrono::Duration::seconds(DEFAULT_UNRUN_GRANT_WINDOW_SECS as i64 + 60));
+        a.decided_at = Some(
+            Utc::now() - chrono::Duration::seconds(DEFAULT_UNRUN_GRANT_WINDOW_SECS as i64 + 60),
+        );
         assert!(a.needs_reauth());
     }
 

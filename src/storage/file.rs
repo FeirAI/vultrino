@@ -3095,7 +3095,10 @@ mod tests {
         // reset/bumped — a shifted param would derive a different key and brick the vault).
         let after: StorageFile =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_ne!(after.salt, before.salt, "the re-key must generate a new salt");
+        assert_ne!(
+            after.salt, before.salt,
+            "the re-key must generate a new salt"
+        );
         assert_eq!(
             after.version, before.version,
             "STORAGE_VERSION is preserved across a re-key"

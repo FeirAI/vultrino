@@ -86,6 +86,10 @@ pub struct AppState {
     /// JSON-RPC request id. Cancellation notifications remove and abort exactly
     /// the referenced request without retaining bearer secrets in memory.
     pub mcp_requests: Arc<RwLock<std::collections::HashMap<String, tokio::task::AbortHandle>>>,
+    /// When this process loaded its startup config — the provenance timestamp the
+    /// tenant-mode read endpoint reports (`loaded_at`). Tenant modes come from the
+    /// startup TOML and cannot change until restart, so this is the honest "as of".
+    pub config_loaded_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl FromRef<AppState> for Arc<dyn StorageBackend> {
@@ -166,6 +170,7 @@ impl WebServer {
             server,
             govder,
             mcp_requests: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            config_loaded_at: chrono::Utc::now(),
         };
 
         Self { config, app_state }
@@ -314,6 +319,11 @@ impl WebServer {
             .route("/api/v1/sessions", get(api::api_list_sessions))
             // Metrics read-back (V12).
             .route("/api/v1/metrics", get(api::api_metrics))
+            .route("/api/v1/tenant-mode", get(api::api_tenant_mode))
+            .route(
+                "/api/v1/would-deny-reports",
+                get(api::api_would_deny_reports),
+            )
             // Signed event outbox replay + DLQ (V9).
             .route("/api/v1/events", get(api::api_list_events))
             .route("/api/v1/events/dead", get(api::api_list_dead_letters))

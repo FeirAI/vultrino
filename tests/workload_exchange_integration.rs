@@ -186,7 +186,11 @@ async fn replayed_jti_second_request_is_409() {
         .oneshot(exchange_req(&assertion))
         .await
         .unwrap();
-    assert_eq!(first.status(), StatusCode::OK, "first exchange must succeed");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "first exchange must succeed"
+    );
 
     // Replaying the identical assertion is rejected as a replay.
     let second = router.oneshot(exchange_req(&assertion)).await.unwrap();

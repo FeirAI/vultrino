@@ -24,8 +24,7 @@ async fn test_vault_and_outbox_written_owner_only() {
     let vault = dir.path().join("store.enc");
     let outbox = dir.path().join("outbox.enc");
     let pw = SecretString::from("pw");
-    let storage: Arc<dyn StorageBackend> =
-        Arc::new(FileStorage::new(&vault, &pw).await.unwrap());
+    let storage: Arc<dyn StorageBackend> = Arc::new(FileStorage::new(&vault, &pw).await.unwrap());
 
     // Storing a credential persists the vault via the temp-file + atomic rename path.
     let cred = Credential::new(
@@ -59,7 +58,10 @@ async fn test_vault_and_outbox_written_owner_only() {
     );
 
     // The advisory-lock sidecars, when created, are owner-only too.
-    for lock in [dir.path().join("store.lock"), dir.path().join("outbox.lock")] {
+    for lock in [
+        dir.path().join("store.lock"),
+        dir.path().join("outbox.lock"),
+    ] {
         if lock.exists() {
             assert_eq!(
                 mode_of(&lock),
