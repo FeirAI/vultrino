@@ -2995,6 +2995,325 @@ pub async fn deliver_outbox_periodically(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// plan 088 Step 3b — the averin durable-queue delivery worker
+// ---------------------------------------------------------------------------------------------
+//
+// A SIBLING of `deliver_outbox_once` above, never a branch of it (plan 088 D1): averin needs two
+// endpoints, per-endpoint JSON bodies, and a per-record Ed25519 PoP signature — the govder
+// outbox's fixed HMAC `delivery_body`/`OutboxConfig` model cannot express that, so this worker
+// builds its own request bodies and reuses only `AverinClient`'s transport (`post`/`config`).
+//
+// Cross-process note (Step 3a, Option A): the averin queue is single-writer-PROCESS — exactly one
+// live process holds the queue directory's exclusive `flock` (`FileStorage::averin_queue()` is
+// `Some` only for that process; every other process seals via the 087 async fail-open path
+// instead). So this worker runs entirely IN the queue-owning process and reads THAT process's own
+// in-memory queue map — there is no cross-process worker reconciliation to build here.
+
+/// Max events delivered per [`deliver_averin_outbox_once`] pass, mirroring [`OUTBOX_BATCH`]'s role
+/// for the govder outbox — bounds a single pass's work.
+const AVERIN_OUTBOX_BATCH: usize = 64;
+
+/// How long a claimed-for-delivery averin event is leased, mirroring [`OUTBOX_LEASE_SECS`]'s role:
+/// comfortably longer than an averin request's timeout, short enough that a stuck/panicked task's
+/// events are promptly re-claimable. The queue has no cross-process claimant (Step 3a), so this
+/// guards only against a stuck task within THIS same process.
+const AVERIN_OUTBOX_LEASE_SECS: u64 = 30;
+
+/// Run a synchronous, potentially fsync-blocking [`crate::storage::AverinQueue`] call without
+/// stalling a multi-thread tokio runtime's worker for the whole wait — the exact "match runtime
+/// flavor" idiom `PopKeyStore`/`AverinDeadLetterStore` already use for their own blocking file I/O
+/// (`tokio::task::block_in_place` panics on a `current_thread` runtime, hence the match).
+fn run_averin_queue_blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::current().runtime_flavor() {
+        RuntimeFlavor::CurrentThread => f(),
+        _ => tokio::task::block_in_place(f),
+    }
+}
+
+/// Rebuild + deliver one `"averin.grant"` event (plan 088 D3). Every field the grant request needs
+/// (`action`/`scope`/`use_limit`) already lives in the PoP-key entry a future enqueue site inserts
+/// at mint time (Step 5, not built yet — Step 3b's tests insert entries directly); the event's OWN
+/// payload carries nothing this worker reads today (reserved for future audit/debugging fields).
+/// On success, writes averin's `{grant_id, capability}` back into the popkey entry (D3's
+/// `GrantResolved` write-back) AND durably records the SAME resolution in the queue's own journal
+/// (`AverinQueue::resolve_grant`) so a crash between the two writes is reconcilable on replay.
+async fn deliver_averin_grant(
+    event: &crate::outbox::OutboxEvent,
+    queue: &crate::storage::AverinQueue,
+    popkeys: &crate::storage::PopKeyStore,
+    averin_client: &crate::averin::AverinClient,
+) -> Result<(), String> {
+    let token_id = event.subject.clone();
+    let entry = popkeys
+        .get(&token_id)
+        .await
+        .map_err(|e| format!("popkey lookup failed: {e}"))?
+        .ok_or_else(|| format!("no PoP-key entry for token {token_id} (grant cannot be rebuilt)"))?;
+
+    let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
+    let agent_pubkey = keypair.agent_pubkey_b64();
+    let agent_id = format!("vultrino:{token_id}");
+    let resource = averin_client.config().resource_id.clone();
+
+    let challenge = crate::averin::pop::grant_challenge(
+        &entry.action,
+        &agent_id,
+        &agent_pubkey,
+        &resource,
+        &entry.scope,
+    );
+    let agent_sig = keypair.sign_b64(&challenge);
+
+    // Mirrors `AverinClient::seal_grant`'s exact body shape (`src/averin/mod.rs`) — same fields,
+    // same `scope_class`/`use_limit` derivation — rebuilt here from the entry instead of the
+    // in-memory `pop` map `seal_grant` uses (this worker never touches that map; D1).
+    let scope_class = entry.use_limit.filter(|n| *n > 1).map(|_| "bounded_reuse");
+    let body = serde_json::json!({
+        "idempotency_key": token_id,
+        "project_id": averin_client.config().project_id,
+        "session_id": averin_client.config().session_id,
+        "agent_id": agent_id,
+        "action": entry.action,
+        "resource": resource,
+        "scope": entry.scope,
+        "scope_class": scope_class,
+        "use_limit": entry.use_limit.filter(|n| *n > 1).unwrap_or(0),
+        "agent_pubkey": agent_pubkey,
+        "agent_sig": agent_sig,
+        "ttl_seconds": averin_client.config().grant_ttl_secs,
+    });
+
+    let resp = averin_client
+        .post("/v2/grants", &body)
+        .await
+        .map_err(|e| e.to_string())?;
+    let grant_id = resp
+        .get("grant_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "averin grant response missing grant_id".to_string())?
+        .to_string();
+    let capability = resp
+        .get("capability")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "averin grant response missing capability".to_string())?
+        .to_string();
+
+    let delivered_at = chrono::Utc::now();
+    let expires_at = Some(
+        delivered_at + chrono::Duration::seconds(i64::from(averin_client.config().grant_ttl_secs)),
+    );
+
+    popkeys
+        .grant_resolved(
+            &token_id,
+            capability.clone(),
+            grant_id.clone(),
+            delivered_at,
+            expires_at,
+        )
+        .await
+        .map_err(|e| format!("popkey grant_resolved write-back failed: {e}"))?;
+
+    run_averin_queue_blocking(|| queue.resolve_grant(&token_id, &grant_id, &capability))
+        .map_err(|e| format!("queue GrantResolved append failed: {e}"))?;
+
+    Ok(())
+}
+
+/// Rebuild + deliver one `"averin.use"` event. Per D3, this event only ever becomes head-of-line
+/// deliverable AFTER its subject's grant has delivered (the same-subject FIFO in
+/// `earliest_pending_per_subject`), so the popkey entry's `grant_id`/`capability` are expected to
+/// already be populated; if they are not (defensive — should never happen under that ordering
+/// guarantee) this fails the attempt (retried, eventually quarantined like any other persistent
+/// failure) rather than panicking.
+///
+/// **Step 4 (D5) marker**: a real deterministic-retry rebuild persists `nonce`/`params_nonce` at
+/// ENQUEUE time and reuses those STORED values here so every retry produces a byte-identical
+/// `use_sig`/`params_commitment` and averin's idempotent-retry match succeeds instead of 409ing
+/// (an already-sealed use would otherwise get quarantined by its own successful prior delivery).
+/// Step 3b does not implement that — see the fresh-nonce generation below.
+async fn deliver_averin_use(
+    event: &crate::outbox::OutboxEvent,
+    popkeys: &crate::storage::PopKeyStore,
+    averin_client: &crate::averin::AverinClient,
+) -> Result<(), String> {
+    let token_id = event.subject.clone();
+    let entry = popkeys
+        .get(&token_id)
+        .await
+        .map_err(|e| format!("popkey lookup failed: {e}"))?
+        .ok_or_else(|| format!("no PoP-key entry for token {token_id} (use cannot be rebuilt)"))?;
+
+    let (grant_id, capability) = match (entry.grant_id.clone(), entry.capability.clone()) {
+        (Some(g), Some(c)) => (g, c),
+        _ => {
+            return Err(format!(
+                "use for token {token_id} is head-of-line but its grant has not resolved yet \
+                 (unexpected under D3's per-subject ordering)"
+            ))
+        }
+    };
+
+    // Step 3b's placeholder `averin.use` payload shape: `{"params": <string>}` (mirrors
+    // `AverinClient::seal_use`'s existing UTF-8-lossy embedding of raw params into the JSON body).
+    // Step 4/5 extends this with `nonce`/`params_nonce`/`request_id`/`use_sequence_number` (D5/D5c)
+    // for a byte-exact, idempotent rebuild; nothing production-side enqueues this event yet
+    // (Step 5), so this shape is Step 3b's own test-construction contract, not an external one.
+    let params = event
+        .payload
+        .get("params")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "averin.use event payload missing params".to_string())?
+        .as_bytes()
+        .to_vec();
+
+    let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
+    let credential_binding = crate::averin::pop::credential_binding(&capability)
+        .map_err(|e| format!("credential_binding: {e}"))?;
+
+    // Step 4 (D5): deterministic nonce/params_nonce rebuild — persist BOTH in the `averin.use`
+    // event payload at enqueue time and reuse the STORED values here (never fresh ones), so a
+    // retry is byte-identical instead of minting a new nonce/use_sig every attempt. Not done here:
+    let params_nonce = crate::averin::pop::random_params_nonce_hex();
+    let params_commitment = crate::averin::pop::params_commitment(&params, &params_nonce)
+        .map_err(|e| format!("params_commitment: {e}"))?;
+    let nonce = crate::averin::pop::random_params_nonce_hex();
+
+    let challenge = crate::averin::pop::use_pop_challenge(
+        &grant_id,
+        &averin_client.config().resource_id,
+        &entry.action,
+        &params_commitment,
+        &credential_binding,
+        &nonce,
+    );
+    let use_sig = keypair.sign_b64(&challenge);
+
+    // Mirrors `AverinClient::seal_use`'s exact body shape, rebuilt from the popkey entry + this
+    // event's stored params instead of the in-memory `pop` map (this worker never touches it; D1).
+    let body = serde_json::json!({
+        "idempotency_key": format!("{token_id}:use"),
+        "project_id": averin_client.config().project_id,
+        "session_id": averin_client.config().session_id,
+        "capability": capability,
+        "use_sig": use_sig,
+        "action": entry.action,
+        "params": String::from_utf8_lossy(&params),
+        "nonce": nonce,
+        "params_nonce": params_nonce,
+    });
+
+    averin_client
+        .post("/v2/use", &body)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// One pass of averin durable-queue delivery (plan 088 Step 3b): claim the earliest-pending event
+/// per subject (subject == `token.id`, so a grant always delivers before its use — D3's automatic
+/// head-of-line join), route it by `event_type`, POST it to averin, and record the outcome.
+///
+/// **Dead-letter handling (D4, the finding-#2 fix)**: `OutboxStore::gc`'s contiguous-prefix prune
+/// (`take_while` stopping at the first non-`Delivered` event) would let a single `DeadLettered`
+/// event freeze retention of every LATER event for every subject — for this queue that would mean
+/// unbounded retention of later uses' raw `params`. So a dead-letter transition here MOVES the
+/// record out of the active queue into `quarantine` (a separate, independently-retention-bounded
+/// store): the active queue records the sequence as terminal (GC/compaction-reclaimable) and the
+/// SUBJECT advances normally (its own later events, if any, are unaffected — `DeadLettered`, like
+/// `Delivered`, is terminal to `earliest_pending_per_subject`'s head-of-line check) — and, just as
+/// important, OTHER subjects were never blocked by it in the first place (per-subject head-of-line
+/// is independent per subject already); this worker's job is only to ensure ITS OWN error handling
+/// (a failed quarantine move, a failed `record_delivery` write) never aborts the whole pass via `?`
+/// and so never prevents later subjects' events from being claimed in the same or a later pass.
+///
+/// Runs entirely IN the queue-owning process (Step 3a: single-writer-PROCESS via an exclusive
+/// `flock`) — there is no cross-process worker reconciliation here, only this process's own
+/// in-memory queue map.
+pub async fn deliver_averin_outbox_once(
+    queue: &crate::storage::AverinQueue,
+    popkeys: &crate::storage::PopKeyStore,
+    quarantine: &crate::storage::AverinDeadLetterStore,
+    averin_client: &crate::averin::AverinClient,
+    max_attempts: u32,
+) -> Result<(), crate::storage::StorageError> {
+    for _ in 0..AVERIN_OUTBOX_BATCH {
+        let mut claimed = run_averin_queue_blocking(|| queue.claim(1, AVERIN_OUTBOX_LEASE_SECS))?;
+        let Some(event) = claimed.pop() else {
+            break;
+        };
+
+        let outcome: Result<(), String> = match event.event_type.as_str() {
+            "averin.grant" => deliver_averin_grant(&event, queue, popkeys, averin_client).await,
+            "averin.use" => deliver_averin_use(&event, popkeys, averin_client).await,
+            other => Err(format!("unknown averin durable event_type {other:?}")),
+        };
+
+        let (success, error) = match outcome {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e)),
+        };
+        if !success {
+            warn!(
+                target: "averin_seal",
+                subject = %event.subject,
+                sequence = event.sequence,
+                event_type = %event.event_type,
+                attempts = event.attempts,
+                error = error.as_deref().unwrap_or("unknown"),
+                "averin durable delivery attempt failed"
+            );
+        }
+
+        let sequence = event.sequence;
+        let record_result = run_averin_queue_blocking(|| {
+            queue.record_delivery(sequence, success, error.clone(), max_attempts)
+        });
+        match record_result {
+            Ok(true) => {
+                // Dead-letter transition: fetch the authoritative terminal record
+                // `record_delivery` just durably committed (its final `attempts`/`last_error`/
+                // `delivery`) rather than reusing the pre-attempt `event` snapshot, then MOVE it
+                // into quarantine (D4). Never logs `params`/`pop_seed` — token/project context only.
+                let final_event = queue.get(sequence).unwrap_or(event);
+                error!(
+                    target: "averin_seal",
+                    subject = %final_event.subject,
+                    sequence,
+                    event_type = %final_event.event_type,
+                    attempts = final_event.attempts,
+                    project_id = %averin_client.config().project_id,
+                    "AVERIN-SEAL-DEADLETTERED averin durable event exhausted delivery attempts — \
+                     moved to quarantine"
+                );
+                if let Err(qe) = quarantine.quarantine(final_event, chrono::Utc::now()).await {
+                    // Never propagated via `?`: a quarantine-move failure must not abort the rest
+                    // of this pass (that would resurrect exactly the freeze D4 exists to prevent).
+                    warn!(
+                        target: "averin_seal",
+                        error = %qe,
+                        sequence,
+                        "failed to move dead-lettered averin event into quarantine (it stays \
+                         terminal in the active queue; a later pass should retry the move)"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    target: "averin_seal",
+                    error = %e,
+                    sequence,
+                    "failed to record averin durable delivery outcome"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Background loop that reconciles intent-staged events (D1 transactional outbox) to the outbox on a
 /// periodic tick. Coupled emits (approval decisions / lifecycle transitions) drain inline right after
 /// committing, and startup reconciles once; this tick is the SAFETY NET that bounds an orphaned
@@ -3343,6 +3662,395 @@ mod tests {
             server
                 .trusted_irreversible_for_action("unknown.action", None)
                 .await
+        );
+    }
+}
+
+/// Tests for plan 088 Step 3b's `deliver_averin_outbox_once` (+ its `deliver_averin_grant`/
+/// `deliver_averin_use` routing helpers), against a RESPONDING fake averin. Adapted from
+/// `src/averin/mod.rs`'s `blocked_averin` — a raw `tokio::net::TcpListener` that accepts and never
+/// answers — into an axum router that actually answers `/v2/grants`/`/v2/use` (axum is already a
+/// main dependency of this crate for the real server, so this needs no new dependency).
+#[cfg(test)]
+mod averin_worker_tests {
+    use super::*;
+    use crate::averin::{AverinClient, AverinConfig};
+    use crate::crypto::MasterKey;
+    use crate::outbox::DeliveryState;
+    use crate::storage::{AverinDeadLetterStore, AverinQueue, PopKeyEntry, PopKeyStore, QuarantineStatus};
+    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+    use std::collections::HashSet;
+
+    /// What the fake averin observed, in receipt order (a single shared log across BOTH
+    /// endpoints — the only way a test can assert grant-BEFORE-use ordering, not just presence)
+    /// plus two failure-injection sets so a test can force a specific subject's grant or use to
+    /// fail deterministically (no real network outage needed to test the retry/dead-letter path).
+    #[derive(Default)]
+    struct FakeAverinState {
+        call_log: parking_lot::Mutex<Vec<String>>,
+        /// `agent_id` values whose `/v2/grants` call should return 500.
+        fail_grant_agents: parking_lot::Mutex<HashSet<String>>,
+        /// `action` values whose `/v2/use` call should return 500.
+        fail_use_actions: parking_lot::Mutex<HashSet<String>>,
+    }
+
+    async fn fake_grants(
+        State(state): State<Arc<FakeAverinState>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let agent_id = body
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if state.fail_grant_agents.lock().contains(&agent_id) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "forced grant failure"})),
+            );
+        }
+        state.call_log.lock().push(format!("grant:{agent_id}"));
+        let grant_id = format!("grant-{agent_id}");
+        // `credential_binding` (src/averin/pop.rs) splits at the first '.' and base64url-decodes
+        // the payload half — so, unlike a real averin capability, this fake's payload half must
+        // ITSELF be valid base64url (a plain "cap-{agent_id}" would fail to decode, since agent_id
+        // contains ':').
+        use base64::Engine;
+        let payload_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(agent_id.as_bytes());
+        let capability = format!("{payload_b64}.sig");
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"grant_id": grant_id, "capability": capability})),
+        )
+    }
+
+    async fn fake_use(
+        State(state): State<Arc<FakeAverinState>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let action = body
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if state.fail_use_actions.lock().contains(&action) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "forced use failure"})),
+            );
+        }
+        let capability = body
+            .get("capability")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut log = state.call_log.lock();
+        log.push(format!("use:{capability}"));
+        let record_id = format!("rec-{}", log.len());
+        drop(log);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"record": {"record_id": record_id}})),
+        )
+    }
+
+    /// Stand up a RESPONDING fake averin on an ephemeral local port. Returns its base_url plus the
+    /// shared observation/failure-injection state a test manipulates.
+    async fn responding_averin() -> (String, Arc<FakeAverinState>) {
+        let state = Arc::new(FakeAverinState::default());
+        let app = Router::new()
+            .route("/v2/grants", post(fake_grants))
+            .route("/v2/use", post(fake_use))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), state)
+    }
+
+    fn test_client(base_url: &str) -> AverinClient {
+        AverinClient::new(AverinConfig {
+            enabled: true,
+            base_url: base_url.to_string(),
+            resource_id: "orders-db".to_string(),
+            ..AverinConfig::default()
+        })
+        .expect("client builds")
+        .expect("client is Some when enabled")
+    }
+
+    fn test_stores(dir: &std::path::Path) -> (AverinQueue, PopKeyStore, AverinDeadLetterStore) {
+        let key = Arc::new(MasterKey::from_bytes(vec![5u8; 32]).unwrap());
+        let queue = AverinQueue::open(dir.join("averin-queue"), Arc::clone(&key)).unwrap();
+        let popkeys = PopKeyStore::new(dir.join("averin-popkeys.enc"), Arc::clone(&key));
+        let deadletter = AverinDeadLetterStore::new(dir.join("averin-deadletter.enc"), key);
+        (queue, popkeys, deadletter)
+    }
+
+    fn popkey_entry(action: &str, scope: &str) -> PopKeyEntry {
+        PopKeyEntry {
+            pop_seed: [7u8; 32],
+            action: action.to_string(),
+            scope: scope.to_string(),
+            use_limit: None,
+            capability: None,
+            grant_id: None,
+            minted_at: chrono::Utc::now(),
+            grant_delivered_at: None,
+            grant_expires_at: None,
+            abandoned: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn averin_worker_delivers_grant_then_use_in_order_for_one_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+
+        popkeys
+            .insert("tok-1", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        let grant_seq = queue
+            .append("tok-1", "averin.grant", serde_json::json!({}))
+            .unwrap();
+        let use_seq = queue
+            .append(
+                "tok-1",
+                "averin.use",
+                serde_json::json!({"params": "hello-world"}),
+            )
+            .unwrap();
+        assert!(grant_seq < use_seq);
+
+        deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 8)
+            .await
+            .unwrap();
+
+        // Both delivered — nothing left pending for this subject.
+        assert!(queue.deliverable(10).is_empty());
+        assert_eq!(
+            queue.get(grant_seq).unwrap().delivery,
+            DeliveryState::Delivered
+        );
+        assert_eq!(
+            queue.get(use_seq).unwrap().delivery,
+            DeliveryState::Delivered
+        );
+
+        // The grant resolution landed in BOTH the popkey store (D3 write-back) and the queue's own
+        // journal (`GrantResolved`, the reconciliation source on a crash between the two writes).
+        let entry = popkeys.get("tok-1").await.unwrap().unwrap();
+        assert!(entry.grant_id.is_some());
+        assert!(entry.capability.is_some());
+        assert!(entry.grant_delivered_at.is_some());
+        assert_eq!(
+            queue.resolved_grant("tok-1"),
+            Some((
+                entry.grant_id.clone().unwrap(),
+                entry.capability.clone().unwrap()
+            ))
+        );
+
+        // Ordering: the grant call landed in the fake's log BEFORE the use call.
+        let log = fake.call_log.lock().clone();
+        assert_eq!(
+            log.len(),
+            2,
+            "exactly one grant + one use reached the fake averin: {log:?}"
+        );
+        assert!(log[0].starts_with("grant:"), "grant must be first: {log:?}");
+        assert!(log[1].starts_with("use:"), "use must follow its grant: {log:?}");
+
+        assert!(deadletter.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn averin_worker_withholds_use_until_its_grant_delivers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+
+        let agent_id = "vultrino:tok-2";
+        fake.fail_grant_agents.lock().insert(agent_id.to_string());
+
+        popkeys
+            .insert("tok-2", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        queue
+            .append("tok-2", "averin.grant", serde_json::json!({}))
+            .unwrap();
+        queue
+            .append("tok-2", "averin.use", serde_json::json!({"params": "p"}))
+            .unwrap();
+
+        // Pass 1: the grant fails (forced 500). The use must NEVER even be attempted while its
+        // grant is still Pending — D3's per-subject head-of-line ordering, exercised under an
+        // adversarial (failing) grant rather than just the happy-path enqueue order.
+        deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 8)
+            .await
+            .unwrap();
+        assert!(
+            fake.call_log.lock().is_empty(),
+            "the use must not reach averin while its grant is still pending: {:?}",
+            fake.call_log.lock()
+        );
+        let deliverable = queue.deliverable(10);
+        assert_eq!(deliverable.len(), 1, "only the grant is head-of-line");
+        assert_eq!(deliverable[0].event_type, "averin.grant");
+        assert!(popkeys
+            .get("tok-2")
+            .await
+            .unwrap()
+            .unwrap()
+            .grant_id
+            .is_none());
+
+        // A second pass, still with the grant failing, must ALSO never let the use slip through
+        // (the withholding isn't a one-shot accident of pass 1's particular claim order) — the
+        // failed grant is now leased/backed off, so this pass claims nothing at all and is a no-op,
+        // which is itself the point: there is no path from "grant not yet delivered" to "use
+        // attempted" in this worker.
+        deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 8)
+            .await
+            .unwrap();
+        assert!(
+            fake.call_log.lock().is_empty(),
+            "still nothing reached averin while the grant remains undelivered: {:?}",
+            fake.call_log.lock()
+        );
+
+        // Once the grant genuinely succeeds (a fresh subject, so no backoff lease to wait out),
+        // grant-then-use deliver in order for it — the SAME property test 1 already covers,
+        // confirming this isn't a client/fake wiring bug specific to tok-2.
+        fake.fail_grant_agents.lock().remove(agent_id);
+        popkeys
+            .insert("tok-2b", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        queue
+            .append("tok-2b", "averin.grant", serde_json::json!({}))
+            .unwrap();
+        queue
+            .append("tok-2b", "averin.use", serde_json::json!({"params": "p"}))
+            .unwrap();
+        deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 8)
+            .await
+            .unwrap();
+        let log = fake.call_log.lock().clone();
+        assert_eq!(log.len(), 2, "tok-2b's grant + use both land: {log:?}");
+        assert!(log[0].starts_with("grant:"));
+        assert!(log[1].starts_with("use:"));
+    }
+
+    #[tokio::test]
+    async fn averin_worker_deadletter_quarantines_one_subject_without_blocking_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+
+        // Subject A's use always fails; B and C succeed normally.
+        fake.fail_use_actions.lock().insert("action-A".to_string());
+
+        for (subject, action) in [("A", "action-A"), ("B", "action-B"), ("C", "action-C")] {
+            popkeys
+                .insert(subject, popkey_entry(action, "read:orders"))
+                .await
+                .unwrap();
+            queue
+                .append(subject, "averin.grant", serde_json::json!({}))
+                .unwrap();
+            queue
+                .append(subject, "averin.use", serde_json::json!({"params": "p"}))
+                .unwrap();
+        }
+
+        // max_attempts=1: A's use dead-letters on its FIRST failed attempt (no backoff wait
+        // needed), all within this ONE pass — B/C's events are all claimable in the same pass too
+        // (the 64-event batch bound comfortably covers these 6 events).
+        deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 1)
+            .await
+            .unwrap();
+
+        // A's use is quarantined — MOVED out of the active queue, not a frozen tombstone.
+        let quarantined = deadletter.list().await.unwrap();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly A's use is quarantined: {quarantined:?}"
+        );
+        assert_eq!(quarantined[0].event.subject, "A");
+        assert_eq!(quarantined[0].event.event_type, "averin.use");
+        assert_eq!(quarantined[0].status, QuarantineStatus::Open);
+
+        // B and C were NOT blocked by A's dead-letter: both delivered within the SAME pass.
+        let log = fake.call_log.lock().clone();
+        let use_count = log.iter().filter(|l| l.starts_with("use:")).count();
+        assert_eq!(use_count, 2, "B and C's uses both reached averin: {log:?}");
+        let grant_count = log.iter().filter(|l| l.starts_with("grant:")).count();
+        assert_eq!(grant_count, 3, "all three subjects' grants delivered: {log:?}");
+
+        // Nothing left Pending anywhere: A's grant Delivered + A's use DeadLettered (terminal, so
+        // it no longer blocks anything, including this subject's OWN later events, let alone B/C's
+        // — the exact `OutboxStore::gc` contiguous-prefix freeze this plan's D4 avoids).
+        assert!(queue.deliverable(10).is_empty());
+    }
+
+    #[tokio::test]
+    async fn averin_worker_unknown_event_type_fails_closed_without_blocking_the_pass() {
+        // Defensive: an unrecognized event_type must not panic and must not silently "succeed" —
+        // it fails the attempt (retried/eventually quarantined like any other failure) and must
+        // not stop a later subject's event in the same pass from being processed.
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let (base_url, _fake) = responding_averin().await;
+        let client = test_client(&base_url);
+
+        queue
+            .append("weird", "averin.mystery", serde_json::json!({}))
+            .unwrap();
+        popkeys
+            .insert("normal", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        queue
+            .append("normal", "averin.grant", serde_json::json!({}))
+            .unwrap();
+
+        deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 8)
+            .await
+            .unwrap();
+
+        // The unknown-type event stays Pending after one failed attempt (not Delivered, not yet
+        // DeadLettered at max_attempts=8) — `deliverable()` ignores lease (a read-only peek), so
+        // it still shows up; the "normal" subject's grant is gone from this list because it
+        // Delivered (terminal, no longer Pending).
+        let remaining = queue.deliverable(10);
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only the still-pending unknown-type event remains: {remaining:?}"
+        );
+        assert_eq!(remaining[0].subject, "weird");
+        // The unknown event stayed Pending (retried later), never Delivered/DeadLettered on its
+        // very first attempt; the normal subject's grant delivered in the SAME pass regardless.
+        assert!(
+            popkeys
+                .get("normal")
+                .await
+                .unwrap()
+                .unwrap()
+                .grant_id
+                .is_some(),
+            "the unrelated subject's grant still delivered in the same pass"
         );
     }
 }

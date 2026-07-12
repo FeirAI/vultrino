@@ -1042,6 +1042,16 @@ impl AverinQueue {
             .count()
     }
 
+    /// Look up a specific sequence's CURRENT record — a production analogue of the test-only
+    /// [`Self::all_events`]. Plan 088 Step 3b's delivery worker uses this to read back the
+    /// authoritative state [`Self::record_delivery`] just durably committed (its final `attempts`/
+    /// `last_error`/terminal `delivery`) before moving a dead-lettered record into quarantine,
+    /// rather than re-deriving `record_delivery_transition`'s arithmetic in the caller.
+    pub fn get(&self, sequence: u64) -> Option<OutboxEvent> {
+        let mem = self.mem.lock();
+        mem.cache.outbox.get(&sequence).cloned()
+    }
+
     /// EVERY event in the live map regardless of delivery/subject state (test-only introspection).
     /// [`Self::deliverable`] deliberately returns only ONE (the earliest-pending) event per subject —
     /// exactly right for the delivery worker, wrong for asserting "how many records actually survived

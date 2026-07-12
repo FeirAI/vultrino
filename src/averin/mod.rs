@@ -355,6 +355,15 @@ impl AverinClient {
         self.cfg.mode
     }
 
+    /// The client's config — `pub(crate)` so the plan 088 Step 3b durable delivery worker
+    /// (`src/server/mod.rs`, a SIBLING transport, never a branch of `seal_grant`/`seal_use`, D1)
+    /// can read `project_id`/`session_id`/`resource_id`/`grant_ttl_secs` when it rebuilds a
+    /// grant/use request from a durable queue event + the PoP-key store, without widening
+    /// `AverinConfig` field access outside the crate.
+    pub(crate) fn config(&self) -> &AverinConfig {
+        &self.cfg
+    }
+
     /// Snapshot the fail-open seal counters (for `GET /api/v1/metrics` + tests).
     pub fn metrics(&self) -> SealMetricsSnapshot {
         self.metrics.snapshot()
@@ -675,7 +684,12 @@ impl AverinClient {
 
     // ---- transport -------------------------------------------------------
 
-    async fn post(
+    /// `pub(crate)` (was private) so the plan 088 Step 3b durable delivery worker can POST a
+    /// grant/use request it rebuilt from a durable queue event + the PoP-key store through the
+    /// SAME transport (auth header/query, response-size cap, non-2xx/parse handling) `seal_grant`/
+    /// `seal_use` use — reusing the transport, not branching it (D1). No behavior change to any
+    /// existing call site.
+    pub(crate) async fn post(
         &self,
         endpoint: &'static str,
         body: &serde_json::Value,
