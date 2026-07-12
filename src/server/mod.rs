@@ -4119,10 +4119,12 @@ mod tests {
 #[cfg(test)]
 mod averin_worker_tests {
     use super::*;
-    use crate::averin::{AverinClient, AverinConfig};
+    use crate::averin::{AverinClient, AverinConfig, AverinMode};
     use crate::crypto::MasterKey;
     use crate::outbox::{DeliveryState, OutboxEvent};
-    use crate::storage::{AverinDeadLetterStore, AverinQueue, PopKeyEntry, PopKeyStore, QuarantineStatus};
+    use crate::storage::{
+        AverinDeadLetterStore, AverinQueue, FileStorage, PopKeyEntry, PopKeyStore, QuarantineStatus,
+    };
     use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
     use std::collections::{HashMap, HashSet};
 
@@ -4856,6 +4858,176 @@ mod averin_worker_tests {
             "C: a replayable dead-letter must block eviction"
         );
         assert!(popkeys.get("D").await.unwrap().is_some(), "D: never resolved -> never evicted");
+    }
+
+    /// Plan 088 D8's headline test: a `vultrino rekey` must carry a PENDING averin grant+use (and the
+    /// `PopKeyEntry` seed the use depends on) through the master-key rotation intact. Drives the REAL
+    /// production entry points — `seal_mint` (persists the `PopKeyEntry`, enqueues `"averin.grant"`)
+    /// and `seal_after_consume` (enqueues `"averin.use"`) — against a durable-queue-owning
+    /// `FileStorage`, rekeys it, then REOPENS under the NEW password and runs one worker pass against
+    /// a responding fake averin. Asserts (a) the `pop_seed` survived the rotation (the `PopKeyEntry` is
+    /// still there, and the grant/use both deliver) and (b) the rebuilt use PoP still verifies: the
+    /// EXACT signature the worker sent to averin is reproduced from the reopened seed (RFC 8032
+    /// determinism) AND cryptographically verifies under that seed's public key.
+    #[tokio::test]
+    async fn rekey_survives_a_pending_grant_and_use_pop_seed_round_trips_and_use_pop_verifies() {
+        use crate::auth::NewUseToken;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let old_pw = secrecy::SecretString::from("old-master-password");
+        let new_pw = secrecy::SecretString::from("new-master-password");
+        let resource_id = "orders-db";
+
+        let (base_url, fake) = responding_averin().await;
+
+        // Mint + execute durable through the REAL production entry points, backed by a CONCRETE
+        // `FileStorage` (not the `Arc<dyn StorageBackend>` trait object `VultrinoServer` holds) so
+        // `.rekey()` — an inherent method, not part of the trait — can be called on it directly.
+        let token_id = "tok-rekey-1".to_string();
+        {
+            let storage = Arc::new(
+                FileStorage::new_with_averin(&path, &old_pw, true)
+                    .await
+                    .unwrap(),
+            );
+            assert!(
+                storage.averin_queue().is_some(),
+                "this process must own the durable queue"
+            );
+
+            let mut config = Config::default();
+            config.averin = AverinConfig {
+                enabled: true,
+                base_url: base_url.clone(),
+                resource_id: resource_id.to_string(),
+                mode: AverinMode::Observe,
+                durable: true,
+                ..AverinConfig::default()
+            };
+            let server = VultrinoServer::new(
+                config,
+                storage.clone() as Arc<dyn StorageBackend>,
+                CredentialResolver::new(storage.clone() as Arc<dyn StorageBackend>),
+            );
+            let av = server.averin().expect("averin client constructed (enabled = true)");
+
+            let (_plaintext, mut token) = crate::auth::UseToken::create(NewUseToken {
+                name: "test-token".to_string(),
+                credential_scope: "orders-*".to_string(),
+                action_scope: Some("db.query:orders-ro".to_string()),
+                max_uses: Some(3),
+                require_approval: false,
+                expires_in: None,
+            });
+            token.id = token_id.clone();
+
+            server.seal_mint(&token).await;
+            let result = server
+                .seal_after_consume(&av, &token.id, br#"{"q":1}"#.to_vec(), 1, "req-rekey-1")
+                .await;
+            assert!(result.is_ok(), "Observe must never return Err");
+
+            // Confirm the pre-rekey state actually landed before rotating the key out from under it.
+            let popkeys_before = storage.averin_popkeys().unwrap();
+            assert!(popkeys_before.get(&token_id).await.unwrap().is_some());
+            let queue_before = storage.averin_queue().unwrap();
+            assert_eq!(
+                queue_before.deliverable(10).len(),
+                1,
+                "the use is withheld behind its own not-yet-delivered grant (D3)"
+            );
+
+            storage.rekey(&new_pw).await.unwrap();
+            // `server`/`av`/`storage` all drop at the end of this block — releasing the vault fd-lock
+            // AND the averin queue's exclusive process-lifetime owner lock — so the fresh open below
+            // can succeed.
+        }
+
+        // Reopen with the NEW password and run ONE worker pass against the (still-running) fake averin.
+        let reopened = FileStorage::new_with_averin(&path, &new_pw, true)
+            .await
+            .unwrap();
+        let queue2 = reopened
+            .averin_queue()
+            .expect("the queue reopens cleanly under the new password (D8)");
+        let popkeys2 = reopened.averin_popkeys().unwrap();
+        let deadletter2 = reopened.averin_deadletter().unwrap();
+        let client = test_client(&base_url);
+
+        deliver_averin_outbox_once(queue2, popkeys2, deadletter2, &client, 8)
+            .await
+            .unwrap();
+
+        assert!(
+            queue2.deliverable(10).is_empty(),
+            "both the grant and the use must deliver after rekey + reopen"
+        );
+
+        let entry = popkeys2
+            .get(&token_id)
+            .await
+            .unwrap()
+            .expect("the PopKeyEntry (and its pop_seed) survived the rekey");
+        let grant_id = entry.grant_id.clone().expect("the grant delivered");
+        let capability = entry.capability.clone().expect("the grant delivered");
+
+        // The rebuilt use PoP must still verify. Recompute the expected use_sig from the REOPENED
+        // (post-rekey) pop_seed against the fields the worker actually sent, and check it two ways:
+        // (1) it must be BYTE-IDENTICAL to what the worker sent (RFC 8032 determinism — a
+        // mis-decrypted/corrupted seed would reconstruct a DIFFERENT keypair and so a different
+        // signature), and (2) it must cryptographically VERIFY under that seed's own public key.
+        let sent = fake
+            .use_request_bodies
+            .lock()
+            .last()
+            .cloned()
+            .expect("a use request reached the fake averin");
+        let use_sig_b64 = sent["use_sig"].as_str().unwrap().to_string();
+        let nonce = sent["nonce"].as_str().unwrap().to_string();
+        let params_nonce = sent["params_nonce"].as_str().unwrap().to_string();
+        let params = sent["params"].as_str().unwrap().as_bytes().to_vec();
+
+        let credential_binding = crate::averin::pop::credential_binding(&capability).unwrap();
+        let params_commitment =
+            crate::averin::pop::params_commitment(&params, &params_nonce).unwrap();
+        let challenge = crate::averin::pop::use_pop_challenge(
+            &grant_id,
+            resource_id,
+            &entry.action,
+            &params_commitment,
+            &credential_binding,
+            &nonce,
+        );
+
+        let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
+        let recomputed_sig = keypair.sign_b64(&challenge);
+        assert_eq!(
+            recomputed_sig, use_sig_b64,
+            "the rebuilt use PoP (post-rekey seed) must reproduce the EXACT signature the worker \
+             sent (RFC 8032 determinism) — proving the seed round-tripped through the key change \
+             byte-for-byte"
+        );
+
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let sig_bytes: [u8; 64] = b64
+            .decode(&use_sig_b64)
+            .unwrap()
+            .try_into()
+            .expect("a 64-byte ed25519 signature");
+        let pubkey_bytes: [u8; 32] = b64
+            .decode(keypair.agent_pubkey_b64())
+            .unwrap()
+            .try_into()
+            .expect("a 32-byte ed25519 public key");
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes).unwrap();
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        use ed25519_dalek::Verifier;
+        assert!(
+            verifying_key.verify(&challenge, &signature).is_ok(),
+            "the rebuilt use PoP must cryptographically verify under the post-rekey seed's public key"
+        );
     }
 }
 

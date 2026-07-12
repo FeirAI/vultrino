@@ -87,6 +87,26 @@ pub enum StorageError {
 
     #[error("averin durable queue directory is owned by another live process: {0}")]
     AverinQueueBusy(String),
+
+    /// Plan 088 D8: an averin durable-seal store's file/segment failed to decrypt under the vault's
+    /// just-derived master key at OPEN time. The queue is eager (it must replay its live map at open),
+    /// so this is the on-open mid-rekey signal: a `vultrino rekey` that committed this store's rename
+    /// under a NEW key but crashed before the vault's own (LAST) rename leaves the vault still
+    /// deriving the OLD key while this file is already NEW-key-only — never a corrupted/mixed-key
+    /// store (the generation-swap protocol, D8, guarantees that), only a stale cross-reference between
+    /// two otherwise-intact generations. Fails closed with this clear diagnostic rather than a silent
+    /// brick or a partially-open averin subsystem; recovery is `re-run vultrino rekey offline to
+    /// completion` (the same residual the pre-088 two-file rekey already documented, now covering the
+    /// larger averin file set). The popkey/quarantine stores are lazy (whole-file, read on first touch,
+    /// mirroring `OutboxStore`) and so surface this SAME failure mode lazily on their first touch after
+    /// open, not synchronously at this point — consistent with, not a regression from, that existing
+    /// precedent.
+    #[error(
+        "averin durable-seal store at {0} could not be decrypted under the vault's current key — \
+         this looks like an interrupted 'vultrino rekey' (D8): re-run 'vultrino rekey' offline to \
+         completion"
+    )]
+    AverinStaleKey(String),
 }
 
 /// Outcome of reserving an [`Idempotency-Key`](StorageBackend::idempotency_check_or_reserve)

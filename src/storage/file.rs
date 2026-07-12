@@ -6,6 +6,8 @@ use super::averin_deadletter::AverinDeadLetterStore;
 use super::averin_queue::AverinQueue;
 use super::outbox_store::OutboxStore;
 use super::popkey_store::PopKeyStore;
+#[cfg(test)]
+use super::popkey_store::PopKeyEntry;
 use super::{ExecutionClaim, IdempotencyState, StorageBackend, StorageError};
 use crate::approval::{tenant_may_act, ApprovalRequest};
 use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
@@ -280,7 +282,18 @@ impl AverinStores {
     /// THIS process then has no durable averin stores and seals via the 087 async fail-open path
     /// instead (the durable queue is single-writer-PROCESS — see `AverinQueue`'s "Cross-process
     /// safety" doc). `Ok(Some(_))` when this process owns the durable queue; `Err` on a real failure.
+    ///
+    /// **D8 — the on-open mid-rekey signal.** `AverinQueue::open` eagerly decrypts its latest snapshot
+    /// (it must, to rebuild the live map before serving) — so a decrypt failure here (an
+    /// `Encryption`/`CryptoError` from a wrong-key GCM auth-tag mismatch, never any other error kind)
+    /// under the just-derived `master_key` means this directory's files are on a DIFFERENT generation
+    /// than the vault: an interrupted `vultrino rekey` committed the queue's rename but crashed before
+    /// the vault's own (LAST) rename — see [`FileStorage::rekey_blocking`]'s crash-ordering doc. Mapped
+    /// to [`StorageError::AverinStaleKey`] so the operator gets a clear, specific diagnostic (never a
+    /// silent brick, never a partial open — the whole `FileStorage::create`/`load` call this feeds
+    /// fails closed).
     fn open(vault: &Path, master_key: &Arc<MasterKey>) -> Result<Option<Self>, StorageError> {
+        let queue_dir_for_err = averin_queue_dir(vault);
         let queue = match open_averin_queue_blocking(averin_queue_dir(vault), Arc::clone(master_key)) {
             Ok(q) => q,
             Err(StorageError::AverinQueueBusy(dir)) => {
@@ -292,6 +305,12 @@ impl AverinStores {
                      seal fail-open."
                 );
                 return Ok(None);
+            }
+            Err(StorageError::Encryption(inner)) => {
+                return Err(StorageError::AverinStaleKey(format!(
+                    "{} ({inner})",
+                    queue_dir_for_err.display()
+                )));
             }
             Err(e) => return Err(e),
         };
@@ -1028,19 +1047,40 @@ impl FileStorage {
     /// Under the vault fd-lock: decrypt the secrets vault AND the split outbox file with the CURRENT
     /// master key, derive a fresh key from `new_password` + a NEW salt using the SAME pinned KDF params
     /// (#12 — never reset/bump: a shifted param would derive a different key and brick the vault), then
-    /// re-encrypt and atomically swap BOTH files. [`STORAGE_VERSION`] and the outbox file version are
+    /// re-encrypt and atomically swap the vault + outbox + (plan 088 D8, when averin is enabled) the
+    /// three averin durable-seal stores. [`STORAGE_VERSION`] and the outbox/averin file versions are
     /// PRESERVED — a re-key rotates the key, not the on-disk format (so this is a no-op on the data).
     ///
-    /// TWO-FILE NON-ATOMICITY: the vault and outbox are separate files with separate renames sharing one
-    /// key. Both tmp files are written + fsynced BEFORE either rename, and the two renames run
-    /// back-to-back (outbox FIRST, vault LAST) so the crash window is only the gap between two rename
-    /// syscalls. The vault (the salt/KDF anchor + the secrets) is swapped LAST, so a crash mid-swap
-    /// leaves the AUTHORITATIVE vault OLD and intact — fail-closed: never a half-re-keyed vault, and no
-    /// secret is lost. Even so, RUN THIS OFFLINE (service stopped): a crash strictly between the two
-    /// renames leaves outbox=new-key / vault=old-key, and the next open (old password → old vault → old
-    /// key) can't decrypt the new-key outbox until the re-key is re-run to completion. The fd-lock also
-    /// keeps a live server from racing the swap. On any step error the operation aborts leaving the old
-    /// files intact.
+    /// **D8 — averin's three encrypted files are rotated too.** `self.averin` is `None` unless this
+    /// instance was opened with averin enabled ([`Self::new_with_averin`]); when it is `None`, this
+    /// method is BYTE-IDENTICAL to the pre-088 two-file rekey below (no averin tmp is ever prepared, no
+    /// averin rename ever runs, no averin directory is ever touched). When averin IS enabled, the
+    /// averin USE queue (`averin_queue.rs`'s [`super::averin_queue::AverinQueue::rekey_prepare`] —
+    /// compacts the live map into a single new-key snapshot segment, since this runs OFFLINE the O(n)
+    /// rewrite is fine), the PoP-key store, and the dead-letter quarantine (the latter two mirroring
+    /// [`OutboxStore::rekey_prepare`]'s whole-file pattern exactly) are folded into the SAME generation
+    /// swap as the outbox — otherwise `vultrino rekey` would rotate the vault+outbox but leave these
+    /// three files under the OLD key, bricking them on the very next open.
+    ///
+    /// GENERATION-SWAP NON-ATOMICITY (SPIKE-VALIDATED, plan 088 header INCREMENT-3): the vault, outbox,
+    /// and (when present) the three averin files are separate files/directory with separate renames
+    /// sharing one key. EVERY tmp is written + fsynced BEFORE any rename, and the renames then run
+    /// back-to-back in a fixed order — the averin files (queue, popkeys, deadletter), THEN the outbox,
+    /// THEN the vault LAST — so the crash window is only the gap between rename syscalls, never a torn
+    /// write. The vault (the salt/KDF anchor + the secrets) is swapped LAST — the spike proved this
+    /// exact shape (prepare a full new generation, switch ONE authoritative pointer via atomic `rename`
+    /// LAST) survives a crash injected at every step: exactly one complete generation is ever live, zero
+    /// mixed-key records — so a crash mid-swap leaves the AUTHORITATIVE vault OLD and intact:
+    /// fail-closed, never a half-re-keyed vault, and no secret is lost. Even so, RUN THIS OFFLINE
+    /// (service stopped): a crash strictly between two renames leaves a later file already new-key while
+    /// the vault (and anything renamed after the crash point) is still old-key, and the next open (old
+    /// password → old vault → old key) can't decrypt an already-new-key file until the re-key is re-run
+    /// to completion — the SAME residual the pre-088 two-file case already documented, now spanning a
+    /// larger file set. On OPEN, a new-file decrypt failure under the just-derived key is exactly this
+    /// mid-rekey signal (see [`AverinStores::open`]'s handling) — it fails closed with a clear
+    /// "re-run vultrino rekey" error, never a silent brick or a partial open. The fd-lock also keeps a
+    /// live server from racing the swap. On any step error the operation aborts leaving the old files
+    /// intact.
     ///
     /// This finalizes the on-disk vault but does NOT rotate this in-memory handle's key; the caller is
     /// an offline one-shot (`vultrino rekey`) that exits, and must re-open with the new password to use
@@ -1095,8 +1135,41 @@ impl FileStorage {
         // 4. Prepare the outbox tmp likewise (Ok(None) if no outbox file exists yet).
         let outbox_tmp = self.outbox.rekey_prepare(&new_key)?;
 
-        // 5. Commit with both tmps already durable: rename the outbox FIRST, then the vault LAST (see the
-        //    two-file note above) so a crash mid-swap leaves the authoritative vault old-and-intact.
+        // 4b. D8: prepare the three averin durable-seal stores likewise, ONLY when averin is enabled
+        //     for this instance (`self.averin` is `Some`). An averin-DISABLED rekey never even
+        //     evaluates this branch, so it is BYTE-IDENTICAL to the pre-088 two-file rekey above: no
+        //     averin tmp is ever created, no averin directory is ever touched. The queue's `rekey_prepare`
+        //     always produces a snapshot (a directory always "exists" once averin is enabled); the
+        //     popkey/quarantine stores mirror the outbox's `Option<PathBuf>` shape (no file yet if that
+        //     store never wrote anything).
+        let averin_staged = match &self.averin {
+            Some(a) => Some((
+                a.queue.rekey_prepare(&new_key)?,
+                a.popkeys.rekey_prepare(&new_key)?,
+                a.deadletter.rekey_prepare(&new_key)?,
+            )),
+            None => None,
+        };
+
+        // 5. Commit with EVERY tmp already durable: rename the averin files, THEN the outbox, THEN the
+        //    vault LAST (see the crash-ordering doc above) so a crash mid-swap leaves the authoritative
+        //    vault old-and-intact. Averin's three renames run FIRST among this set (harmless — nothing
+        //    reads them until the worker/seal-client reopens under the NEW key, which only happens after
+        //    a full successful rekey + restart).
+        if let Some((queue_staged, popkeys_tmp, deadletter_tmp)) = &averin_staged {
+            // `self.averin` is `Some` here — `averin_staged` was built from it just above.
+            let averin = self
+                .averin
+                .as_ref()
+                .expect("averin_staged is Some only when self.averin is Some");
+            averin.queue.rekey_commit(queue_staged)?;
+            if let Some(tmp) = popkeys_tmp {
+                averin.popkeys.rekey_commit(tmp)?;
+            }
+            if let Some(tmp) = deadletter_tmp {
+                averin.deadletter.rekey_commit(tmp)?;
+            }
+        }
         if let Some(tmp) = &outbox_tmp {
             self.outbox.rekey_commit(tmp)?;
         }
@@ -3382,5 +3455,157 @@ mod tests {
             "the pinned KDF params are preserved across a re-key"
         );
         assert_eq!(after.kdf, crate::crypto::KdfParams::default());
+    }
+
+    /// Plan 088 D8 — an averin-DISABLED rekey must be BYTE-IDENTICAL to the pre-088 two-file rekey:
+    /// no averin tmp/rename ever happens, no averin file/dir is ever created or touched. This is the
+    /// explicit negative-space proof the `self.averin.is_some()` gate in `rekey_blocking` claims.
+    #[tokio::test]
+    async fn rekey_with_averin_disabled_never_touches_any_averin_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let old_pw = SecretString::from("old-master-password");
+        let new_pw = SecretString::from("new-master-password");
+
+        // `FileStorage::new` (never `new_with_averin`) — averin is `None` on this instance.
+        let storage = FileStorage::new(&path, &old_pw).await.unwrap();
+        storage.store(&test_credential("stripe")).await.unwrap();
+        storage
+            .append_event("subj", "evt", serde_json::json!({"n": 1}))
+            .await
+            .unwrap();
+
+        storage.rekey(&new_pw).await.unwrap();
+        drop(storage);
+
+        // No averin file or directory was ever created by the rekey.
+        assert!(!path.with_file_name("averin-queue").exists());
+        assert!(!path.with_file_name("averin-popkeys.enc").exists());
+        assert!(!path.with_file_name("averin-deadletter.enc").exists());
+        assert!(!path.with_file_name("averin-popkeys.enc.rekey.tmp").exists());
+        assert!(!path.with_file_name("averin-deadletter.enc.rekey.tmp").exists());
+
+        // The vault + outbox still rotate and reopen normally under the new password.
+        let reopened = FileStorage::new(&path, &new_pw).await.unwrap();
+        assert!(reopened.get_by_alias("stripe").await.unwrap().is_some());
+        assert_eq!(reopened.list_events_after(0, 100).await.unwrap().len(), 1);
+    }
+
+    /// Plan 088 D8 — the spike-validated crash-ordering discipline, extended to the larger averin file
+    /// set: prepare every tmp, commit the averin stores + outbox, then simulate a crash STRICTLY
+    /// BEFORE the vault's own (LAST) rename by simply not performing it. This proves two things: (a)
+    /// the AUTHORITATIVE vault is old-and-intact — reopening with the OLD password still works, byte-
+    /// for-byte, never a half-re-keyed vault; and (b) the mid-rekey state is detected, not silently
+    /// bricked or partially served — reopening WITH averin enabled (necessarily still under the OLD
+    /// password, since the vault never rotated) fails closed with a clear
+    /// [`StorageError::AverinStaleKey`] rather than succeeding wrongly or hanging.
+    #[tokio::test]
+    async fn rekey_crash_before_vault_rename_leaves_vault_old_and_intact_and_averin_reopen_fails_closed(
+    ) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let old_pw = SecretString::from("old-master-password");
+        let new_pw = SecretString::from("new-master-password");
+
+        let storage = FileStorage::new_with_averin(&path, &old_pw, true)
+            .await
+            .unwrap();
+        storage.store(&test_credential("stripe")).await.unwrap();
+        let queue = storage.averin_queue().expect("queue constructed");
+        queue
+            .append("tok-1", "averin.use", serde_json::json!({"n": 1}))
+            .unwrap();
+        storage
+            .averin_popkeys()
+            .unwrap()
+            .insert(
+                "tok-1",
+                PopKeyEntry {
+                    pop_seed: [7u8; 32],
+                    action: "db.query:orders-ro".to_string(),
+                    scope: "read:orders".to_string(),
+                    use_limit: Some(3),
+                    capability: None,
+                    grant_id: None,
+                    minted_at: Utc::now(),
+                    grant_delivered_at: None,
+                    grant_expires_at: None,
+                    abandoned: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Capture the vault's on-disk bytes BEFORE simulating the crash, to assert byte-for-byte
+        // intactness after (not just "still opens").
+        let vault_bytes_before = std::fs::read(&path).unwrap();
+
+        // Run the SAME prepare+commit sequence `rekey_blocking` runs, but STOP before the final vault
+        // rename — this is exactly the crash point plan 088's header (INCREMENT-3) injected at every
+        // step of the generation swap.
+        {
+            let new_salt = generate_salt();
+            let new_key = derive_key(&new_pw, &new_salt, storage.kdf).unwrap();
+            let averin = storage.averin.as_ref().expect("averin enabled");
+            let queue_staged = averin.queue.rekey_prepare(&new_key).unwrap();
+            let popkeys_tmp = averin.popkeys.rekey_prepare(&new_key).unwrap();
+            let deadletter_tmp = averin.deadletter.rekey_prepare(&new_key).unwrap();
+            let outbox_tmp = storage.outbox.rekey_prepare(&new_key).unwrap();
+
+            averin.queue.rekey_commit(&queue_staged).unwrap();
+            if let Some(tmp) = &popkeys_tmp {
+                averin.popkeys.rekey_commit(tmp).unwrap();
+            }
+            if let Some(tmp) = &deadletter_tmp {
+                averin.deadletter.rekey_commit(tmp).unwrap();
+            }
+            if let Some(tmp) = &outbox_tmp {
+                storage.outbox.rekey_commit(tmp).unwrap();
+            }
+            // Deliberately DO NOT rename the vault tmp into place — the simulated crash point.
+        }
+        drop(storage); // release the vault fd-lock + the averin queue's owner lock
+
+        // (a) The authoritative vault is OLD-and-intact: byte-for-byte unchanged, and the OLD password
+        // still opens it (averin disabled here — just proving the vault itself, independent of the
+        // averin subsystem's own fail-closed check below).
+        let vault_bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            vault_bytes_before, vault_bytes_after,
+            "a crash before the vault's rename must leave it byte-for-byte untouched"
+        );
+        let reopened_vault_only = FileStorage::new(&path, &old_pw).await.unwrap();
+        assert!(reopened_vault_only
+            .get_by_alias("stripe")
+            .await
+            .unwrap()
+            .is_some());
+        drop(reopened_vault_only);
+
+        // (b) Opening WITH averin enabled — necessarily under the OLD password, since the vault never
+        // rotated — must fail CLOSED with a clear stale-key diagnostic (the averin files are already
+        // under the NEW key), never a silent brick and never a partial open.
+        let reopen_result = FileStorage::new_with_averin(&path, &old_pw, true).await;
+        match reopen_result {
+            Ok(_) => panic!(
+                "opening averin under a stale key must fail closed, never silently succeed"
+            ),
+            Err(err @ StorageError::AverinStaleKey(_)) => {
+                let rendered = err.to_string();
+                assert!(
+                    rendered.contains("rekey"),
+                    "the stale-key error must point the operator at re-running rekey: {rendered}"
+                );
+            }
+            Err(other) => panic!(
+                "expected a fail-closed StorageError::AverinStaleKey, got: {other:?}"
+            ),
+        }
+
+        // Recovery (documented residual, mirrors the pre-088 two-file note): re-running rekey to
+        // completion from a state where the averin files are already new-key but the vault is not yet
+        // rotated is the SAME widened crash window the two-file case already accepted — this test's
+        // job is to prove the vault is fail-closed and intact, and that the mismatch is DETECTED, not
+        // silently served.
     }
 }

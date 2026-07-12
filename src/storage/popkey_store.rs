@@ -40,7 +40,7 @@
 //! [`PopKeyStore::evict_resolved`]'s doc for the exact contract.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -391,6 +391,58 @@ impl PopKeyStore {
     fn file_change_token(&self) -> Option<(SystemTime, u64)> {
         let meta = std::fs::metadata(&self.path).ok()?;
         Some((meta.modified().ok()?, meta.len()))
+    }
+
+    // ---- offline vault re-key (FileStorage::rekey delegates the popkey half here; plan 088 D8) ----
+
+    /// Prepare the popkey half of an offline vault re-key: under this store's fd-lock, decrypt the
+    /// file with the CURRENT (shared) master key and write a `.rekey.tmp` re-encrypted with
+    /// `new_key`, fsynced but NOT yet renamed. Returns the tmp path for the caller to commit (via
+    /// [`Self::rekey_commit`]) so this file's rename lands back-to-back with the vault's/outbox's/
+    /// other averin stores' — see `FileStorage::rekey_blocking`'s crash-ordering doc (D8: averin
+    /// files + outbox rename FIRST, the authoritative vault LAST). Returns `Ok(None)` when no popkey
+    /// file exists yet (nothing to re-encrypt). [`POPKEY_FILE_VERSION`] is PRESERVED — a re-key
+    /// rotates the key, never the format. On any error the live file is left untouched (fail-closed).
+    /// Mirrors `OutboxStore::rekey_prepare` exactly.
+    pub(super) fn rekey_prepare(&self, new_key: &MasterKey) -> Result<Option<PathBuf>, StorageError> {
+        let mut flock = self.lock_file_exclusive()?;
+        let _guard = flock.write().map_err(StorageError::Io)?;
+        if !self.path.exists() {
+            return Ok(None); // no popkey file yet -> nothing to re-encrypt
+        }
+        // Decrypt with the OLD (shared) master key still held by this process.
+        let cache = self.read_from_disk()?;
+        let data =
+            serde_json::to_vec(&cache).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let encrypted = encrypt(&data, new_key)?;
+        let file = PopKeyFile {
+            version: POPKEY_FILE_VERSION, // PRESERVED — key changes, format does not
+            data: encrypted,
+        };
+        let content = serde_json::to_string_pretty(&file)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let tmp = self.path.with_extension("rekey.tmp");
+        // fsync the tmp BEFORE returning so the re-encrypted bytes are durable before the caller's
+        // rename makes them visible (same crash discipline as write_to_disk).
+        {
+            let f = create_private_file(&tmp)?;
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(f);
+            w.write_all(content.as_bytes())?;
+            w.flush()?;
+            w.into_inner()
+                .map_err(|e| StorageError::Io(e.into_error()))?
+                .sync_all()?;
+        }
+        Ok(Some(tmp))
+    }
+
+    /// Commit the popkey half of an offline vault re-key: atomically rename the `.rekey.tmp` from
+    /// [`Self::rekey_prepare`] over the live popkey file and fsync the parent directory.
+    pub(super) fn rekey_commit(&self, tmp: &Path) -> Result<(), StorageError> {
+        std::fs::rename(tmp, &self.path)?;
+        fsync_parent_dir(&self.path)?;
+        Ok(())
     }
 }
 

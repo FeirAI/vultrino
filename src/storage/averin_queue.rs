@@ -1156,6 +1156,89 @@ impl AverinQueue {
             .map(|(_, path, _)| path)
             .expect("at least one delta segment always exists after open()")
     }
+
+    // ---- offline vault re-key (FileStorage::rekey delegates the queue half here; plan 088 D8) ----
+
+    /// D8: prepare the queue's half of an offline vault re-key. Captures the FULL current live state
+    /// (the reused `OutboxCache` map + the `resolved_grants` side map) under the in-memory lock —
+    /// the SAME snapshot-capture discipline [`Self::compact`] uses — and re-encrypts it as ONE fresh
+    /// snapshot, written to a `.rekey.tmp` path and fsynced, but NOT YET renamed into the live segment
+    /// sequence. This collapses the queue's entire history into a single new-key snapshot, which is
+    /// acceptable OFFLINE (D8: "so the O(n) rewrite is acceptable" — rekey is a one-shot `vultrino
+    /// rekey` run, never the `/execute` hot path). The OLD (still old-key) delta/snapshot segments are
+    /// left in place on disk; [`Self::rekey_commit`] never deletes them itself. They are harmless
+    /// (never read again once a HIGHER-indexed snapshot exists — [`Self::open`]'s replay always starts
+    /// from the highest-indexed snapshot) and are swept by `open`'s own existing best-effort hygiene
+    /// the next time this directory is opened — mirrors the spike's proven "prepare a full new
+    /// generation, switch one pointer, GC the old generation after" protocol (plan 088's header,
+    /// INCREMENT-3). On any error the live queue is left completely untouched (fail-closed).
+    pub(super) fn rekey_prepare(&self, new_key: &MasterKey) -> Result<QueueRekeyStaged, StorageError> {
+        let mem = self.mem.lock();
+        let snapshot = QueueSnapshot {
+            cache: mem.cache.clone(),
+            resolved_grants: mem.resolved_grants.clone(),
+        };
+        drop(mem); // the slow encrypt+write below doesn't need the cache lock any further
+
+        // Choose an index strictly ABOVE every existing segment (delta or snapshot) so that, once
+        // committed, this new-key snapshot is the ONLY segment `open()` will use as its replay base
+        // (mirrors `compact`'s "one snapshot at the highest index wins" contract) — the queue's whole
+        // history collapses into it. `.rekey.tmp` (below) is not a recognized segment extension
+        // (`parse_segment_name` only knows `.delta`/`.snapshot`), so a stale leftover from a PRIOR
+        // interrupted rekey attempt never perturbs this computation, and a retried `rekey_prepare`
+        // deterministically recomputes (and overwrites) the same tmp path.
+        let existing = list_segments(&self.dir)?;
+        let new_index = existing
+            .iter()
+            .map(|(index, _, _)| *index)
+            .max()
+            .map_or(0, |m| m + 1);
+
+        let data = serde_json::to_vec(&snapshot)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let encrypted = encrypt(&data, new_key)?;
+        let file = SnapshotFile {
+            version: SNAPSHOT_FILE_VERSION, // PRESERVED — key changes, format does not
+            data: encrypted,
+        };
+        let content =
+            serde_json::to_string(&file).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let final_path = self.dir.join(segment_name(new_index, true));
+        let tmp_path = self.dir.join(format!("{:020}.rekey.tmp", new_index));
+        // fsync the tmp BEFORE returning, same discipline as `write_snapshot`/`OutboxStore::rekey_prepare`:
+        // the eventual rename gives crash-atomicity, only `sync_all` gives crash-DURABILITY of the bytes.
+        {
+            let f = create_private_file(&tmp_path)?;
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(f);
+            w.write_all(content.as_bytes())?;
+            w.flush()?;
+            w.into_inner()
+                .map_err(|e| StorageError::Io(e.into_error()))?
+                .sync_all()?;
+        }
+        Ok(QueueRekeyStaged { tmp_path, final_path })
+    }
+
+    /// Commit the queue's half of an offline vault re-key (D8): atomically rename the prepared
+    /// new-key snapshot from [`Self::rekey_prepare`] into place as a real segment — by construction
+    /// the highest-indexed one, so it becomes the ONLY segment a fresh [`Self::open`] replays from —
+    /// and fsync the parent directory. This is the queue's analog of `OutboxStore::rekey_commit`; see
+    /// `FileStorage::rekey_blocking`'s crash-ordering doc for why this (and the other averin stores)
+    /// must be committed BEFORE the vault.
+    pub(super) fn rekey_commit(&self, staged: &QueueRekeyStaged) -> Result<(), StorageError> {
+        std::fs::rename(&staged.tmp_path, &staged.final_path)?;
+        fsync_parent_dir(&staged.final_path)?;
+        Ok(())
+    }
+}
+
+/// The staged (prepared-but-not-yet-committed) output of [`AverinQueue::rekey_prepare`]: the new-key
+/// snapshot's tmp path (already written + fsynced) and the real segment path [`AverinQueue::rekey_commit`]
+/// will atomically rename it to.
+pub(super) struct QueueRekeyStaged {
+    tmp_path: PathBuf,
+    final_path: PathBuf,
 }
 
 #[cfg(test)]
