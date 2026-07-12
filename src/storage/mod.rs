@@ -711,6 +711,15 @@ pub trait StorageBackend: Send + Sync {
         None
     }
 
+    /// The averin dead-letter quarantine store (D4). See [`Self::averin_durable_queue`]'s doc for the
+    /// gating contract — `Some`/`None` always agree with the other two averin handles. Plan 088 Step
+    /// 6a's periodic worker uses this (alongside the queue + popkey handles above) to reach all three
+    /// averin stores generically over `Arc<dyn StorageBackend>`, without downcasting to the concrete
+    /// `FileStorage`.
+    fn averin_durable_deadletter(&self) -> Option<Arc<AverinDeadLetterStore>> {
+        None
+    }
+
     // ==================== Policy Storage (admin API, V1) ====================
     //
     // Policies pushed at runtime via the admin API. Distinct from the static

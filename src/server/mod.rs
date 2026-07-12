@@ -3210,6 +3210,36 @@ const AVERIN_OUTBOX_BATCH: usize = 64;
 /// guards only against a stuck task within THIS same process.
 const AVERIN_OUTBOX_LEASE_SECS: u64 = 30;
 
+/// Default interval for the background averin durable-queue delivery pass (plan 088 Step 6a),
+/// mirroring [`OUTBOX_DELIVERY_SECS`]'s role for the govder outbox.
+pub const AVERIN_OUTBOX_DELIVERY_SECS: u64 = 5;
+
+/// Run the GC/compaction tick on this many delivery passes, mirroring [`OUTBOX_GC_EVERY`]'s role —
+/// so it isn't on the hot delivery path.
+const AVERIN_GC_EVERY: u64 = 60;
+
+/// Max delivery attempts before an `averin.grant`/`averin.use` event dead-letters (plan 088 D4),
+/// mirroring `OutboxConfig::default().max_attempts` (`src/outbox.rs:737` — the govder outbox's own
+/// default of 8). No dedicated `[averin]` config knob exists for this yet (out of this step's scope,
+/// which only spawns the worker + closes the GC/D4 gaps); a fixed default matches the existing
+/// hardcoded [`AVERIN_OUTBOX_BATCH`]/[`AVERIN_OUTBOX_LEASE_SECS`] constants above, which are the same
+/// kind of averin-worker constant with no config surface either.
+const AVERIN_MAX_ATTEMPTS: u32 = 8;
+
+/// Bounded sensitive-data retention window (D4): how long a quarantined record's raw `params` survive
+/// before the GC tick's [`AverinDeadLetterStore::purge_expired_params`] call redacts them, keeping
+/// only non-sensitive metadata for the audit trail. Mirrors `OutboxConfig::default().retention_secs`
+/// (2 days, `src/outbox.rs:742`) — same reasoning as [`AVERIN_MAX_ATTEMPTS`] for why this is a fixed
+/// constant rather than a new config field at this step.
+const AVERIN_QUARANTINE_PARAMS_RETENTION_SECS: u64 = 2 * 24 * 3600;
+
+/// The averin queue's own bounded-growth alarm threshold ([`AverinQueue::stuck_undelivered_count`]),
+/// carried over from `OutboxStore::gc`'s alarm contract (D0). Reuses the same window as
+/// [`AVERIN_QUARANTINE_PARAMS_RETENTION_SECS`] for consistency; the two are conceptually independent
+/// (one store's params-redaction window, the other's undelivered-event alarm) but there is no reason
+/// for them to differ absent an operator-specified need.
+const AVERIN_QUEUE_RETENTION_SECS: u64 = 2 * 24 * 3600;
+
 /// Run a synchronous, potentially fsync-blocking [`crate::storage::AverinQueue`] call without
 /// stalling a multi-thread tokio runtime's worker for the whole wait — the exact "match runtime
 /// flavor" idiom `PopKeyStore`/`AverinDeadLetterStore` already use for their own blocking file I/O
@@ -3505,17 +3535,12 @@ pub async fn deliver_averin_outbox_once(
                     "AVERIN-SEAL-DEADLETTERED averin durable event exhausted delivery attempts — \
                      moved to quarantine"
                 );
-                if let Err(qe) = quarantine.quarantine(final_event, chrono::Utc::now()).await {
-                    // Never propagated via `?`: a quarantine-move failure must not abort the rest
-                    // of this pass (that would resurrect exactly the freeze D4 exists to prevent).
-                    warn!(
-                        target: "averin_seal",
-                        error = %qe,
-                        sequence,
-                        "failed to move dead-lettered averin event into quarantine (it stays \
-                         terminal in the active queue; a later pass should retry the move)"
-                    );
-                }
+                // A record can dead-letter (by construction) only ONCE — `record_delivery` returns
+                // `true` exactly on that one transition — so it is never already in quarantine here;
+                // `already_quarantined = false` always holds at this call site (contrast the GC-tick
+                // retry-sweep below, which re-visits a record whose quarantine move already succeeded
+                // in an earlier pass and must NOT re-upsert it).
+                quarantine_and_reclaim_dead_letter(final_event, queue, quarantine, false).await;
             }
             Ok(false) => {}
             Err(e) => {
@@ -3529,6 +3554,209 @@ pub async fn deliver_averin_outbox_once(
         }
     }
     Ok(())
+}
+
+/// D4's completeness fix (plan 088 Step 6a) — the true "MOVE", shared by two call sites: the worker's
+/// own just-dead-lettered-this-pass branch above (always `already_quarantined = false` — see its call
+/// site's comment) and the periodic GC tick's retry-sweep (below), which re-visits any `DeadLettered`
+/// record still sitting in the live queue map (one whose quarantine-move and/or reclaim failed in an
+/// EARLIER pass — a terminal `DeadLettered` record is never re-claimed by [`AverinQueue::claim`], so
+/// this sweep is the only thing that ever retries it).
+///
+/// **Invariant (D4, load-bearing):** [`AverinQueue::reclaim_dead_letter`] — which is what actually
+/// drops the record (and its raw `params`) from the active queue — is called ONLY after the
+/// quarantine write is confirmed durable (either just now, or already durable from an earlier pass).
+/// On a quarantine-write failure, this returns without reclaiming: the record stays `DeadLettered` in
+/// the active queue (never pruned unquarantined — that would lose the only surviving copy of the
+/// audit record) and the next GC tick's sweep retries it.
+///
+/// `already_quarantined` skips a redundant [`AverinDeadLetterStore::quarantine`] upsert for a record
+/// the sweep already confirmed (via [`AverinDeadLetterStore::contains`]) is durably quarantined —
+/// re-quarantining it would silently reset an operator's `Acknowledged`/`Abandoned` decision, or a
+/// since-expired `params_purged` redaction, back to a fresh `Open`/unpurged record.
+async fn quarantine_and_reclaim_dead_letter(
+    event: crate::outbox::OutboxEvent,
+    queue: &crate::storage::AverinQueue,
+    quarantine: &crate::storage::AverinDeadLetterStore,
+    already_quarantined: bool,
+) {
+    let sequence = event.sequence;
+    let subject = event.subject.clone();
+    if !already_quarantined {
+        if let Err(qe) = quarantine.quarantine(event, chrono::Utc::now()).await {
+            // Never propagated via `?`: a quarantine-move failure must not abort the rest of the
+            // caller's pass (that would resurrect exactly the freeze D4 exists to prevent).
+            warn!(
+                target: "averin_seal",
+                error = %qe,
+                sequence,
+                subject = %subject,
+                "failed to move dead-lettered averin event into quarantine (it stays terminal in \
+                 the active queue, unreclaimed; the periodic GC tick's retry-sweep will retry the \
+                 move)"
+            );
+            return;
+        }
+    }
+    // The quarantine copy is now durable (either just written, or already durable from an earlier
+    // pass) — complete the MOVE: drop the record from the active queue so its raw `params` leave
+    // this store (and every future snapshot) entirely.
+    if let Err(re) = run_averin_queue_blocking(|| queue.reclaim_dead_letter(sequence)) {
+        warn!(
+            target: "averin_seal",
+            error = %re,
+            sequence,
+            subject = %subject,
+            "quarantined a dead-lettered averin event but failed to reclaim it from the active \
+             queue (the audit copy is already durable in quarantine, so this is retryable, not a \
+             loss; the periodic GC tick's retry-sweep will retry the reclaim)"
+        );
+    }
+}
+
+/// Background loop driving the averin durable-queue delivery worker + its periodic GC/compaction tick
+/// (plan 088 Step 6a) — a SIBLING of [`deliver_outbox_periodically`] above (D1: never a branch of it),
+/// spawned in `main.rs` in BOTH entry points, gated on `[averin] enabled && durable` AND this process
+/// owning the durable queue (Step 3a's single-writer-PROCESS `flock` — the caller checks
+/// `storage.averin_durable_queue().is_some()` before ever constructing this future, so a sibling
+/// process that lost that race never even calls this function; it seals via the 087 async fail-open
+/// path instead). Runs entirely IN the queue-owning process, exactly like [`deliver_averin_outbox_once`]
+/// itself.
+pub async fn deliver_averin_outbox_periodically(
+    queue: Arc<crate::storage::AverinQueue>,
+    popkeys: Arc<crate::storage::PopKeyStore>,
+    quarantine: Arc<crate::storage::AverinDeadLetterStore>,
+    averin_client: Arc<crate::averin::AverinClient>,
+    interval: std::time::Duration,
+) {
+    let mut ticks: u64 = 0;
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Err(e) =
+            deliver_averin_outbox_once(&queue, &popkeys, &quarantine, &averin_client, AVERIN_MAX_ATTEMPTS)
+                .await
+        {
+            warn!(error = %e, "averin durable delivery pass failed");
+        }
+        ticks = ticks.wrapping_add(1);
+        if ticks.is_multiple_of(AVERIN_GC_EVERY) {
+            run_averin_gc_tick(&queue, &popkeys, &quarantine).await;
+        }
+    }
+}
+
+/// One GC/compaction tick for the averin durable-seal stores (plan 088 Step 6a), run periodically off
+/// the hot delivery path by [`deliver_averin_outbox_periodically`] above. Order matters (mirrors D2's
+/// documented cross-store contract: "the popkey `gc(now)` runs on the same periodic tick as the queue
+/// GC, AFTER it"):
+///
+/// 1. **Queue compaction** (D0): fold delta segments into a fresh snapshot — the ONE O(n) operation,
+///    off the append hot path — bounding replay time/disk. A [`AverinQueue::reclaim_dead_letter`]
+///    (D4) that already ran (in the worker pass or the retry-sweep below) means a reclaimed record's
+///    raw `params` are ALREADY gone from the live map before this snapshot is even taken, so they
+///    never reappear in it.
+/// 2. **D4 retry-sweep**: any `DeadLettered` record still sitting in the live queue (its quarantine
+///    move and/or reclaim failed in an earlier pass — see [`quarantine_and_reclaim_dead_letter`]'s
+///    doc) gets that move re-attempted, fail-closed against clobbering an operator's quarantine
+///    decision ([`AverinDeadLetterStore::contains`] gates a redundant re-quarantine).
+/// 3. **The bounded-growth alarm** (D0, carried over from `OutboxStore::gc`): a non-zero
+///    [`AverinQueue::stuck_undelivered_count`] means delivery is stalled and the journal is growing.
+/// 4. **The quarantine's own bounded sensitive-data retention** (D4): redact raw `params` past the
+///    window, independent of whatever the queue side is doing.
+/// 5. **Cross-store popkey eviction** (D2): `PopKeyStore::evict_resolved` with the REAL
+///    `subject_has_live_use`/`subject_has_replayable_dead_letter` predicates — both fail closed
+///    toward retention (an unreadable quarantine listing skips eviction for this tick entirely rather
+///    than guess; `AverinQueue::has_pending_for_subject` cannot fail, it is a pure in-memory read).
+async fn run_averin_gc_tick(
+    queue: &crate::storage::AverinQueue,
+    popkeys: &crate::storage::PopKeyStore,
+    quarantine: &crate::storage::AverinDeadLetterStore,
+) {
+    // 1. Queue compaction (D0) — off the hot path, the one O(n) operation.
+    if let Err(e) = run_averin_queue_blocking(|| queue.compact()) {
+        warn!(error = %e, "averin queue compaction failed");
+    }
+
+    // 2. D4 retry-sweep: complete the MOVE for any record a prior pass left DeadLettered-but-
+    // unreclaimed in the live map (a terminal DeadLettered record is never re-claimed by `claim()`,
+    // so this sweep is the only thing that ever retries it).
+    let stragglers = run_averin_queue_blocking(|| queue.dead_lettered_events());
+    for event in stragglers {
+        let sequence = event.sequence;
+        let already_quarantined = match quarantine.contains(sequence).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    sequence,
+                    "failed to check whether a dead-lettered averin event is already quarantined — \
+                     skipping its retry-sweep this tick (fail-closed: never risk re-quarantining and \
+                     clobbering an operator decision on a bad read)"
+                );
+                continue;
+            }
+        };
+        quarantine_and_reclaim_dead_letter(event, queue, quarantine, already_quarantined).await;
+    }
+
+    // 3. The bounded-growth alarm (D0), carried over from `OutboxStore::gc`'s alarm contract.
+    let stuck = run_averin_queue_blocking(|| queue.stuck_undelivered_count(AVERIN_QUEUE_RETENTION_SECS));
+    if stuck > 0 {
+        warn!(
+            count = stuck,
+            "averin durable queue retains events older than the retention window because they are \
+             undelivered (pending/dead-lettered-unreclaimed); delivery may be stalled and the \
+             journal will grow until they resolve"
+        );
+    }
+
+    // 4. The quarantine's own bounded sensitive-data retention (D4) — independent of the queue side.
+    let now = chrono::Utc::now();
+    if let Some(before) = chrono::Duration::try_seconds(AVERIN_QUARANTINE_PARAMS_RETENTION_SECS as i64)
+        .and_then(|d| now.checked_sub_signed(d))
+    {
+        match quarantine.purge_expired_params(before).await {
+            Ok(0) => {}
+            Ok(purged) => info!(purged, "averin quarantine redacted raw params past the retention window"),
+            Err(e) => warn!(error = %e, "averin quarantine params-purge pass failed"),
+        }
+    }
+
+    // 5. Cross-store popkey eviction (D2) — the real queue/quarantine predicates, fail-closed toward
+    // retention. `quarantine.list()` is fetched ONCE up front (not per-candidate inside the closure,
+    // which must stay synchronous) and turned into a set of subjects with an OPEN, unpurged (i.e.
+    // still `replay`-eligible) record; a listing failure skips eviction entirely THIS tick rather than
+    // guess — over-retention (a resolved subject's seed lingers one more tick) is always the safe
+    // failure mode here, never under-retention.
+    let replayable_subjects: Option<std::collections::HashSet<String>> = match quarantine.list().await {
+        Ok(records) => Some(
+            records
+                .into_iter()
+                .filter(|r| r.status == crate::storage::QuarantineStatus::Open && !r.params_purged)
+                .map(|r| r.event.subject)
+                .collect(),
+        ),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "averin quarantine listing failed during popkey GC — skipping popkey eviction this \
+                 tick (fail-closed toward retention, D2)"
+            );
+            None
+        }
+    };
+    if let Some(replayable_subjects) = replayable_subjects {
+        let subject_has_live_use = |subject: &str| queue.has_pending_for_subject(subject);
+        let subject_has_replayable_dead_letter = |subject: &str| replayable_subjects.contains(subject);
+        match popkeys
+            .evict_resolved(subject_has_live_use, subject_has_replayable_dead_letter)
+            .await
+        {
+            Ok(0) => {}
+            Ok(evicted) => info!(evicted, "averin popkey GC evicted fully-resolved subjects' PoP seeds"),
+            Err(e) => warn!(error = %e, "averin popkey GC eviction pass failed"),
+        }
+    }
 }
 
 /// Background loop that reconciles intent-staged events (D1 transactional outbox) to the outbox on a
@@ -4454,6 +4682,180 @@ mod averin_worker_tests {
 
         assert!(queue.deliverable(10).is_empty());
         assert!(deadletter.list().await.unwrap().is_empty());
+    }
+
+    // ---- Plan 088 Step 6a: D4 completeness (the "MOVE") + the GC tick ----
+
+    /// A quarantine-move FAILURE must NOT reclaim the record: D4's invariant is "reclaimable by GC
+    /// ONLY after it is durably in the quarantine" — never before. This forces a REAL (not mocked)
+    /// I/O failure on every quarantine-store operation by pointing its path at
+    /// `<a regular file>/deadletter.enc`: the store's lock-file sidecar can't be created because a
+    /// component of its own path is a plain file, not a directory.
+    #[tokio::test]
+    async fn averin_worker_deadletter_whose_quarantine_move_fails_is_not_reclaimed_params_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, _unused) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+        fake.fail_use_actions.lock().insert("action-fail".to_string());
+
+        let bad_parent = dir.path().join("not-a-directory");
+        std::fs::write(&bad_parent, b"occupied").unwrap();
+        let key = Arc::new(MasterKey::from_bytes(vec![5u8; 32]).unwrap());
+        let broken_deadletter = AverinDeadLetterStore::new(bad_parent.join("deadletter.enc"), key);
+
+        popkeys
+            .insert("tok-fail", popkey_entry("action-fail", "read:orders"))
+            .await
+            .unwrap();
+        queue.append("tok-fail", "averin.grant", serde_json::json!({})).unwrap();
+        let use_seq = queue
+            .append(
+                "tok-fail",
+                "averin.use",
+                use_payload("SECRET_PARAMS_never_lost", "req-fail", 1),
+            )
+            .unwrap();
+
+        // max_attempts=1: dead-letters on the first failed attempt. The subsequent quarantine-move
+        // MUST fail (the broken store) — `deliver_averin_outbox_once` itself must still return `Ok`,
+        // never aborting the whole pass over a quarantine-move failure.
+        deliver_averin_outbox_once(&queue, &popkeys, &broken_deadletter, &client, 1)
+            .await
+            .expect("a quarantine-move failure must not abort the whole delivery pass");
+
+        // NEVER reclaimed: the record stays DeadLettered in the active queue with its raw params
+        // intact — the audit trail is never lost just because the quarantine write happened to fail.
+        let still_there = queue
+            .get(use_seq)
+            .expect("a failed quarantine-move must NOT reclaim the record from the active queue");
+        assert_eq!(still_there.delivery, DeliveryState::DeadLettered);
+        assert_eq!(
+            still_there.payload["params"], "SECRET_PARAMS_never_lost",
+            "raw params must be preserved in the queue when the quarantine move failed"
+        );
+    }
+
+    /// The GC tick's retry-sweep (Step 6a) completes a MOVE a prior worker pass couldn't: dead-letter
+    /// a use against a BROKEN quarantine store first (so it's left DeadLettered-but-unreclaimed in
+    /// the live queue, its raw params still present), then run `run_averin_gc_tick` against the REAL
+    /// quarantine store — the straggler must be found, quarantined, and reclaimed this time. This is
+    /// exactly the "a later pass should retry the move" contract `quarantine_and_reclaim_dead_letter`
+    /// documents.
+    #[tokio::test]
+    async fn averin_gc_tick_retry_sweep_completes_a_previously_failed_quarantine_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+        fake.fail_use_actions.lock().insert("action-sweep".to_string());
+
+        popkeys
+            .insert("tok-sweep", popkey_entry("action-sweep", "read:orders"))
+            .await
+            .unwrap();
+        queue.append("tok-sweep", "averin.grant", serde_json::json!({})).unwrap();
+        let use_seq = queue
+            .append("tok-sweep", "averin.use", use_payload("SWEEP_SECRET", "req-sweep", 1))
+            .unwrap();
+
+        let bad_parent = dir.path().join("not-a-directory");
+        std::fs::write(&bad_parent, b"occupied").unwrap();
+        let broken_key = Arc::new(MasterKey::from_bytes(vec![9u8; 32]).unwrap());
+        let broken_deadletter = AverinDeadLetterStore::new(bad_parent.join("deadletter.enc"), broken_key);
+
+        deliver_averin_outbox_once(&queue, &popkeys, &broken_deadletter, &client, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            queue.get(use_seq).unwrap().delivery,
+            DeliveryState::DeadLettered,
+            "left unreclaimed after the broken quarantine attempt"
+        );
+
+        // Now run the GC tick against the REAL (working) quarantine store: its retry-sweep must find
+        // the still-DeadLettered straggler and complete the move.
+        run_averin_gc_tick(&queue, &popkeys, &deadletter).await;
+
+        assert!(
+            queue.get(use_seq).is_none(),
+            "the retry-sweep must reclaim the straggler once quarantine succeeds — no trace of the \
+             record (or its raw params) survives in the live queue"
+        );
+        let quarantined = deadletter.list().await.unwrap();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].event.subject, "tok-sweep");
+        assert_eq!(
+            quarantined[0].event.payload["params"], "SWEEP_SECRET",
+            "the quarantine copy retains the raw params (until its own purge window)"
+        );
+    }
+
+    /// The GC tick's cross-store popkey eviction (D2), exercised against the REAL queue + quarantine
+    /// predicates the tick wires up (not the injected test closures `PopKeyStore`'s own unit tests
+    /// use): a resolved subject's seed is evicted ONLY when the queue has no live use AND the
+    /// quarantine has no replayable dead-letter for it — fail-closed toward retention otherwise.
+    #[tokio::test]
+    async fn averin_gc_tick_evicts_popkey_seed_only_when_fully_resolved_with_no_blockers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let now = chrono::Utc::now();
+
+        // A: grant resolved, no queue entry at all, no quarantine entry -> fully resolved, no
+        // blockers -> the tick must evict it.
+        popkeys.insert("A", popkey_entry("action-a", "read:orders")).await.unwrap();
+        popkeys
+            .grant_resolved("A", "cap-a".into(), "grant-a".into(), now, None)
+            .await
+            .unwrap();
+
+        // B: grant resolved, but a Pending use still sits in the queue -> a live use blocks eviction.
+        popkeys.insert("B", popkey_entry("action-b", "read:orders")).await.unwrap();
+        popkeys
+            .grant_resolved("B", "cap-b".into(), "grant-b".into(), now, None)
+            .await
+            .unwrap();
+        queue.append("B", "averin.use", use_payload("pb", "req-b", 1)).unwrap();
+
+        // C: grant resolved, no live use in the queue, but an OPEN unpurged quarantine record exists
+        // for it -> a replayable dead-letter blocks eviction.
+        popkeys.insert("C", popkey_entry("action-c", "read:orders")).await.unwrap();
+        popkeys
+            .grant_resolved("C", "cap-c".into(), "grant-c".into(), now, None)
+            .await
+            .unwrap();
+        deadletter
+            .quarantine(
+                OutboxEvent {
+                    sequence: 999,
+                    subject: "C".to_string(),
+                    event_type: "averin.use".to_string(),
+                    payload: serde_json::json!({"params": "pc"}),
+                    created_at: now,
+                    delivery: DeliveryState::DeadLettered,
+                    attempts: 8,
+                    leased_until: None,
+                    last_attempt_at: None,
+                    last_error: Some("boom".to_string()),
+                    dedup_id: None,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        // D: the grant never delivered (not resolved, not abandoned) -> never even a candidate.
+        popkeys.insert("D", popkey_entry("action-d", "read:orders")).await.unwrap();
+
+        run_averin_gc_tick(&queue, &popkeys, &deadletter).await;
+
+        assert!(popkeys.get("A").await.unwrap().is_none(), "A: fully resolved, no blockers -> evicted");
+        assert!(popkeys.get("B").await.unwrap().is_some(), "B: a live use must block eviction");
+        assert!(
+            popkeys.get("C").await.unwrap().is_some(),
+            "C: a replayable dead-letter must block eviction"
+        );
+        assert!(popkeys.get("D").await.unwrap().is_some(), "D: never resolved -> never evicted");
     }
 }
 

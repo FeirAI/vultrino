@@ -309,6 +309,32 @@ impl AverinDeadLetterStore {
         Ok(self.cache.read().entries.len())
     }
 
+    /// Whether `sequence` currently has ANY quarantine record (any status). Plan 088 Step 6a's GC-tick
+    /// retry-sweep uses this to avoid re-calling [`Self::quarantine`] (an UPSERT) for a record already
+    /// durably quarantined — re-quarantining it would silently reset an operator's
+    /// `Acknowledged`/`Abandoned` decision, or a since-set `params_purged` flag, back to a fresh
+    /// `Open`/unpurged record. The sweep calls this FIRST and only quarantines when it answers `false`.
+    pub async fn contains(&self, sequence: u64) -> Result<bool, StorageError> {
+        self.reload().await?;
+        Ok(self.cache.read().entries.contains_key(&sequence))
+    }
+
+    /// Plan 088 D2's `subject_has_replayable_dead_letter` cross-store predicate for
+    /// `PopKeyStore::evict_resolved`'s GC tick: does `subject` have at least one quarantined record
+    /// that is still [`Self::replay`]-eligible (`Open` and its raw `params` not yet purged) — the
+    /// EXACT same gate `replay` itself enforces, so this answers "would `replay` succeed for this
+    /// subject right now" without duplicating that method's rejection arms. An `Acknowledged`/
+    /// `Abandoned` record, or one whose params already expired ([`Self::purge_expired_params`]),
+    /// never blocks eviction — the seed it might have needed to re-sign a replay is no longer usable
+    /// for that purpose anyway.
+    pub async fn has_replayable_for_subject(&self, subject: &str) -> Result<bool, StorageError> {
+        self.reload().await?;
+        let c = self.cache.read();
+        Ok(c.entries
+            .values()
+            .any(|r| r.event.subject == subject && r.status == QuarantineStatus::Open && !r.params_purged))
+    }
+
     // ---- internal persistence (mirrors PopKeyStore's locked_mutate / reload on its own file) ----
 
     async fn locked_mutate<T>(
@@ -649,6 +675,54 @@ mod tests {
         // touch the still-recent record.
         let purged_again = s.purge_expired_params(cutoff).await.unwrap();
         assert_eq!(purged_again, 0);
+    }
+
+    #[tokio::test]
+    async fn contains_reflects_presence_regardless_of_status() {
+        let (s, _d) = store();
+        assert!(!s.contains(1).await.unwrap());
+        s.quarantine(use_event(1, "tok-a", "p"), Utc::now()).await.unwrap();
+        assert!(s.contains(1).await.unwrap());
+        s.ack(1).await.unwrap();
+        assert!(s.contains(1).await.unwrap(), "Acknowledged is still present, not gone");
+        assert!(s.purge(1).await.unwrap());
+        assert!(!s.contains(1).await.unwrap(), "purge actually removes it");
+    }
+
+    // ---- D2 cross-store predicate: `has_replayable_for_subject` ----
+
+    #[tokio::test]
+    async fn has_replayable_for_subject_true_only_for_an_open_unpurged_record() {
+        let (s, _d) = store();
+        assert!(
+            !s.has_replayable_for_subject("tok-a").await.unwrap(),
+            "no quarantined record at all -> not replayable"
+        );
+
+        s.quarantine(use_event(1, "tok-a", "p"), Utc::now()).await.unwrap();
+        assert!(
+            s.has_replayable_for_subject("tok-a").await.unwrap(),
+            "a fresh Open, unpurged record IS replayable"
+        );
+        assert!(
+            !s.has_replayable_for_subject("tok-b").await.unwrap(),
+            "a different subject is unaffected"
+        );
+
+        // Acknowledged -> no longer replayable.
+        s.ack(1).await.unwrap();
+        assert!(!s.has_replayable_for_subject("tok-a").await.unwrap());
+
+        // Abandoned -> no longer replayable either.
+        s.quarantine(use_event(2, "tok-c", "p"), Utc::now()).await.unwrap();
+        s.abandon("tok-c").await.unwrap();
+        assert!(!s.has_replayable_for_subject("tok-c").await.unwrap());
+
+        // Open but past its params-purge window -> no longer replayable (mirrors `replay`'s own gate).
+        s.quarantine(use_event(3, "tok-d", "p"), Utc::now()).await.unwrap();
+        let cutoff = Utc::now() + chrono::Duration::seconds(1);
+        s.purge_expired_params(cutoff).await.unwrap();
+        assert!(!s.has_replayable_for_subject("tok-d").await.unwrap());
     }
 
     #[tokio::test]

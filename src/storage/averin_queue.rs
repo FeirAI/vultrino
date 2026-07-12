@@ -168,6 +168,16 @@ enum Delta {
     /// Not yet emitted by any Step-1 code path (GC/dead-letter quarantine is plan 088 D4, a later
     /// step) but defined now so the frame format is stable and round-trip-tested from the start.
     Prune { upto_seq: u64 },
+    /// D4's "true MOVE", completed (plan 088 Step 6a): drop exactly ONE sequence from the live map —
+    /// deliberately NOT a prefix operation like [`Delta::Prune`], because a mid-sequence `DeadLetter`
+    /// can resolve (via the worker's quarantine call) while LOWER-numbered sequences for OTHER
+    /// subjects are still genuinely `Pending`; a prefix drop would wrongly discard those too.
+    /// **Invariant (D4, load-bearing): the caller ([`AverinQueue::reclaim_dead_letter`]) commits this
+    /// ONLY for a sequence already `DeadLettered` AND already durably copied into the quarantine
+    /// store** (`AverinDeadLetterStore::quarantine` must have returned `Ok` first) — never for a
+    /// still-`Pending`/`Delivered` record, and never for a `DeadLettered` record whose quarantine-move
+    /// has not (yet) succeeded, or the audit copy could be lost with no surviving record anywhere.
+    Reclaimed { seq: u64 },
     /// averin's response to `POST /v2/grants` resolved for `token_id` (plan 088 D3). Recorded in THIS
     /// journal (not only the popkey store) so a crash between the grant delivering and the popkey
     /// write-back can be reconciled by replaying the queue that already knows the outcome.
@@ -391,6 +401,9 @@ fn apply_delta(cache: &mut OutboxCache, resolved: &mut HashMap<String, ResolvedG
         }
         Delta::Prune { upto_seq } => {
             cache.outbox.retain(|seq, _| *seq > upto_seq);
+        }
+        Delta::Reclaimed { seq } => {
+            cache.outbox.remove(&seq);
         }
         Delta::GrantResolved {
             token_id,
@@ -1052,6 +1065,70 @@ impl AverinQueue {
         mem.cache.outbox.get(&sequence).cloned()
     }
 
+    /// D4's completeness fix (plan 088 Step 6a) — the true "MOVE": durably drop `sequence` from the
+    /// live map now that it has been copied into the quarantine store. The caller (the averin worker's
+    /// dead-letter path, `deliver_averin_outbox_once`) MUST call this ONLY after
+    /// `AverinDeadLetterStore::quarantine` has already returned `Ok` for this exact record — never
+    /// before, and never on a quarantine failure (the record then stays `DeadLettered` here, retried
+    /// next pass, so the audit copy is never silently lost with nothing durable anywhere). A no-op
+    /// (`Ok(())`, no commit) if `sequence` is absent or not (no longer) `DeadLettered` — defensive
+    /// against a duplicate/late call (e.g. the worker retrying after it crashed between the quarantine
+    /// write and this call: quarantine's own `quarantine()` upsert is idempotent, and calling this
+    /// twice for an already-reclaimed sequence is harmless).
+    ///
+    /// Deliberately a SINGLE-sequence removal ([`Delta::Reclaimed`]), not [`Self::compact`]'s
+    /// contiguous-prefix `Prune`: a mid-queue dead-letter must become reclaimable independent of
+    /// whatever lower-numbered, still-genuinely-`Pending` events for OTHER subjects remain — exactly
+    /// the "one subject's dead-letter must not freeze GC of later subjects" bug D4 exists to fix. Once
+    /// removed here, the record is gone from every future snapshot ([`Self::compact`]) too — its raw
+    /// `params` no longer exist in this store at all, only in the quarantine (which redacts them
+    /// independently on its own retention window).
+    pub fn reclaim_dead_letter(&self, sequence: u64) -> Result<(), StorageError> {
+        let mut mem = self.mem.lock();
+        match mem.cache.outbox.get(&sequence) {
+            Some(e) if e.delivery == DeliveryState::DeadLettered => {}
+            _ => return Ok(()),
+        }
+        let delta = Delta::Reclaimed { seq: sequence };
+        let frame = seal_delta(&delta, &self.master_key)?;
+        self.writer.commit(frame)?;
+        mem.cache.outbox.remove(&sequence);
+        Ok(())
+    }
+
+    /// Whether the live map holds a `Pending` (unclaimed OR leased — both are the `Pending` delivery
+    /// state, see the module's reused `OutboxCache`) event for `subject` — plan 088 D2's
+    /// `subject_has_live_use` predicate for `PopKeyStore::evict_resolved`'s cross-store query. A
+    /// `Delivered`/`DeadLettered` event never counts (terminal — the seed's continued need, if any, is
+    /// the quarantine's `subject_has_replayable_dead_letter` predicate's job to answer, not this one's).
+    /// Cheap: an in-memory scan under the same lock every other read-only accessor here uses (no I/O,
+    /// so — unlike [`Self::compact`]/[`Self::claim`]/[`Self::record_delivery`] — this never needs the
+    /// worker's `run_averin_queue_blocking` blocking-thread dance).
+    pub fn has_pending_for_subject(&self, subject: &str) -> bool {
+        let mem = self.mem.lock();
+        mem.cache
+            .outbox
+            .values()
+            .any(|e| e.subject == subject && e.delivery == DeliveryState::Pending)
+    }
+
+    /// Every currently `DeadLettered` event still sitting in the live map — i.e. one whose D4
+    /// quarantine-move and/or [`Self::reclaim_dead_letter`] has not (yet) succeeded. A terminal
+    /// `DeadLettered` record is never re-claimed by [`Self::claim`] (only `Pending` events are), so
+    /// this is the ONLY way a periodic GC tick can find a record whose dead-letter transition
+    /// happened but whose move to quarantine didn't complete in the same worker pass (a transient
+    /// quarantine-store I/O error, or a crash between the two writes) — the retry-sweep this method
+    /// backs (plan 088 Step 6a). Cheap in-memory scan; expected to normally be empty or near-empty.
+    pub fn dead_lettered_events(&self) -> Vec<OutboxEvent> {
+        let mem = self.mem.lock();
+        mem.cache
+            .outbox
+            .values()
+            .filter(|e| e.delivery == DeliveryState::DeadLettered)
+            .cloned()
+            .collect()
+    }
+
     /// EVERY event in the live map regardless of delivery/subject state (test-only introspection).
     /// [`Self::deliverable`] deliberately returns only ONE (the earliest-pending) event per subject —
     /// exactly right for the delivery worker, wrong for asserting "how many records actually survived
@@ -1437,5 +1514,105 @@ mod tests {
         let q2 = AverinQueue::open(dir.path().to_path_buf(), key()).unwrap();
         assert_eq!(q2.all_events().len(), 1, "the reopened owner replays the prior record");
         drop(q2);
+    }
+
+    // ---- D4 completeness (plan 088 Step 6a): the true "MOVE" ----
+
+    #[test]
+    fn reclaim_dead_letter_removes_a_deadlettered_record_and_its_params_from_the_live_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+        let seq = q
+            .append("tok-a", "averin.use", serde_json::json!({"params": "SECRET_PARAMS"}))
+            .unwrap();
+        q.claim(10, 60).unwrap();
+        // max_attempts=1: the first failed attempt dead-letters immediately.
+        let dead_lettered = q.record_delivery(seq, false, Some("boom".into()), 1).unwrap();
+        assert!(dead_lettered, "the single allowed attempt must dead-letter");
+        assert_eq!(q.get(seq).unwrap().delivery, DeliveryState::DeadLettered);
+
+        // Reclaim (simulating the worker's post-quarantine-success MOVE): the record — and its raw
+        // params — are GONE from the live map entirely, not merely re-tagged.
+        q.reclaim_dead_letter(seq).unwrap();
+        assert!(q.get(seq).is_none(), "the dead-lettered record must leave the live map");
+        assert!(
+            q.all_events().is_empty(),
+            "no trace of the record (or its params) survives in the live map"
+        );
+
+        // The removal is itself durable: a reopen must NOT resurrect the reclaimed record.
+        drop(q);
+        let q2 = reopen(dir.path());
+        assert!(
+            q2.all_events().is_empty(),
+            "the reclaim must survive a crash/reopen, not just live in memory"
+        );
+    }
+
+    #[test]
+    fn reclaim_dead_letter_survives_compaction_the_record_never_reappears_in_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+        let a = q.append("A", "averin.use", serde_json::json!({"params": "p"})).unwrap();
+        let b = q.append("B", "averin.use", serde_json::json!({"params": "p"})).unwrap();
+        q.claim(10, 60).unwrap();
+        assert!(q.record_delivery(a, false, Some("boom".into()), 1).unwrap());
+        assert!(!q.record_delivery(b, true, None, 1).unwrap());
+        q.reclaim_dead_letter(a).unwrap();
+
+        // Compact (the periodic GC tick's snapshot rewrite, D0): only B survives into the snapshot —
+        // A's reclaim already dropped it, so it never reappears via compaction either.
+        q.compact().unwrap();
+        drop(q);
+        let q2 = reopen(dir.path());
+        let remaining = q2.all_events();
+        assert_eq!(remaining.len(), 1, "only B survives compaction: {remaining:?}");
+        assert_eq!(remaining[0].sequence, b);
+    }
+
+    #[test]
+    fn reclaim_dead_letter_is_a_noop_on_a_still_pending_or_delivered_or_unknown_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+        let pending = q.append("A", "averin.use", serde_json::json!({})).unwrap();
+        let delivered = q.append("B", "averin.use", serde_json::json!({})).unwrap();
+        q.claim(10, 60).unwrap();
+        assert!(!q.record_delivery(delivered, true, None, 8).unwrap());
+
+        // Never reclaim a still-Pending or a Delivered record — reclaim is D4's dead-letter-only MOVE.
+        q.reclaim_dead_letter(pending).unwrap();
+        q.reclaim_dead_letter(delivered).unwrap();
+        assert_eq!(q.get(pending).unwrap().delivery, DeliveryState::Pending);
+        assert_eq!(q.get(delivered).unwrap().delivery, DeliveryState::Delivered);
+
+        // An unknown sequence is a harmless no-op too (defensive against a duplicate/late call).
+        q.reclaim_dead_letter(9999).unwrap();
+    }
+
+    #[test]
+    fn has_pending_for_subject_reflects_only_the_pending_delivery_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+        assert!(!q.has_pending_for_subject("A"), "unknown subject has no live use");
+
+        let a = q.append("A", "averin.use", serde_json::json!({})).unwrap();
+        assert!(q.has_pending_for_subject("A"), "a fresh Pending event is live");
+
+        q.claim(10, 60).unwrap();
+        assert!(q.record_delivery(a, false, Some("boom".into()), 1).unwrap()); // -> DeadLettered
+        assert!(
+            !q.has_pending_for_subject("A"),
+            "a terminal DeadLettered record is not a live use (D2's predicate is Pending-only)"
+        );
+
+        let b = q.append("B", "averin.use", serde_json::json!({})).unwrap();
+        q.claim(10, 60).unwrap(); // leases B — still `Pending`, just leased
+        assert!(
+            q.has_pending_for_subject("B"),
+            "a leased-but-Pending event still counts as live (per the module's Pending model)"
+        );
+
+        assert!(!q.record_delivery(b, true, None, 8).unwrap()); // -> Delivered
+        assert!(!q.has_pending_for_subject("B"), "a Delivered record is not a live use");
     }
 }

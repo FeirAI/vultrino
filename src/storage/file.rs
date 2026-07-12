@@ -2079,6 +2079,10 @@ impl StorageBackend for FileStorage {
         self.averin_popkeys().cloned()
     }
 
+    fn averin_durable_deadletter(&self) -> Option<Arc<AverinDeadLetterStore>> {
+        self.averin_deadletter().cloned()
+    }
+
     // ==================== Policy Storage (admin API, V1) ====================
 
     async fn store_policy(&self, policy: &Policy) -> Result<(), StorageError> {
