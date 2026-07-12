@@ -17,12 +17,84 @@
 pub mod pop;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use tokio::sync::Semaphore;
 
 use pop::PopKeypair;
+
+/// Plan 087 — greppable fail-open seal counters (the metric half of the alarm).
+/// Per-process, in-memory, shared across `AverinClient` clones via `Arc`. Paired
+/// with the distinct `AVERIN-SEAL-FAILED` / `AVERIN-SEAL-DROPPED` log lines and
+/// surfaced on `GET /api/v1/metrics`. Plan 085 independently detects the unsealed
+/// actions these counters count.
+#[derive(Default)]
+pub struct SealMetrics {
+    /// Use receipts sealed successfully (sync or async path).
+    sealed: AtomicU64,
+    /// Seal attempts that failed or timed out — fail-open, the action still ran.
+    failed: AtomicU64,
+    /// Seals DROPPED because the async fan-out cap was saturated (fail-open gap).
+    dropped: AtomicU64,
+    /// Current in-flight async seal tasks (a gauge, for the cap-holds invariant).
+    in_flight: AtomicU64,
+    /// High-water mark of `in_flight` — proves the cap held under overload.
+    max_in_flight: AtomicU64,
+}
+
+impl SealMetrics {
+    fn record_sealed(&self) {
+        self.sealed.fetch_add(1, Ordering::Relaxed);
+    }
+    fn record_failed(&self) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+    }
+    fn record_dropped(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+    fn enter_inflight(&self) {
+        let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        // Keep `max_in_flight` a monotone high-water mark (best-effort CAS loop).
+        let mut hw = self.max_in_flight.load(Ordering::Relaxed);
+        while now > hw {
+            match self.max_in_flight.compare_exchange_weak(
+                hw,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(cur) => hw = cur,
+            }
+        }
+    }
+    fn leave_inflight(&self) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+    /// Snapshot for the JSON `/api/v1/metrics` read-back and tests.
+    pub fn snapshot(&self) -> SealMetricsSnapshot {
+        SealMetricsSnapshot {
+            sealed: self.sealed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+            max_in_flight: self.max_in_flight.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time snapshot of [`SealMetrics`].
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct SealMetricsSnapshot {
+    pub sealed: u64,
+    pub failed: u64,
+    pub dropped: u64,
+    pub in_flight: u64,
+    pub max_in_flight: u64,
+}
 
 /// Fail-mode on `/execute` when the synchronous seal fails or averin is
 /// unreachable. Mint is always fail-open (a token must not depend on averin).
@@ -60,6 +132,14 @@ pub struct AverinConfig {
     pub timeout: Duration,
     /// TTL (seconds) stamped on minted grants.
     pub grant_ttl_secs: u32,
+    /// Plan 087 — the fan-out bound that matters. Max concurrent in-flight ASYNC
+    /// use-seal tasks (Observe/fail-open mode). A sustained averin outage under
+    /// high `/execute` load must not pile up unbounded spawned tasks → OOM; once
+    /// this many seals are in flight, further seals are DROPPED fail-open (an
+    /// 085-detected gap) rather than blocking `/execute` or growing unboundedly.
+    /// Does NOT bound the synchronous `require_evidence` path (that already blocks
+    /// `/execute`, so it is naturally back-pressured).
+    pub max_inflight_seals: usize,
 }
 
 impl Default for AverinConfig {
@@ -74,6 +154,11 @@ impl Default for AverinConfig {
             mode: AverinMode::Observe,
             timeout: Duration::from_secs(5),
             grant_ttl_secs: 300,
+            // 256 concurrent async seals — enough headroom for a healthy averin's
+            // round-trip under load, small enough that a full outage caps the
+            // extra memory at a few hundred pending tasks (each holds a token id +
+            // params snapshot), then sheds fail-open. Operator-tunable.
+            max_inflight_seals: 256,
         }
     }
 }
@@ -96,6 +181,12 @@ pub struct AverinClient {
     /// token.id -> PopEntry. In-memory and restart-losable (matching the seal's
     /// best-effort posture); durable persistence is Phase-2.
     pop: Arc<Mutex<HashMap<String, PopEntry>>>,
+    /// Plan 087 — bounds concurrent async use-seal tasks (Observe/fail-open). A
+    /// permit is claimed WITHOUT blocking (`try_acquire_owned`) before each spawn;
+    /// on saturation the seal is dropped fail-open instead of blocking `/execute`.
+    seal_permits: Arc<Semaphore>,
+    /// Plan 087 — fail-open seal counters (the metric half of the alarm).
+    metrics: Arc<SealMetrics>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,15 +230,43 @@ impl AverinClient {
             .timeout(cfg.timeout)
             .build()
             .map_err(AverinError::HttpBuild)?;
+        // At least one permit — a zero cap would drop every seal (misconfig, not
+        // intent). The fan-out bound is `max(1, configured)`.
+        let permits = cfg.max_inflight_seals.max(1);
         Ok(Some(Self {
             http,
             cfg: Arc::new(cfg),
             pop: Arc::new(Mutex::new(HashMap::new())),
+            seal_permits: Arc::new(Semaphore::new(permits)),
+            metrics: Arc::new(SealMetrics::default()),
         }))
     }
 
     pub fn mode(&self) -> AverinMode {
         self.cfg.mode
+    }
+
+    /// Snapshot the fail-open seal counters (for `GET /api/v1/metrics` + tests).
+    pub fn metrics(&self) -> SealMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Inject a PoP entry so a unit test can exercise `seal_use`/`spawn_use_seal`
+    /// against a fake/blocked averin WITHOUT a real `/v2/grants` round-trip. A
+    /// capability containing a `.` (e.g. `"AAAA.sig"`) passes `credential_binding`
+    /// so the seal reaches the network; one without a `.` fails there (a
+    /// deterministic, no-network seal failure for the alarm test).
+    #[cfg(test)]
+    fn insert_test_grant(&self, token_id: &str, capability: &str) {
+        self.pop.lock().insert(
+            token_id.to_string(),
+            PopEntry {
+                capability: capability.to_string(),
+                grant_id: "g-test".to_string(),
+                keypair: PopKeypair::generate(),
+                action: "db.query:orders-ro".to_string(),
+            },
+        );
     }
 
     fn url(&self, path: &str) -> String {
@@ -235,30 +354,102 @@ impl AverinClient {
 
     // ---- execute hook ----------------------------------------------------
 
-    /// Synchronous use seal on `/execute` (consume-before-act). Returns `Err`
-    /// ONLY when `mode = require_evidence` and the seal failed (so the caller
-    /// fails the action, fail-closed). In `observe` mode a failure is logged and
-    /// `Ok(())` is returned (fail-open) — the action proceeds.
+    /// SYNCHRONOUS use seal on `/execute` — the strict `require_evidence` path
+    /// (consume-before-act, fail-closed). Returns `Err` ONLY when
+    /// `mode = require_evidence` and the seal failed, so the caller BLOCKS the
+    /// action. In `observe` mode a failure is logged fail-open and `Ok(())` is
+    /// returned — but the production Observe path no longer calls this at all; it
+    /// uses [`Self::spawn_use_seal`] (async, off the hot path). `on_execute` stays
+    /// synchronous-by-design for `require_evidence` and is what the spike calls
+    /// directly to MEASURE the added latency.
     ///
-    /// The spike calls this SYNCHRONOUSLY before the side effect on purpose, to
-    /// measure the added latency; the design doc recommends async as the default.
+    /// **Consume-before-seal caveat (unchanged, out of scope for plan 087):** in
+    /// `require_evidence` the caller has already consumed the `vut_` token before
+    /// reaching here, so a strict block here BURNS the token. Fixing that ordering
+    /// (seal-before-consume, or a consume rollback) is a separate change — plan 087
+    /// only moves the *fail-open* path async, where nothing ever blocks, so this
+    /// caveat is unreachable in the default (Observe) posture.
     pub async fn on_execute(&self, token_id: &str, params: &[u8]) -> Result<(), AverinError> {
         match self.seal_use(token_id, params).await {
             Ok(rid) => {
-                tracing::debug!(target: "averin_seal", token_id, record_id = %rid, "averin use sealed");
+                self.metrics.record_sealed();
+                tracing::debug!(target: "averin_seal", token_id, record_id = %rid, "averin use sealed (sync)");
                 Ok(())
             }
             Err(e) => match self.cfg.mode {
                 AverinMode::RequireEvidence => {
-                    tracing::error!(target: "averin_seal", token_id, error = %e, "averin use seal failed (require_evidence) — BLOCKING action");
+                    self.metrics.record_failed();
+                    // ALARM: greppable marker + counter. token/project context only,
+                    // never a secret or raw params (params are never logged).
+                    tracing::error!(target: "averin_seal", token_id, project_id = %self.cfg.project_id, error = %e, "AVERIN-SEAL-FAILED averin use seal failed (require_evidence) — BLOCKING action");
                     Err(e)
                 }
                 AverinMode::Observe => {
-                    tracing::warn!(target: "averin_seal", token_id, error = %e, "averin use seal failed (observe/fail-open) — action proceeds");
+                    self.metrics.record_failed();
+                    tracing::warn!(target: "averin_seal", token_id, project_id = %self.cfg.project_id, error = %e, "AVERIN-SEAL-FAILED averin use seal failed (observe/fail-open) — action proceeds");
                     Ok(())
                 }
             },
         }
+    }
+
+    /// Plan 087 — the PRODUCTION Observe (fail-open) execute seal: fire-and-forget
+    /// the `POST /v2/use` OFF the `/execute` hot path so `plugin.execute` never
+    /// waits on averin. Returns IMMEDIATELY.
+    ///
+    /// Bounded by `max_inflight_seals`: a permit is claimed WITHOUT blocking
+    /// (`try_acquire_owned`) before the spawn. On saturation (a sustained averin
+    /// outage under load) the seal is DROPPED fail-open — an 085-detected gap —
+    /// rather than blocking `/execute` or spawning unbounded tasks. Drop, failure,
+    /// and timeout each bump a counter AND emit a distinct greppable alarm line
+    /// (`AVERIN-SEAL-DROPPED` / `AVERIN-SEAL-FAILED`) carrying token/project
+    /// context but NEVER a secret or the raw params.
+    ///
+    /// The snapshot-out-of-the-lock in [`Self::seal_use`] means no lock is held
+    /// across the spawned `.await` (STOP-condition check: it is not).
+    pub fn spawn_use_seal(&self, token_id: &str, params: &[u8]) {
+        // Claim a fan-out permit without blocking; saturated → drop fail-open.
+        let permit = match Arc::clone(&self.seal_permits).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                self.metrics.record_dropped();
+                tracing::warn!(
+                    target: "averin_seal",
+                    token_id,
+                    project_id = %self.cfg.project_id,
+                    cap = self.cfg.max_inflight_seals,
+                    "AVERIN-SEAL-DROPPED averin use-seal fan-out cap saturated; seal dropped (fail-open — action proceeded, plan-085 detects the unsealed use)"
+                );
+                return;
+            }
+        };
+        let this = self.clone();
+        let token_id = token_id.to_string();
+        let params = params.to_vec();
+        tokio::spawn(async move {
+            // Held for the seal's whole lifetime; releasing it frees a fan-out slot.
+            let _permit = permit;
+            this.metrics.enter_inflight();
+            let outcome = this.seal_use(&token_id, &params).await;
+            this.metrics.leave_inflight();
+            match outcome {
+                Ok(rid) => {
+                    this.metrics.record_sealed();
+                    tracing::debug!(target: "averin_seal", token_id = %token_id, record_id = %rid, "averin use sealed (async, off the /execute hot path)");
+                }
+                Err(e) => {
+                    this.metrics.record_failed();
+                    // ALARM: token/project context only — params are never logged.
+                    tracing::warn!(
+                        target: "averin_seal",
+                        token_id = %token_id,
+                        project_id = %this.cfg.project_id,
+                        error = %e,
+                        "AVERIN-SEAL-FAILED averin async use-seal failed/timed out (fail-open — action already proceeded; plan-085 detects the unsealed use)"
+                    );
+                }
+            }
+        });
     }
 
     /// Seal `POST /v2/use` under the token's stored grant + PoP key. Returns the
@@ -381,5 +572,142 @@ mod tests {
     #[test]
     fn mode_default_is_fail_open_observe() {
         assert_eq!(AverinMode::default(), AverinMode::Observe);
+    }
+
+    #[test]
+    fn default_config_has_a_sane_fan_out_cap() {
+        // The fan-out bound must be a positive default so the async seal is bounded
+        // out of the box; a zero cap (which would drop every seal) is impossible —
+        // `new` floors it at 1.
+        assert_eq!(AverinConfig::default().max_inflight_seals, 256);
+    }
+
+    // ---- plan 087 async fail-open behaviour --------------------------------
+
+    use std::time::Instant;
+
+    /// An averin that accepts TCP connections but NEVER responds — a seal pointed
+    /// at it stays in-flight until the client timeout. Returns its base_url; the
+    /// accept loop lives on the test runtime and is torn down when it ends.
+    async fn blocked_averin() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream); // hold the connection open, never write a response
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn client_with(base_url: &str, cap: usize, timeout: Duration) -> AverinClient {
+        AverinClient::new(AverinConfig {
+            enabled: true,
+            base_url: base_url.to_string(),
+            resource_id: "orders-db".to_string(),
+            timeout,
+            max_inflight_seals: cap,
+            ..AverinConfig::default()
+        })
+        .expect("client builds")
+        .expect("client is Some when enabled")
+    }
+
+    /// Step 1: in Observe mode the `/execute` seal is fire-and-forget — the hot
+    /// path returns immediately even though averin will hang for the full timeout.
+    #[tokio::test]
+    async fn observe_execute_does_not_wait_on_slow_seal() {
+        let base = blocked_averin().await;
+        let client = client_with(&base, 256, Duration::from_secs(30));
+        client.insert_test_grant("vut_slow", "AAAA.sig");
+
+        let t0 = Instant::now();
+        client.spawn_use_seal("vut_slow", br#"{"q":1}"#);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "spawn_use_seal blocked the /execute hot path for {elapsed:?} (must be fire-and-forget)"
+        );
+
+        // The seal is still in-flight against the blocked averin — not completed.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let m = client.metrics();
+        assert_eq!(m.sealed, 0, "seal must still be in-flight, not sealed");
+        assert!(m.in_flight >= 1, "the spawned seal task must be in flight");
+    }
+
+    /// Step 2: under overload the async fan-out stays bounded — `/execute` never
+    /// blocks, in-flight tasks never exceed the cap, and the surplus is DROPPED
+    /// fail-open (the drop counter increments).
+    #[tokio::test]
+    async fn observe_fan_out_is_bounded_and_drops_on_saturation() {
+        let base = blocked_averin().await;
+        let cap = 8usize;
+        let total = 200usize;
+        let client = client_with(&base, cap, Duration::from_secs(30));
+        for i in 0..total {
+            client.insert_test_grant(&format!("vut_{i}"), "AAAA.sig");
+        }
+
+        let t0 = Instant::now();
+        for i in 0..total {
+            client.spawn_use_seal(&format!("vut_{i}"), b"{}");
+        }
+        let fire_elapsed = t0.elapsed();
+        // (a) /execute never blocks: firing `total` bounded spawns is ~instant.
+        assert!(
+            fire_elapsed < Duration::from_millis(500),
+            "firing {total} bounded seals blocked for {fire_elapsed:?}"
+        );
+
+        // Let the <=cap admitted tasks reach in-flight.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let m = client.metrics();
+        // (b) in-flight never exceeds the cap.
+        assert!(
+            m.max_in_flight <= cap as u64,
+            "in-flight high-water {} exceeded the fan-out cap {cap}",
+            m.max_in_flight
+        );
+        assert!(
+            m.max_in_flight >= 1,
+            "at least one seal should have gone in-flight"
+        );
+        // (c) the surplus was dropped fail-open.
+        assert!(
+            m.dropped >= (total - cap) as u64,
+            "expected >= {} drops on saturation, got {}",
+            total - cap,
+            m.dropped
+        );
+        assert_eq!(m.sealed, 0, "no seal completes against a blocked averin");
+    }
+
+    /// Step 3: a fail-open seal FAILURE fires the alarm counter (paired with the
+    /// greppable `AVERIN-SEAL-FAILED` line on the same branch). A malformed
+    /// capability fails at `credential_binding` — a deterministic, no-network
+    /// failure of the async seal.
+    #[tokio::test]
+    async fn observe_seal_failure_fires_alarm_counter() {
+        // base_url unused (the seal fails before any network), but must be non-empty.
+        let client = client_with("http://127.0.0.1:9", 256, Duration::from_secs(5));
+        client.insert_test_grant("vut_bad", "nodothere"); // no '.' → MalformedCapability
+
+        client.spawn_use_seal("vut_bad", b"{}");
+        // Wait for the spawned task to run.
+        for _ in 0..100 {
+            if client.metrics().failed >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let m = client.metrics();
+        assert_eq!(
+            m.failed, 1,
+            "AVERIN-SEAL-FAILED counter must fire on a failed seal"
+        );
+        assert_eq!(m.sealed, 0);
+        assert_eq!(m.dropped, 0);
     }
 }

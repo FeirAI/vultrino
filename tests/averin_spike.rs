@@ -104,6 +104,7 @@ fn client(base_url: &str, mode: AverinMode) -> AverinClient {
         mode,
         timeout: Duration::from_secs(5),
         grant_ttl_secs: 300,
+        max_inflight_seals: 256,
     })
     .expect("client builds")
     .expect("client is Some when enabled")
