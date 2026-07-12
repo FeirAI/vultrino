@@ -82,24 +82,30 @@
 //! D0's SLO targets, and a real delivery worker (plan 088 Step 3) is normally single-instance per
 //! queue anyway (mirroring `OutboxStore::claim`'s existing single-worker-tick usage pattern).
 //!
-//! # Scope boundary: ONE process per queue directory (Step 1)
+//! # Cross-process safety: single-writer-PROCESS + graceful degradation (Step 3a, Option A)
 //!
-//! Unlike `OutboxStore` (which takes a cross-process `fd_lock` because vultrino's `serve` and `mcp`
-//! subcommands are separate OS processes that can both open the SAME `outbox.enc`), THIS module
-//! assumes a single process holds `AverinQueue::open` for the lifetime of a queue directory — there is
-//! no cross-process locking here, and [`SegmentWriter::create`]'s use of [`create_private_file`]
-//! (which `truncate`s) is safe only because each process picks a FRESH, never-before-seen segment
-//! index on open and while rolling. If a second live process opened the SAME directory concurrently,
-//! both could compute the same "next index" and each `create_private_file` call would truncate the
-//! other's file — real data loss. The Phase-0 spike DID prove a `write()` to an `O_APPEND`-opened file
-//! is atomic across concurrent processes with no lock needed (see the plan's header) — but that
-//! requires opening with `O_APPEND`, which this module does not (it keeps one `std::fs::File` handle
-//! open per segment and relies on sequential same-handle writes instead, which is simpler and
-//! sufficient for one writer). Wiring this queue into `FileStorage::create`/`open` so multiple
-//! processes can share one averin queue directory (mirroring `OutboxStore`'s `fd_lock`, or switching
-//! `SegmentWriter` to `O_APPEND` per the spike) is Step 3's integration work, not this Step's.
+//! This queue is single-writer-PROCESS by design: the append/claim/record_delivery/compact locking
+//! model above (the in-memory `mem` lock + the dedicated group-commit writer thread) is correct and
+//! deadlock-free precisely BECAUSE no cross-process file lock sits in those hot paths. (An earlier
+//! attempt to make the append itself multi-process — `O_APPEND` + a per-reserve `flock` + a segment-
+//! roll `flock` in the writer thread — deadlocked: `claim`/`compact` hold `mem` while waiting on the
+//! writer, the writer took `flock` on a roll, and a concurrent reserve held `flock` while waiting for
+//! `mem` — a three-way cycle. Genuinely-concurrent multi-process durable append is the harder cross-
+//! process-linearizability problem the plan's Phase-0 spike scoped as a separate follow-on; it is NOT
+//! attempted here.)
+//!
+//! Instead, [`AverinQueue::open`] takes an EXCLUSIVE, process-lifetime `flock(LOCK_EX|LOCK_NB)` on
+//! `<dir>/queue.owner.lock` (held by the [`AverinQueue::_owner_lock`] `File` for the queue's whole
+//! lifetime; advisory, auto-released when the struct drops OR the process dies — a crash never strands
+//! it). A SECOND live process opening the same directory gets `EWOULDBLOCK` →
+//! [`StorageError::AverinQueueBusy`], which `FileStorage` turns into "this process has no durable
+//! averin queue and seals via the 087 async fail-open path instead" (graceful + logged, never a hang
+//! or a startup failure). So `serve` and `mcp` can co-run against the same vault: exactly one owns the
+//! durable queue; any other seals fail-open (the 087 default). `SegmentWriter::create`'s truncate is
+//! safe under this lock because only the one owning process ever creates/rolls segments here.
 
 use std::collections::{HashMap, VecDeque};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -685,6 +691,41 @@ pub struct AverinQueue {
     master_key: Arc<MasterKey>,
     mem: Mutex<QueueMemory>,
     writer: Writer,
+    /// The exclusive, process-lifetime ownership lock (`flock` on `<dir>/queue.owner.lock`). Held for
+    /// the queue's entire lifetime so exactly one process operates this directory (see the module doc's
+    /// "Cross-process safety" section). Declared AFTER `writer` so on drop the writer thread joins
+    /// (flushing its last batch) BEFORE this lock releases — a sibling process can't take ownership
+    /// until our writer has fully quiesced. Never read; its Drop is the whole point.
+    _owner_lock: std::fs::File,
+}
+
+/// Acquire the EXCLUSIVE, process-lifetime ownership lock for a queue directory (Step 3a, Option A).
+/// A raw non-blocking `flock(LOCK_EX|LOCK_NB)` on a held-open `<dir>/queue.owner.lock`: advisory,
+/// auto-released when the returned `File` drops or the process dies (a crash never strands it). Returns
+/// [`StorageError::AverinQueueBusy`] if another live process already owns the directory — the caller
+/// (`FileStorage`) degrades that process to 087 async fail-open sealing rather than hanging or failing
+/// startup. The lock file is opened read-write WITHOUT truncation (its bytes are irrelevant; only the
+/// `flock` matters), `0600`.
+fn acquire_owner_lock(dir: &Path) -> Result<std::fs::File, StorageError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join("queue.owner.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?;
+    // SAFETY: `file` owns a valid fd for the duration of the call; `flock` only reads it. `LOCK_NB`
+    // makes contention report via `EWOULDBLOCK` instead of blocking the caller forever.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(file);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Err(StorageError::AverinQueueBusy(dir.display().to_string()));
+    }
+    Err(StorageError::Io(err))
 }
 
 impl AverinQueue {
@@ -694,6 +735,9 @@ impl AverinQueue {
     /// simpler and safer than truncating-then-reopening it).
     pub fn open(dir: PathBuf, master_key: Arc<MasterKey>) -> Result<Self, StorageError> {
         std::fs::create_dir_all(&dir)?;
+        // Claim exclusive process ownership BEFORE any replay/segment side effect (Option A — a busy
+        // queue reports cleanly, never partially opens). Released when the returned struct drops.
+        let owner_lock = acquire_owner_lock(&dir)?;
         let entries = list_segments(&dir)?;
 
         let snapshot_index = entries
@@ -745,6 +789,7 @@ impl AverinQueue {
                 resolved_grants,
             }),
             writer,
+            _owner_lock: owner_lock,
         })
     }
 
@@ -1356,5 +1401,31 @@ mod tests {
             "solo-append p99 grew {worst_ratio:.2}x from the 10-record baseline to the worst later \
              checkpoint — that is the O(n)-per-append regression this benchmark exists to catch"
         );
+    }
+
+    #[test]
+    fn a_second_open_reports_busy_and_reopen_succeeds_after_the_owner_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = || Arc::new(MasterKey::from_bytes(vec![21u8; 32]).unwrap());
+
+        // First open takes exclusive process ownership.
+        let q1 = AverinQueue::open(dir.path().to_path_buf(), key()).unwrap();
+        q1.append("s", "averin.use", serde_json::json!({"n": 1})).unwrap();
+
+        // A SECOND live open on the SAME directory must fail-closed with AverinQueueBusy — never hang,
+        // never corrupt (Option A: single-writer-PROCESS ownership). `flock` mutually excludes even
+        // across two fds within one process, so this holds in-process too.
+        match AverinQueue::open(dir.path().to_path_buf(), key()) {
+            Err(StorageError::AverinQueueBusy(_)) => {}
+            Err(e) => panic!("expected AverinQueueBusy while the owner is held, got a different error: {e:?}"),
+            Ok(_) => panic!("expected AverinQueueBusy while the owner is held, but a second open SUCCEEDED"),
+        }
+
+        // Once the owner drops (releasing the flock), a fresh open on the same dir succeeds AND sees the
+        // durably-appended record — ownership is transferable, only never SHARED.
+        drop(q1);
+        let q2 = AverinQueue::open(dir.path().to_path_buf(), key()).unwrap();
+        assert_eq!(q2.all_events().len(), 1, "the reopened owner replays the prior record");
+        drop(q2);
     }
 }

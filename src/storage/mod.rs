@@ -2,12 +2,14 @@
 //!
 //! Provides traits and implementations for storing credentials securely.
 
+mod averin_deadletter;
 mod averin_queue;
 mod file;
 mod outbox_model;
 mod outbox_store;
 mod popkey_store;
 
+pub use averin_deadletter::{AverinDeadLetterStore, QuarantineRecord, QuarantineStatus};
 pub use averin_queue::AverinQueue;
 pub use file::FileStorage;
 pub use outbox_store::OutboxStore;
@@ -81,6 +83,9 @@ pub enum StorageError {
 
     #[error("Invalid storage configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("averin durable queue directory is owned by another live process: {0}")]
+    AverinQueueBusy(String),
 }
 
 /// Outcome of reserving an [`Idempotency-Key`](StorageBackend::idempotency_check_or_reserve)

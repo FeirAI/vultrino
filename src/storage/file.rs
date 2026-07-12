@@ -2,7 +2,10 @@
 //!
 //! Stores credentials in an encrypted JSON file on disk.
 
+use super::averin_deadletter::AverinDeadLetterStore;
+use super::averin_queue::AverinQueue;
 use super::outbox_store::OutboxStore;
+use super::popkey_store::PopKeyStore;
 use super::{ExecutionClaim, IdempotencyState, StorageBackend, StorageError};
 use crate::approval::{tenant_may_act, ApprovalRequest};
 use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
@@ -207,6 +210,15 @@ pub struct FileStorage {
     /// event append no longer rewrites all secrets). The vault delegates all outbox trait methods to
     /// it; coupled emits (approval decisions) stage an intent in the vault then drain to it.
     outbox: OutboxStore,
+    /// The three averin durable-seal stores (plan 088 D1), constructed ONLY when `[averin] enabled =
+    /// true` was passed to this instance's constructor — `None` otherwise, so a disabled config is
+    /// BYTE-IDENTICAL to pre-088 behavior (no `averin-queue/` dir, no `averin-popkeys.enc`/
+    /// `averin-deadletter.enc` files, no extra locks ever taken). All three share this vault's SAME
+    /// `Arc<MasterKey>` — constructed HERE, where the key is already in scope, never via a widened
+    /// `StorageBackend`-trait accessor (D1). See [`Self::averin_queue`]/[`Self::averin_popkeys`]/
+    /// [`Self::averin_deadletter`] for the accessors plan 088 Step 3b's worker + the seal client hold
+    /// clones from.
+    averin: Option<AverinStores>,
     /// In-memory cache of credentials
     cache: RwLock<StorageCache>,
     /// Salt used for key derivation (stored in file)
@@ -228,6 +240,90 @@ pub struct FileStorage {
 /// (its own PVC in k8s). Its `.lock`/`.tmp` sidecars don't collide with the vault's.
 fn outbox_path(vault: &Path) -> PathBuf {
     vault.with_file_name("outbox.enc")
+}
+
+/// The averin USE queue's OWN directory, a sibling of the vault (plan 088 D1: "live on their OWN
+/// files... siblings of outbox.enc, derive via vault.with_file_name(...)"). A directory (not a single
+/// file) because the queue is itself a segmented append-only journal (`averin_queue.rs`), not a
+/// whole-file store.
+fn averin_queue_dir(vault: &Path) -> PathBuf {
+    vault.with_file_name("averin-queue")
+}
+
+/// The averin PoP-key store's file, a sibling of the vault (plan 088 D2).
+fn averin_popkeys_path(vault: &Path) -> PathBuf {
+    vault.with_file_name("averin-popkeys.enc")
+}
+
+/// The averin dead-letter quarantine store's file, a sibling of the vault (plan 088 D4).
+fn averin_deadletter_path(vault: &Path) -> PathBuf {
+    vault.with_file_name("averin-deadletter.enc")
+}
+
+/// The three averin durable-seal stores (plan 088 D1), held together so [`FileStorage`] has ONE
+/// `Option` to gate rather than three. Each field is an `Arc` so [`FileStorage::averin_queue`]/
+/// [`FileStorage::averin_popkeys`]/[`FileStorage::averin_deadletter`] can hand out cheap clones to
+/// plan 088 Step 3b's delivery worker + the averin seal client, without widening access to the
+/// `Arc<MasterKey>` those stores were built with (D1 — never via a `StorageBackend`-trait accessor).
+#[derive(Clone)]
+struct AverinStores {
+    queue: Arc<AverinQueue>,
+    popkeys: Arc<PopKeyStore>,
+    deadletter: Arc<AverinDeadLetterStore>,
+}
+
+impl AverinStores {
+    /// Construct the three stores for `vault`'s sibling averin files, sharing `master_key`. Blocking
+    /// (the queue's `AverinQueue::open` replays + opens a segment synchronously — see
+    /// [`open_averin_queue_blocking`]'s doc for why this runs off the async executor thread).
+    /// Returns `Ok(None)` when the durable queue directory is already owned by another live process:
+    /// THIS process then has no durable averin stores and seals via the 087 async fail-open path
+    /// instead (the durable queue is single-writer-PROCESS — see `AverinQueue`'s "Cross-process
+    /// safety" doc). `Ok(Some(_))` when this process owns the durable queue; `Err` on a real failure.
+    fn open(vault: &Path, master_key: &Arc<MasterKey>) -> Result<Option<Self>, StorageError> {
+        let queue = match open_averin_queue_blocking(averin_queue_dir(vault), Arc::clone(master_key)) {
+            Ok(q) => q,
+            Err(StorageError::AverinQueueBusy(dir)) => {
+                tracing::warn!(
+                    queue_dir = %dir,
+                    "averin durable queue is owned by another live process; THIS process will seal via \
+                     the async fail-open path (plan 087), NOT durable at-least-once delivery. Run the \
+                     durable-averin tier on ONE vultrino process, or accept that co-running processes \
+                     seal fail-open."
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let popkeys = PopKeyStore::new(averin_popkeys_path(vault), Arc::clone(master_key));
+        let deadletter =
+            AverinDeadLetterStore::new(averin_deadletter_path(vault), Arc::clone(master_key));
+        Ok(Some(Self {
+            queue: Arc::new(queue),
+            popkeys: Arc::new(popkeys),
+            deadletter: Arc::new(deadletter),
+        }))
+    }
+}
+
+/// `AverinQueue::open` is a synchronous, potentially slow call (replays existing segments, opens/
+/// joins the current one, each under the cross-process `queue.lock` — plan 088 Step 3a's D0/D1 fix).
+/// `FileStorage::create`/`load` are `async fn`s that normally run on a tokio worker thread, so calling
+/// it directly there would block that thread for the duration of the replay. Mirrors the EXACT
+/// runtime-flavor branch `OutboxStore`/`PopKeyStore` already use elsewhere in this crate:
+/// `block_in_place` on a real multi-thread runtime (frees the worker thread for other tasks while this
+/// one blocks), called directly on a `current_thread` runtime (where `block_in_place` would panic —
+/// unit tests that construct storage without `#[tokio::test(flavor = "multi_thread")]` still work,
+/// since there is no OTHER task on that runtime to starve).
+fn open_averin_queue_blocking(
+    dir: PathBuf,
+    master_key: Arc<MasterKey>,
+) -> Result<AverinQueue, StorageError> {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::current().runtime_flavor() {
+        RuntimeFlavor::CurrentThread => AverinQueue::open(dir, master_key),
+        _ => tokio::task::block_in_place(|| AverinQueue::open(dir, master_key)),
+    }
 }
 
 /// An outbox event STAGED in the vault (intent-staging, D1): written atomically with the state change
@@ -411,10 +507,26 @@ struct StorageFile {
 }
 
 impl FileStorage {
-    /// Create a new file storage, loading existing data if present
+    /// Create a new file storage, loading existing data if present. Averin's durable-seal stores
+    /// (plan 088 D1) are NEVER constructed by this entry point — use [`Self::new_with_averin`] to
+    /// opt in. This keeps every existing caller/test byte-identical to pre-088 behavior.
     pub async fn new(
         path: impl AsRef<Path>,
         password: &SecretString,
+    ) -> Result<Self, StorageError> {
+        Self::new_with_averin(path, password, false).await
+    }
+
+    /// Like [`Self::new`], but ALSO constructs the three averin durable-seal stores (D1: the queue,
+    /// the PoP-key store, the dead-letter quarantine) when `averin_enabled` is `true` — gated exactly
+    /// the way `AverinClient::new` gates the seal client itself (`config.averin.enabled`). `false`
+    /// (the default) is byte-identical to [`Self::new`]: no averin directories/files are created, no
+    /// extra locks are ever taken. See [`Self::averin_queue`]/[`Self::averin_popkeys`]/
+    /// [`Self::averin_deadletter`] for the resulting accessors.
+    pub async fn new_with_averin(
+        path: impl AsRef<Path>,
+        password: &SecretString,
+        averin_enabled: bool,
     ) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
 
@@ -426,25 +538,35 @@ impl FileStorage {
         // Check if file exists
         if path.exists() {
             // Load existing storage
-            Self::load(path, password).await
+            Self::load(path, password, averin_enabled).await
         } else {
             // Create new storage
-            Self::create(path, password).await
+            Self::create(path, password, averin_enabled).await
         }
     }
 
     /// Create a new storage file
-    async fn create(path: PathBuf, password: &SecretString) -> Result<Self, StorageError> {
+    async fn create(
+        path: PathBuf,
+        password: &SecretString,
+        averin_enabled: bool,
+    ) -> Result<Self, StorageError> {
         let salt = generate_salt();
         // Pin today's params on a fresh vault (persisted in the header, re-read on every open).
         let kdf = crate::crypto::KdfParams::default();
         let master_key = Arc::new(derive_key(password, &salt, kdf)?);
         let outbox = OutboxStore::new(outbox_path(&path), Arc::clone(&master_key));
+        let averin = if averin_enabled {
+            AverinStores::open(&path, &master_key)?
+        } else {
+            None
+        };
 
         let storage = Self {
             path,
             master_key,
             outbox,
+            averin,
             cache: RwLock::new(StorageCache::default()),
             salt,
             kdf,
@@ -458,7 +580,11 @@ impl FileStorage {
     }
 
     /// Load an existing storage file
-    async fn load(path: PathBuf, password: &SecretString) -> Result<Self, StorageError> {
+    async fn load(
+        path: PathBuf,
+        password: &SecretString,
+        averin_enabled: bool,
+    ) -> Result<Self, StorageError> {
         let content = fs::read_to_string(&path).await?;
         let storage_file: StorageFile = serde_json::from_str(&content)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -482,10 +608,16 @@ impl FileStorage {
         let cache = Self::parse_cache(&decrypted)?;
 
         let outbox = OutboxStore::new(outbox_path(&path), Arc::clone(&master_key));
+        let averin = if averin_enabled {
+            AverinStores::open(&path, &master_key)?
+        } else {
+            None
+        };
         let storage = Self {
             path,
             master_key,
             outbox,
+            averin,
             cache: RwLock::new(cache),
             salt,
             kdf,
@@ -504,6 +636,27 @@ impl FileStorage {
         // outbox before serving so a coupled emit (an approval decision) is never lost.
         storage.drain_pending_events().await?;
         Ok(storage)
+    }
+
+    /// The averin durable USE queue (plan 088 D0/D1), if this instance was opened with
+    /// `averin_enabled = true` ([`Self::new_with_averin`]). `None` when averin is disabled (the
+    /// default via [`Self::new`]) — the byte-identical-when-off contract D1 requires. Clone the
+    /// returned `Arc` to hold a handle beyond this borrow (plan 088 Step 3b's worker + the seal
+    /// client do exactly this).
+    pub fn averin_queue(&self) -> Option<&Arc<AverinQueue>> {
+        self.averin.as_ref().map(|a| &a.queue)
+    }
+
+    /// The averin PoP-key store (plan 088 D2). See [`Self::averin_queue`]'s doc for the gating
+    /// contract.
+    pub fn averin_popkeys(&self) -> Option<&Arc<PopKeyStore>> {
+        self.averin.as_ref().map(|a| &a.popkeys)
+    }
+
+    /// The averin dead-letter quarantine store (plan 088 D4). See [`Self::averin_queue`]'s doc for
+    /// the gating contract.
+    pub fn averin_deadletter(&self) -> Option<&Arc<AverinDeadLetterStore>> {
+        self.averin.as_ref().map(|a| &a.deadletter)
     }
 
     /// Drain a v6 in-vault outbox into the split-out outbox file (one-time, on first v7 open).
@@ -2699,6 +2852,109 @@ mod tests {
 
             let cred = cred.unwrap();
             assert_eq!(cred.alias, "test-api");
+        }
+    }
+
+    #[tokio::test]
+    async fn averin_stores_are_none_when_disabled_and_wired_when_enabled() {
+        // Plan 088 D1's default-off parity: `FileStorage::new` (used by every pre-088 caller/test —
+        // including every other test in this module) never constructs the averin stores, and never
+        // creates their sibling files/dir.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.enc");
+        let password = SecretString::from("test-password");
+        {
+            let storage = FileStorage::new(&path, &password).await.unwrap();
+            assert!(storage.averin_queue().is_none());
+            assert!(storage.averin_popkeys().is_none());
+            assert!(storage.averin_deadletter().is_none());
+            assert!(
+                !path.with_file_name("averin-queue").exists(),
+                "disabled averin must not create the queue dir"
+            );
+            assert!(!path.with_file_name("averin-popkeys.enc").exists());
+            assert!(!path.with_file_name("averin-deadletter.enc").exists());
+        }
+
+        // Enabling constructs all three, sharing THIS vault's master key, as siblings of the vault
+        // (D1: derived via `with_file_name`, mirroring `outbox_path`).
+        let dir2 = tempdir().unwrap();
+        let path2 = dir2.path().join("test.enc");
+        {
+            let storage = FileStorage::new_with_averin(&path2, &password, true)
+                .await
+                .unwrap();
+            let queue = storage.averin_queue().expect("queue constructed when enabled");
+            let popkeys = storage
+                .averin_popkeys()
+                .expect("popkeys constructed when enabled");
+            let deadletter = storage
+                .averin_deadletter()
+                .expect("deadletter constructed when enabled");
+
+            let seq = queue
+                .append("tok-1", "averin.use", serde_json::json!({"n": 1}))
+                .unwrap();
+            assert_eq!(seq, 1);
+
+            popkeys
+                .insert(
+                    "tok-1",
+                    crate::storage::PopKeyEntry {
+                        pop_seed: [1u8; 32],
+                        action: "db.query:orders-ro".to_string(),
+                        scope: "read:orders".to_string(),
+                        use_limit: None,
+                        capability: None,
+                        grant_id: None,
+                        minted_at: Utc::now(),
+                        grant_delivered_at: None,
+                        grant_expires_at: None,
+                        abandoned: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(popkeys.get("tok-1").await.unwrap().is_some());
+
+            deadletter
+                .quarantine(
+                    crate::outbox::OutboxEvent {
+                        sequence: 99,
+                        subject: "tok-2".to_string(),
+                        event_type: "averin.use".to_string(),
+                        payload: serde_json::json!({"params": "p"}),
+                        created_at: Utc::now(),
+                        delivery: crate::outbox::DeliveryState::DeadLettered,
+                        attempts: 8,
+                        leased_until: None,
+                        last_attempt_at: None,
+                        last_error: Some("boom".to_string()),
+                        dedup_id: None,
+                    },
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(deadletter.list().await.unwrap().len(), 1);
+
+            assert!(path2.with_file_name("averin-queue").is_dir());
+            assert!(path2.with_file_name("averin-popkeys.enc").exists());
+            assert!(path2.with_file_name("averin-deadletter.enc").exists());
+        }
+
+        // Reopening with averin enabled again picks up the SAME durable state across all three
+        // stores (each survives a restart, re-deriving the SAME master key from the vault header).
+        {
+            let storage = FileStorage::new_with_averin(&path2, &password, true)
+                .await
+                .unwrap();
+            let queue = storage.averin_queue().unwrap();
+            assert_eq!(queue.deliverable(10).len(), 1);
+            let popkeys = storage.averin_popkeys().unwrap();
+            assert!(popkeys.get("tok-1").await.unwrap().is_some());
+            let deadletter = storage.averin_deadletter().unwrap();
+            assert_eq!(deadletter.list().await.unwrap().len(), 1);
         }
     }
 

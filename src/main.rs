@@ -947,7 +947,11 @@ async fn init_storage(
                 .clone()
                 .unwrap_or_else(Config::default_storage_path);
 
-            let storage = FileStorage::new(&path, &password).await?;
+            // Plan 088 D1: construct the averin durable-seal stores here too, gated on
+            // `[averin] enabled` exactly like `AverinClient` itself gates the seal client
+            // (`server/mod.rs`) — `false` (the default) is byte-identical to pre-088 behavior.
+            let storage =
+                FileStorage::new_with_averin(&path, &password, config.averin.enabled).await?;
             Ok(Arc::new(storage))
         }
         StorageBackendType::Keychain => {
