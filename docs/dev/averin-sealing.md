@@ -224,6 +224,31 @@ These are a cross-language binding averin keeps in
   where `payload` is the part of the `capability` before the first `.`
   (`resourceshim.credentialBinding`).
 
+### 5a. Params retention — raw vs commitment (resolved)
+
+The `/v2/use` body sends the **raw `params`** (the agent's `/execute` payload)
+alongside `params_nonce`. This is **required, not a footgun**: averin does not
+accept a `params_commitment` field on the wire — it **recomputes** the
+commitment server-side (`Commit("input", raw_params, params_nonce)`,
+`server/internal/api/server.go handleUsePhase`) and rejects the seal if it does
+not match the commitment the `use_sig` PoP was signed over
+(`resourceshim.ValidateUse` → `ed25519.Verify`). This is averin's
+**recompute-or-reject** integrity property: "the agent cannot bind params
+different from those it sends." Dropping raw params would make averin recompute
+the commitment over empty bytes → mismatch → HTTP 400 → the seal breaks.
+
+Crucially, raw params do **not** enter averin's permanent, signed,
+hash-chained record body. `buildUseRecord` seals **only the hiding commitment**
+into the signed body (`input_commit.commitment`); the raw bytes are stored in
+averin's **erasable content store** as a `DisclosureSecret` —
+AES-256-GCM-encrypted per-tenant (`EncryptedFSStore`) and **retention-purged**
+after `AVERIN_RAW_RETENTION_DAYS`, after which the record still verifies from
+its commitment alone (`averin/docs/dev/SECURITY.md §"Data retention & erasure"`).
+So the privacy posture is: **permanent = commitment only (a hiding hash);
+raw params = encrypted + time-boxed + erasable disclosure**. When the async
+production build lands (per the go/no-go), keep this two-tier split — never seal
+raw params into the permanent body, and honor the retention window.
+
 ## 6. What the spike proves (and the honest capstone gap)
 
 The spike (flag ON) drives a real `vut_`-authenticated `/execute` and shows, via
