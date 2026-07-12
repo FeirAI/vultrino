@@ -26,6 +26,20 @@ use tokio::sync::Semaphore;
 
 use pop::PopKeypair;
 
+/// Plan 087 FIX 3c — hard cap on how many bytes of an averin response we buffer.
+/// averin's real success bodies (a `grant_id`/`capability`, or a `record.record_id`)
+/// are tiny; a cap keeps a hostile or malfunctioning averin from making a bounded
+/// fan-out buffer an unbounded body (`resp.text()` was unbounded). 64 KiB is far above
+/// any real response yet still small enough that 256 concurrent reads stay trivial.
+const MAX_AVERIN_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Plan 087 FIX 5 — minimum spacing between `AVERIN-SEAL-DROPPED` log lines. The drop
+/// COUNTER still increments per drop (cheap, lock-free); only the LOG is rate-limited,
+/// so a sustained averin outage under high `/execute` load cannot turn every dropped
+/// seal into a synchronous `tracing::warn!` on the hot path (a log-I/O storm that could
+/// stall `/execute`).
+const DROP_LOG_MIN_INTERVAL_MS: u64 = 5_000;
+
 /// Plan 087 — greppable fail-open seal counters (the metric half of the alarm).
 /// Per-process, in-memory, shared across `AverinClient` clones via `Arc`. Paired
 /// with the distinct `AVERIN-SEAL-FAILED` / `AVERIN-SEAL-DROPPED` log lines and
@@ -43,6 +57,12 @@ pub struct SealMetrics {
     in_flight: AtomicU64,
     /// High-water mark of `in_flight` — proves the cap held under overload.
     max_in_flight: AtomicU64,
+    /// Plan 087 FIX 5 — monotonic-ms (relative to the client's start `Instant`) at
+    /// which the last `AVERIN-SEAL-DROPPED` line was emitted; 0 = never (so the very
+    /// first drop always logs). Rate-limits ONLY the log line; `dropped` still counts
+    /// every drop, so no accounting is lost — only the synchronous `warn!` I/O on the
+    /// hot path is coalesced during a sustained outage.
+    drop_log_last_ms: AtomicU64,
 }
 
 impl SealMetrics {
@@ -82,6 +102,44 @@ impl SealMetrics {
             dropped: self.dropped.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Relaxed),
             max_in_flight: self.max_in_flight.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Plan 087 FIX 6 — RAII so the `in_flight` gauge is decremented even when the
+/// spawned seal task PANICS or is CANCELLED mid-`await`. The owned semaphore permit
+/// is already RAII-released on an abnormal exit (good); this makes the gauge (and the
+/// failure alarm) symmetric. On a normal exit the task calls [`Self::complete`]
+/// FIRST, so `Drop` only decrements; on an abnormal exit `complete` was never called,
+/// so `Drop` also counts a `failed` — the lost seal is reflected, not silently
+/// dropped, and `in_flight` cannot drift upward forever.
+struct InflightGuard {
+    metrics: Arc<SealMetrics>,
+    completed: bool,
+}
+
+impl InflightGuard {
+    fn enter(metrics: Arc<SealMetrics>) -> Self {
+        metrics.enter_inflight();
+        Self {
+            metrics,
+            completed: false,
+        }
+    }
+    /// Mark the seal task as having recorded its own outcome (sealed OR failed), so
+    /// `Drop` does not double-count a failure. Called on both the Ok and Err arms.
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.metrics.leave_inflight();
+        if !self.completed {
+            // The task panicked/was cancelled before recording an outcome — count the
+            // lost seal so the `failed` counter and its alarm reflect reality.
+            self.metrics.record_failed();
         }
     }
 }
@@ -140,6 +198,17 @@ pub struct AverinConfig {
     /// Does NOT bound the synchronous `require_evidence` path (that already blocks
     /// `/execute`, so it is naturally back-pressured).
     pub max_inflight_seals: usize,
+    /// Plan 087 FIX 3 — max raw-`params` size (bytes) a single use-seal will carry to
+    /// averin. `max_inflight_seals` bounds the task COUNT, not the BYTES each retains;
+    /// without a byte cap, 256 large LLM payloads could pin gigabytes (each is copied
+    /// into the seal body and averin's response is buffered). Params larger than this
+    /// are NOT sealed: in `Observe` the seal is DROPPED fail-open (counted, oversize
+    /// alarm) so `/execute` proceeds; in `RequireEvidence` the action is DENIED with a
+    /// bounded error, never transmitting the oversize body. averin RECOMPUTES the
+    /// params commitment from the raw bytes (§5a recompute-or-reject), so there is no
+    /// "seal a fixed-size commitment WITHOUT the raw body" option — hence oversize =
+    /// drop/deny, not truncate. Operator-tunable.
+    pub max_seal_params_bytes: usize,
 }
 
 impl Default for AverinConfig {
@@ -159,6 +228,13 @@ impl Default for AverinConfig {
             // extra memory at a few hundred pending tasks (each holds a token id +
             // params snapshot), then sheds fail-open. Operator-tunable.
             max_inflight_seals: 256,
+            // 128 KiB — comfortably above a normal `/execute` payload, below the size
+            // that would let the bounded fan-out pin large memory: worst case is
+            // ~`max_inflight_seals * max_seal_params_bytes` (256 * 128 KiB = 32 MiB),
+            // not the gigabytes an uncapped seal could hold. Oversize payloads are
+            // dropped/denied, never truncated (averin recomputes the commitment from
+            // the raw bytes). Operator-tunable.
+            max_seal_params_bytes: 128 * 1024,
         }
     }
 }
@@ -187,6 +263,10 @@ pub struct AverinClient {
     seal_permits: Arc<Semaphore>,
     /// Plan 087 — fail-open seal counters (the metric half of the alarm).
     metrics: Arc<SealMetrics>,
+    /// Plan 087 FIX 5 — the monotonic base for the drop-log rate limiter. Copied on
+    /// `clone` (all clones share the same instant value), so `since.elapsed()` is a
+    /// consistent process-wide clock for `drop_log_last_ms`.
+    since: std::time::Instant,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -199,12 +279,15 @@ pub enum AverinError {
     HttpBuild(#[source] reqwest::Error),
     #[error("averin request failed: {0}")]
     Request(#[source] reqwest::Error),
-    #[error("averin {endpoint} returned {status}: {body}")]
-    Status {
-        endpoint: &'static str,
-        status: u16,
-        body: String,
-    },
+    // FIX 4 — `Display` (what the alarm logs via `error = %e`) carries ONLY the
+    // endpoint + status code, NEVER the upstream response body. The body (possible
+    // PII/secret) is deliberately NOT carried on the error; it is emitted once at a
+    // DEBUG-ONLY channel at the `post` site, so it can never leak into an
+    // `AVERIN-SEAL-*` alarm line.
+    #[error("averin {endpoint} returned {status}")]
+    Status { endpoint: &'static str, status: u16 },
+    #[error("averin seal params {len} bytes exceed cap {cap} bytes")]
+    ParamsTooLarge { len: usize, cap: usize },
     #[error("no grant on record for token {0} (mint seal did not land)")]
     NoGrant(String),
     #[error("pop preimage error: {0}")]
@@ -239,7 +322,33 @@ impl AverinClient {
             pop: Arc::new(Mutex::new(HashMap::new())),
             seal_permits: Arc::new(Semaphore::new(permits)),
             metrics: Arc::new(SealMetrics::default()),
+            since: std::time::Instant::now(),
         }))
+    }
+
+    /// Plan 087 FIX 5 — return `Some(running_dropped_total)` at most once per
+    /// [`DROP_LOG_MIN_INTERVAL_MS`] (and always on the very first drop), else `None`.
+    /// The counter is bumped by the caller regardless; this gates only the LOG line so
+    /// a sustained outage cannot storm the hot path with a `warn!` per dropped seal.
+    fn claim_drop_log(&self) -> Option<u64> {
+        let now_ms = self.since.elapsed().as_millis() as u64;
+        let last = self.metrics.drop_log_last_ms.load(Ordering::Relaxed);
+        // 0 = never logged → always log the first drop; otherwise wait out the window.
+        if last != 0 && now_ms.saturating_sub(last) < DROP_LOG_MIN_INTERVAL_MS {
+            return None;
+        }
+        // Claim the slot (`.max(1)` so the stored stamp is never 0 = "never"). If
+        // another thread claimed it first, stay silent — no double log.
+        if self
+            .metrics
+            .drop_log_last_ms
+            .compare_exchange(last, now_ms.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(self.metrics.dropped.load(Ordering::Relaxed))
+        } else {
+            None
+        }
     }
 
     pub fn mode(&self) -> AverinMode {
@@ -369,8 +478,30 @@ impl AverinClient {
     /// (seal-before-consume, or a consume rollback) is a separate change — plan 087
     /// only moves the *fail-open* path async, where nothing ever blocks, so this
     /// caveat is unreachable in the default (Observe) posture.
-    pub async fn on_execute(&self, token_id: &str, params: &[u8]) -> Result<(), AverinError> {
-        match self.seal_use(token_id, params).await {
+    pub async fn on_execute(&self, token_id: &str, params: Vec<u8>) -> Result<(), AverinError> {
+        // FIX 3 — never transmit an oversize body. averin recomputes the commitment
+        // from the raw bytes (§5a), so we cannot seal a fixed-size commitment WITHOUT
+        // the body; oversize therefore deny (require_evidence) or drop (observe),
+        // bounded — never gigabytes on the wire.
+        if params.len() > self.cfg.max_seal_params_bytes {
+            return match self.cfg.mode {
+                AverinMode::RequireEvidence => {
+                    self.metrics.record_failed();
+                    let e = AverinError::ParamsTooLarge {
+                        len: params.len(),
+                        cap: self.cfg.max_seal_params_bytes,
+                    };
+                    tracing::error!(target: "averin_seal", token_id, project_id = %self.cfg.project_id, error = %e, "AVERIN-SEAL-FAILED oversize params (require_evidence) — BLOCKING action");
+                    Err(e)
+                }
+                AverinMode::Observe => {
+                    self.metrics.record_dropped();
+                    tracing::warn!(target: "averin_seal", token_id, project_id = %self.cfg.project_id, params_bytes = params.len(), cap = self.cfg.max_seal_params_bytes, "AVERIN-SEAL-DROPPED-oversize params exceed max_seal_params_bytes (observe/fail-open) — action proceeds");
+                    Ok(())
+                }
+            };
+        }
+        match self.seal_use(token_id, &params).await {
             Ok(rid) => {
                 self.metrics.record_sealed();
                 tracing::debug!(target: "averin_seal", token_id, record_id = %rid, "averin use sealed (sync)");
@@ -407,38 +538,71 @@ impl AverinClient {
     ///
     /// The snapshot-out-of-the-lock in [`Self::seal_use`] means no lock is held
     /// across the spawned `.await` (STOP-condition check: it is not).
-    pub fn spawn_use_seal(&self, token_id: &str, params: &[u8]) {
+    ///
+    /// Takes OWNED `params` (FIX 3b): the buffer the caller already built moves into
+    /// the spawned task instead of being copied again (`.to_vec()` is gone). Oversize
+    /// params (> `max_seal_params_bytes`) are dropped BEFORE claiming a permit (FIX 3),
+    /// and the saturation/oversize drop LOG is rate-limited (FIX 5) though the counter
+    /// always increments. The in-flight gauge is RAII-guarded (FIX 6).
+    pub fn spawn_use_seal(&self, token_id: &str, params: Vec<u8>) {
+        // FIX 3 — oversize params are never sealed (averin recomputes the commitment
+        // from the raw bytes, so there is no fixed-size-commitment-only option). Drop
+        // fail-open + count; the action already proceeded (085 detects the gap). Done
+        // BEFORE claiming a permit so an oversize flood cannot even occupy the fan-out.
+        if params.len() > self.cfg.max_seal_params_bytes {
+            self.metrics.record_dropped();
+            if let Some(total) = self.claim_drop_log() {
+                tracing::warn!(
+                    target: "averin_seal",
+                    token_id,
+                    project_id = %self.cfg.project_id,
+                    params_bytes = params.len(),
+                    cap = self.cfg.max_seal_params_bytes,
+                    dropped_total = total,
+                    "AVERIN-SEAL-DROPPED-oversize params exceed max_seal_params_bytes; seal dropped (fail-open — action proceeded, plan-085 detects the unsealed use). Log rate-limited; dropped_total is the running count."
+                );
+            }
+            return;
+        }
         // Claim a fan-out permit without blocking; saturated → drop fail-open.
         let permit = match Arc::clone(&self.seal_permits).try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
                 self.metrics.record_dropped();
-                tracing::warn!(
-                    target: "averin_seal",
-                    token_id,
-                    project_id = %self.cfg.project_id,
-                    cap = self.cfg.max_inflight_seals,
-                    "AVERIN-SEAL-DROPPED averin use-seal fan-out cap saturated; seal dropped (fail-open — action proceeded, plan-085 detects the unsealed use)"
-                );
+                // FIX 5 — the counter always bumps (above); the LOG is rate-limited so a
+                // sustained outage can't storm the hot path with a warn per dropped seal.
+                if let Some(total) = self.claim_drop_log() {
+                    tracing::warn!(
+                        target: "averin_seal",
+                        token_id,
+                        project_id = %self.cfg.project_id,
+                        cap = self.cfg.max_inflight_seals,
+                        dropped_total = total,
+                        "AVERIN-SEAL-DROPPED averin use-seal fan-out cap saturated; seal dropped (fail-open — action proceeded, plan-085 detects the unsealed use). Log rate-limited; dropped_total is the running count."
+                    );
+                }
                 return;
             }
         };
         let this = self.clone();
         let token_id = token_id.to_string();
-        let params = params.to_vec();
         tokio::spawn(async move {
             // Held for the seal's whole lifetime; releasing it frees a fan-out slot.
             let _permit = permit;
-            this.metrics.enter_inflight();
+            // FIX 6 — RAII: `in_flight` is decremented (and a failure counted) even if
+            // this task panics or is cancelled mid-await. `complete()` on the normal
+            // arms stops `Drop` from double-counting a failure.
+            let mut guard = InflightGuard::enter(this.metrics.clone());
             let outcome = this.seal_use(&token_id, &params).await;
-            this.metrics.leave_inflight();
             match outcome {
                 Ok(rid) => {
                     this.metrics.record_sealed();
+                    guard.complete();
                     tracing::debug!(target: "averin_seal", token_id = %token_id, record_id = %rid, "averin use sealed (async, off the /execute hot path)");
                 }
                 Err(e) => {
                     this.metrics.record_failed();
+                    guard.complete();
                     // ALARM: token/project context only — params are never logged.
                     tracing::warn!(
                         target: "averin_seal",
@@ -525,17 +689,48 @@ impl AverinClient {
         }
         let resp = req.send().await.map_err(AverinError::Request)?;
         let status = resp.status();
-        let text = resp.text().await.map_err(AverinError::Request)?;
+        // FIX 3c — read at most MAX_AVERIN_RESPONSE_BYTES instead of the unbounded
+        // `resp.text()`, so a hostile or malfunctioning averin cannot make a bounded
+        // fan-out buffer an unbounded body. averin's real bodies are far under the cap.
+        let text = read_capped(resp, MAX_AVERIN_RESPONSE_BYTES).await?;
         if !status.is_success() {
+            let body_snippet: String = text.chars().take(400).collect();
+            // FIX 4 — the upstream body (possible PII/secret) goes ONLY to a
+            // debug-level channel, NEVER to an AVERIN-SEAL-* alarm line (those log
+            // `error = %e`, and `Status`'s Display deliberately omits the body).
+            tracing::debug!(
+                target: "averin_seal",
+                endpoint,
+                status = status.as_u16(),
+                body = %body_snippet,
+                "averin non-2xx response body (debug-only; excluded from alarm lines)"
+            );
             return Err(AverinError::Status {
                 endpoint,
                 status: status.as_u16(),
-                body: text.chars().take(400).collect(),
             });
         }
         serde_json::from_str(&text)
             .map_err(|e| AverinError::BadResponse(format!("{endpoint}: {e}")))
     }
+}
+
+/// FIX 3c — buffer at most `cap` bytes of a response body (averin's real responses
+/// are tiny; this bounds a hostile/broken one). Reads the byte stream chunk-by-chunk
+/// and stops once the cap is reached, so the full body is never materialized.
+async fn read_capped(resp: reqwest::Response, cap: usize) -> Result<String, AverinError> {
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(AverinError::Request)?;
+        if buf.len() >= cap {
+            break;
+        }
+        let take = (cap - buf.len()).min(chunk.len());
+        buf.extend_from_slice(&chunk[..take]);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 #[cfg(test)]
@@ -623,7 +818,7 @@ mod tests {
         client.insert_test_grant("vut_slow", "AAAA.sig");
 
         let t0 = Instant::now();
-        client.spawn_use_seal("vut_slow", br#"{"q":1}"#);
+        client.spawn_use_seal("vut_slow", br#"{"q":1}"#.to_vec());
         let elapsed = t0.elapsed();
         assert!(
             elapsed < Duration::from_millis(100),
@@ -652,7 +847,7 @@ mod tests {
 
         let t0 = Instant::now();
         for i in 0..total {
-            client.spawn_use_seal(&format!("vut_{i}"), b"{}");
+            client.spawn_use_seal(&format!("vut_{i}"), b"{}".to_vec());
         }
         let fire_elapsed = t0.elapsed();
         // (a) /execute never blocks: firing `total` bounded spawns is ~instant.
@@ -694,7 +889,7 @@ mod tests {
         let client = client_with("http://127.0.0.1:9", 256, Duration::from_secs(5));
         client.insert_test_grant("vut_bad", "nodothere"); // no '.' → MalformedCapability
 
-        client.spawn_use_seal("vut_bad", b"{}");
+        client.spawn_use_seal("vut_bad", b"{}".to_vec());
         // Wait for the spawned task to run.
         for _ in 0..100 {
             if client.metrics().failed >= 1 {
@@ -709,5 +904,117 @@ mod tests {
         );
         assert_eq!(m.sealed, 0);
         assert_eq!(m.dropped, 0);
+    }
+
+    // ---- plan 087 FIX 3/4/5/6 -----------------------------------------------
+
+    /// A client with a tiny params cap, for the oversize tests.
+    fn client_capped(mode: AverinMode, cap_bytes: usize) -> AverinClient {
+        AverinClient::new(AverinConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:9".to_string(),
+            resource_id: "orders-db".to_string(),
+            mode,
+            max_seal_params_bytes: cap_bytes,
+            ..AverinConfig::default()
+        })
+        .expect("client builds")
+        .expect("client is Some when enabled")
+    }
+
+    /// FIX 3 — in Observe, oversize params are DROPPED before a permit is claimed and
+    /// before any task spawns (no unbounded bytes retained), the drop counter bumps,
+    /// and the action still proceeds (spawn_use_seal returns immediately).
+    #[tokio::test]
+    async fn observe_oversize_params_dropped_before_spawn() {
+        let client = client_capped(AverinMode::Observe, 8);
+        client.insert_test_grant("vut_big", "AAAA.sig");
+        client.spawn_use_seal("vut_big", vec![b'x'; 64]); // 64 > 8-byte cap
+        let m = client.metrics();
+        assert_eq!(m.dropped, 1, "oversize params must be dropped");
+        assert_eq!(m.in_flight, 0, "no task is spawned for oversize params");
+        assert_eq!(m.sealed, 0);
+        assert_eq!(m.failed, 0);
+        // A within-cap seal is NOT dropped (it spawns and — NoGrant-free here, but the
+        // dead port means it will fail later; we only assert it wasn't oversize-dropped).
+        client.insert_test_grant("vut_small", "AAAA.sig");
+        client.spawn_use_seal("vut_small", vec![b'x'; 4]);
+        assert_eq!(client.metrics().dropped, 1, "a within-cap seal must not be dropped");
+    }
+
+    /// FIX 3 — in RequireEvidence, oversize params DENY with a bounded `ParamsTooLarge`
+    /// error (no body transmitted, no raw params in the error) and count a failure.
+    #[tokio::test]
+    async fn require_evidence_oversize_params_denied_bounded() {
+        let client = client_capped(AverinMode::RequireEvidence, 8);
+        client.insert_test_grant("vut_big", "AAAA.sig");
+        let err = client
+            .on_execute("vut_big", vec![b'x'; 64])
+            .await
+            .expect_err("oversize params must DENY in require_evidence");
+        assert!(matches!(err, AverinError::ParamsTooLarge { .. }));
+        let msg = format!("{err}");
+        assert!(msg.contains("exceed cap"), "bounded error, got: {msg}");
+        assert!(
+            !msg.contains("xxxx"),
+            "the error must not carry the raw params, got: {msg}"
+        );
+        let m = client.metrics();
+        assert_eq!(m.failed, 1);
+        assert_eq!(m.sealed, 0);
+    }
+
+    /// FIX 4 — the `Status` error's Display (what the alarm logs via `error = %e`)
+    /// carries ONLY endpoint + status, never a response body.
+    #[test]
+    fn status_error_display_excludes_response_body() {
+        let e = AverinError::Status {
+            endpoint: "/v2/use",
+            status: 500,
+        };
+        assert_eq!(format!("{e}"), "averin /v2/use returned 500");
+    }
+
+    /// FIX 5 — the drop LOG is rate-limited: the first claim logs, every claim within
+    /// the window is silent (the COUNTER, tested elsewhere, still bumps per drop).
+    #[test]
+    fn drop_log_is_rate_limited_after_the_first() {
+        let client = client_with("http://127.0.0.1:9", 256, Duration::from_secs(5));
+        assert!(client.claim_drop_log().is_some(), "the first drop always logs");
+        for _ in 0..10_000 {
+            assert!(
+                client.claim_drop_log().is_none(),
+                "further drops within the window must be silent (no per-request log storm)"
+            );
+        }
+    }
+
+    /// FIX 6 — the RAII guard releases `in_flight` AND counts a failure when the task
+    /// drops WITHOUT completing (the panic/cancel path).
+    #[test]
+    fn inflight_guard_releases_and_counts_failure_on_abnormal_drop() {
+        let metrics = Arc::new(SealMetrics::default());
+        {
+            let _g = InflightGuard::enter(metrics.clone());
+            assert_eq!(metrics.snapshot().in_flight, 1);
+        } // dropped WITHOUT complete() → abnormal (panic/cancel) path
+        let m = metrics.snapshot();
+        assert_eq!(m.in_flight, 0, "guard must release in_flight even on panic/cancel");
+        assert_eq!(m.failed, 1, "an abnormal drop must count the lost seal as failed");
+        assert_eq!(m.max_in_flight, 1);
+    }
+
+    /// FIX 6 — a normally-completed guard releases `in_flight` and does NOT double-count
+    /// a failure (the task already recorded its own outcome).
+    #[test]
+    fn inflight_guard_normal_completion_counts_no_failure() {
+        let metrics = Arc::new(SealMetrics::default());
+        {
+            let mut g = InflightGuard::enter(metrics.clone());
+            g.complete();
+        }
+        let m = metrics.snapshot();
+        assert_eq!(m.in_flight, 0);
+        assert_eq!(m.failed, 0, "a completed guard must not count a failure");
     }
 }
