@@ -920,11 +920,19 @@ async fn rekey_vault(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             let current = get_storage_password()?;
             let new = get_new_storage_password()?;
             // Opening with the CURRENT password validates it (decrypt) before we touch anything.
-            let storage = FileStorage::new(&path, &current).await?;
+            // CRITICAL (Codex review): open the durable averin stores TOO when the deployment runs
+            // them, so `rekey` actually rotates them (D8). `FileStorage::new` hardcodes
+            // averin_enabled=false, which left the averin queue/popkey/quarantine under the OLD key
+            // after every CLI rekey — undecryptable on the next durable startup. Gate on the SAME
+            // condition that constructs them (enabled && durable) so a non-durable deployment never
+            // materializes empty averin files during a rekey.
+            let averin_durable = config.averin.enabled && config.averin.durable;
+            let storage = FileStorage::new_with_averin(&path, &current, averin_durable).await?;
             storage.rekey(&new).await?;
             println!(
-                "vault re-keyed: {} (and its outbox). Restart the service with the new password.",
-                path.display()
+                "vault re-keyed: {}{}. Restart the service with the new password.",
+                path.display(),
+                if averin_durable { " (and its outbox + averin durable stores)" } else { " (and its outbox)" }
             );
             Ok(())
         }
