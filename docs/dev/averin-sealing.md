@@ -494,3 +494,167 @@ byte-identical to today. Summary of the resulting behavior:
   reflected, not silently dropped). Tests:
   `inflight_guard_releases_and_counts_failure_on_abnormal_drop`,
   `inflight_guard_normal_completion_counts_no_failure`.
+
+## 12. Durability (plan 088) — at-least-once seal delivery, an opt-in reliability tier
+
+Plan 087 (§10 above) made the async fail-open seal production-ready but left one
+honest residual: a vultrino crash, or an averin outage longer than the bounded
+fan-out can absorb, leaves an unsealed use with **no receipt** (detected by plan
+085, never recovered on its own). Plan 088 adds an **opt-in** reliability tier that
+closes that specific gap — **at-least-once delivery**, surviving a restart — without
+touching the trust verdict, the default posture, or anything about averin itself.
+
+### What `[averin] durable = true` gives
+
+- **At-least-once delivery of the `/v2/use` seal (and its `/v2/grants` grant),
+  surviving a restart.** Mint persists a `PopKeyEntry` (the PoP keypair seed +
+  action/scope/use_limit) and appends an `"averin.grant"` event instead of
+  synchronously sealing; `/execute` appends an `"averin.use"` event (D5's stored
+  `nonce`/`params_nonce`/`request_id`/`use_sequence_number`) instead of spawning the
+  087 fire-and-forget POST. A background worker
+  (`deliver_averin_outbox_once`/`_periodically`, `src/server/mod.rs`) claims,
+  delivers, and retries both — with exponential backoff — until averin accepts
+  them, and a process restart does not lose progress: on reopen the queue replays
+  its durable segments and resumes exactly where it left off.
+- **The durable substrate that makes this possible** is three new encrypted stores,
+  siblings of the existing vault and `outbox.enc`:
+  - `src/storage/averin_queue.rs` — the `AverinQueue` O(1) crash-safe, append-only,
+    segmented delta-journal (framed `[len][sealed record]`, per-record fsync,
+    segment roll, compaction, startup replay) that persists the grant/use event
+    queue itself, on disk as the `averin-queue/` directory.
+  - `averin-popkeys.enc` — the encrypted PoP-key store (D2), keyed by `token.id`,
+    holding each token's PoP private seed and the grant's resolved
+    `capability`/`grant_id` once the grant delivers.
+  - `averin-deadletter.enc` — the dead-letter quarantine (D4, below).
+  - Deterministic-rebuild idempotency (D5): because the worker rebuilds every
+    retry from the exact `nonce`/`params_nonce` stored at enqueue time (never
+    fresh ones) and Ed25519 signing is deterministic (RFC 8032), a retried
+    delivery reproduces a byte-identical request — averin's own idempotency-key
+    matching treats it as an honest replay, never a 409 that would wrongly
+    quarantine an already-sealed use.
+  - Together, the O(1) journal + the encrypted PoP-key store + this determinism
+    is what turns "best-effort, restart-losable" into **at-least-once,
+    restart-durable**. `cargo test survives_restart` exercises exactly this: a
+    grant and a use are durably enqueued, every in-process handle is dropped
+    (simulating a crash), fresh stores are reopened on the same vault files, and
+    one worker pass against a responding fake averin delivers both, in order,
+    with the PoP seed and the rebuilt use signature intact.
+
+### What it does NOT give
+
+- **Not the D8 capstone.** A durable use still reaches, at most,
+  `resource_trust: "assumed_truthful"` — never
+  `attested_complete_over_brokered_surface`. That capstone needs a two-phase
+  `use-intent`/`use-outcome` producer, a `coverage_manifest`, a
+  `deployment_attestation`, and an anchored checkpoint — all averin-verify-time
+  concerns plan 088 does not touch. That is **plan 089**, which is built ON this
+  durable substrate (it reuses the queue, D5's determinism, and D5c's
+  `use_sequence_number` threading) but is a separate, later piece of work.
+- **The one-phase phantom-use residual (honest, not closed here).** The durable
+  use is enqueued at the seal chokepoint (`seal_after_consume`) *before*
+  `plugin.execute` runs — the D0 O(1) append is what keeps that off the hot path.
+  A crash after the enqueue commits but before the side effect actually runs
+  therefore durably records a use for an action that may never have executed (a
+  **phantom use**). This is the accepted one-phase Observe-tier residual — plan
+  088 makes delivery reliable, it does not make the record's relationship to the
+  real-world side effect exactly-once. Closing that requires 089's two-phase
+  intent/outcome state machine (an intent recorded before the act, an outcome
+  recorded after, joined at verify time); 088 does not attempt it.
+- **Default OFF, unconditionally.** `[averin] enabled` and `[averin] durable` both
+  default to `false`. Nothing above changes unless an operator explicitly flips
+  both — enabling the durable tier is a per-deployment decision, never a default,
+  exactly like enabling `enabled` itself was in plan 087.
+
+### The single-writer-PROCESS constraint (Step 3a)
+
+The durable queue is **owned by exactly one process at a time** — `AverinQueue::open`
+takes an exclusive lock over the `averin-queue/` directory, and a second process
+pointed at the same vault fails to acquire it. That losing process does **not**
+error out or refuse to serve: it falls back to the 087 asynchronous fail-open seal
+path for as long as it does not own the queue, and logs a warning identifying the
+directory and explaining the fallback (`AverinStores::open` in `src/storage/file.rs`)
+— e.g. "averin durable queue is owned by another live process; THIS process will
+seal via the async fail-open path (plan 087), NOT durable at-least-once delivery."
+Releasing the owner (a clean shutdown, or a crash) frees the lock for the next
+process to acquire it, including the SAME process on restart — the mechanism the
+`survives_restart` test exercises directly. Practically: run the durable tier
+against ONE vultrino process per vault, or accept that any co-running sibling
+seals fail-open (documented behavior, not a bug).
+
+### Honest enqueue latency
+
+The durable enqueue is O(1) in retained events — proven by an in-tree
+growing-backlog benchmark that holds append p99 flat from 10 to 100k retained
+records, not merely assumed. That O(1) *shape* is a portable, hardware-independent
+property of the append-only journal design. The **absolute** per-append latency is
+not: it is a property of the deployment target's storage stack. On the stated
+production target (Linux + NVMe), a single synchronous per-append `fdatasync` is
+typically sub-millisecond, comfortably inside a p99 ≤ 5 ms budget. On a busy
+laptop-class disk or macOS/APFS, the same synchronous fsync barrier measured
+~4–6 ms and can run higher (~5–30 ms) under contention — the durable tier is
+explicitly **trading latency for durability**: every enqueue pays a real fsync
+before it is considered committed, because that is the only way to survive a
+restart with the record intact. This is a deliberate, documented cost of turning
+on `durable = true`, not a defect. The **four-plane e2e** harness
+(`cd govder && go test -tags e2e ./e2e/ -run TestFourPlaneE2E -timeout 600s`,
+per the top-level `CLAUDE.md`) is the SLO-validation surface for this in a
+realistic multi-process deployment shape — it runs with averin off today (088
+does not change that), so validating the durable tier's latency under real
+production conditions is deployment-specific work for whoever turns `durable` on,
+not something the in-tree unit benchmark alone can promise.
+
+### The at-rest posture (the PoP private seed)
+
+`averin-popkeys.enc` is the first place vultrino persists a non-averin **private**
+key at rest — the Ed25519 PoP seed a durable grant/use signs with. It gets exactly
+the same treatment as every other secret in the vault: AES-256-GCM under the
+shared vault master key (no new key primitive), the file is `0600`
+(`create_private_file`), the seed is never logged and never appears in an
+`AverinError` `Display` or in a hand-written redacting `Debug` impl (mirroring
+087 FIX 4's redaction discipline), and it is never dumped in a config listing.
+It also **survives a `vultrino rekey`** (D8): the rekey protocol prepares a full
+new generation of all three averin stores (queue segments, `averin-popkeys.enc`,
+`averin-deadletter.enc`) under the new key, then atomically switches one
+authoritative pointer last, so a crash mid-rekey never leaves a half-migrated,
+partially-unreadable store — verified by
+`rekey_survives_a_pending_grant_and_use_pop_seed_round_trips_and_use_pop_verifies`,
+which rekeys a vault carrying a pending grant+use, reopens under the new
+password, and confirms the rebuilt use PoP still cryptographically verifies.
+
+### Dead-letter quarantine (D4) and the fail-open residual (D7)
+
+A use or grant that exhausts its retry budget (`max_attempts`, capped exponential
+backoff) is **moved** — not merely marked — out of the active queue into
+`averin-deadletter.enc`, a separately-purposed, separately retention-bounded
+quarantine store, and an `AVERIN-SEAL-DEADLETTERED` line is emitted. This is
+deliberately a MOVE, not a frozen tombstone: one subject's dead-letter must never
+block GC/compaction or the delivery of every later subject's events, and never
+retain another subject's raw `params` indefinitely. The quarantine supports
+operator `list`/`ack`/`abandon`/`purge`/`replay` — an operator can requeue a
+transiently-failed record back to the active queue, or purge it (which, once no
+other live or quarantined use references the subject, is what finally lets D2 evict
+its PoP seed).
+
+Separately, a **local persistence failure** at enqueue time (disk full, fsync EIO)
+is a different, narrower residual: it is treated exactly like an 087 fan-out drop —
+counted, alarmed with a distinct `AVERIN-SEAL-ENQUEUE-FAILED` line (token/project
+context only, never `params` or the PoP seed), and the action proceeds fail-open in
+Observe (the only mode `durable = true` can run in — see D6 below). Plan 085's
+existing govder-side reconciliation of unsealed actions is what detects and
+surfaces this residual operationally; 088 does not add a second reconciliation
+path, it feeds the same one.
+
+`[averin] durable = true` is rejected at config load when combined with
+`mode = require_evidence` (D6): the strict synchronous path reads only the
+in-memory PoP map durable mint never populates, so the combination would deny
+every execute. Durable at-least-once is Observe-only by construction.
+
+### One more honest constraint: params are UTF-8 on the wire
+
+Both the 087 synchronous/async seal path (`src/averin/mod.rs`) and the 088 durable
+enqueue path (`src/server/mod.rs`, `seal_after_consume`) build the `/v2/use` JSON
+body with `String::from_utf8_lossy(&params_bytes)` — i.e. non-UTF-8 `params` bytes
+are lossily converted (replacement characters) before they ever reach averin. This
+is a **pre-existing constraint of the averin-seal JSON wire format**, not something
+088 introduces or changes; a resource whose `/execute` params are not valid UTF-8
+should not expect its raw bytes to seal byte-exactly through either seal path.

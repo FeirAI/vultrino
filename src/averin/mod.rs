@@ -57,6 +57,12 @@ pub struct SealMetrics {
     in_flight: AtomicU64,
     /// High-water mark of `in_flight` — proves the cap held under overload.
     max_in_flight: AtomicU64,
+    /// Plan 088 D7 — durable enqueues (Observe + `durable = true` only, D6) that FAILED (a local
+    /// I/O error: disk full, fsync EIO, …). Paired with the greppable `AVERIN-SEAL-ENQUEUE-FAILED`
+    /// alarm line. Distinct from `failed` (which counts a completed averin ROUND-TRIP that failed)
+    /// because an enqueue failure never even reaches the network — it is a LOCAL persistence
+    /// problem, and `plugin.execute` still proceeds fail-open exactly like every other Observe drop.
+    enqueue_failed: AtomicU64,
     /// Plan 087 FIX 5 — monotonic-ms (relative to the client's start `Instant`) at
     /// which the last `AVERIN-SEAL-DROPPED` line was emitted; 0 = never (so the very
     /// first drop always logs). Rate-limits ONLY the log line; `dropped` still counts
@@ -74,6 +80,10 @@ impl SealMetrics {
     }
     fn record_dropped(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Plan 088 D7 — a durable enqueue attempt failed (local I/O, never a network round-trip).
+    fn record_enqueue_failed(&self) {
+        self.enqueue_failed.fetch_add(1, Ordering::Relaxed);
     }
     fn enter_inflight(&self) {
         let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
@@ -102,6 +112,7 @@ impl SealMetrics {
             dropped: self.dropped.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Relaxed),
             max_in_flight: self.max_in_flight.load(Ordering::Relaxed),
+            enqueue_failed: self.enqueue_failed.load(Ordering::Relaxed),
         }
     }
 }
@@ -152,6 +163,9 @@ pub struct SealMetricsSnapshot {
     pub dropped: u64,
     pub in_flight: u64,
     pub max_in_flight: u64,
+    /// Plan 088 D7 — durable enqueue attempts (Observe + `durable = true`) that failed locally
+    /// (disk full, fsync EIO, …) and were dropped fail-open. See [`SealMetrics::enqueue_failed`].
+    pub enqueue_failed: u64,
 }
 
 /// Fail-mode on `/execute` when the synchronous seal fails or averin is
@@ -209,6 +223,20 @@ pub struct AverinConfig {
     /// "seal a fixed-size commitment WITHOUT the raw body" option — hence oversize =
     /// drop/deny, not truncate. Operator-tunable.
     pub max_seal_params_bytes: usize,
+    /// Plan 088 — the reliability tier's master switch. Default **false**: `/execute`'s Observe
+    /// seal is the exact 087 async fire-and-forget path (`spawn_use_seal`), byte-identical to
+    /// pre-088 behavior. `true` upgrades the Observe seal to AT-LEAST-ONCE durable delivery: mint
+    /// persists a `PopKeyEntry` + appends an `"averin.grant"` event (D3) instead of synchronously
+    /// sealing the grant, and `/execute` appends an `"averin.use"` event (D0's O(1) journal append)
+    /// instead of spawning the async POST — a background worker (plan 088 Step 6, not wired by this
+    /// flag alone) delivers both, retried until averin accepts them, surviving a restart. Only takes
+    /// effect in THIS process when it also owns the durable queue (Step 3a's single-writer-process
+    /// lock; a losing sibling process falls back to the 087 async path regardless of this flag).
+    /// **Config validation (D6) rejects `durable = true` with `mode = require_evidence`** at load —
+    /// durable at-least-once is Observe-only (the strict path is synchronous and reads the
+    /// in-memory `pop` map durable mint never populates, so the combination would deny every
+    /// execute). Never flip this default; enabling it is a deliberate per-deployment choice.
+    pub durable: bool,
 }
 
 impl Default for AverinConfig {
@@ -235,6 +263,10 @@ impl Default for AverinConfig {
             // dropped/denied, never truncated (averin recomputes the commitment from
             // the raw bytes). Operator-tunable.
             max_seal_params_bytes: 128 * 1024,
+            // Plan 088 — the DEFAULT-OFF reliability tier. `false` keeps `/execute`'s Observe seal
+            // on the exact 087 async path; enabling durable at-least-once delivery is an explicit
+            // per-deployment opt-in, never a default flip.
+            durable: false,
         }
     }
 }
@@ -296,6 +328,61 @@ pub enum AverinError {
     BadResponse(String),
 }
 
+/// The deterministic outputs of [`build_use_pop`]: `params_commitment` is exposed (not just
+/// consumed internally) so a unit test can assert it, byte-for-byte, alongside `use_sig` across
+/// two calls with the same inputs — plan 088 D5's determinism contract, the thing that makes a
+/// durable retry idempotent at averin instead of a 409.
+pub(crate) struct UsePop {
+    // Not read by any production call site (the wire body sends `nonce`/`params_nonce` and lets
+    // averin recompute the commitment itself, per `on_execute`'s doc — `§5a recompute-or-reject`);
+    // kept on the struct purely so the determinism unit test can assert it byte-for-byte.
+    #[allow(dead_code)]
+    pub params_commitment: String,
+    pub use_sig: String,
+}
+
+/// Plan 088 D5 — the use-PoP "core" build, shared by [`AverinClient::seal_use`] (the
+/// synchronous 087 path) and the durable delivery worker (`deliver_averin_use`,
+/// `src/server/mod.rs`). Computes `params_commitment`/`use_sig` from EXPLICIT
+/// `(nonce, params_nonce)` — it never generates them itself — so identical inputs always
+/// reproduce identical outputs: Ed25519 signing is deterministic (RFC 8032), so a durable
+/// retry that rebuilds from the SAME stored nonces reproduces the EXACT `use_sig` averin
+/// already recorded, and averin's `storedUseMatchesRequest` (`server.go:1990`) sees an honest
+/// retry (`idempotent: true`) rather than a 409 conflict that would wrongly quarantine an
+/// already-sealed use.
+///
+/// `seal_use` calls this with FRESH `(nonce, params_nonce)` on every call (unchanged wire
+/// behavior, byte-identical to before this refactor); `deliver_averin_use` calls it with the
+/// STORED `(nonce, params_nonce)` from the enqueue-time event payload.
+#[allow(clippy::too_many_arguments)] // mirrors the use-PoP preimage's fixed field list exactly
+pub(crate) fn build_use_pop(
+    keypair: &PopKeypair,
+    capability: &str,
+    grant_id: &str,
+    resource_id: &str,
+    action: &str,
+    params: &[u8],
+    nonce: &str,
+    params_nonce: &str,
+) -> Result<UsePop, AverinError> {
+    let credential_binding = pop::credential_binding(capability).map_err(AverinError::Pop)?;
+    let params_commitment =
+        pop::params_commitment(params, params_nonce).map_err(AverinError::Pop)?;
+    let challenge = pop::use_pop_challenge(
+        grant_id,
+        resource_id,
+        action,
+        &params_commitment,
+        &credential_binding,
+        nonce,
+    );
+    let use_sig = keypair.sign_b64(&challenge);
+    Ok(UsePop {
+        params_commitment,
+        use_sig,
+    })
+}
+
 impl AverinClient {
     /// Build the client. Returns `Ok(None)` when disabled so the caller can fold
     /// it straight into `Option<Arc<AverinClient>>` without a guard.
@@ -355,9 +442,26 @@ impl AverinClient {
         self.cfg.mode
     }
 
+    /// The client's config — `pub(crate)` so the plan 088 Step 3b durable delivery worker
+    /// (`src/server/mod.rs`, a SIBLING transport, never a branch of `seal_grant`/`seal_use`, D1)
+    /// can read `project_id`/`session_id`/`resource_id`/`grant_ttl_secs` when it rebuilds a
+    /// grant/use request from a durable queue event + the PoP-key store, without widening
+    /// `AverinConfig` field access outside the crate.
+    pub(crate) fn config(&self) -> &AverinConfig {
+        &self.cfg
+    }
+
     /// Snapshot the fail-open seal counters (for `GET /api/v1/metrics` + tests).
     pub fn metrics(&self) -> SealMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// Plan 088 D7 — bump the durable-enqueue-failure counter. `pub(crate)` so
+    /// `VultrinoServer::seal_after_consume`'s durable Observe branch (`src/server/mod.rs`) can count
+    /// a local enqueue failure (disk full/fsync EIO) the exact same way the async fan-out counts a
+    /// drop, without widening `SealMetrics`'s fields (private to this module) outside the crate.
+    pub(crate) fn record_enqueue_failed(&self) {
+        self.metrics.record_enqueue_failed();
     }
 
     /// Inject a PoP entry so a unit test can exercise `seal_use`/`spawn_use_seal`
@@ -620,36 +724,36 @@ impl AverinClient {
     /// averin `record.record_id` of the sealed receipt. Raw mechanism (returns the
     /// real `Result`); [`Self::on_execute`] wraps it with the configured fail-mode.
     /// Public so the spike's integration test can assert + time it against a real averin.
+    ///
+    /// Plan 088 D5 — generates a FRESH `nonce`/`params_nonce` on every call, exactly as before
+    /// this refactor: this is the synchronous 087 path, and its wire body must stay
+    /// byte-identical to today (durable = false, the default). The body-build itself is now
+    /// [`build_use_pop`] — the SAME helper the durable delivery worker
+    /// (`deliver_averin_use`, `src/server/mod.rs`) calls with STORED `(nonce, params_nonce)`
+    /// instead of fresh ones, so a durable retry rebuilds byte-for-byte (D5's determinism
+    /// contract) while this synchronous path's behavior does not change at all.
     pub async fn seal_use(&self, token_id: &str, params: &[u8]) -> Result<String, AverinError> {
+        let params_nonce = pop::random_params_nonce_hex();
+        let nonce = pop::random_params_nonce_hex(); // any non-empty freshness string
+
         // Snapshot the fields we need without holding the lock across the await.
-        let (capability, grant_id, agent_pubkey, action, use_sig, nonce, params_nonce) = {
+        let (capability, action, use_sig) = {
             let map = self.pop.lock();
-            let entry = map.get(token_id).ok_or_else(|| AverinError::NoGrant(token_id.to_string()))?;
-            let credential_binding =
-                pop::credential_binding(&entry.capability).map_err(AverinError::Pop)?;
-            let params_nonce = pop::random_params_nonce_hex();
-            let params_commitment =
-                pop::params_commitment(params, &params_nonce).map_err(AverinError::Pop)?;
-            let nonce = pop::random_params_nonce_hex(); // any non-empty freshness string
-            let challenge = pop::use_pop_challenge(
+            let entry = map
+                .get(token_id)
+                .ok_or_else(|| AverinError::NoGrant(token_id.to_string()))?;
+            let use_pop = build_use_pop(
+                &entry.keypair,
+                &entry.capability,
                 &entry.grant_id,
                 &self.cfg.resource_id,
                 &entry.action,
-                &params_commitment,
-                &credential_binding,
+                params,
                 &nonce,
-            );
-            (
-                entry.capability.clone(),
-                entry.grant_id.clone(),
-                entry.keypair.agent_pubkey_b64(),
-                entry.action.clone(),
-                entry.keypair.sign_b64(&challenge),
-                nonce,
-                params_nonce,
-            )
+                &params_nonce,
+            )?;
+            (entry.capability.clone(), entry.action.clone(), use_pop.use_sig)
         };
-        let _ = (grant_id, agent_pubkey); // (available for richer receipts in Phase-2)
 
         let body = serde_json::json!({
             "idempotency_key": format!("{token_id}:use"),
@@ -675,7 +779,12 @@ impl AverinClient {
 
     // ---- transport -------------------------------------------------------
 
-    async fn post(
+    /// `pub(crate)` (was private) so the plan 088 Step 3b durable delivery worker can POST a
+    /// grant/use request it rebuilt from a durable queue event + the PoP-key store through the
+    /// SAME transport (auth header/query, response-size cap, non-2xx/parse handling) `seal_grant`/
+    /// `seal_use` use — reusing the transport, not branching it (D1). No behavior change to any
+    /// existing call site.
+    pub(crate) async fn post(
         &self,
         endpoint: &'static str,
         body: &serde_json::Value,
@@ -1016,5 +1125,158 @@ mod tests {
         let m = metrics.snapshot();
         assert_eq!(m.in_flight, 0);
         assert_eq!(m.failed, 0, "a completed guard must not count a failure");
+    }
+
+    // ---- plan 088 Step 4 (D5): deterministic use-PoP rebuild ---------------
+
+    /// D5's determinism contract, isolated from any network/lock/PopEntry plumbing:
+    /// [`build_use_pop`] called TWICE with the exact same `(seed, nonce, params_nonce, params,
+    /// grant_id, resource_id, action, capability)` produces BYTE-IDENTICAL
+    /// `params_commitment` + `use_sig`. This is exactly what makes a durable retry idempotent
+    /// at averin (same operation under the same `idempotency_key` — an honest retry) instead of
+    /// a 409 (`storedUseMatchesRequest`, `server.go:1990`).
+    #[test]
+    fn build_use_pop_is_byte_identical_across_calls_with_fixed_inputs() {
+        let keypair = PopKeypair::from_seed_bytes(&[9u8; 32]);
+        let capability = "AAAA.sig";
+        let grant_id = "grant-1";
+        let resource_id = "orders-db";
+        let action = "db.query:orders-ro";
+        let params = br#"{"q":1}"#;
+        let nonce = "fixed-nonce";
+        let params_nonce = "ab".repeat(32);
+
+        let a = build_use_pop(
+            &keypair,
+            capability,
+            grant_id,
+            resource_id,
+            action,
+            params,
+            nonce,
+            &params_nonce,
+        )
+        .expect("build_use_pop succeeds on well-formed inputs");
+        let b = build_use_pop(
+            &keypair,
+            capability,
+            grant_id,
+            resource_id,
+            action,
+            params,
+            nonce,
+            &params_nonce,
+        )
+        .expect("build_use_pop succeeds on well-formed inputs");
+
+        assert_eq!(
+            a.params_commitment, b.params_commitment,
+            "params_commitment must be byte-identical across calls with fixed inputs"
+        );
+        assert_eq!(
+            a.use_sig, b.use_sig,
+            "use_sig must be byte-identical across calls with fixed inputs (RFC 8032 \
+             deterministic Ed25519 signing)"
+        );
+
+        // A rebuild reconstructed from ONLY the 32-byte seed (the durable PoP-key store's
+        // exact round-trip, D2) reproduces the same signature too — not just the same
+        // in-memory `PopKeypair` instance.
+        let rebuilt_keypair = PopKeypair::from_seed_bytes(&keypair.seed_bytes());
+        let c = build_use_pop(
+            &rebuilt_keypair,
+            capability,
+            grant_id,
+            resource_id,
+            action,
+            params,
+            nonce,
+            &params_nonce,
+        )
+        .expect("build_use_pop succeeds on well-formed inputs");
+        assert_eq!(a.use_sig, c.use_sig);
+    }
+
+    /// A minimal RESPONDING fake `/v2/use` that just captures the request body it received —
+    /// enough to prove the synchronous 087 path's WIRE SHAPE is unchanged by the D5 refactor
+    /// (this test's whole point), without needing a real averin.
+    async fn responding_use_capture() -> (String, Arc<parking_lot::Mutex<Vec<serde_json::Value>>>)
+    {
+        use axum::{extract::State, routing::post, Json, Router};
+        let bodies: Arc<parking_lot::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        async fn use_handler(
+            State(bodies): State<Arc<parking_lot::Mutex<Vec<serde_json::Value>>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            bodies.lock().push(body);
+            Json(serde_json::json!({"record": {"record_id": "rec-1"}}))
+        }
+        let app = Router::new()
+            .route("/v2/use", post(use_handler))
+            .with_state(bodies.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), bodies)
+    }
+
+    /// Plan 088 Step 4 — the DEFAULT-OFF / `durable = false` constraint: `seal_use`'s refactored
+    /// body-build must be byte-for-byte the same WIRE SHAPE as before the refactor. Asserts (a)
+    /// the idempotency key is still the bare `"{token_id}:use"` (the D5b `:request_id` suffix is
+    /// a DURABLE-worker-only change, never the synchronous path's), (b) there is no
+    /// `use_sequence_number` field (that is a durable-worker-only addition too), and (c) two
+    /// calls still generate FRESH, DIFFERENT nonces each time (the synchronous path's existing
+    /// fresh-per-call behavior, unchanged by extracting `build_use_pop`).
+    #[tokio::test]
+    async fn seal_use_wire_shape_is_byte_identical_to_before_the_d5_refactor() {
+        let (base_url, bodies) = responding_use_capture().await;
+        let client = client_with(&base_url, 256, Duration::from_secs(5));
+        client.insert_test_grant("vut_shape", "AAAA.sig");
+
+        client
+            .seal_use("vut_shape", br#"{"q":1}"#)
+            .await
+            .expect("seal against the responding fake succeeds");
+        client
+            .seal_use("vut_shape", br#"{"q":1}"#)
+            .await
+            .expect("seal against the responding fake succeeds");
+
+        let seen = bodies.lock().clone();
+        assert_eq!(seen.len(), 2);
+        for body in &seen {
+            assert_eq!(body["idempotency_key"], serde_json::json!("vut_shape:use"));
+            assert!(
+                body.get("use_sequence_number").is_none(),
+                "the synchronous 087 path must NOT carry use_sequence_number (durable-worker-only): {body:?}"
+            );
+            let expected_keys: std::collections::BTreeSet<&str> = [
+                "idempotency_key",
+                "project_id",
+                "session_id",
+                "capability",
+                "use_sig",
+                "action",
+                "params",
+                "nonce",
+                "params_nonce",
+            ]
+            .into_iter()
+            .collect();
+            let actual_keys: std::collections::BTreeSet<&str> =
+                body.as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(actual_keys, expected_keys, "seal_use's body key set must be unchanged");
+        }
+        assert_ne!(
+            seen[0]["nonce"], seen[1]["nonce"],
+            "the synchronous path must still mint a FRESH nonce every call"
+        );
+        assert_ne!(
+            seen[0]["params_nonce"], seen[1]["params_nonce"],
+            "the synchronous path must still mint a FRESH params_nonce every call"
+        );
     }
 }

@@ -2,11 +2,18 @@
 //!
 //! Provides traits and implementations for storing credentials securely.
 
+mod averin_deadletter;
+mod averin_queue;
 mod file;
+mod outbox_model;
 mod outbox_store;
+mod popkey_store;
 
+pub use averin_deadletter::{AverinDeadLetterStore, QuarantineRecord, QuarantineStatus};
+pub use averin_queue::AverinQueue;
 pub use file::FileStorage;
 pub use outbox_store::OutboxStore;
+pub use popkey_store::{PopKeyEntry, PopKeyStore};
 
 use crate::approval::{ApprovalRequest, ApprovalStatus};
 use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
@@ -15,6 +22,7 @@ use crate::outbox::OutboxEvent;
 use crate::policy::Policy;
 use crate::{Credential, CredentialMetadata};
 use async_trait::async_trait;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Storage-related errors
@@ -76,6 +84,29 @@ pub enum StorageError {
 
     #[error("Invalid storage configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("averin durable queue directory is owned by another live process: {0}")]
+    AverinQueueBusy(String),
+
+    /// Plan 088 D8: an averin durable-seal store's file/segment failed to decrypt under the vault's
+    /// just-derived master key at OPEN time. The queue is eager (it must replay its live map at open),
+    /// so this is the on-open mid-rekey signal: a `vultrino rekey` that committed this store's rename
+    /// under a NEW key but crashed before the vault's own (LAST) rename leaves the vault still
+    /// deriving the OLD key while this file is already NEW-key-only — never a corrupted/mixed-key
+    /// store (the generation-swap protocol, D8, guarantees that), only a stale cross-reference between
+    /// two otherwise-intact generations. Fails closed with this clear diagnostic rather than a silent
+    /// brick or a partially-open averin subsystem; recovery is `re-run vultrino rekey offline to
+    /// completion` (the same residual the pre-088 two-file rekey already documented, now covering the
+    /// larger averin file set). The popkey/quarantine stores are lazy (whole-file, read on first touch,
+    /// mirroring `OutboxStore`) and so surface this SAME failure mode lazily on their first touch after
+    /// open, not synchronously at this point — consistent with, not a regression from, that existing
+    /// precedent.
+    #[error(
+        "averin durable-seal store at {0} could not be decrypted under the vault's current key — \
+         this looks like an interrupted 'vultrino rekey' (D8): re-run 'vultrino rekey' offline to \
+         completion"
+    )]
+    AverinStaleKey(String),
 }
 
 /// Outcome of reserving an [`Idempotency-Key`](StorageBackend::idempotency_check_or_reserve)
@@ -671,6 +702,42 @@ pub trait StorageBackend: Send + Sync {
     /// (an in-memory read). Default 0: only the file backend stages events inside the vault.
     async fn pending_event_count(&self) -> Result<usize, StorageError> {
         Ok(0)
+    }
+
+    // ==================== averin durable-seal handles (plan 088 D1/Step 5) ====================
+    //
+    // The mint/execute enqueue hooks (`VultrinoServer::seal_mint`/`seal_after_consume`) need to
+    // reach the averin durable USE queue (D0) and the PoP-key store (D2) WITHOUT downcasting
+    // `Arc<dyn StorageBackend>` back to the concrete `FileStorage` — the same trait-accessor shape
+    // `append_event`/`list_events_after` already use for the govder outbox. These are NOT the D1
+    // "master-key accessor" this plan explicitly forbids: only the already-constructed
+    // `AverinQueue`/`PopKeyStore` handles are exposed (never the vault's `Arc<MasterKey>` itself),
+    // and both are cheap `Arc` clones. Default `None` (every backend but `FileStorage`, and
+    // `FileStorage` itself when `[averin] enabled = false` or this process lost the queue's
+    // exclusive owner lock to a sibling process — Step 3a's graceful degradation).
+
+    /// The averin durable USE queue (D0), if this backend constructed one AND this process
+    /// currently owns it. `None` means: either averin durable delivery is off, or ANOTHER live
+    /// process owns the queue — either way the caller must fall back to the 087 async fail-open
+    /// seal path for this token/process (never block, never silently drop the seal entirely).
+    fn averin_durable_queue(&self) -> Option<Arc<AverinQueue>> {
+        None
+    }
+
+    /// The averin PoP-key store (D2). See [`Self::averin_durable_queue`]'s doc for the gating
+    /// contract — `Some`/`None` always agree with `averin_durable_queue` (the same process either
+    /// owns the whole averin durable-seal bundle or none of it).
+    fn averin_durable_popkeys(&self) -> Option<Arc<PopKeyStore>> {
+        None
+    }
+
+    /// The averin dead-letter quarantine store (D4). See [`Self::averin_durable_queue`]'s doc for the
+    /// gating contract — `Some`/`None` always agree with the other two averin handles. Plan 088 Step
+    /// 6a's periodic worker uses this (alongside the queue + popkey handles above) to reach all three
+    /// averin stores generically over `Arc<dyn StorageBackend>`, without downcasting to the concrete
+    /// `FileStorage`.
+    fn averin_durable_deadletter(&self) -> Option<Arc<AverinDeadLetterStore>> {
+        None
     }
 
     // ==================== Policy Storage (admin API, V1) ====================

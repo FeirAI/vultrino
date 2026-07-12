@@ -85,6 +85,7 @@ shellexpand = "3"
 tempfile = "3"
 fd-lock = "4.0.4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+libc = "0.2.186"
 
 # Future optional features
 # ethers = { version = "2", optional = true }

@@ -106,6 +106,7 @@ fn client(base_url: &str, mode: AverinMode) -> AverinClient {
         grant_ttl_secs: 300,
         max_inflight_seals: 256,
         max_seal_params_bytes: 128 * 1024,
+        durable: false,
     })
     .expect("client builds")
     .expect("client is Some when enabled")
@@ -224,4 +225,152 @@ async fn measure_added_execute_latency() {
     // A generous sanity ceiling so a pathological regression fails the run; the
     // real go/no-go is the recorded numbers + the ingestMu argument, not this bound.
     assert!(p(0.99) < Duration::from_millis(500), "p99 seal latency unexpectedly high: {:?}", p(0.99));
+}
+
+/// Plan 088 Step 4 (D5/D5b/D5c), against a REAL averin: reproduces the EXACT wire contract the
+/// durable delivery worker (`deliver_averin_use`, `src/server/mod.rs`) builds from a stored event
+/// — `build_use_pop` itself is `pub(crate)` and invisible to this external test crate, so this
+/// reimplements the same body from `vultrino::averin::pop`'s PUBLIC primitives (the same ones the
+/// worker calls) rather than exercising `AverinClient` (whose `seal_use` is the SYNCHRONOUS
+/// 087 path and deliberately does NOT send `use_sequence_number` or the `:request_id`-suffixed
+/// idempotency key — those are durable-worker-only, D5b/D5c).
+///
+/// Asserts, against real averin:
+/// - a `bounded_reuse` grant (`use_limit: 2`) accepts a use at `use_sequence_number: 1` (finding
+///   #4 — `seal_use`'s old body omitted this field entirely, which real averin's
+///   `resourceshim.go:233-259` requires in range for a bounded-reuse capability);
+/// - a RETRY of that exact same request (byte-identical body, same `idempotency_key`) is
+///   idempotent — a 2xx, NOT a 409 (finding #3, `storedUseMatchesRequest`, `server.go:1990`);
+/// - a SECOND, distinct execute (`use_sequence_number: 2`, a distinct `request_id` and therefore
+///   a distinct `idempotency_key`, D5b) is ALSO accepted — the two uses do not collapse into one
+///   averin record.
+#[tokio::test]
+#[ignore = "spawns a real averin-server binary; run with --ignored"]
+async fn durable_worker_shape_accepts_bounded_reuse_sequence_and_dedups_retry() {
+    use vultrino::averin::pop::{self, PopKeypair};
+
+    let av = spawn_averin();
+    wait_healthz(&av.base_url).await;
+    let http = reqwest::Client::new();
+
+    let token_id = "vut_spike_bounded_0001";
+    let agent_id = format!("vultrino:{token_id}");
+    let keypair = PopKeypair::generate();
+    let agent_pubkey = keypair.agent_pubkey_b64();
+
+    // POST /v2/grants directly — mirrors `AverinClient::seal_grant`'s exact body shape, with
+    // `use_limit: 2` so averin classifies this grant `bounded_reuse`.
+    let grant_challenge =
+        pop::grant_challenge(ACTION, &agent_id, &agent_pubkey, RESOURCE_ID, SCOPE);
+    let agent_sig = keypair.sign_b64(&grant_challenge);
+    let grant_body = serde_json::json!({
+        "idempotency_key": token_id,
+        "project_id": PROJECT,
+        "session_id": SESSION,
+        "agent_id": agent_id,
+        "action": ACTION,
+        "resource": RESOURCE_ID,
+        "scope": SCOPE,
+        "scope_class": "bounded_reuse",
+        "use_limit": 2,
+        "agent_pubkey": agent_pubkey,
+        "agent_sig": agent_sig,
+        "ttl_seconds": 300,
+    });
+    let grant_resp: serde_json::Value = http
+        .post(format!("{}/v2/grants", av.base_url))
+        .json(&grant_body)
+        .send()
+        .await
+        .expect("grant POST succeeds")
+        .json()
+        .await
+        .expect("grant response is JSON");
+    let grant_id = grant_resp["grant_id"]
+        .as_str()
+        .expect("grant response has grant_id")
+        .to_string();
+    let capability = grant_resp["capability"]
+        .as_str()
+        .expect("grant response has capability")
+        .to_string();
+
+    // Build the use #1 body — mirrors `deliver_averin_use`'s exact rebuild from STORED
+    // nonce/params_nonce/request_id/use_sequence_number.
+    let build_use_body = |params: &[u8], nonce: &str, params_nonce: &str, request_id: &str, seq: u32| {
+        let credential_binding = pop::credential_binding(&capability).unwrap();
+        let params_commitment = pop::params_commitment(params, params_nonce).unwrap();
+        let challenge = pop::use_pop_challenge(
+            &grant_id,
+            RESOURCE_ID,
+            ACTION,
+            &params_commitment,
+            &credential_binding,
+            nonce,
+        );
+        let use_sig = keypair.sign_b64(&challenge);
+        serde_json::json!({
+            "idempotency_key": format!("{token_id}:use:{request_id}"),
+            "project_id": PROJECT,
+            "session_id": SESSION,
+            "capability": capability,
+            "use_sig": use_sig,
+            "action": ACTION,
+            "params": String::from_utf8_lossy(params),
+            "nonce": nonce,
+            "params_nonce": params_nonce,
+            "use_sequence_number": seq,
+        })
+    };
+
+    let params = br#"{"q":"select 1"}"#;
+    let params_nonce_1 = pop::random_params_nonce_hex();
+    let use_body_1 = build_use_body(params, "fixed-nonce-1", &params_nonce_1, "req-1", 1);
+
+    let resp1 = http
+        .post(format!("{}/v2/use", av.base_url))
+        .json(&use_body_1)
+        .send()
+        .await
+        .expect("use #1 POST succeeds");
+    let status1 = resp1.status();
+    let body1 = resp1.text().await.unwrap_or_default();
+    assert!(
+        status1.is_success(),
+        "bounded-reuse use #1 (use_sequence_number=1) must be ACCEPTED by real averin, got {status1}: {body1}"
+    );
+
+    // D5's exact scenario: retry the IDENTICAL request (byte-identical body, same
+    // idempotency_key) — must be idempotent (2xx), never a 409.
+    let resp1_retry = http
+        .post(format!("{}/v2/use", av.base_url))
+        .json(&use_body_1)
+        .send()
+        .await
+        .expect("retry POST succeeds");
+    let status1_retry = resp1_retry.status();
+    let body1_retry = resp1_retry.text().await.unwrap_or_default();
+    assert!(
+        status1_retry.is_success(),
+        "a retry of the SAME use request (D5's deterministic rebuild) must be idempotent, \
+         NOT a 409 conflict, got {status1_retry}: {body1_retry}"
+    );
+
+    // D5b/D5c: a SECOND, distinct execute — distinct request_id (-> distinct idempotency_key)
+    // and use_sequence_number=2 — must ALSO be accepted (not collapsed into use #1's record).
+    let params_nonce_2 = pop::random_params_nonce_hex();
+    let use_body_2 = build_use_body(params, "fixed-nonce-2", &params_nonce_2, "req-2", 2);
+    let resp2 = http
+        .post(format!("{}/v2/use", av.base_url))
+        .json(&use_body_2)
+        .send()
+        .await
+        .expect("use #2 POST succeeds");
+    let status2 = resp2.status();
+    let body2 = resp2.text().await.unwrap_or_default();
+    assert!(
+        status2.is_success(),
+        "bounded-reuse use #2 (use_sequence_number=2, distinct request_id) must ALSO be \
+         ACCEPTED by real averin (D5b: distinct executes stay distinct records), got {status2}: {body2}"
+    );
 }

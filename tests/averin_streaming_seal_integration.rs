@@ -153,6 +153,43 @@ async fn store_cred_and_token(storage: &Arc<dyn StorageBackend>) -> UseToken {
     token
 }
 
+/// Plan 088 Step 4 (D5c) — a bounded-reuse token (`max_uses: Some(2)`), aliased separately from
+/// [`store_cred_and_token`]'s so both can coexist in one test. Also stored WITHOUT a pre-sealed
+/// grant (Observe is fail-open regardless, so the seal's own outcome is irrelevant to what this
+/// helper exists to prove: that `consume_use_token`'s post-increment `uses` — the authoritative
+/// `use_sequence_number` D5c threads through `seal_after_consume` — sequences 1 then 2 across two
+/// executes of the SAME token).
+async fn store_cred_and_multi_use_token(storage: &Arc<dyn StorageBackend>) -> UseToken {
+    let cred = Credential::new(
+        "api-cred-multi".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("secret"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    );
+    storage.store(&cred).await.unwrap();
+
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "multi-use".to_string(),
+        credential_scope: "api-cred-multi".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: Some(2),
+        require_approval: false,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+    token
+}
+
+fn multi_use_echo_request() -> ExecuteRequest {
+    ExecuteRequest {
+        credential: "api-cred-multi".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({"hello": "world"}),
+    }
+}
+
 fn exec_auth_for(token: &UseToken) -> ExecAuth {
     ExecAuth {
         auth: Some(AuthResult::for_use_token(token)),
@@ -292,5 +329,47 @@ async fn seal_mint_records_grant_so_first_execute_seals_not_nogrant() {
         av.metrics().failed,
         0,
         "no NoGrant / no seal failure once the grant is on record"
+    );
+}
+
+/// Plan 088 Step 4 (D5c) — `consume_use_token`'s post-increment `uses` (the authoritative,
+/// atomic 1-based sequence a bounded-reuse token's Nth execute gets, `src/storage/file.rs:1247`)
+/// is now CAPTURED by `run_action` (previously discarded, `src/server/mod.rs`) and threaded
+/// through `seal_after_consume` toward the `use_sequence_number` a durable use event will carry
+/// once Step 5 wires the enqueue. This proves the SOURCE value that threading depends on is
+/// correct across sequential executes of a `--uses 2` token: the first execute consumes
+/// `uses == 1`, the second `uses == 2` — never skipped, never repeated, never discarded.
+#[tokio::test]
+async fn buffered_execute_consumes_bounded_reuse_token_at_sequential_use_numbers() {
+    let (server, storage) = setup_averin(AverinMode::Observe).await;
+    let token = store_cred_and_multi_use_token(&storage).await;
+
+    server
+        .execute_gated(multi_use_echo_request(), exec_auth_for(&token))
+        .await
+        .expect("the FIRST execute of a --uses 2 token must succeed (Observe is fail-open)");
+    let after_first = storage.get_use_token(&token.id).await.unwrap().unwrap();
+    assert_eq!(after_first.uses, 1, "the FIRST execute must consume use #1");
+    assert!(!after_first.is_exhausted(), "one of two uses remains");
+
+    server
+        .execute_gated(multi_use_echo_request(), exec_auth_for(&token))
+        .await
+        .expect("the SECOND execute of a --uses 2 token must succeed");
+    let after_second = storage.get_use_token(&token.id).await.unwrap().unwrap();
+    assert_eq!(
+        after_second.uses, 2,
+        "the SECOND execute must consume use #2 (sequential, not repeated or skipped)"
+    );
+    assert!(after_second.is_exhausted(), "both uses are now spent");
+
+    // A third execute must fail closed (uses exhausted) — confirms `uses` genuinely advanced
+    // rather than being silently capped/discarded.
+    let third = server
+        .execute_gated(multi_use_echo_request(), exec_auth_for(&token))
+        .await;
+    assert!(
+        third.is_err(),
+        "a THIRD execute of an exhausted --uses 2 token must be denied"
     );
 }

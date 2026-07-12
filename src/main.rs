@@ -947,7 +947,11 @@ async fn init_storage(
                 .clone()
                 .unwrap_or_else(Config::default_storage_path);
 
-            let storage = FileStorage::new(&path, &password).await?;
+            // Plan 088 D1: construct the averin durable-seal stores here too, gated on
+            // `[averin] enabled` exactly like `AverinClient` itself gates the seal client
+            // (`server/mod.rs`) — `false` (the default) is byte-identical to pre-088 behavior.
+            let storage =
+                FileStorage::new_with_averin(&path, &password, config.averin.enabled).await?;
             Ok(Arc::new(storage))
         }
         StorageBackendType::Keychain => {
@@ -963,6 +967,48 @@ async fn init_storage(
 
 // (removed dead `run_server` stub — `serve` now requires --mcp; the JSON API/console is `vultrino web`.)
 
+/// Plan 088 Step 6a — spawn the averin durable-queue delivery worker + its GC/compaction tick
+/// (`vultrino::server::deliver_averin_outbox_periodically`) for this process, gated on
+/// `[averin] enabled && durable` AND this process actually owning the durable queue (Step 3a's
+/// single-writer-PROCESS `flock` — `averin_durable_queue()` is `None` on a sibling process that lost
+/// that race, which then seals via the 087 async fail-open path instead; nothing is spawned for it
+/// here). `enabled = false` OR `durable = false` (the default for both) takes neither branch and
+/// spawns nothing — byte-identical to every build before this plan. Shared by both `run_mcp_server`
+/// and `run_web_server` (mirroring the govder outbox worker's spawn, next to it in each) so the
+/// gate/spawn logic can't drift between the two entry points.
+///
+/// Returns the spawned task's `JoinHandle` when the gate held and every averin handle resolved
+/// (`Some`), or `None` when nothing was spawned. This return value exists so the spawn DECISION is
+/// directly assertable in a test (`is_some()`/`is_none()`) without needing to spy on `tokio::spawn`
+/// itself or observe the worker's runtime behavior; every real call site drops the handle
+/// immediately — a dropped `JoinHandle` only detaches it (does NOT abort the task), the same
+/// fire-and-forget pattern every other `tokio::spawn(...)` call in this file already uses.
+fn spawn_averin_worker_if_enabled(
+    server: &VultrinoServer,
+    averin_enabled: bool,
+    averin_durable: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !(averin_enabled && averin_durable) {
+        return None;
+    }
+    let storage = server.storage();
+    // Each `?` below is the exact gate: this process doesn't own the durable queue (a sibling process
+    // holds the exclusive lock, already logged by `AverinStores::open` at storage-open time) or the
+    // averin client is otherwise unavailable — nothing to spawn; this process seals via the 087 async
+    // fail-open path instead.
+    let queue = storage.averin_durable_queue()?;
+    let popkeys = storage.averin_durable_popkeys()?;
+    let deadletter = storage.averin_durable_deadletter()?;
+    let averin_client = server.averin()?;
+    Some(tokio::spawn(vultrino::server::deliver_averin_outbox_periodically(
+        queue,
+        popkeys,
+        deadletter,
+        averin_client,
+        std::time::Duration::from_secs(vultrino::server::AVERIN_OUTBOX_DELIVERY_SECS),
+    )))
+}
+
 /// Run the MCP server for LLM integration
 async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
@@ -976,9 +1022,11 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     )));
 
     let config_policies = config.policies.clone();
-    // Capture the approval + outbox config before `config` moves into the server.
+    // Capture the approval + outbox + averin config before `config` moves into the server.
     let approval_cfg = config.approval.clone();
     let outbox_cfg = config.outbox.clone();
+    let averin_enabled = config.averin.enabled;
+    let averin_durable = config.averin.durable;
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage, resolver);
 
@@ -1028,6 +1076,11 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
         std::time::Duration::from_secs(vultrino::server::OUTBOX_DELIVERY_SECS),
         server.outbox_metrics(),
     ));
+    // Deliver + GC the averin durable-seal queue (plan 088 Step 6a) — a SIBLING of the govder outbox
+    // worker just above, never a branch of it. Spawns nothing unless `[averin] enabled && durable`
+    // AND this process actually owns the durable queue (Step 3a's single-writer-process lock) —
+    // default OFF, byte-identical to every build before this plan.
+    let _ = spawn_averin_worker_if_enabled(&server, averin_enabled, averin_durable);
     // Reconcile any intent-staged events an inline drain left behind (D1 safety net) so a committed
     // approval decision's signed event is delivered within a tick, not only on the next restart.
     tokio::spawn(vultrino::server::drain_pending_events_periodically(
@@ -1099,6 +1152,11 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
         std::time::Duration::from_secs(vultrino::server::OUTBOX_DELIVERY_SECS),
         exec_server.outbox_metrics(),
     ));
+    // Deliver + GC the averin durable-seal queue (plan 088 Step 6a) — a SIBLING of the govder outbox
+    // worker just above, never a branch of it. Spawns nothing unless `[averin] enabled && durable`
+    // AND this process actually owns the durable queue (Step 3a's single-writer-process lock) —
+    // default OFF, byte-identical to every build before this plan.
+    let _ = spawn_averin_worker_if_enabled(&exec_server, config.averin.enabled, config.averin.durable);
     // Reconcile any intent-staged events an inline drain left behind (D1 safety net).
     tokio::spawn(vultrino::server::drain_pending_events_periodically(
         exec_server.storage().clone(),
@@ -2985,4 +3043,122 @@ async fn reload_plugin(name: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("Note: Hot-reload is only effective for running servers");
 
     Ok(())
+}
+
+/// Plan 088 Step 6a — the spawn-guard contract for `spawn_averin_worker_if_enabled`: the worker task
+/// is spawned IFF `[averin] enabled && durable` AND this process owns the durable queue, and NOT
+/// otherwise. Every axis is exercised against a REAL `FileStorage` (never a mock) so the "owns the
+/// queue" case is the genuine `flock`-based single-writer-process contract (Step 3a), not an assumed
+/// stand-in.
+#[cfg(test)]
+mod averin_worker_spawn_gate_tests {
+    use super::*;
+    use vultrino::averin::AverinConfig;
+
+    fn averin_cfg(enabled: bool, durable: bool) -> AverinConfig {
+        AverinConfig {
+            enabled,
+            base_url: "http://127.0.0.1:9".to_string(), // port 9 ("discard") — never actually dialed
+            resource_id: "orders-db".to_string(),
+            durable,
+            ..AverinConfig::default()
+        }
+    }
+
+    async fn server_over(
+        storage: Arc<dyn StorageBackend>,
+        cfg: AverinConfig,
+    ) -> VultrinoServer {
+        let mut config = Config::default();
+        config.averin = cfg;
+        let resolver = CredentialResolver::new(storage.clone());
+        VultrinoServer::new(config, storage, resolver)
+    }
+
+    #[tokio::test]
+    async fn does_not_spawn_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = SecretString::from("test-password");
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            FileStorage::new_with_averin(&dir.path().join("vault.enc"), &password, false)
+                .await
+                .unwrap(),
+        );
+        let server = server_over(storage, averin_cfg(false, false)).await;
+        assert!(
+            spawn_averin_worker_if_enabled(&server, false, false).is_none(),
+            "enabled=false, durable=false must spawn nothing (the default)"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_spawn_when_enabled_but_not_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = SecretString::from("test-password");
+        // The storage side IS averin-enabled (constructs + owns the durable queue) — proving the gate
+        // is `durable`, not merely "averin stores exist".
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            FileStorage::new_with_averin(&dir.path().join("vault.enc"), &password, true)
+                .await
+                .unwrap(),
+        );
+        assert!(storage.averin_durable_queue().is_some(), "this process owns the queue");
+        let server = server_over(storage, averin_cfg(true, false)).await;
+        assert!(
+            spawn_averin_worker_if_enabled(&server, true, false).is_none(),
+            "durable=false must spawn nothing even though enabled=true and this process owns the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawns_when_enabled_and_durable_and_owning_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = SecretString::from("test-password");
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            FileStorage::new_with_averin(&dir.path().join("vault.enc"), &password, true)
+                .await
+                .unwrap(),
+        );
+        let server = server_over(storage, averin_cfg(true, true)).await;
+        let handle = spawn_averin_worker_if_enabled(&server, true, true);
+        assert!(
+            handle.is_some(),
+            "enabled=true, durable=true, owns the queue -> the worker must be spawned"
+        );
+        handle.unwrap().abort(); // this test only asserts the spawn DECISION, not the loop's behavior
+    }
+
+    #[tokio::test]
+    async fn does_not_spawn_when_the_gate_is_true_but_this_process_lost_the_queue_ownership_race() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = SecretString::from("test-password");
+        let path = dir.path().join("vault.enc");
+
+        // The FIRST opener wins the durable queue's exclusive owner lock (Step 3a) and is kept alive
+        // for the rest of this test — its `_owner_lock` is what makes the second open lose the race.
+        let storage1: Arc<dyn StorageBackend> = Arc::new(
+            FileStorage::new_with_averin(&path, &password, true).await.unwrap(),
+        );
+        assert!(storage1.averin_durable_queue().is_some(), "the first opener owns the queue");
+
+        // A SECOND live `FileStorage` on the SAME vault path (the "another live process already owns
+        // it" case Step 3a's `AverinQueue::open` degrades gracefully, exercised here in-process via
+        // two open `FileStorage` handles) must construct fine but WITHOUT the durable averin stores —
+        // `averin_durable_queue()` is `None` even though `[averin] enabled` is `true`.
+        let storage2: Arc<dyn StorageBackend> = Arc::new(
+            FileStorage::new_with_averin(&path, &password, true).await.unwrap(),
+        );
+        assert!(
+            storage2.averin_durable_queue().is_none(),
+            "a second live opener must NOT win the exclusive queue lock"
+        );
+
+        let server2 = server_over(storage2, averin_cfg(true, true)).await;
+        assert!(
+            spawn_averin_worker_if_enabled(&server2, true, true).is_none(),
+            "enabled=true, durable=true, but this process does NOT own the queue -> spawn nothing"
+        );
+
+        drop(storage1); // keep the first opener's owner lock alive until after the assertion above
+    }
 }
