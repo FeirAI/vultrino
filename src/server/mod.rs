@@ -1258,24 +1258,40 @@ impl VultrinoServer {
             started_at: chrono::Utc::now(),
         });
 
-        // averin seal (plan 086, the "fourth contract"): a consume-before-act use
-        // receipt. Runs AFTER the vut_ token is consumed (above) and BEFORE
-        // `plugin.execute` (the point of no return), so a sealed intent precedes
-        // the side effect. Default-off (`self.averin == None`) → skipped entirely,
-        // so `/execute` is byte-identical to today. The spike seals SYNCHRONOUSLY
-        // to MEASURE the added latency; the design doc recommends async as the
-        // production default. Fail-mode is the client's: `observe` (fail-open) logs
-        // and returns Ok (action proceeds); `require_evidence` returns Err and we
-        // block here. (Known Phase-2 refinement: in strict mode the vut_ token was
-        // already consumed above, so blocking burns it — the seal should move
-        // before the consume, or the consume roll back. Out of scope for this
-        // flag-off spike.)
+        // averin seal (plan 086/087, the "fourth contract"): a use receipt sealed
+        // into averin's tamper-evident DAG. Default-off (`self.averin == None`) →
+        // skipped ENTIRELY, so with `[averin] enabled = false` (the production
+        // default) `/execute` is byte-identical to today. Fail-mode is the client's:
+        //
+        //   - Observe (fail-open, the default): plan 087 makes this ASYNC and OFF
+        //     the hot path. `spawn_use_seal` fires-and-forgets the `POST /v2/use`
+        //     so `plugin.execute` NEVER waits on averin; the fan-out is bounded
+        //     (`max_inflight_seals`) and dropped fail-open on saturation, and a
+        //     failed/dropped seal alarms (AVERIN-SEAL-FAILED/DROPPED) and is
+        //     independently detected by plan 085. `plugin.execute` proceeds
+        //     regardless — an averin outage cannot stall or fail a governed action.
+        //
+        //   - RequireEvidence (fail-closed, opt-in per-resource only): SYNCHRONOUS
+        //     by design — we await the seal BEFORE `plugin.execute` (the point of
+        //     no return) and block the action if it fails. Consume-before-seal
+        //     caveat (unchanged, out of scope for 087): the vut_ token was already
+        //     consumed above, so a strict block here burns it; fixing that ordering
+        //     is a separate change. This caveat is UNREACHABLE in the default
+        //     (Observe) posture because the async path never blocks.
         if let (Some(av), Some(tid)) = (&self.averin, use_token_id) {
             let params_bytes = serde_json::to_vec(&params).unwrap_or_default();
-            if let Err(e) = av.on_execute(tid, &params_bytes).await {
-                return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
-                    "averin evidence seal required but failed (require_evidence): {e}"
-                ))));
+            match av.mode() {
+                crate::averin::AverinMode::Observe => {
+                    // Fire-and-forget off the hot path — returns immediately.
+                    av.spawn_use_seal(tid, &params_bytes);
+                }
+                crate::averin::AverinMode::RequireEvidence => {
+                    if let Err(e) = av.on_execute(tid, &params_bytes).await {
+                        return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
+                            "averin evidence seal required but failed (require_evidence): {e}"
+                        ))));
+                    }
+                }
             }
         }
 
