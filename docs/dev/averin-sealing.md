@@ -1,9 +1,10 @@
 # averin sealing — the fourth contract (vultrino → averin per-use grant/use)
 
-> **Design doc for plan 086 (feir-os). DESIGN + SPIKE, not a shipped seal path.**
-> This resolves the load-bearing decisions the mapped design left to
-> implementation, and records the go/no-go the flag-gated spike produced. The
-> production default stays **byte-identical to today**: the seal-client is behind
+> **Design doc for plans 086 + 087 (feir-os).** §§0–9 are the plan-086 DESIGN +
+> SPIKE and its go/no-go; **§10 is the plan-087 production-ready posture** (async
+> fail-open, off the hot path, bounded fan-out, alarm). This resolves the
+> load-bearing decisions the mapped design left to implementation. The production
+> default stays **byte-identical to today**: the seal-client is behind
 > `[averin] enabled = false` and, off, vultrino's `/execute` and `/token-mint`
 > paths are unchanged.
 >
@@ -359,3 +360,66 @@ coupling `/execute` to averin); offer **synchronous `require_evidence`** as an
 explicit, per-resource opt-in for the narrow high-assurance case whose operator
 accepts the availability coupling and the single-writer ceiling. **Do not flip
 any production default in plan 086** — the seal-client stays `enabled = false`.
+
+## 10. Plan 087 — production-ready async posture (what "enabled=true" now means)
+
+Plan 086 landed the seal-client + the go/no-go above but seals SYNCHRONOUSLY (to
+measure Cost 1). Plan 087 makes the seal **production-ready** by implementing the
+§8 recommendation, while keeping the **default OFF and the default-off build
+byte-identical** (`self.averin == None` → both hooks skipped; verified: the only
+new code runs when `[averin] enabled = true`).
+
+**The execute seal is now async fail-open, off the hot path.** In `Observe` mode
+(the default), `run_action` calls `AverinClient::spawn_use_seal` instead of
+awaiting `on_execute`: it `tokio::spawn`s the `POST /v2/use` and returns
+immediately, so `plugin.execute` NEVER waits on averin. An averin outage cannot
+stall or fail a governed action — it only leaves an unsealed use (the honest §3.1
+(C) residual), which **plan 085** independently detects and reconciles.
+`require_evidence` is unchanged: still synchronous-by-design (await + block on
+failure), carrying its documented consume-before-seal caveat (the vut_ token is
+consumed before the seal, so a strict block burns it — out of scope here; that
+caveat is UNREACHABLE in the async Observe default because it never blocks).
+
+**The async fan-out is bounded — the one discipline that matters.** A sustained
+averin outage under high `/execute` load must not pile up unbounded spawned tasks
+→ OOM. `spawn_use_seal` claims a permit from a `tokio::sync::Semaphore`
+(`[averin] max_inflight_seals`, default **256**) WITHOUT blocking
+(`try_acquire_owned`); the permit is held for the seal's whole lifetime and frees
+a slot on completion. On saturation the seal is **DROPPED fail-open** — never
+blocking `/execute`, never growing unboundedly — becoming an 085-detected gap.
+Drop-vs-block is deliberately **drop**: blocking would reintroduce exactly the
+`/execute`↔averin coupling §3.2 rejects. The bound does not apply to
+`require_evidence` (that path already blocks `/execute`, so it is naturally
+back-pressured).
+
+**Fail-open failures/drops/timeouts alarm.** Each of {seal HTTP failure, timeout,
+fan-out drop} bumps a per-process counter (`sealed`/`failed`/`dropped`, surfaced
+on `GET /api/v1/metrics` as `averin_seal`, present only when enabled) AND emits a
+distinct greppable line — `AVERIN-SEAL-FAILED` / `AVERIN-SEAL-DROPPED` — carrying
+token id + `project_id` context but **never a secret or the raw params** (params
+are never logged). This is the operator alarm §2/§8 require; it pairs with plan
+085's govder-side reconciliation of the unsealed actions.
+
+**Mint stays synchronous (Step 4, deliberately).** The grant record + PoP entry
+must be on record before the token is handed back, or the agent's first
+`/execute` could race ahead of the grant seal and hit `NoGrant`. Mint is the
+control plane, not the `/execute` hot path, so its averin round-trip does not
+touch action latency; it remains fail-open (a token never depends on averin).
+
+### What `enabled = true` now gives — and does NOT give
+
+- **Gives:** every brokered `/execute` (Observe) gets a sealed averin `/v2/use`
+  receipt, **asynchronously and fail-open**, with a **bounded** fan-out and an
+  **alarm** on the residual — safe to enable per deployment, with no `/execute`
+  latency or availability coupling to averin, and no fleet serialization through
+  `ingestMu` (one async seal per action, shed under overload).
+- **Does NOT give:** at-least-once durability (a crash/outage/drop window leaves
+  an unsealed use — detected by **085**, made durable by **plan 088**, which
+  reuses vultrino's `outbox_store` for at-least-once `/v2/use` delivery +
+  durable token→PoP persistence); and **not** the D8 capstone
+  `attested_complete_over_brokered_surface` (that needs two-phase
+  use-intent/outcome + coverage manifest + attestation + anchored checkpoint —
+  **plan 089**, separate, needs averin-side validation). The in-memory pop map is
+  still unevicted (flagged for 088).
+- **Unchanged:** the production default is `enabled = false`. Plan 087 makes
+  enabling SAFE and READY; it does not flip the switch on any deployment.
