@@ -2104,6 +2104,19 @@ pub async fn api_create_token(
                 crate::outbox::admin_audit_payload(&actor, &token.id, "created"),
             )
             .await;
+        // averin seal (plan 086): record-before-issue grant. Best-effort and
+        // fail-open — a seal failure NEVER fails the mint. No-op unless
+        // `[averin] enabled = true` (`st.server.averin()` is then `None`), so the
+        // mint stays byte-identical to today. Maps the token's credential/action
+        // scope onto the averin grant; `max_uses > 1` selects `bounded_reuse`.
+        if let Some(av) = st.server.averin() {
+            let scope = token.credential_scope.clone();
+            let action = token
+                .action_scope
+                .clone()
+                .unwrap_or_else(|| "db.query:orders-ro".to_string());
+            av.on_mint(&token.id, &scope, &action, token.max_uses).await;
+        }
         (
             StatusCode::CREATED,
             serde_json::json!({

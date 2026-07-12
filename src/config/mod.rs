@@ -79,6 +79,11 @@ pub struct Config {
     /// Govder decide-plane client config (plan 031). Sourced from
     /// `GOVDER_BASE_URL` + `GOVDER_TENANT_ASSERTION_SECRET` at startup — not TOML.
     pub govder: Option<crate::govder::GovderConfig>,
+    /// averin seal-client config (plan 086, the "fourth contract"). Parsed from
+    /// the `[averin]` TOML block; `enabled` defaults to **false**, so the seal
+    /// path is off and `/execute` is byte-identical unless explicitly turned on.
+    /// The API key is filled from `AVERIN_API_KEY` at startup (never TOML).
+    pub averin: crate::averin::AverinConfig,
 }
 
 /// Tunables for the metered LLM proxy's streaming path (connector M1).
@@ -438,6 +443,7 @@ impl Config {
             policy_hash_secret: None,
             llm_proxy,
             govder: None,
+            averin: raw.averin.map(Into::into).unwrap_or_default(),
         })
     }
 
@@ -460,6 +466,7 @@ impl Config {
             policy_hash_secret: None,
             llm_proxy: LlmProxyConfig::default(),
             govder: None,
+            averin: crate::averin::AverinConfig::default(),
         }
     }
 

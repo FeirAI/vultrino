@@ -34,6 +34,8 @@ pub struct RawConfig {
     pub identity: Option<RawIdentityConfig>,
     /// Metered LLM-proxy streaming tunables (connector M1).
     pub llm_proxy: Option<RawLlmProxyConfig>,
+    /// averin seal-client (plan 086, the "fourth contract"). Absent → disabled.
+    pub averin: Option<RawAverinConfig>,
 }
 
 /// TOML shape for `[identity]` (V10/R6): `kind = "spiffe"|"oidc"`,
@@ -439,6 +441,51 @@ impl From<RawLlmProxyConfig> for LlmProxyConfig {
                 .stream_max_line_bytes
                 .filter(|&n| n > 0)
                 .unwrap_or(d.stream_max_line_bytes),
+        }
+    }
+}
+
+/// TOML shape for `[averin]` (plan 086, the "fourth contract"). Every field is
+/// optional; `enabled` defaults to **false** so an absent block — or a present
+/// block that never sets `enabled` — leaves the seal-client OFF and `/execute`
+/// byte-identical to today. The API key is NOT read from TOML (a config dump must
+/// never carry it) — the process entrypoint fills it from `AVERIN_API_KEY`.
+#[derive(Debug, Deserialize, Default)]
+pub struct RawAverinConfig {
+    pub enabled: Option<bool>,
+    pub base_url: Option<String>,
+    pub project_id: Option<String>,
+    pub session_id: Option<String>,
+    pub resource_id: Option<String>,
+    /// `"observe"` (fail-open, default) or `"require_evidence"` (fail-closed).
+    pub mode: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub grant_ttl_secs: Option<u32>,
+}
+
+impl From<RawAverinConfig> for crate::averin::AverinConfig {
+    fn from(raw: RawAverinConfig) -> Self {
+        let d = crate::averin::AverinConfig::default();
+        let mode = match raw.mode.as_deref() {
+            Some("require_evidence") => crate::averin::AverinMode::RequireEvidence,
+            // Any other value (incl. "observe" and typos) is the safe fail-open default.
+            _ => crate::averin::AverinMode::Observe,
+        };
+        Self {
+            enabled: raw.enabled.unwrap_or(d.enabled),
+            base_url: raw.base_url.unwrap_or(d.base_url),
+            project_id: raw.project_id.unwrap_or(d.project_id),
+            session_id: raw.session_id.unwrap_or(d.session_id),
+            resource_id: raw.resource_id.unwrap_or(d.resource_id),
+            // Sourced from AVERIN_API_KEY at startup, never TOML.
+            api_key: None,
+            mode,
+            timeout: raw
+                .timeout_secs
+                .filter(|&n| n > 0)
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(d.timeout),
+            grant_ttl_secs: raw.grant_ttl_secs.filter(|&n| n > 0).unwrap_or(d.grant_ttl_secs),
         }
     }
 }
