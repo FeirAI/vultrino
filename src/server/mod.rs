@@ -3659,11 +3659,18 @@ pub async fn deliver_averin_outbox_periodically(
 ///    move and/or reclaim failed in an earlier pass — see [`quarantine_and_reclaim_dead_letter`]'s
 ///    doc) gets that move re-attempted, fail-closed against clobbering an operator's quarantine
 ///    decision ([`AverinDeadLetterStore::contains`] gates a redundant re-quarantine).
-/// 3. **The bounded-growth alarm** (D0, carried over from `OutboxStore::gc`): a non-zero
+/// 3. **Delivered-prefix prune** (Codex HIGH-3 on plan 088): [`AverinQueue::prune_delivered_prefix`]
+///    durably drops the contiguous run of terminal-`Delivered` records past the retention window —
+///    before this fix, nothing ever pruned a successfully-delivered record (only a dead-lettered-then-
+///    reclaimed one left the map), so every successful use's raw `params` were retained, and
+///    re-replayed, forever. Runs AFTER the retry-sweep above so a dead-letter reclaimed earlier in
+///    THIS SAME tick already frees its gap in the map, letting the prefix scan continue past it onto
+///    any later terminal-`Delivered` records instead of stopping one tick early.
+/// 4. **The bounded-growth alarm** (D0, carried over from `OutboxStore::gc`): a non-zero
 ///    [`AverinQueue::stuck_undelivered_count`] means delivery is stalled and the journal is growing.
-/// 4. **The quarantine's own bounded sensitive-data retention** (D4): redact raw `params` past the
+/// 5. **The quarantine's own bounded sensitive-data retention** (D4): redact raw `params` past the
 ///    window, independent of whatever the queue side is doing.
-/// 5. **Cross-store popkey eviction** (D2): `PopKeyStore::evict_resolved` with the REAL
+/// 6. **Cross-store popkey eviction** (D2): `PopKeyStore::evict_resolved` with the REAL
 ///    `subject_has_live_use`/`subject_has_replayable_dead_letter` predicates — both fail closed
 ///    toward retention (an unreadable quarantine listing skips eviction for this tick entirely rather
 ///    than guess; `AverinQueue::has_pending_for_subject` cannot fail, it is a pure in-memory read).
@@ -3699,7 +3706,18 @@ async fn run_averin_gc_tick(
         quarantine_and_reclaim_dead_letter(event, queue, quarantine, already_quarantined).await;
     }
 
-    // 3. The bounded-growth alarm (D0), carried over from `OutboxStore::gc`'s alarm contract.
+    // 3. Delivered-prefix prune (Codex HIGH-3): bound the disk/replay growth from records nothing
+    // else ever prunes. Reuses the same retention window as the stuck-undelivered alarm below,
+    // mirroring `OutboxStore::gc`'s own single-`retention_secs` contract.
+    match run_averin_queue_blocking(|| queue.prune_delivered_prefix(AVERIN_QUEUE_RETENTION_SECS)) {
+        Ok(0) => {}
+        Ok(pruned) => {
+            info!(pruned, "averin durable queue pruned its delivered-prefix past the retention window")
+        }
+        Err(e) => warn!(error = %e, "averin durable queue delivered-prefix prune failed"),
+    }
+
+    // 4. The bounded-growth alarm (D0), carried over from `OutboxStore::gc`'s alarm contract.
     let stuck = run_averin_queue_blocking(|| queue.stuck_undelivered_count(AVERIN_QUEUE_RETENTION_SECS));
     if stuck > 0 {
         warn!(
@@ -3710,7 +3728,7 @@ async fn run_averin_gc_tick(
         );
     }
 
-    // 4. The quarantine's own bounded sensitive-data retention (D4) — independent of the queue side.
+    // 5. The quarantine's own bounded sensitive-data retention (D4) — independent of the queue side.
     let now = chrono::Utc::now();
     if let Some(before) = chrono::Duration::try_seconds(AVERIN_QUARANTINE_PARAMS_RETENTION_SECS as i64)
         .and_then(|d| now.checked_sub_signed(d))
@@ -3722,7 +3740,7 @@ async fn run_averin_gc_tick(
         }
     }
 
-    // 5. Cross-store popkey eviction (D2) — the real queue/quarantine predicates, fail-closed toward
+    // 6. Cross-store popkey eviction (D2) — the real queue/quarantine predicates, fail-closed toward
     // retention. `quarantine.list()` is fetched ONCE up front (not per-candidate inside the closure,
     // which must stay synchronous) and turned into a set of subjects with an OPEN, unpurged (i.e.
     // still `replay`-eligible) record; a listing failure skips eviction entirely THIS tick rather than
