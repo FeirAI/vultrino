@@ -5029,6 +5029,210 @@ mod averin_worker_tests {
             "the rebuilt use PoP must cryptographically verify under the post-rekey seed's public key"
         );
     }
+
+    /// **Plan 088 Step 7 — the HEADLINE restart-durability test.** This is the whole point of 088:
+    /// a `/v2/use` seal enqueued durably, then interrupted by a process restart BEFORE it ever
+    /// reached averin, is still delivered after the restart. Unlike the D8 rekey test above (which
+    /// rotates the master key), this test changes NOTHING about the key/password — it only DROPS
+    /// every in-process handle (the `FileStorage`, the `VultrinoServer`, the `AverinClient`) to
+    /// simulate a hard process exit (which also releases the Step-3a single-writer-process owner
+    /// lock on the durable queue directory), then constructs completely FRESH stores by reopening
+    /// the SAME vault files — exactly `outbox_store.rs:760`'s "kill-then-reopen" restart pattern,
+    /// reproduced here for the averin queue/popkey stores instead of the govder outbox.
+    ///
+    /// Drives the REAL production entry points end to end: `seal_mint` (durable) persists the
+    /// `PopKeyEntry` seed and enqueues `"averin.grant"`; `seal_after_consume` (durable) enqueues
+    /// `"averin.use"` with the D5 stored nonces — all BEFORE the "restart". Nothing is delivered to
+    /// averin pre-restart (the fake's call log is asserted empty first), so this is genuinely the
+    /// "enqueued then interrupted" scenario, not a lucky ordering artifact. After reopening, ONE
+    /// `deliver_averin_outbox_once` pass against the still-running fake averin must: (1) deliver the
+    /// grant BEFORE the use (D3 head-of-line ordering survives the restart, not just a single
+    /// in-memory run), (2) leave nothing pending, (3) show the `PopKeyEntry` (and its `pop_seed`)
+    /// survived the restart, and (4) reproduce a use PoP signature that both matches what the worker
+    /// actually sent AND cryptographically verifies under the reopened seed's public key — proving
+    /// the seed that signed post-restart is bit-for-bit the seed persisted pre-restart.
+    #[tokio::test]
+    async fn grant_and_use_seal_survives_restart_and_delivers_in_order() {
+        use crate::auth::NewUseToken;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        // Deliberately the SAME password across the "restart" — Step 7 proves durability across a
+        // process restart, not a rekey (that's the D8 test above). Reopening under an unchanged
+        // password is the honest analogue of a process crash/redeploy against the same vault.
+        let pw = secrecy::SecretString::from("restart-test-password");
+        let resource_id = "orders-db";
+        let token_id = "tok-restart-1".to_string();
+
+        let (base_url, fake) = responding_averin().await;
+
+        {
+            let storage = Arc::new(
+                FileStorage::new_with_averin(&path, &pw, true)
+                    .await
+                    .unwrap(),
+            );
+            assert!(
+                storage.averin_queue().is_some(),
+                "this process must own the durable queue"
+            );
+
+            let mut config = Config::default();
+            config.averin = AverinConfig {
+                enabled: true,
+                base_url: base_url.clone(),
+                resource_id: resource_id.to_string(),
+                mode: AverinMode::Observe,
+                durable: true,
+                ..AverinConfig::default()
+            };
+            let server = VultrinoServer::new(
+                config,
+                storage.clone() as Arc<dyn StorageBackend>,
+                CredentialResolver::new(storage.clone() as Arc<dyn StorageBackend>),
+            );
+            let av = server.averin().expect("averin client constructed (enabled = true)");
+
+            let (_plaintext, mut token) = crate::auth::UseToken::create(NewUseToken {
+                name: "test-token".to_string(),
+                credential_scope: "orders-*".to_string(),
+                action_scope: Some("db.query:orders-ro".to_string()),
+                max_uses: Some(1),
+                require_approval: false,
+                expires_in: None,
+            });
+            token.id = token_id.clone();
+
+            // Enqueue BOTH the grant (mint) and the use (execute) — durably, locally, off any
+            // network round-trip — then "crash" before either ever reaches averin.
+            server.seal_mint(&token).await;
+            let result = server
+                .seal_after_consume(&av, &token.id, br#"{"q":1}"#.to_vec(), 1, "req-restart-1")
+                .await;
+            assert!(result.is_ok(), "Observe must never return Err");
+
+            // Confirm this really is the "enqueued then interrupted" scenario: nothing has reached
+            // averin yet (the use is withheld head-of-line behind its own not-yet-delivered grant,
+            // D3), and both events are durably queued before the simulated restart.
+            assert!(
+                fake.call_log.lock().is_empty(),
+                "nothing must reach averin before the simulated restart"
+            );
+            let popkeys_before = storage.averin_popkeys().unwrap();
+            assert!(popkeys_before.get(&token_id).await.unwrap().is_some());
+            let queue_before = storage.averin_queue().unwrap();
+            assert_eq!(
+                queue_before.deliverable(10).len(),
+                1,
+                "only the grant is head-of-line; the use sits behind it, both durably enqueued"
+            );
+
+            // `storage`/`server`/`av` all drop at the end of this block — simulating a process
+            // restart: it releases the vault fd-lock AND the averin queue's exclusive
+            // process-lifetime owner lock (Step 3a), so the fresh open below can succeed.
+        }
+
+        // Reopen FRESH stores on the SAME vault files, same password — the restart. Then run ONE
+        // worker pass against the (still-running) fake averin.
+        let reopened = FileStorage::new_with_averin(&path, &pw, true)
+            .await
+            .unwrap();
+        let queue2 = reopened
+            .averin_queue()
+            .expect("the queue reopens cleanly after a restart");
+        let popkeys2 = reopened.averin_popkeys().unwrap();
+        let deadletter2 = reopened.averin_deadletter().unwrap();
+        let client = test_client(&base_url);
+
+        deliver_averin_outbox_once(queue2, popkeys2, deadletter2, &client, 8)
+            .await
+            .unwrap();
+
+        // Both delivered, nothing left pending for this subject.
+        assert!(
+            queue2.deliverable(10).is_empty(),
+            "both the grant and the use must deliver after the restart"
+        );
+        assert!(deadletter2.list().await.unwrap().is_empty());
+
+        // Ordering survived the restart: the grant landed at averin BEFORE the use (D3's
+        // per-subject head-of-line ordering is a property of the REBUILT in-memory state, not just
+        // the original in-process run).
+        let log = fake.call_log.lock().clone();
+        assert_eq!(
+            log.len(),
+            2,
+            "exactly one grant + one use reached the fake averin post-restart: {log:?}"
+        );
+        assert!(log[0].starts_with("grant:"), "grant must be first: {log:?}");
+        assert!(log[1].starts_with("use:"), "use must follow its grant: {log:?}");
+
+        // The PoP-key entry (the seed — the whole point of D2) survived the restart.
+        let entry = popkeys2
+            .get(&token_id)
+            .await
+            .unwrap()
+            .expect("the PopKeyEntry (and its pop_seed) survived the restart");
+        let grant_id = entry.grant_id.clone().expect("the grant delivered");
+        let capability = entry.capability.clone().expect("the grant delivered");
+
+        // The rebuilt use PoP must still verify. Recompute the expected use_sig from the REOPENED
+        // (post-restart) pop_seed against the fields the worker actually sent, and check it two
+        // ways: (1) byte-identical to what the worker sent (RFC 8032 determinism — a corrupted or
+        // freshly-regenerated seed would produce a DIFFERENT signature), and (2) cryptographically
+        // verifies under that seed's own public key.
+        let sent = fake
+            .use_request_bodies
+            .lock()
+            .last()
+            .cloned()
+            .expect("a use request reached the fake averin");
+        let use_sig_b64 = sent["use_sig"].as_str().unwrap().to_string();
+        let nonce = sent["nonce"].as_str().unwrap().to_string();
+        let params_nonce = sent["params_nonce"].as_str().unwrap().to_string();
+        let params = sent["params"].as_str().unwrap().as_bytes().to_vec();
+
+        let credential_binding = crate::averin::pop::credential_binding(&capability).unwrap();
+        let params_commitment =
+            crate::averin::pop::params_commitment(&params, &params_nonce).unwrap();
+        let challenge = crate::averin::pop::use_pop_challenge(
+            &grant_id,
+            resource_id,
+            &entry.action,
+            &params_commitment,
+            &credential_binding,
+            &nonce,
+        );
+
+        let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
+        let recomputed_sig = keypair.sign_b64(&challenge);
+        assert_eq!(
+            recomputed_sig, use_sig_b64,
+            "the rebuilt use PoP (post-restart seed) must reproduce the EXACT signature the worker \
+             sent (RFC 8032 determinism) — proving the seed survived the restart byte-for-byte"
+        );
+
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let sig_bytes: [u8; 64] = b64
+            .decode(&use_sig_b64)
+            .unwrap()
+            .try_into()
+            .expect("a 64-byte ed25519 signature");
+        let pubkey_bytes: [u8; 32] = b64
+            .decode(keypair.agent_pubkey_b64())
+            .unwrap()
+            .try_into()
+            .expect("a 32-byte ed25519 public key");
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes).unwrap();
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        use ed25519_dalek::Verifier;
+        assert!(
+            verifying_key.verify(&challenge, &signature).is_ok(),
+            "the rebuilt use PoP must cryptographically verify under the post-restart seed's public \
+             key"
+        );
+    }
 }
 
 /// Plan 088 Step 5 — the mint/execute durable ENQUEUE wiring (D0/D3/D5/D6/D7): `seal_mint`/
