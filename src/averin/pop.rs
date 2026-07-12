@@ -52,6 +52,23 @@ impl PopKeypair {
     pub fn sign_b64(&self, msg: &[u8]) -> String {
         B64.encode(self.signing.sign(msg).to_bytes())
     }
+
+    /// Reconstruct a keypair from its 32-byte Ed25519 seed (`SigningKey::from_bytes`) — the
+    /// durable PoP-key store round-trip (plan 088 D2): the store persists ONLY this seed (never
+    /// derived nonce/scalar state), and this reconstructs a fully-usable signing keypair from it
+    /// after a restart.
+    pub fn from_seed_bytes(seed: &[u8; 32]) -> Self {
+        Self {
+            signing: SigningKey::from_bytes(seed),
+        }
+    }
+
+    /// The 32-byte Ed25519 seed (`SigningKey::to_bytes`) — the ONLY bytes the durable PoP-key
+    /// store persists (plan 088 D2's `pop_seed` field). Round-trips through
+    /// [`Self::from_seed_bytes`] byte-for-byte.
+    pub fn seed_bytes(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
 }
 
 /// Append `LP(b) = uint32_be(len(b)) ‖ b` (RCP §9 length-prefix).
@@ -240,5 +257,46 @@ mod tests {
         assert_eq!(B64.decode(&pk).unwrap().len(), 32);
         let sig = kp.sign_b64(b"hello");
         assert_eq!(B64.decode(&sig).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn from_seed_bytes_round_trips_and_signs_deterministically() {
+        // plan 088 D2/Step 2: the durable PoP-key store persists ONLY `seed_bytes()`. This
+        // asserts the round trip through `from_seed_bytes` reconstructs a keypair that (a) has
+        // the SAME public key and (b) signs BYTE-IDENTICALLY to the original — RFC 8032 Ed25519
+        // signing is deterministic (same seed + same message -> same signature), which is
+        // load-bearing for D5's deterministic retry (a durable-worker retry after a restart must
+        // reproduce the exact `use_sig` averin already recorded, or an honest retry would 409 as
+        // a mismatched operation).
+        let kp = PopKeypair::generate();
+        let seed = kp.seed_bytes();
+        let rebuilt = PopKeypair::from_seed_bytes(&seed);
+
+        assert_eq!(
+            kp.agent_pubkey_b64(),
+            rebuilt.agent_pubkey_b64(),
+            "the reconstructed keypair must have the SAME public key"
+        );
+
+        let msg = b"averin durable pop seed round-trip";
+        let sig_original = kp.sign_b64(msg);
+        let sig_rebuilt_1 = rebuilt.sign_b64(msg);
+        let sig_rebuilt_2 = rebuilt.sign_b64(msg);
+
+        assert_eq!(
+            sig_original, sig_rebuilt_1,
+            "a keypair rebuilt from the seed signs BYTE-IDENTICALLY to the original (RFC 8032)"
+        );
+        assert_eq!(
+            sig_rebuilt_1, sig_rebuilt_2,
+            "signing the same message twice with the same (rebuilt) key is deterministic"
+        );
+
+        // Round-trip the seed itself, twice removed, to be thorough: seed -> keypair -> seed.
+        assert_eq!(
+            rebuilt.seed_bytes(),
+            seed,
+            "seed_bytes(from_seed_bytes(seed)) must reproduce the original seed exactly"
+        );
     }
 }
