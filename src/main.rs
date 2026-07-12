@@ -556,6 +556,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|s| !s.trim().is_empty());
     config.govder = vultrino::govder::GovderConfig::from_env();
+    // averin seal-client API key (plan 086): env-only so a config dump never
+    // carries it. Only consulted when `[averin] enabled = true`.
+    config.averin.api_key = std::env::var("AVERIN_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
     // Execute command
     match cli.command {

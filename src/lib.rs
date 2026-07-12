@@ -6,6 +6,7 @@
 
 pub mod approval;
 pub mod auth;
+pub mod averin;
 pub mod capability;
 pub mod config;
 pub mod crypto;

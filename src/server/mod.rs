@@ -516,6 +516,14 @@ pub struct VultrinoServer {
     /// the free-standing `deliver_outbox_periodically` background loop (see
     /// [`OutboxMetrics`]'s doc) via [`Self::outbox_metrics`].
     outbox_metrics: Arc<OutboxMetrics>,
+    /// averin seal-client (plan 086, the "fourth contract"). `None` unless
+    /// `[averin] enabled = true`. When set, it is the SINGLE shared instance: its
+    /// in-memory `token.id -> {capability, PoP key}` map is written by the mint
+    /// hook (`api_create_token`, via [`Self::averin`]) and read by the execute
+    /// hook in [`Self::run_action`], so both must go through this one client.
+    /// Default-off: `None`, and both hooks are no-ops — `/execute` and mint stay
+    /// byte-identical to today. See `docs/dev/averin-sealing.md`.
+    averin: Option<Arc<crate::averin::AverinClient>>,
 }
 
 /// A wired inbound workload-identity resolver (V10/R6): the request header to
@@ -596,6 +604,18 @@ impl VultrinoServer {
             }
         });
 
+        // averin seal-client (plan 086). Built once here (before `config` moves
+        // into Self) so the SAME instance — and its shared PoP map — backs both
+        // the mint hook and the execute hook. `Ok(None)` when disabled (the
+        // default) → no-op hooks; an init error disables it (never fails startup).
+        let averin = match crate::averin::AverinClient::new(config.averin.clone()) {
+            Ok(client) => client.map(Arc::new),
+            Err(e) => {
+                warn!(error = %e, "averin seal-client disabled: config invalid");
+                None
+            }
+        };
+
         Self {
             config,
             resolver,
@@ -612,7 +632,16 @@ impl VultrinoServer {
             inbound_identity,
             detect_emit_gate: parking_lot::RwLock::new(std::collections::HashMap::new()),
             outbox_metrics: Arc::new(OutboxMetrics::default()),
+            averin,
         }
+    }
+
+    /// The averin seal-client, if `[averin] enabled = true`. `None` otherwise
+    /// (the default). The mint hook in `api_create_token` calls this to seal a
+    /// `POST /v2/grants` on token issuance; the execute hook uses `self.averin`
+    /// directly. Returns a cheap `Arc` clone so the caller can `await` off it.
+    pub fn averin(&self) -> Option<Arc<crate::averin::AverinClient>> {
+        self.averin.clone()
     }
 
     /// The inbound header to read a verified workload-identity document from, if a
@@ -1228,6 +1257,27 @@ impl VultrinoServer {
             action: full_action.clone(),
             started_at: chrono::Utc::now(),
         });
+
+        // averin seal (plan 086, the "fourth contract"): a consume-before-act use
+        // receipt. Runs AFTER the vut_ token is consumed (above) and BEFORE
+        // `plugin.execute` (the point of no return), so a sealed intent precedes
+        // the side effect. Default-off (`self.averin == None`) → skipped entirely,
+        // so `/execute` is byte-identical to today. The spike seals SYNCHRONOUSLY
+        // to MEASURE the added latency; the design doc recommends async as the
+        // production default. Fail-mode is the client's: `observe` (fail-open) logs
+        // and returns Ok (action proceeds); `require_evidence` returns Err and we
+        // block here. (Known Phase-2 refinement: in strict mode the vut_ token was
+        // already consumed above, so blocking burns it — the seal should move
+        // before the consume, or the consume roll back. Out of scope for this
+        // flag-off spike.)
+        if let (Some(av), Some(tid)) = (&self.averin, use_token_id) {
+            let params_bytes = serde_json::to_vec(&params).unwrap_or_default();
+            if let Err(e) = av.on_execute(tid, &params_bytes).await {
+                return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
+                    "averin evidence seal required but failed (require_evidence): {e}"
+                ))));
+            }
+        }
 
         let plugin_request = crate::plugins::PluginRequest {
             credential,
