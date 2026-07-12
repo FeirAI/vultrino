@@ -2,9 +2,12 @@
 //!
 //! Provides traits and implementations for storing credentials securely.
 
+mod averin_queue;
 mod file;
+mod outbox_model;
 mod outbox_store;
 
+pub use averin_queue::AverinQueue;
 pub use file::FileStorage;
 pub use outbox_store::OutboxStore;
 

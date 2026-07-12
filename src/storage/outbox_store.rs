@@ -20,33 +20,25 @@
 //! contract is preserved verbatim: monotonic gap-free sequence, per-subject ordering, lease-based
 //! cross-process claim, attempts/backoff/dead-letter, explicit replay, and prefix GC.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{decrypt, encrypt, EncryptedData, MasterKey};
 use crate::outbox::{DeliveryState, OutboxEvent};
+use crate::storage::outbox_model::{
+    earliest_pending_per_subject, push_event, record_delivery_transition, OutboxCache,
+};
 use crate::storage::StorageError;
 
 /// On-disk format version for the OUTBOX file (independent of the vault's STORAGE_VERSION). v1 is the
 /// first split-out format. A newer file is refused (binary downgrade guard), mirroring the vault.
 const OUTBOX_FILE_VERSION: u32 = 1;
-
-/// The in-memory + on-disk outbox state (serialized as the file body, then encrypted).
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct OutboxCache {
-    /// Events keyed by monotonic sequence (BTreeMap → gap-free cursor replay order).
-    #[serde(default)]
-    outbox: BTreeMap<u64, OutboxEvent>,
-    /// The last assigned sequence (monotonic; survives restart so the broker cursor never rewinds).
-    #[serde(default)]
-    outbox_seq: u64,
-}
 
 /// The encrypted on-disk envelope. No salt: the key is the vault's already-derived master key
 /// (shared via Arc), so the outbox file is decrypted with it directly — no separate KDF.
@@ -252,31 +244,11 @@ impl OutboxStore {
     ) -> Result<bool, StorageError> {
         self.locked_mutate(move |c| {
             // Not found, or a late outcome against an already-terminal event → no mutation, no write.
-            let Some(e) = c.outbox.get_mut(&sequence) else {
-                return Ok((false, false));
-            };
-            if e.delivery != DeliveryState::Pending {
-                return Ok((false, false));
-            }
-            e.attempts += 1;
-            e.last_attempt_at = Some(Utc::now());
-            if success {
-                e.delivery = DeliveryState::Delivered;
-                e.leased_until = None;
-                e.last_error = None;
-                return Ok((false, true));
-            }
-            e.last_error = error;
-            if e.attempts >= max_attempts {
-                e.delivery = DeliveryState::DeadLettered;
-                e.leased_until = None;
-                Ok((true, true))
-            } else {
-                // Exponential-ish backoff lease, capped at 5 min (same as v6).
-                let backoff = (10u64.saturating_mul(1 << e.attempts.min(5))).min(300);
-                e.leased_until = Some(Utc::now() + chrono::Duration::seconds(backoff as i64));
-                Ok((false, true))
-            }
+            // (record_delivery_transition, extracted verbatim to `outbox_model` — plan 088 D0 — so the
+            // averin durable queue reuses the identical success/backoff/dead-letter arithmetic.)
+            let (dead_lettered, dirty) =
+                record_delivery_transition(&mut c.outbox, sequence, success, error, max_attempts);
+            Ok((dead_lettered, dirty))
         })
         .await
     }
@@ -649,64 +621,6 @@ pub(super) fn create_private_file(path: &Path) -> std::io::Result<std::fs::File>
         opts.mode(0o600);
     }
     opts.open(path)
-}
-
-/// Increment the sequence and insert a fresh Pending event (with an optional intent-drain dedup id).
-/// Relocated from FileStorage (+ the dedup_id for the v6→v7 intent-staging).
-fn push_event(
-    cache: &mut OutboxCache,
-    subject: &str,
-    event_type: &str,
-    payload: serde_json::Value,
-    dedup_id: Option<String>,
-) -> u64 {
-    cache.outbox_seq += 1;
-    let seq = cache.outbox_seq;
-    cache.outbox.insert(
-        seq,
-        OutboxEvent {
-            sequence: seq,
-            subject: subject.to_string(),
-            event_type: event_type.to_string(),
-            payload,
-            created_at: Utc::now(),
-            delivery: DeliveryState::Pending,
-            attempts: 0,
-            leased_until: None,
-            last_attempt_at: None,
-            last_error: None,
-            dedup_id,
-        },
-    );
-    seq
-}
-
-/// Earliest still-pending event per subject (per-subject ordering: a later event is withheld until
-/// its earlier sibling delivers; a leased earlier event still blocks). Relocated verbatim.
-fn earliest_pending_per_subject(
-    outbox: &BTreeMap<u64, OutboxEvent>,
-    limit: usize,
-    respect_lease: bool,
-    now: DateTime<Utc>,
-) -> Vec<OutboxEvent> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for e in outbox.values() {
-        if e.delivery != DeliveryState::Pending {
-            continue;
-        }
-        if !seen.insert(e.subject.as_str()) {
-            continue;
-        }
-        if respect_lease && e.leased_until.is_some_and(|t| t > now) {
-            continue;
-        }
-        out.push(e.clone());
-        if out.len() >= limit {
-            break;
-        }
-    }
-    out
 }
 
 #[cfg(test)]
