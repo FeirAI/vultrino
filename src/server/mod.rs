@@ -1190,12 +1190,27 @@ impl VultrinoServer {
     /// `params_bytes` serialization — entirely, keeping the default-off path
     /// byte-identical. Takes OWNED `params_bytes` (FIX 3b): the buffer moves into the
     /// seal instead of being copied again.
+    ///
+    /// Plan 088 D5c — `use_sequence_number` (the `consume_use_token` post-increment `uses`,
+    /// 1-based) and `request_id` are threaded through here from both call sites so they are
+    /// available at the ONE hook both execute paths share, ready for the durable enqueue
+    /// (`Step 5`, not wired yet — this step only carries the values, matching the
+    /// `let _ = (grant_id, agent_pubkey)` reserved-field idiom already used in
+    /// `crate::averin::AverinClient::seal_use`). Neither the Observe fire-and-forget nor the
+    /// RequireEvidence synchronous seal reads them today: both still call
+    /// `spawn_use_seal`/`on_execute` exactly as before, so the `durable = false` (087) wire
+    /// body is unaffected.
     async fn seal_after_consume(
         &self,
         av: &crate::averin::AverinClient,
         token_id: &str,
         params_bytes: Vec<u8>,
+        use_sequence_number: u32,
+        request_id: &str,
     ) -> Result<(), RunError> {
+        // Reserved for the plan 088 Step 5 durable enqueue (D5c's use_sequence_number + D5b's
+        // per-execute idempotency key); this step only threads them this far.
+        let _ = (use_sequence_number, request_id);
         match av.mode() {
             crate::averin::AverinMode::Observe => {
                 av.spawn_use_seal(token_id, params_bytes);
@@ -1249,13 +1264,21 @@ impl VultrinoServer {
         // effect. A failure here (exhausted/expired/revoked) means nothing ran
         // AND the token will never become usable, so it is terminal — a resumed
         // approval finalizes with the error rather than retrying forever.
+        //
+        // Plan 088 D5c — CAPTURE the post-increment `uses` (1-based: the token's first
+        // execute consumes `uses == 1`, its second `uses == 2`, …) instead of discarding it:
+        // this is the authoritative `use_sequence_number` a bounded-reuse (`--uses N`)
+        // capability's durable seal must carry (averin requires it in `[1, use_limit]`,
+        // `resourceshim.go:233-259`). Defaults to 0 (never read) when there is no use token.
+        let mut use_sequence_number: u32 = 0;
         if let Some(tid) = use_token_id {
-            self.storage.consume_use_token(tid).await.map_err(|e| {
+            let consumed = self.storage.consume_use_token(tid).await.map_err(|e| {
                 RunError::terminal(VultrinoError::PolicyDenied(format!(
                     "Use token cannot be used: {}",
                     e
                 )))
             })?;
+            use_sequence_number = consumed.uses;
         }
 
         let request_id = context.request_id.clone();
@@ -1349,8 +1372,10 @@ impl VultrinoServer {
             // Plan 087 FIX 1 — the mode-dependent seal hook now lives in ONE shared
             // helper so the buffered and streaming execute paths cannot drift. In
             // RequireEvidence a seal failure returns Err and DENIES the action here
-            // (before `plugin.execute` — the point of no return).
-            self.seal_after_consume(av, tid, params_bytes).await?;
+            // (before `plugin.execute` — the point of no return). Plan 088 D5c threads
+            // this execute's `use_sequence_number` + `request_id` through too.
+            self.seal_after_consume(av, tid, params_bytes, use_sequence_number, &request_id)
+                .await?;
         }
 
         let plugin_request = crate::plugins::PluginRequest {
@@ -1575,13 +1600,19 @@ impl VultrinoServer {
 
         // Reserve the use token atomically, fail-closed, BEFORE the first byte —
         // the point of no return, identical to the buffered path.
+        //
+        // Plan 088 D5c — CAPTURE the post-increment `uses` (the authoritative
+        // `use_sequence_number`), identical to `run_action`'s capture (see the comment
+        // there); defaults to 0 (never read) when there is no use token.
+        let mut use_sequence_number: u32 = 0;
         if let Some(tid) = use_token_id {
-            self.storage.consume_use_token(tid).await.map_err(|e| {
+            let consumed = self.storage.consume_use_token(tid).await.map_err(|e| {
                 RunError::terminal(VultrinoError::PolicyDenied(format!(
                     "Use token cannot be used: {}",
                     e
                 )))
             })?;
+            use_sequence_number = consumed.uses;
         }
 
         let request_id = context.request_id.clone();
@@ -1661,7 +1692,10 @@ impl VultrinoServer {
         // `params` move into `plugin_request` below.
         if let (Some(av), Some(tid)) = (&self.averin, use_token_id) {
             let params_bytes = serde_json::to_vec(&params).unwrap_or_default();
-            self.seal_after_consume(av, tid, params_bytes).await?;
+            // Plan 088 D5c — threads this execute's `use_sequence_number` + `request_id`
+            // through too, identical to the buffered path.
+            self.seal_after_consume(av, tid, params_bytes, use_sequence_number, &request_id)
+                .await?;
         }
 
         let plugin_request = crate::plugins::PluginRequest {
@@ -3129,11 +3163,23 @@ async fn deliver_averin_grant(
 /// guarantee) this fails the attempt (retried, eventually quarantined like any other persistent
 /// failure) rather than panicking.
 ///
-/// **Step 4 (D5) marker**: a real deterministic-retry rebuild persists `nonce`/`params_nonce` at
-/// ENQUEUE time and reuses those STORED values here so every retry produces a byte-identical
-/// `use_sig`/`params_commitment` and averin's idempotent-retry match succeeds instead of 409ing
-/// (an already-sealed use would otherwise get quarantined by its own successful prior delivery).
-/// Step 3b does not implement that — see the fresh-nonce generation below.
+/// Plan 088 Step 4 (D5/D5b/D5c) — a deterministic, idempotent rebuild. The `averin.use` event's
+/// payload shape is `{params, nonce, params_nonce, request_id, use_sequence_number}` (Step 5
+/// populates it at enqueue; Step 3b's + this step's tests construct it directly). Every field is
+/// read VERBATIM from the STORED event — none regenerated — so a retry of the SAME event (a
+/// worker re-attempt after losing the response to a prior, already-committed POST) rebuilds the
+/// EXACT same `params_commitment`/`use_sig` (Ed25519 signing is deterministic, RFC 8032) and
+/// averin's `storedUseMatchesRequest` (`server.go:1990`) sees an honest retry (`idempotent:
+/// true`), never a 409 that would wrongly quarantine an already-sealed use (D5).
+///
+/// D5b: the idempotency key includes `request_id` (`"{token_id}:use:{request_id}"`, NOT the bare
+/// `"{token_id}:use"` the synchronous 087 path still uses) so a `--uses N` token's N distinct
+/// executes (N distinct `request_id`s) stay N distinct averin records, while a retry of the SAME
+/// event (same `request_id`) reuses the same key and dedups.
+///
+/// D5c: `use_sequence_number` (the `consume_use_token` post-increment `uses`, captured at
+/// `src/server/mod.rs`'s execute call sites) rides verbatim into the body. averin ignores it for
+/// non-bounded scope classes, so it is always included.
 async fn deliver_averin_use(
     event: &crate::outbox::OutboxEvent,
     popkeys: &crate::storage::PopKeyStore,
@@ -3156,11 +3202,6 @@ async fn deliver_averin_use(
         }
     };
 
-    // Step 3b's placeholder `averin.use` payload shape: `{"params": <string>}` (mirrors
-    // `AverinClient::seal_use`'s existing UTF-8-lossy embedding of raw params into the JSON body).
-    // Step 4/5 extends this with `nonce`/`params_nonce`/`request_id`/`use_sequence_number` (D5/D5c)
-    // for a byte-exact, idempotent rebuild; nothing production-side enqueues this event yet
-    // (Step 5), so this shape is Step 3b's own test-construction contract, not an external one.
     let params = event
         .payload
         .get("params")
@@ -3168,41 +3209,61 @@ async fn deliver_averin_use(
         .ok_or_else(|| "averin.use event payload missing params".to_string())?
         .as_bytes()
         .to_vec();
+    // D5 — STORED, never regenerated: the whole point is that these are the SAME bytes on
+    // every delivery attempt for this event.
+    let nonce = event
+        .payload
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "averin.use event payload missing nonce".to_string())?
+        .to_string();
+    let params_nonce = event
+        .payload
+        .get("params_nonce")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "averin.use event payload missing params_nonce".to_string())?
+        .to_string();
+    // D5b — the per-execute idempotency-key discriminator.
+    let request_id = event
+        .payload
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "averin.use event payload missing request_id".to_string())?
+        .to_string();
+    // D5c — the bounded-reuse sequence number; averin ignores it for non-bounded scopes.
+    let use_sequence_number = event
+        .payload
+        .get("use_sequence_number")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "averin.use event payload missing use_sequence_number".to_string())?;
 
     let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
-    let credential_binding = crate::averin::pop::credential_binding(&capability)
-        .map_err(|e| format!("credential_binding: {e}"))?;
-
-    // Step 4 (D5): deterministic nonce/params_nonce rebuild — persist BOTH in the `averin.use`
-    // event payload at enqueue time and reuse the STORED values here (never fresh ones), so a
-    // retry is byte-identical instead of minting a new nonce/use_sig every attempt. Not done here:
-    let params_nonce = crate::averin::pop::random_params_nonce_hex();
-    let params_commitment = crate::averin::pop::params_commitment(&params, &params_nonce)
-        .map_err(|e| format!("params_commitment: {e}"))?;
-    let nonce = crate::averin::pop::random_params_nonce_hex();
-
-    let challenge = crate::averin::pop::use_pop_challenge(
+    let use_pop = crate::averin::build_use_pop(
+        &keypair,
+        &capability,
         &grant_id,
         &averin_client.config().resource_id,
         &entry.action,
-        &params_commitment,
-        &credential_binding,
+        &params,
         &nonce,
-    );
-    let use_sig = keypair.sign_b64(&challenge);
+        &params_nonce,
+    )
+    .map_err(|e| e.to_string())?;
 
-    // Mirrors `AverinClient::seal_use`'s exact body shape, rebuilt from the popkey entry + this
-    // event's stored params instead of the in-memory `pop` map (this worker never touches it; D1).
+    // Mirrors `AverinClient::seal_use`'s body shape, rebuilt from the popkey entry + this event's
+    // STORED fields instead of the in-memory `pop` map (this worker never touches it; D1) — plus
+    // the D5b per-execute idempotency key and the D5c `use_sequence_number`.
     let body = serde_json::json!({
-        "idempotency_key": format!("{token_id}:use"),
+        "idempotency_key": format!("{token_id}:use:{request_id}"),
         "project_id": averin_client.config().project_id,
         "session_id": averin_client.config().session_id,
         "capability": capability,
-        "use_sig": use_sig,
+        "use_sig": use_pop.use_sig,
         "action": entry.action,
         "params": String::from_utf8_lossy(&params),
         "nonce": nonce,
         "params_nonce": params_nonce,
+        "use_sequence_number": use_sequence_number,
     });
 
     averin_client
@@ -3676,10 +3737,10 @@ mod averin_worker_tests {
     use super::*;
     use crate::averin::{AverinClient, AverinConfig};
     use crate::crypto::MasterKey;
-    use crate::outbox::DeliveryState;
+    use crate::outbox::{DeliveryState, OutboxEvent};
     use crate::storage::{AverinDeadLetterStore, AverinQueue, PopKeyEntry, PopKeyStore, QuarantineStatus};
     use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     /// What the fake averin observed, in receipt order (a single shared log across BOTH
     /// endpoints — the only way a test can assert grant-BEFORE-use ordering, not just presence)
@@ -3692,6 +3753,15 @@ mod averin_worker_tests {
         fail_grant_agents: parking_lot::Mutex<HashSet<String>>,
         /// `action` values whose `/v2/use` call should return 500.
         fail_use_actions: parking_lot::Mutex<HashSet<String>>,
+        /// Plan 088 Step 4 (D5) — every `/v2/use` request body received, IN ORDER, regardless of
+        /// whether it was a fresh use or an idempotent replay — so a test can assert two POST
+        /// bodies for the SAME retried event are byte-identical (D5's determinism contract).
+        use_request_bodies: parking_lot::Mutex<Vec<serde_json::Value>>,
+        /// `idempotency_key -> (the first body seen under it, the record_id minted for it)` —
+        /// mirrors averin's real `storedUseMatchesRequest` (`server.go:1990`): a repeat key with
+        /// a MATCHING body is an honest retry (return the same record, `idempotent: true`); a
+        /// repeat key with a DIFFERENT body is the real 409 conflict (`:1994`/`:2035`).
+        use_by_idempotency_key: parking_lot::Mutex<HashMap<String, (serde_json::Value, String)>>,
     }
 
     async fn fake_grants(
@@ -3740,19 +3810,47 @@ mod averin_worker_tests {
                 Json(serde_json::json!({"error": "forced use failure"})),
             );
         }
-        let capability = body
-            .get("capability")
+        // Plan 088 Step 4 (D5) — record EVERY request body received, regardless of what happens
+        // next, so a test can compare two attempts byte-for-byte.
+        state.use_request_bodies.lock().push(body.clone());
+
+        let idempotency_key = body
+            .get("idempotency_key")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let mut log = state.call_log.lock();
-        log.push(format!("use:{capability}"));
-        let record_id = format!("rec-{}", log.len());
-        drop(log);
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({"record": {"record_id": record_id}})),
-        )
+        {
+            let mut by_key = state.use_by_idempotency_key.lock();
+            if let Some((prior_body, record_id)) = by_key.get(&idempotency_key) {
+                if *prior_body == body {
+                    // An honest retry (D5): the SAME operation replayed under the SAME key —
+                    // return the already-sealed record, mirroring averin's idempotent dedup.
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"record": {"record_id": record_id}, "idempotent": true})),
+                    );
+                }
+                // A DIFFERENT operation reusing an already-claimed key — averin's real 409.
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": "idempotency key reused with a mismatched request"})),
+                );
+            }
+            let capability = body
+                .get("capability")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let mut log = state.call_log.lock();
+            log.push(format!("use:{capability}"));
+            let record_id = format!("rec-{}", log.len());
+            drop(log);
+            by_key.insert(idempotency_key, (body, record_id.clone()));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"record": {"record_id": record_id}})),
+            )
+        }
     }
 
     /// Stand up a RESPONDING fake averin on an ephemeral local port. Returns its base_url plus the
@@ -3805,6 +3903,23 @@ mod averin_worker_tests {
         }
     }
 
+    /// Plan 088 Step 4 (D5/D5b/D5c) — the `averin.use` event's full payload shape:
+    /// `{params, nonce, params_nonce, request_id, use_sequence_number}`. `deliver_averin_use`
+    /// requires all five fields (a real enqueue, Step 5, will populate them); `params_nonce`
+    /// must be 64 lowercase hex chars (`pop::params_commitment` validates it strictly), `nonce`
+    /// may be any non-empty string. Distinct `request_id`s give distinct D5b idempotency keys; a
+    /// retry of the SAME logical event reuses the SAME `request_id` (see the dedicated retry
+    /// test below, which reuses one whole event rather than this helper twice).
+    fn use_payload(params: &str, request_id: &str, use_sequence_number: u32) -> serde_json::Value {
+        serde_json::json!({
+            "params": params,
+            "nonce": format!("nonce-{request_id}"),
+            "params_nonce": "ab".repeat(32),
+            "request_id": request_id,
+            "use_sequence_number": use_sequence_number,
+        })
+    }
+
     #[tokio::test]
     async fn averin_worker_delivers_grant_then_use_in_order_for_one_subject() {
         let dir = tempfile::tempdir().unwrap();
@@ -3820,11 +3935,7 @@ mod averin_worker_tests {
             .append("tok-1", "averin.grant", serde_json::json!({}))
             .unwrap();
         let use_seq = queue
-            .append(
-                "tok-1",
-                "averin.use",
-                serde_json::json!({"params": "hello-world"}),
-            )
+            .append("tok-1", "averin.use", use_payload("hello-world", "req-1", 1))
             .unwrap();
         assert!(grant_seq < use_seq);
 
@@ -3888,7 +3999,7 @@ mod averin_worker_tests {
             .append("tok-2", "averin.grant", serde_json::json!({}))
             .unwrap();
         queue
-            .append("tok-2", "averin.use", serde_json::json!({"params": "p"}))
+            .append("tok-2", "averin.use", use_payload("p", "req-2", 1))
             .unwrap();
 
         // Pass 1: the grant fails (forced 500). The use must NEVER even be attempted while its
@@ -3939,7 +4050,7 @@ mod averin_worker_tests {
             .append("tok-2b", "averin.grant", serde_json::json!({}))
             .unwrap();
         queue
-            .append("tok-2b", "averin.use", serde_json::json!({"params": "p"}))
+            .append("tok-2b", "averin.use", use_payload("p", "req-2b", 1))
             .unwrap();
         deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 8)
             .await
@@ -3969,7 +4080,11 @@ mod averin_worker_tests {
                 .append(subject, "averin.grant", serde_json::json!({}))
                 .unwrap();
             queue
-                .append(subject, "averin.use", serde_json::json!({"params": "p"}))
+                .append(
+                    subject,
+                    "averin.use",
+                    use_payload("p", &format!("req-{subject}"), 1),
+                )
                 .unwrap();
         }
 
@@ -4052,5 +4167,136 @@ mod averin_worker_tests {
                 .is_some(),
             "the unrelated subject's grant still delivered in the same pass"
         );
+    }
+
+    /// Plan 088 Step 4 (D5, adversarial finding #3's exact scenario): a durable use is
+    /// delivered, then the worker RETRIES the SAME event (e.g. it lost the response to a POST
+    /// averin had already committed). `deliver_averin_use` reads only STORED fields
+    /// (`nonce`/`params_nonce`/`params`/`request_id`/`use_sequence_number`) and never
+    /// regenerates them, so the two attempts must produce byte-identical POST bodies — which is
+    /// exactly what lets the fake (mirroring averin's real `storedUseMatchesRequest`,
+    /// `server.go:1990`) treat the second call as an honest retry (`idempotent: true`) instead
+    /// of a 409 that would wrongly quarantine an already-sealed use.
+    #[tokio::test]
+    async fn averin_worker_use_retry_of_same_event_is_byte_identical_and_idempotent_not_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_queue, popkeys, _deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+
+        popkeys
+            .insert("tok-retry", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        popkeys
+            .grant_resolved(
+                "tok-retry",
+                "AAAA.sig".to_string(),
+                "grant-retry".to_string(),
+                chrono::Utc::now(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let event = OutboxEvent {
+            sequence: 1,
+            subject: "tok-retry".to_string(),
+            event_type: "averin.use".to_string(),
+            payload: use_payload("hello", "req-retry", 1),
+            created_at: chrono::Utc::now(),
+            delivery: DeliveryState::Pending,
+            attempts: 0,
+            leased_until: None,
+            last_attempt_at: None,
+            last_error: None,
+            dedup_id: None,
+        };
+
+        deliver_averin_use(&event, &popkeys, &client)
+            .await
+            .expect("first delivery succeeds");
+        deliver_averin_use(&event, &popkeys, &client)
+            .await
+            .expect("a retry of the SAME event must ALSO succeed (idempotent, not a 409)");
+
+        let bodies = fake.use_request_bodies.lock().clone();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "both attempts reached the fake averin: {bodies:?}"
+        );
+        assert_eq!(
+            bodies[0], bodies[1],
+            "a retry of the SAME event must produce a byte-identical POST body (nonce, \
+             params_nonce, use_sig, idempotency_key — the D5 determinism contract)"
+        );
+        // Exactly one averin record was actually minted; the retry deduped rather than
+        // spuriously creating a second one.
+        let use_calls = fake
+            .call_log
+            .lock()
+            .iter()
+            .filter(|l| l.starts_with("use:"))
+            .count();
+        assert_eq!(
+            use_calls, 1,
+            "the retry must dedup at averin, not mint a second record"
+        );
+    }
+
+    /// Plan 088 Step 4 (D5b/D5c) — a bounded-reuse (`--uses N`) token's DISTINCT executes (each
+    /// with its own `request_id`) must land at averin as DISTINCT idempotency keys carrying
+    /// their correct 1-based `use_sequence_number` — never collapsed into one record the way the
+    /// bare 087-era `"{token_id}:use"` key would (D5b), and never omitting the sequence number
+    /// bounded-reuse capabilities require (D5c).
+    #[tokio::test]
+    async fn averin_worker_multi_use_token_gets_distinct_keys_and_sequence_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+
+        popkeys
+            .insert("tok-multi", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        queue
+            .append("tok-multi", "averin.grant", serde_json::json!({}))
+            .unwrap();
+        queue
+            .append("tok-multi", "averin.use", use_payload("p1", "req-1", 1))
+            .unwrap();
+        queue
+            .append("tok-multi", "averin.use", use_payload("p2", "req-2", 2))
+            .unwrap();
+
+        // One pass: the 64-event batch bound comfortably covers grant + both uses for this one
+        // subject, each becoming head-of-line in turn as the previous one delivers (D3).
+        deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 8)
+            .await
+            .unwrap();
+
+        let bodies = fake.use_request_bodies.lock().clone();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "both distinct uses reached averin: {bodies:?}"
+        );
+
+        let key1 = bodies[0]["idempotency_key"].as_str().unwrap();
+        let key2 = bodies[1]["idempotency_key"].as_str().unwrap();
+        assert_eq!(key1, "tok-multi:use:req-1");
+        assert_eq!(key2, "tok-multi:use:req-2");
+        assert_ne!(
+            key1, key2,
+            "distinct executes must get DISTINCT idempotency keys (D5b)"
+        );
+
+        assert_eq!(bodies[0]["use_sequence_number"].as_u64(), Some(1));
+        assert_eq!(bodies[1]["use_sequence_number"].as_u64(), Some(2));
+
+        assert!(queue.deliverable(10).is_empty());
+        assert!(deadletter.list().await.unwrap().is_empty());
     }
 }
