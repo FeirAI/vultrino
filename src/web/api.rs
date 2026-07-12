@@ -2104,19 +2104,17 @@ pub async fn api_create_token(
                 crate::outbox::admin_audit_payload(&actor, &token.id, "created"),
             )
             .await;
-        // averin seal (plan 086): record-before-issue grant. Best-effort and
-        // fail-open — a seal failure NEVER fails the mint. No-op unless
-        // `[averin] enabled = true` (`st.server.averin()` is then `None`), so the
-        // mint stays byte-identical to today. Maps the token's credential/action
-        // scope onto the averin grant; `max_uses > 1` selects `bounded_reuse`.
-        if let Some(av) = st.server.averin() {
-            let scope = token.credential_scope.clone();
-            let action = token
-                .action_scope
-                .clone()
-                .unwrap_or_else(|| "db.query:orders-ro".to_string());
-            av.on_mint(&token.id, &scope, &action, token.max_uses).await;
-        }
+        // averin seal (plan 086/087): record-before-issue grant, via the SHARED
+        // `seal_mint` (plan 087 FIX 2 — the same helper every in-process mint surface
+        // now calls, so a token minted here, on the web console, or on the workload
+        // exchange all get their grant on record before the token is returned). Kept
+        // SYNCHRONOUS on purpose: the grant record + PoP entry MUST be on record before
+        // the token is handed back, or the agent's first `/execute` could race ahead of
+        // the grant seal and hit NoGrant. Mint is the control plane, not the `/execute`
+        // hot path, so its averin round-trip does not touch action latency. Best-effort
+        // + fail-open (a token never depends on averin's uptime). No-op unless `[averin]
+        // enabled = true`, so the mint stays byte-identical to today.
+        st.server.seal_mint(&token).await;
         (
             StatusCode::CREATED,
             serde_json::json!({
@@ -3074,7 +3072,13 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
     // background delivery loop via `VultrinoServer::outbox_metrics()`.
     let outbox = state.server.outbox_metrics().snapshot();
 
-    let body = serde_json::json!({
+    // Plan 087 — averin fail-open seal counters. Only present when `[averin]` is
+    // enabled (otherwise the seal-client is `None`), so with the production
+    // default (enabled=false) this endpoint's output is byte-for-byte unchanged
+    // (the key is inserted below only when a seal-client exists).
+    let averin_seal = state.server.averin().map(|av| av.metrics());
+
+    let mut body = serde_json::json!({
         "unauthorized_attempts": state.server.unauthorized_attempts(),
         "tenant_scope": acting_tenant,
         "approvals": {
@@ -3096,6 +3100,14 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
             "last_delivered_sequence": outbox.last_delivered_sequence,
         },
     });
+    // Plan 087 — insert the seal counters ONLY when [averin] is enabled, so the
+    // default-off (enabled=false) metrics output stays byte-for-byte unchanged.
+    // `sealed` = use receipts sealed; `failed` = fail-open failures/timeouts
+    // (AVERIN-SEAL-FAILED); `dropped` = fan-out-cap drops (AVERIN-SEAL-DROPPED);
+    // `in_flight`/`max_in_flight` = the bounded fan-out gauge + high-water mark.
+    if let Some(seal) = averin_seal {
+        body["averin_seal"] = serde_json::to_value(seal).unwrap_or(serde_json::Value::Null);
+    }
     (StatusCode::OK, Json(body)).into_response()
 }
 

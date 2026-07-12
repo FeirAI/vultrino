@@ -473,6 +473,11 @@ pub async fn exchange_workload_token(
             e.to_string(),
         );
     }
+    // averin seal (plan 087 FIX 2): record-before-issue grant for a workload-exchange
+    // mint, via the SHARED `seal_mint` — so an exchanged MCP token gets its grant on
+    // record and its first `/execute` doesn't seal NoGrant. No-op unless `[averin]
+    // enabled = true`; best-effort + fail-open.
+    state.server.seal_mint(&mcp).await;
     let mut model_tokens = HashMap::new();
     let mut metadata = Vec::new();
     let mut minted_ids = vec![mcp.id.clone()];
@@ -497,6 +502,9 @@ pub async fn exchange_workload_token(
             );
         }
         minted_ids.push(token.id.clone());
+        // averin seal (plan 087 FIX 2): grant-before-issue for each per-channel model
+        // token too, via the SHARED `seal_mint`. No-op unless `[averin] enabled = true`.
+        state.server.seal_mint(&token).await;
         model_tokens.insert(channel, plain);
         metadata.push(UseTokenMetadata::from(&token));
     }

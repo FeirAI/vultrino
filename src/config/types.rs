@@ -461,6 +461,16 @@ pub struct RawAverinConfig {
     pub mode: Option<String>,
     pub timeout_secs: Option<u64>,
     pub grant_ttl_secs: Option<u32>,
+    /// Plan 087 — max concurrent in-flight async use-seal tasks (Observe mode).
+    /// Bounds the fail-open fan-out; on saturation seals are dropped fail-open.
+    /// Default 256; `0` is floored to 1 at build time.
+    pub max_inflight_seals: Option<usize>,
+    /// Plan 087 FIX 3 — max raw-`params` bytes a single use-seal will carry to averin.
+    /// Bounds the BYTES the bounded fan-out retains (a permit bounds task COUNT, not
+    /// size). Oversize params are dropped (Observe) / denied (RequireEvidence), never
+    /// truncated (averin recomputes the commitment from the raw bytes). Default 128
+    /// KiB; `0` falls back to the default.
+    pub max_seal_params_bytes: Option<usize>,
 }
 
 impl From<RawAverinConfig> for crate::averin::AverinConfig {
@@ -486,6 +496,14 @@ impl From<RawAverinConfig> for crate::averin::AverinConfig {
                 .map(std::time::Duration::from_secs)
                 .unwrap_or(d.timeout),
             grant_ttl_secs: raw.grant_ttl_secs.filter(|&n| n > 0).unwrap_or(d.grant_ttl_secs),
+            max_inflight_seals: raw
+                .max_inflight_seals
+                .filter(|&n| n > 0)
+                .unwrap_or(d.max_inflight_seals),
+            max_seal_params_bytes: raw
+                .max_seal_params_bytes
+                .filter(|&n| n > 0)
+                .unwrap_or(d.max_seal_params_bytes),
         }
     }
 }

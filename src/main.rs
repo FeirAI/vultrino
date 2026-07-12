@@ -2207,6 +2207,28 @@ async fn create_use_token(
 
     storage.store_use_token(&token).await?;
 
+    // Plan 087 FIX 2 — the CLI mints in a SEPARATE process and cannot populate the
+    // serving process's in-memory PoP map, so (unlike the in-process JSON API / web
+    // console / workload-exchange surfaces, which now all seal the grant via
+    // `VultrinoServer::seal_mint`) it cannot record the averin grant. Rather than
+    // silently issue a token whose first `/execute` seals NoGrant (Observe: a fail-open
+    // logged gap; RequireEvidence: a consume-then-deny that BURNS the token), warn the
+    // operator explicitly. See docs/dev/averin-sealing.md §11.
+    if config.averin.enabled {
+        eprintln!(
+            "WARNING: [averin] is enabled, but this token was minted by the CLI (a separate process)."
+        );
+        eprintln!(
+            "         Its averin grant is NOT on record in the running server, so the first /execute"
+        );
+        eprintln!(
+            "         will seal NoGrant (require_evidence would DENY and burn the token). Mint via the"
+        );
+        eprintln!(
+            "         JSON API, web console, or workload exchange for a sealed grant. See docs/dev/averin-sealing.md §11."
+        );
+    }
+
     println!("Use token created successfully!\n");
     println!("Token: {}", full_token);
     println!("\n*** SAVE THIS TOKEN - IT WILL NOT BE SHOWN AGAIN ***\n");

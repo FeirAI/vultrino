@@ -644,6 +644,32 @@ impl VultrinoServer {
         self.averin.clone()
     }
 
+    /// Plan 087 FIX 2 — the SINGLE grant-before-issue seal for EVERY in-process mint
+    /// surface (JSON admin API, web console, workload exchange). Centralizing it here
+    /// means the token→PoP grant is recorded for a token minted on ANY of them, so its
+    /// first `/execute` no longer seals `NoGrant` (Observe: a fail-open logged gap;
+    /// RequireEvidence: consume-then-deny that burns the token). No-op unless `[averin]
+    /// enabled = true` (`self.averin == None`), so mint stays byte-identical to today.
+    /// Best-effort + fail-open (a seal failure NEVER fails the mint — a token is a
+    /// vultrino artifact whose existence must not depend on averin's uptime).
+    ///
+    /// SYNCHRONOUS by design (mint is the control plane, not the `/execute` hot path):
+    /// the grant record + PoP entry MUST be on record before the token is handed back,
+    /// or the agent's first `/execute` could race ahead of the grant seal. The
+    /// out-of-process **CLI** mint cannot populate THIS process's in-memory PoP map, so
+    /// it warns instead of silently issuing an unsealed token — see
+    /// `docs/dev/averin-sealing.md` §11.
+    pub async fn seal_mint(&self, token: &UseToken) {
+        if let Some(av) = &self.averin {
+            let scope = token.credential_scope.clone();
+            let action = token
+                .action_scope
+                .clone()
+                .unwrap_or_else(|| "db.query:orders-ro".to_string());
+            av.on_mint(&token.id, &scope, &action, token.max_uses).await;
+        }
+    }
+
     /// The inbound header to read a verified workload-identity document from, if a
     /// resolver is wired (V10/R6). Lower-cased for case-insensitive matching.
     pub fn identity_header(&self) -> Option<&str> {
@@ -1145,6 +1171,46 @@ impl VultrinoServer {
         }
     }
 
+    /// Plan 087 FIX 1 — the SHARED averin use-seal hook for BOTH the buffered
+    /// ([`Self::run_action`]) and streaming ([`Self::run_action_streaming`]) execute
+    /// paths. Called AFTER the use token is consumed (the point of no return) and
+    /// BEFORE `plugin.execute*`, so a `stream: true` request gets exactly the seal a
+    /// buffered one does — the two paths cannot drift.
+    ///
+    /// - `Observe` (default): fire-and-forget off the hot path via `spawn_use_seal`
+    ///   (bounded fan-out, dropped fail-open on saturation). Returns `Ok(())` ALWAYS,
+    ///   so the action always proceeds — an averin outage never stalls or fails it.
+    /// - `RequireEvidence` (opt-in, per-resource): AWAIT the seal; on failure return
+    ///   `Err` so the caller DENIES the action before any side effect (buffered:
+    ///   returns the error; streaming: denies BEFORE the SSE body opens). This closes
+    ///   the strict-mode fail-OPEN hole the streaming path previously had.
+    ///
+    /// Callers reach this only inside `if let (Some(av), Some(tid)) = (&self.averin,
+    /// use_token_id)`, so `[averin] enabled = false` (the default) skips it — and the
+    /// `params_bytes` serialization — entirely, keeping the default-off path
+    /// byte-identical. Takes OWNED `params_bytes` (FIX 3b): the buffer moves into the
+    /// seal instead of being copied again.
+    async fn seal_after_consume(
+        &self,
+        av: &crate::averin::AverinClient,
+        token_id: &str,
+        params_bytes: Vec<u8>,
+    ) -> Result<(), RunError> {
+        match av.mode() {
+            crate::averin::AverinMode::Observe => {
+                av.spawn_use_seal(token_id, params_bytes);
+                Ok(())
+            }
+            crate::averin::AverinMode::RequireEvidence => {
+                av.on_execute(token_id, params_bytes).await.map_err(|e| {
+                    RunError::terminal(VultrinoError::PolicyDenied(format!(
+                        "averin evidence seal required but failed (require_evidence): {e}"
+                    )))
+                })
+            }
+        }
+    }
+
     /// Run a plugin action against a resolved credential.
     ///
     /// This is the shared core invoked both by the immediate path
@@ -1258,25 +1324,33 @@ impl VultrinoServer {
             started_at: chrono::Utc::now(),
         });
 
-        // averin seal (plan 086, the "fourth contract"): a consume-before-act use
-        // receipt. Runs AFTER the vut_ token is consumed (above) and BEFORE
-        // `plugin.execute` (the point of no return), so a sealed intent precedes
-        // the side effect. Default-off (`self.averin == None`) → skipped entirely,
-        // so `/execute` is byte-identical to today. The spike seals SYNCHRONOUSLY
-        // to MEASURE the added latency; the design doc recommends async as the
-        // production default. Fail-mode is the client's: `observe` (fail-open) logs
-        // and returns Ok (action proceeds); `require_evidence` returns Err and we
-        // block here. (Known Phase-2 refinement: in strict mode the vut_ token was
-        // already consumed above, so blocking burns it — the seal should move
-        // before the consume, or the consume roll back. Out of scope for this
-        // flag-off spike.)
+        // averin seal (plan 086/087, the "fourth contract"): a use receipt sealed
+        // into averin's tamper-evident DAG. Default-off (`self.averin == None`) →
+        // skipped ENTIRELY, so with `[averin] enabled = false` (the production
+        // default) `/execute` is byte-identical to today. Fail-mode is the client's:
+        //
+        //   - Observe (fail-open, the default): plan 087 makes this ASYNC and OFF
+        //     the hot path. `spawn_use_seal` fires-and-forgets the `POST /v2/use`
+        //     so `plugin.execute` NEVER waits on averin; the fan-out is bounded
+        //     (`max_inflight_seals`) and dropped fail-open on saturation, and a
+        //     failed/dropped seal alarms (AVERIN-SEAL-FAILED/DROPPED) and is
+        //     independently detected by plan 085. `plugin.execute` proceeds
+        //     regardless — an averin outage cannot stall or fail a governed action.
+        //
+        //   - RequireEvidence (fail-closed, opt-in per-resource only): SYNCHRONOUS
+        //     by design — we await the seal BEFORE `plugin.execute` (the point of
+        //     no return) and block the action if it fails. Consume-before-seal
+        //     caveat (unchanged, out of scope for 087): the vut_ token was already
+        //     consumed above, so a strict block here burns it; fixing that ordering
+        //     is a separate change. This caveat is UNREACHABLE in the default
+        //     (Observe) posture because the async path never blocks.
         if let (Some(av), Some(tid)) = (&self.averin, use_token_id) {
             let params_bytes = serde_json::to_vec(&params).unwrap_or_default();
-            if let Err(e) = av.on_execute(tid, &params_bytes).await {
-                return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
-                    "averin evidence seal required but failed (require_evidence): {e}"
-                ))));
-            }
+            // Plan 087 FIX 1 — the mode-dependent seal hook now lives in ONE shared
+            // helper so the buffered and streaming execute paths cannot drift. In
+            // RequireEvidence a seal failure returns Err and DENIES the action here
+            // (before `plugin.execute` — the point of no return).
+            self.seal_after_consume(av, tid, params_bytes).await?;
         }
 
         let plugin_request = crate::plugins::PluginRequest {
@@ -1574,6 +1648,21 @@ impl VultrinoServer {
             action: full_action.clone(),
             started_at: chrono::Utc::now(),
         });
+
+        // averin use-seal (plan 086/087, the "fourth contract") — SHARED with the
+        // buffered `run_action` via [`Self::seal_after_consume`], so a STREAMING
+        // execute is sealed exactly like a buffered one (plan 087 FIX 1: the streaming
+        // path previously had NO seal hook, so a `stream: true` request bypassed the
+        // seal and RequireEvidence failed OPEN for streams). Default-off
+        // (`self.averin == None`) → skipped entirely, byte-identical to today. In
+        // RequireEvidence the seal is AWAITED and a failure DENIES here — BEFORE
+        // `plugin.execute_streaming` (the point of no return) opens the upstream
+        // stream, so strict mode now fails CLOSED on streams too. Must precede the
+        // `params` move into `plugin_request` below.
+        if let (Some(av), Some(tid)) = (&self.averin, use_token_id) {
+            let params_bytes = serde_json::to_vec(&params).unwrap_or_default();
+            self.seal_after_consume(av, tid, params_bytes).await?;
+        }
 
         let plugin_request = crate::plugins::PluginRequest {
             credential,

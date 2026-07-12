@@ -1,9 +1,10 @@
 # averin sealing — the fourth contract (vultrino → averin per-use grant/use)
 
-> **Design doc for plan 086 (feir-os). DESIGN + SPIKE, not a shipped seal path.**
-> This resolves the load-bearing decisions the mapped design left to
-> implementation, and records the go/no-go the flag-gated spike produced. The
-> production default stays **byte-identical to today**: the seal-client is behind
+> **Design doc for plans 086 + 087 (feir-os).** §§0–9 are the plan-086 DESIGN +
+> SPIKE and its go/no-go; **§10 is the plan-087 production-ready posture** (async
+> fail-open, off the hot path, bounded fan-out, alarm). This resolves the
+> load-bearing decisions the mapped design left to implementation. The production
+> default stays **byte-identical to today**: the seal-client is behind
 > `[averin] enabled = false` and, off, vultrino's `/execute` and `/token-mint`
 > paths are unchanged.
 >
@@ -359,3 +360,137 @@ coupling `/execute` to averin); offer **synchronous `require_evidence`** as an
 explicit, per-resource opt-in for the narrow high-assurance case whose operator
 accepts the availability coupling and the single-writer ceiling. **Do not flip
 any production default in plan 086** — the seal-client stays `enabled = false`.
+
+## 10. Plan 087 — production-ready async posture (what "enabled=true" now means)
+
+Plan 086 landed the seal-client + the go/no-go above but seals SYNCHRONOUSLY (to
+measure Cost 1). Plan 087 makes the seal **production-ready** by implementing the
+§8 recommendation, while keeping the **default OFF and the default-off build
+byte-identical** (`self.averin == None` → both hooks skipped; verified: the only
+new code runs when `[averin] enabled = true`).
+
+**The execute seal is now async fail-open, off the hot path.** In `Observe` mode
+(the default), `run_action` calls `AverinClient::spawn_use_seal` instead of
+awaiting `on_execute`: it `tokio::spawn`s the `POST /v2/use` and returns
+immediately, so `plugin.execute` NEVER waits on averin. An averin outage cannot
+stall or fail a governed action — it only leaves an unsealed use (the honest §3.1
+(C) residual), which **plan 085** independently detects and reconciles.
+`require_evidence` is unchanged: still synchronous-by-design (await + block on
+failure), carrying its documented consume-before-seal caveat (the vut_ token is
+consumed before the seal, so a strict block burns it — out of scope here; that
+caveat is UNREACHABLE in the async Observe default because it never blocks).
+
+**The async fan-out is bounded — the one discipline that matters.** A sustained
+averin outage under high `/execute` load must not pile up unbounded spawned tasks
+→ OOM. `spawn_use_seal` claims a permit from a `tokio::sync::Semaphore`
+(`[averin] max_inflight_seals`, default **256**) WITHOUT blocking
+(`try_acquire_owned`); the permit is held for the seal's whole lifetime and frees
+a slot on completion. On saturation the seal is **DROPPED fail-open** — never
+blocking `/execute`, never growing unboundedly — becoming an 085-detected gap.
+Drop-vs-block is deliberately **drop**: blocking would reintroduce exactly the
+`/execute`↔averin coupling §3.2 rejects. The bound does not apply to
+`require_evidence` (that path already blocks `/execute`, so it is naturally
+back-pressured).
+
+**Fail-open failures/drops/timeouts alarm.** Each of {seal HTTP failure, timeout,
+fan-out drop} bumps a per-process counter (`sealed`/`failed`/`dropped`, surfaced
+on `GET /api/v1/metrics` as `averin_seal`, present only when enabled) AND emits a
+distinct greppable line — `AVERIN-SEAL-FAILED` / `AVERIN-SEAL-DROPPED` — carrying
+token id + `project_id` context but **never a secret or the raw params** (params
+are never logged). This is the operator alarm §2/§8 require; it pairs with plan
+085's govder-side reconciliation of the unsealed actions.
+
+**Mint stays synchronous (Step 4, deliberately).** The grant record + PoP entry
+must be on record before the token is handed back, or the agent's first
+`/execute` could race ahead of the grant seal and hit `NoGrant`. Mint is the
+control plane, not the `/execute` hot path, so its averin round-trip does not
+touch action latency; it remains fail-open (a token never depends on averin).
+
+### What `enabled = true` now gives — and does NOT give
+
+- **Gives:** every brokered `/execute` (Observe) gets a sealed averin `/v2/use`
+  receipt, **asynchronously and fail-open**, with a **bounded** fan-out and an
+  **alarm** on the residual — safe to enable per deployment, with no `/execute`
+  latency or availability coupling to averin, and no fleet serialization through
+  `ingestMu` (one async seal per action, shed under overload).
+- **Does NOT give:** at-least-once durability (a crash/outage/drop window leaves
+  an unsealed use — detected by **085**, made durable by **plan 088**, which
+  reuses vultrino's `outbox_store` for at-least-once `/v2/use` delivery +
+  durable token→PoP persistence); and **not** the D8 capstone
+  `attested_complete_over_brokered_surface` (that needs two-phase
+  use-intent/outcome + coverage manifest + attestation + anchored checkpoint —
+  **plan 089**, separate, needs averin-side validation). The in-memory pop map is
+  still unevicted (flagged for 088).
+- **Unchanged:** the production default is `enabled = false`. Plan 087 makes
+  enabling SAFE and READY; it does not flip the switch on any deployment.
+
+## 11. Plan 087 hardening — the six adversarial-review fixes
+
+An adversarial review of the §10 landing found six issues (all verified against
+the code). All six are fixed on `advisor/087-async-seal`, and all stay **behind
+the existing `Some(av)` / `av.mode()` guards** — `enabled = false` remains
+byte-identical to today. Summary of the resulting behavior:
+
+- **Streaming is now sealed (FIX 1, was CRITICAL).** The execute seal previously
+  lived ONLY in the buffered `run_action`; `run_action_streaming` consumed the use
+  token and streamed WITHOUT any `/v2/use` seal — so a `stream: true` request had
+  no receipt and, in `require_evidence`, proceeded even with averin down (a
+  strict-mode fail-OPEN hole). The mode-dependent hook is now ONE shared helper,
+  `VultrinoServer::seal_after_consume`, called from BOTH paths after the token
+  consume and before `plugin.execute*`. On the streaming path in
+  `require_evidence` the seal is **awaited and a failure DENIES before the SSE body
+  opens** (fails CLOSED); in `Observe` it is spawned off the hot path exactly like
+  the buffered path. Tests: `observe_streaming_execute_proceeds_and_spawns_seal`,
+  `require_evidence_streaming_denies_when_seal_fails`
+  (`tests/averin_streaming_seal_integration.rs`).
+
+- **Mint coverage is centralized (FIX 2, was MAJOR).** Only the JSON admin API
+  called `on_mint`; the web console and workload exchange issued usable tokens
+  WITHOUT a grant, so their first `/execute` sealed `NoGrant` (Observe: a fail-open
+  logged gap; `require_evidence`: consume-then-deny that burns the token). All
+  **in-process** mint surfaces now call the same `VultrinoServer::seal_mint`
+  (JSON API `api_create_token`, web-console token create, workload-exchange MCP +
+  per-channel model tokens). Test:
+  `seal_mint_records_grant_so_first_execute_seals_not_nogrant`.
+  **CLI limitation (explicit):** `vultrino token create` mints in a **separate
+  process** and cannot populate the serving process's in-memory PoP map, so it
+  CANNOT record the in-process grant. Rather than silently issue a token whose
+  first `/execute` seals `NoGrant`, the CLI **warns** (to stderr) when `[averin]
+  enabled = true`. Durable, cross-process token→PoP persistence (which would let
+  the CLI seal a grant the server can use) is **plan 088** — until then, mint via
+  an in-process surface when averin is enabled.
+
+- **The fan-out is bounded in BYTES, not just task count (FIX 3, was MAJOR).** A
+  permit caps the task COUNT, not the bytes each retains, so large payloads could
+  pin gigabytes. New `[averin] max_seal_params_bytes` (default **128 KiB**,
+  operator-tunable): params larger than the cap are **not sealed** — in `Observe`
+  the seal is DROPPED fail-open (counted, `AVERIN-SEAL-DROPPED-oversize`); in
+  `require_evidence` the action is DENIED with a bounded `ParamsTooLarge` error,
+  **never transmitting the oversize body**. There is no "seal the commitment only"
+  option: averin **recomputes** the params commitment from the raw bytes (§5a
+  recompute-or-reject), so a fixed-size commitment cannot be sealed without the raw
+  body — hence oversize = drop/deny, not truncate. Also: the seal now **moves** the
+  params buffer into the task instead of re-copying it, and the averin **response
+  read is capped** (`MAX_AVERIN_RESPONSE_BYTES`, 64 KiB) instead of an unbounded
+  `resp.text()`.
+
+- **Alarm lines never carry a response body (FIX 4, was MAJOR).** `AverinError::
+  Status`'s `Display` (what the alarm logs via `error = %e`) now carries ONLY the
+  endpoint + status code. The upstream body (possible PII/secret) is emitted once
+  at a **debug-only** channel at the `post` site and is not carried on the error at
+  all — no `AVERIN-SEAL-*` line can leak a body, capability, params, or secret.
+  Test: `status_error_display_excludes_response_body`.
+
+- **The drop log is rate-limited (FIX 5, was MAJOR).** Every saturated drop still
+  bumps the counter synchronously (cheap, lock-free), but the `AVERIN-SEAL-DROPPED`
+  **log line** is emitted at most once per 5 s (and always on the first drop, with
+  a running `dropped_total`), so a sustained averin outage under load can't turn
+  every dropped seal into a synchronous `warn!` on the `/execute` hot path. Test:
+  `drop_log_is_rate_limited_after_the_first`.
+
+- **`in_flight` is RAII-guarded (FIX 6, was MINOR).** A small `InflightGuard`
+  decrements the `in_flight` gauge on `Drop`, so a panicking/cancelled seal task no
+  longer overstates it; an abnormal exit also counts a `failed` (the lost seal is
+  reflected, not silently dropped). Tests:
+  `inflight_guard_releases_and_counts_failure_on_abnormal_drop`,
+  `inflight_guard_normal_completion_counts_no_failure`.

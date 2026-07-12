@@ -1336,6 +1336,12 @@ pub async fn token_create(
             .into_response();
     }
 
+    // averin seal (plan 087 FIX 2): record-before-issue grant for a web-console mint,
+    // via the SHARED `seal_mint` — so a console-minted token gets its grant on record
+    // just like a JSON-API one and its first `/execute` doesn't seal NoGrant.
+    // No-op unless `[averin] enabled = true`; best-effort + fail-open.
+    state.server.seal_mint(&token).await;
+
     render_tokens_list(
         &state,
         &session,
