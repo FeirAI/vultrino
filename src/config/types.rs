@@ -471,17 +471,41 @@ pub struct RawAverinConfig {
     /// truncated (averin recomputes the commitment from the raw bytes). Default 128
     /// KiB; `0` falls back to the default.
     pub max_seal_params_bytes: Option<usize>,
+    /// Plan 088 — the durable at-least-once reliability tier's master switch. Default **false**
+    /// (an absent key, or a present block that never sets it, leaves `/execute`'s Observe seal on
+    /// the exact 087 async path). See [`crate::averin::AverinConfig::durable`]. **`true` combined
+    /// with `mode = "require_evidence"` is REJECTED at load (D6)** — see this module's `TryFrom`.
+    pub durable: Option<bool>,
 }
 
-impl From<RawAverinConfig> for crate::averin::AverinConfig {
-    fn from(raw: RawAverinConfig) -> Self {
+impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawAverinConfig) -> Result<Self, Self::Error> {
         let d = crate::averin::AverinConfig::default();
         let mode = match raw.mode.as_deref() {
             Some("require_evidence") => crate::averin::AverinMode::RequireEvidence,
             // Any other value (incl. "observe" and typos) is the safe fail-open default.
             _ => crate::averin::AverinMode::Observe,
         };
-        Self {
+        let durable = raw.durable.unwrap_or(d.durable);
+        // Plan 088 D6 — durable at-least-once delivery is Observe-only: durable mint enqueues the
+        // grant instead of synchronously sealing it, so the in-memory `pop` map the SYNCHRONOUS
+        // `require_evidence` path reads (`AverinClient::seal_use`) is never populated, and every
+        // execute would deny with `NoGrant`. Reject the combination here — a HARD config-load
+        // failure (`ConfigError::Invalid`, the same "fail closed at startup" mechanism
+        // `[server.tls]` uses above) — rather than let it silently start into a broken state.
+        if durable && mode == crate::averin::AverinMode::RequireEvidence {
+            return Err(ConfigError::Invalid(
+                "[averin] durable = true is incompatible with mode = \"require_evidence\" \
+                 (plan 088 D6): durable at-least-once delivery is Observe-only — the strict \
+                 require_evidence path is synchronous and reads the in-memory PoP map durable \
+                 mint never populates, so the combination would deny every execute. Set \
+                 durable = false, or leave mode = \"observe\"."
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
             enabled: raw.enabled.unwrap_or(d.enabled),
             base_url: raw.base_url.unwrap_or(d.base_url),
             project_id: raw.project_id.unwrap_or(d.project_id),
@@ -504,7 +528,8 @@ impl From<RawAverinConfig> for crate::averin::AverinConfig {
                 .max_seal_params_bytes
                 .filter(|&n| n > 0)
                 .unwrap_or(d.max_seal_params_bytes),
-        }
+            durable,
+        })
     }
 }
 
@@ -1161,5 +1186,57 @@ action = "deny"
         // are lowercase-exact across vultrino, so wrong case also errors.
         assert!(Config::parse("[enforcement]\ndefault_action = \"permit\"").is_err());
         assert!(Config::parse("[enforcement]\ndefault_action = \"Deny\"").is_err());
+    }
+
+    // ---- plan 088 D6: durable + require_evidence config matrix -----------------------------
+
+    /// The full `{enabled}×{durable}×{Observe,RequireEvidence}` matrix (8 cells): the ONE
+    /// rejected combination is `durable = true` with `mode = "require_evidence"` — every other
+    /// cell parses fine, INCLUDING `durable = true` with `enabled = false` (a staged config that
+    /// hasn't been turned on yet is still validated the same way, so a later `enabled = true` flip
+    /// can never surface this failure for the first time at a worse moment).
+    #[test]
+    fn averin_config_matrix_rejects_only_durable_with_require_evidence() {
+        let toml = |enabled: bool, durable: bool, mode: &str| {
+            format!(
+                "[averin]\nenabled = {enabled}\nbase_url = \"http://127.0.0.1:8080\"\n\
+                 resource_id = \"orders-db\"\ndurable = {durable}\nmode = \"{mode}\""
+            )
+        };
+        for &enabled in &[false, true] {
+            for &durable in &[false, true] {
+                for &mode in &["observe", "require_evidence"] {
+                    let result = Config::parse(&toml(enabled, durable, mode));
+                    let should_reject = durable && mode == "require_evidence";
+                    assert_eq!(
+                        result.is_err(),
+                        should_reject,
+                        "enabled={enabled} durable={durable} mode={mode}: expected reject={should_reject}, got {result:?}"
+                    );
+                    if should_reject {
+                        let msg = format!("{}", result.unwrap_err()).to_lowercase();
+                        assert!(
+                            msg.contains("durable") && msg.contains("require_evidence"),
+                            "the error must name both durable and require_evidence: {msg}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn averin_durable_defaults_to_false_and_parses_when_set() {
+        // Absent [averin] (or a present block that never sets `durable`) → false, the
+        // byte-identical-to-087 default.
+        assert!(!Config::parse("").unwrap().averin.durable);
+        assert!(!Config::parse("[averin]\nenabled = true").unwrap().averin.durable);
+        // Explicit durable = true (with the default Observe mode) parses fine.
+        let cfg = Config::parse(
+            "[averin]\nenabled = true\nbase_url = \"http://x\"\nresource_id = \"r\"\ndurable = true",
+        )
+        .unwrap();
+        assert!(cfg.averin.durable);
+        assert_eq!(cfg.averin.mode, crate::averin::AverinMode::Observe);
     }
 }

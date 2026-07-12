@@ -659,6 +659,15 @@ impl VultrinoServer {
     /// out-of-process **CLI** mint cannot populate THIS process's in-memory PoP map, so
     /// it warns instead of silently issuing an unsealed token — see
     /// `docs/dev/averin-sealing.md` §11.
+    ///
+    /// Plan 088 Step 5 (D3) — when `[averin] durable = true` AND this process owns the durable
+    /// queue (`self.storage.averin_durable_queue()`, Step 3a), route the grant seal to the durable
+    /// enqueue instead: persist a `PopKeyEntry` + append an `"averin.grant"` event (the worker, plan
+    /// 088 Step 3b, delivers it) rather than synchronously calling `POST /v2/grants` here. D6
+    /// rejects `durable + require_evidence` at config load, so this is reachable ONLY in Observe. A
+    /// sibling process that does NOT own the durable queue falls back to the exact 087 synchronous
+    /// path below (never a hang, never an unsealed token). `durable = false` (the default) never
+    /// even reaches the `storage.averin_durable_queue()` call, so mint stays BYTE-IDENTICAL to 087.
     pub async fn seal_mint(&self, token: &UseToken) {
         if let Some(av) = &self.averin {
             let scope = token.credential_scope.clone();
@@ -666,7 +675,86 @@ impl VultrinoServer {
                 .action_scope
                 .clone()
                 .unwrap_or_else(|| "db.query:orders-ro".to_string());
+
+            if av.config().durable {
+                if let (Some(queue), Some(popkeys)) = (
+                    self.storage.averin_durable_queue(),
+                    self.storage.averin_durable_popkeys(),
+                ) {
+                    self.enqueue_durable_mint_grant(
+                        av,
+                        &queue,
+                        &popkeys,
+                        &token.id,
+                        &scope,
+                        &action,
+                        token.max_uses,
+                    )
+                    .await;
+                    return;
+                }
+                // This process does not own the durable queue (Step 3a graceful degradation) —
+                // fall back to the 087 synchronous grant seal for THIS process only.
+            }
             av.on_mint(&token.id, &scope, &action, token.max_uses).await;
+        }
+    }
+
+    /// Plan 088 Step 5 (D3) — the durable-mint enqueue: generate a fresh PoP keypair, persist its
+    /// seed (+ `action`/`scope`/`use_limit`, `capability`/`grant_id` still `None` — averin has not
+    /// responded yet) as a [`crate::storage::PopKeyEntry`] keyed by `token_id`, THEN append an
+    /// `"averin.grant"` event to the durable queue with `subject = token_id` (D3's per-subject FIFO
+    /// withholds any later `"averin.use"` for this token until the worker resolves the grant).
+    /// Mirrors `on_mint`'s always-fail-open contract exactly: a mint must never depend on averin's
+    /// OR this queue's uptime, so a persistence failure here is logged (the same
+    /// `AVERIN-SEAL-ENQUEUE-FAILED` alarm D7 uses for the execute-side enqueue) and the mint still
+    /// succeeds — the token is simply issued without a durable grant on record (the same residual
+    /// `on_mint`'s own doc already accepts for the synchronous path).
+    async fn enqueue_durable_mint_grant(
+        &self,
+        av: &crate::averin::AverinClient,
+        queue: &crate::storage::AverinQueue,
+        popkeys: &crate::storage::PopKeyStore,
+        token_id: &str,
+        scope: &str,
+        action: &str,
+        use_limit: Option<u32>,
+    ) {
+        let keypair = crate::averin::pop::PopKeypair::generate();
+        let entry = crate::storage::PopKeyEntry {
+            pop_seed: keypair.seed_bytes(),
+            action: action.to_string(),
+            scope: scope.to_string(),
+            use_limit,
+            capability: None,
+            grant_id: None,
+            minted_at: chrono::Utc::now(),
+            grant_delivered_at: None,
+            grant_expires_at: None,
+            abandoned: false,
+        };
+        if let Err(e) = popkeys.insert(token_id, entry).await {
+            av.record_enqueue_failed();
+            warn!(
+                target: "averin_seal",
+                token_id,
+                error = %e,
+                "AVERIN-SEAL-ENQUEUE-FAILED durable mint PoP-key persist failed (fail-open) — \
+                 token minted without a durable grant on record"
+            );
+            return;
+        }
+        if let Err(e) =
+            run_averin_queue_blocking(|| queue.append(token_id, "averin.grant", serde_json::json!({})))
+        {
+            av.record_enqueue_failed();
+            warn!(
+                target: "averin_seal",
+                token_id,
+                error = %e,
+                "AVERIN-SEAL-ENQUEUE-FAILED durable mint grant enqueue failed (fail-open) — \
+                 token minted without a durable grant on record"
+            );
         }
     }
 
@@ -1193,13 +1281,28 @@ impl VultrinoServer {
     ///
     /// Plan 088 D5c — `use_sequence_number` (the `consume_use_token` post-increment `uses`,
     /// 1-based) and `request_id` are threaded through here from both call sites so they are
-    /// available at the ONE hook both execute paths share, ready for the durable enqueue
-    /// (`Step 5`, not wired yet — this step only carries the values, matching the
-    /// `let _ = (grant_id, agent_pubkey)` reserved-field idiom already used in
-    /// `crate::averin::AverinClient::seal_use`). Neither the Observe fire-and-forget nor the
-    /// RequireEvidence synchronous seal reads them today: both still call
-    /// `spawn_use_seal`/`on_execute` exactly as before, so the `durable = false` (087) wire
-    /// body is unaffected.
+    /// available at the ONE hook both execute paths share, feeding the Step 5 durable enqueue
+    /// below (D5's `{params, nonce, params_nonce, request_id, use_sequence_number}` event shape).
+    ///
+    /// Plan 088 Step 5 (D0/D3/D5/D6/D7) — the Observe branch: when `[averin] durable = true` AND
+    /// this process owns the durable queue (`self.storage.averin_durable_queue()`, Step 3a), mint
+    /// `nonce`/`params_nonce` ONCE here and durably APPEND an `"averin.use"` event
+    /// (`subject = token_id`) instead of spawning the 087 async POST — the append is the D0 O(1)
+    /// hot-path primitive, so `/execute` returns WITHOUT awaiting averin either way. The worker
+    /// (plan 088 Step 3b) rebuilds the use byte-identically from these STORED nonces on every
+    /// delivery attempt (D5's determinism contract). D6 already rejects `durable +
+    /// require_evidence` at config load, so `durable` is only ever consulted in THIS (Observe)
+    /// arm — `RequireEvidence` below is completely unaffected by this step.
+    ///
+    /// D7 — the enqueue returns a `Result`, inspected here (no longer unconditional `Ok`): a local
+    /// persistence failure (disk full, fsync EIO) is counted, alarmed
+    /// (`AVERIN-SEAL-ENQUEUE-FAILED`, token/project context only — never `params`/the PoP seed,
+    /// mirroring 087 FIX 4's redaction), and DROPPED fail-open — `plugin.execute` proceeds exactly
+    /// as it would on an 087 async drop; an averin/disk problem must never fail a governed action
+    /// in Observe.
+    ///
+    /// `durable = false` (the default) never even calls `self.storage.averin_durable_queue()` —
+    /// this arm falls straight through to the EXACT 087 `spawn_use_seal` call, byte-identical.
     async fn seal_after_consume(
         &self,
         av: &crate::averin::AverinClient,
@@ -1208,11 +1311,30 @@ impl VultrinoServer {
         use_sequence_number: u32,
         request_id: &str,
     ) -> Result<(), RunError> {
-        // Reserved for the plan 088 Step 5 durable enqueue (D5c's use_sequence_number + D5b's
-        // per-execute idempotency key); this step only threads them this far.
-        let _ = (use_sequence_number, request_id);
         match av.mode() {
             crate::averin::AverinMode::Observe => {
+                if av.config().durable {
+                    if let Some(queue) = self.storage.averin_durable_queue() {
+                        // D5 — bind the freshness nonces ONCE, here, at enqueue time. The worker
+                        // rebuilds `params_commitment`/`use_sig` from these EXACT stored values on
+                        // every delivery attempt, never regenerating them, so a retry is
+                        // byte-identical (an honest idempotent retry at averin, never a 409).
+                        let nonce = crate::averin::pop::random_params_nonce_hex();
+                        let params_nonce = crate::averin::pop::random_params_nonce_hex();
+                        let payload = serde_json::json!({
+                            "params": String::from_utf8_lossy(&params_bytes),
+                            "nonce": nonce,
+                            "params_nonce": params_nonce,
+                            "request_id": request_id,
+                            "use_sequence_number": use_sequence_number,
+                        });
+                        let result =
+                            run_averin_queue_blocking(|| queue.append(token_id, "averin.use", payload));
+                        return Self::handle_durable_use_enqueue_result(av, token_id, result);
+                    }
+                    // This process does not own the durable queue (Step 3a graceful
+                    // degradation) — fall back to the 087 async path for THIS process only.
+                }
                 av.spawn_use_seal(token_id, params_bytes);
                 Ok(())
             }
@@ -1222,6 +1344,40 @@ impl VultrinoServer {
                         "averin evidence seal required but failed (require_evidence): {e}"
                     )))
                 })
+            }
+        }
+    }
+
+    /// Plan 088 D7 — apply the durable `"averin.use"` enqueue's `Result`: `Ok` (the append landed
+    /// durably) proceeds silently; `Err` (a local persistence failure — disk full, fsync EIO, …)
+    /// counts it, emits the greppable `AVERIN-SEAL-ENQUEUE-FAILED` alarm (token/project context
+    /// ONLY, never `params`/the PoP seed, mirroring 087 FIX 4's redaction), and STILL returns
+    /// `Ok(())` — an averin/disk problem must never fail a governed action in Observe (this arm is
+    /// only ever reached in Observe; D6 rejects `durable + require_evidence` at config load).
+    ///
+    /// Factored out of [`Self::seal_after_consume`] so this exact contract is independently unit-
+    /// testable with a SYNTHETIC `Err` — genuinely reproducing a disk/fsync fault against a real
+    /// `AverinQueue` deterministically (an already-open segment file's fd keeps writing/fsyncing
+    /// successfully regardless of a later `chmod`/`unlink` on the path) is not a portable unit-test
+    /// primitive, so the test drives this function directly with a constructed `StorageError`.
+    fn handle_durable_use_enqueue_result(
+        av: &crate::averin::AverinClient,
+        token_id: &str,
+        result: Result<u64, crate::storage::StorageError>,
+    ) -> Result<(), RunError> {
+        match result {
+            Ok(_seq) => Ok(()),
+            Err(e) => {
+                av.record_enqueue_failed();
+                tracing::warn!(
+                    target: "averin_seal",
+                    token_id,
+                    project_id = %av.config().project_id,
+                    error = %e,
+                    "AVERIN-SEAL-ENQUEUE-FAILED durable averin.use enqueue failed (observe/fail-open) \
+                     — action proceeds"
+                );
+                Ok(())
             }
         }
     }
@@ -4298,5 +4454,283 @@ mod averin_worker_tests {
 
         assert!(queue.deliverable(10).is_empty());
         assert!(deadletter.list().await.unwrap().is_empty());
+    }
+}
+
+/// Plan 088 Step 5 — the mint/execute durable ENQUEUE wiring (D0/D3/D5/D6/D7): `seal_mint`/
+/// `seal_after_consume` routing to the durable queue when `[averin] durable = true`, the
+/// byte-identical `durable = false` fallback, and the D7 fail-open enqueue-failure contract.
+/// Distinct from `averin_worker_tests` (which drives the Step 3b DELIVERY worker against a fake
+/// averin) — these tests never touch the network at all; they only exercise the local ENQUEUE.
+#[cfg(test)]
+mod durable_enqueue_tests {
+    use super::*;
+    use crate::auth::NewUseToken;
+    use crate::averin::{AverinConfig, AverinMode};
+    use std::time::{Duration, Instant};
+
+    /// Build a `VultrinoServer` backed by a REAL `FileStorage` with the averin durable stores
+    /// constructed (`averin_enabled = true`, Step 3a) — so `storage.averin_durable_queue()`/
+    /// `averin_durable_popkeys()` are `Some` regardless of the CLIENT's `durable` flag (the two are
+    /// independent: the STORAGE side is gated by `[averin] enabled` + this process winning the
+    /// queue's owner lock; the CLIENT's `durable` flag, under test here, is what actually ROUTES
+    /// mint/execute to the durable enqueue vs. the 087 async path). `base_url` is deliberately
+    /// unreachable (port 9, "discard") — these tests must never depend on a real network
+    /// round-trip; where a test needs to prove the durable path never even TRIES the network, it
+    /// builds its own genuinely-blocked listener instead (see
+    /// `durable_execute_enqueues_without_awaiting_averin`).
+    async fn durable_test_server(
+        durable: bool,
+        mode: AverinMode,
+        base_url: &str,
+        timeout: Duration,
+    ) -> (
+        VultrinoServer,
+        Arc<dyn StorageBackend>,
+        Arc<crate::averin::AverinClient>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        std::mem::forget(dir); // keep the tempdir alive for the test's duration
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::FileStorage::new_with_averin(
+                &path,
+                &secrecy::SecretString::from("test-password"),
+                true, // averin_enabled — constructs the durable queue/popkeys/deadletter stores
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            storage.averin_durable_queue().is_some(),
+            "this process must own the durable queue for these tests"
+        );
+        assert!(storage.averin_durable_popkeys().is_some());
+
+        let mut config = Config::default();
+        config.averin = AverinConfig {
+            enabled: true,
+            base_url: base_url.to_string(),
+            resource_id: "orders-db".to_string(),
+            mode,
+            durable,
+            timeout,
+            ..AverinConfig::default()
+        };
+
+        let server = VultrinoServer::new(
+            config,
+            storage.clone(),
+            CredentialResolver::new(storage.clone()),
+        );
+        let av = server
+            .averin()
+            .expect("averin client constructed (enabled = true)");
+        (server, storage, av)
+    }
+
+    fn use_token(id: &str, max_uses: Option<u32>) -> UseToken {
+        let (_plaintext, mut token) = UseToken::create(NewUseToken {
+            name: "test-token".to_string(),
+            credential_scope: "orders-*".to_string(),
+            action_scope: Some("db.query:orders-ro".to_string()),
+            max_uses,
+            require_approval: false,
+            expires_in: None,
+        });
+        token.id = id.to_string();
+        token
+    }
+
+    /// The byte-identical proof: with `durable = false` (the default), `seal_after_consume`'s
+    /// Observe branch takes the EXACT 087 path (`spawn_use_seal`), never touching the durable
+    /// queue at all — even though this process DOES own it (Step 3a). No PoP entry was ever
+    /// inserted for this token, so the spawned async task fails `NoGrant` — that failure landing
+    /// on the METRICS (not the durable queue) is the proof the 087 fire-and-forget path ran.
+    #[tokio::test]
+    async fn durable_false_execute_is_the_unchanged_087_spawn_use_seal_path() {
+        let (server, storage, av) = durable_test_server(
+            false,
+            AverinMode::Observe,
+            "http://127.0.0.1:9",
+            Duration::from_millis(200),
+        )
+        .await;
+
+        let result = server
+            .seal_after_consume(&av, "vut_no_grant", b"{}".to_vec(), 1, "req-1")
+            .await;
+        assert!(result.is_ok(), "Observe must never return Err");
+
+        // Wait for the spawned 087 async task to run to completion (NoGrant — no PoP entry was
+        // ever inserted for this token, since `durable = false` never calls `seal_mint`'s durable
+        // branch either).
+        for _ in 0..200 {
+            if av.metrics().failed >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            av.metrics().failed,
+            1,
+            "the async spawn_use_seal task must have run (and failed NoGrant, proving it's the \
+             087 path, not a synchronous durable enqueue)"
+        );
+        assert_eq!(av.metrics().sealed, 0);
+        assert_eq!(
+            av.metrics().enqueue_failed,
+            0,
+            "durable = false must never touch the D7 enqueue-failure counter"
+        );
+
+        // The durable queue stays completely untouched — `durable = false` never even calls
+        // `storage.averin_durable_queue()`.
+        let queue = storage.averin_durable_queue().unwrap();
+        assert!(
+            queue.deliverable(10).is_empty(),
+            "durable = false must never append to the durable queue"
+        );
+    }
+
+    /// Plan 088 Step 5 (D0/D5) — the durable `/execute` enqueue: `seal_after_consume` returns
+    /// WITHOUT awaiting averin (the append is a local, synchronous O(1) journal write, never a
+    /// network round-trip) and an `"averin.use"` event lands in the durable queue carrying the D5
+    /// shape `{params, nonce, params_nonce, request_id, use_sequence_number}`. Points at a
+    /// genuinely BLOCKED listener (accepts, never responds) with a generous 30s client timeout —
+    /// if the durable path ever fell through to a network call, this test would hang for up to
+    /// 30s; instead it must return in well under a second.
+    #[tokio::test]
+    async fn durable_execute_enqueues_without_awaiting_averin() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream); // hold the connection open, never write a response
+            }
+        });
+        let base_url = format!("http://{addr}");
+
+        let (server, storage, av) = durable_test_server(
+            true,
+            AverinMode::Observe,
+            &base_url,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        let t0 = Instant::now();
+        let result = server
+            .seal_after_consume(&av, "tok-durable", br#"{"q":1}"#.to_vec(), 2, "req-42")
+            .await;
+        let elapsed = t0.elapsed();
+        assert!(result.is_ok(), "Observe must never return Err");
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "durable enqueue must return without awaiting averin; took {elapsed:?} against a 30s \
+             client timeout"
+        );
+
+        // Nothing async ever ran — the whole call was a local append.
+        assert_eq!(av.metrics().sealed, 0);
+        assert_eq!(av.metrics().failed, 0);
+        assert_eq!(av.metrics().enqueue_failed, 0);
+
+        let queue = storage.averin_durable_queue().unwrap();
+        let events = queue.deliverable(10);
+        assert_eq!(events.len(), 1, "exactly one averin.use event must land");
+        let ev = &events[0];
+        assert_eq!(ev.subject, "tok-durable");
+        assert_eq!(ev.event_type, "averin.use");
+        assert_eq!(ev.payload["params"], serde_json::json!(r#"{"q":1}"#));
+        assert_eq!(ev.payload["request_id"], serde_json::json!("req-42"));
+        assert_eq!(ev.payload["use_sequence_number"], serde_json::json!(2));
+        assert!(
+            ev.payload["nonce"].as_str().is_some_and(|s| !s.is_empty()),
+            "a fresh nonce must be bound at enqueue time (D5)"
+        );
+        assert!(
+            ev.payload["params_nonce"]
+                .as_str()
+                .is_some_and(|s| s.len() == 64),
+            "params_nonce must be the 64-lowercase-hex shape pop::params_commitment expects"
+        );
+    }
+
+    /// Plan 088 Step 5 (D3) — the durable MINT enqueue: `seal_mint` persists a `PopKeyEntry` keyed
+    /// by `token.id` (seed/action/scope/use_limit populated, capability/grant_id still `None`) AND
+    /// appends an `"averin.grant"` event with `subject = token.id` — never a synchronous
+    /// `POST /v2/grants`.
+    #[tokio::test]
+    async fn seal_mint_durable_persists_popkey_and_enqueues_grant() {
+        let (server, storage, _av) = durable_test_server(
+            true,
+            AverinMode::Observe,
+            "http://127.0.0.1:9",
+            Duration::from_millis(200),
+        )
+        .await;
+
+        let token = use_token("ut_mint_durable_1", Some(3));
+        server.seal_mint(&token).await;
+
+        let popkeys = storage.averin_durable_popkeys().unwrap();
+        let entry = popkeys
+            .get(&token.id)
+            .await
+            .unwrap()
+            .expect("a PopKeyEntry must be persisted at durable mint");
+        assert_eq!(entry.action, "db.query:orders-ro");
+        assert_eq!(entry.scope, "orders-*");
+        assert_eq!(entry.use_limit, Some(3));
+        assert!(entry.capability.is_none(), "averin has not responded yet");
+        assert!(entry.grant_id.is_none(), "averin has not responded yet");
+        assert!(!entry.abandoned);
+
+        let queue = storage.averin_durable_queue().unwrap();
+        let events = queue.deliverable(10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].subject, token.id);
+        assert_eq!(events[0].event_type, "averin.grant");
+    }
+
+    /// Plan 088 D7 — an injected durable-enqueue FAILURE drops fail-open: the helper returns
+    /// `Ok(())` (the caller — `seal_after_consume` — lets `plugin.execute` proceed regardless) and
+    /// counts + would-alarm the failure. A real disk/fsync fault against a live `AverinQueue` isn't
+    /// a portable, deterministic unit-test primitive (an already-open segment file's fd keeps
+    /// writing/fsyncing successfully regardless of a later `chmod`/`unlink` on its path), so this
+    /// drives the exact D7 contract — [`VultrinoServer::handle_durable_use_enqueue_result`], the
+    /// function `seal_after_consume` calls with the queue's real `Result` — with a synthetic
+    /// `Err`, which is honest: it is the SAME function on the SAME `Result` type the real append
+    /// would return on a genuine local I/O failure.
+    #[tokio::test]
+    async fn durable_use_enqueue_failure_drops_fail_open_and_counts() {
+        let (_server, _storage, av) = durable_test_server(
+            true,
+            AverinMode::Observe,
+            "http://127.0.0.1:9",
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(av.metrics().enqueue_failed, 0);
+
+        let simulated = Err(crate::storage::StorageError::Io(std::io::Error::other(
+            "disk full (simulated D7 fault injection)",
+        )));
+        let result = VultrinoServer::handle_durable_use_enqueue_result(&av, "tok-fault", simulated);
+
+        assert!(
+            result.is_ok(),
+            "an enqueue failure must drop fail-open, never deny the action in Observe"
+        );
+        assert_eq!(
+            av.metrics().enqueue_failed,
+            1,
+            "the D7 enqueue-failure counter must bump exactly once"
+        );
+        // Never touches the ordinary async 087 counters — this is a DIFFERENT failure mode.
+        assert_eq!(av.metrics().failed, 0);
+        assert_eq!(av.metrics().sealed, 0);
     }
 }

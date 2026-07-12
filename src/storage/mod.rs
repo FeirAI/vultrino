@@ -22,6 +22,7 @@ use crate::outbox::OutboxEvent;
 use crate::policy::Policy;
 use crate::{Credential, CredentialMetadata};
 use async_trait::async_trait;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Storage-related errors
@@ -681,6 +682,33 @@ pub trait StorageBackend: Send + Sync {
     /// (an in-memory read). Default 0: only the file backend stages events inside the vault.
     async fn pending_event_count(&self) -> Result<usize, StorageError> {
         Ok(0)
+    }
+
+    // ==================== averin durable-seal handles (plan 088 D1/Step 5) ====================
+    //
+    // The mint/execute enqueue hooks (`VultrinoServer::seal_mint`/`seal_after_consume`) need to
+    // reach the averin durable USE queue (D0) and the PoP-key store (D2) WITHOUT downcasting
+    // `Arc<dyn StorageBackend>` back to the concrete `FileStorage` — the same trait-accessor shape
+    // `append_event`/`list_events_after` already use for the govder outbox. These are NOT the D1
+    // "master-key accessor" this plan explicitly forbids: only the already-constructed
+    // `AverinQueue`/`PopKeyStore` handles are exposed (never the vault's `Arc<MasterKey>` itself),
+    // and both are cheap `Arc` clones. Default `None` (every backend but `FileStorage`, and
+    // `FileStorage` itself when `[averin] enabled = false` or this process lost the queue's
+    // exclusive owner lock to a sibling process — Step 3a's graceful degradation).
+
+    /// The averin durable USE queue (D0), if this backend constructed one AND this process
+    /// currently owns it. `None` means: either averin durable delivery is off, or ANOTHER live
+    /// process owns the queue — either way the caller must fall back to the 087 async fail-open
+    /// seal path for this token/process (never block, never silently drop the seal entirely).
+    fn averin_durable_queue(&self) -> Option<Arc<AverinQueue>> {
+        None
+    }
+
+    /// The averin PoP-key store (D2). See [`Self::averin_durable_queue`]'s doc for the gating
+    /// contract — `Some`/`None` always agree with `averin_durable_queue` (the same process either
+    /// owns the whole averin durable-seal bundle or none of it).
+    fn averin_durable_popkeys(&self) -> Option<Arc<PopKeyStore>> {
+        None
     }
 
     // ==================== Policy Storage (admin API, V1) ====================

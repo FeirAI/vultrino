@@ -57,6 +57,12 @@ pub struct SealMetrics {
     in_flight: AtomicU64,
     /// High-water mark of `in_flight` — proves the cap held under overload.
     max_in_flight: AtomicU64,
+    /// Plan 088 D7 — durable enqueues (Observe + `durable = true` only, D6) that FAILED (a local
+    /// I/O error: disk full, fsync EIO, …). Paired with the greppable `AVERIN-SEAL-ENQUEUE-FAILED`
+    /// alarm line. Distinct from `failed` (which counts a completed averin ROUND-TRIP that failed)
+    /// because an enqueue failure never even reaches the network — it is a LOCAL persistence
+    /// problem, and `plugin.execute` still proceeds fail-open exactly like every other Observe drop.
+    enqueue_failed: AtomicU64,
     /// Plan 087 FIX 5 — monotonic-ms (relative to the client's start `Instant`) at
     /// which the last `AVERIN-SEAL-DROPPED` line was emitted; 0 = never (so the very
     /// first drop always logs). Rate-limits ONLY the log line; `dropped` still counts
@@ -74,6 +80,10 @@ impl SealMetrics {
     }
     fn record_dropped(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Plan 088 D7 — a durable enqueue attempt failed (local I/O, never a network round-trip).
+    fn record_enqueue_failed(&self) {
+        self.enqueue_failed.fetch_add(1, Ordering::Relaxed);
     }
     fn enter_inflight(&self) {
         let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
@@ -102,6 +112,7 @@ impl SealMetrics {
             dropped: self.dropped.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Relaxed),
             max_in_flight: self.max_in_flight.load(Ordering::Relaxed),
+            enqueue_failed: self.enqueue_failed.load(Ordering::Relaxed),
         }
     }
 }
@@ -152,6 +163,9 @@ pub struct SealMetricsSnapshot {
     pub dropped: u64,
     pub in_flight: u64,
     pub max_in_flight: u64,
+    /// Plan 088 D7 — durable enqueue attempts (Observe + `durable = true`) that failed locally
+    /// (disk full, fsync EIO, …) and were dropped fail-open. See [`SealMetrics::enqueue_failed`].
+    pub enqueue_failed: u64,
 }
 
 /// Fail-mode on `/execute` when the synchronous seal fails or averin is
@@ -209,6 +223,20 @@ pub struct AverinConfig {
     /// "seal a fixed-size commitment WITHOUT the raw body" option — hence oversize =
     /// drop/deny, not truncate. Operator-tunable.
     pub max_seal_params_bytes: usize,
+    /// Plan 088 — the reliability tier's master switch. Default **false**: `/execute`'s Observe
+    /// seal is the exact 087 async fire-and-forget path (`spawn_use_seal`), byte-identical to
+    /// pre-088 behavior. `true` upgrades the Observe seal to AT-LEAST-ONCE durable delivery: mint
+    /// persists a `PopKeyEntry` + appends an `"averin.grant"` event (D3) instead of synchronously
+    /// sealing the grant, and `/execute` appends an `"averin.use"` event (D0's O(1) journal append)
+    /// instead of spawning the async POST — a background worker (plan 088 Step 6, not wired by this
+    /// flag alone) delivers both, retried until averin accepts them, surviving a restart. Only takes
+    /// effect in THIS process when it also owns the durable queue (Step 3a's single-writer-process
+    /// lock; a losing sibling process falls back to the 087 async path regardless of this flag).
+    /// **Config validation (D6) rejects `durable = true` with `mode = require_evidence`** at load —
+    /// durable at-least-once is Observe-only (the strict path is synchronous and reads the
+    /// in-memory `pop` map durable mint never populates, so the combination would deny every
+    /// execute). Never flip this default; enabling it is a deliberate per-deployment choice.
+    pub durable: bool,
 }
 
 impl Default for AverinConfig {
@@ -235,6 +263,10 @@ impl Default for AverinConfig {
             // dropped/denied, never truncated (averin recomputes the commitment from
             // the raw bytes). Operator-tunable.
             max_seal_params_bytes: 128 * 1024,
+            // Plan 088 — the DEFAULT-OFF reliability tier. `false` keeps `/execute`'s Observe seal
+            // on the exact 087 async path; enabling durable at-least-once delivery is an explicit
+            // per-deployment opt-in, never a default flip.
+            durable: false,
         }
     }
 }
@@ -422,6 +454,14 @@ impl AverinClient {
     /// Snapshot the fail-open seal counters (for `GET /api/v1/metrics` + tests).
     pub fn metrics(&self) -> SealMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// Plan 088 D7 — bump the durable-enqueue-failure counter. `pub(crate)` so
+    /// `VultrinoServer::seal_after_consume`'s durable Observe branch (`src/server/mod.rs`) can count
+    /// a local enqueue failure (disk full/fsync EIO) the exact same way the async fan-out counts a
+    /// drop, without widening `SealMetrics`'s fields (private to this module) outside the crate.
+    pub(crate) fn record_enqueue_failed(&self) {
+        self.metrics.record_enqueue_failed();
     }
 
     /// Inject a PoP entry so a unit test can exercise `seal_use`/`spawn_use_seal`

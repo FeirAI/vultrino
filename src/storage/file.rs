@@ -2066,6 +2066,19 @@ impl StorageBackend for FileStorage {
         Ok(self.cache.read().pending_events.len())
     }
 
+    // ==================== averin durable-seal handles (plan 088 D1/Step 5) ====================
+
+    fn averin_durable_queue(&self) -> Option<Arc<AverinQueue>> {
+        // Delegates to the inherent accessor (`Self::averin_queue`, above) — NOT a recursive call:
+        // Rust prefers the inherent method over this trait method by name, so `.cloned()` here turns
+        // its `Option<&Arc<AverinQueue>>` into the owned `Option<Arc<AverinQueue>>` the trait requires.
+        self.averin_queue().cloned()
+    }
+
+    fn averin_durable_popkeys(&self) -> Option<Arc<PopKeyStore>> {
+        self.averin_popkeys().cloned()
+    }
+
     // ==================== Policy Storage (admin API, V1) ====================
 
     async fn store_policy(&self, policy: &Policy) -> Result<(), StorageError> {
