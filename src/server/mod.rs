@@ -744,8 +744,21 @@ impl VultrinoServer {
             );
             return;
         }
+        // Codex HIGH-6 fix — freeze `project_id`/`session_id`/`resource_id`/`grant_ttl_secs` into
+        // the event at enqueue time, mirroring the `"averin.use"` fix in `seal_after_consume`.
+        // `deliver_averin_grant` previously read all four from LIVE `av.config()` at delivery time;
+        // a config change (redeploy, reload) between enqueue and delivery would rebuild a DIFFERENT
+        // request body under the SAME idempotency key (`token_id`), and — since `resource_id` feeds
+        // the signed grant-PoP challenge (`agent_sig`) — a different signature too, which averin
+        // would see as a conflicting retry (409) rather than the honest one it is.
+        let grant_payload = serde_json::json!({
+            "project_id": av.config().project_id,
+            "session_id": av.config().session_id,
+            "resource_id": av.config().resource_id,
+            "grant_ttl_secs": av.config().grant_ttl_secs,
+        });
         if let Err(e) =
-            run_averin_queue_blocking(|| queue.append(token_id, "averin.grant", serde_json::json!({})))
+            run_averin_queue_blocking(|| queue.append(token_id, "averin.grant", grant_payload))
         {
             av.record_enqueue_failed();
             warn!(
@@ -1282,7 +1295,9 @@ impl VultrinoServer {
     /// Plan 088 D5c — `use_sequence_number` (the `consume_use_token` post-increment `uses`,
     /// 1-based) and `request_id` are threaded through here from both call sites so they are
     /// available at the ONE hook both execute paths share, feeding the Step 5 durable enqueue
-    /// below (D5's `{params, nonce, params_nonce, request_id, use_sequence_number}` event shape).
+    /// below (D5's `{params, nonce, params_nonce, request_id, use_sequence_number}` event shape,
+    /// extended by the Codex HIGH-6 fix to also freeze `project_id`/`session_id`/`resource_id` —
+    /// see that enqueue's own comment below).
     ///
     /// Plan 088 Step 5 (D0/D3/D5/D6/D7) — the Observe branch: when `[averin] durable = true` AND
     /// this process owns the durable queue (`self.storage.averin_durable_queue()`, Step 3a), mint
@@ -1315,18 +1330,41 @@ impl VultrinoServer {
             crate::averin::AverinMode::Observe => {
                 if av.config().durable {
                     if let Some(queue) = self.storage.averin_durable_queue() {
+                        // Codex MED-7 fix — apply the SAME oversize-params cap the 087 async path
+                        // enforces (`AverinClient::spawn_use_seal`) BEFORE ever building/appending
+                        // the durable event. Unlike the async path, an unchecked durable append
+                        // would durably RETAIN an oversize blob far above `AverinQueue`'s 8 MiB
+                        // segment cap — so this must run first, not just mirror the drop after the
+                        // fact. Fail-open: count + alarm (token/project context only, never
+                        // params), enqueue nothing, and let the action proceed exactly like an 087
+                        // drop would.
+                        if av.durable_use_oversize_drop(token_id, params_bytes.len()) {
+                            return Ok(());
+                        }
                         // D5 — bind the freshness nonces ONCE, here, at enqueue time. The worker
                         // rebuilds `params_commitment`/`use_sig` from these EXACT stored values on
                         // every delivery attempt, never regenerating them, so a retry is
                         // byte-identical (an honest idempotent retry at averin, never a 409).
                         let nonce = crate::averin::pop::random_params_nonce_hex();
                         let params_nonce = crate::averin::pop::random_params_nonce_hex();
+                        // Codex HIGH-6 fix — freeze the COMPLETE request at enqueue time, not just
+                        // the D5 nonces. `deliver_averin_use` previously read `project_id`/
+                        // `session_id`/`resource_id` from LIVE `av.config()` at delivery time;
+                        // `resource_id` in particular is part of the SIGNED use-PoP challenge, so a
+                        // retry after any of these values changed produced a different body/
+                        // signature under the SAME idempotency key — averin returns 409, wrongly
+                        // dead-lettering an honest retry of an already-sealed use. Storing them here
+                        // and rebuilding ONLY from these stored values (never live config) makes a
+                        // retry byte-identical regardless of what the live config looks like later.
                         let payload = serde_json::json!({
                             "params": String::from_utf8_lossy(&params_bytes),
                             "nonce": nonce,
                             "params_nonce": params_nonce,
                             "request_id": request_id,
                             "use_sequence_number": use_sequence_number,
+                            "project_id": av.config().project_id,
+                            "session_id": av.config().session_id,
+                            "resource_id": av.config().resource_id,
                         });
                         let result =
                             run_averin_queue_blocking(|| queue.append(token_id, "averin.use", payload));
@@ -3259,6 +3297,15 @@ fn run_averin_queue_blocking<T>(f: impl FnOnce() -> T) -> T {
 /// On success, writes averin's `{grant_id, capability}` back into the popkey entry (D3's
 /// `GrantResolved` write-back) AND durably records the SAME resolution in the queue's own journal
 /// (`AverinQueue::resolve_grant`) so a crash between the two writes is reconcilable on replay.
+///
+/// Codex HIGH-6 fix — `project_id`/`session_id`/`resource_id`/`grant_ttl_secs` are read from the
+/// event's OWN stored payload (frozen at enqueue by `enqueue_durable_mint_grant`), NEVER from live
+/// `averin_client.config()`: `resource_id` feeds the signed grant-PoP challenge, so a live config
+/// change between enqueue and delivery would rebuild a different signature under the same
+/// idempotency key (`token_id`) and averin would see a conflicting retry (409) instead of an
+/// honest one. Back-compat: an event enqueued before this fix has no such fields in its payload
+/// (it was `{}`), so each falls back to the client's current config — the exact pre-fix behavior —
+/// when absent.
 async fn deliver_averin_grant(
     event: &crate::outbox::OutboxEvent,
     queue: &crate::storage::AverinQueue,
@@ -3272,10 +3319,36 @@ async fn deliver_averin_grant(
         .map_err(|e| format!("popkey lookup failed: {e}"))?
         .ok_or_else(|| format!("no PoP-key entry for token {token_id} (grant cannot be rebuilt)"))?;
 
+    // Codex HIGH-6 — STORED, never live: back-compat fallback to config only for events enqueued
+    // before this fix (whose payload is `{}`).
+    let project_id = event
+        .payload
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| averin_client.config().project_id.clone());
+    let session_id = event
+        .payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| averin_client.config().session_id.clone());
+    let resource = event
+        .payload
+        .get("resource_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| averin_client.config().resource_id.clone());
+    let grant_ttl_secs = event
+        .payload
+        .get("grant_ttl_secs")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or_else(|| averin_client.config().grant_ttl_secs);
+
     let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
     let agent_pubkey = keypair.agent_pubkey_b64();
     let agent_id = format!("vultrino:{token_id}");
-    let resource = averin_client.config().resource_id.clone();
 
     let challenge = crate::averin::pop::grant_challenge(
         &entry.action,
@@ -3292,8 +3365,8 @@ async fn deliver_averin_grant(
     let scope_class = entry.use_limit.filter(|n| *n > 1).map(|_| "bounded_reuse");
     let body = serde_json::json!({
         "idempotency_key": token_id,
-        "project_id": averin_client.config().project_id,
-        "session_id": averin_client.config().session_id,
+        "project_id": project_id,
+        "session_id": session_id,
         "agent_id": agent_id,
         "action": entry.action,
         "resource": resource,
@@ -3302,7 +3375,7 @@ async fn deliver_averin_grant(
         "use_limit": entry.use_limit.filter(|n| *n > 1).unwrap_or(0),
         "agent_pubkey": agent_pubkey,
         "agent_sig": agent_sig,
-        "ttl_seconds": averin_client.config().grant_ttl_secs,
+        "ttl_seconds": grant_ttl_secs,
     });
 
     let resp = averin_client
@@ -3321,9 +3394,8 @@ async fn deliver_averin_grant(
         .to_string();
 
     let delivered_at = chrono::Utc::now();
-    let expires_at = Some(
-        delivered_at + chrono::Duration::seconds(i64::from(averin_client.config().grant_ttl_secs)),
-    );
+    let expires_at =
+        Some(delivered_at + chrono::Duration::seconds(i64::from(grant_ttl_secs)));
 
     popkeys
         .grant_resolved(
@@ -3366,6 +3438,15 @@ async fn deliver_averin_grant(
 /// D5c: `use_sequence_number` (the `consume_use_token` post-increment `uses`, captured at
 /// `src/server/mod.rs`'s execute call sites) rides verbatim into the body. averin ignores it for
 /// non-bounded scope classes, so it is always included.
+///
+/// Codex HIGH-6 fix — `project_id`/`session_id`/`resource_id` are ALSO read verbatim from the
+/// STORED event payload (frozen at enqueue by `seal_after_consume`'s durable branch), never from
+/// live `averin_client.config()`. `resource_id` in particular feeds the SIGNED use-PoP challenge
+/// (`build_use_pop`), so rebuilding it from a config that changed between enqueue and delivery
+/// would reproduce a DIFFERENT `use_sig` under the SAME idempotency key — averin would see that as
+/// a conflicting retry (409), wrongly dead-lettering an honest retry of an already-sealed use.
+/// Back-compat: an event enqueued before this fix has no such fields in its payload, so each falls
+/// back to the client's current config when absent — the exact pre-fix behavior.
 async fn deliver_averin_use(
     event: &crate::outbox::OutboxEvent,
     popkeys: &crate::storage::PopKeyStore,
@@ -3422,13 +3503,34 @@ async fn deliver_averin_use(
         .get("use_sequence_number")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "averin.use event payload missing use_sequence_number".to_string())?;
+    // Codex HIGH-6 — STORED, never live: `resource_id` feeds the SIGNED use-PoP challenge below,
+    // so it (and its project/session siblings) must never be re-read from `av.config()` at
+    // delivery time. Back-compat fallback to config only for events enqueued before this fix.
+    let project_id = event
+        .payload
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| averin_client.config().project_id.clone());
+    let session_id = event
+        .payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| averin_client.config().session_id.clone());
+    let resource_id = event
+        .payload
+        .get("resource_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| averin_client.config().resource_id.clone());
 
     let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
     let use_pop = crate::averin::build_use_pop(
         &keypair,
         &capability,
         &grant_id,
-        &averin_client.config().resource_id,
+        &resource_id,
         &entry.action,
         &params,
         &nonce,
@@ -3441,8 +3543,8 @@ async fn deliver_averin_use(
     // the D5b per-execute idempotency key and the D5c `use_sequence_number`.
     let body = serde_json::json!({
         "idempotency_key": format!("{token_id}:use:{request_id}"),
-        "project_id": averin_client.config().project_id,
-        "session_id": averin_client.config().session_id,
+        "project_id": project_id,
+        "session_id": session_id,
         "capability": capability,
         "use_sig": use_pop.use_sig,
         "action": entry.action,
@@ -4649,6 +4751,116 @@ mod averin_worker_tests {
         );
     }
 
+    /// Codex HIGH-6 fix — a retry of the SAME `"averin.use"` event must stay idempotent even when
+    /// the LIVE `[averin]` config has since changed (e.g. a redeploy/reload rotating
+    /// `project_id`/`session_id`/`resource_id`) between the first delivery attempt and the retry.
+    /// Before this fix, `deliver_averin_use` re-read those three fields from LIVE `av.config()` at
+    /// delivery time; `resource_id` in particular feeds the SIGNED use-PoP challenge, so rebuilding
+    /// under a config that had since changed would reproduce a DIFFERENT body/`use_sig` under the
+    /// SAME idempotency key, and the fake (mirroring averin's real `storedUseMatchesRequest`)
+    /// would return 409 — wrongly treating an honest retry as a conflicting one and dead-lettering
+    /// an already-sealed use. This constructs a SECOND `AverinClient` against the SAME fake averin
+    /// but with DIFFERENT `project_id`/`session_id`/`resource_id`, simulating exactly that kind of
+    /// live config drift, and asserts the second delivery reproduces the FIRST attempt's
+    /// body/`use_sig` byte-for-byte (an idempotent 200 replay), never a 409.
+    #[tokio::test]
+    async fn averin_worker_use_retry_survives_live_config_drift_stays_idempotent_not_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_queue, popkeys, _deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+
+        // The client whose config was live at ENQUEUE time — its project_id/session_id/
+        // resource_id get frozen into the event payload below, exactly as `seal_after_consume`'s
+        // durable branch freezes them (the fix under test).
+        let client_a = test_client(&base_url);
+
+        popkeys
+            .insert("tok-drift", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        popkeys
+            .grant_resolved(
+                "tok-drift",
+                "AAAA.sig".to_string(),
+                "grant-drift".to_string(),
+                chrono::Utc::now(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The event as `seal_after_consume`'s durable branch would build it post-fix: the D5
+        // nonces PLUS project_id/session_id/resource_id frozen from client_a's config.
+        let mut payload = use_payload("hello-drift", "req-drift", 1);
+        payload["project_id"] = serde_json::json!(client_a.config().project_id);
+        payload["session_id"] = serde_json::json!(client_a.config().session_id);
+        payload["resource_id"] = serde_json::json!(client_a.config().resource_id);
+
+        let event = OutboxEvent {
+            sequence: 1,
+            subject: "tok-drift".to_string(),
+            event_type: "averin.use".to_string(),
+            payload,
+            created_at: chrono::Utc::now(),
+            delivery: DeliveryState::Pending,
+            attempts: 0,
+            leased_until: None,
+            last_attempt_at: None,
+            last_error: None,
+            dedup_id: None,
+        };
+
+        deliver_averin_use(&event, &popkeys, &client_a)
+            .await
+            .expect("first delivery succeeds");
+
+        // Simulate live config drift: a second client, same fake averin, but DIFFERENT
+        // project_id/session_id/resource_id — the exact scenario Codex HIGH-6 flagged (a config
+        // reload/redeploy between enqueue and a later retry of the same durable event).
+        let client_b = AverinClient::new(AverinConfig {
+            enabled: true,
+            base_url: base_url.clone(),
+            project_id: "a-totally-different-project".to_string(),
+            session_id: "a-totally-different-session".to_string(),
+            resource_id: "a-totally-different-resource".to_string(),
+            ..AverinConfig::default()
+        })
+        .expect("client builds")
+        .expect("client is Some when enabled");
+        assert_ne!(client_a.config().resource_id, client_b.config().resource_id);
+        assert_ne!(client_a.config().session_id, client_b.config().session_id);
+
+        deliver_averin_use(&event, &popkeys, &client_b)
+            .await
+            .expect(
+                "a retry of the SAME event must ALSO succeed even though the live client's \
+                 config has since changed (idempotent, not a 409)",
+            );
+
+        let bodies = fake.use_request_bodies.lock().clone();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "both attempts reached the fake averin: {bodies:?}"
+        );
+        assert_eq!(
+            bodies[0], bodies[1],
+            "a retry of the SAME event must produce a byte-identical POST body regardless of \
+             what the LIVE client's config looks like at retry time — the whole point of \
+             freezing project_id/session_id/resource_id into the event at enqueue (Codex HIGH-6)"
+        );
+        let use_calls = fake
+            .call_log
+            .lock()
+            .iter()
+            .filter(|l| l.starts_with("use:"))
+            .count();
+        assert_eq!(
+            use_calls, 1,
+            "the retry must dedup at averin, not mint a second record (would be a 409 pre-fix)"
+        );
+    }
+
     /// Plan 088 Step 4 (D5b/D5c) — a bounded-reuse (`--uses N`) token's DISTINCT executes (each
     /// with its own `request_id`) must land at averin as DISTINCT idempotency keys carrying
     /// their correct 1-based `use_sequence_number` — never collapsed into one record the way the
@@ -5451,6 +5663,59 @@ mod durable_enqueue_tests {
                 .as_str()
                 .is_some_and(|s| s.len() == 64),
             "params_nonce must be the 64-lowercase-hex shape pop::params_commitment expects"
+        );
+    }
+
+    /// Codex MED-7 fix — the durable Observe enqueue must apply the SAME `max_seal_params_bytes`
+    /// cap the 087 async path (`AverinClient::spawn_use_seal`) enforces. Before this fix, the
+    /// durable branch serialized + appended the FULL body unchecked, so an oversize body would be
+    /// durably retained (well above `AverinQueue`'s 8 MiB segment cap) instead of being dropped
+    /// fail-open like every other oversize seal. This drives params one byte over the default
+    /// 128 KiB cap through the REAL `seal_after_consume` durable branch and asserts: nothing is
+    /// enqueued, the drop is counted on the SAME `dropped` metric (never `enqueue_failed` — this is
+    /// a policy drop, not a local I/O failure), and the action still proceeds (`Ok(())`).
+    #[tokio::test]
+    async fn durable_execute_drops_oversize_params_without_enqueuing_action_still_proceeds() {
+        let (server, storage, av) = durable_test_server(
+            true,
+            AverinMode::Observe,
+            "http://127.0.0.1:9",
+            Duration::from_millis(200),
+        )
+        .await;
+
+        let cap = av.config().max_seal_params_bytes;
+        let oversize_params = vec![b'x'; cap + 1];
+        assert_eq!(av.metrics().dropped, 0);
+
+        let result = server
+            .seal_after_consume(&av, "tok-oversize", oversize_params, 1, "req-oversize")
+            .await;
+        assert!(
+            result.is_ok(),
+            "Observe must never return Err, even for an oversize durable seal"
+        );
+
+        assert_eq!(
+            av.metrics().dropped,
+            1,
+            "the oversize durable drop must count on the SAME `dropped` metric \
+             spawn_use_seal's oversize drop uses"
+        );
+        assert_eq!(av.metrics().sealed, 0);
+        assert_eq!(av.metrics().failed, 0);
+        assert_eq!(
+            av.metrics().enqueue_failed,
+            0,
+            "an oversize drop is a POLICY decision, not a D7 local-persistence failure — it must \
+             never touch the enqueue-failure counter"
+        );
+
+        let queue = storage.averin_durable_queue().unwrap();
+        assert!(
+            queue.deliverable(10).is_empty(),
+            "an oversize durable use must never be enqueued at all — not even a truncated or \
+             quarantined record"
         );
     }
 

@@ -464,6 +464,40 @@ impl AverinClient {
         self.metrics.record_enqueue_failed();
     }
 
+    /// Codex MED-7 fix (plan 088) — mirror [`Self::spawn_use_seal`]'s oversize-params drop for the
+    /// DURABLE Observe enqueue (`VultrinoServer::seal_after_consume`, `src/server/mod.rs`). The
+    /// async 087 path never seals params over `max_seal_params_bytes` (averin recomputes the
+    /// commitment from the raw bytes — §5a recompute-or-reject — so there is no
+    /// fixed-size-commitment-only option; oversize must drop, not truncate), but the durable branch
+    /// used to serialize + durably append the FULL body unchecked, retaining an oversize blob far
+    /// above `AverinQueue`'s 8 MiB segment cap. The caller runs this check BEFORE building/appending
+    /// the event: on oversize it counts the SAME `dropped` metric and emits the SAME rate-limited
+    /// `AVERIN-SEAL-DROPPED` alarm (token/project context only, never params) `spawn_use_seal` does,
+    /// then returns `true` so the caller skips the enqueue entirely and lets the action proceed
+    /// fail-open — Observe must never block (or durably retain oversize data) on a params size the
+    /// operator has bounded. Returns `false` when params are within the cap (enqueue proceeds
+    /// normally).
+    pub(crate) fn durable_use_oversize_drop(&self, token_id: &str, params_len: usize) -> bool {
+        if params_len <= self.cfg.max_seal_params_bytes {
+            return false;
+        }
+        self.metrics.record_dropped();
+        if let Some(total) = self.claim_drop_log() {
+            tracing::warn!(
+                target: "averin_seal",
+                token_id,
+                project_id = %self.cfg.project_id,
+                params_bytes = params_len,
+                cap = self.cfg.max_seal_params_bytes,
+                dropped_total = total,
+                "AVERIN-SEAL-DROPPED-oversize durable averin.use enqueue skipped: params exceed \
+                 max_seal_params_bytes (observe/fail-open) — action proceeds, nothing durably \
+                 appended"
+            );
+        }
+        true
+    }
+
     /// Inject a PoP entry so a unit test can exercise `seal_use`/`spawn_use_seal`
     /// against a fake/blocked averin WITHOUT a real `/v2/grants` round-trip. A
     /// capability containing a `.` (e.g. `"AAAA.sig"`) passes `credential_binding`
@@ -803,16 +837,20 @@ impl AverinClient {
         // fan-out buffer an unbounded body. averin's real bodies are far under the cap.
         let text = read_capped(resp, MAX_AVERIN_RESPONSE_BYTES).await?;
         if !status.is_success() {
-            let body_snippet: String = text.chars().take(400).collect();
-            // FIX 4 — the upstream body (possible PII/secret) goes ONLY to a
-            // debug-level channel, NEVER to an AVERIN-SEAL-* alarm line (those log
-            // `error = %e`, and `Status`'s Display deliberately omits the body).
+            // Codex LOW-11 fix — do NOT log the upstream response body, even at
+            // debug level. averin can echo request content (including raw `params`)
+            // in an error body, so logging it here would reopen exactly the
+            // params-in-logs path FIX 4 closed for the alarm line, just through a
+            // different (debug) channel. Log only the status/context — a redacted
+            // marker in place of the body — which stays useful for debugging
+            // without ever risking a leak; the PoP seed is never part of the
+            // request either way, so it stays protected regardless.
             tracing::debug!(
                 target: "averin_seal",
                 endpoint,
                 status = status.as_u16(),
-                body = %body_snippet,
-                "averin non-2xx response body (debug-only; excluded from alarm lines)"
+                body = "<response body redacted>",
+                "averin non-2xx response (body redacted — see Codex LOW-11)"
             );
             return Err(AverinError::Status {
                 endpoint,
