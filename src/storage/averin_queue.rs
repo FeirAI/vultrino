@@ -136,6 +136,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use parking_lot::{Condvar, Mutex};
@@ -818,6 +819,14 @@ struct QueueMemory {
 /// Delegates straight to the shared helper when `committing` is empty (the overwhelmingly common
 /// case — appends are fast, so the set drains almost immediately), so ordinary operation pays no
 /// extra cost or behavior difference from the reused `outbox_model` logic.
+///
+/// **Per-subject FIFO (Codex R3 HIGH-2)**: a `committing` seq is not merely skipped — it also marks
+/// its subject `seen`, head-of-line-blocking every LATER seq for that same subject this pass, even
+/// once that later seq is itself durable. Without this, a subject with an earlier seq `N` still
+/// committing and a later seq `N+1` already committed would have `N` skipped (still committing) and
+/// then `N+1` claimed — delivering `N+1` before `N` is even durable, out of order. Skipping this
+/// subject entirely for one pass is harmless: the scan runs again on the next tick, and `N` claims
+/// (and unblocks `N+1`) as soon as its own commit lands.
 fn earliest_pending_per_subject_skipping_committing(
     outbox: &BTreeMap<u64, OutboxEvent>,
     committing: &HashSet<u64>,
@@ -832,6 +841,7 @@ fn earliest_pending_per_subject_skipping_committing(
     let mut out = Vec::new();
     for (seq, e) in outbox.iter() {
         if committing.contains(seq) {
+            seen.insert(e.subject.as_str());
             continue;
         }
         if e.delivery != DeliveryState::Pending {
@@ -850,6 +860,16 @@ fn earliest_pending_per_subject_skipping_committing(
     }
     out
 }
+
+/// Cap on how long [`AverinQueue::compact`]/[`AverinQueue::prune_delivered_prefix`] will wait on
+/// [`AverinQueue::committing_cv`] for `committing` to drain (Codex R3 MEDIUM-4 — liveness). A commit
+/// stuck in unbounded file I/O (or enough overlapping appends to keep the set perpetually nonempty)
+/// must never wedge these — both are best-effort GC run synchronously from the periodic tick, so a
+/// stalled waiter here stalls every later GC/delivery pass too. On timeout, the caller skips this
+/// pass entirely (compacting/pruning nothing) and retries on the next tick, rather than blocking
+/// forever; the happy path (fast-draining `committing`) is unaffected — it still proceeds the moment
+/// the set empties, well under this cap.
+const COMMITTING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The averin USE queue's durable append-only journal (plan 088 D0). See the module doc for the
 /// on-disk shape, crash-safety contract, and locking model.
@@ -1306,10 +1326,24 @@ impl AverinQueue {
     /// — a silent loss on the next crash, since `committing`-ness has nothing to do with which segment
     /// a commit physically landed in, only with whether `mem.cache.outbox`'s in-memory reflection of
     /// it is confirmed-durable yet.
+    ///
+    /// **Bounded wait (Codex R3 MEDIUM-4)**: the wait above is capped at
+    /// [`COMMITTING_DRAIN_TIMEOUT`] — a commit stuck in unbounded file I/O must never wedge this call
+    /// forever, since the periodic GC tick awaits it synchronously. If `committing` hasn't drained by
+    /// the deadline, this pass is skipped entirely (nothing compacted) rather than blocking; the next
+    /// tick retries. Compaction is best-effort GC, so skipping a pass is safe.
     pub fn compact(&self) -> Result<(), StorageError> {
         let mut mem = self.mem.lock();
-        while !mem.committing.is_empty() {
-            self.committing_cv.wait(&mut mem);
+        let timed_out = self
+            .committing_cv
+            .wait_while_for(
+                &mut mem,
+                |m| !m.committing.is_empty(),
+                COMMITTING_DRAIN_TIMEOUT,
+            )
+            .timed_out();
+        if timed_out {
+            return Ok(());
         }
         let new_index = self.writer.roll()?;
         let snapshot_index = new_index - 1;
@@ -1385,8 +1419,20 @@ impl AverinQueue {
         // computed past it, and the resulting `Delta::Prune` would, on replay, apply AFTER that lower
         // sequence's own `Append` — deleting a genuinely still-`Pending` record that was never
         // eligible for pruning.
-        while !mem.committing.is_empty() {
-            self.committing_cv.wait(&mut mem);
+        //
+        // Bounded, same as `Self::compact` (Codex R3 MEDIUM-4): skip this pass (prune nothing) rather
+        // than block forever if `committing` hasn't drained within `COMMITTING_DRAIN_TIMEOUT` — the
+        // next GC tick retries.
+        let timed_out = self
+            .committing_cv
+            .wait_while_for(
+                &mut mem,
+                |m| !m.committing.is_empty(),
+                COMMITTING_DRAIN_TIMEOUT,
+            )
+            .timed_out();
+        if timed_out {
+            return Ok(0);
         }
         let upto_seq = mem
             .cache
@@ -2273,6 +2319,111 @@ mod tests {
         assert_eq!(q2.all_events().len(), 2);
         assert_eq!(q2.get(seq1).unwrap().delivery, DeliveryState::Pending);
         assert_eq!(q2.get(seq2).unwrap().delivery, DeliveryState::Delivered);
+    }
+
+    // ---- Codex R3 HIGH-2 (claim skipped a committing seq without blocking its subject) ----
+    //
+    // The `committing` set stops `claim`/`deliverable` from acting on a not-yet-durable seq, but the
+    // scan just `continue`d past it — it never marked the seq's SUBJECT as blocked. So a LATER,
+    // already-committed seq for the SAME subject could still be claimed while the earlier one was
+    // still committing: a per-subject FIFO violation (a later bounded-reuse use reaching averin before
+    // an earlier same-subject grant/use was even durable). The fix marks the whole subject `seen` the
+    // moment any of its sequences is found `committing`, head-of-line-blocking every later seq for that
+    // subject until the committing one drains and delivers in order.
+
+    #[test]
+    fn claim_head_of_line_blocks_a_subject_with_an_earlier_committing_seq_from_a_later_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+
+        // N: reserved but deliberately left `committing` (never finished) — nothing durable backs it.
+        let (seq_n, event_n) = q.reserve_for_append("S", "averin.use", serde_json::json!({"n": 1}));
+        // N+1: same subject, reserved AND fully committed — durable and genuinely Pending.
+        let seq_n1 = q.append("S", "averin.use", serde_json::json!({"n": 2})).unwrap();
+        assert_eq!(seq_n1, seq_n + 1, "N+1 must immediately follow N in sequence order");
+
+        // While N is still committing, claim() must return NOTHING for subject S — not N+1 ahead of
+        // it. This is the exact interleaving Codex R3 HIGH-2 flagged.
+        let claimed = q.claim(10, 60).unwrap();
+        assert!(
+            claimed.is_empty(),
+            "S has an earlier committing seq (N); N+1 must not be claimed ahead of it, got {claimed:?}"
+        );
+
+        // Let N actually commit durably (mirrors `finish_append`'s success tail).
+        assert_eq!(q.finish_append(seq_n, event_n).unwrap(), seq_n);
+
+        // N is now durable and Pending — it, not N+1, is the earliest claimable event for S.
+        let claimed = q.claim(10, 60).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].sequence, seq_n, "N claims first, in order");
+        assert!(!q.record_delivery(seq_n, true, None, 8).unwrap());
+
+        // N has delivered — S is unblocked, and N+1 is now (and only now) claimable.
+        let claimed = q.claim(10, 60).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].sequence, seq_n1, "N+1 claims only after N delivers, still in order");
+    }
+
+    // ---- Codex R3 MEDIUM-4 (unbounded compact/prune wait on a stuck committing seq — liveness) ----
+    //
+    // `compact`/`prune_delivered_prefix` waited on `committing_cv` with NO timeout. A writer stuck in
+    // unbounded file I/O (or sustained overlapping appends) could leave `committing` nonempty forever,
+    // wedging both GC passes permanently — and since the periodic GC/delivery worker awaits `compact()`
+    // synchronously, that stalls every later tick too. The fix bounds the wait at
+    // `COMMITTING_DRAIN_TIMEOUT` and skips the pass (best-effort — retried next tick) on timeout.
+
+    #[test]
+    fn compact_and_prune_skip_their_pass_instead_of_hanging_when_committing_never_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Arc::new(queue(dir.path()));
+
+        // Reserve a seq and never finish/publish/abort it — `committing` never drains for the rest of
+        // this test, exactly the stuck-writer scenario Codex R3 MEDIUM-4 flagged.
+        let (seq, _event) = q.reserve_for_append("S", "averin.use", serde_json::json!({}));
+
+        // Run both waiters concurrently so this test's wall-clock cost is ~one timeout, not two.
+        let q1 = Arc::clone(&q);
+        let compact_thread = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            q1.compact().unwrap();
+            start.elapsed()
+        });
+        let q2 = Arc::clone(&q);
+        let prune_thread = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let pruned = q2.prune_delivered_prefix(0).unwrap();
+            (start.elapsed(), pruned)
+        });
+
+        // Joining is itself the "does not hang" assertion: pre-fix, both would have blocked forever.
+        let compact_elapsed = compact_thread.join().unwrap();
+        let (prune_elapsed, pruned) = prune_thread.join().unwrap();
+
+        let margin = COMMITTING_DRAIN_TIMEOUT + std::time::Duration::from_secs(5);
+        assert!(
+            compact_elapsed < margin,
+            "compact must give up within a bounded margin of COMMITTING_DRAIN_TIMEOUT, took \
+             {compact_elapsed:?}"
+        );
+        assert!(
+            prune_elapsed < margin,
+            "prune_delivered_prefix must give up within a bounded margin of \
+             COMMITTING_DRAIN_TIMEOUT, took {prune_elapsed:?}"
+        );
+
+        // Best-effort skip, not a partial pass: nothing pruned, and no snapshot was ever written
+        // (compact bailed before touching disk) — the queue is unchanged, ready to retry next tick.
+        assert_eq!(pruned, 0, "prune must skip (not prune) while committing never drains");
+        let segs = list_segments(dir.path()).unwrap();
+        assert!(
+            !segs.iter().any(|(_, _, is_snap)| *is_snap),
+            "compact must not have written a snapshot on a skipped pass"
+        );
+
+        // `seq` itself is untouched: still published (visible) but still committing/Pending — never
+        // lost, never resurrected, never pruned.
+        assert_eq!(q.get(seq).unwrap().delivery, DeliveryState::Pending);
     }
 
     // ---- Codex HIGH-3 (delivered records retained forever / unbounded growth) ----
