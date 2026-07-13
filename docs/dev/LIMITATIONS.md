@@ -79,6 +79,17 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 - **Audit-to-file is not implemented.** `[logging] audit_file` is parsed but unused;
   the web "audit log" page is a TODO. Admin mutations are logged via structured
   `tracing`; the durable event history is the signed outbox.
+- **Durable-queue compaction and delivered-prefix pruning are best-effort GC that
+  run on the periodic tick and yield to in-flight commits.** They wait up to
+  `COMMITTING_DRAIN_TIMEOUT` (5s) for the `committing` set to drain, and skip the
+  tick if it doesn't. Under sustained append saturation (the committing set never
+  fully empties within the window) they skip every tick, so journal segments and
+  delivered records' raw params can grow and are retained past the retention
+  window until append traffic quiesces. Each skipped tick is logged at `warn`
+  (target `averin_seal`) so the condition is observable. This is a deliberate
+  bound: the queue never blocks the GC/delivery worker and never risks losing or
+  resurrecting an in-flight event — it defers reclamation until a lull. Averin
+  durable sealing is default-OFF.
 
 ## Documented-not-enforced / posture notes
 

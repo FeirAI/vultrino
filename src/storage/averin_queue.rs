@@ -141,6 +141,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::crypto::{decrypt, encrypt, EncryptedData, MasterKey};
 use crate::outbox::{DeliveryState, OutboxEvent};
@@ -1331,7 +1332,10 @@ impl AverinQueue {
     /// [`COMMITTING_DRAIN_TIMEOUT`] — a commit stuck in unbounded file I/O must never wedge this call
     /// forever, since the periodic GC tick awaits it synchronously. If `committing` hasn't drained by
     /// the deadline, this pass is skipped entirely (nothing compacted) rather than blocking; the next
-    /// tick retries. Compaction is best-effort GC, so skipping a pass is safe.
+    /// tick retries. Compaction is best-effort GC, so skipping a pass is safe — but the skip is logged
+    /// at `warn` (Codex 4th-pass M4: sustained overlapping appends can keep `committing` non-empty
+    /// across every tick, so a silent skip would let journal segments grow unalerted) rather than
+    /// silently returning `Ok(())` indistinguishable from "nothing to do".
     pub fn compact(&self) -> Result<(), StorageError> {
         let mut mem = self.mem.lock();
         let timed_out = self
@@ -1343,6 +1347,14 @@ impl AverinQueue {
             )
             .timed_out();
         if timed_out {
+            warn!(
+                target: "averin_seal",
+                timeout_secs = COMMITTING_DRAIN_TIMEOUT.as_secs(),
+                "averin queue compaction skipped this tick: appends are continuously in-flight \
+                 (the committing set did not drain within the timeout), so the snapshot/segment \
+                 reclaim is deferred to a later tick; the journal may grow until append traffic \
+                 quiesces"
+            );
             return Ok(());
         }
         let new_index = self.writer.roll()?;
@@ -1422,7 +1434,8 @@ impl AverinQueue {
         //
         // Bounded, same as `Self::compact` (Codex R3 MEDIUM-4): skip this pass (prune nothing) rather
         // than block forever if `committing` hasn't drained within `COMMITTING_DRAIN_TIMEOUT` — the
-        // next GC tick retries.
+        // next GC tick retries. The skip is logged at `warn` (Codex 4th-pass M4), not silent — see
+        // `Self::compact`'s doc for why a silent skip here is unsafe under sustained append traffic.
         let timed_out = self
             .committing_cv
             .wait_while_for(
@@ -1432,6 +1445,13 @@ impl AverinQueue {
             )
             .timed_out();
         if timed_out {
+            warn!(
+                target: "averin_seal",
+                timeout_secs = COMMITTING_DRAIN_TIMEOUT.as_secs(),
+                "averin queue delivered-prefix prune skipped this tick: appends are continuously \
+                 in-flight (the committing set did not drain within the timeout), so delivered \
+                 records' raw params are retained past the window until append traffic quiesces"
+            );
             return Ok(0);
         }
         let upto_seq = mem
