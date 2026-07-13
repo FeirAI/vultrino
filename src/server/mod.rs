@@ -3732,17 +3732,27 @@ async fn quarantine_and_reclaim_dead_letter(
     let sequence = event.sequence;
     let subject = event.subject.clone();
 
-    // FIX 2 (Codex HIGH — undelivered-grant PoP seeds leak forever): a permanently dead-lettered
-    // GRANT means this subject can NEVER be sealed, so its `PopKeyEntry.grant_expires_at` stays
-    // `None` forever and `PopKeyStore::evict_resolved` (which reclaims on `abandoned || grant_expires_at
-    // <= now`) would never reclaim its `pop_seed` — an unbounded seed leak. Mark the subject
-    // `abandoned` here so the next popkey GC tick can evict its seed (fail-closed toward NOT leaking;
-    // releasing a dead subject's seed is correct — the grant that would have needed it is gone). This
-    // runs from BOTH call sites (the worker's one-shot dead-letter transition AND the GC retry-sweep),
-    // but `mark_abandoned` is idempotent (a no-op once the flag is set / the entry is gone), so a
-    // straggler re-visited by the sweep re-marks harmlessly. `averin.use` dead-letters are untouched:
-    // their subject's grant DID deliver and the use may be replayed by an operator, which still needs
-    // the seed. Never propagated: a mark failure is logged, not fatal to the pass.
+    // FIX 2 (Codex HIGH — undelivered-grant PoP seeds leak forever), CORRECTED (R3-B Codex 3rd-pass
+    // H1): a permanently dead-lettered GRANT means this subject can NEVER be sealed, so its
+    // `PopKeyEntry.grant_expires_at` stays `None` forever and `PopKeyStore::evict_resolved` (which
+    // reclaims on `abandoned || grant_expires_at <= now`) would never reclaim its `pop_seed` — an
+    // unbounded seed leak. Mark the subject `abandoned` here so the next popkey GC tick can evict its
+    // seed (fail-closed toward NOT leaking; releasing a dead subject's seed is correct — the grant
+    // that would have needed it is gone). `averin.use` dead-letters are untouched: their subject's
+    // grant DID deliver and the use may be replayed by an operator, which still needs the seed.
+    //
+    // ORDERING IS LOAD-BEARING: a `mark_abandoned` failure must NOT fall through to quarantine +
+    // reclaim below. Once `reclaim_dead_letter` runs, the record leaves the live queue and
+    // `dead_lettered_events()` never returns it again — the GC retry-sweep (the ONLY thing that ever
+    // retries a terminal `DeadLettered` record) would never re-visit it, so a mark failure on this
+    // exact transient-storage-error path would leave the popkey entry with neither `abandoned` nor a
+    // `grant_expires_at`, leaking its seed forever. So: on `Err`, log and return EARLY, exactly like
+    // the quarantine-write failure branch below — the grant stays `DeadLettered`-but-unreclaimed in
+    // the live queue, the retry-sweep re-visits it next tick, and only once `mark_abandoned` SUCCEEDS
+    // does it proceed to quarantine + reclaim. This guarantees the subject is durably `abandoned`
+    // (seed accounted-for) BEFORE the grant ever leaves the sweep's view. `mark_abandoned` is also
+    // idempotent (a no-op once the flag is set / the entry is gone), so a straggler re-visited after
+    // an EARLIER successful mark re-marks harmlessly.
     if event.event_type == "averin.grant" {
         if let Err(e) = popkeys.mark_abandoned(&subject).await {
             warn!(
@@ -3750,9 +3760,12 @@ async fn quarantine_and_reclaim_dead_letter(
                 error = %e,
                 sequence,
                 subject = %subject,
-                "failed to mark a dead-lettered grant's subject abandoned; its PoP seed may linger \
-                 until a later GC tick re-marks it"
+                "failed to mark a dead-lettered grant's subject abandoned; leaving it DeadLettered-\
+                 but-unreclaimed in the active queue so the next GC tick's retry-sweep re-attempts \
+                 the mark (fail-closed: reclaiming before the mark succeeds would strand the PoP \
+                 seed forever, since a reclaimed grant never re-appears in dead_lettered_events())"
             );
+            return;
         }
     }
 
@@ -5431,6 +5444,94 @@ mod averin_worker_tests {
         assert!(
             popkeys.get(token_id).await.unwrap().is_none(),
             "the GC tick must evict the abandoned dead-lettered grant's PoP seed (no unbounded leak)"
+        );
+    }
+
+    /// R3-B (Codex 3rd-pass H1): the ordering fix in `quarantine_and_reclaim_dead_letter` — a
+    /// `mark_abandoned` failure must NOT fall through to quarantine+reclaim, or the grant would leave
+    /// `dead_lettered_events()` forever with its subject neither `abandoned` nor `grant_expires_at`-
+    /// bearing, leaking its PoP seed for good. Forces a REAL `mark_abandoned` error (not a mock) by
+    /// pointing a SECOND `PopKeyStore` at the SAME on-disk file under the WRONG master key: the file
+    /// already holds the real entry (written by the correct-key `popkeys` below), so the wrong-key
+    /// store's read-before-write decrypt genuinely fails — `mark_abandoned` returns `Err` without
+    /// touching the file, exactly like a transient storage error would. Drives
+    /// `quarantine_and_reclaim_dead_letter` directly (the function under fix) rather than the whole
+    /// worker pass, so the assertions land squarely on its contract.
+    #[tokio::test]
+    async fn dead_lettered_grant_whose_mark_abandoned_fails_stays_unreclaimed_until_a_retry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let subject = "tok-mark-fail";
+
+        popkeys
+            .insert(subject, popkey_entry("action-mark-fail", "read:orders"))
+            .await
+            .unwrap();
+        let seq = queue.append(subject, "averin.grant", grant_payload()).unwrap();
+        // Dead-letter it in one shot: max_attempts=1 -> the first recorded failure is terminal.
+        queue.claim(10, 1).unwrap();
+        queue
+            .record_delivery(seq, false, Some("forced failure".to_string()), 1)
+            .unwrap();
+        let dead_lettered_event = queue.get(seq).expect("still in the queue, now DeadLettered");
+        assert_eq!(dead_lettered_event.delivery, DeliveryState::DeadLettered);
+
+        // A SEPARATE store instance over the identical path, keyed wrong — decrypting the
+        // already-written (correct-key) file will genuinely fail.
+        let wrong_key = Arc::new(MasterKey::from_bytes(vec![9u8; 32]).unwrap());
+        let broken_popkeys = PopKeyStore::new(dir.path().join("averin-popkeys.enc"), wrong_key);
+        assert!(
+            broken_popkeys.mark_abandoned(subject).await.is_err(),
+            "sanity check: the wrong-key store must fail to even read the existing entry"
+        );
+
+        quarantine_and_reclaim_dead_letter(
+            dead_lettered_event.clone(),
+            &queue,
+            &broken_popkeys,
+            &deadletter,
+            false,
+        )
+        .await;
+
+        // Fail-closed: NOT quarantined, NOT reclaimed, NOT abandoned — a straggler the retry-sweep
+        // will see again next tick, exactly like a failed quarantine-move.
+        assert!(
+            queue
+                .dead_lettered_events()
+                .iter()
+                .any(|e| e.sequence == seq),
+            "a mark_abandoned failure must leave the grant sitting in dead_lettered_events() so the \
+             GC retry-sweep re-visits it — this is the only thing that ever retries a terminal \
+             DeadLettered record"
+        );
+        assert_eq!(
+            queue.get(seq).map(|e| e.delivery),
+            Some(DeliveryState::DeadLettered),
+            "must not be reclaimed from the active queue when the mark failed"
+        );
+        assert!(
+            !deadletter.contains(seq).await.unwrap(),
+            "must not be quarantined when the mark failed (quarantining before the mark succeeds is \
+             exactly the ordering bug: reclaim would then hide it from the retry-sweep forever)"
+        );
+        assert!(
+            !popkeys.get(subject).await.unwrap().unwrap().abandoned,
+            "the subject must not be abandoned when mark_abandoned itself failed"
+        );
+
+        // Retry with a WORKING popkeys store (as the GC retry-sweep would do on its next tick): this
+        // time mark_abandoned succeeds, so the grant proceeds all the way through quarantine+reclaim.
+        quarantine_and_reclaim_dead_letter(dead_lettered_event, &queue, &popkeys, &deadletter, false)
+            .await;
+        assert!(
+            popkeys.get(subject).await.unwrap().unwrap().abandoned,
+            "a successful retry must mark the subject abandoned"
+        );
+        assert!(queue.get(seq).is_none(), "a successful retry must reclaim the grant from the queue");
+        assert!(
+            deadletter.contains(seq).await.unwrap(),
+            "a successful retry must quarantine the grant"
         );
     }
 
