@@ -16,28 +16,38 @@
 //! redacting `Debug`, `src/outbox.rs:715-729`). This is NOT a new key primitive: it reuses
 //! `crate::crypto::{encrypt, decrypt}` + the same shared `Arc<MasterKey>` exactly.
 //!
-//! # Eviction — the REWRITTEN rule (D2, adversarial finding #6)
+//! # Eviction — the REWRITTEN rule (D2, adversarial finding #6; further corrected by Codex HIGH-4)
 //!
 //! The draft's rule ("evict once `minted_at + grant_ttl` elapsed AND events terminal") was wrong
 //! three ways: a dead-lettered use still needs its seed to replay; `minted_at` is the wrong clock
 //! (a grant that sat in a backlog past `grant_ttl_secs` before delivering would be evicted the
 //! moment it landed, before its use could deliver); and a lone `gc(now)` had no view of the
-//! queue/quarantine subject state. The rule here is: **retain the seed until the subject is fully
-//! resolved.** [`PopKeyStore::evict_resolved`] evicts `token.id` IFF:
-//!   (a) the grant is terminal-delivered (`grant_delivered_at.is_some()`) OR the subject is
-//!       `abandoned`, AND
+//! queue/quarantine subject state. A first fix then evicted a candidate as soon as
+//! `grant_delivered_at.is_some()` held AND nothing was pending — but a token whose grant delivered
+//! may still be used LATER (a delayed first execute, or the next use of a bounded-reuse `--uses N`
+//! token between uses): with no use pending at THAT GC tick, the seed was evicted, and the next use
+//! could no longer rebuild its PoP (it dead-letters instead). The rule here is: **retain the seed
+//! until the grant can no longer be used at all, not merely until nothing is using it this
+//! instant.** [`PopKeyStore::evict_resolved`] evicts `token.id` IFF:
+//!   (a) the subject is `abandoned` OR the grant has EXPIRED (`grant_expires_at.is_some()` AND
+//!       `grant_expires_at <= now`), AND
 //!   (b) no pending/leased use exists for `subject == token.id`, AND
 //!   (c) no replayable dead-lettered use exists for that subject.
 //!
-//! `minted_at` is retained for audit ONLY and is NEVER an eviction trigger; `grant_expires_at`
-//! only informs operators, never eviction. Because the averin USE queue (D0) and the dead-letter
-//! quarantine (D4) are separate stores not wired until later steps, (b) and (c) are INJECTED
-//! predicates/closures — the caller decides how to answer them (a later step passes the real
-//! queue/quarantine lookups). The cross-store query FAILS CLOSED TOWARD RETENTION (D2): a
-//! predicate that cannot be evaluated must answer `true` ("still blocking") — over-retention (a
-//! resolved subject's seed lingers one extra tick) is harmless; under-retention (evicting a seed
-//! a live/replayable use still needs) is a correctness bug and must never happen. See
-//! [`PopKeyStore::evict_resolved`]'s doc for the exact contract.
+//! `minted_at` is retained for audit ONLY and is NEVER an eviction trigger. `grant_delivered_at` is
+//! likewise never consulted directly by eviction — a grant that never delivered has
+//! `grant_expires_at = None` and so is only evictable via `abandoned`; a grant that delivered is
+//! evictable only once `grant_expires_at` (set at delivery, from the grant response's
+//! `delivered_at + ttl`) has actually elapsed. `now` is threaded in by the caller (the GC tick
+//! passes `Utc::now()`) rather than read internally, so this method stays a pure function of its
+//! inputs. Because the averin USE queue (D0) and the dead-letter quarantine (D4) are separate
+//! stores not wired until later steps, (b) and (c) are INJECTED predicates/closures — the caller
+//! decides how to answer them (a later step passes the real queue/quarantine lookups). The
+//! cross-store query FAILS CLOSED TOWARD RETENTION (D2): a predicate that cannot be evaluated must
+//! answer `true` ("still blocking") — over-retention (a resolved subject's seed lingers one extra
+//! tick) is harmless; under-retention (evicting a seed a live/replayable use still needs) is a
+//! correctness bug and must never happen. See [`PopKeyStore::evict_resolved`]'s doc for the exact
+//! contract.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -83,6 +93,11 @@ pub struct PopKeyEntry {
     /// The grant's action (the use must present the same one).
     pub action: String,
     pub scope: String,
+    /// Bounded-reuse cap on a `--uses N` token. Stored for audit/operator visibility; NOT
+    /// consulted by `evict_resolved` (the eviction trigger is `grant_expires_at` elapsing, or
+    /// `abandoned` — see the module doc). A between-uses tick with nothing pending must not evict
+    /// a still-valid bounded-reuse token's seed, which is exactly what consulting `use_limit` (or
+    /// "no use pending right now") instead of expiry would get wrong.
     pub use_limit: Option<u32>,
     /// Filled in when the GRANT delivers (D3's `GrantResolved` write-back).
     pub capability: Option<String>,
@@ -90,15 +105,20 @@ pub struct PopKeyEntry {
     pub grant_id: Option<String>,
     /// Control/audit only — NEVER an eviction trigger (see the module doc / `evict_resolved`).
     pub minted_at: DateTime<Utc>,
-    /// Set when the grant actually delivers; `Some` is this entry's "terminal-delivered" signal
-    /// for eviction rule (a).
+    /// Set when the grant actually delivers. NOT itself an eviction trigger (see the module doc /
+    /// `evict_resolved`) — it only gates whether `grant_expires_at` is meaningful. A grant that
+    /// never delivers leaves this `None` and `grant_expires_at` stays `None` too, so such a subject
+    /// is only evictable via `abandoned`.
     pub grant_delivered_at: Option<DateTime<Utc>>,
-    /// averin's grant validity end (from the grant response / delivered_at + ttl). Operator-info
-    /// only — never consulted by eviction.
+    /// averin's grant validity end (from the grant response / delivered_at + ttl). This IS the
+    /// eviction trigger for a delivered grant (rule (a) in `evict_resolved`'s doc): the seed is
+    /// retained until `grant_expires_at <= now`, i.e. until the grant can no longer be used, not
+    /// merely until nothing is using it right now.
     pub grant_expires_at: Option<DateTime<Utc>>,
     /// Operator-set: the subject is being purged (D4's abandon/purge releases it). `true` is the
-    /// OTHER way eviction rule (a) can be satisfied, independent of `grant_delivered_at` (e.g. a
-    /// grant that permanently dead-lettered and never delivered).
+    /// OTHER way eviction rule (a) can be satisfied, independent of `grant_expires_at` (e.g. a
+    /// grant that permanently dead-lettered and never delivered, or an operator override before
+    /// expiry).
     pub abandoned: bool,
 }
 
@@ -208,11 +228,19 @@ impl PopKeyStore {
         .await
     }
 
-    /// The D2 rewritten eviction rule. Evicts `token_id` IFF (a) the grant is terminal-delivered
-    /// (`grant_delivered_at.is_some()`) OR the subject is `abandoned`, AND (b)
-    /// `subject_has_live_use(token_id)` returns `false`, AND (c)
-    /// `subject_has_replayable_dead_letter(token_id)` returns `false`. `minted_at`/
-    /// `grant_expires_at` are NEVER consulted (audit/operator-info only, per the module doc).
+    /// The D2 rewritten eviction rule (Codex HIGH-4 corrected). Evicts `token_id` IFF (a) the
+    /// subject is `abandoned` OR the grant has EXPIRED (`grant_expires_at.is_some()` AND
+    /// `grant_expires_at <= now`), AND (b) `subject_has_live_use(token_id)` returns `false`, AND
+    /// (c) `subject_has_replayable_dead_letter(token_id)` returns `false`. `minted_at` is NEVER
+    /// consulted (audit only, per the module doc); `grant_delivered_at` is not consulted directly
+    /// either — it only determines whether `grant_expires_at` was ever set. Critically, a
+    /// delivered-but-UNEXPIRED grant with no pending use right now is NOT a candidate: the grant
+    /// may still be used later (a delayed first execute, or the next use of a bounded-reuse
+    /// `--uses N` token between uses), so its seed must survive until the grant itself can no
+    /// longer be used.
+    ///
+    /// `now` is supplied by the caller (the GC tick passes `Utc::now()`) rather than read
+    /// internally, keeping this method a pure function of its inputs for testability.
     ///
     /// **Fail-closed contract (load-bearing):** both predicates answer a plain `bool`, but the
     /// CALLER MUST return `true` ("still blocking") whenever the answer cannot be determined —
@@ -231,6 +259,7 @@ impl PopKeyStore {
     /// Returns the number of entries evicted.
     pub async fn evict_resolved(
         &self,
+        now: DateTime<Utc>,
         subject_has_live_use: impl Fn(&str) -> bool,
         subject_has_replayable_dead_letter: impl Fn(&str) -> bool,
     ) -> Result<usize, StorageError> {
@@ -238,7 +267,9 @@ impl PopKeyStore {
             let candidates: Vec<String> = c
                 .entries
                 .iter()
-                .filter(|(_, e)| e.grant_delivered_at.is_some() || e.abandoned)
+                .filter(|(_, e)| {
+                    e.abandoned || e.grant_expires_at.is_some_and(|expires_at| expires_at <= now)
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             let mut evicted = 0usize;
@@ -586,28 +617,77 @@ mod tests {
         ));
     }
 
-    // ---- eviction (D2 rewritten rule) ----
+    // ---- eviction (D2 rewritten rule, Codex HIGH-4 corrected) ----
 
     #[tokio::test]
     async fn eviction_skips_an_unresolved_subject_regardless_of_predicates() {
         let (s, _d) = store();
         s.insert("tok-pending", entry([1u8; 32])).await.unwrap(); // grant never delivered, not abandoned
-        let evicted = s.evict_resolved(|_| false, |_| false).await.unwrap();
+        let evicted = s.evict_resolved(Utc::now(), |_| false, |_| false).await.unwrap();
         assert_eq!(evicted, 0, "an unresolved subject is never evicted");
         assert_eq!(s.entry_count().await.unwrap(), 1);
+    }
+
+    /// The core Codex HIGH-4 regression test: a grant that delivered but has NOT yet expired must
+    /// be retained even though nothing is using it at this exact GC tick — the token may still be
+    /// used later (a delayed first execute, or the next use of a bounded-reuse `--uses N` token).
+    #[tokio::test]
+    async fn eviction_retains_a_delivered_but_unexpired_grant_with_no_pending_use() {
+        let (s, _d) = store();
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::hours(1); // still valid
+        s.insert("tok-1", entry([1u8; 32])).await.unwrap();
+        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, Some(expires_at))
+            .await
+            .unwrap();
+        // No pending use, no dead letter, but the grant hasn't expired yet → must NOT evict.
+        let evicted = s.evict_resolved(now, |_| false, |_| false).await.unwrap();
+        assert_eq!(
+            evicted, 0,
+            "a delivered-but-unexpired grant must be retained even with no use pending right now"
+        );
+        assert!(s.get("tok-1").await.unwrap().is_some());
+    }
+
+    /// The other half of the HIGH-4 fix: once `grant_expires_at` has actually elapsed (and nothing
+    /// is outstanding), the SAME subject is now evictable.
+    #[tokio::test]
+    async fn eviction_evicts_the_same_subject_once_its_grant_has_expired() {
+        let (s, _d) = store();
+        let minted_at = Utc::now();
+        let expires_at = minted_at + chrono::Duration::hours(1);
+        s.insert("tok-1", entry([1u8; 32])).await.unwrap();
+        s.grant_resolved(
+            "tok-1",
+            "cap".into(),
+            "grant-1".into(),
+            minted_at,
+            Some(expires_at),
+        )
+        .await
+        .unwrap();
+        // A GC tick running strictly AFTER expiry, still nothing outstanding → evict.
+        let after_expiry = expires_at + chrono::Duration::seconds(1);
+        let evicted = s.evict_resolved(after_expiry, |_| false, |_| false).await.unwrap();
+        assert_eq!(
+            evicted, 1,
+            "an expired grant with nothing outstanding must be evicted"
+        );
+        assert!(s.get("tok-1").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn eviction_retains_a_resolved_subject_with_a_live_use() {
         let (s, _d) = store();
         let now = Utc::now();
+        let expires_at = now - chrono::Duration::hours(1); // already expired -> a candidate
         s.insert("tok-1", entry([1u8; 32])).await.unwrap();
-        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, None)
+        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, Some(expires_at))
             .await
             .unwrap();
-        // Resolved, but a pending/leased use still exists for the subject → must NOT evict.
+        // A candidate (expired), but a pending/leased use still exists for the subject → must NOT evict.
         let evicted = s
-            .evict_resolved(|subj| subj == "tok-1", |_| false)
+            .evict_resolved(now, |subj| subj == "tok-1", |_| false)
             .await
             .unwrap();
         assert_eq!(evicted, 0, "a live use blocks eviction (D2 rule b)");
@@ -618,13 +698,14 @@ mod tests {
     async fn eviction_retains_a_resolved_subject_with_a_replayable_dead_letter() {
         let (s, _d) = store();
         let now = Utc::now();
+        let expires_at = now - chrono::Duration::hours(1); // already expired -> a candidate
         s.insert("tok-1", entry([1u8; 32])).await.unwrap();
-        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, None)
+        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, Some(expires_at))
             .await
             .unwrap();
-        // Resolved, no live use, but a replayable dead-lettered use still exists → must NOT evict.
+        // A candidate (expired), no live use, but a replayable dead-lettered use still exists → must NOT evict.
         let evicted = s
-            .evict_resolved(|_| false, |subj| subj == "tok-1")
+            .evict_resolved(now, |_| false, |subj| subj == "tok-1")
             .await
             .unwrap();
         assert_eq!(
@@ -638,47 +719,74 @@ mod tests {
     async fn eviction_removes_a_fully_resolved_subject() {
         let (s, _d) = store();
         let now = Utc::now();
+        let expires_at = now - chrono::Duration::hours(1); // already expired
         s.insert("tok-1", entry([1u8; 32])).await.unwrap();
-        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, None)
+        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, Some(expires_at))
             .await
             .unwrap();
-        let evicted = s.evict_resolved(|_| false, |_| false).await.unwrap();
+        let evicted = s.evict_resolved(now, |_| false, |_| false).await.unwrap();
         assert_eq!(
             evicted, 1,
-            "grant delivered + no live use + no replayable dead-letter → evict"
+            "grant expired + no live use + no replayable dead-letter → evict"
         );
         assert!(s.get("tok-1").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn eviction_via_abandoned_does_not_require_grant_delivery() {
-        // A grant that permanently dead-lettered never sets grant_delivered_at; the operator
-        // abandon path is the ONLY way rule (a) is satisfied for it.
+        // A grant that permanently dead-lettered never sets grant_delivered_at (so
+        // grant_expires_at stays None too); the operator abandon path is the ONLY way rule (a) is
+        // satisfied for it.
         let (s, _d) = store();
         s.insert("tok-1", entry([1u8; 32])).await.unwrap();
         assert_eq!(
-            s.evict_resolved(|_| false, |_| false).await.unwrap(),
+            s.evict_resolved(Utc::now(), |_| false, |_| false).await.unwrap(),
             0,
-            "not resolved yet — neither delivered nor abandoned"
+            "not resolved yet — neither abandoned nor expired (never delivered)"
         );
         assert!(s.mark_abandoned("tok-1").await.unwrap());
-        let evicted = s.evict_resolved(|_| false, |_| false).await.unwrap();
+        let evicted = s.evict_resolved(Utc::now(), |_| false, |_| false).await.unwrap();
         assert_eq!(evicted, 1, "abandoned satisfies rule (a) without a delivered grant");
+    }
+
+    /// Task-required case: an abandoned subject is evicted regardless of expiry — even a grant
+    /// that delivered and has NOT yet expired is evicted the moment it's abandoned.
+    #[tokio::test]
+    async fn eviction_via_abandoned_evicts_even_before_the_grant_would_expire() {
+        let (s, _d) = store();
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::hours(1); // still far from expiry
+        s.insert("tok-1", entry([1u8; 32])).await.unwrap();
+        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, Some(expires_at))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.evict_resolved(now, |_| false, |_| false).await.unwrap(),
+            0,
+            "delivered but unexpired and not abandoned — not yet a candidate"
+        );
+        assert!(s.mark_abandoned("tok-1").await.unwrap());
+        let evicted = s.evict_resolved(now, |_| false, |_| false).await.unwrap();
+        assert_eq!(
+            evicted, 1,
+            "abandoned evicts regardless of an unexpired grant_expires_at"
+        );
     }
 
     #[tokio::test]
     async fn eviction_only_removes_the_targeted_subject() {
         let (s, _d) = store();
         let now = Utc::now();
+        let expires_at = now - chrono::Duration::hours(1); // already expired for all three
         for id in ["a", "b", "c"] {
             s.insert(id, entry([1u8; 32])).await.unwrap();
-            s.grant_resolved(id, "cap".into(), "g".into(), now, None)
+            s.grant_resolved(id, "cap".into(), "g".into(), now, Some(expires_at))
                 .await
                 .unwrap();
         }
         // Only "b" has a live use; "a" and "c" fully resolve.
         let evicted = s
-            .evict_resolved(|subj| subj == "b", |_| false)
+            .evict_resolved(now, |subj| subj == "b", |_| false)
             .await
             .unwrap();
         assert_eq!(evicted, 2);
@@ -695,13 +803,14 @@ mod tests {
         // fail-closed contract, if honored by the caller, is enforced by this method.
         let (s, _d) = store();
         let now = Utc::now();
+        let expires_at = now - chrono::Duration::hours(1); // already expired -> a candidate
         s.insert("tok-1", entry([1u8; 32])).await.unwrap();
-        s.grant_resolved("tok-1", "cap".into(), "g".into(), now, None)
+        s.grant_resolved("tok-1", "cap".into(), "g".into(), now, Some(expires_at))
             .await
             .unwrap();
         let unknown_is_blocking = |_subj: &str| true; // conservative "cannot evaluate" answer
         let evicted = s
-            .evict_resolved(unknown_is_blocking, |_| false)
+            .evict_resolved(now, unknown_is_blocking, |_| false)
             .await
             .unwrap();
         assert_eq!(evicted, 0, "an unevaluable predicate must retain, never evict");

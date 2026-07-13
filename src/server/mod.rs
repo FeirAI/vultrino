@@ -3772,10 +3772,14 @@ pub async fn deliver_averin_outbox_periodically(
 ///    [`AverinQueue::stuck_undelivered_count`] means delivery is stalled and the journal is growing.
 /// 5. **The quarantine's own bounded sensitive-data retention** (D4): redact raw `params` past the
 ///    window, independent of whatever the queue side is doing.
-/// 6. **Cross-store popkey eviction** (D2): `PopKeyStore::evict_resolved` with the REAL
-///    `subject_has_live_use`/`subject_has_replayable_dead_letter` predicates — both fail closed
-///    toward retention (an unreadable quarantine listing skips eviction for this tick entirely rather
-///    than guess; `AverinQueue::has_pending_for_subject` cannot fail, it is a pure in-memory read).
+/// 6. **Cross-store popkey eviction** (D2, Codex HIGH-4 corrected): `PopKeyStore::evict_resolved`
+///    with this tick's `now` and the REAL `subject_has_live_use`/`subject_has_replayable_dead_letter`
+///    predicates — both fail closed toward retention (an unreadable quarantine listing skips eviction
+///    for this tick entirely rather than guess; `AverinQueue::has_pending_for_subject` cannot fail, it
+///    is a pure in-memory read). A delivered-but-unexpired grant is never a candidate here regardless
+///    of `now` — only `grant_expires_at <= now` (or `abandoned`) makes one, so a token that simply has
+///    no use pending RIGHT NOW (a delayed first execute, or between uses of a bounded-reuse token)
+///    keeps its seed.
 async fn run_averin_gc_tick(
     queue: &crate::storage::AverinQueue,
     popkeys: &crate::storage::PopKeyStore,
@@ -3869,7 +3873,7 @@ async fn run_averin_gc_tick(
         let subject_has_live_use = |subject: &str| queue.has_pending_for_subject(subject);
         let subject_has_replayable_dead_letter = |subject: &str| replayable_subjects.contains(subject);
         match popkeys
-            .evict_resolved(subject_has_live_use, subject_has_replayable_dead_letter)
+            .evict_resolved(now, subject_has_live_use, subject_has_replayable_dead_letter)
             .await
         {
             Ok(0) => {}
@@ -5023,37 +5027,44 @@ mod averin_worker_tests {
         );
     }
 
-    /// The GC tick's cross-store popkey eviction (D2), exercised against the REAL queue + quarantine
-    /// predicates the tick wires up (not the injected test closures `PopKeyStore`'s own unit tests
-    /// use): a resolved subject's seed is evicted ONLY when the queue has no live use AND the
-    /// quarantine has no replayable dead-letter for it — fail-closed toward retention otherwise.
+    /// The GC tick's cross-store popkey eviction (D2, Codex HIGH-4 corrected), exercised against the
+    /// REAL queue + quarantine predicates the tick wires up (not the injected test closures
+    /// `PopKeyStore`'s own unit tests use): a resolved subject's seed is evicted ONLY when its grant
+    /// has EXPIRED (or the subject is abandoned) AND the queue has no live use AND the quarantine has
+    /// no replayable dead-letter for it — fail-closed toward retention otherwise. Each grant below is
+    /// resolved with an ALREADY-EXPIRED `grant_expires_at` (rather than `None`) so it qualifies as a
+    /// candidate under the corrected rule; a still-valid (unexpired) grant is covered by
+    /// `PopKeyStore`'s own `eviction_retains_a_delivered_but_unexpired_grant_with_no_pending_use` unit
+    /// test instead.
     #[tokio::test]
     async fn averin_gc_tick_evicts_popkey_seed_only_when_fully_resolved_with_no_blockers() {
         let dir = tempfile::tempdir().unwrap();
         let (queue, popkeys, deadletter) = test_stores(dir.path());
         let now = chrono::Utc::now();
+        let already_expired = Some(now - chrono::Duration::seconds(1));
 
-        // A: grant resolved, no queue entry at all, no quarantine entry -> fully resolved, no
-        // blockers -> the tick must evict it.
+        // A: grant resolved and EXPIRED, no queue entry at all, no quarantine entry -> fully
+        // resolved, no blockers -> the tick must evict it.
         popkeys.insert("A", popkey_entry("action-a", "read:orders")).await.unwrap();
         popkeys
-            .grant_resolved("A", "cap-a".into(), "grant-a".into(), now, None)
+            .grant_resolved("A", "cap-a".into(), "grant-a".into(), now, already_expired)
             .await
             .unwrap();
 
-        // B: grant resolved, but a Pending use still sits in the queue -> a live use blocks eviction.
+        // B: grant resolved and EXPIRED, but a Pending use still sits in the queue -> a live use
+        // blocks eviction.
         popkeys.insert("B", popkey_entry("action-b", "read:orders")).await.unwrap();
         popkeys
-            .grant_resolved("B", "cap-b".into(), "grant-b".into(), now, None)
+            .grant_resolved("B", "cap-b".into(), "grant-b".into(), now, already_expired)
             .await
             .unwrap();
         queue.append("B", "averin.use", use_payload("pb", "req-b", 1)).unwrap();
 
-        // C: grant resolved, no live use in the queue, but an OPEN unpurged quarantine record exists
-        // for it -> a replayable dead-letter blocks eviction.
+        // C: grant resolved and EXPIRED, no live use in the queue, but an OPEN unpurged quarantine
+        // record exists for it -> a replayable dead-letter blocks eviction.
         popkeys.insert("C", popkey_entry("action-c", "read:orders")).await.unwrap();
         popkeys
-            .grant_resolved("C", "cap-c".into(), "grant-c".into(), now, None)
+            .grant_resolved("C", "cap-c".into(), "grant-c".into(), now, already_expired)
             .await
             .unwrap();
         deadletter
@@ -5079,15 +5090,35 @@ mod averin_worker_tests {
         // D: the grant never delivered (not resolved, not abandoned) -> never even a candidate.
         popkeys.insert("D", popkey_entry("action-d", "read:orders")).await.unwrap();
 
+        // E (Codex HIGH-4 regression, exercised through the FULL tick, not just the unit-level
+        // predicates): grant delivered but NOT yet expired, no live use, no quarantine record ->
+        // must NOT be evicted. Before the fix, "delivered + nothing pending" alone was enough to
+        // evict this, which would have dead-lettered a delayed/later use of this same token.
+        popkeys.insert("E", popkey_entry("action-e", "read:orders")).await.unwrap();
+        popkeys
+            .grant_resolved(
+                "E",
+                "cap-e".into(),
+                "grant-e".into(),
+                now,
+                Some(now + chrono::Duration::hours(1)),
+            )
+            .await
+            .unwrap();
+
         run_averin_gc_tick(&queue, &popkeys, &deadletter).await;
 
-        assert!(popkeys.get("A").await.unwrap().is_none(), "A: fully resolved, no blockers -> evicted");
+        assert!(popkeys.get("A").await.unwrap().is_none(), "A: expired, no blockers -> evicted");
         assert!(popkeys.get("B").await.unwrap().is_some(), "B: a live use must block eviction");
         assert!(
             popkeys.get("C").await.unwrap().is_some(),
             "C: a replayable dead-letter must block eviction"
         );
         assert!(popkeys.get("D").await.unwrap().is_some(), "D: never resolved -> never evicted");
+        assert!(
+            popkeys.get("E").await.unwrap().is_some(),
+            "E: delivered but not yet expired, nothing pending -> must be RETAINED (Codex HIGH-4)"
+        );
     }
 
     /// Plan 088 D8's headline test: a `vultrino rekey` must carry a PENDING averin grant+use (and the
