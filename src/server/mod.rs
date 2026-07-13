@@ -3298,14 +3298,16 @@ fn run_averin_queue_blocking<T>(f: impl FnOnce() -> T) -> T {
 /// `GrantResolved` write-back) AND durably records the SAME resolution in the queue's own journal
 /// (`AverinQueue::resolve_grant`) so a crash between the two writes is reconcilable on replay.
 ///
-/// Codex HIGH-6 fix — `project_id`/`session_id`/`resource_id`/`grant_ttl_secs` are read from the
-/// event's OWN stored payload (frozen at enqueue by `enqueue_durable_mint_grant`), NEVER from live
-/// `averin_client.config()`: `resource_id` feeds the signed grant-PoP challenge, so a live config
-/// change between enqueue and delivery would rebuild a different signature under the same
-/// idempotency key (`token_id`) and averin would see a conflicting retry (409) instead of an
-/// honest one. Back-compat: an event enqueued before this fix has no such fields in its payload
-/// (it was `{}`), so each falls back to the client's current config — the exact pre-fix behavior —
-/// when absent.
+/// Codex HIGH-6 / re-review #6 — `project_id`/`session_id`/`resource_id`/`grant_ttl_secs` are read
+/// from the event's OWN stored payload (frozen at enqueue by `enqueue_durable_mint_grant`), NEVER
+/// from live `averin_client.config()`: `resource_id` feeds the signed grant-PoP challenge, so a live
+/// config change between enqueue and delivery would rebuild a different signature under the same
+/// idempotency key (`token_id`) and averin would see a conflicting retry (409) instead of an honest
+/// one. The `?project=` routing query is likewise frozen (via `post_for_project`), so the whole
+/// request — body AND route — is byte-identical on every retry. FAIL-CLOSED: a missing frozen field
+/// ERRORS the delivery (retries/dead-letters visibly); there is NO live-config fallback — durable is
+/// default-OFF and unreleased, so no legacy field-less event exists, and silently substituting live
+/// config was exactly the per-field fallback that reproduced the 409 this freeze prevents.
 async fn deliver_averin_grant(
     event: &crate::outbox::OutboxEvent,
     queue: &crate::storage::AverinQueue,
@@ -3319,32 +3321,53 @@ async fn deliver_averin_grant(
         .map_err(|e| format!("popkey lookup failed: {e}"))?
         .ok_or_else(|| format!("no PoP-key entry for token {token_id} (grant cannot be rebuilt)"))?;
 
-    // Codex HIGH-6 — STORED, never live: back-compat fallback to config only for events enqueued
-    // before this fix (whose payload is `{}`).
+    // Codex re-review #6 — STORED, never live, and FAIL-CLOSED: these are the fields frozen into the
+    // event at enqueue (`enqueue_durable_mint_grant`). A missing frozen field must ERROR the delivery
+    // (retry/dead-letter visibly), NEVER silently substitute live `av.config()` — that per-field
+    // fallback re-read a changed config and reproduced the exact 409 the freeze exists to prevent
+    // (`resource_id`/`grant_ttl_secs` feed the signed grant-PoP challenge / request body under the
+    // same idempotency key). durable is default-OFF and unreleased, so no legacy field-less event
+    // exists; an absent field here is a real defect, not a back-compat case.
     let project_id = event
         .payload
         .get("project_id")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| averin_client.config().project_id.clone());
+        .ok_or_else(|| {
+            "averin.grant event payload missing frozen project_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
     let session_id = event
         .payload
         .get("session_id")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| averin_client.config().session_id.clone());
+        .ok_or_else(|| {
+            "averin.grant event payload missing frozen session_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
     let resource = event
         .payload
         .get("resource_id")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| averin_client.config().resource_id.clone());
+        .ok_or_else(|| {
+            "averin.grant event payload missing frozen resource_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
     let grant_ttl_secs = event
         .payload
         .get("grant_ttl_secs")
         .and_then(|v| v.as_u64())
         .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or_else(|| averin_client.config().grant_ttl_secs);
+        .ok_or_else(|| {
+            "averin.grant event payload missing frozen grant_ttl_secs (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?;
 
     let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
     let agent_pubkey = keypair.agent_pubkey_b64();
@@ -3378,8 +3401,10 @@ async fn deliver_averin_grant(
         "ttl_seconds": grant_ttl_secs,
     });
 
+    // Codex re-review #6 — route the `?project=` auth query by the FROZEN `project_id`, not live
+    // config, so a retry after the deployment's project changed stays byte-identical (body AND query).
     let resp = averin_client
-        .post("/v2/grants", &body)
+        .post_for_project("/v2/grants", &body, &project_id)
         .await
         .map_err(|e| e.to_string())?;
     let grant_id = resp
@@ -3439,14 +3464,17 @@ async fn deliver_averin_grant(
 /// `src/server/mod.rs`'s execute call sites) rides verbatim into the body. averin ignores it for
 /// non-bounded scope classes, so it is always included.
 ///
-/// Codex HIGH-6 fix — `project_id`/`session_id`/`resource_id` are ALSO read verbatim from the
-/// STORED event payload (frozen at enqueue by `seal_after_consume`'s durable branch), never from
+/// Codex HIGH-6 / re-review #6 — `project_id`/`session_id`/`resource_id` are ALSO read verbatim from
+/// the STORED event payload (frozen at enqueue by `seal_after_consume`'s durable branch), never from
 /// live `averin_client.config()`. `resource_id` in particular feeds the SIGNED use-PoP challenge
-/// (`build_use_pop`), so rebuilding it from a config that changed between enqueue and delivery
-/// would reproduce a DIFFERENT `use_sig` under the SAME idempotency key — averin would see that as
-/// a conflicting retry (409), wrongly dead-lettering an honest retry of an already-sealed use.
-/// Back-compat: an event enqueued before this fix has no such fields in its payload, so each falls
-/// back to the client's current config when absent — the exact pre-fix behavior.
+/// (`build_use_pop`), so rebuilding it from a config that changed between enqueue and delivery would
+/// reproduce a DIFFERENT `use_sig` under the SAME idempotency key — averin would see that as a
+/// conflicting retry (409), wrongly dead-lettering an honest retry of an already-sealed use. The
+/// `?project=` routing query is frozen too (via `post_for_project`), so both the body and the route
+/// are byte-identical on every retry. FAIL-CLOSED: a missing frozen field ERRORS the delivery
+/// (retries/dead-letters visibly); there is NO live-config fallback — durable is default-OFF and
+/// unreleased, so no legacy field-less event exists, and silently substituting live config was
+/// exactly the per-field fallback that reproduced the 409 this freeze prevents.
 async fn deliver_averin_use(
     event: &crate::outbox::OutboxEvent,
     popkeys: &crate::storage::PopKeyStore,
@@ -3503,27 +3531,42 @@ async fn deliver_averin_use(
         .get("use_sequence_number")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "averin.use event payload missing use_sequence_number".to_string())?;
-    // Codex HIGH-6 — STORED, never live: `resource_id` feeds the SIGNED use-PoP challenge below,
-    // so it (and its project/session siblings) must never be re-read from `av.config()` at
-    // delivery time. Back-compat fallback to config only for events enqueued before this fix.
+    // Codex re-review #6 — STORED, never live, and FAIL-CLOSED: `resource_id` feeds the SIGNED use-PoP
+    // challenge below, so it (and its project/session siblings) must never be re-read from
+    // `av.config()` at delivery time. A missing frozen field must ERROR the delivery (retry/dead-letter
+    // visibly), NEVER fall back to live config — that per-field fallback re-read a changed config and
+    // reproduced the exact 409 the freeze exists to prevent. durable is default-OFF and unreleased, so
+    // no legacy field-less event exists; an absent field here is a real defect, not a back-compat case.
     let project_id = event
         .payload
         .get("project_id")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| averin_client.config().project_id.clone());
+        .ok_or_else(|| {
+            "averin.use event payload missing frozen project_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
     let session_id = event
         .payload
         .get("session_id")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| averin_client.config().session_id.clone());
+        .ok_or_else(|| {
+            "averin.use event payload missing frozen session_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
     let resource_id = event
         .payload
         .get("resource_id")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| averin_client.config().resource_id.clone());
+        .ok_or_else(|| {
+            "averin.use event payload missing frozen resource_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
 
     let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
     let use_pop = crate::averin::build_use_pop(
@@ -3554,8 +3597,10 @@ async fn deliver_averin_use(
         "use_sequence_number": use_sequence_number,
     });
 
+    // Codex re-review #6 — route the `?project=` auth query by the FROZEN `project_id`, not live
+    // config, so a retry after the deployment's project changed stays byte-identical (body AND query).
     averin_client
-        .post("/v2/use", &body)
+        .post_for_project("/v2/use", &body, &project_id)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -4310,6 +4355,10 @@ mod averin_worker_tests {
         /// a MATCHING body is an honest retry (return the same record, `idempotent: true`); a
         /// repeat key with a DIFFERENT body is the real 409 conflict (`:1994`/`:2035`).
         use_by_idempotency_key: parking_lot::Mutex<HashMap<String, (serde_json::Value, String)>>,
+        /// Codex re-review #6 — the value of the `?project=` auth ROUTING query on every `/v2/use`
+        /// call, IN ORDER, so a test can assert the durable worker routes by the FROZEN project, not
+        /// live config. Empty when the client carries no API key (no `?project=` is sent then).
+        use_query_projects: parking_lot::Mutex<Vec<String>>,
     }
 
     async fn fake_grants(
@@ -4345,8 +4394,14 @@ mod averin_worker_tests {
 
     async fn fake_use(
         State(state): State<Arc<FakeAverinState>>,
+        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
         Json(body): Json<serde_json::Value>,
     ) -> (StatusCode, Json<serde_json::Value>) {
+        // Codex re-review #6 — record the routing project the transport put on `?project=` (present
+        // only when the client has an API key). A non-body extractor, so it precedes `Json`.
+        if let Some(project) = query.get("project") {
+            state.use_query_projects.lock().push(project.clone());
+        }
         let action = body
             .get("action")
             .and_then(|v| v.as_str())
@@ -4465,6 +4520,26 @@ mod averin_worker_tests {
             "params_nonce": "ab".repeat(32),
             "request_id": request_id,
             "use_sequence_number": use_sequence_number,
+            // Codex re-review #6 — the frozen routing/identity fields `seal_after_consume`'s durable
+            // branch writes at enqueue. `deliver_averin_use` now reads them FAIL-CLOSED (no live-config
+            // fallback), so a test event must carry them exactly as production does. Values match
+            // `test_client`'s config (default project/session + the "orders-db" resource).
+            "project_id": "vultrino",
+            "session_id": "vultrino-seal",
+            "resource_id": "orders-db",
+        })
+    }
+
+    /// Codex re-review #6 — the frozen fields `enqueue_durable_mint_grant` writes into every
+    /// `"averin.grant"` event at enqueue. `deliver_averin_grant` reads them FAIL-CLOSED, so a test
+    /// grant event must carry them (production never enqueues a `{}` grant). Values match
+    /// `test_client`'s config (default project/session + `grant_ttl_secs`, "orders-db" resource).
+    fn grant_payload() -> serde_json::Value {
+        serde_json::json!({
+            "project_id": "vultrino",
+            "session_id": "vultrino-seal",
+            "resource_id": "orders-db",
+            "grant_ttl_secs": 300,
         })
     }
 
@@ -4480,7 +4555,7 @@ mod averin_worker_tests {
             .await
             .unwrap();
         let grant_seq = queue
-            .append("tok-1", "averin.grant", serde_json::json!({}))
+            .append("tok-1", "averin.grant", grant_payload())
             .unwrap();
         let use_seq = queue
             .append("tok-1", "averin.use", use_payload("hello-world", "req-1", 1))
@@ -4544,7 +4619,7 @@ mod averin_worker_tests {
             .await
             .unwrap();
         queue
-            .append("tok-2", "averin.grant", serde_json::json!({}))
+            .append("tok-2", "averin.grant", grant_payload())
             .unwrap();
         queue
             .append("tok-2", "averin.use", use_payload("p", "req-2", 1))
@@ -4595,7 +4670,7 @@ mod averin_worker_tests {
             .await
             .unwrap();
         queue
-            .append("tok-2b", "averin.grant", serde_json::json!({}))
+            .append("tok-2b", "averin.grant", grant_payload())
             .unwrap();
         queue
             .append("tok-2b", "averin.use", use_payload("p", "req-2b", 1))
@@ -4625,7 +4700,7 @@ mod averin_worker_tests {
                 .await
                 .unwrap();
             queue
-                .append(subject, "averin.grant", serde_json::json!({}))
+                .append(subject, "averin.grant", grant_payload())
                 .unwrap();
             queue
                 .append(
@@ -4685,7 +4760,7 @@ mod averin_worker_tests {
             .await
             .unwrap();
         queue
-            .append("normal", "averin.grant", serde_json::json!({}))
+            .append("normal", "averin.grant", grant_payload())
             .unwrap();
 
         deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 8)
@@ -4903,6 +4978,152 @@ mod averin_worker_tests {
         );
     }
 
+    /// Codex re-review #6 — the ROUTING-query freeze (the companion to the BODY freeze above). A
+    /// prior fix froze the request BODY's `project_id`, but the shared transport still built the
+    /// authenticated `?project=` query from LIVE `self.cfg.project_id`. So a durable use retried
+    /// after the deployment's `project_id` changed carried the FROZEN old project in its body while
+    /// being ROUTED to the NEW live project — mis-routed (wrong tenant) or 409, never byte-identical.
+    /// This asserts the worker routes `?project=` by the STORED (frozen) project, not the live
+    /// config's changed one: an `AverinClient` whose live `project_id` is DIFFERENT from the event's
+    /// frozen `project_id` (and which carries an API key, so `?project=` is actually emitted) must
+    /// still send the FROZEN project on the routing query.
+    #[tokio::test]
+    async fn averin_worker_use_routes_by_stored_project_not_live_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_queue, popkeys, _deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+
+        popkeys
+            .insert("tok-route", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        popkeys
+            .grant_resolved(
+                "tok-route",
+                "AAAA.sig".to_string(),
+                "grant-route".to_string(),
+                chrono::Utc::now(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The event as it was FROZEN at enqueue: its own project_id, captured then.
+        let mut payload = use_payload("hello-route", "req-route", 1);
+        payload["project_id"] = serde_json::json!("proj-frozen-at-enqueue");
+        let event = OutboxEvent {
+            sequence: 1,
+            subject: "tok-route".to_string(),
+            event_type: "averin.use".to_string(),
+            payload,
+            created_at: chrono::Utc::now(),
+            delivery: DeliveryState::Pending,
+            attempts: 0,
+            leased_until: None,
+            last_attempt_at: None,
+            last_error: None,
+            dedup_id: None,
+        };
+
+        // The LIVE client's config has a DIFFERENT project_id (a deployment change since enqueue),
+        // plus an API key so the transport actually emits the `?project=` auth query.
+        let client_live = AverinClient::new(AverinConfig {
+            enabled: true,
+            base_url: base_url.clone(),
+            project_id: "proj-live-changed".to_string(),
+            resource_id: "orders-db".to_string(),
+            api_key: Some("test-key".to_string()),
+            ..AverinConfig::default()
+        })
+        .expect("client builds")
+        .expect("client is Some when enabled");
+
+        deliver_averin_use(&event, &popkeys, &client_live)
+            .await
+            .expect("delivery succeeds");
+
+        let projects = fake.use_query_projects.lock().clone();
+        assert_eq!(
+            projects,
+            vec!["proj-frozen-at-enqueue".to_string()],
+            "the durable use must route ?project= by the STORED (frozen) project, never the live \
+             config's changed project_id: {projects:?}"
+        );
+        assert!(
+            !projects.iter().any(|p| p == "proj-live-changed"),
+            "the live config's changed project_id must NEVER appear on the routing query"
+        );
+    }
+
+    /// Codex re-review #6 — the FAIL-CLOSED stored-field read (replacing the live-config fallback
+    /// that re-reproduced the 409). durable is default-OFF and unreleased, so no legacy field-less
+    /// event exists; a `"averin.use"` event MISSING its frozen `project_id` is a real defect that
+    /// must FAIL the delivery (so it retries/dead-letters visibly), NEVER be papered over by silently
+    /// substituting live `av.config().project_id` (which, on a config change, is exactly what
+    /// reproduced the original mis-route/409).
+    #[tokio::test]
+    async fn averin_worker_use_missing_frozen_project_id_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_queue, popkeys, _deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+
+        popkeys
+            .insert("tok-missing", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        popkeys
+            .grant_resolved(
+                "tok-missing",
+                "AAAA.sig".to_string(),
+                "grant-missing".to_string(),
+                chrono::Utc::now(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A well-formed use event with every field EXCEPT the frozen project_id.
+        let mut payload = use_payload("hello-missing", "req-missing", 1);
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("project_id")
+            .expect("use_payload seeds project_id");
+        let event = OutboxEvent {
+            sequence: 1,
+            subject: "tok-missing".to_string(),
+            event_type: "averin.use".to_string(),
+            payload,
+            created_at: chrono::Utc::now(),
+            delivery: DeliveryState::Pending,
+            attempts: 0,
+            leased_until: None,
+            last_attempt_at: None,
+            last_error: None,
+            dedup_id: None,
+        };
+
+        let err = deliver_averin_use(&event, &popkeys, &client)
+            .await
+            .expect_err(
+                "a use event missing its frozen project_id must FAIL the delivery, not fall back \
+                 to live config",
+            );
+        assert!(
+            err.contains("project_id"),
+            "the error must name the missing frozen field (fail-closed, not a silent substitution): \
+             {err}"
+        );
+        // Nothing reached averin — the delivery failed BEFORE the POST, so no record was minted
+        // under a wrong/substituted project.
+        assert!(
+            fake.call_log.lock().is_empty(),
+            "a fail-closed missing-field delivery must never reach averin: {:?}",
+            fake.call_log.lock()
+        );
+    }
+
     /// Plan 088 Step 4 (D5b/D5c) — a bounded-reuse (`--uses N`) token's DISTINCT executes (each
     /// with its own `request_id`) must land at averin as DISTINCT idempotency keys carrying
     /// their correct 1-based `use_sequence_number` — never collapsed into one record the way the
@@ -4920,7 +5141,7 @@ mod averin_worker_tests {
             .await
             .unwrap();
         queue
-            .append("tok-multi", "averin.grant", serde_json::json!({}))
+            .append("tok-multi", "averin.grant", grant_payload())
             .unwrap();
         queue
             .append("tok-multi", "averin.use", use_payload("p1", "req-1", 1))
@@ -4982,7 +5203,7 @@ mod averin_worker_tests {
             .insert("tok-fail", popkey_entry("action-fail", "read:orders"))
             .await
             .unwrap();
-        queue.append("tok-fail", "averin.grant", serde_json::json!({})).unwrap();
+        queue.append("tok-fail", "averin.grant", grant_payload()).unwrap();
         let use_seq = queue
             .append(
                 "tok-fail",
@@ -5028,7 +5249,7 @@ mod averin_worker_tests {
             .insert("tok-sweep", popkey_entry("action-sweep", "read:orders"))
             .await
             .unwrap();
-        queue.append("tok-sweep", "averin.grant", serde_json::json!({})).unwrap();
+        queue.append("tok-sweep", "averin.grant", grant_payload()).unwrap();
         let use_seq = queue
             .append("tok-sweep", "averin.use", use_payload("SWEEP_SECRET", "req-sweep", 1))
             .unwrap();
@@ -5183,7 +5404,7 @@ mod averin_worker_tests {
             .await
             .unwrap();
         queue
-            .append(token_id, "averin.grant", serde_json::json!({}))
+            .append(token_id, "averin.grant", grant_payload())
             .unwrap();
 
         // max_attempts = 1: the first failed attempt dead-letters the grant, which (FIX 2) marks the

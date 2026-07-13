@@ -817,18 +817,51 @@ impl AverinClient {
     /// grant/use request it rebuilt from a durable queue event + the PoP-key store through the
     /// SAME transport (auth header/query, response-size cap, non-2xx/parse handling) `seal_grant`/
     /// `seal_use` use — reusing the transport, not branching it (D1). No behavior change to any
-    /// existing call site.
+    /// existing call site. The durable worker itself now uses [`Self::post_for_project`] so it can
+    /// route the `?project=` query by the FROZEN project (Codex re-review #6); this variant keeps
+    /// routing by live `self.cfg.project_id` for the synchronous 087 seal path.
     pub(crate) async fn post(
         &self,
         endpoint: &'static str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, AverinError> {
+        // The synchronous 087 seal path (`seal_grant`/`seal_use`/mint): route the authenticated
+        // `?project=` query by LIVE `self.cfg.project_id`. Byte-identical to before the routing-freeze
+        // fix — the live request IS the current deployment's request, so live config is correct here.
+        self.post_inner(endpoint, body, &self.cfg.project_id).await
+    }
+
+    /// Codex re-review #6 (plan 088 r2) — the SAME transport as [`Self::post`], but routing the
+    /// authenticated `?project=` query by an EXPLICIT, caller-supplied `project_id` instead of live
+    /// `self.cfg.project_id`. The durable delivery worker (`deliver_averin_grant`/`deliver_averin_use`,
+    /// `src/server/mod.rs`) calls this with the project FROZEN into the durable event at enqueue time,
+    /// so a use/grant retried after the deployment's `project_id` changed is still routed to the STORED
+    /// project — byte-identical to its first attempt (BODY *and* routing query), never mis-routed to
+    /// the new live project (which would 409 or land the record under the wrong tenant). This is the
+    /// query-side companion to the already-frozen request BODY fields; without it the frozen body was
+    /// still routed by the wrong `?project=`.
+    pub(crate) async fn post_for_project(
+        &self,
+        endpoint: &'static str,
+        body: &serde_json::Value,
+        project_id: &str,
+    ) -> Result<serde_json::Value, AverinError> {
+        self.post_inner(endpoint, body, project_id).await
+    }
+
+    /// Shared POST core for both [`Self::post`] (live-config routing, the 087 path) and
+    /// [`Self::post_for_project`] (frozen-project routing, the durable worker). `project` is the only
+    /// difference between the two: it becomes the `?project=` auth query when an API key is set.
+    async fn post_inner(
+        &self,
+        endpoint: &'static str,
+        body: &serde_json::Value,
+        project: &str,
+    ) -> Result<serde_json::Value, AverinError> {
         let mut req = self.http.post(self.url(endpoint)).json(body);
         if let Some(k) = &self.cfg.api_key {
             // averin scopes auth on ?project=; the key goes in the Authorization header.
-            req = req
-                .query(&[("project", self.cfg.project_id.as_str())])
-                .bearer_auth(k);
+            req = req.query(&[("project", project)]).bearer_auth(k);
         }
         let resp = req.send().await.map_err(AverinError::Request)?;
         let status = resp.status();
