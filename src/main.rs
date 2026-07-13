@@ -20,7 +20,7 @@ use vultrino::mcp::McpServer;
 use vultrino::plugins::PluginInstaller;
 use vultrino::router::CredentialResolver;
 use vultrino::server::VultrinoServer;
-use vultrino::storage::{FileStorage, StorageBackend};
+use vultrino::storage::{FileStorage, StorageBackend, StorageError};
 use vultrino::web::{AdminAuth, WebConfig, WebServer};
 use vultrino::{Credential, CredentialData, ExecuteRequest, Secret};
 
@@ -927,12 +927,37 @@ async fn rekey_vault(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             // condition that constructs them (enabled && durable) so a non-durable deployment never
             // materializes empty averin files during a rekey.
             let averin_durable = config.averin.enabled && config.averin.durable;
-            let storage = FileStorage::new_with_averin(&path, &current, averin_durable).await?;
+            // FAIL CLOSED (Codex re-review): use the STRICT open (`open_for_rekey`), NOT the normal
+            // `new_with_averin`. If the durable service is still running it holds the queue's
+            // process-lifetime lock, so a non-strict open would swallow `AverinQueueBusy` to
+            // `Ok(None)` → `self.averin` = None → `rekey` rotates ONLY vault+outbox while STILL
+            // printing success → the old-key averin files brick the next restart. The strict open
+            // propagates the busy signal instead, and we surface it as a clear operator instruction.
+            let storage = match FileStorage::open_for_rekey(&path, &current, averin_durable).await {
+                Ok(storage) => storage,
+                Err(StorageError::AverinQueueBusy(dir)) => {
+                    return Err(format!(
+                        "cannot re-key: the durable averin queue at {dir} is in use by a running \
+                         process; stop the vultrino service before re-keying so its averin durable \
+                         stores are rotated too (a partial rekey would brick the next durable startup)"
+                    )
+                    .into());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            // Only claim the averin stores were rotated if they were ACTUALLY opened (self.averin was
+            // Some). With the strict open above, a durable-configured deployment whose queue is busy
+            // already errored out, so reaching here with the stores present means they WILL rotate.
+            let rotated_averin = storage.averin_queue().is_some();
             storage.rekey(&new).await?;
             println!(
                 "vault re-keyed: {}{}. Restart the service with the new password.",
                 path.display(),
-                if averin_durable { " (and its outbox + averin durable stores)" } else { " (and its outbox)" }
+                if rotated_averin {
+                    " (and its outbox + averin durable stores)"
+                } else {
+                    " (and its outbox)"
+                }
             );
             Ok(())
         }

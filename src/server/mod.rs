@@ -3642,7 +3642,8 @@ pub async fn deliver_averin_outbox_once(
                 // `already_quarantined = false` always holds at this call site (contrast the GC-tick
                 // retry-sweep below, which re-visits a record whose quarantine move already succeeded
                 // in an earlier pass and must NOT re-upsert it).
-                quarantine_and_reclaim_dead_letter(final_event, queue, quarantine, false).await;
+                quarantine_and_reclaim_dead_letter(final_event, queue, popkeys, quarantine, false)
+                    .await;
             }
             Ok(false) => {}
             Err(e) => {
@@ -3679,11 +3680,37 @@ pub async fn deliver_averin_outbox_once(
 async fn quarantine_and_reclaim_dead_letter(
     event: crate::outbox::OutboxEvent,
     queue: &crate::storage::AverinQueue,
+    popkeys: &crate::storage::PopKeyStore,
     quarantine: &crate::storage::AverinDeadLetterStore,
     already_quarantined: bool,
 ) {
     let sequence = event.sequence;
     let subject = event.subject.clone();
+
+    // FIX 2 (Codex HIGH — undelivered-grant PoP seeds leak forever): a permanently dead-lettered
+    // GRANT means this subject can NEVER be sealed, so its `PopKeyEntry.grant_expires_at` stays
+    // `None` forever and `PopKeyStore::evict_resolved` (which reclaims on `abandoned || grant_expires_at
+    // <= now`) would never reclaim its `pop_seed` — an unbounded seed leak. Mark the subject
+    // `abandoned` here so the next popkey GC tick can evict its seed (fail-closed toward NOT leaking;
+    // releasing a dead subject's seed is correct — the grant that would have needed it is gone). This
+    // runs from BOTH call sites (the worker's one-shot dead-letter transition AND the GC retry-sweep),
+    // but `mark_abandoned` is idempotent (a no-op once the flag is set / the entry is gone), so a
+    // straggler re-visited by the sweep re-marks harmlessly. `averin.use` dead-letters are untouched:
+    // their subject's grant DID deliver and the use may be replayed by an operator, which still needs
+    // the seed. Never propagated: a mark failure is logged, not fatal to the pass.
+    if event.event_type == "averin.grant" {
+        if let Err(e) = popkeys.mark_abandoned(&subject).await {
+            warn!(
+                target: "averin_seal",
+                error = %e,
+                sequence,
+                subject = %subject,
+                "failed to mark a dead-lettered grant's subject abandoned; its PoP seed may linger \
+                 until a later GC tick re-marks it"
+            );
+        }
+    }
+
     if !already_quarantined {
         if let Err(qe) = quarantine.quarantine(event, chrono::Utc::now()).await {
             // Never propagated via `?`: a quarantine-move failure must not abort the rest of the
@@ -3809,7 +3836,8 @@ async fn run_averin_gc_tick(
                 continue;
             }
         };
-        quarantine_and_reclaim_dead_letter(event, queue, quarantine, already_quarantined).await;
+        quarantine_and_reclaim_dead_letter(event, queue, popkeys, quarantine, already_quarantined)
+            .await;
     }
 
     // 3. Delivered-prefix prune (Codex HIGH-3): bound the disk/replay growth from records nothing
@@ -3856,7 +3884,17 @@ async fn run_averin_gc_tick(
         Ok(records) => Some(
             records
                 .into_iter()
-                .filter(|r| r.status == crate::storage::QuarantineStatus::Open && !r.params_purged)
+                .filter(|r| {
+                    r.status == crate::storage::QuarantineStatus::Open
+                        && !r.params_purged
+                        // FIX 2: a dead-lettered GRANT does NOT retain its subject's seed. Its
+                        // subject was marked `abandoned` at dead-letter time (it can never be sealed,
+                        // so its seed is intentionally releasable) — counting its OWN quarantine
+                        // record as a "replayable dead-letter" here would re-block eviction via rule
+                        // (c) and defeat the abandon. Only a dead-lettered `averin.use` keeps its
+                        // seed retained for a possible operator replay of that use.
+                        && r.event.event_type != "averin.grant"
+                })
                 .map(|r| r.event.subject)
                 .collect(),
         ),
@@ -5118,6 +5156,60 @@ mod averin_worker_tests {
         assert!(
             popkeys.get("E").await.unwrap().is_some(),
             "E: delivered but not yet expired, nothing pending -> must be RETAINED (Codex HIGH-4)"
+        );
+    }
+
+    /// FIX 2 (Codex HIGH — undelivered-grant PoP seeds leak forever): a grant that PERMANENTLY
+    /// dead-letters never sets `grant_expires_at` (it never delivered), so the seed-expiry eviction
+    /// rule alone would retain its `pop_seed` forever. The dead-letter transition must therefore mark
+    /// the subject `abandoned` so the next popkey GC tick evicts the seed. This drives the REAL worker
+    /// pass (forcing the grant to fail) + the REAL GC tick — no injected closures.
+    #[tokio::test]
+    async fn dead_lettered_grant_marks_subject_abandoned_and_gc_evicts_its_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+
+        let token_id = "tok-grant-dl";
+        // `deliver_averin_grant` derives `agent_id = "vultrino:{token_id}"`; fail that agent's grant so
+        // the grant POST always 500s and dead-letters.
+        fake.fail_grant_agents
+            .lock()
+            .insert(format!("vultrino:{token_id}"));
+
+        popkeys
+            .insert(token_id, popkey_entry("action-dl", "read:orders"))
+            .await
+            .unwrap();
+        queue
+            .append(token_id, "averin.grant", serde_json::json!({}))
+            .unwrap();
+
+        // max_attempts = 1: the first failed attempt dead-letters the grant, which (FIX 2) marks the
+        // subject abandoned and moves the record to quarantine.
+        deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 1)
+            .await
+            .unwrap();
+
+        let after_dl = popkeys.get(token_id).await.unwrap().expect("entry still present pre-GC");
+        assert!(
+            after_dl.abandoned,
+            "a permanently dead-lettered grant must mark its subject abandoned"
+        );
+        assert!(
+            after_dl.grant_expires_at.is_none(),
+            "the grant never delivered, so grant_expires_at stays None — the seed-expiry rule alone \
+             could NEVER reclaim this seed; only the abandoned flag can (the leak this fix closes)"
+        );
+
+        // The next GC tick must now evict the seed: abandoned (rule a), no live use (rule b — the grant
+        // was reclaimed from the queue), and the grant's own quarantine record does NOT count as a
+        // replayable dead-letter (rule c — grants don't retain seeds).
+        run_averin_gc_tick(&queue, &popkeys, &deadletter).await;
+        assert!(
+            popkeys.get(token_id).await.unwrap().is_none(),
+            "the GC tick must evict the abandoned dead-lettered grant's PoP seed (no unbounded leak)"
         );
     }
 

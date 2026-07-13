@@ -278,10 +278,22 @@ impl AverinStores {
     /// Construct the three stores for `vault`'s sibling averin files, sharing `master_key`. Blocking
     /// (the queue's `AverinQueue::open` replays + opens a segment synchronously — see
     /// [`open_averin_queue_blocking`]'s doc for why this runs off the async executor thread).
-    /// Returns `Ok(None)` when the durable queue directory is already owned by another live process:
-    /// THIS process then has no durable averin stores and seals via the 087 async fail-open path
-    /// instead (the durable queue is single-writer-PROCESS — see `AverinQueue`'s "Cross-process
-    /// safety" doc). `Ok(Some(_))` when this process owns the durable queue; `Err` on a real failure.
+    ///
+    /// `strict` distinguishes the two open paths that share this code:
+    /// * **Non-strict (`false`, the normal serve/mcp startup path):** returns `Ok(None)` when the
+    ///   durable queue directory is already owned by another live process — THIS process then has no
+    ///   durable averin stores and seals via the 087 async fail-open path instead (the durable queue
+    ///   is single-writer-PROCESS — see `AverinQueue`'s "Cross-process safety" doc). This graceful
+    ///   degradation lets co-running processes start.
+    /// * **Strict (`true`, the offline `vultrino rekey` path):** a busy queue is a HARD error
+    ///   ([`StorageError::AverinQueueBusy`] propagated, never degraded to `None`). A rekey that
+    ///   silently skipped the durable averin stores because the service still held the queue lock
+    ///   would rotate ONLY the vault+outbox and leave the averin files under the OLD key — bricking
+    ///   the next durable startup — so rekey MUST fail closed and tell the operator to stop the
+    ///   service first. `FileStorage::open_for_rekey` passes `true`; every other caller passes `false`.
+    ///
+    /// `Ok(Some(_))` when this process owns the durable queue; `Ok(None)` only in the non-strict case
+    /// above; `Err` on a real failure (or a busy queue under `strict`).
     ///
     /// **D8 — the on-open mid-rekey signal.** `AverinQueue::open` eagerly decrypts its latest snapshot
     /// (it must, to rebuild the live map before serving) — so a decrypt failure here (an
@@ -292,10 +304,20 @@ impl AverinStores {
     /// to [`StorageError::AverinStaleKey`] so the operator gets a clear, specific diagnostic (never a
     /// silent brick, never a partial open — the whole `FileStorage::create`/`load` call this feeds
     /// fails closed).
-    fn open(vault: &Path, master_key: &Arc<MasterKey>) -> Result<Option<Self>, StorageError> {
+    fn open(
+        vault: &Path,
+        master_key: &Arc<MasterKey>,
+        strict: bool,
+    ) -> Result<Option<Self>, StorageError> {
         let queue_dir_for_err = averin_queue_dir(vault);
         let queue = match open_averin_queue_blocking(averin_queue_dir(vault), Arc::clone(master_key)) {
             Ok(q) => q,
+            Err(StorageError::AverinQueueBusy(dir)) if strict => {
+                // Rekey path: NEVER degrade a busy queue to `Ok(None)` — that is exactly the silent
+                // skip that leaves the averin files under the old key. Fail closed; `rekey_vault`
+                // renders this as "stop the service before re-keying".
+                return Err(StorageError::AverinQueueBusy(dir));
+            }
             Err(StorageError::AverinQueueBusy(dir)) => {
                 tracing::warn!(
                     queue_dir = %dir,
@@ -547,6 +569,35 @@ impl FileStorage {
         password: &SecretString,
         averin_enabled: bool,
     ) -> Result<Self, StorageError> {
+        // strict = false: the normal serve/mcp startup path keeps its graceful `Ok(None)`
+        // degradation when the durable queue is owned by another live process.
+        Self::open_inner(path, password, averin_enabled, false).await
+    }
+
+    /// Open the file-backed vault + (when `averin_enabled`) its durable averin stores in STRICT mode
+    /// for an offline `vultrino rekey`: a durable queue that is BUSY (held by a running service's
+    /// process-lifetime lock) is a HARD error here, NOT the graceful `Ok(None)` degradation
+    /// [`Self::new_with_averin`] uses at serve/mcp startup. Rekey must rotate all three averin stores
+    /// or fail — silently skipping them (because `self.averin` came back `None`) would leave those
+    /// files under the OLD key and brick the next durable startup. `rekey_vault` (`main.rs`) turns the
+    /// resulting [`StorageError::AverinQueueBusy`] into "stop the service before re-keying".
+    pub async fn open_for_rekey(
+        path: impl AsRef<Path>,
+        password: &SecretString,
+        averin_enabled: bool,
+    ) -> Result<Self, StorageError> {
+        Self::open_inner(path, password, averin_enabled, true).await
+    }
+
+    /// Shared body of [`Self::new_with_averin`] (`strict = false`) and [`Self::open_for_rekey`]
+    /// (`strict = true`). `strict` only affects how a busy durable averin queue is handled (degrade
+    /// vs. fail closed — see [`AverinStores::open`]).
+    async fn open_inner(
+        path: impl AsRef<Path>,
+        password: &SecretString,
+        averin_enabled: bool,
+        strict: bool,
+    ) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
 
         // Ensure parent directory exists
@@ -557,10 +608,10 @@ impl FileStorage {
         // Check if file exists
         if path.exists() {
             // Load existing storage
-            Self::load(path, password, averin_enabled).await
+            Self::load(path, password, averin_enabled, strict).await
         } else {
             // Create new storage
-            Self::create(path, password, averin_enabled).await
+            Self::create(path, password, averin_enabled, strict).await
         }
     }
 
@@ -569,6 +620,7 @@ impl FileStorage {
         path: PathBuf,
         password: &SecretString,
         averin_enabled: bool,
+        strict: bool,
     ) -> Result<Self, StorageError> {
         let salt = generate_salt();
         // Pin today's params on a fresh vault (persisted in the header, re-read on every open).
@@ -576,7 +628,7 @@ impl FileStorage {
         let master_key = Arc::new(derive_key(password, &salt, kdf)?);
         let outbox = OutboxStore::new(outbox_path(&path), Arc::clone(&master_key));
         let averin = if averin_enabled {
-            AverinStores::open(&path, &master_key)?
+            AverinStores::open(&path, &master_key, strict)?
         } else {
             None
         };
@@ -603,6 +655,7 @@ impl FileStorage {
         path: PathBuf,
         password: &SecretString,
         averin_enabled: bool,
+        strict: bool,
     ) -> Result<Self, StorageError> {
         let content = fs::read_to_string(&path).await?;
         let storage_file: StorageFile = serde_json::from_str(&content)
@@ -628,7 +681,7 @@ impl FileStorage {
 
         let outbox = OutboxStore::new(outbox_path(&path), Arc::clone(&master_key));
         let averin = if averin_enabled {
-            AverinStores::open(&path, &master_key)?
+            AverinStores::open(&path, &master_key, strict)?
         } else {
             None
         };
@@ -3489,6 +3542,171 @@ mod tests {
         let reopened = FileStorage::new(&path, &new_pw).await.unwrap();
         assert!(reopened.get_by_alias("stripe").await.unwrap().is_some());
         assert_eq!(reopened.list_events_after(0, 100).await.unwrap().len(), 1);
+    }
+
+    /// FIX 1 (Codex re-review, CRITICAL) — a rekey must FAIL CLOSED, never silently skip the durable
+    /// averin stores, when the durable queue is still owned by a live process (the service is running,
+    /// holding the queue's process-lifetime lock). The strict rekey open (`open_for_rekey`) propagates
+    /// `AverinQueueBusy` instead of degrading it to `Ok(None)` (which would rotate ONLY vault+outbox,
+    /// print false success, and brick the next durable startup). The contrast is proven in the same
+    /// test: the NORMAL (non-strict) `new_with_averin` open still degrades gracefully while the lock is
+    /// held — that startup path is unchanged.
+    #[tokio::test]
+    async fn rekey_fails_closed_when_the_durable_queue_lock_is_held() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let old_pw = SecretString::from("old-master-password");
+
+        // A live durable process: the first opener wins the queue's exclusive owner lock and stays
+        // alive for the rest of the test (this is what makes the rekey open see the queue as busy).
+        let holder = FileStorage::new_with_averin(&path, &old_pw, true)
+            .await
+            .unwrap();
+        assert!(
+            holder.averin_queue().is_some(),
+            "the live holder owns the durable queue"
+        );
+
+        // The STRICT rekey open must FAIL CLOSED with AverinQueueBusy — never Ok (which would be the
+        // silent skip that leaves the averin files under the old key).
+        match FileStorage::open_for_rekey(&path, &old_pw, true).await {
+            Err(StorageError::AverinQueueBusy(_)) => {}
+            Ok(_) => panic!(
+                "a rekey open while the durable queue lock is held must FAIL CLOSED, not degrade to \
+                 Ok (that is the silent skip this fix removes)"
+            ),
+            Err(other) => panic!("expected AverinQueueBusy, got {other:?}"),
+        }
+
+        // Contrast — the NORMAL startup open (non-strict) is UNCHANGED: it still degrades to Ok with
+        // no durable averin stores when the queue is busy, so co-running processes still start.
+        let degraded = FileStorage::new_with_averin(&path, &old_pw, true)
+            .await
+            .expect("the non-strict startup open still succeeds when the queue is busy");
+        assert!(
+            degraded.averin_queue().is_none(),
+            "the non-strict startup open degrades to Ok(None) (unchanged graceful behavior)"
+        );
+
+        // No rekey tmp files were left behind by the failed rekey open (it never got to prepare).
+        assert!(!path.with_file_name("vault.rekey.tmp").exists());
+        assert!(!path.with_file_name("averin-popkeys.enc.rekey.tmp").exists());
+    }
+
+    /// FIX 1 positive path — a rekey with durable configured AND the queue free rotates ALL THREE
+    /// averin durable stores (queue, popkey, dead-letter quarantine), not just vault+outbox. Each of
+    /// the three is given an on-disk file first, then the strict rekey open + `rekey` rotates them, and
+    /// a reopen under the NEW password decrypts every one (the OLD password fails).
+    #[tokio::test]
+    async fn rekey_with_durable_free_rotates_all_three_averin_stores() {
+        use crate::outbox::{DeliveryState, OutboxEvent};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let old_pw = SecretString::from("old-master-password");
+        let new_pw = SecretString::from("new-master-password");
+
+        // Seed all three averin stores so each has a file to rotate.
+        {
+            let storage = FileStorage::new_with_averin(&path, &old_pw, true)
+                .await
+                .unwrap();
+            storage.store(&test_credential("stripe")).await.unwrap();
+            storage
+                .averin_queue()
+                .unwrap()
+                .append("tok-1", "averin.use", serde_json::json!({"n": 1}))
+                .unwrap();
+            storage
+                .averin_popkeys()
+                .unwrap()
+                .insert(
+                    "tok-1",
+                    PopKeyEntry {
+                        pop_seed: [7u8; 32],
+                        action: "db.query:orders-ro".to_string(),
+                        scope: "read:orders".to_string(),
+                        use_limit: Some(3),
+                        capability: None,
+                        grant_id: None,
+                        minted_at: Utc::now(),
+                        grant_delivered_at: None,
+                        grant_expires_at: None,
+                        abandoned: false,
+                    },
+                )
+                .await
+                .unwrap();
+            storage
+                .averin_deadletter()
+                .unwrap()
+                .quarantine(
+                    OutboxEvent {
+                        sequence: 42,
+                        subject: "tok-dl".to_string(),
+                        event_type: "averin.use".to_string(),
+                        payload: serde_json::json!({"params": "p"}),
+                        created_at: Utc::now(),
+                        delivery: DeliveryState::DeadLettered,
+                        attempts: 8,
+                        leased_until: None,
+                        last_attempt_at: None,
+                        last_error: Some("boom".to_string()),
+                        dedup_id: None,
+                    },
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            // Drop `storage` here to release the queue's owner lock so the rekey open below can win it.
+        }
+
+        // All three files exist on disk before the rekey.
+        assert!(path.with_file_name("averin-queue").exists());
+        assert!(path.with_file_name("averin-popkeys.enc").exists());
+        assert!(path.with_file_name("averin-deadletter.enc").exists());
+
+        // Strict rekey open: the queue is free now, so it succeeds AND owns the durable stores.
+        let storage = FileStorage::open_for_rekey(&path, &old_pw, true)
+            .await
+            .expect("rekey open succeeds when the queue is free");
+        assert!(
+            storage.averin_queue().is_some(),
+            "with durable configured + queue free, the rekey opener owns all three averin stores"
+        );
+        storage.rekey(&new_pw).await.unwrap();
+        drop(storage);
+
+        // The OLD password no longer opens the durable stores; the NEW password decrypts all three.
+        assert!(
+            FileStorage::new_with_averin(&path, &old_pw, true).await.is_err(),
+            "the old password must fail after a full three-store rekey"
+        );
+        let reopened = FileStorage::new_with_averin(&path, &new_pw, true)
+            .await
+            .expect("the new password reopens the rekeyed vault + all three averin stores");
+        assert!(
+            reopened
+                .averin_queue()
+                .unwrap()
+                .has_pending_for_subject("tok-1"),
+            "the queue event survived the rekey (replayed + decryptable under the new key)"
+        );
+        assert!(
+            reopened
+                .averin_popkeys()
+                .unwrap()
+                .get("tok-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the popkey entry survived the rekey (decryptable under the new key)"
+        );
+        assert_eq!(
+            reopened.averin_deadletter().unwrap().list().await.unwrap().len(),
+            1,
+            "the dead-letter quarantine record survived the rekey"
+        );
     }
 
     /// Plan 088 D8 — the spike-validated crash-ordering discipline, extended to the larger averin file
