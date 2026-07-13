@@ -34,7 +34,11 @@
 //!   (plan 088 Step 3b's worker) can re-enqueue it into the active queue under a FRESH sequence. Fails
 //!   closed (a clear [`StorageError::Conflict`]) on anything other than an `Open` record whose raw
 //!   `params` have not yet been purged — replaying a redacted record would inject a hole where
-//!   `params` should be, corrupting the eventual re-delivered use.
+//!   `params` should be, corrupting the eventual re-delivered use. An `averin.grant` record is ALWAYS
+//!   rejected too (R3-B Codex 3rd-pass M5), regardless of status/purge state: a dead-lettered grant's
+//!   subject is marked `abandoned` and its PoP seed released for GC on dead-letter (see the worker's
+//!   `quarantine_and_reclaim_dead_letter`), so the grant is permanently terminal — re-enqueuing it
+//!   would fail to rebuild its proof-of-possession.
 //!
 //! # Bounded sensitive-data retention
 //!
@@ -251,10 +255,13 @@ impl AverinDeadLetterStore {
     /// Re-queue a quarantined use: removes it from quarantine and returns the
     /// [`crate::outbox::OutboxEvent`] for a caller (plan 088 Step 3b's worker) to re-append into the
     /// active queue under a FRESH sequence. Fails closed with [`StorageError::Conflict`] (never a
-    /// silent `None`) when the record is not `Open` (an operator already acknowledged/abandoned it) or
+    /// silent `None`) when the record is not `Open` (an operator already acknowledged/abandoned it),
     /// its raw `params` were already purged (replaying a redacted payload would corrupt the
-    /// re-delivered use — see [`Self::purge_expired_params`]). Returns [`StorageError::NotFound`] when
-    /// `sequence` is unknown.
+    /// re-delivered use — see [`Self::purge_expired_params`]), or the record is an `averin.grant` (R3-B
+    /// Codex 3rd-pass M5 — a dead-lettered grant's subject is abandoned and its PoP seed released for
+    /// GC at dead-letter time, so the grant is permanently terminal regardless of its `Open`/unpurged
+    /// status; re-enqueuing it would fail to rebuild its proof-of-possession). Returns
+    /// [`StorageError::NotFound`] when `sequence` is unknown.
     pub async fn replay(&self, sequence: u64) -> Result<OutboxEvent, StorageError> {
         self.locked_mutate(move |c| {
             let Some(record) = c.entries.get(&sequence) else {
@@ -262,6 +269,13 @@ impl AverinDeadLetterStore {
                     "no quarantined averin record for sequence {sequence}"
                 )));
             };
+            if record.event.event_type == "averin.grant" {
+                return Err(StorageError::Conflict(format!(
+                    "quarantined averin record {sequence} is an averin.grant — grant subjects are \
+                     abandoned and their PoP seed released on dead-letter, so the grant is terminal \
+                     and NOT replayable (re-enqueue would fail to rebuild its proof-of-possession)"
+                )));
+            }
             if record.status != QuarantineStatus::Open {
                 return Err(StorageError::Conflict(format!(
                     "quarantined averin record {sequence} is {:?}, not Open — not replayable",
@@ -549,6 +563,14 @@ mod tests {
         }
     }
 
+    /// Same shape as [`use_event`] but `event_type: "averin.grant"` — for the R3-B/M5 tests exercising
+    /// `replay`'s grant-rejection.
+    fn grant_event(sequence: u64, subject: &str) -> OutboxEvent {
+        let mut event = use_event(sequence, subject, "grant-params-unused");
+        event.event_type = "averin.grant".to_string();
+        event
+    }
+
     #[tokio::test]
     async fn quarantine_list_and_round_trip_through_reopen() {
         let (s, dir) = store();
@@ -693,6 +715,32 @@ mod tests {
         let cutoff = Utc::now() + chrono::Duration::seconds(1);
         s.purge_expired_params(cutoff).await.unwrap();
         assert!(matches!(s.replay(4).await, Err(StorageError::Conflict(_))));
+    }
+
+    /// R3-B (Codex 3rd-pass M5): a quarantined `averin.grant` is NEVER replayable, even while it is
+    /// `Open` and unpurged (the exact state that would otherwise pass every other `replay` gate) —
+    /// its subject was abandoned and its PoP seed released for GC at dead-letter time (see the
+    /// worker's `quarantine_and_reclaim_dead_letter`), so re-enqueuing it could never rebuild a valid
+    /// proof-of-possession. An `averin.use` quarantined in the identical (Open, unpurged) state must
+    /// still replay normally — this fix is grant-specific, not a broader regression.
+    #[tokio::test]
+    async fn replay_rejects_a_quarantined_grant_even_when_open_and_unpurged() {
+        let (s, _d) = store();
+        s.quarantine(grant_event(10, "tok-grant"), Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            matches!(s.replay(10).await, Err(StorageError::Conflict(_))),
+            "a dead-lettered averin.grant must never be reported as replayable"
+        );
+        // Rejected, not removed: the quarantine record must still be there afterward.
+        assert_eq!(s.entry_count().await.unwrap(), 1);
+
+        s.quarantine(use_event(11, "tok-use", "p"), Utc::now())
+            .await
+            .unwrap();
+        let event = s.replay(11).await.unwrap();
+        assert_eq!(event.sequence, 11, "an averin.use in the same Open/unpurged state still replays");
     }
 
     #[tokio::test]

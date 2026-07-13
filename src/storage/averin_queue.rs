@@ -16,11 +16,13 @@
 //!
 //! A queue lives in its own directory. Two kinds of files:
 //! - **delta segments** (`<20-digit index>.delta`): an append-only sequence of frames, each
-//!   `uint32_be(len) ‖ sealed_bytes`, where `sealed_bytes` is `serde_json::to_vec` of the crate's own
-//!   [`crate::crypto::EncryptedData`] (nonce + AES-256-GCM ciphertext of one JSON-serialized [`Delta`])
-//!   — the SAME encrypted envelope shape `OutboxStore`/the vault use, just one small record per frame
-//!   instead of one giant document. A segment rolls to a fresh file at [`SEGMENT_ROLL_BYTES`] (fsyncing
-//!   the queue directory once, via [`fsync_parent_dir`]).
+//!   `MAGIC(4 bytes, "AVQ1") ‖ uint32_be(len) ‖ uint32_be(len_crc32) ‖ sealed_bytes` (a fixed
+//!   [`FRAME_HEADER_LEN`]-byte self-describing header — see "Crash safety" below for why — followed
+//!   by `sealed_bytes`, which is `serde_json::to_vec` of the crate's own [`crate::crypto::EncryptedData`]
+//!   (nonce + AES-256-GCM ciphertext of one JSON-serialized [`Delta`])) — the SAME encrypted envelope
+//!   shape `OutboxStore`/the vault use, just one small record per frame instead of one giant document.
+//!   A segment rolls to a fresh file at [`SEGMENT_ROLL_BYTES`] (fsyncing the queue directory once, via
+//!   [`fsync_parent_dir`]).
 //! - **snapshot segments** (`<20-digit index>.snapshot`): written only by [`AverinQueue::compact`] (the
 //!   ONE O(n) operation, off the append hot path) — a single encrypted document (mirroring
 //!   `OutboxStore`'s own file format) holding the ENTIRE live map, superseding every delta segment
@@ -32,16 +34,28 @@
 //!
 //! # Crash safety
 //!
-//! A record is "committed" only after ITS `fsync` returns (see [`Writer`], below). On replay, a
-//! **torn trailing record** — a partial length prefix, a length prefix claiming more bytes than the
-//! file has, or (for what IS a complete-byte-length last frame) a GCM authentication failure on the
-//! LAST frame in the file — is discarded; everything durably written before it survives untouched.
-//! Interior corruption (a frame that fails to authenticate/parse but is NOT the trailing record) is
-//! NOT silently skipped — [`AverinQueue::open`] fails closed, refusing to serve a store that may have
-//! silently lost a record in the middle of its history (Phase-0 spike item 3). GCM's authentication tag
-//! is the corruption detector; there is no separate checksum field (unlike the throwaway spike
-//! harness's ad hoc `[len][crc32][payload]` frame — production records are already AEAD-sealed, so the
-//! tag IS the integrity check, and adding a second one would be redundant).
+//! A record is "committed" only after ITS `fsync` returns (see [`Writer`], below). The on-disk frame
+//! header is `MAGIC ‖ len ‖ len_crc32` (crc32 covers ONLY the 4 `len` bytes — the payload's own AEAD
+//! tag remains the payload integrity check; this header exists only to make the otherwise-unprotected
+//! length prefix self-describing). On replay, exactly two shapes are a genuine **torn trailing
+//! record** (discarded; everything durably written before it survives untouched): (1) fewer than
+//! [`FRAME_HEADER_LEN`] bytes remain (a partial header), or (2) the header is fully intact (magic
+//! matches, `len_crc32` matches) but fewer than `len` payload bytes remain — a process death mid-`write()`
+//! truncates the file at whatever point it reached, it never fabricates a wrong magic or a
+//! self-consistent-but-wrong length. Every OTHER failure is **interior corruption**, fails closed
+//! (`AverinQueue::open` returns `Err`, refusing to serve a store that may have silently lost a record)
+//! regardless of where in the file it occurs — this includes a GCM authentication failure on a frame
+//! whose header is intact AND whose full claimed-length payload is present (even if it's the LAST frame
+//! in the file): a fully-present frame means the single `write()` call that appended it (see
+//! `Writer::write_and_maybe_roll`) completed, so a failed auth tag there can only be corruption after
+//! the fact, never an in-progress write — silently discarding it as "torn" would fail OPEN on a
+//! genuinely corrupted, already-fsynced record (Codex review HIGH-5 on plan 088). A bit-flipped length
+//! prefix on an INTERIOR frame is caught by the `len_crc32` (or, if the flip also collides with a wrong
+//! magic read, by the magic check) rather than being misread as a valid — if bogus — frame boundary
+//! (the original vulnerability: an unprotected length prefix let interior corruption masquerade as a
+//! torn tail, silently dropping that record and every later one). (Phase-0 spike item 3 is the origin
+//! of the interior-corruption-fails-closed contract itself; this crc32 hardening closes the gap Codex
+//! found in how the boundary between "torn" and "interior" was originally drawn.)
 //!
 //! # Durable GROUP-COMMIT, not lossy mpsc (D0 fallback ladder, tier 1)
 //!
@@ -82,6 +96,19 @@
 //! D0's SLO targets, and a real delivery worker (plan 088 Step 3) is normally single-instance per
 //! queue anyway (mirroring `OutboxStore::claim`'s existing single-worker-tick usage pattern).
 //!
+//! A `committing` set (`QueueMemory::committing`, guarded by the SAME `mem` lock) plus a dedicated
+//! [`Condvar`] (`AverinQueue::committing_cv`) closes a related hole a prior fix opened (Codex
+//! re-review #2/#3 — full incident in [`AverinQueue::append`]'s doc): [`AverinQueue::append`]
+//! publishes into `mem.cache.outbox` IMMEDIATELY (so [`AverinQueue::compact`]/
+//! [`AverinQueue::prune_delivered_prefix`] always observe it) but marks the sequence `committing`
+//! until its own commit is confirmed durable. [`AverinQueue::claim`]/[`AverinQueue::deliverable`]/
+//! [`AverinQueue::record_delivery`] skip anything still `committing` (no resurrection — the original
+//! hole this reuses [`AverinQueue::claim`]'s already-held lock to close for free), while `compact`/
+//! `prune_delivered_prefix` WAIT for `committing` to drain before snapshotting/pruning (no durable-
+//! but-unpublished event can be lost or mispruned). `Condvar::wait` releases `mem` for the duration of
+//! the wait, and nothing ever holds `mem` across a blocking `writer.commit`/`writer.roll` call, so
+//! this cannot cycle with the group-commit writer thread — see `append`'s doc for the full argument.
+//!
 //! # Cross-process safety: single-writer-PROCESS + graceful degradation (Step 3a, Option A)
 //!
 //! This queue is single-writer-PROCESS by design: the append/claim/record_delivery/compact locking
@@ -104,20 +131,22 @@
 //! durable queue; any other seals fail-open (the 087 default). `SegmentWriter::create`'s truncate is
 //! safe under this lock because only the one owning process ever creates/rolls segments here.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::crypto::{decrypt, encrypt, EncryptedData, MasterKey};
 use crate::outbox::{DeliveryState, OutboxEvent};
 use crate::storage::outbox_model::{
-    earliest_pending_per_subject, push_event, record_delivery_transition, OutboxCache,
+    earliest_pending_per_subject, record_delivery_transition, OutboxCache,
 };
 // Reused verbatim (both are `pub(super)` in outbox_store.rs, i.e. visible throughout `crate::storage`):
 // the 0600-private-file creator and the crash-durable parent-dir fsync. Not duplicated here.
@@ -165,8 +194,10 @@ enum Delta {
     /// Terminal failure (`attempts >= max_attempts`).
     DeadLetter { seq: u64 },
     /// Drop every sequence `<= upto_seq` from the live map (mirrors `OutboxStore::gc`'s prefix prune).
-    /// Not yet emitted by any Step-1 code path (GC/dead-letter quarantine is plan 088 D4, a later
-    /// step) but defined now so the frame format is stable and round-trip-tested from the start.
+    /// Emitted by [`AverinQueue::prune_delivered_prefix`] (Codex HIGH-3 fix, plan 088 GC hardening) for
+    /// the largest contiguous run of terminal-`Delivered` records past the retention window — a
+    /// still-`Pending`/leased or still-`DeadLettered`-unreclaimed record blocks the prefix at that
+    /// point, same as `OutboxStore::gc`'s own semantics.
     Prune { upto_seq: u64 },
     /// D4's "true MOVE", completed (plan 088 Step 6a): drop exactly ONE sequence from the live map —
     /// deliberately NOT a prefix operation like [`Delta::Prune`], because a mid-sequence `DeadLetter`
@@ -269,10 +300,37 @@ fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf, bool)>, StorageError> 
     Ok(out)
 }
 
-/// Seal one [`Delta`] into a ready-to-write frame: `uint32_be(len) ‖ sealed_bytes`, where
-/// `sealed_bytes` is the JSON encoding of the crate's [`EncryptedData`] (fresh nonce per record, the
-/// shared vault master key) — the same envelope shape `OutboxStore` uses for its whole-file blob,
-/// applied here per-record.
+/// The frame's magic prefix (Codex HIGH-5 hardening): makes the header self-describing so that
+/// interior corruption of the length prefix cannot be misread as a valid frame boundary and mistaken
+/// for a torn tail. `AVQ1` — "AVerin Queue, format 1".
+const FRAME_MAGIC: [u8; 4] = *b"AVQ1";
+
+/// `MAGIC(4) ‖ len:u32_be(4) ‖ len_crc32:u32_be(4)` — the fixed-size, self-describing frame header
+/// (Codex HIGH-5). `sealed_bytes` (the AEAD-sealed, `len`-byte payload) follows immediately after.
+const FRAME_HEADER_LEN: usize = 12;
+
+/// Minimal CRC-32 (IEEE 802.3 / zlib polynomial `0xEDB88320`), computed bit-by-bit rather than via a
+/// lookup table — this only ever runs over the 4-byte length field (never the payload, which is
+/// already AEAD-sealed and doesn't need a second integrity check), so a table's throughput would be
+/// wasted. Deliberately self-contained (no new crate dependency) so this fix stays scoped to this
+/// module; see the module doc's "Crash safety" section for what this closes.
+fn crc32_ieee(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Seal one [`Delta`] into a ready-to-write frame: `MAGIC ‖ len:u32_be ‖ len_crc32:u32_be ‖
+/// sealed_bytes`, where `sealed_bytes` is the JSON encoding of the crate's [`EncryptedData`] (fresh
+/// nonce per record, the shared vault master key) — the same envelope shape `OutboxStore` uses for its
+/// whole-file blob, applied here per-record, with a self-describing header (Codex HIGH-5) added around
+/// it.
 fn seal_delta(delta: &Delta, key: &MasterKey) -> Result<Vec<u8>, StorageError> {
     let plaintext =
         serde_json::to_vec(delta).map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -282,8 +340,12 @@ fn seal_delta(delta: &Delta, key: &MasterKey) -> Result<Vec<u8>, StorageError> {
     let len = u32::try_from(body.len()).map_err(|_| {
         StorageError::Serialization("averin-queue record exceeds the 4 GiB frame limit".into())
     })?;
-    let mut frame = Vec::with_capacity(4 + body.len());
-    frame.extend_from_slice(&len.to_be_bytes());
+    let len_bytes = len.to_be_bytes();
+    let len_crc = crc32_ieee(&len_bytes);
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + body.len());
+    frame.extend_from_slice(&FRAME_MAGIC);
+    frame.extend_from_slice(&len_bytes);
+    frame.extend_from_slice(&len_crc.to_be_bytes());
     frame.extend_from_slice(&body);
     Ok(frame)
 }
@@ -296,61 +358,89 @@ fn parse_and_decrypt_delta(body: &[u8], key: &MasterKey) -> Result<Delta, Storag
 }
 
 /// Replay one delta segment into a flat `Vec<Delta>`, in file order. See the module doc's "Crash
-/// safety" section for the torn-tail vs. interior-corruption distinction this implements.
+/// safety" section for the torn-tail vs. interior-corruption distinction this implements (Codex
+/// HIGH-5: the header is now self-describing — `MAGIC ‖ len ‖ len_crc32` — so a corrupted length can
+/// no longer be misread as a valid-but-wrong frame boundary).
 fn replay_segment(path: &Path, key: &MasterKey) -> Result<Vec<Delta>, StorageError> {
     let buf = std::fs::read(path)?;
     let mut pos = 0usize;
     let mut deltas = Vec::new();
     while pos < buf.len() {
-        if pos + 4 > buf.len() {
+        let remaining = buf.len() - pos;
+
+        // (1) Partial header: fewer than FRAME_HEADER_LEN bytes remain. A process death mid-`write()`
+        // truncates the file at exactly the point it reached — this is a genuine torn tail.
+        if remaining < FRAME_HEADER_LEN {
             tracing::warn!(
                 file = %path.display(),
                 offset = pos,
-                discarded_bytes = buf.len() - pos,
-                "torn trailing averin-queue record (partial length prefix) — discarding; \
+                discarded_bytes = remaining,
+                "torn trailing averin-queue record (partial frame header) — discarding; \
                  all prior records in this segment are intact"
             );
             break;
         }
-        let len = u32::from_be_bytes(buf[pos..pos + 4].try_into().expect("4 bytes")) as usize;
-        if pos + 4 + len > buf.len() {
+
+        let magic: [u8; 4] = buf[pos..pos + 4].try_into().expect("4 bytes");
+        // (2) Bad magic: a torn write never fabricates a wrong magic (it only truncates), so this is
+        // interior corruption — fail closed rather than risk misreading a bogus frame boundary.
+        if magic != FRAME_MAGIC {
+            return Err(StorageError::Serialization(format!(
+                "corrupt averin-queue frame header in {} at offset {pos} (bad magic) — not a torn \
+                 tail (a torn write only truncates, it never fabricates a wrong magic); refusing to \
+                 replay past possible interior data loss",
+                path.display()
+            )));
+        }
+
+        let len_bytes: [u8; 4] = buf[pos + 4..pos + 8].try_into().expect("4 bytes");
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        let claimed_crc = u32::from_be_bytes(buf[pos + 8..pos + 12].try_into().expect("4 bytes"));
+        // (3) The magic matched but the length's own CRC doesn't: the header was durably committed
+        // (magic intact), so a corrupted length here is interior corruption, not a torn tail — this
+        // is exactly the case Codex HIGH-5 flagged (an enlarged/corrupted interior length previously
+        // fell straight through to "claims more bytes than remain" and was silently treated as a torn
+        // tail, dropping that record and every later one).
+        if crc32_ieee(&len_bytes) != claimed_crc {
+            return Err(StorageError::Serialization(format!(
+                "corrupt averin-queue frame header in {} at offset {pos} (length-prefix CRC \
+                 mismatch, claimed_len={len}) — not a torn tail (the magic was intact); refusing to \
+                 replay past possible interior data loss",
+                path.display()
+            )));
+        }
+
+        // (4) Header fully valid, but the claimed payload doesn't fit in what's left: a genuine torn
+        // tail (a record was mid-write when the process died).
+        if FRAME_HEADER_LEN + len > remaining {
             tracing::warn!(
                 file = %path.display(),
                 offset = pos,
                 claimed_len = len,
-                available = buf.len() - pos - 4,
-                "torn trailing averin-queue record (partial payload) — discarding; \
+                available = remaining - FRAME_HEADER_LEN,
+                "torn trailing averin-queue record (intact header, partial payload) — discarding; \
                  all prior records in this segment are intact"
             );
             break;
         }
-        let body = &buf[pos + 4..pos + 4 + len];
+
+        let body = &buf[pos + FRAME_HEADER_LEN..pos + FRAME_HEADER_LEN + len];
         match parse_and_decrypt_delta(body, key) {
             Ok(delta) => {
                 deltas.push(delta);
-                pos += 4 + len;
+                pos += FRAME_HEADER_LEN + len;
             }
             Err(e) => {
-                if pos + 4 + len == buf.len() {
-                    // The LAST frame in the file failed to parse/authenticate. A length-complete but
-                    // torn write (the OS flushed the length prefix and part of the payload before a
-                    // crash) fails AES-GCM's auth tag — that IS the corruption detector here (no
-                    // separate checksum field). Torn tail: discard it, keep everything before it.
-                    tracing::warn!(
-                        file = %path.display(),
-                        offset = pos,
-                        error = %e,
-                        "torn trailing averin-queue record failed to authenticate — discarding; \
-                         all prior records in this segment are intact"
-                    );
-                    break;
-                }
-                // NOT the trailing record — this is interior corruption, not a torn tail (Phase-0
-                // spike item 3: fail closed here rather than silently skip past a possibly-lost
-                // durable record in the middle of the file).
+                // (5) Header fully valid AND the full claimed-length payload is present, yet it fails
+                // to authenticate/parse. A fully-present frame means the single `write()` call that
+                // appended it (`Writer::write_and_maybe_roll`) completed — there is no "torn" shape
+                // left to explain this. Codex HIGH-5: previously a failure here was assumed torn
+                // WHENEVER it was the last frame in the file, silently discarding a genuinely
+                // corrupted, already-fsynced record. Fail closed instead, regardless of position.
                 return Err(StorageError::Serialization(format!(
-                    "corrupt averin-queue record in {} at offset {pos} (not the trailing record) \
-                     — refusing to replay past possible data loss",
+                    "corrupt averin-queue record in {} at offset {pos} (frame header intact, full \
+                     payload present, but it failed to authenticate: {e}) — not a torn tail; \
+                     refusing to replay past possible interior data loss",
                     path.display()
                 )));
             }
@@ -682,7 +772,22 @@ impl Writer {
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::Release);
+        // Pre-existing, unrelated lost-wakeup fix (found while stress-testing this file for the
+        // committing-set fix, and reproduced on the UNMODIFIED base code too — ~1/25 runs hung under
+        // `--test-threads=1`, so it predates and is independent of the `committing` change above):
+        // `shutdown` MUST be set while holding `shared.queue`'s lock, the SAME lock `Writer::run`'s
+        // `wait_while` holds while re-checking `q.is_empty() && !shutdown.load(..)` right before
+        // atomically unlocking-and-parking. Setting it without that lock (the original code) races:
+        // if the store + `notify_all` land entirely inside the writer's "predicate just evaluated
+        // true, about to park" window, there is nothing yet registered for `notify_all` to wake, and
+        // the notification is silently lost — the writer parks forever and `join()` below hangs.
+        // Acquiring `shared.queue` first forces the store to happen-after any park registration
+        // already in flight (the writer can't be mid-park while we hold its mutex), so a subsequent
+        // `notify_all` is guaranteed to either find it already parked or arrive before it next checks.
+        {
+            let _queue_guard = self.shared.queue.lock();
+            self.shared.shutdown.store(true, Ordering::Release);
+        }
         self.shared.cv.notify_all();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -695,7 +800,77 @@ impl Drop for Writer {
 struct QueueMemory {
     cache: OutboxCache,
     resolved_grants: HashMap<String, ResolvedGrant>,
+    /// Sequences published into `cache.outbox` (so [`AverinQueue::compact`]/
+    /// [`AverinQueue::prune_delivered_prefix`] always observe them) whose durable commit has NOT yet
+    /// been confirmed by the group-commit writer. [`AverinQueue::claim`]/[`AverinQueue::deliverable`]/
+    /// [`AverinQueue::record_delivery`] treat any sequence in this set as not-yet-durable and skip/
+    /// refuse it — claiming or delivering it before its own `Delta::Append` has committed is exactly
+    /// the Codex HIGH-2 resurrection hole. [`AverinQueue::compact`]/
+    /// [`AverinQueue::prune_delivered_prefix`] instead WAIT (on [`AverinQueue::committing_cv`]) for
+    /// this set to fully drain before snapshotting/pruning, so a durably-committed-but-still-
+    /// committing event is never snapshotted-and-then-deleted out from under itself (Codex re-review
+    /// #2/#3) nor pruned past by an `upto_seq` computed while it was still invisible to that scan. See
+    /// [`AverinQueue::append`]'s doc for the full incident and fix.
+    committing: HashSet<u64>,
 }
+
+/// Same head-of-line semantics as [`earliest_pending_per_subject`], but additionally treats any
+/// sequence present in `committing` as if it weren't in the map at all — i.e. not yet durable, so it
+/// must never be claimed or reported deliverable (see [`AverinQueue::append`]'s doc for why).
+/// Delegates straight to the shared helper when `committing` is empty (the overwhelmingly common
+/// case — appends are fast, so the set drains almost immediately), so ordinary operation pays no
+/// extra cost or behavior difference from the reused `outbox_model` logic.
+///
+/// **Per-subject FIFO (Codex R3 HIGH-2)**: a `committing` seq is not merely skipped — it also marks
+/// its subject `seen`, head-of-line-blocking every LATER seq for that same subject this pass, even
+/// once that later seq is itself durable. Without this, a subject with an earlier seq `N` still
+/// committing and a later seq `N+1` already committed would have `N` skipped (still committing) and
+/// then `N+1` claimed — delivering `N+1` before `N` is even durable, out of order. Skipping this
+/// subject entirely for one pass is harmless: the scan runs again on the next tick, and `N` claims
+/// (and unblocks `N+1`) as soon as its own commit lands.
+fn earliest_pending_per_subject_skipping_committing(
+    outbox: &BTreeMap<u64, OutboxEvent>,
+    committing: &HashSet<u64>,
+    limit: usize,
+    respect_lease: bool,
+    now: DateTime<Utc>,
+) -> Vec<OutboxEvent> {
+    if committing.is_empty() {
+        return earliest_pending_per_subject(outbox, limit, respect_lease, now);
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (seq, e) in outbox.iter() {
+        if committing.contains(seq) {
+            seen.insert(e.subject.as_str());
+            continue;
+        }
+        if e.delivery != DeliveryState::Pending {
+            continue;
+        }
+        if !seen.insert(e.subject.as_str()) {
+            continue;
+        }
+        if respect_lease && e.leased_until.is_some_and(|t| t > now) {
+            continue;
+        }
+        out.push(e.clone());
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+/// Cap on how long [`AverinQueue::compact`]/[`AverinQueue::prune_delivered_prefix`] will wait on
+/// [`AverinQueue::committing_cv`] for `committing` to drain (Codex R3 MEDIUM-4 — liveness). A commit
+/// stuck in unbounded file I/O (or enough overlapping appends to keep the set perpetually nonempty)
+/// must never wedge these — both are best-effort GC run synchronously from the periodic tick, so a
+/// stalled waiter here stalls every later GC/delivery pass too. On timeout, the caller skips this
+/// pass entirely (compacting/pruning nothing) and retries on the next tick, rather than blocking
+/// forever; the happy path (fast-draining `committing`) is unaffected — it still proceeds the moment
+/// the set empties, well under this cap.
+const COMMITTING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The averin USE queue's durable append-only journal (plan 088 D0). See the module doc for the
 /// on-disk shape, crash-safety contract, and locking model.
@@ -703,6 +878,11 @@ pub struct AverinQueue {
     dir: PathBuf,
     master_key: Arc<MasterKey>,
     mem: Mutex<QueueMemory>,
+    /// Paired with `mem`: signalled whenever `mem.lock().committing` becomes empty (see
+    /// [`AverinQueue::publish_committed`]/[`AverinQueue::abort_committing`]). [`AverinQueue::compact`]/
+    /// [`AverinQueue::prune_delivered_prefix`] wait on this before snapshotting/pruning — see
+    /// [`AverinQueue::append`]'s doc for the incident this closes and the deadlock-freedom argument.
+    committing_cv: Condvar,
     writer: Writer,
     /// The exclusive, process-lifetime ownership lock (`flock` on `<dir>/queue.owner.lock`). Held for
     /// the queue's entire lifetime so exactly one process operates this directory (see the module doc's
@@ -800,62 +980,175 @@ impl AverinQueue {
             mem: Mutex::new(QueueMemory {
                 cache,
                 resolved_grants,
+                committing: HashSet::new(),
             }),
+            committing_cv: Condvar::new(),
             writer,
             _owner_lock: owner_lock,
         })
     }
 
+    /// Reserve a fresh monotonic sequence, build its [`OutboxEvent`], and publish it IMMEDIATELY into
+    /// `mem.cache.outbox` (so [`Self::compact`]/[`Self::prune_delivered_prefix`] always observe it) —
+    /// but mark its sequence `committing` (`QueueMemory::committing`) until [`Self::finish_append`]'s
+    /// commit is confirmed durable. See [`Self::append`]'s doc for why publishing immediately (rather
+    /// than the prior fix's deferred insert) is the correct fix here. Split out of `append` so a test
+    /// can exercise the exact reserve/commit interleaving Codex flagged.
+    fn reserve_for_append(
+        &self,
+        subject: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> (u64, OutboxEvent) {
+        let mut mem = self.mem.lock();
+        mem.cache.outbox_seq += 1;
+        let seq = mem.cache.outbox_seq;
+        let event = OutboxEvent {
+            sequence: seq,
+            subject: subject.to_string(),
+            event_type: event_type.to_string(),
+            payload,
+            created_at: Utc::now(),
+            delivery: DeliveryState::Pending,
+            attempts: 0,
+            leased_until: None,
+            last_attempt_at: None,
+            last_error: None,
+            dedup_id: None,
+        };
+        mem.cache.outbox.insert(seq, event.clone());
+        mem.committing.insert(seq);
+        (seq, event)
+    }
+
+    /// Seal + durably commit `event`'s `Delta::Append`. `seq`/`event` were already published into
+    /// `mem.cache.outbox` (marked `committing`) by [`Self::reserve_for_append`]; this call only
+    /// settles that marker: [`Self::publish_committed`] on success, [`Self::abort_committing`] on
+    /// failure (which also removes the optimistically-published event — a failed commit must leave no
+    /// phantom entry with nothing durable backing it, same "burned sequence, nothing left to roll
+    /// back but the map entry" contract as before).
+    fn finish_append(&self, seq: u64, event: OutboxEvent) -> Result<u64, StorageError> {
+        let delta = Delta::Append(event);
+        let commit_result =
+            seal_delta(&delta, &self.master_key).and_then(|frame| self.writer.commit(frame));
+        match commit_result {
+            Ok(()) => {
+                self.publish_committed(seq);
+                Ok(seq)
+            }
+            Err(e) => {
+                self.abort_committing(seq);
+                Err(e)
+            }
+        }
+    }
+
+    /// `seq`'s commit is now confirmed durable: clear it from `committing` and wake anything waiting
+    /// on [`Self::committing_cv`] — most notably [`Self::compact`]/[`Self::prune_delivered_prefix`],
+    /// which wait for `committing` to fully drain before snapshotting/pruning (see their docs, and
+    /// [`Self::append`]'s doc for the incident this closes). The event itself needs no further
+    /// mutation here — it was already published into `mem.cache.outbox` back in
+    /// [`Self::reserve_for_append`].
+    fn publish_committed(&self, seq: u64) {
+        let mut mem = self.mem.lock();
+        mem.committing.remove(&seq);
+        drop(mem);
+        self.committing_cv.notify_all();
+    }
+
+    /// `seq`'s commit FAILED: remove the optimistically-published event from `mem.cache.outbox`
+    /// entirely (nothing durable backs it, so it must leave no phantom Pending record) and clear
+    /// `committing`, then wake anything waiting on [`Self::committing_cv`] (a waiter must never block
+    /// forever behind a commit that will never succeed).
+    fn abort_committing(&self, seq: u64) {
+        let mut mem = self.mem.lock();
+        mem.cache.outbox.remove(&seq);
+        mem.committing.remove(&seq);
+        drop(mem);
+        self.committing_cv.notify_all();
+    }
+
     /// Append a new event. **The hot-path method** (D0's SLO target): one sealed frame, one durable
-    /// commit. Reserves the sequence and inserts OPTIMISTICALLY (via the reused `push_event`) before
-    /// the durability wait, then releases the in-memory lock — so concurrent callers' commits can land
-    /// in the SAME group-commit batch — and rolls the optimistic insert back (an O(1) removal by the
-    /// exact key, never a whole-map clone) if the commit fails. `outbox_seq` is intentionally left
-    /// advanced on a genuine failure (a burned sequence number is preferable to reusing one under
-    /// concurrency — see the module doc's locking-model note).
+    /// commit.
+    ///
+    /// **History — three review passes on the same window, closed together by this fix:**
+    ///
+    /// 1. *Original bug (Codex HIGH-2, resurrection)*: the freshly reserved event was inserted into
+    ///    `mem.cache.outbox` (making it claimable) BEFORE its `Delta::Append` had committed durably,
+    ///    then rolled back on failure. A concurrent worker's [`Self::claim`] +
+    ///    [`Self::record_delivery`] could commit `Lease`/`Delivered` deltas for the sequence before its
+    ///    own `Append` landed on disk. If this call's commit then landed AFTER those (independent
+    ///    commits queued to the same group-commit writer — nothing ordered them relative to each
+    ///    other), the journal read `Lease`, `Delivered`, `Append` in that order; on replay,
+    ///    `Lease`/`Delivered` were no-ops against a not-yet-inserted sequence (see [`apply_delta`]),
+    ///    and the trailing `Append` then resurrected an already-delivered use as fresh, re-deliverable
+    ///    `Pending` work — a real bug for a fail-closed metering/credential queue.
+    /// 2. *First fix (deferred insert)*: reserve the sequence WITHOUT publishing it into
+    ///    `mem.cache.outbox` at all, commit `Delta::Append` durably, and ONLY on success insert the
+    ///    event. This closed the resurrection hole — but opened a NEW one (Codex re-review #2/#3):
+    ///    between `writer.commit` returning `Ok` and the subsequent re-acquisition of `mem` to insert
+    ///    the event, the event was durably committed on disk yet completely invisible to
+    ///    `mem.cache.outbox`. A concurrent [`Self::compact`] (which snapshots `mem.cache` then DELETES
+    ///    every segment its snapshot supersedes) running in that window would snapshot without ever
+    ///    seeing the event, then delete the very segment holding its only durable copy — an
+    ///    acknowledged, durably-committed event silently lost on the next crash. [`Self::
+    ///    prune_delivered_prefix`] had a subtler shape of the same hole: a lower-numbered
+    ///    committing-but-invisible sequence sitting behind an already-`Delivered` higher one let the
+    ///    prefix scan compute a `Prune{upto_seq}` that, on replay, applied AFTER that lower sequence's
+    ///    own `Append` — deleting a genuinely-`Pending` record that was never eligible for pruning.
+    /// 3. *This fix (the `committing` set)*: publish the event into `mem.cache.outbox` IMMEDIATELY, in
+    ///    [`Self::reserve_for_append`] under the same `mem` lock as the sequence bump — so `compact`/
+    ///    `prune_delivered_prefix` always see it — but mark its sequence `committing`
+    ///    (`QueueMemory::committing`) until [`Self::publish_committed`] clears it on a confirmed
+    ///    durable commit ([`Self::abort_committing`] instead removes the event entirely on a failed
+    ///    commit, preserving the "no phantom entry" contract). [`Self::claim`]/[`Self::deliverable`]
+    ///    skip any sequence still `committing` (never claim/report a not-yet-durable event — the
+    ///    original HIGH-2 hole stays closed), and [`Self::record_delivery`] refuses to act on one too.
+    ///    Separately, [`Self::compact`]/[`Self::prune_delivered_prefix`] WAIT (on
+    ///    [`Self::committing_cv`]) for `committing` to fully drain before snapshotting/pruning, so
+    ///    every event they act on is either already durably committed (safe to include/prune around)
+    ///    or not reserved at all yet (irrelevant to that pass). This closes both holes at once without
+    ///    reintroducing the first.
+    ///
+    /// **Deadlock-freedom**: [`Self::finish_append`] never holds `mem` while blocked on
+    /// `self.writer.commit` — it releases `mem` at the end of [`Self::reserve_for_append`], and only
+    /// re-acquires it, briefly, in [`Self::publish_committed`]/[`Self::abort_committing`] AFTER the
+    /// commit call has already returned. The writer thread ([`Writer::run`]) never touches
+    /// `mem`/`committing` at all — only its own `WriterShared` queue and the segment file. So
+    /// `compact`/`prune_delivered_prefix` waiting on `committing_cv` (which, per the `Condvar`
+    /// contract, atomically releases `mem` for the duration of the wait) can never cycle with the
+    /// writer: the one thing that needs `mem` back to clear `committing` (a `finish_append` whose
+    /// commit already returned) is never itself waiting on the writer, and the writer never waits on
+    /// `mem` — no lock/wait ordering cycle exists among `mem`, `committing_cv`, `WriterShared`'s queue
+    /// lock, or any individual `JobResult`. `outbox_seq` is still intentionally left advanced on a
+    /// genuine commit failure (a burned sequence number is preferable to reusing one under concurrency
+    /// — see the module doc's locking-model note).
     pub fn append(
         &self,
         subject: &str,
         event_type: &str,
         payload: serde_json::Value,
     ) -> Result<u64, StorageError> {
-        let (seq, event) = {
-            let mut mem = self.mem.lock();
-            let seq = push_event(&mut mem.cache, subject, event_type, payload, None);
-            let event = mem
-                .cache
-                .outbox
-                .get(&seq)
-                .cloned()
-                .expect("push_event just inserted this sequence");
-            (seq, event)
-        };
-
-        let delta = Delta::Append(event);
-        let frame = match seal_delta(&delta, &self.master_key) {
-            Ok(f) => f,
-            Err(e) => {
-                let mut mem = self.mem.lock();
-                mem.cache.outbox.remove(&seq);
-                return Err(e);
-            }
-        };
-        if let Err(e) = self.writer.commit(frame) {
-            let mut mem = self.mem.lock();
-            mem.cache.outbox.remove(&seq);
-            return Err(e);
-        }
-        Ok(seq)
+        let (seq, event) = self.reserve_for_append(subject, event_type, payload);
+        self.finish_append(seq, event)
     }
 
     /// Claim the earliest-pending event per subject for delivery, durably stamping a lease so a
     /// sibling worker won't double-deliver. Holds the in-memory lock for the full call (see the module
     /// doc's locking-model note) and rolls back any lease already applied in THIS call if a later one
-    /// in the same batch fails to commit.
+    /// in the same batch fails to commit. Skips anything still `committing` (not yet durable — see
+    /// [`Self::append`]'s doc): claiming it before its own `Delta::Append` has committed is the
+    /// original Codex HIGH-2 resurrection hole.
     pub fn claim(&self, limit: usize, lease_secs: u64) -> Result<Vec<OutboxEvent>, StorageError> {
         let mut mem = self.mem.lock();
         let now = Utc::now();
-        let claimed = earliest_pending_per_subject(&mem.cache.outbox, limit, true, now);
+        let claimed = earliest_pending_per_subject_skipping_committing(
+            &mem.cache.outbox,
+            &mem.committing,
+            limit,
+            true,
+            now,
+        );
         if claimed.is_empty() {
             return Ok(vec![]);
         }
@@ -898,7 +1191,8 @@ impl AverinQueue {
     /// `record_delivery_transition` arithmetic, identical to `OutboxStore::record_delivery`). Holds the
     /// in-memory lock for the full call and rolls back to the pre-transition snapshot if the durable
     /// commit fails, so a caller's natural retry sees the SAME pre-transition state (never silently
-    /// swallowed by a phantom in-memory-only transition).
+    /// swallowed by a phantom in-memory-only transition). Refuses (no-op, `Ok(false)`) a sequence still
+    /// `committing` — see [`Self::append`]'s doc for why.
     pub fn record_delivery(
         &self,
         sequence: u64,
@@ -907,6 +1201,12 @@ impl AverinQueue {
         max_attempts: u32,
     ) -> Result<bool, StorageError> {
         let mut mem = self.mem.lock();
+        if mem.committing.contains(&sequence) {
+            // Not yet durable — acting on it now (before its own `Delta::Append` has committed) is
+            // exactly the toxic ordering Codex HIGH-2 flagged. Treat it as absent, same as a
+            // genuinely-unknown sequence: a caller's natural retry sees it once it publishes.
+            return Ok(false);
+        }
         let Some(before) = mem.cache.outbox.get(&sequence).cloned() else {
             return Ok(false);
         };
@@ -955,9 +1255,18 @@ impl AverinQueue {
     }
 
     /// Read-only peek at the next deliverable events (earliest-pending per subject), no claim, no I/O.
+    /// Skips anything still `committing` (not yet durable — see [`Self::append`]'s doc): reporting it
+    /// as deliverable before its own `Delta::Append` has committed would let a caller act on it ahead
+    /// of its durability.
     pub fn deliverable(&self, limit: usize) -> Vec<OutboxEvent> {
         let mem = self.mem.lock();
-        earliest_pending_per_subject(&mem.cache.outbox, limit, false, Utc::now())
+        earliest_pending_per_subject_skipping_committing(
+            &mem.cache.outbox,
+            &mem.committing,
+            limit,
+            false,
+            Utc::now(),
+        )
     }
 
     /// Record averin's grant resolution for `token_id` durably (plan 088 D3 — see [`Delta::GrantResolved`]).
@@ -997,9 +1306,10 @@ impl AverinQueue {
     /// serialize the ENTIRE live map into one fresh snapshot segment, fsync it, atomically switch to
     /// it as the new replay base, then delete every segment it supersedes.
     ///
-    /// **Cutover safety**: holds the in-memory lock for the WHOLE call, so no `append`'s optimistic
-    /// insert (which also needs this lock) can race the snapshot capture — any event visible in the
-    /// snapshot is exactly "every append whose in-memory mutation happened-before this call started".
+    /// **Cutover safety**: holds the in-memory lock for the WHOLE call, so no `append`'s durable-commit
+    /// insert (which also needs this lock — see [`Self::finish_append`]) can race the snapshot capture
+    /// — any event visible in the snapshot is exactly "every append whose in-memory mutation
+    /// happened-before this call started".
     /// Before capturing the snapshot it asks the writer to [`Writer::roll`]: because the writer
     /// processes every job in the STRICT order it was enqueued, this guarantees every durable commit
     /// enqueued before this call acquired the lock has already landed in a segment at or below the
@@ -1008,8 +1318,45 @@ impl AverinQueue {
     /// already-present sequence is idempotent). Deletion happens only after the new snapshot is
     /// itself durable, so a crash mid-compaction leaves either the OLD generation intact or the NEW
     /// snapshot intact — never neither (mirrors the plan's proven generation-rekey discipline, D8).
+    ///
+    /// **Committing-set wait (Codex re-review #2/#3)**: before doing anything else, waits for
+    /// `mem.committing` to fully drain (see [`Self::append`]'s doc for the incident and
+    /// [`Self::committing_cv`]'s doc for the deadlock-freedom argument). Without this, a durably
+    /// committed-but-still-`committing` event could be absent from the snapshot captured below while
+    /// its ONLY durable copy (the segment holding its `Delta::Append`) gets deleted a few lines later
+    /// — a silent loss on the next crash, since `committing`-ness has nothing to do with which segment
+    /// a commit physically landed in, only with whether `mem.cache.outbox`'s in-memory reflection of
+    /// it is confirmed-durable yet.
+    ///
+    /// **Bounded wait (Codex R3 MEDIUM-4)**: the wait above is capped at
+    /// [`COMMITTING_DRAIN_TIMEOUT`] — a commit stuck in unbounded file I/O must never wedge this call
+    /// forever, since the periodic GC tick awaits it synchronously. If `committing` hasn't drained by
+    /// the deadline, this pass is skipped entirely (nothing compacted) rather than blocking; the next
+    /// tick retries. Compaction is best-effort GC, so skipping a pass is safe — but the skip is logged
+    /// at `warn` (Codex 4th-pass M4: sustained overlapping appends can keep `committing` non-empty
+    /// across every tick, so a silent skip would let journal segments grow unalerted) rather than
+    /// silently returning `Ok(())` indistinguishable from "nothing to do".
     pub fn compact(&self) -> Result<(), StorageError> {
-        let mem = self.mem.lock();
+        let mut mem = self.mem.lock();
+        let timed_out = self
+            .committing_cv
+            .wait_while_for(
+                &mut mem,
+                |m| !m.committing.is_empty(),
+                COMMITTING_DRAIN_TIMEOUT,
+            )
+            .timed_out();
+        if timed_out {
+            warn!(
+                target: "averin_seal",
+                timeout_secs = COMMITTING_DRAIN_TIMEOUT.as_secs(),
+                "averin queue compaction skipped this tick: appends are continuously in-flight \
+                 (the committing set did not drain within the timeout), so the snapshot/segment \
+                 reclaim is deferred to a later tick; the journal may grow until append traffic \
+                 quiesces"
+            );
+            return Ok(());
+        }
         let new_index = self.writer.roll()?;
         let snapshot_index = new_index - 1;
         let snapshot = QueueSnapshot {
@@ -1053,6 +1400,76 @@ impl AverinQueue {
             .values()
             .filter(|e| e.created_at < cutoff && e.delivery != DeliveryState::Delivered)
             .count()
+    }
+
+    /// GC: prune the durable CONTIGUOUS DELIVERED PREFIX from the live map (Codex HIGH-3 on plan 088 —
+    /// nothing previously pruned a successfully-`Delivered` record; only a dead-lettered-then-
+    /// reclaimed one ever left the map via [`Self::reclaim_dead_letter`], so every successful use's
+    /// raw `params` were retained on disk, and re-replayed, forever). Mirrors `OutboxStore::gc`'s own
+    /// prefix-prune semantics (`outbox_store.rs::gc`): walking the map in sequence order, the prefix
+    /// stops at the first record that is NOT terminal-`Delivered` (a still-`Pending`/leased record, or
+    /// a `DeadLettered` record whose [`Self::reclaim_dead_letter`] hasn't happened yet, both correctly
+    /// block it — only a genuinely-terminal `Delivered` record is eligible) OR that is younger than
+    /// `retention_secs` (by `created_at`, the same age basis `OutboxStore::gc` uses — this is the
+    /// retention window so a just-delivered record isn't pruned instantly). The whole eligible run is
+    /// dropped with ONE `Delta::Prune { upto_seq }` (which [`apply_delta`] already knows how to apply
+    /// on replay). Returns the number of records pruned (`0` — no commit issued — if the prefix is
+    /// empty). Holds the in-memory lock for the full call, same as [`Self::record_delivery`]/
+    /// [`Self::reclaim_dead_letter`] — acceptable because this runs on the periodic GC tick, never the
+    /// append hot path.
+    pub fn prune_delivered_prefix(&self, retention_secs: u64) -> Result<usize, StorageError> {
+        let secs = i64::try_from(retention_secs).unwrap_or(i64::MAX);
+        let Some(cutoff) =
+            chrono::Duration::try_seconds(secs).and_then(|d| Utc::now().checked_sub_signed(d))
+        else {
+            return Ok(0);
+        };
+        let mut mem = self.mem.lock();
+        // Same committing-set wait as `Self::compact` (Codex re-review #2/#3 — see `Self::append`'s
+        // doc for the full incident): without it, a lower-numbered committing-but-invisible-to-this-
+        // scan sequence sitting behind an already-`Delivered` higher one would let `upto_seq` below be
+        // computed past it, and the resulting `Delta::Prune` would, on replay, apply AFTER that lower
+        // sequence's own `Append` — deleting a genuinely still-`Pending` record that was never
+        // eligible for pruning.
+        //
+        // Bounded, same as `Self::compact` (Codex R3 MEDIUM-4): skip this pass (prune nothing) rather
+        // than block forever if `committing` hasn't drained within `COMMITTING_DRAIN_TIMEOUT` — the
+        // next GC tick retries. The skip is logged at `warn` (Codex 4th-pass M4), not silent — see
+        // `Self::compact`'s doc for why a silent skip here is unsafe under sustained append traffic.
+        let timed_out = self
+            .committing_cv
+            .wait_while_for(
+                &mut mem,
+                |m| !m.committing.is_empty(),
+                COMMITTING_DRAIN_TIMEOUT,
+            )
+            .timed_out();
+        if timed_out {
+            warn!(
+                target: "averin_seal",
+                timeout_secs = COMMITTING_DRAIN_TIMEOUT.as_secs(),
+                "averin queue delivered-prefix prune skipped this tick: appends are continuously \
+                 in-flight (the committing set did not drain within the timeout), so delivered \
+                 records' raw params are retained past the window until append traffic quiesces"
+            );
+            return Ok(0);
+        }
+        let upto_seq = mem
+            .cache
+            .outbox
+            .iter()
+            .take_while(|(_, e)| e.created_at < cutoff && e.delivery == DeliveryState::Delivered)
+            .map(|(seq, _)| *seq)
+            .last();
+        let Some(upto_seq) = upto_seq else {
+            return Ok(0);
+        };
+        let delta = Delta::Prune { upto_seq };
+        let frame = seal_delta(&delta, &self.master_key)?;
+        self.writer.commit(frame)?;
+        let before = mem.cache.outbox.len();
+        mem.cache.outbox.retain(|seq, _| *seq > upto_seq);
+        Ok(before - mem.cache.outbox.len())
     }
 
     /// Look up a specific sequence's CURRENT record — a production analogue of the test-only
@@ -1697,5 +2114,525 @@ mod tests {
 
         assert!(!q.record_delivery(b, true, None, 8).unwrap()); // -> Delivered
         assert!(!q.has_pending_for_subject("B"), "a Delivered record is not a live use");
+    }
+
+    // ---- Codex HIGH-2 (append-ordering resurrection) ----
+
+    #[test]
+    fn a_reservation_is_not_claimable_or_deliverable_until_its_append_commits_no_resurrection() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+
+        // Reserve sequence N WITHOUT yet committing its `Delta::Append` durably — this mirrors the
+        // exact interleaving Codex flagged: a concurrent worker's `claim` + `record_delivery` racing
+        // this call's own durability wait. `reserve_for_append` publishes the event into
+        // `mem.cache.outbox` IMMEDIATELY (the committing-set fix, so `compact`/
+        // `prune_delivered_prefix` always see it) but marks it `committing`.
+        let (seq, event) = q.reserve_for_append("tok-a", "averin.use", serde_json::json!({"n": 1}));
+        assert_eq!(seq, 1);
+
+        // Attempt EXACTLY the toxic interleaving BEFORE the reservation's Append is durable: claim,
+        // then deliver. Post-fix this must be a complete no-op in both directions — `claim`/
+        // `deliverable`/`record_delivery` all treat a still-`committing` sequence as not-yet-durable,
+        // proving the vulnerability's precondition (committing Lease/Delivered for a sequence whose
+        // own Append hasn't committed yet) is now structurally unreachable through the public API —
+        // even though `get` (an internal/introspection accessor) already sees the published event.
+        assert!(
+            q.deliverable(10).is_empty(),
+            "an uncommitted (still-committing) reservation must not be deliverable"
+        );
+        let claimed = q.claim(10, 60).unwrap();
+        assert!(claimed.is_empty(), "an uncommitted reservation must not be claimable");
+        let delivered = q.record_delivery(seq, true, None, 8).unwrap();
+        assert!(!delivered, "record_delivery on a still-committing sequence must be a no-op");
+        assert_eq!(
+            q.get(seq).unwrap().delivery,
+            DeliveryState::Pending,
+            "the reservation is published (compact/prune must see it) though not yet claimable"
+        );
+
+        // NOW let the append actually commit + publish (mirrors `finish_append`, the second half of
+        // the real `append()`).
+        let committed_seq = q.finish_append(seq, event).unwrap();
+        assert_eq!(committed_seq, seq);
+
+        // The sequence is now genuinely Pending, deliverable, and claimable — nothing was lost or
+        // resurrected by the earlier no-op attempt.
+        assert_eq!(q.get(seq).unwrap().delivery, DeliveryState::Pending);
+        assert_eq!(q.deliverable(10).len(), 1);
+        let claimed = q.claim(10, 60).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].sequence, seq);
+        assert!(q.record_delivery(seq, true, None, 8).is_ok());
+        assert_eq!(q.get(seq).unwrap().delivery, DeliveryState::Delivered);
+
+        // Drop + reopen: replay must show the event exactly as it genuinely happened — Delivered —
+        // and must NEVER regress back to Pending (the actual regression Codex HIGH-2 flagged: a
+        // Lease/Delivered pair committed before their event's own Append resurrected it as fresh
+        // Pending work on replay).
+        drop(q);
+        let q2 = reopen(dir.path());
+        let ev = q2.get(seq).expect("the committed, delivered append survives replay");
+        assert_eq!(
+            ev.delivery,
+            DeliveryState::Delivered,
+            "a genuinely delivered record must never come back as Pending after replay (resurrection)"
+        );
+    }
+
+    #[test]
+    fn a_concurrent_claimant_never_observes_an_unpublished_reservation() {
+        // A second angle on the same fix under real concurrency: reserve N on this thread, run a
+        // worker that hammers claim+deliver while N is reserved-but-uncommitted (committing), and
+        // STOP+JOIN that worker BEFORE publishing N — so the whole window the worker runs in is
+        // exactly "N reserved, its Append not yet durable". Post-fix, `claim` treats a still-
+        // `committing` sequence as unclaimable (its `assert_ne` never fires) even though the
+        // committing-set fix means N IS already published into `mem.cache.outbox` (so
+        // `compact`/`prune_delivered_prefix` can see it) — the two properties are independent. N only
+        // becomes genuinely claimable — still Pending — after `finish_append` clears `committing`.
+        let dir = tempfile::tempdir().unwrap();
+        let q = Arc::new(queue(dir.path()));
+
+        let (seq, event) = q.reserve_for_append("tok-a", "averin.use", serde_json::json!({"n": 1}));
+
+        let q_bg = Arc::clone(&q);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        let bg = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::Relaxed) {
+                let claimed = q_bg.claim(10, 60).unwrap();
+                for e in claimed {
+                    assert_ne!(e.sequence, seq, "the unpublished reservation must never be claimed");
+                    let _ = q_bg.record_delivery(e.sequence, true, None, 8);
+                }
+                // A small yield keeps this a genuine concurrency probe without a lock-starving spin.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+
+        // Let the worker run against the not-yet-published reservation, then stop + join it BEFORE
+        // publishing — the assertion window closes with the reservation still uncommitted.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        stop.store(true, Ordering::Relaxed);
+        bg.join().unwrap();
+
+        // The reservation was never claimed during the whole window (the background worker's own
+        // `assert_ne!` above already proved that) — it's published (visible via `get`) but still
+        // marked `committing` until its Append actually commits.
+        assert_eq!(
+            q.get(seq).unwrap().delivery,
+            DeliveryState::Pending,
+            "published but still committing — never claimed during the worker's whole window"
+        );
+        let committed_seq = q.finish_append(seq, event).unwrap();
+        assert_eq!(committed_seq, seq);
+        assert_eq!(q.get(seq).unwrap().delivery, DeliveryState::Pending);
+    }
+
+    // ---- Codex re-review #2/#3 (committing-set fix: durable-but-unpublished compact/prune race) ----
+    //
+    // The FIRST fix above (deferred insert) closed the HIGH-2 resurrection hole but opened a NEW one:
+    // a window where an event is durably committed to disk but not yet reflected in `mem.cache.outbox`
+    // at all. A concurrent `compact`/`prune_delivered_prefix` running in that window could snapshot/
+    // prune without ever seeing the event, then delete its only durable copy — an acknowledged,
+    // already-fsynced event silently lost on the next crash. See `AverinQueue::append`'s doc for the
+    // full incident; these two tests reproduce the exact race the committing-set fix closes.
+
+    #[test]
+    fn compact_waits_for_an_in_flight_commit_before_snapshotting_no_lost_durable_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Arc::new(queue(dir.path()));
+
+        // Reserve + durably commit seq A's `Delta::Append` directly (the frame is written+fsynced),
+        // but do NOT yet call `publish_committed` — simulates the publish step being delayed while a
+        // concurrent `compact` runs: durably on disk, still `committing`.
+        let (seq, event) = q.reserve_for_append("A", "averin.use", serde_json::json!({"x": 1}));
+        let frame = seal_delta(&Delta::Append(event.clone()), &q.master_key).unwrap();
+        q.writer.commit(frame).unwrap();
+
+        let q_bg = Arc::clone(&q);
+        let compact_done = Arc::new(AtomicBool::new(false));
+        let compact_done_bg = Arc::clone(&compact_done);
+        let bg = std::thread::spawn(move || {
+            q_bg.compact().unwrap();
+            compact_done_bg.store(true, Ordering::SeqCst);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !compact_done.load(Ordering::SeqCst),
+            "compact must block on the committing condvar while A's Append is still committing"
+        );
+        // Compact is still blocked — it has not rolled, snapshotted, or deleted anything yet, so A's
+        // original delta segment is fully intact and no snapshot exists. This is the direct assertion
+        // that compact does NOT delete A's data while it is committing.
+        let segs_while_blocked = list_segments(dir.path()).unwrap();
+        assert!(
+            !segs_while_blocked.iter().any(|(_, _, is_snap)| *is_snap),
+            "compact must not have written (or deleted anything toward) a snapshot while A is still \
+             committing"
+        );
+
+        // Let A's publish proceed exactly as `finish_append` would on commit success.
+        q.publish_committed(seq);
+        bg.join().unwrap();
+        assert!(compact_done.load(Ordering::SeqCst));
+
+        // The snapshot compact produced must include A: nothing is lost even though its Append had
+        // already committed durably before compact observed it as safe to snapshot.
+        let q = Arc::try_unwrap(q).unwrap_or_else(|_| panic!("bg thread's Arc clone should be gone"));
+        drop(q);
+        let q2 = reopen(dir.path());
+        assert_eq!(q2.all_events().len(), 1, "A must survive compaction, not be lost");
+        assert_eq!(q2.get(seq).unwrap().sequence, seq);
+    }
+
+    #[test]
+    fn prune_delivered_prefix_waits_for_an_in_flight_commit_a_committing_seq_is_never_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Arc::new(queue(dir.path()));
+
+        // seq1 ("A"): reserve + durably commit its `Delta::Append` directly, but do NOT yet call
+        // `publish_committed` — simulates the exact race Codex flagged: durably on disk, still
+        // `committing`.
+        let (seq1, event1) = q.reserve_for_append("A", "averin.use", serde_json::json!({}));
+        let frame1 = seal_delta(&Delta::Append(event1.clone()), &q.master_key).unwrap();
+        q.writer.commit(frame1).unwrap();
+
+        // seq2 ("B"): a normal, fully-published, already-`Delivered` event — the scenario Codex
+        // described precisely: "seq 1 is committing-but-unpublished while seq 2 is delivered".
+        let seq2 = q.append("B", "averin.use", serde_json::json!({})).unwrap();
+        let claimed = q.claim(10, 60).unwrap();
+        assert_eq!(claimed.len(), 1, "seq1 is still committing and must not be claimed alongside seq2");
+        assert_eq!(claimed[0].sequence, seq2);
+        assert!(!q.record_delivery(seq2, true, None, 8).unwrap());
+
+        // `prune_delivered_prefix` must WAIT (not prune) while seq1 is still committing — spawn it in
+        // the background and confirm it has not returned yet.
+        let q_bg = Arc::clone(&q);
+        let done = Arc::new(AtomicBool::new(false));
+        let done_bg = Arc::clone(&done);
+        let bg = std::thread::spawn(move || {
+            let pruned = q_bg.prune_delivered_prefix(0).unwrap();
+            done_bg.store(true, Ordering::SeqCst);
+            pruned
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!done.load(Ordering::SeqCst), "prune must wait while seq1 is still committing");
+
+        // Now let seq1 actually publish (mirrors `finish_append`'s success tail).
+        q.publish_committed(seq1);
+        let pruned = bg.join().unwrap();
+
+        // seq1 is now genuinely Pending (never delivered) — it correctly BLOCKS the whole prefix
+        // (mirrors the existing "a still-pending record blocks the prefix" contract), so a committing
+        // seq is never pruned, and nothing else is pruned out of sequence order either.
+        assert_eq!(pruned, 0, "a just-published, still-Pending seq1 blocks the prefix entirely");
+        assert_eq!(q.get(seq1).unwrap().delivery, DeliveryState::Pending);
+        assert!(q.get(seq2).is_some(), "seq2 must not be pruned past the still-Pending seq1");
+
+        // Durability check: replay must agree — seq1 (Pending) and seq2 (Delivered) both survive.
+        let q = Arc::try_unwrap(q).unwrap_or_else(|_| panic!("bg thread's Arc clone should be gone"));
+        drop(q);
+        let q2 = reopen(dir.path());
+        assert_eq!(q2.all_events().len(), 2);
+        assert_eq!(q2.get(seq1).unwrap().delivery, DeliveryState::Pending);
+        assert_eq!(q2.get(seq2).unwrap().delivery, DeliveryState::Delivered);
+    }
+
+    // ---- Codex R3 HIGH-2 (claim skipped a committing seq without blocking its subject) ----
+    //
+    // The `committing` set stops `claim`/`deliverable` from acting on a not-yet-durable seq, but the
+    // scan just `continue`d past it — it never marked the seq's SUBJECT as blocked. So a LATER,
+    // already-committed seq for the SAME subject could still be claimed while the earlier one was
+    // still committing: a per-subject FIFO violation (a later bounded-reuse use reaching averin before
+    // an earlier same-subject grant/use was even durable). The fix marks the whole subject `seen` the
+    // moment any of its sequences is found `committing`, head-of-line-blocking every later seq for that
+    // subject until the committing one drains and delivers in order.
+
+    #[test]
+    fn claim_head_of_line_blocks_a_subject_with_an_earlier_committing_seq_from_a_later_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+
+        // N: reserved but deliberately left `committing` (never finished) — nothing durable backs it.
+        let (seq_n, event_n) = q.reserve_for_append("S", "averin.use", serde_json::json!({"n": 1}));
+        // N+1: same subject, reserved AND fully committed — durable and genuinely Pending.
+        let seq_n1 = q.append("S", "averin.use", serde_json::json!({"n": 2})).unwrap();
+        assert_eq!(seq_n1, seq_n + 1, "N+1 must immediately follow N in sequence order");
+
+        // While N is still committing, claim() must return NOTHING for subject S — not N+1 ahead of
+        // it. This is the exact interleaving Codex R3 HIGH-2 flagged.
+        let claimed = q.claim(10, 60).unwrap();
+        assert!(
+            claimed.is_empty(),
+            "S has an earlier committing seq (N); N+1 must not be claimed ahead of it, got {claimed:?}"
+        );
+
+        // Let N actually commit durably (mirrors `finish_append`'s success tail).
+        assert_eq!(q.finish_append(seq_n, event_n).unwrap(), seq_n);
+
+        // N is now durable and Pending — it, not N+1, is the earliest claimable event for S.
+        let claimed = q.claim(10, 60).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].sequence, seq_n, "N claims first, in order");
+        assert!(!q.record_delivery(seq_n, true, None, 8).unwrap());
+
+        // N has delivered — S is unblocked, and N+1 is now (and only now) claimable.
+        let claimed = q.claim(10, 60).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].sequence, seq_n1, "N+1 claims only after N delivers, still in order");
+    }
+
+    // ---- Codex R3 MEDIUM-4 (unbounded compact/prune wait on a stuck committing seq — liveness) ----
+    //
+    // `compact`/`prune_delivered_prefix` waited on `committing_cv` with NO timeout. A writer stuck in
+    // unbounded file I/O (or sustained overlapping appends) could leave `committing` nonempty forever,
+    // wedging both GC passes permanently — and since the periodic GC/delivery worker awaits `compact()`
+    // synchronously, that stalls every later tick too. The fix bounds the wait at
+    // `COMMITTING_DRAIN_TIMEOUT` and skips the pass (best-effort — retried next tick) on timeout.
+
+    #[test]
+    fn compact_and_prune_skip_their_pass_instead_of_hanging_when_committing_never_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Arc::new(queue(dir.path()));
+
+        // Reserve a seq and never finish/publish/abort it — `committing` never drains for the rest of
+        // this test, exactly the stuck-writer scenario Codex R3 MEDIUM-4 flagged.
+        let (seq, _event) = q.reserve_for_append("S", "averin.use", serde_json::json!({}));
+
+        // Run both waiters concurrently so this test's wall-clock cost is ~one timeout, not two.
+        let q1 = Arc::clone(&q);
+        let compact_thread = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            q1.compact().unwrap();
+            start.elapsed()
+        });
+        let q2 = Arc::clone(&q);
+        let prune_thread = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let pruned = q2.prune_delivered_prefix(0).unwrap();
+            (start.elapsed(), pruned)
+        });
+
+        // Joining is itself the "does not hang" assertion: pre-fix, both would have blocked forever.
+        let compact_elapsed = compact_thread.join().unwrap();
+        let (prune_elapsed, pruned) = prune_thread.join().unwrap();
+
+        let margin = COMMITTING_DRAIN_TIMEOUT + std::time::Duration::from_secs(5);
+        assert!(
+            compact_elapsed < margin,
+            "compact must give up within a bounded margin of COMMITTING_DRAIN_TIMEOUT, took \
+             {compact_elapsed:?}"
+        );
+        assert!(
+            prune_elapsed < margin,
+            "prune_delivered_prefix must give up within a bounded margin of \
+             COMMITTING_DRAIN_TIMEOUT, took {prune_elapsed:?}"
+        );
+
+        // Best-effort skip, not a partial pass: nothing pruned, and no snapshot was ever written
+        // (compact bailed before touching disk) — the queue is unchanged, ready to retry next tick.
+        assert_eq!(pruned, 0, "prune must skip (not prune) while committing never drains");
+        let segs = list_segments(dir.path()).unwrap();
+        assert!(
+            !segs.iter().any(|(_, _, is_snap)| *is_snap),
+            "compact must not have written a snapshot on a skipped pass"
+        );
+
+        // `seq` itself is untouched: still published (visible) but still committing/Pending — never
+        // lost, never resurrected, never pruned.
+        assert_eq!(q.get(seq).unwrap().delivery, DeliveryState::Pending);
+    }
+
+    // ---- Codex HIGH-3 (delivered records retained forever / unbounded growth) ----
+
+    #[test]
+    fn prune_delivered_prefix_drops_delivered_records_and_their_params_but_never_a_still_pending_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+
+        let a = q.append("A", "averin.use", serde_json::json!({"params": "SECRET_A"})).unwrap();
+        let b = q.append("B", "averin.use", serde_json::json!({"params": "SECRET_B"})).unwrap();
+        let c = q.append("C", "averin.use", serde_json::json!({"params": "SECRET_C"})).unwrap(); // stays Pending
+
+        q.claim(10, 60).unwrap();
+        assert!(!q.record_delivery(a, true, None, 8).unwrap());
+        assert!(!q.record_delivery(b, true, None, 8).unwrap());
+        // `c` is deliberately never claimed/delivered — it must survive the prune untouched.
+
+        // retention_secs = 0: every already-`created_at`-stamped record instantly qualifies by age,
+        // isolating the test to the delivery-state gate this fix adds.
+        let pruned = q.prune_delivered_prefix(0).unwrap();
+        assert_eq!(pruned, 2, "both delivered records (A, B) are pruned");
+
+        assert!(q.get(a).is_none(), "A's delivered record (and its raw params) must be gone");
+        assert!(q.get(b).is_none(), "B's delivered record (and its raw params) must be gone");
+        let remaining = q.get(c).expect("C, still Pending, must survive the prune");
+        assert_eq!(remaining.delivery, DeliveryState::Pending);
+        assert_eq!(q.all_events().len(), 1, "only the still-Pending record C remains live");
+
+        // The prune is itself durable: a reopen must not resurrect A or B.
+        drop(q);
+        let q2 = reopen(dir.path());
+        assert_eq!(q2.all_events().len(), 1);
+        assert!(q2.get(a).is_none());
+        assert!(q2.get(b).is_none());
+        assert_eq!(q2.get(c).unwrap().delivery, DeliveryState::Pending);
+    }
+
+    #[test]
+    fn prune_delivered_prefix_is_blocked_by_a_still_pending_record_even_if_a_later_one_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+
+        // Two different subjects so both can be independently claimed in one pass, but `a` (lower
+        // sequence) is left Pending while `b` (higher sequence) delivers — the prefix scan must stop
+        // AT `a`, never skip over it to prune `b` out of sequence order (mirrors `OutboxStore::gc`'s
+        // own prefix semantics: a blocking record freezes the WHOLE prefix from that point on).
+        let a = q.append("A", "averin.use", serde_json::json!({})).unwrap();
+        let b = q.append("B", "averin.use", serde_json::json!({})).unwrap();
+        q.claim(10, 60).unwrap();
+        assert!(!q.record_delivery(b, true, None, 8).unwrap());
+        // `a` is left Pending (never delivered).
+
+        let pruned = q.prune_delivered_prefix(0).unwrap();
+        assert_eq!(pruned, 0, "the still-Pending `a` blocks the prefix even though `b` delivered");
+        assert!(q.get(a).is_some());
+        assert!(q.get(b).is_some(), "b survives too: the prefix never reaches past the blocker");
+    }
+
+    #[test]
+    fn prune_delivered_prefix_respects_the_retention_window_a_just_delivered_record_is_not_pruned_instantly() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+        let a = q.append("A", "averin.use", serde_json::json!({})).unwrap();
+        q.claim(10, 60).unwrap();
+        assert!(!q.record_delivery(a, true, None, 8).unwrap());
+
+        // A large retention window (well past "just now") must NOT prune a just-delivered record.
+        let pruned = q.prune_delivered_prefix(24 * 3600).unwrap();
+        assert_eq!(pruned, 0, "a just-delivered record must survive within the retention window");
+        assert!(q.get(a).is_some());
+
+        // retention_secs = 0 (no window) prunes it immediately, proving the ONLY thing that withheld
+        // it above was the window, not some other gate.
+        let pruned = q.prune_delivered_prefix(0).unwrap();
+        assert_eq!(pruned, 1);
+        assert!(q.get(a).is_none());
+    }
+
+    // ---- Codex HIGH-5 (interior corruption misclassified as torn-tail) ----
+
+    #[test]
+    fn interior_frame_length_corruption_fails_closed_instead_of_being_treated_as_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+        for i in 0..3u32 {
+            q.append("subj", "t", serde_json::json!({"n": i})).unwrap();
+        }
+        let segment_path = q.current_segment_path();
+        drop(q); // close the writer thread + file handle before mutating bytes on disk
+
+        let mut bytes = std::fs::read(&segment_path).unwrap();
+        // Locate the SECOND frame (an interior frame, not the last) using the real header layout, and
+        // flip a bit in ITS length field — Codex HIGH-5's exact scenario: a corrupted interior length
+        // that (pre-fix) could claim more bytes than remain and be silently treated as a torn tail,
+        // dropping that record and every later one.
+        let first_len = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let second_frame_start = FRAME_HEADER_LEN + first_len;
+        assert!(
+            second_frame_start + FRAME_HEADER_LEN <= bytes.len(),
+            "need at least 2 frames for this test"
+        );
+        let len_field_offset = second_frame_start + 4;
+        bytes[len_field_offset] ^= 0x40; // flip a bit in the second frame's claimed length
+
+        std::fs::write(&segment_path, &bytes).unwrap();
+
+        let key = Arc::new(MasterKey::from_bytes(vec![11u8; 32]).unwrap());
+        let result = AverinQueue::open(dir.path().to_path_buf(), key);
+        let msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!(
+                "a corrupted interior frame length must fail closed, never silently truncate"
+            ),
+        };
+        assert!(
+            msg.contains("CRC mismatch") || msg.contains("bad magic"),
+            "expected a fail-closed frame-corruption error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn final_frame_payload_corruption_with_an_intact_header_fails_closed_not_torn() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+        for i in 0..3u32 {
+            q.append("subj", "t", serde_json::json!({"n": i})).unwrap();
+        }
+        let segment_path = q.current_segment_path();
+        drop(q);
+
+        let mut bytes = std::fs::read(&segment_path).unwrap();
+        // Flip the very last byte of the file: it lands inside the LAST frame's sealed payload, well
+        // past its 12-byte header, which stays fully intact (magic + length + length-CRC all still
+        // match). Codex HIGH-5's other sub-case: a corrupted-but-complete-length last record must NOT
+        // be silently discarded as a "torn tail" — it must fail closed instead.
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&segment_path, &bytes).unwrap();
+
+        let key = Arc::new(MasterKey::from_bytes(vec![11u8; 32]).unwrap());
+        let result = AverinQueue::open(dir.path().to_path_buf(), key);
+        let msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!(
+                "a corrupted-but-complete-length final record must fail closed, never be discarded \
+                 as torn"
+            ),
+        };
+        assert!(
+            msg.contains("not a torn tail"),
+            "expected a fail-closed authentication error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn genuinely_torn_trailing_write_with_an_intact_header_is_still_discarded_as_torn() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue(dir.path());
+        for i in 0..5u32 {
+            q.append("subj", "t", serde_json::json!({"n": i})).unwrap();
+        }
+        let segment_path = q.current_segment_path();
+        drop(q);
+
+        let full = std::fs::read(&segment_path).unwrap();
+        // Walk frames (using the real header layout) to find the LAST frame's start, so we can
+        // truncate INSIDE its payload while leaving its 12-byte header fully intact — the genuine
+        // "process died mid-write" shape the torn-tail path exists for, as distinct from the
+        // interior-corruption cases above.
+        let mut pos = 0usize;
+        let mut last_frame_start = 0usize;
+        while pos < full.len() {
+            let len = u32::from_be_bytes(full[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            last_frame_start = pos;
+            pos += FRAME_HEADER_LEN + len;
+        }
+        let last_len =
+            u32::from_be_bytes(full[last_frame_start + 4..last_frame_start + 8].try_into().unwrap())
+                as usize;
+        assert!(last_len > 4, "need a payload with a few bytes to truncate mid-record");
+        let cut_len = last_frame_start + FRAME_HEADER_LEN + (last_len / 2).max(1);
+        assert!(cut_len < full.len(), "must actually truncate something");
+        std::fs::write(&segment_path, &full[..cut_len]).unwrap();
+
+        let q2 = reopen(dir.path());
+        let recovered = q2.all_events();
+        assert_eq!(recovered.len(), 4, "the torn 5th record is discarded; the first 4 survive intact");
+        let seqs: StdHashSet<u64> = recovered.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, StdHashSet::from([1, 2, 3, 4]));
     }
 }

@@ -744,8 +744,21 @@ impl VultrinoServer {
             );
             return;
         }
+        // Codex HIGH-6 fix — freeze `project_id`/`session_id`/`resource_id`/`grant_ttl_secs` into
+        // the event at enqueue time, mirroring the `"averin.use"` fix in `seal_after_consume`.
+        // `deliver_averin_grant` previously read all four from LIVE `av.config()` at delivery time;
+        // a config change (redeploy, reload) between enqueue and delivery would rebuild a DIFFERENT
+        // request body under the SAME idempotency key (`token_id`), and — since `resource_id` feeds
+        // the signed grant-PoP challenge (`agent_sig`) — a different signature too, which averin
+        // would see as a conflicting retry (409) rather than the honest one it is.
+        let grant_payload = serde_json::json!({
+            "project_id": av.config().project_id,
+            "session_id": av.config().session_id,
+            "resource_id": av.config().resource_id,
+            "grant_ttl_secs": av.config().grant_ttl_secs,
+        });
         if let Err(e) =
-            run_averin_queue_blocking(|| queue.append(token_id, "averin.grant", serde_json::json!({})))
+            run_averin_queue_blocking(|| queue.append(token_id, "averin.grant", grant_payload))
         {
             av.record_enqueue_failed();
             warn!(
@@ -1282,7 +1295,9 @@ impl VultrinoServer {
     /// Plan 088 D5c — `use_sequence_number` (the `consume_use_token` post-increment `uses`,
     /// 1-based) and `request_id` are threaded through here from both call sites so they are
     /// available at the ONE hook both execute paths share, feeding the Step 5 durable enqueue
-    /// below (D5's `{params, nonce, params_nonce, request_id, use_sequence_number}` event shape).
+    /// below (D5's `{params, nonce, params_nonce, request_id, use_sequence_number}` event shape,
+    /// extended by the Codex HIGH-6 fix to also freeze `project_id`/`session_id`/`resource_id` —
+    /// see that enqueue's own comment below).
     ///
     /// Plan 088 Step 5 (D0/D3/D5/D6/D7) — the Observe branch: when `[averin] durable = true` AND
     /// this process owns the durable queue (`self.storage.averin_durable_queue()`, Step 3a), mint
@@ -1315,18 +1330,41 @@ impl VultrinoServer {
             crate::averin::AverinMode::Observe => {
                 if av.config().durable {
                     if let Some(queue) = self.storage.averin_durable_queue() {
+                        // Codex MED-7 fix — apply the SAME oversize-params cap the 087 async path
+                        // enforces (`AverinClient::spawn_use_seal`) BEFORE ever building/appending
+                        // the durable event. Unlike the async path, an unchecked durable append
+                        // would durably RETAIN an oversize blob far above `AverinQueue`'s 8 MiB
+                        // segment cap — so this must run first, not just mirror the drop after the
+                        // fact. Fail-open: count + alarm (token/project context only, never
+                        // params), enqueue nothing, and let the action proceed exactly like an 087
+                        // drop would.
+                        if av.durable_use_oversize_drop(token_id, params_bytes.len()) {
+                            return Ok(());
+                        }
                         // D5 — bind the freshness nonces ONCE, here, at enqueue time. The worker
                         // rebuilds `params_commitment`/`use_sig` from these EXACT stored values on
                         // every delivery attempt, never regenerating them, so a retry is
                         // byte-identical (an honest idempotent retry at averin, never a 409).
                         let nonce = crate::averin::pop::random_params_nonce_hex();
                         let params_nonce = crate::averin::pop::random_params_nonce_hex();
+                        // Codex HIGH-6 fix — freeze the COMPLETE request at enqueue time, not just
+                        // the D5 nonces. `deliver_averin_use` previously read `project_id`/
+                        // `session_id`/`resource_id` from LIVE `av.config()` at delivery time;
+                        // `resource_id` in particular is part of the SIGNED use-PoP challenge, so a
+                        // retry after any of these values changed produced a different body/
+                        // signature under the SAME idempotency key — averin returns 409, wrongly
+                        // dead-lettering an honest retry of an already-sealed use. Storing them here
+                        // and rebuilding ONLY from these stored values (never live config) makes a
+                        // retry byte-identical regardless of what the live config looks like later.
                         let payload = serde_json::json!({
                             "params": String::from_utf8_lossy(&params_bytes),
                             "nonce": nonce,
                             "params_nonce": params_nonce,
                             "request_id": request_id,
                             "use_sequence_number": use_sequence_number,
+                            "project_id": av.config().project_id,
+                            "session_id": av.config().session_id,
+                            "resource_id": av.config().resource_id,
                         });
                         let result =
                             run_averin_queue_blocking(|| queue.append(token_id, "averin.use", payload));
@@ -3259,6 +3297,17 @@ fn run_averin_queue_blocking<T>(f: impl FnOnce() -> T) -> T {
 /// On success, writes averin's `{grant_id, capability}` back into the popkey entry (D3's
 /// `GrantResolved` write-back) AND durably records the SAME resolution in the queue's own journal
 /// (`AverinQueue::resolve_grant`) so a crash between the two writes is reconcilable on replay.
+///
+/// Codex HIGH-6 / re-review #6 — `project_id`/`session_id`/`resource_id`/`grant_ttl_secs` are read
+/// from the event's OWN stored payload (frozen at enqueue by `enqueue_durable_mint_grant`), NEVER
+/// from live `averin_client.config()`: `resource_id` feeds the signed grant-PoP challenge, so a live
+/// config change between enqueue and delivery would rebuild a different signature under the same
+/// idempotency key (`token_id`) and averin would see a conflicting retry (409) instead of an honest
+/// one. The `?project=` routing query is likewise frozen (via `post_for_project`), so the whole
+/// request — body AND route — is byte-identical on every retry. FAIL-CLOSED: a missing frozen field
+/// ERRORS the delivery (retries/dead-letters visibly); there is NO live-config fallback — durable is
+/// default-OFF and unreleased, so no legacy field-less event exists, and silently substituting live
+/// config was exactly the per-field fallback that reproduced the 409 this freeze prevents.
 async fn deliver_averin_grant(
     event: &crate::outbox::OutboxEvent,
     queue: &crate::storage::AverinQueue,
@@ -3272,10 +3321,57 @@ async fn deliver_averin_grant(
         .map_err(|e| format!("popkey lookup failed: {e}"))?
         .ok_or_else(|| format!("no PoP-key entry for token {token_id} (grant cannot be rebuilt)"))?;
 
+    // Codex re-review #6 — STORED, never live, and FAIL-CLOSED: these are the fields frozen into the
+    // event at enqueue (`enqueue_durable_mint_grant`). A missing frozen field must ERROR the delivery
+    // (retry/dead-letter visibly), NEVER silently substitute live `av.config()` — that per-field
+    // fallback re-read a changed config and reproduced the exact 409 the freeze exists to prevent
+    // (`resource_id`/`grant_ttl_secs` feed the signed grant-PoP challenge / request body under the
+    // same idempotency key). durable is default-OFF and unreleased, so no legacy field-less event
+    // exists; an absent field here is a real defect, not a back-compat case.
+    let project_id = event
+        .payload
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "averin.grant event payload missing frozen project_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
+    let session_id = event
+        .payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "averin.grant event payload missing frozen session_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
+    let resource = event
+        .payload
+        .get("resource_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "averin.grant event payload missing frozen resource_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
+    let grant_ttl_secs = event
+        .payload
+        .get("grant_ttl_secs")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| {
+            "averin.grant event payload missing frozen grant_ttl_secs (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?;
+
     let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
     let agent_pubkey = keypair.agent_pubkey_b64();
     let agent_id = format!("vultrino:{token_id}");
-    let resource = averin_client.config().resource_id.clone();
 
     let challenge = crate::averin::pop::grant_challenge(
         &entry.action,
@@ -3292,8 +3388,8 @@ async fn deliver_averin_grant(
     let scope_class = entry.use_limit.filter(|n| *n > 1).map(|_| "bounded_reuse");
     let body = serde_json::json!({
         "idempotency_key": token_id,
-        "project_id": averin_client.config().project_id,
-        "session_id": averin_client.config().session_id,
+        "project_id": project_id,
+        "session_id": session_id,
         "agent_id": agent_id,
         "action": entry.action,
         "resource": resource,
@@ -3302,11 +3398,13 @@ async fn deliver_averin_grant(
         "use_limit": entry.use_limit.filter(|n| *n > 1).unwrap_or(0),
         "agent_pubkey": agent_pubkey,
         "agent_sig": agent_sig,
-        "ttl_seconds": averin_client.config().grant_ttl_secs,
+        "ttl_seconds": grant_ttl_secs,
     });
 
+    // Codex re-review #6 — route the `?project=` auth query by the FROZEN `project_id`, not live
+    // config, so a retry after the deployment's project changed stays byte-identical (body AND query).
     let resp = averin_client
-        .post("/v2/grants", &body)
+        .post_for_project("/v2/grants", &body, &project_id)
         .await
         .map_err(|e| e.to_string())?;
     let grant_id = resp
@@ -3321,9 +3419,8 @@ async fn deliver_averin_grant(
         .to_string();
 
     let delivered_at = chrono::Utc::now();
-    let expires_at = Some(
-        delivered_at + chrono::Duration::seconds(i64::from(averin_client.config().grant_ttl_secs)),
-    );
+    let expires_at =
+        Some(delivered_at + chrono::Duration::seconds(i64::from(grant_ttl_secs)));
 
     popkeys
         .grant_resolved(
@@ -3366,6 +3463,18 @@ async fn deliver_averin_grant(
 /// D5c: `use_sequence_number` (the `consume_use_token` post-increment `uses`, captured at
 /// `src/server/mod.rs`'s execute call sites) rides verbatim into the body. averin ignores it for
 /// non-bounded scope classes, so it is always included.
+///
+/// Codex HIGH-6 / re-review #6 — `project_id`/`session_id`/`resource_id` are ALSO read verbatim from
+/// the STORED event payload (frozen at enqueue by `seal_after_consume`'s durable branch), never from
+/// live `averin_client.config()`. `resource_id` in particular feeds the SIGNED use-PoP challenge
+/// (`build_use_pop`), so rebuilding it from a config that changed between enqueue and delivery would
+/// reproduce a DIFFERENT `use_sig` under the SAME idempotency key — averin would see that as a
+/// conflicting retry (409), wrongly dead-lettering an honest retry of an already-sealed use. The
+/// `?project=` routing query is frozen too (via `post_for_project`), so both the body and the route
+/// are byte-identical on every retry. FAIL-CLOSED: a missing frozen field ERRORS the delivery
+/// (retries/dead-letters visibly); there is NO live-config fallback — durable is default-OFF and
+/// unreleased, so no legacy field-less event exists, and silently substituting live config was
+/// exactly the per-field fallback that reproduced the 409 this freeze prevents.
 async fn deliver_averin_use(
     event: &crate::outbox::OutboxEvent,
     popkeys: &crate::storage::PopKeyStore,
@@ -3422,13 +3531,49 @@ async fn deliver_averin_use(
         .get("use_sequence_number")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "averin.use event payload missing use_sequence_number".to_string())?;
+    // Codex re-review #6 — STORED, never live, and FAIL-CLOSED: `resource_id` feeds the SIGNED use-PoP
+    // challenge below, so it (and its project/session siblings) must never be re-read from
+    // `av.config()` at delivery time. A missing frozen field must ERROR the delivery (retry/dead-letter
+    // visibly), NEVER fall back to live config — that per-field fallback re-read a changed config and
+    // reproduced the exact 409 the freeze exists to prevent. durable is default-OFF and unreleased, so
+    // no legacy field-less event exists; an absent field here is a real defect, not a back-compat case.
+    let project_id = event
+        .payload
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "averin.use event payload missing frozen project_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
+    let session_id = event
+        .payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "averin.use event payload missing frozen session_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
+    let resource_id = event
+        .payload
+        .get("resource_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "averin.use event payload missing frozen resource_id (fail-closed — never \
+             substitute live config)"
+                .to_string()
+        })?
+        .to_string();
 
     let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
     let use_pop = crate::averin::build_use_pop(
         &keypair,
         &capability,
         &grant_id,
-        &averin_client.config().resource_id,
+        &resource_id,
         &entry.action,
         &params,
         &nonce,
@@ -3441,8 +3586,8 @@ async fn deliver_averin_use(
     // the D5b per-execute idempotency key and the D5c `use_sequence_number`.
     let body = serde_json::json!({
         "idempotency_key": format!("{token_id}:use:{request_id}"),
-        "project_id": averin_client.config().project_id,
-        "session_id": averin_client.config().session_id,
+        "project_id": project_id,
+        "session_id": session_id,
         "capability": capability,
         "use_sig": use_pop.use_sig,
         "action": entry.action,
@@ -3452,8 +3597,10 @@ async fn deliver_averin_use(
         "use_sequence_number": use_sequence_number,
     });
 
+    // Codex re-review #6 — route the `?project=` auth query by the FROZEN `project_id`, not live
+    // config, so a retry after the deployment's project changed stays byte-identical (body AND query).
     averin_client
-        .post("/v2/use", &body)
+        .post_for_project("/v2/use", &body, &project_id)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -3540,7 +3687,8 @@ pub async fn deliver_averin_outbox_once(
                 // `already_quarantined = false` always holds at this call site (contrast the GC-tick
                 // retry-sweep below, which re-visits a record whose quarantine move already succeeded
                 // in an earlier pass and must NOT re-upsert it).
-                quarantine_and_reclaim_dead_letter(final_event, queue, quarantine, false).await;
+                quarantine_and_reclaim_dead_letter(final_event, queue, popkeys, quarantine, false)
+                    .await;
             }
             Ok(false) => {}
             Err(e) => {
@@ -3577,11 +3725,50 @@ pub async fn deliver_averin_outbox_once(
 async fn quarantine_and_reclaim_dead_letter(
     event: crate::outbox::OutboxEvent,
     queue: &crate::storage::AverinQueue,
+    popkeys: &crate::storage::PopKeyStore,
     quarantine: &crate::storage::AverinDeadLetterStore,
     already_quarantined: bool,
 ) {
     let sequence = event.sequence;
     let subject = event.subject.clone();
+
+    // FIX 2 (Codex HIGH — undelivered-grant PoP seeds leak forever), CORRECTED (R3-B Codex 3rd-pass
+    // H1): a permanently dead-lettered GRANT means this subject can NEVER be sealed, so its
+    // `PopKeyEntry.grant_expires_at` stays `None` forever and `PopKeyStore::evict_resolved` (which
+    // reclaims on `abandoned || grant_expires_at <= now`) would never reclaim its `pop_seed` — an
+    // unbounded seed leak. Mark the subject `abandoned` here so the next popkey GC tick can evict its
+    // seed (fail-closed toward NOT leaking; releasing a dead subject's seed is correct — the grant
+    // that would have needed it is gone). `averin.use` dead-letters are untouched: their subject's
+    // grant DID deliver and the use may be replayed by an operator, which still needs the seed.
+    //
+    // ORDERING IS LOAD-BEARING: a `mark_abandoned` failure must NOT fall through to quarantine +
+    // reclaim below. Once `reclaim_dead_letter` runs, the record leaves the live queue and
+    // `dead_lettered_events()` never returns it again — the GC retry-sweep (the ONLY thing that ever
+    // retries a terminal `DeadLettered` record) would never re-visit it, so a mark failure on this
+    // exact transient-storage-error path would leave the popkey entry with neither `abandoned` nor a
+    // `grant_expires_at`, leaking its seed forever. So: on `Err`, log and return EARLY, exactly like
+    // the quarantine-write failure branch below — the grant stays `DeadLettered`-but-unreclaimed in
+    // the live queue, the retry-sweep re-visits it next tick, and only once `mark_abandoned` SUCCEEDS
+    // does it proceed to quarantine + reclaim. This guarantees the subject is durably `abandoned`
+    // (seed accounted-for) BEFORE the grant ever leaves the sweep's view. `mark_abandoned` is also
+    // idempotent (a no-op once the flag is set / the entry is gone), so a straggler re-visited after
+    // an EARLIER successful mark re-marks harmlessly.
+    if event.event_type == "averin.grant" {
+        if let Err(e) = popkeys.mark_abandoned(&subject).await {
+            warn!(
+                target: "averin_seal",
+                error = %e,
+                sequence,
+                subject = %subject,
+                "failed to mark a dead-lettered grant's subject abandoned; leaving it DeadLettered-\
+                 but-unreclaimed in the active queue so the next GC tick's retry-sweep re-attempts \
+                 the mark (fail-closed: reclaiming before the mark succeeds would strand the PoP \
+                 seed forever, since a reclaimed grant never re-appears in dead_lettered_events())"
+            );
+            return;
+        }
+    }
+
     if !already_quarantined {
         if let Err(qe) = quarantine.quarantine(event, chrono::Utc::now()).await {
             // Never propagated via `?`: a quarantine-move failure must not abort the rest of the
@@ -3659,14 +3846,25 @@ pub async fn deliver_averin_outbox_periodically(
 ///    move and/or reclaim failed in an earlier pass — see [`quarantine_and_reclaim_dead_letter`]'s
 ///    doc) gets that move re-attempted, fail-closed against clobbering an operator's quarantine
 ///    decision ([`AverinDeadLetterStore::contains`] gates a redundant re-quarantine).
-/// 3. **The bounded-growth alarm** (D0, carried over from `OutboxStore::gc`): a non-zero
+/// 3. **Delivered-prefix prune** (Codex HIGH-3 on plan 088): [`AverinQueue::prune_delivered_prefix`]
+///    durably drops the contiguous run of terminal-`Delivered` records past the retention window —
+///    before this fix, nothing ever pruned a successfully-delivered record (only a dead-lettered-then-
+///    reclaimed one left the map), so every successful use's raw `params` were retained, and
+///    re-replayed, forever. Runs AFTER the retry-sweep above so a dead-letter reclaimed earlier in
+///    THIS SAME tick already frees its gap in the map, letting the prefix scan continue past it onto
+///    any later terminal-`Delivered` records instead of stopping one tick early.
+/// 4. **The bounded-growth alarm** (D0, carried over from `OutboxStore::gc`): a non-zero
 ///    [`AverinQueue::stuck_undelivered_count`] means delivery is stalled and the journal is growing.
-/// 4. **The quarantine's own bounded sensitive-data retention** (D4): redact raw `params` past the
+/// 5. **The quarantine's own bounded sensitive-data retention** (D4): redact raw `params` past the
 ///    window, independent of whatever the queue side is doing.
-/// 5. **Cross-store popkey eviction** (D2): `PopKeyStore::evict_resolved` with the REAL
-///    `subject_has_live_use`/`subject_has_replayable_dead_letter` predicates — both fail closed
-///    toward retention (an unreadable quarantine listing skips eviction for this tick entirely rather
-///    than guess; `AverinQueue::has_pending_for_subject` cannot fail, it is a pure in-memory read).
+/// 6. **Cross-store popkey eviction** (D2, Codex HIGH-4 corrected): `PopKeyStore::evict_resolved`
+///    with this tick's `now` and the REAL `subject_has_live_use`/`subject_has_replayable_dead_letter`
+///    predicates — both fail closed toward retention (an unreadable quarantine listing skips eviction
+///    for this tick entirely rather than guess; `AverinQueue::has_pending_for_subject` cannot fail, it
+///    is a pure in-memory read). A delivered-but-unexpired grant is never a candidate here regardless
+///    of `now` — only `grant_expires_at <= now` (or `abandoned`) makes one, so a token that simply has
+///    no use pending RIGHT NOW (a delayed first execute, or between uses of a bounded-reuse token)
+///    keeps its seed.
 async fn run_averin_gc_tick(
     queue: &crate::storage::AverinQueue,
     popkeys: &crate::storage::PopKeyStore,
@@ -3696,10 +3894,22 @@ async fn run_averin_gc_tick(
                 continue;
             }
         };
-        quarantine_and_reclaim_dead_letter(event, queue, quarantine, already_quarantined).await;
+        quarantine_and_reclaim_dead_letter(event, queue, popkeys, quarantine, already_quarantined)
+            .await;
     }
 
-    // 3. The bounded-growth alarm (D0), carried over from `OutboxStore::gc`'s alarm contract.
+    // 3. Delivered-prefix prune (Codex HIGH-3): bound the disk/replay growth from records nothing
+    // else ever prunes. Reuses the same retention window as the stuck-undelivered alarm below,
+    // mirroring `OutboxStore::gc`'s own single-`retention_secs` contract.
+    match run_averin_queue_blocking(|| queue.prune_delivered_prefix(AVERIN_QUEUE_RETENTION_SECS)) {
+        Ok(0) => {}
+        Ok(pruned) => {
+            info!(pruned, "averin durable queue pruned its delivered-prefix past the retention window")
+        }
+        Err(e) => warn!(error = %e, "averin durable queue delivered-prefix prune failed"),
+    }
+
+    // 4. The bounded-growth alarm (D0), carried over from `OutboxStore::gc`'s alarm contract.
     let stuck = run_averin_queue_blocking(|| queue.stuck_undelivered_count(AVERIN_QUEUE_RETENTION_SECS));
     if stuck > 0 {
         warn!(
@@ -3710,7 +3920,7 @@ async fn run_averin_gc_tick(
         );
     }
 
-    // 4. The quarantine's own bounded sensitive-data retention (D4) — independent of the queue side.
+    // 5. The quarantine's own bounded sensitive-data retention (D4) — independent of the queue side.
     let now = chrono::Utc::now();
     if let Some(before) = chrono::Duration::try_seconds(AVERIN_QUARANTINE_PARAMS_RETENTION_SECS as i64)
         .and_then(|d| now.checked_sub_signed(d))
@@ -3722,7 +3932,7 @@ async fn run_averin_gc_tick(
         }
     }
 
-    // 5. Cross-store popkey eviction (D2) — the real queue/quarantine predicates, fail-closed toward
+    // 6. Cross-store popkey eviction (D2) — the real queue/quarantine predicates, fail-closed toward
     // retention. `quarantine.list()` is fetched ONCE up front (not per-candidate inside the closure,
     // which must stay synchronous) and turned into a set of subjects with an OPEN, unpurged (i.e.
     // still `replay`-eligible) record; a listing failure skips eviction entirely THIS tick rather than
@@ -3732,7 +3942,17 @@ async fn run_averin_gc_tick(
         Ok(records) => Some(
             records
                 .into_iter()
-                .filter(|r| r.status == crate::storage::QuarantineStatus::Open && !r.params_purged)
+                .filter(|r| {
+                    r.status == crate::storage::QuarantineStatus::Open
+                        && !r.params_purged
+                        // FIX 2: a dead-lettered GRANT does NOT retain its subject's seed. Its
+                        // subject was marked `abandoned` at dead-letter time (it can never be sealed,
+                        // so its seed is intentionally releasable) — counting its OWN quarantine
+                        // record as a "replayable dead-letter" here would re-block eviction via rule
+                        // (c) and defeat the abandon. Only a dead-lettered `averin.use` keeps its
+                        // seed retained for a possible operator replay of that use.
+                        && r.event.event_type != "averin.grant"
+                })
                 .map(|r| r.event.subject)
                 .collect(),
         ),
@@ -3749,7 +3969,7 @@ async fn run_averin_gc_tick(
         let subject_has_live_use = |subject: &str| queue.has_pending_for_subject(subject);
         let subject_has_replayable_dead_letter = |subject: &str| replayable_subjects.contains(subject);
         match popkeys
-            .evict_resolved(subject_has_live_use, subject_has_replayable_dead_letter)
+            .evict_resolved(now, subject_has_live_use, subject_has_replayable_dead_letter)
             .await
         {
             Ok(0) => {}
@@ -4148,6 +4368,10 @@ mod averin_worker_tests {
         /// a MATCHING body is an honest retry (return the same record, `idempotent: true`); a
         /// repeat key with a DIFFERENT body is the real 409 conflict (`:1994`/`:2035`).
         use_by_idempotency_key: parking_lot::Mutex<HashMap<String, (serde_json::Value, String)>>,
+        /// Codex re-review #6 — the value of the `?project=` auth ROUTING query on every `/v2/use`
+        /// call, IN ORDER, so a test can assert the durable worker routes by the FROZEN project, not
+        /// live config. Empty when the client carries no API key (no `?project=` is sent then).
+        use_query_projects: parking_lot::Mutex<Vec<String>>,
     }
 
     async fn fake_grants(
@@ -4183,8 +4407,14 @@ mod averin_worker_tests {
 
     async fn fake_use(
         State(state): State<Arc<FakeAverinState>>,
+        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
         Json(body): Json<serde_json::Value>,
     ) -> (StatusCode, Json<serde_json::Value>) {
+        // Codex re-review #6 — record the routing project the transport put on `?project=` (present
+        // only when the client has an API key). A non-body extractor, so it precedes `Json`.
+        if let Some(project) = query.get("project") {
+            state.use_query_projects.lock().push(project.clone());
+        }
         let action = body
             .get("action")
             .and_then(|v| v.as_str())
@@ -4303,6 +4533,26 @@ mod averin_worker_tests {
             "params_nonce": "ab".repeat(32),
             "request_id": request_id,
             "use_sequence_number": use_sequence_number,
+            // Codex re-review #6 — the frozen routing/identity fields `seal_after_consume`'s durable
+            // branch writes at enqueue. `deliver_averin_use` now reads them FAIL-CLOSED (no live-config
+            // fallback), so a test event must carry them exactly as production does. Values match
+            // `test_client`'s config (default project/session + the "orders-db" resource).
+            "project_id": "vultrino",
+            "session_id": "vultrino-seal",
+            "resource_id": "orders-db",
+        })
+    }
+
+    /// Codex re-review #6 — the frozen fields `enqueue_durable_mint_grant` writes into every
+    /// `"averin.grant"` event at enqueue. `deliver_averin_grant` reads them FAIL-CLOSED, so a test
+    /// grant event must carry them (production never enqueues a `{}` grant). Values match
+    /// `test_client`'s config (default project/session + `grant_ttl_secs`, "orders-db" resource).
+    fn grant_payload() -> serde_json::Value {
+        serde_json::json!({
+            "project_id": "vultrino",
+            "session_id": "vultrino-seal",
+            "resource_id": "orders-db",
+            "grant_ttl_secs": 300,
         })
     }
 
@@ -4318,7 +4568,7 @@ mod averin_worker_tests {
             .await
             .unwrap();
         let grant_seq = queue
-            .append("tok-1", "averin.grant", serde_json::json!({}))
+            .append("tok-1", "averin.grant", grant_payload())
             .unwrap();
         let use_seq = queue
             .append("tok-1", "averin.use", use_payload("hello-world", "req-1", 1))
@@ -4382,7 +4632,7 @@ mod averin_worker_tests {
             .await
             .unwrap();
         queue
-            .append("tok-2", "averin.grant", serde_json::json!({}))
+            .append("tok-2", "averin.grant", grant_payload())
             .unwrap();
         queue
             .append("tok-2", "averin.use", use_payload("p", "req-2", 1))
@@ -4433,7 +4683,7 @@ mod averin_worker_tests {
             .await
             .unwrap();
         queue
-            .append("tok-2b", "averin.grant", serde_json::json!({}))
+            .append("tok-2b", "averin.grant", grant_payload())
             .unwrap();
         queue
             .append("tok-2b", "averin.use", use_payload("p", "req-2b", 1))
@@ -4463,7 +4713,7 @@ mod averin_worker_tests {
                 .await
                 .unwrap();
             queue
-                .append(subject, "averin.grant", serde_json::json!({}))
+                .append(subject, "averin.grant", grant_payload())
                 .unwrap();
             queue
                 .append(
@@ -4523,7 +4773,7 @@ mod averin_worker_tests {
             .await
             .unwrap();
         queue
-            .append("normal", "averin.grant", serde_json::json!({}))
+            .append("normal", "averin.grant", grant_payload())
             .unwrap();
 
         deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 8)
@@ -4631,6 +4881,262 @@ mod averin_worker_tests {
         );
     }
 
+    /// Codex HIGH-6 fix — a retry of the SAME `"averin.use"` event must stay idempotent even when
+    /// the LIVE `[averin]` config has since changed (e.g. a redeploy/reload rotating
+    /// `project_id`/`session_id`/`resource_id`) between the first delivery attempt and the retry.
+    /// Before this fix, `deliver_averin_use` re-read those three fields from LIVE `av.config()` at
+    /// delivery time; `resource_id` in particular feeds the SIGNED use-PoP challenge, so rebuilding
+    /// under a config that had since changed would reproduce a DIFFERENT body/`use_sig` under the
+    /// SAME idempotency key, and the fake (mirroring averin's real `storedUseMatchesRequest`)
+    /// would return 409 — wrongly treating an honest retry as a conflicting one and dead-lettering
+    /// an already-sealed use. This constructs a SECOND `AverinClient` against the SAME fake averin
+    /// but with DIFFERENT `project_id`/`session_id`/`resource_id`, simulating exactly that kind of
+    /// live config drift, and asserts the second delivery reproduces the FIRST attempt's
+    /// body/`use_sig` byte-for-byte (an idempotent 200 replay), never a 409.
+    #[tokio::test]
+    async fn averin_worker_use_retry_survives_live_config_drift_stays_idempotent_not_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_queue, popkeys, _deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+
+        // The client whose config was live at ENQUEUE time — its project_id/session_id/
+        // resource_id get frozen into the event payload below, exactly as `seal_after_consume`'s
+        // durable branch freezes them (the fix under test).
+        let client_a = test_client(&base_url);
+
+        popkeys
+            .insert("tok-drift", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        popkeys
+            .grant_resolved(
+                "tok-drift",
+                "AAAA.sig".to_string(),
+                "grant-drift".to_string(),
+                chrono::Utc::now(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The event as `seal_after_consume`'s durable branch would build it post-fix: the D5
+        // nonces PLUS project_id/session_id/resource_id frozen from client_a's config.
+        let mut payload = use_payload("hello-drift", "req-drift", 1);
+        payload["project_id"] = serde_json::json!(client_a.config().project_id);
+        payload["session_id"] = serde_json::json!(client_a.config().session_id);
+        payload["resource_id"] = serde_json::json!(client_a.config().resource_id);
+
+        let event = OutboxEvent {
+            sequence: 1,
+            subject: "tok-drift".to_string(),
+            event_type: "averin.use".to_string(),
+            payload,
+            created_at: chrono::Utc::now(),
+            delivery: DeliveryState::Pending,
+            attempts: 0,
+            leased_until: None,
+            last_attempt_at: None,
+            last_error: None,
+            dedup_id: None,
+        };
+
+        deliver_averin_use(&event, &popkeys, &client_a)
+            .await
+            .expect("first delivery succeeds");
+
+        // Simulate live config drift: a second client, same fake averin, but DIFFERENT
+        // project_id/session_id/resource_id — the exact scenario Codex HIGH-6 flagged (a config
+        // reload/redeploy between enqueue and a later retry of the same durable event).
+        let client_b = AverinClient::new(AverinConfig {
+            enabled: true,
+            base_url: base_url.clone(),
+            project_id: "a-totally-different-project".to_string(),
+            session_id: "a-totally-different-session".to_string(),
+            resource_id: "a-totally-different-resource".to_string(),
+            ..AverinConfig::default()
+        })
+        .expect("client builds")
+        .expect("client is Some when enabled");
+        assert_ne!(client_a.config().resource_id, client_b.config().resource_id);
+        assert_ne!(client_a.config().session_id, client_b.config().session_id);
+
+        deliver_averin_use(&event, &popkeys, &client_b)
+            .await
+            .expect(
+                "a retry of the SAME event must ALSO succeed even though the live client's \
+                 config has since changed (idempotent, not a 409)",
+            );
+
+        let bodies = fake.use_request_bodies.lock().clone();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "both attempts reached the fake averin: {bodies:?}"
+        );
+        assert_eq!(
+            bodies[0], bodies[1],
+            "a retry of the SAME event must produce a byte-identical POST body regardless of \
+             what the LIVE client's config looks like at retry time — the whole point of \
+             freezing project_id/session_id/resource_id into the event at enqueue (Codex HIGH-6)"
+        );
+        let use_calls = fake
+            .call_log
+            .lock()
+            .iter()
+            .filter(|l| l.starts_with("use:"))
+            .count();
+        assert_eq!(
+            use_calls, 1,
+            "the retry must dedup at averin, not mint a second record (would be a 409 pre-fix)"
+        );
+    }
+
+    /// Codex re-review #6 — the ROUTING-query freeze (the companion to the BODY freeze above). A
+    /// prior fix froze the request BODY's `project_id`, but the shared transport still built the
+    /// authenticated `?project=` query from LIVE `self.cfg.project_id`. So a durable use retried
+    /// after the deployment's `project_id` changed carried the FROZEN old project in its body while
+    /// being ROUTED to the NEW live project — mis-routed (wrong tenant) or 409, never byte-identical.
+    /// This asserts the worker routes `?project=` by the STORED (frozen) project, not the live
+    /// config's changed one: an `AverinClient` whose live `project_id` is DIFFERENT from the event's
+    /// frozen `project_id` (and which carries an API key, so `?project=` is actually emitted) must
+    /// still send the FROZEN project on the routing query.
+    #[tokio::test]
+    async fn averin_worker_use_routes_by_stored_project_not_live_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_queue, popkeys, _deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+
+        popkeys
+            .insert("tok-route", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        popkeys
+            .grant_resolved(
+                "tok-route",
+                "AAAA.sig".to_string(),
+                "grant-route".to_string(),
+                chrono::Utc::now(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The event as it was FROZEN at enqueue: its own project_id, captured then.
+        let mut payload = use_payload("hello-route", "req-route", 1);
+        payload["project_id"] = serde_json::json!("proj-frozen-at-enqueue");
+        let event = OutboxEvent {
+            sequence: 1,
+            subject: "tok-route".to_string(),
+            event_type: "averin.use".to_string(),
+            payload,
+            created_at: chrono::Utc::now(),
+            delivery: DeliveryState::Pending,
+            attempts: 0,
+            leased_until: None,
+            last_attempt_at: None,
+            last_error: None,
+            dedup_id: None,
+        };
+
+        // The LIVE client's config has a DIFFERENT project_id (a deployment change since enqueue),
+        // plus an API key so the transport actually emits the `?project=` auth query.
+        let client_live = AverinClient::new(AverinConfig {
+            enabled: true,
+            base_url: base_url.clone(),
+            project_id: "proj-live-changed".to_string(),
+            resource_id: "orders-db".to_string(),
+            api_key: Some("test-key".to_string()),
+            ..AverinConfig::default()
+        })
+        .expect("client builds")
+        .expect("client is Some when enabled");
+
+        deliver_averin_use(&event, &popkeys, &client_live)
+            .await
+            .expect("delivery succeeds");
+
+        let projects = fake.use_query_projects.lock().clone();
+        assert_eq!(
+            projects,
+            vec!["proj-frozen-at-enqueue".to_string()],
+            "the durable use must route ?project= by the STORED (frozen) project, never the live \
+             config's changed project_id: {projects:?}"
+        );
+        assert!(
+            !projects.iter().any(|p| p == "proj-live-changed"),
+            "the live config's changed project_id must NEVER appear on the routing query"
+        );
+    }
+
+    /// Codex re-review #6 — the FAIL-CLOSED stored-field read (replacing the live-config fallback
+    /// that re-reproduced the 409). durable is default-OFF and unreleased, so no legacy field-less
+    /// event exists; a `"averin.use"` event MISSING its frozen `project_id` is a real defect that
+    /// must FAIL the delivery (so it retries/dead-letters visibly), NEVER be papered over by silently
+    /// substituting live `av.config().project_id` (which, on a config change, is exactly what
+    /// reproduced the original mis-route/409).
+    #[tokio::test]
+    async fn averin_worker_use_missing_frozen_project_id_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_queue, popkeys, _deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+
+        popkeys
+            .insert("tok-missing", popkey_entry("db.query:orders-ro", "read:orders"))
+            .await
+            .unwrap();
+        popkeys
+            .grant_resolved(
+                "tok-missing",
+                "AAAA.sig".to_string(),
+                "grant-missing".to_string(),
+                chrono::Utc::now(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A well-formed use event with every field EXCEPT the frozen project_id.
+        let mut payload = use_payload("hello-missing", "req-missing", 1);
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("project_id")
+            .expect("use_payload seeds project_id");
+        let event = OutboxEvent {
+            sequence: 1,
+            subject: "tok-missing".to_string(),
+            event_type: "averin.use".to_string(),
+            payload,
+            created_at: chrono::Utc::now(),
+            delivery: DeliveryState::Pending,
+            attempts: 0,
+            leased_until: None,
+            last_attempt_at: None,
+            last_error: None,
+            dedup_id: None,
+        };
+
+        let err = deliver_averin_use(&event, &popkeys, &client)
+            .await
+            .expect_err(
+                "a use event missing its frozen project_id must FAIL the delivery, not fall back \
+                 to live config",
+            );
+        assert!(
+            err.contains("project_id"),
+            "the error must name the missing frozen field (fail-closed, not a silent substitution): \
+             {err}"
+        );
+        // Nothing reached averin — the delivery failed BEFORE the POST, so no record was minted
+        // under a wrong/substituted project.
+        assert!(
+            fake.call_log.lock().is_empty(),
+            "a fail-closed missing-field delivery must never reach averin: {:?}",
+            fake.call_log.lock()
+        );
+    }
+
     /// Plan 088 Step 4 (D5b/D5c) — a bounded-reuse (`--uses N`) token's DISTINCT executes (each
     /// with its own `request_id`) must land at averin as DISTINCT idempotency keys carrying
     /// their correct 1-based `use_sequence_number` — never collapsed into one record the way the
@@ -4648,7 +5154,7 @@ mod averin_worker_tests {
             .await
             .unwrap();
         queue
-            .append("tok-multi", "averin.grant", serde_json::json!({}))
+            .append("tok-multi", "averin.grant", grant_payload())
             .unwrap();
         queue
             .append("tok-multi", "averin.use", use_payload("p1", "req-1", 1))
@@ -4710,7 +5216,7 @@ mod averin_worker_tests {
             .insert("tok-fail", popkey_entry("action-fail", "read:orders"))
             .await
             .unwrap();
-        queue.append("tok-fail", "averin.grant", serde_json::json!({})).unwrap();
+        queue.append("tok-fail", "averin.grant", grant_payload()).unwrap();
         let use_seq = queue
             .append(
                 "tok-fail",
@@ -4756,7 +5262,7 @@ mod averin_worker_tests {
             .insert("tok-sweep", popkey_entry("action-sweep", "read:orders"))
             .await
             .unwrap();
-        queue.append("tok-sweep", "averin.grant", serde_json::json!({})).unwrap();
+        queue.append("tok-sweep", "averin.grant", grant_payload()).unwrap();
         let use_seq = queue
             .append("tok-sweep", "averin.use", use_payload("SWEEP_SECRET", "req-sweep", 1))
             .unwrap();
@@ -4793,37 +5299,44 @@ mod averin_worker_tests {
         );
     }
 
-    /// The GC tick's cross-store popkey eviction (D2), exercised against the REAL queue + quarantine
-    /// predicates the tick wires up (not the injected test closures `PopKeyStore`'s own unit tests
-    /// use): a resolved subject's seed is evicted ONLY when the queue has no live use AND the
-    /// quarantine has no replayable dead-letter for it — fail-closed toward retention otherwise.
+    /// The GC tick's cross-store popkey eviction (D2, Codex HIGH-4 corrected), exercised against the
+    /// REAL queue + quarantine predicates the tick wires up (not the injected test closures
+    /// `PopKeyStore`'s own unit tests use): a resolved subject's seed is evicted ONLY when its grant
+    /// has EXPIRED (or the subject is abandoned) AND the queue has no live use AND the quarantine has
+    /// no replayable dead-letter for it — fail-closed toward retention otherwise. Each grant below is
+    /// resolved with an ALREADY-EXPIRED `grant_expires_at` (rather than `None`) so it qualifies as a
+    /// candidate under the corrected rule; a still-valid (unexpired) grant is covered by
+    /// `PopKeyStore`'s own `eviction_retains_a_delivered_but_unexpired_grant_with_no_pending_use` unit
+    /// test instead.
     #[tokio::test]
     async fn averin_gc_tick_evicts_popkey_seed_only_when_fully_resolved_with_no_blockers() {
         let dir = tempfile::tempdir().unwrap();
         let (queue, popkeys, deadletter) = test_stores(dir.path());
         let now = chrono::Utc::now();
+        let already_expired = Some(now - chrono::Duration::seconds(1));
 
-        // A: grant resolved, no queue entry at all, no quarantine entry -> fully resolved, no
-        // blockers -> the tick must evict it.
+        // A: grant resolved and EXPIRED, no queue entry at all, no quarantine entry -> fully
+        // resolved, no blockers -> the tick must evict it.
         popkeys.insert("A", popkey_entry("action-a", "read:orders")).await.unwrap();
         popkeys
-            .grant_resolved("A", "cap-a".into(), "grant-a".into(), now, None)
+            .grant_resolved("A", "cap-a".into(), "grant-a".into(), now, already_expired)
             .await
             .unwrap();
 
-        // B: grant resolved, but a Pending use still sits in the queue -> a live use blocks eviction.
+        // B: grant resolved and EXPIRED, but a Pending use still sits in the queue -> a live use
+        // blocks eviction.
         popkeys.insert("B", popkey_entry("action-b", "read:orders")).await.unwrap();
         popkeys
-            .grant_resolved("B", "cap-b".into(), "grant-b".into(), now, None)
+            .grant_resolved("B", "cap-b".into(), "grant-b".into(), now, already_expired)
             .await
             .unwrap();
         queue.append("B", "averin.use", use_payload("pb", "req-b", 1)).unwrap();
 
-        // C: grant resolved, no live use in the queue, but an OPEN unpurged quarantine record exists
-        // for it -> a replayable dead-letter blocks eviction.
+        // C: grant resolved and EXPIRED, no live use in the queue, but an OPEN unpurged quarantine
+        // record exists for it -> a replayable dead-letter blocks eviction.
         popkeys.insert("C", popkey_entry("action-c", "read:orders")).await.unwrap();
         popkeys
-            .grant_resolved("C", "cap-c".into(), "grant-c".into(), now, None)
+            .grant_resolved("C", "cap-c".into(), "grant-c".into(), now, already_expired)
             .await
             .unwrap();
         deadletter
@@ -4849,15 +5362,177 @@ mod averin_worker_tests {
         // D: the grant never delivered (not resolved, not abandoned) -> never even a candidate.
         popkeys.insert("D", popkey_entry("action-d", "read:orders")).await.unwrap();
 
+        // E (Codex HIGH-4 regression, exercised through the FULL tick, not just the unit-level
+        // predicates): grant delivered but NOT yet expired, no live use, no quarantine record ->
+        // must NOT be evicted. Before the fix, "delivered + nothing pending" alone was enough to
+        // evict this, which would have dead-lettered a delayed/later use of this same token.
+        popkeys.insert("E", popkey_entry("action-e", "read:orders")).await.unwrap();
+        popkeys
+            .grant_resolved(
+                "E",
+                "cap-e".into(),
+                "grant-e".into(),
+                now,
+                Some(now + chrono::Duration::hours(1)),
+            )
+            .await
+            .unwrap();
+
         run_averin_gc_tick(&queue, &popkeys, &deadletter).await;
 
-        assert!(popkeys.get("A").await.unwrap().is_none(), "A: fully resolved, no blockers -> evicted");
+        assert!(popkeys.get("A").await.unwrap().is_none(), "A: expired, no blockers -> evicted");
         assert!(popkeys.get("B").await.unwrap().is_some(), "B: a live use must block eviction");
         assert!(
             popkeys.get("C").await.unwrap().is_some(),
             "C: a replayable dead-letter must block eviction"
         );
         assert!(popkeys.get("D").await.unwrap().is_some(), "D: never resolved -> never evicted");
+        assert!(
+            popkeys.get("E").await.unwrap().is_some(),
+            "E: delivered but not yet expired, nothing pending -> must be RETAINED (Codex HIGH-4)"
+        );
+    }
+
+    /// FIX 2 (Codex HIGH — undelivered-grant PoP seeds leak forever): a grant that PERMANENTLY
+    /// dead-letters never sets `grant_expires_at` (it never delivered), so the seed-expiry eviction
+    /// rule alone would retain its `pop_seed` forever. The dead-letter transition must therefore mark
+    /// the subject `abandoned` so the next popkey GC tick evicts the seed. This drives the REAL worker
+    /// pass (forcing the grant to fail) + the REAL GC tick — no injected closures.
+    #[tokio::test]
+    async fn dead_lettered_grant_marks_subject_abandoned_and_gc_evicts_its_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+
+        let token_id = "tok-grant-dl";
+        // `deliver_averin_grant` derives `agent_id = "vultrino:{token_id}"`; fail that agent's grant so
+        // the grant POST always 500s and dead-letters.
+        fake.fail_grant_agents
+            .lock()
+            .insert(format!("vultrino:{token_id}"));
+
+        popkeys
+            .insert(token_id, popkey_entry("action-dl", "read:orders"))
+            .await
+            .unwrap();
+        queue
+            .append(token_id, "averin.grant", grant_payload())
+            .unwrap();
+
+        // max_attempts = 1: the first failed attempt dead-letters the grant, which (FIX 2) marks the
+        // subject abandoned and moves the record to quarantine.
+        deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 1)
+            .await
+            .unwrap();
+
+        let after_dl = popkeys.get(token_id).await.unwrap().expect("entry still present pre-GC");
+        assert!(
+            after_dl.abandoned,
+            "a permanently dead-lettered grant must mark its subject abandoned"
+        );
+        assert!(
+            after_dl.grant_expires_at.is_none(),
+            "the grant never delivered, so grant_expires_at stays None — the seed-expiry rule alone \
+             could NEVER reclaim this seed; only the abandoned flag can (the leak this fix closes)"
+        );
+
+        // The next GC tick must now evict the seed: abandoned (rule a), no live use (rule b — the grant
+        // was reclaimed from the queue), and the grant's own quarantine record does NOT count as a
+        // replayable dead-letter (rule c — grants don't retain seeds).
+        run_averin_gc_tick(&queue, &popkeys, &deadletter).await;
+        assert!(
+            popkeys.get(token_id).await.unwrap().is_none(),
+            "the GC tick must evict the abandoned dead-lettered grant's PoP seed (no unbounded leak)"
+        );
+    }
+
+    /// R3-B (Codex 3rd-pass H1): the ordering fix in `quarantine_and_reclaim_dead_letter` — a
+    /// `mark_abandoned` failure must NOT fall through to quarantine+reclaim, or the grant would leave
+    /// `dead_lettered_events()` forever with its subject neither `abandoned` nor `grant_expires_at`-
+    /// bearing, leaking its PoP seed for good. Forces a REAL `mark_abandoned` error (not a mock) by
+    /// pointing a SECOND `PopKeyStore` at the SAME on-disk file under the WRONG master key: the file
+    /// already holds the real entry (written by the correct-key `popkeys` below), so the wrong-key
+    /// store's read-before-write decrypt genuinely fails — `mark_abandoned` returns `Err` without
+    /// touching the file, exactly like a transient storage error would. Drives
+    /// `quarantine_and_reclaim_dead_letter` directly (the function under fix) rather than the whole
+    /// worker pass, so the assertions land squarely on its contract.
+    #[tokio::test]
+    async fn dead_lettered_grant_whose_mark_abandoned_fails_stays_unreclaimed_until_a_retry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let subject = "tok-mark-fail";
+
+        popkeys
+            .insert(subject, popkey_entry("action-mark-fail", "read:orders"))
+            .await
+            .unwrap();
+        let seq = queue.append(subject, "averin.grant", grant_payload()).unwrap();
+        // Dead-letter it in one shot: max_attempts=1 -> the first recorded failure is terminal.
+        queue.claim(10, 1).unwrap();
+        queue
+            .record_delivery(seq, false, Some("forced failure".to_string()), 1)
+            .unwrap();
+        let dead_lettered_event = queue.get(seq).expect("still in the queue, now DeadLettered");
+        assert_eq!(dead_lettered_event.delivery, DeliveryState::DeadLettered);
+
+        // A SEPARATE store instance over the identical path, keyed wrong — decrypting the
+        // already-written (correct-key) file will genuinely fail.
+        let wrong_key = Arc::new(MasterKey::from_bytes(vec![9u8; 32]).unwrap());
+        let broken_popkeys = PopKeyStore::new(dir.path().join("averin-popkeys.enc"), wrong_key);
+        assert!(
+            broken_popkeys.mark_abandoned(subject).await.is_err(),
+            "sanity check: the wrong-key store must fail to even read the existing entry"
+        );
+
+        quarantine_and_reclaim_dead_letter(
+            dead_lettered_event.clone(),
+            &queue,
+            &broken_popkeys,
+            &deadletter,
+            false,
+        )
+        .await;
+
+        // Fail-closed: NOT quarantined, NOT reclaimed, NOT abandoned — a straggler the retry-sweep
+        // will see again next tick, exactly like a failed quarantine-move.
+        assert!(
+            queue
+                .dead_lettered_events()
+                .iter()
+                .any(|e| e.sequence == seq),
+            "a mark_abandoned failure must leave the grant sitting in dead_lettered_events() so the \
+             GC retry-sweep re-visits it — this is the only thing that ever retries a terminal \
+             DeadLettered record"
+        );
+        assert_eq!(
+            queue.get(seq).map(|e| e.delivery),
+            Some(DeliveryState::DeadLettered),
+            "must not be reclaimed from the active queue when the mark failed"
+        );
+        assert!(
+            !deadletter.contains(seq).await.unwrap(),
+            "must not be quarantined when the mark failed (quarantining before the mark succeeds is \
+             exactly the ordering bug: reclaim would then hide it from the retry-sweep forever)"
+        );
+        assert!(
+            !popkeys.get(subject).await.unwrap().unwrap().abandoned,
+            "the subject must not be abandoned when mark_abandoned itself failed"
+        );
+
+        // Retry with a WORKING popkeys store (as the GC retry-sweep would do on its next tick): this
+        // time mark_abandoned succeeds, so the grant proceeds all the way through quarantine+reclaim.
+        quarantine_and_reclaim_dead_letter(dead_lettered_event, &queue, &popkeys, &deadletter, false)
+            .await;
+        assert!(
+            popkeys.get(subject).await.unwrap().unwrap().abandoned,
+            "a successful retry must mark the subject abandoned"
+        );
+        assert!(queue.get(seq).is_none(), "a successful retry must reclaim the grant from the queue");
+        assert!(
+            deadletter.contains(seq).await.unwrap(),
+            "a successful retry must quarantine the grant"
+        );
     }
 
     /// Plan 088 D8's headline test: a `vultrino rekey` must carry a PENDING averin grant+use (and the
@@ -5433,6 +6108,59 @@ mod durable_enqueue_tests {
                 .as_str()
                 .is_some_and(|s| s.len() == 64),
             "params_nonce must be the 64-lowercase-hex shape pop::params_commitment expects"
+        );
+    }
+
+    /// Codex MED-7 fix — the durable Observe enqueue must apply the SAME `max_seal_params_bytes`
+    /// cap the 087 async path (`AverinClient::spawn_use_seal`) enforces. Before this fix, the
+    /// durable branch serialized + appended the FULL body unchecked, so an oversize body would be
+    /// durably retained (well above `AverinQueue`'s 8 MiB segment cap) instead of being dropped
+    /// fail-open like every other oversize seal. This drives params one byte over the default
+    /// 128 KiB cap through the REAL `seal_after_consume` durable branch and asserts: nothing is
+    /// enqueued, the drop is counted on the SAME `dropped` metric (never `enqueue_failed` — this is
+    /// a policy drop, not a local I/O failure), and the action still proceeds (`Ok(())`).
+    #[tokio::test]
+    async fn durable_execute_drops_oversize_params_without_enqueuing_action_still_proceeds() {
+        let (server, storage, av) = durable_test_server(
+            true,
+            AverinMode::Observe,
+            "http://127.0.0.1:9",
+            Duration::from_millis(200),
+        )
+        .await;
+
+        let cap = av.config().max_seal_params_bytes;
+        let oversize_params = vec![b'x'; cap + 1];
+        assert_eq!(av.metrics().dropped, 0);
+
+        let result = server
+            .seal_after_consume(&av, "tok-oversize", oversize_params, 1, "req-oversize")
+            .await;
+        assert!(
+            result.is_ok(),
+            "Observe must never return Err, even for an oversize durable seal"
+        );
+
+        assert_eq!(
+            av.metrics().dropped,
+            1,
+            "the oversize durable drop must count on the SAME `dropped` metric \
+             spawn_use_seal's oversize drop uses"
+        );
+        assert_eq!(av.metrics().sealed, 0);
+        assert_eq!(av.metrics().failed, 0);
+        assert_eq!(
+            av.metrics().enqueue_failed,
+            0,
+            "an oversize drop is a POLICY decision, not a D7 local-persistence failure — it must \
+             never touch the enqueue-failure counter"
+        );
+
+        let queue = storage.averin_durable_queue().unwrap();
+        assert!(
+            queue.deliverable(10).is_empty(),
+            "an oversize durable use must never be enqueued at all — not even a truncated or \
+             quarantined record"
         );
     }
 

@@ -464,6 +464,40 @@ impl AverinClient {
         self.metrics.record_enqueue_failed();
     }
 
+    /// Codex MED-7 fix (plan 088) — mirror [`Self::spawn_use_seal`]'s oversize-params drop for the
+    /// DURABLE Observe enqueue (`VultrinoServer::seal_after_consume`, `src/server/mod.rs`). The
+    /// async 087 path never seals params over `max_seal_params_bytes` (averin recomputes the
+    /// commitment from the raw bytes — §5a recompute-or-reject — so there is no
+    /// fixed-size-commitment-only option; oversize must drop, not truncate), but the durable branch
+    /// used to serialize + durably append the FULL body unchecked, retaining an oversize blob far
+    /// above `AverinQueue`'s 8 MiB segment cap. The caller runs this check BEFORE building/appending
+    /// the event: on oversize it counts the SAME `dropped` metric and emits the SAME rate-limited
+    /// `AVERIN-SEAL-DROPPED` alarm (token/project context only, never params) `spawn_use_seal` does,
+    /// then returns `true` so the caller skips the enqueue entirely and lets the action proceed
+    /// fail-open — Observe must never block (or durably retain oversize data) on a params size the
+    /// operator has bounded. Returns `false` when params are within the cap (enqueue proceeds
+    /// normally).
+    pub(crate) fn durable_use_oversize_drop(&self, token_id: &str, params_len: usize) -> bool {
+        if params_len <= self.cfg.max_seal_params_bytes {
+            return false;
+        }
+        self.metrics.record_dropped();
+        if let Some(total) = self.claim_drop_log() {
+            tracing::warn!(
+                target: "averin_seal",
+                token_id,
+                project_id = %self.cfg.project_id,
+                params_bytes = params_len,
+                cap = self.cfg.max_seal_params_bytes,
+                dropped_total = total,
+                "AVERIN-SEAL-DROPPED-oversize durable averin.use enqueue skipped: params exceed \
+                 max_seal_params_bytes (observe/fail-open) — action proceeds, nothing durably \
+                 appended"
+            );
+        }
+        true
+    }
+
     /// Inject a PoP entry so a unit test can exercise `seal_use`/`spawn_use_seal`
     /// against a fake/blocked averin WITHOUT a real `/v2/grants` round-trip. A
     /// capability containing a `.` (e.g. `"AAAA.sig"`) passes `credential_binding`
@@ -783,18 +817,51 @@ impl AverinClient {
     /// grant/use request it rebuilt from a durable queue event + the PoP-key store through the
     /// SAME transport (auth header/query, response-size cap, non-2xx/parse handling) `seal_grant`/
     /// `seal_use` use — reusing the transport, not branching it (D1). No behavior change to any
-    /// existing call site.
+    /// existing call site. The durable worker itself now uses [`Self::post_for_project`] so it can
+    /// route the `?project=` query by the FROZEN project (Codex re-review #6); this variant keeps
+    /// routing by live `self.cfg.project_id` for the synchronous 087 seal path.
     pub(crate) async fn post(
         &self,
         endpoint: &'static str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, AverinError> {
+        // The synchronous 087 seal path (`seal_grant`/`seal_use`/mint): route the authenticated
+        // `?project=` query by LIVE `self.cfg.project_id`. Byte-identical to before the routing-freeze
+        // fix — the live request IS the current deployment's request, so live config is correct here.
+        self.post_inner(endpoint, body, &self.cfg.project_id).await
+    }
+
+    /// Codex re-review #6 (plan 088 r2) — the SAME transport as [`Self::post`], but routing the
+    /// authenticated `?project=` query by an EXPLICIT, caller-supplied `project_id` instead of live
+    /// `self.cfg.project_id`. The durable delivery worker (`deliver_averin_grant`/`deliver_averin_use`,
+    /// `src/server/mod.rs`) calls this with the project FROZEN into the durable event at enqueue time,
+    /// so a use/grant retried after the deployment's `project_id` changed is still routed to the STORED
+    /// project — byte-identical to its first attempt (BODY *and* routing query), never mis-routed to
+    /// the new live project (which would 409 or land the record under the wrong tenant). This is the
+    /// query-side companion to the already-frozen request BODY fields; without it the frozen body was
+    /// still routed by the wrong `?project=`.
+    pub(crate) async fn post_for_project(
+        &self,
+        endpoint: &'static str,
+        body: &serde_json::Value,
+        project_id: &str,
+    ) -> Result<serde_json::Value, AverinError> {
+        self.post_inner(endpoint, body, project_id).await
+    }
+
+    /// Shared POST core for both [`Self::post`] (live-config routing, the 087 path) and
+    /// [`Self::post_for_project`] (frozen-project routing, the durable worker). `project` is the only
+    /// difference between the two: it becomes the `?project=` auth query when an API key is set.
+    async fn post_inner(
+        &self,
+        endpoint: &'static str,
+        body: &serde_json::Value,
+        project: &str,
+    ) -> Result<serde_json::Value, AverinError> {
         let mut req = self.http.post(self.url(endpoint)).json(body);
         if let Some(k) = &self.cfg.api_key {
             // averin scopes auth on ?project=; the key goes in the Authorization header.
-            req = req
-                .query(&[("project", self.cfg.project_id.as_str())])
-                .bearer_auth(k);
+            req = req.query(&[("project", project)]).bearer_auth(k);
         }
         let resp = req.send().await.map_err(AverinError::Request)?;
         let status = resp.status();
@@ -803,16 +870,20 @@ impl AverinClient {
         // fan-out buffer an unbounded body. averin's real bodies are far under the cap.
         let text = read_capped(resp, MAX_AVERIN_RESPONSE_BYTES).await?;
         if !status.is_success() {
-            let body_snippet: String = text.chars().take(400).collect();
-            // FIX 4 — the upstream body (possible PII/secret) goes ONLY to a
-            // debug-level channel, NEVER to an AVERIN-SEAL-* alarm line (those log
-            // `error = %e`, and `Status`'s Display deliberately omits the body).
+            // Codex LOW-11 fix — do NOT log the upstream response body, even at
+            // debug level. averin can echo request content (including raw `params`)
+            // in an error body, so logging it here would reopen exactly the
+            // params-in-logs path FIX 4 closed for the alarm line, just through a
+            // different (debug) channel. Log only the status/context — a redacted
+            // marker in place of the body — which stays useful for debugging
+            // without ever risking a leak; the PoP seed is never part of the
+            // request either way, so it stays protected regardless.
             tracing::debug!(
                 target: "averin_seal",
                 endpoint,
                 status = status.as_u16(),
-                body = %body_snippet,
-                "averin non-2xx response body (debug-only; excluded from alarm lines)"
+                body = "<response body redacted>",
+                "averin non-2xx response (body redacted — see Codex LOW-11)"
             );
             return Err(AverinError::Status {
                 endpoint,

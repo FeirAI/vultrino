@@ -20,7 +20,7 @@ use vultrino::mcp::McpServer;
 use vultrino::plugins::PluginInstaller;
 use vultrino::router::CredentialResolver;
 use vultrino::server::VultrinoServer;
-use vultrino::storage::{FileStorage, StorageBackend};
+use vultrino::storage::{FileStorage, StorageBackend, StorageError};
 use vultrino::web::{AdminAuth, WebConfig, WebServer};
 use vultrino::{Credential, CredentialData, ExecuteRequest, Secret};
 
@@ -920,11 +920,44 @@ async fn rekey_vault(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             let current = get_storage_password()?;
             let new = get_new_storage_password()?;
             // Opening with the CURRENT password validates it (decrypt) before we touch anything.
-            let storage = FileStorage::new(&path, &current).await?;
+            // CRITICAL (Codex review): open the durable averin stores TOO when the deployment runs
+            // them, so `rekey` actually rotates them (D8). `FileStorage::new` hardcodes
+            // averin_enabled=false, which left the averin queue/popkey/quarantine under the OLD key
+            // after every CLI rekey — undecryptable on the next durable startup. Gate on the SAME
+            // condition that constructs them (enabled && durable) so a non-durable deployment never
+            // materializes empty averin files during a rekey.
+            let averin_durable = config.averin.enabled && config.averin.durable;
+            // FAIL CLOSED (Codex re-review): use the STRICT open (`open_for_rekey`), NOT the normal
+            // `new_with_averin`. If the durable service is still running it holds the queue's
+            // process-lifetime lock, so a non-strict open would swallow `AverinQueueBusy` to
+            // `Ok(None)` → `self.averin` = None → `rekey` rotates ONLY vault+outbox while STILL
+            // printing success → the old-key averin files brick the next restart. The strict open
+            // propagates the busy signal instead, and we surface it as a clear operator instruction.
+            let storage = match FileStorage::open_for_rekey(&path, &current, averin_durable).await {
+                Ok(storage) => storage,
+                Err(StorageError::AverinQueueBusy(dir)) => {
+                    return Err(format!(
+                        "cannot re-key: the durable averin queue at {dir} is in use by a running \
+                         process; stop the vultrino service before re-keying so its averin durable \
+                         stores are rotated too (a partial rekey would brick the next durable startup)"
+                    )
+                    .into());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            // Only claim the averin stores were rotated if they were ACTUALLY opened (self.averin was
+            // Some). With the strict open above, a durable-configured deployment whose queue is busy
+            // already errored out, so reaching here with the stores present means they WILL rotate.
+            let rotated_averin = storage.averin_queue().is_some();
             storage.rekey(&new).await?;
             println!(
-                "vault re-keyed: {} (and its outbox). Restart the service with the new password.",
-                path.display()
+                "vault re-keyed: {}{}. Restart the service with the new password.",
+                path.display(),
+                if rotated_averin {
+                    " (and its outbox + averin durable stores)"
+                } else {
+                    " (and its outbox)"
+                }
             );
             Ok(())
         }
@@ -948,10 +981,21 @@ async fn init_storage(
                 .unwrap_or_else(Config::default_storage_path);
 
             // Plan 088 D1: construct the averin durable-seal stores here too, gated on
-            // `[averin] enabled` exactly like `AverinClient` itself gates the seal client
-            // (`server/mod.rs`) — `false` (the default) is byte-identical to pre-088 behavior.
-            let storage =
-                FileStorage::new_with_averin(&path, &password, config.averin.enabled).await?;
+            // `[averin] enabled && durable` (Codex MED-8 fix) — NOT `enabled` alone. `enabled=true,
+            // durable=false` must run the EXACT 087 seal path (async fail-open only): before this
+            // fix, `enabled` alone was enough to build + replay the durable queue and take its
+            // process-lifetime lock even though durable delivery was off, so an old/corrupted/
+            // wrong-key durable queue could fail startup for a deployment that never asked for
+            // durable delivery, and process behavior wasn't byte-identical to 087. Gate on the SAME
+            // condition `spawn_averin_worker_if_enabled` and `rekey_vault` already use
+            // (`averin.enabled && averin.durable`), so a non-durable deployment never materializes
+            // `averin-queue/`, `averin-popkeys.enc`, or `averin-deadletter.enc`, and never takes the
+            // durable queue's cross-process lock. `AverinClient`'s own seal-path gate
+            // (`server/mod.rs`) already checks `averin_durable_queue().is_some()` before choosing the
+            // durable path, so `None` here correctly falls back to `seal_after_consume`/`seal_mint`'s
+            // 087 in-memory path.
+            let averin_durable = config.averin.enabled && config.averin.durable;
+            let storage = FileStorage::new_with_averin(&path, &password, averin_durable).await?;
             Ok(Arc::new(storage))
         }
         StorageBackendType::Keychain => {
@@ -3160,5 +3204,110 @@ mod averin_worker_spawn_gate_tests {
         );
 
         drop(storage1); // keep the first opener's owner lock alive until after the assertion above
+    }
+
+    /// Codex MED-8 regression test: `init_storage` must gate the durable averin store construction
+    /// on `enabled && durable`, NOT `enabled` alone. Before the fix, `enabled=true, durable=false`
+    /// still built + replayed the durable queue and took its process-lifetime lock — behavior that
+    /// should be reserved for `enabled && durable`, per the exact contract
+    /// `spawn_averin_worker_if_enabled`/`rekey_vault` already use.
+    ///
+    /// Run single-threaded within this one test (never spawned in parallel with another test that
+    /// touches `VULTRINO_PASSWORD`) so the env var this exercises can't race another test.
+    #[tokio::test]
+    async fn init_storage_gates_durable_averin_construction_on_enabled_and_durable() {
+        // SAFETY: no other test in this crate reads or writes VULTRINO_PASSWORD, and this test does
+        // not await across the mutation, so there is no concurrent access to race with.
+        unsafe {
+            std::env::set_var("VULTRINO_PASSWORD", "test-password-088-fixes");
+        }
+
+        // Case 1: enabled=true, durable=false -> the 087-only path. No averin queue dir, no popkey
+        // file, no quarantine file, and no durable-queue lock acquired.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let mut config = Config::default();
+        config.storage.file_path = Some(path.clone());
+        config.averin = averin_cfg(true, false);
+        let storage = init_storage(&config).await.unwrap();
+        assert!(
+            storage.averin_durable_queue().is_none(),
+            "enabled=true, durable=false must NOT construct the durable averin queue"
+        );
+        assert!(
+            !path.with_file_name("averin-queue").exists(),
+            "enabled=true, durable=false must NOT create the averin-queue dir (no lock acquired)"
+        );
+        assert!(!path.with_file_name("averin-popkeys.enc").exists());
+        assert!(!path.with_file_name("averin-deadletter.enc").exists());
+        drop(storage); // release before the second case reopens the same vault path
+
+        // Case 2: enabled=true, durable=true -> the durable stores ARE constructed on the SAME vault,
+        // and the queue dir/lock exists as soon as it's opened (eager: `AverinQueue::open` creates
+        // its dir and takes the owner lock before any append). The popkey/quarantine files are lazy
+        // (created on first write, like `OutboxStore`), so exercise one write on each to prove they
+        // land on disk rather than merely asserting the handles are `Some`.
+        let mut config2 = Config::default();
+        config2.storage.file_path = Some(path.clone());
+        config2.averin = averin_cfg(true, true);
+        let storage2 = init_storage(&config2).await.unwrap();
+        assert!(
+            storage2.averin_durable_queue().is_some(),
+            "enabled=true, durable=true must construct the durable averin queue"
+        );
+        assert!(
+            path.with_file_name("averin-queue").is_dir(),
+            "enabled=true, durable=true must create + own the averin-queue dir/lock"
+        );
+        let popkeys = storage2
+            .averin_durable_popkeys()
+            .expect("popkeys constructed when enabled && durable");
+        popkeys
+            .insert(
+                "tok-1",
+                vultrino::storage::PopKeyEntry {
+                    pop_seed: [1u8; 32],
+                    action: "db.query:orders-ro".to_string(),
+                    scope: "read:orders".to_string(),
+                    use_limit: None,
+                    capability: None,
+                    grant_id: None,
+                    minted_at: chrono::Utc::now(),
+                    grant_delivered_at: None,
+                    grant_expires_at: None,
+                    abandoned: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(path.with_file_name("averin-popkeys.enc").exists());
+
+        let deadletter = storage2
+            .averin_durable_deadletter()
+            .expect("deadletter constructed when enabled && durable");
+        deadletter
+            .quarantine(
+                vultrino::outbox::OutboxEvent {
+                    sequence: 1,
+                    subject: "tok-2".to_string(),
+                    event_type: "averin.use".to_string(),
+                    payload: serde_json::json!({"params": "p"}),
+                    created_at: chrono::Utc::now(),
+                    delivery: vultrino::outbox::DeliveryState::DeadLettered,
+                    attempts: 8,
+                    leased_until: None,
+                    last_attempt_at: None,
+                    last_error: Some("boom".to_string()),
+                    dedup_id: None,
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert!(path.with_file_name("averin-deadletter.enc").exists());
+
+        unsafe {
+            std::env::remove_var("VULTRINO_PASSWORD");
+        }
     }
 }
