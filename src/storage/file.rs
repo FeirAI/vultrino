@@ -883,17 +883,34 @@ impl FileStorage {
                     approval.delegate_veto_until = veto_until;
                 }
                 let decided = approval.clone();
-                let event_type = if approve {
-                    crate::outbox::EVENT_APPROVAL_APPROVED
-                } else {
-                    crate::outbox::EVENT_APPROVAL_DENIED
+                // Emit the event that reflects the request's ACTUAL resulting status
+                // after transition(), NOT the raw approve/deny boolean (Codex P2 review
+                // MAJOR 5). A majority-mode dissent (approve=false) leaves the request
+                // OPEN — emitting a terminal `approval.denied` here would seal it as
+                // denied downstream (govder lets the event TYPE override payload status),
+                // and the later real approval would be ignored as already-terminal
+                // ("proof says denied while vultrino executes approved"). Likewise a
+                // partial M-of-N sign-off (approve=true, threshold not yet met) must not
+                // emit a terminal `approval.approved`. In both still-open cases we emit NO
+                // terminal decision event; the sign-off is still carried on the eventual
+                // terminal event's `signoffs` set (never lost).
+                use crate::approval::ApprovalStatus;
+                let event_type = match decided.status {
+                    ApprovalStatus::Approved => Some(crate::outbox::EVENT_APPROVAL_APPROVED),
+                    ApprovalStatus::Denied => Some(crate::outbox::EVENT_APPROVAL_DENIED),
+                    ApprovalStatus::Expired => Some(crate::outbox::EVENT_APPROVAL_EXPIRED),
+                    // Still open: a recorded-but-non-terminal dissent (majority mode) or a
+                    // partial M-of-N sign-off — no terminal decision event.
+                    ApprovalStatus::Pending | ApprovalStatus::Escalated => None,
                 };
-                stage_event(
-                    cache,
-                    &decided.id,
-                    event_type,
-                    approval_event_payload(&decided),
-                )?;
+                if let Some(event_type) = event_type {
+                    stage_event(
+                        cache,
+                        &decided.id,
+                        event_type,
+                        approval_event_payload(&decided),
+                    )?;
+                }
                 Ok(decided)
             })
             .await?;
@@ -2498,6 +2515,116 @@ mod tests {
         let p2 = approval_event_payload(&mk(None));
         assert!(p2.get("tenant").is_some(), "tenant key must be present");
         assert!(p2["tenant"].is_null(), "untenanted ⇒ null");
+    }
+
+    #[tokio::test]
+    async fn majority_dissent_emits_no_terminal_denial_event() {
+        // Codex P2 review MAJOR 5: under majority-with-dissent-recorded (below Extreme),
+        // a dissent leaves the request OPEN — the storage layer must NOT emit a terminal
+        // `approval.denied` event (which govder would seal as denied, then ignore the
+        // later real approval). The event must reflect the ACTUAL resulting status, not
+        // the raw approve/deny boolean.
+        use crate::approval::{
+            ApprovalRule, ApprovalStatus, ApproverClass, Recipe, RecipeDecisionMode, RecipeTerm,
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let storage = FileStorage::new(&path, &SecretString::from("pw"))
+            .await
+            .unwrap();
+
+        // A `2 teammate`, majority-mode rule with a RESOLVED, non-forcing authoritative
+        // tier (so the deny-wins force does not fire — see BLOCKER 5).
+        let mut approval = mk_approval("major5");
+        approval.approval_rule = Some(ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        });
+        approval.authoritative_risk_tier = "Medium".to_string();
+        storage.store_approval(&approval).await.unwrap();
+
+        let denied_events = |evs: &[crate::outbox::OutboxEvent]| {
+            evs.iter()
+                .filter(|e| e.event_type == crate::outbox::EVENT_APPROVAL_DENIED)
+                .count()
+        };
+
+        // First teammate approval: still Pending (1 of 2) — no terminal event.
+        storage
+            .decide_approval(
+                &approval.id,
+                true,
+                "admin panel",
+                "alice",
+                false,
+                None,
+                None,
+                None,
+                Some(ApproverClass::Teammate),
+                None,
+            )
+            .await
+            .unwrap();
+        // A dissent: recorded, request STAYS OPEN under majority mode.
+        let after_dissent = storage
+            .decide_approval(
+                &approval.id,
+                false,
+                "admin panel",
+                "carol",
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after_dissent.status,
+            ApprovalStatus::Pending,
+            "a majority-mode dissent must not terminate the request"
+        );
+        let evs = storage.list_events_after(0, 100).await.unwrap();
+        assert_eq!(
+            denied_events(&evs),
+            0,
+            "a non-terminal dissent must NOT emit a terminal approval.denied event"
+        );
+
+        // The second distinct teammate approval meets the recipe → Approved → the
+        // terminal event is `approval.approved` (never a stale denial).
+        let approved = storage
+            .decide_approval(
+                &approval.id,
+                true,
+                "admin panel",
+                "bob",
+                false,
+                None,
+                None,
+                None,
+                Some(ApproverClass::Teammate),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.status, ApprovalStatus::Approved);
+        let evs = storage.list_events_after(0, 100).await.unwrap();
+        assert_eq!(denied_events(&evs), 0, "still no terminal denial event");
+        assert_eq!(
+            evs.iter()
+                .filter(|e| e.event_type == crate::outbox::EVENT_APPROVAL_APPROVED)
+                .count(),
+            1,
+            "exactly one terminal approval.approved once the recipe clears"
+        );
     }
 
     #[test]

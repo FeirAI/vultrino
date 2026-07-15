@@ -594,6 +594,22 @@ pub struct ApprovalRequest {
     /// terminal re-validation independently; see [`approval_rule_satisfied`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_rule: Option<ApprovalRule>,
+    /// Govder-AUTHORITATIVE risk tier for the recipe deny-wins force (Codex P2 review
+    /// BLOCKER 5), stamped from `GET /v1/oversight/gates/rule` ALONGSIDE
+    /// `approval_rule` — NOT vultrino's LOCAL [`Self::criticality`] (which can diverge
+    /// from govder). Only consulted when `approval_rule` is `Some`. Wire values are
+    /// `Low`/`Medium`/`High`/`Extreme`; `""` (govder could not resolve) or any
+    /// unparseable value is treated as Extreme (fail-closed) by
+    /// [`Self::recipe_forces_deny_on_any_deny`]. Defaults to `""` on older records —
+    /// the fail-closed direction (a stamped rule with no risk facts forces
+    /// deny-on-any-deny).
+    #[serde(default)]
+    pub authoritative_risk_tier: String,
+    /// Govder-AUTHORITATIVE irreversibility for the recipe deny-wins force (Codex P2
+    /// review BLOCKER 5). NOT vultrino's LOCAL [`Self::trusted_irreversible`]
+    /// (capability-metadata stamp). Only consulted when `approval_rule` is `Some`.
+    #[serde(default)]
+    pub authoritative_irreversible: bool,
     /// Criticality class (V5) — drives the escalation/expiry windows and is
     /// recorded for separation-of-duty / complacency analytics.
     #[serde(default)]
@@ -718,6 +734,13 @@ impl ApprovalRequest {
             required_approvals: params.required_approvals.max(1),
             signoffs: Vec::new(),
             approval_rule: params.approval_rule,
+            // Govder-authoritative risk facts default to empty/false here; the
+            // server stamps them from the rule-fetch response right after open()
+            // (alongside the trusted-spend stamps). An empty `authoritative_risk_tier`
+            // forces deny-on-any-deny (fail-closed) — see
+            // `recipe_forces_deny_on_any_deny`.
+            authoritative_risk_tier: String::new(),
+            authoritative_irreversible: false,
             criticality: params.criticality,
             trusted_irreversible: params.trusted_irreversible.unwrap_or(false),
             trusted_spend_amount_minor: None,
@@ -814,6 +837,22 @@ impl ApprovalRequest {
         self.transition(ApprovalStatus::Denied, decision)
     }
 
+    /// Whether a stamped recipe rule must behave as `deny-on-any-deny` regardless of
+    /// its configured `decision_mode` knob (approval-recipes.md §3/§5 D4a; Codex P2
+    /// review BLOCKER 5). Uses govder's AUTHORITATIVE facts stamped at fetch
+    /// ([`Self::authoritative_irreversible`] / [`Self::authoritative_risk_tier`]) —
+    /// NEVER vultrino's LOCAL [`Self::criticality`] / [`Self::trusted_irreversible`],
+    /// which can diverge from govder (the divergence where a majority-mode deny went
+    /// non-terminal because vultrino locally classified an authoritatively-Extreme
+    /// action as Medium). Mirrors govder's
+    /// `forceDenyOnAnyDeny := irreversible || riskTier == Extreme`, extended per the
+    /// review so an empty/unparseable `authoritative_risk_tier` is treated as Extreme
+    /// (fail-closed).
+    fn recipe_forces_deny_on_any_deny(&self) -> bool {
+        self.authoritative_irreversible
+            || risk_tier_forces_deny_on_any_deny(&self.authoritative_risk_tier)
+    }
+
     fn transition(&mut self, to: ApprovalStatus, decision: Decision) -> Result<(), ApprovalError> {
         // V5: a human decision must carry an authenticated approver identity, so
         // every decision is attributable and SoD is computable. Reject blanks.
@@ -850,6 +889,8 @@ impl ApprovalRequest {
             //    verbatim, byte-identical parity with today;
             //  - Extreme risk or an irreversible action (forced deny-on-any-deny
             //    regardless of the configured knob — approval-recipes.md §3/§5 D4a);
+            //    this force now reads govder's AUTHORITATIVE facts, NOT vultrino's
+            //    LOCAL criticality (Codex P2 review BLOCKER 5);
             //  - a veto of an ALREADY-Approved request (`is_delegate_veto`) —
             //    vetoing is always terminal, never a "dissent" on a still-open
             //    collection.
@@ -857,8 +898,7 @@ impl ApprovalRequest {
                 || match &self.approval_rule {
                     None => true,
                     Some(rule) => {
-                        self.trusted_irreversible
-                            || self.criticality == CriticalityClass::Critical
+                        self.recipe_forces_deny_on_any_deny()
                             || rule.decision_mode == RecipeDecisionMode::DenyOnAnyDeny
                     }
                 };
@@ -1157,15 +1197,19 @@ fn approval_rule_satisfied(rule: &ApprovalRule, signoffs: &[Signoff]) -> bool {
         };
         // Kind/Class cross-check (defense in depth), mirrors govder's
         // classifySignOffs: a "human" Kind must resolve to senior/teammate and a
-        // "delegate-agent" Kind must resolve to agent-reviewer; a mismatch (or an
-        // unrecognized Kind) is malformed and dropped. An empty Kind skips the
-        // cross-check (older callers that never set approver_kind default to
-        // "human" via `default_approver_kind`, which is intentionally permissive
-        // here — only an EXPLICIT mismatch is treated as malformed).
+        // "delegate-agent" Kind must resolve to agent-reviewer; a mismatch is
+        // malformed and dropped. An EXPLICIT, non-empty, unrecognized Kind is ALSO
+        // dropped (Codex P2 review MINOR): the previous wildcard silently accepted
+        // it, more permissive than govder — which only ever classifies
+        // human/delegate-agent. An empty Kind still skips the cross-check (older
+        // callers that never set approver_kind default to "human" via
+        // `default_approver_kind`; a genuinely-empty stored value is treated
+        // permissively, matching govder's empty-Kind path).
         match so.approver_kind.trim() {
             "human" if !class.is_human() => continue,
             "delegate-agent" if class != ApproverClass::AgentReviewer => continue,
-            _ => {}
+            "human" | "delegate-agent" | "" => {}
+            _ => continue, // explicit unknown Kind: fail-closed, drop
         }
         match class {
             ApproverClass::Senior | ApproverClass::Teammate => humans.push(so),
@@ -1208,6 +1252,26 @@ fn approval_rule_satisfied(rule: &ApprovalRule, signoffs: &[Signoff]) -> bool {
         .any(|r| recipe_satisfied(r, avail_senior, avail_teammate, avail_agent_reviewer))
 }
 
+/// Whether a govder-AUTHORITATIVE `risk_tier` wire value forces `deny-on-any-deny`
+/// regardless of an org's `majority-with-dissent-recorded` opt-in (Codex P2 review
+/// BLOCKER 5). `Low`/`Medium`/`High` do NOT force — majority mode is a legitimate
+/// per-org relaxation below Extreme (approval-recipes.md §5 D4(a)), mirroring govder's
+/// `forceDenyOnAnyDeny := irreversible || riskTier == Extreme`. `Extreme` forces; `""`
+/// (govder could not resolve) or ANY unparseable value → treated as Extreme
+/// (fail-closed).
+fn risk_tier_forces_deny_on_any_deny(risk_tier: &str) -> bool {
+    !matches!(risk_tier.trim(), "Low" | "Medium" | "High")
+}
+
+/// Cross-plane cap on any single [`RecipeTerm::count`] AND the summed total per recipe
+/// (Codex P2 review BLOCKER 3; mirrors govder's `maxRecipeTermCount`). A stamped rule
+/// with a huge or repeated `count` must never wrap the `u32` slot-need sum to a small
+/// value and clear with fewer approvers — a recipe breaching this cap is treated as
+/// permanently UNSATISFIABLE (fail-closed). 64 is far above any legitimate recipe (the
+/// realistic ceiling is single digits) and leaves no path to `u32` overflow, since
+/// [`recipe_well_formed`] rejects the recipe the moment a running sum would exceed it.
+const MAX_RECIPE_TERM_COUNT: u32 = 64;
+
 /// Injective senior-first slot matching (mirrors govder's `recipeSatisfied` exactly).
 /// Senior slots are filled by senior sign-offs first; any senior LEFT OVER after that
 /// may fill a teammate slot (a senior is a fortiori a teammate); agent-reviewer slots
@@ -1230,37 +1294,77 @@ fn recipe_satisfied(
     let mut need_teammate = 0u32;
     let mut need_agent_reviewer = 0u32;
     for t in &r.terms {
+        // Saturating arithmetic (BLOCKER 3): `recipe_well_formed` already caps every
+        // count and the running total at `MAX_RECIPE_TERM_COUNT`, so this can never
+        // actually saturate — but `saturating_add` GUARANTEES that even a rule that
+        // somehow slipped past the cap can only make a requirement HARDER (never wrap
+        // a `u32` down to a smaller need that fewer approvers would satisfy).
         match t.class {
-            ApproverClass::Senior => need_senior += t.count,
-            ApproverClass::Teammate => need_teammate += t.count,
-            ApproverClass::AgentReviewer => need_agent_reviewer += t.count,
+            ApproverClass::Senior => need_senior = need_senior.saturating_add(t.count),
+            ApproverClass::Teammate => need_teammate = need_teammate.saturating_add(t.count),
+            ApproverClass::AgentReviewer => {
+                need_agent_reviewer = need_agent_reviewer.saturating_add(t.count)
+            }
             ApproverClass::Unknown => return false, // recipe_well_formed already excludes this
         }
+    }
+    // Agent-reviewer recipe terms are disabled system-wide (Codex P2 review finding 6;
+    // mirrors govder's `recipeSatisfied` hard guard). govder rejects agent-reviewer
+    // terms at WRITE time, so a fetched rule should only ever contain {senior,
+    // teammate} — but if a hand-crafted or stale rule somehow arrives, a recipe
+    // REQUIRING an agent-reviewer term is UNSATISFIABLE here too (never clears via
+    // agents), regardless of how many agent-reviewer sign-offs were collected.
+    if need_agent_reviewer > 0 {
+        return false;
     }
     if avail_senior < need_senior {
         return false; // senior slots can ONLY be filled by seniors
     }
     let leftover_senior = avail_senior - need_senior;
-    if leftover_senior + avail_teammate < need_teammate {
+    if leftover_senior.saturating_add(avail_teammate) < need_teammate {
         return false;
     }
+    // Moot past the hard guard above (`need_agent_reviewer == 0`), kept for signature
+    // parity with govder's `recipeSatisfied` and the collect machinery.
     avail_agent_reviewer >= need_agent_reviewer
 }
 
 /// Structural well-formedness (mirrors govder's `recipeComposition`'s `ok` return): a
-/// recipe with no terms, any non-positive count, or any unknown class can never be
-/// satisfied — permanently disqualified rather than erroring the whole rule.
+/// recipe with no terms, any non-positive OR over-cap count, a summed total exceeding
+/// [`MAX_RECIPE_TERM_COUNT`], or any unknown class can never be satisfied — permanently
+/// disqualified rather than erroring the whole rule. The per-term AND running-total
+/// caps are the BLOCKER-3 overflow guard: they reject a malformed rule long before any
+/// `u32` slot-need sum could wrap (agent-reviewer terms remain structurally valid here,
+/// exactly as in govder — [`recipe_satisfied`]'s hard guard is what makes them
+/// unsatisfiable at eval time).
 fn recipe_well_formed(r: &Recipe) -> bool {
     if r.terms.is_empty() {
         return false;
     }
-    r.terms.iter().all(|t| {
-        t.count > 0
-            && matches!(
-                t.class,
-                ApproverClass::Senior | ApproverClass::Teammate | ApproverClass::AgentReviewer
-            )
-    })
+    let mut total: u32 = 0;
+    for t in &r.terms {
+        // Per-term cap (BLOCKER 3): a count outside [1, MAX_RECIPE_TERM_COUNT] is
+        // rejected outright — this is how a huge (or negative-after-wrap on the wire)
+        // count would otherwise let a small sign-off set clear a recipe reading as
+        // enormous on paper.
+        if t.count == 0 || t.count > MAX_RECIPE_TERM_COUNT {
+            return false;
+        }
+        // Running total, capped after every addition (BLOCKER 3): catches both a
+        // single huge term and many small terms whose cumulative sum would exceed any
+        // sane recipe, long before the sum could approach an overflow boundary.
+        total = total.saturating_add(t.count);
+        if total > MAX_RECIPE_TERM_COUNT {
+            return false;
+        }
+        if !matches!(
+            t.class,
+            ApproverClass::Senior | ApproverClass::Teammate | ApproverClass::AgentReviewer
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 /// D4(b) distinct principals: keep the FIRST occurrence per distinct identity
@@ -2511,14 +2615,17 @@ mod tests {
     // ============ Plan 100 P2 Phase D: approval-recipe in-lock evaluator ========
 
     #[test]
-    fn recipe_one_senior_plus_two_agent_reviewers_needs_all_three_distinct() {
+    fn recipe_with_agent_reviewer_term_is_unsatisfiable_even_when_fully_signed() {
+        // Finding 6 (agent-reviewer defense-in-depth): govder rejects agent-reviewer
+        // terms at write, so a fetched rule should only ever contain {senior,
+        // teammate}. If a hand-crafted / stale rule somehow arrives, a recipe REQUIRING
+        // an agent-reviewer term is UNSATISFIABLE — it never clears via agents, no
+        // matter how many distinct-controller agent-reviewers sign off.
         let mut a = new_approval_with_rule(senior_plus_two_reviewers_rule());
 
-        // A senior alone is not enough (still needs 2 agent-reviewers).
         approve_as(&mut a, "senior@corp", ApproverClass::Senior, None, None).unwrap();
         assert_eq!(a.status, ApprovalStatus::Pending);
 
-        // One agent-reviewer: still short by one.
         approve_as(
             &mut a,
             "ep_reviewer_a",
@@ -2527,9 +2634,11 @@ mod tests {
             Some("dg_a"),
         )
         .unwrap();
-        assert_eq!(a.status, ApprovalStatus::Pending, "1 of 2 reviewers");
+        assert_eq!(a.status, ApprovalStatus::Pending);
 
-        // A second agent-reviewer under a DISTINCT controller completes the recipe.
+        // A SECOND agent-reviewer under a DISTINCT controller would once have completed
+        // the "1 senior + 2 agent-reviewer" recipe — now the recipe is categorically
+        // unsatisfiable, so the request stays pending forever.
         approve_as(
             &mut a,
             "ep_reviewer_b",
@@ -2538,38 +2647,12 @@ mod tests {
             Some("dg_b"),
         )
         .unwrap();
-        assert_eq!(a.status, ApprovalStatus::Approved);
-        assert_eq!(a.signoffs.len(), 3);
-    }
-
-    #[test]
-    fn recipe_two_agent_reviewers_sharing_a_controller_count_as_one() {
-        let mut a = new_approval_with_rule(senior_plus_two_reviewers_rule());
-        approve_as(&mut a, "senior@corp", ApproverClass::Senior, None, None).unwrap();
-        approve_as(
-            &mut a,
-            "ep_reviewer_a",
-            ApproverClass::AgentReviewer,
-            Some("same-controller"),
-            Some("dg_a"),
-        )
-        .unwrap();
-        // Distinct identity, distinct grant ref, but the SAME controller — D4(f)
-        // collapses these to ONE toward the recipe's "2 agent-reviewer" slot.
-        approve_as(
-            &mut a,
-            "ep_reviewer_b",
-            ApproverClass::AgentReviewer,
-            Some("same-controller"),
-            Some("dg_b"),
-        )
-        .unwrap();
         assert_eq!(
             a.status,
             ApprovalStatus::Pending,
-            "two reviewers behind one controller must not satisfy a 2-reviewer recipe"
+            "an agent-reviewer recipe term is disabled system-wide (never clears via agents)"
         );
-        assert_eq!(a.signoffs.len(), 3, "both sign-offs are still recorded");
+        assert_eq!(a.signoffs.len(), 3, "the sign-offs are still recorded");
     }
 
     #[test]
@@ -2647,6 +2730,11 @@ mod tests {
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
         };
         let mut a = new_approval_with_rule(rule);
+        // Majority mode is only honored below Extreme (approval-recipes.md §5 D4(a)):
+        // stamp a RESOLVED, non-forcing authoritative tier so the deny-wins force does
+        // not fire. Without this, the default "" authoritative_risk_tier would be
+        // treated as Extreme (fail-closed) and the dissent WOULD terminate.
+        a.authoritative_risk_tier = "Medium".to_string();
         approve_as(&mut a, "alice@corp", ApproverClass::Teammate, None, None).unwrap();
         // A dissent: recorded, but NOT terminal under majority mode.
         a.deny(Decision::new("admin panel", "carol@corp")).unwrap();
@@ -2666,9 +2754,12 @@ mod tests {
     }
 
     #[test]
-    fn recipe_extreme_criticality_forces_deny_on_any_deny_despite_majority_mode() {
-        // Extreme/irreversible actions ALWAYS behave as deny-on-any-deny, regardless
-        // of the configured decision_mode (approval-recipes.md §3/§5 D4a).
+    fn recipe_extreme_authoritative_tier_forces_deny_on_any_deny_despite_majority_mode() {
+        // BLOCKER 5: Extreme/irreversible actions ALWAYS behave as deny-on-any-deny,
+        // regardless of the configured decision_mode (approval-recipes.md §3/§5 D4a).
+        // The force uses govder's AUTHORITATIVE risk tier, NOT vultrino's local
+        // criticality — here local criticality is deliberately left at its default
+        // Medium to prove it no longer drives the force.
         let rule = ApprovalRule {
             recipes: vec![Recipe {
                 terms: vec![RecipeTerm {
@@ -2679,14 +2770,97 @@ mod tests {
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
         };
         let mut a = new_approval_with_rule(rule);
-        a.criticality = CriticalityClass::Critical;
+        a.authoritative_risk_tier = "Extreme".to_string();
+        assert_eq!(a.criticality, CriticalityClass::Medium, "local criticality is not the authority");
         approve_as(&mut a, "alice@corp", ApproverClass::Teammate, None, None).unwrap();
         a.deny(Decision::new("admin panel", "carol@corp")).unwrap();
         assert_eq!(
             a.status,
             ApprovalStatus::Denied,
-            "Extreme criticality forces deny-on-any-deny even under majority mode"
+            "authoritative Extreme forces deny-on-any-deny even under majority mode"
         );
+    }
+
+    #[test]
+    fn recipe_empty_authoritative_tier_forces_deny_on_any_deny_fail_closed() {
+        // BLOCKER 5: risk_tier == "" (govder could not resolve) → treated as Extreme
+        // (fail-closed). A stamped majority-mode rule with NO authoritative risk facts
+        // must still force deny-on-any-deny — a dissent terminates.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        };
+        let mut a = new_approval_with_rule(rule);
+        assert_eq!(a.authoritative_risk_tier, "", "default is the unresolved worst case");
+        approve_as(&mut a, "alice@corp", ApproverClass::Teammate, None, None).unwrap();
+        a.deny(Decision::new("admin panel", "carol@corp")).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Denied,
+            "an empty authoritative risk_tier is Extreme (fail-closed) and forces deny-wins"
+        );
+    }
+
+    #[test]
+    fn recipe_authoritative_irreversible_forces_deny_on_any_deny_despite_majority_mode() {
+        // BLOCKER 5: an authoritatively-irreversible action forces deny-on-any-deny
+        // even under majority mode, using the AUTHORITATIVE stamp (not local
+        // trusted_irreversible). Risk tier is a resolved, non-forcing value to prove
+        // irreversibility alone is sufficient.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        };
+        let mut a = new_approval_with_rule(rule);
+        a.authoritative_risk_tier = "Medium".to_string();
+        a.authoritative_irreversible = true;
+        approve_as(&mut a, "alice@corp", ApproverClass::Teammate, None, None).unwrap();
+        a.deny(Decision::new("admin panel", "carol@corp")).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Denied,
+            "authoritative irreversibility forces deny-on-any-deny even under majority mode"
+        );
+    }
+
+    #[test]
+    fn recipe_high_authoritative_tier_honors_majority_mode() {
+        // BLOCKER 5 boundary (approval-recipes.md §5 D4(a)): majority-with-dissent is a
+        // legitimate per-org opt-in BELOW Extreme, so a RESOLVED High/Medium/Low tier
+        // does NOT force deny-on-any-deny — the dissent stays non-terminal and the
+        // recipe can still clear. This mirrors govder's
+        // `forceDenyOnAnyDeny := irreversible || riskTier == Extreme` exactly (High is
+        // NOT forced), keeping the two planes convergent rather than diverging.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        };
+        let mut a = new_approval_with_rule(rule);
+        a.authoritative_risk_tier = "High".to_string();
+        approve_as(&mut a, "alice@corp", ApproverClass::Teammate, None, None).unwrap();
+        a.deny(Decision::new("admin panel", "carol@corp")).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "resolved High honors majority mode (deny non-terminal) — matches govder"
+        );
+        approve_as(&mut a, "bob@corp", ApproverClass::Teammate, None, None).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Approved);
     }
 
     #[test]
@@ -2746,6 +2920,135 @@ mod tests {
         // The malformed recipe (bad class) is unsatisfiable; the second, well-formed
         // recipe (1 teammate) still lets the approval clear.
         approve_as(&mut a, "bob@corp", ApproverClass::Teammate, None, None).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn recipe_over_cap_or_overflow_count_is_unsatisfiable() {
+        // BLOCKER 3: per-term AND summed-total caps prevent a u32 wrap from letting a
+        // small sign-off set clear a recipe reading as enormous on paper.
+        //
+        // (a) The concrete overflow exploit: senior:u32::MAX + senior:2. Unchecked
+        // summation would wrap need_senior to 1, so ONE senior would clear a rule
+        // reading as 4,294,967,297 seniors. The cap disqualifies the recipe outright —
+        // no available pool, however large, can satisfy it.
+        let overflow = Recipe {
+            terms: vec![
+                RecipeTerm {
+                    class: ApproverClass::Senior,
+                    count: u32::MAX,
+                },
+                RecipeTerm {
+                    class: ApproverClass::Senior,
+                    count: 2,
+                },
+            ],
+        };
+        assert!(!recipe_well_formed(&overflow));
+        assert!(
+            !recipe_satisfied(&overflow, 1, 0, 0),
+            "one senior must never clear a wrapped requirement"
+        );
+        assert!(
+            !recipe_satisfied(&overflow, u32::MAX, u32::MAX, u32::MAX),
+            "even a maxed-out available pool cannot satisfy a capped-out recipe"
+        );
+
+        // (b) A single over-cap term (65 > 64) is unsatisfiable.
+        let over = Recipe {
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Teammate,
+                count: 65,
+            }],
+        };
+        assert!(!recipe_well_formed(&over));
+        assert!(!recipe_satisfied(&over, 0, 100, 0));
+
+        // (c) Per-term counts are each <= 64 but the SUMMED total exceeds 64.
+        let summed = Recipe {
+            terms: vec![
+                RecipeTerm {
+                    class: ApproverClass::Senior,
+                    count: 40,
+                },
+                RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 40,
+                },
+            ],
+        };
+        assert!(!recipe_well_formed(&summed));
+        assert!(!recipe_satisfied(&summed, 100, 100, 0));
+
+        // (d) A recipe exactly AT the cap (total 64) still clears with enough approvers
+        // — the cap disqualifies only rules that BREACH it, never a legitimate one.
+        let at_cap = Recipe {
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Teammate,
+                count: 64,
+            }],
+        };
+        assert!(recipe_well_formed(&at_cap));
+        assert!(recipe_satisfied(&at_cap, 0, 64, 0));
+        assert!(!recipe_satisfied(&at_cap, 0, 63, 0));
+    }
+
+    #[test]
+    fn recipe_over_cap_rule_never_auto_approves_via_transition() {
+        // BLOCKER 3 end-to-end: a stamped rule whose only recipe breaches the cap is
+        // unsatisfiable through the real approve path — it never auto-approves.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![
+                    RecipeTerm {
+                        class: ApproverClass::Senior,
+                        count: u32::MAX,
+                    },
+                    RecipeTerm {
+                        class: ApproverClass::Senior,
+                        count: 2,
+                    },
+                ],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        };
+        let mut a = new_approval_with_rule(rule);
+        approve_as(&mut a, "senior@corp", ApproverClass::Senior, None, None).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "a capped-out recipe is unsatisfiable and must never clear with fewer approvers"
+        );
+    }
+
+    #[test]
+    fn recipe_explicit_unknown_kind_is_dropped_fail_closed() {
+        // MINOR: an EXPLICIT, non-empty, unrecognized approver_kind must be dropped from
+        // recipe matching (fail-closed) — govder only ever classifies
+        // human/delegate-agent. The previous wildcard silently accepted it.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Senior,
+                    count: 1,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        };
+        let mut a = new_approval_with_rule(rule);
+        // Explicit unknown Kind with an otherwise-valid senior class: dropped.
+        let mut d =
+            Decision::new("admin panel", "mystery").with_resolved_class(ApproverClass::Senior);
+        d.approver_kind = "robot".to_string();
+        a.approve(d).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "an explicit unknown Kind must not satisfy a senior recipe"
+        );
+
+        // Positive control: a well-formed human senior sign-off DOES satisfy it.
+        approve_as(&mut a, "senior@corp", ApproverClass::Senior, None, None).unwrap();
         assert_eq!(a.status, ApprovalStatus::Approved);
     }
 }

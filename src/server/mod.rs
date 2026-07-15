@@ -1163,15 +1163,25 @@ impl VultrinoServer {
             // A genuine govder fetch failure here `?`-propagates: vultrino could
             // not confirm the gate's oversight requirement, so it must fail this
             // approval-open closed rather than silently opening under the
-            // (possibly weaker) numeric-threshold path. `Ok(None)`/`Ok(Some(_))`
-            // both flow straight into `NewApproval` exactly as before.
-            let approval_rule = self
+            // (possibly weaker) numeric-threshold path. On success we split the
+            // fetched shape into the rule itself plus govder's AUTHORITATIVE risk
+            // facts (BLOCKER 5): the recipe deny-wins force reads THESE, never
+            // vultrino's LOCAL criticality. No rule → no facts (numeric path).
+            let (approval_rule, authoritative_risk_tier, authoritative_irreversible) = match self
                 .fetch_gate_rule_for_action(
                     principal_tenant.as_deref(),
                     agent_id_for_rule.as_deref(),
                     &full_action,
                 )
-                .await?;
+                .await?
+            {
+                Some(fetched) => (
+                    Some(fetched.rule),
+                    fetched.risk_tier,
+                    fetched.irreversible,
+                ),
+                None => (None, String::new(), false),
+            };
             let (mut approval, decision_token) = ApprovalRequest::open(NewApproval {
                 credential: credential.alias.clone(),
                 action: full_action.clone(),
@@ -1209,6 +1219,12 @@ impl VultrinoServer {
                 .as_ref()
                 .map(|s| i64::try_from(s.amount).unwrap_or(i64::MAX));
             approval.trusted_spend_asset = spend.as_ref().map(|s| s.asset.clone());
+            // Stamp govder's AUTHORITATIVE risk facts (BLOCKER 5) so the in-lock
+            // recipe deny-wins force uses them (not vultrino's LOCAL criticality).
+            // Only meaningful when a rule was stamped; "" risk_tier → Extreme
+            // (fail-closed) in the force decision.
+            approval.authoritative_risk_tier = authoritative_risk_tier;
+            approval.authoritative_irreversible = authoritative_irreversible;
 
             // Bound the number of *pending* approvals a use token can open: each
             // open reserves a future use, so outstanding pending approvals plus
@@ -2745,7 +2761,7 @@ impl VultrinoServer {
         tenant: Option<&str>,
         agent_id: Option<&str>,
         action_class: &str,
-    ) -> Result<Option<crate::approval::ApprovalRule>, VultrinoError> {
+    ) -> Result<Option<crate::govder::FetchedGateRule>, VultrinoError> {
         let govder = match self.govder.as_ref() {
             Some(g) => g,
             None => return Ok(None),

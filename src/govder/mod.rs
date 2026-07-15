@@ -140,12 +140,42 @@ struct EvaluateResponse {
 /// Wire shape of `GET /v1/oversight/gates/rule` (plan 100 P2 Phase D). `has_rule` is
 /// the unambiguous signal of rule presence — `approval_rule` is `None` whenever
 /// `has_rule` is `false`, mirroring govder's `GateApprovalRuleResponse`.
+///
+/// `has_rule` is a REQUIRED field (no `#[serde(default)]`): a 2xx body that OMITS it
+/// is semantically malformed and must fail the fetch closed rather than silently
+/// decode as `has_rule: false` and downgrade to the weaker numeric-threshold path
+/// (Codex P2 review BLOCKER 6). `fetch_gate_rule` additionally rejects any body whose
+/// `has_rule`/`approval_rule` pair is internally inconsistent.
+///
+/// `risk_tier` and `irreversible` are govder's AUTHORITATIVE risk facts for this
+/// action (BLOCKER 5): vultrino stamps them alongside the rule so the recipe
+/// deny-wins force uses govder's judgement rather than vultrino's LOCAL criticality.
+/// `risk_tier == ""` means govder could not resolve it — the consumer treats that as
+/// the fail-closed worst case (Extreme).
 #[derive(Debug, Clone, Deserialize)]
 struct GateApprovalRuleResponse {
-    #[serde(default)]
     has_rule: bool,
     #[serde(default)]
     approval_rule: Option<crate::approval::ApprovalRule>,
+    #[serde(default)]
+    risk_tier: String,
+    #[serde(default)]
+    irreversible: bool,
+}
+
+/// A fetched, PRESENT approval rule plus govder's AUTHORITATIVE risk facts for it
+/// (Codex P2 review BLOCKER 5). Only produced when `has_rule: true`. The recipe
+/// deny-wins force in [`crate::approval::ApprovalRequest::transition`] uses
+/// `risk_tier`/`irreversible` from here rather than vultrino's LOCAL criticality —
+/// closing the Go/Rust divergence where a majority-mode deny became non-terminal
+/// because vultrino locally classified an authoritatively-Extreme action as Medium.
+/// `risk_tier == ""` (govder could not resolve) is carried verbatim; the consumer
+/// treats it as Extreme (fail-closed).
+#[derive(Debug, Clone)]
+pub struct FetchedGateRule {
+    pub rule: crate::approval::ApprovalRule,
+    pub risk_tier: String,
+    pub irreversible: bool,
 }
 
 /// HTTP client for govder delegation endpoints.
@@ -317,7 +347,7 @@ impl GovderClient {
         tenant: &str,
         agent_id: &str,
         action_class: &str,
-    ) -> Result<Option<crate::approval::ApprovalRule>, GovderError> {
+    ) -> Result<Option<FetchedGateRule>, GovderError> {
         let agent_id = agent_id.trim();
         let action_class = action_class.trim();
         if tenant.trim().is_empty() || agent_id.is_empty() || action_class.is_empty() {
@@ -353,15 +383,15 @@ impl GovderClient {
                 "govder gate-rule fetch returned a non-2xx status; failing closed");
             return Err(GovderError::Http { status, body });
         }
-        let parsed: GateApprovalRuleResponse = serde_json::from_str(&body).map_err(|error| {
+        // Parse + consistency-check the 2xx body (BLOCKER 6). A missing `has_rule`, or
+        // an internally-inconsistent has_rule/approval_rule pair, is a genuine fetch
+        // failure → fail closed, NEVER a numeric fallback. Only a clean `has_rule:
+        // false` (no rule) maps to `Ok(None)` numeric parity.
+        interpret_2xx_gate_rule_body(&body).map_err(|error| {
             tracing::error!(%error, %agent_id, %action_class,
-                "govder gate-rule response failed to parse; failing closed");
-            GovderError::Decode(error.to_string())
-        })?;
-        if !parsed.has_rule {
-            return Ok(None); // confirmed: gate exists, no rule stamped
-        }
-        Ok(parsed.approval_rule)
+                "govder gate-rule 2xx response is malformed or internally inconsistent (missing has_rule, or a has_rule/approval_rule contradiction); failing closed");
+            error
+        })
     }
 
     async fn signed_json(
@@ -404,6 +434,44 @@ impl GovderClient {
                 .body(b.to_vec());
         }
         Ok(req.send().await?)
+    }
+}
+
+/// Interpret a 2xx `GET /v1/oversight/gates/rule` body (Codex P2 review BLOCKER 6).
+/// Pure (no I/O) so the fail-closed contract is unit-testable:
+///
+/// - a body that fails to parse — including one MISSING the required `has_rule` field
+///   (an HTTP-200 `{}`) — is a genuine fetch failure (`Err(Decode)`), never a numeric
+///   fallback;
+/// - a body whose `has_rule`/`approval_rule` pair is INTERNALLY INCONSISTENT
+///   (`has_rule:true` with no rule, or `has_rule:false` WITH a rule present) is
+///   likewise `Err(Decode)`;
+/// - only a clean `has_rule:false` (no rule) → `Ok(None)` (confirmed no rule → numeric
+///   parity);
+/// - `has_rule:true` with a rule → `Ok(Some(FetchedGateRule))`, carrying govder's
+///   authoritative `risk_tier`/`irreversible`.
+fn interpret_2xx_gate_rule_body(body: &str) -> Result<Option<FetchedGateRule>, GovderError> {
+    let parsed: GateApprovalRuleResponse =
+        serde_json::from_str(body).map_err(|e| GovderError::Decode(e.to_string()))?;
+    let GateApprovalRuleResponse {
+        has_rule,
+        approval_rule,
+        risk_tier,
+        irreversible,
+    } = parsed;
+    match (has_rule, approval_rule) {
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err(GovderError::Decode(
+            "gate-rule response inconsistent: has_rule=false but approval_rule present".to_string(),
+        )),
+        (true, None) => Err(GovderError::Decode(
+            "gate-rule response inconsistent: has_rule=true but approval_rule missing".to_string(),
+        )),
+        (true, Some(rule)) => Ok(Some(FetchedGateRule {
+            rule,
+            risk_tier,
+            irreversible,
+        })),
     }
 }
 
@@ -455,7 +523,49 @@ struct GrantsListResponse {
 #[cfg(test)]
 mod tests {
     use super::tenant_assert::sign_tenant_assertion;
+    use super::{interpret_2xx_gate_rule_body, GovderError};
     use chrono::TimeZone;
+
+    // ===== BLOCKER 6: a semantically-malformed 2xx rule body must fail closed =====
+
+    #[test]
+    fn gate_rule_body_missing_has_rule_fails_closed() {
+        // HTTP 200 `{}` — `has_rule` is required, so this is a fetch failure, NOT a
+        // silent downgrade to the numeric-threshold path.
+        let err = interpret_2xx_gate_rule_body("{}").unwrap_err();
+        assert!(matches!(err, GovderError::Decode(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn gate_rule_body_has_rule_true_without_rule_fails_closed() {
+        let err = interpret_2xx_gate_rule_body(r#"{"has_rule":true}"#).unwrap_err();
+        assert!(matches!(err, GovderError::Decode(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn gate_rule_body_has_rule_false_with_rule_present_fails_closed() {
+        let body = r#"{"has_rule":false,"approval_rule":{"recipes":[{"terms":[{"class":"senior","count":1}]}],"decision_mode":"deny-on-any-deny"}}"#;
+        let err = interpret_2xx_gate_rule_body(body).unwrap_err();
+        assert!(matches!(err, GovderError::Decode(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn gate_rule_body_clean_no_rule_is_numeric_parity() {
+        // Only a clean `has_rule:false` (no rule) confirms "no rule" → numeric path.
+        assert!(interpret_2xx_gate_rule_body(r#"{"has_rule":false}"#)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn gate_rule_body_present_carries_authoritative_risk_facts() {
+        let body = r#"{"has_rule":true,"risk_tier":"High","irreversible":true,
+            "approval_rule":{"recipes":[{"terms":[{"class":"senior","count":1}]}],"decision_mode":"deny-on-any-deny"}}"#;
+        let fetched = interpret_2xx_gate_rule_body(body).unwrap().unwrap();
+        assert_eq!(fetched.risk_tier, "High");
+        assert!(fetched.irreversible);
+        assert_eq!(fetched.rule.recipes.len(), 1);
+    }
 
     #[test]
     fn assertion_has_four_segments() {
