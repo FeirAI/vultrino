@@ -13,7 +13,10 @@ use secrecy::SecretString;
 use tempfile::tempdir;
 use tower::ServiceExt;
 
-use vultrino::approval::{ApprovalRequest, NewApproval, RequesterInfo};
+use vultrino::approval::{
+    ApprovalRequest, ApprovalRule, ApproverClass, NewApproval, Recipe, RecipeDecisionMode,
+    RecipeTerm, RequesterInfo,
+};
 use vultrino::auth::{ApprovalToken, AuthManager, NewApprovalToken, NewUseToken, UseToken};
 use vultrino::config::Config;
 use vultrino::delegation::DelegationGrantScope;
@@ -2904,6 +2907,490 @@ async fn test_json_decision_hard_sod_blocks_same_key_no_operator_then_operator()
         1,
         "the second same-key sign-off was not recorded"
     );
+}
+
+/// Build a tenant-scoped, hard-SoD router + a stored RECIPE-gated approval
+/// (`dual_control: false, required_approvals: 1` — the exact shape an ordinary
+/// require_approval token opens with; a stamped recipe REPLACES the numeric
+/// threshold in `transition`, so this is deliberately NOT a dual-control shape).
+/// Mirrors `build_hard_sod_dual_control_fixture` but stamps the caller-supplied
+/// `ApprovalRule` and an explicit `authoritative_risk_tier`.
+///
+/// `risk_tier` MUST be passed explicitly (not left as the `NewApproval`-derived
+/// default): the default empty `authoritative_risk_tier` is treated as Extreme
+/// worst-case and force-coerces `decision_mode` to `DenyOnAnyDeny` regardless of
+/// the rule's own setting (see `ApprovalRequest::authoritative_risk_tier` doc),
+/// which would silently defeat the `MajorityWithDissentRecorded` matrix cases.
+async fn build_hard_sod_recipe_fixture(
+    tenant: &str,
+    rule: ApprovalRule,
+    risk_tier: &str,
+) -> (axum::Router, Arc<dyn StorageBackend>, String, String) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let seed = AuthManager::new();
+    let (key, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some(tenant.to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    let mut sod_config = Config::default();
+    sod_config.approval.enforce_separation_of_duty = true;
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        sod_config,
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    let (mut approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo::local(),
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: Some(tenant.to_string()),
+        workload_id: None,
+        preview: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::High,
+        trusted_irreversible: None,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+        approval_rule: Some(rule),
+    });
+    approval.authoritative_risk_tier = risk_tier.to_string();
+    let id = approval.id.clone();
+    storage.store_approval(&approval).await.unwrap();
+    (router, storage, key, id)
+}
+
+#[tokio::test]
+async fn test_json_decision_recipe_hard_sod_senior_pair_one_key_409() {
+    // HTTP-layer mirror of `recipe_hard_sod_senior_cannot_fabricate_teammate_slots_via_one_key`
+    // (Senior + Senior on one key): a Senior fills a Teammate slot (senior ⊇
+    // teammate), so two Seniors asserted by the SAME aggregator key must not be
+    // able to fabricate the two distinct humans a {teammate:2} recipe requires.
+    let rule = ApprovalRule {
+        recipes: vec![Recipe {
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Teammate,
+                count: 2,
+            }],
+        }],
+        decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+    };
+    let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "fake-alice@corp", "approver_class": "senior"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "pending");
+    assert_eq!(body["approvals_received"], 1);
+
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "fake-bob@corp", "approver_class": "senior"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "two seniors asserted by one key must not fabricate two teammate slots",
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "separation_of_duty");
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(
+        stored.signoffs.len(),
+        1,
+        "the second same-key sign-off was not recorded"
+    );
+}
+
+#[tokio::test]
+async fn test_json_decision_recipe_hard_sod_senior_then_teammate_one_key_409() {
+    // HTTP-layer mirror of the Senior-then-Teammate leg of
+    // `recipe_hard_sod_senior_cannot_fabricate_teammate_slots_via_one_key`: the
+    // existing senior already contributes a teammate slot, so a differently-classed
+    // second sign-off from the SAME key is equally rejected.
+    let rule = ApprovalRule {
+        recipes: vec![Recipe {
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Teammate,
+                count: 2,
+            }],
+        }],
+        decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+    };
+    let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "fake-carol@corp", "approver_class": "senior"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "fake-dave@corp", "approver_class": "teammate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "senior-then-teammate on one key must not fabricate two teammate slots",
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "separation_of_duty");
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.signoffs.len(), 1);
+}
+
+#[tokio::test]
+async fn test_json_decision_recipe_hard_sod_teammate_then_senior_one_key_409() {
+    // HTTP-layer mirror of the REVERSE ordering (Codex RE-REVIEW-6
+    // order-independence): a teammate first, then a senior on the same key. The
+    // senior would also fill a teammate slot, so this is equally rejected.
+    let rule = ApprovalRule {
+        recipes: vec![Recipe {
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Teammate,
+                count: 2,
+            }],
+        }],
+        decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+    };
+    let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "fake-erin@corp", "approver_class": "teammate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "fake-frank@corp", "approver_class": "senior"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "teammate-then-senior on one key must not fabricate two teammate slots",
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "separation_of_duty");
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.signoffs.len(), 1);
+}
+
+#[tokio::test]
+async fn test_json_decision_recipe_hard_sod_unsatisfiable_branch_then_senior_allowed() {
+    // HTTP-layer mirror of `recipe_hard_sod_unsatisfiable_branch_positive_does_not_poison_key`:
+    // rule is `{teammate:1, agent-reviewer:1}` OR `{senior:1}`. The agent-reviewer
+    // term is never satisfiable here, so a teammate positive toward that branch
+    // fills no VIABLE slot and must not poison the aggregator key for a later
+    // senior clearing the other branch.
+    let rule = ApprovalRule {
+        recipes: vec![
+            Recipe {
+                terms: vec![
+                    RecipeTerm {
+                        class: ApproverClass::Teammate,
+                        count: 1,
+                    },
+                    RecipeTerm {
+                        class: ApproverClass::AgentReviewer,
+                        count: 1,
+                    },
+                ],
+            },
+            Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Senior,
+                    count: 1,
+                }],
+            },
+        ],
+        decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+    };
+    let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
+
+    // Teammate toward the unsatisfiable branch — recorded, still pending.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "bob@corp", "approver_class": "teammate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "pending");
+
+    // Senior on the SAME key clears the {senior:1} branch — must NOT be 409.
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@corp", "approver_class": "senior"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a positive toward an unsatisfiable branch must not veto the senior on that key",
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "approved");
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
+}
+
+#[tokio::test]
+async fn test_json_decision_recipe_hard_sod_dissent_then_distinct_approve_allowed() {
+    // HTTP-layer mirror of `recipe_hard_sod_majority_dissent_does_not_poison_aggregator_key`:
+    // a recorded majority-mode DISSENT must not poison the per-tenant aggregator
+    // key — Feir OS uses ONE vultrino key per tenant, so a dissent and a later
+    // distinct approval routinely share a key.
+    let rule = ApprovalRule {
+        recipes: vec![Recipe {
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Teammate,
+                count: 1,
+            }],
+        }],
+        decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+    };
+    // "High" (required): majority-with-dissent semantics are only honored below
+    // Extreme — Extreme/irreversible force DenyOnAnyDeny regardless of the rule's
+    // own decision_mode, which would make the dissent terminal.
+    let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
+
+    // Carol dissents through the tenant key — non-terminal at High.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": false, "approver": "carol@corp", "approver_class": "teammate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "pending");
+
+    // Alice — a distinct real teammate — approves through the SAME key. Her single
+    // positive is all {teammate:1} requires; the recorded dissent must not veto it.
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@corp", "approver_class": "teammate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a dissent on the per-tenant key must not veto a distinct approver on that key",
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "approved");
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
+}
+
+#[tokio::test]
+async fn test_json_decision_recipe_hard_sod_two_distinct_keys_allowed() {
+    // Proves the fast-fail is KEY-scoped, not a blanket recipe block: a senior via
+    // key A then a teammate via a DISTINCT key B legitimately clear a {teammate:2}
+    // recipe (a senior is a valid teammate-slot filler — mirrors the "two DISTINCT
+    // keys still clear it" tail of
+    // `recipe_hard_sod_senior_cannot_fabricate_teammate_slots_via_one_key`).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    // Two DISTINCT aggregator admin keys, both scoped to team-a (mirrors the
+    // two-key fixture in `test_json_decision_idempotent_for_coapprover_retry_on_granted_mofn`).
+    let seed = AuthManager::new();
+    let (key_a, api_key_a) = seed.create_api_key("agg-a", "admin", None).unwrap();
+    let (key_b, api_key_b) = seed.create_api_key("agg-b", "admin", None).unwrap();
+    let mut tk_a = api_key_a.clone();
+    tk_a.tenant = Some("team-a".to_string());
+    let mut tk_b = api_key_b.clone();
+    tk_b.tenant = Some("team-a".to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tk_a.clone(), tk_b.clone()]);
+    storage.store_api_key(&tk_a).await.unwrap();
+    storage.store_api_key(&tk_b).await.unwrap();
+
+    let mut sod_config = Config::default();
+    sod_config.approval.enforce_separation_of_duty = true;
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        sod_config,
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    let rule = ApprovalRule {
+        recipes: vec![Recipe {
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Teammate,
+                count: 2,
+            }],
+        }],
+        decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+    };
+    let (mut approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo::local(),
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: Some("team-a".to_string()),
+        workload_id: None,
+        preview: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::High,
+        trusted_irreversible: None,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+        approval_rule: Some(rule),
+    });
+    approval.authoritative_risk_tier = "High".to_string();
+    let id = approval.id.clone();
+    storage.store_approval(&approval).await.unwrap();
+
+    // Senior via key A.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key_a,
+            serde_json::json!({"approve": true, "approver": "alice@corp", "approver_class": "senior"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "pending");
+
+    // Teammate via a DIFFERENT key B → clears the recipe, no 409.
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key_b,
+            serde_json::json!({"approve": true, "approver": "bob@corp", "approver_class": "teammate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a senior + a teammate on DISTINCT keys legitimately fill {{teammate:2}}",
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "approved");
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
 }
 
 #[tokio::test]
