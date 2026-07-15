@@ -272,6 +272,7 @@ async fn delegate_approval_records_approver_kind_in_outbox() {
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 1,
+        approval_rule: None,
     });
     storage.store_approval(&approval).await.unwrap();
 
@@ -412,6 +413,7 @@ async fn delegate_decision_delivers_signed_webhook_to_govder_consumer() {
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 1,
+        approval_rule: None,
     });
     storage.store_approval(&approval).await.unwrap();
 
@@ -542,6 +544,7 @@ async fn delegate_decision_cross_plane_to_govder() {
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 1,
+        approval_rule: None,
     });
     storage.store_approval(&approval).await.unwrap();
     println!("CROSS_PLANE_APPROVAL_ID={}", approval.id);
@@ -630,6 +633,7 @@ async fn delegate_decide_high_risk_blocked_at_pep() {
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 1,
+        approval_rule: None,
     });
     storage.store_approval(&approval).await.unwrap();
 
@@ -749,6 +753,7 @@ async fn delegate_decide_irreversible_blocked_at_pep() {
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 1,
+        approval_rule: None,
     });
     storage.store_approval(&approval).await.unwrap();
 

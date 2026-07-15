@@ -137,6 +137,17 @@ struct EvaluateResponse {
     veto_window_secs: u64,
 }
 
+/// Wire shape of `GET /v1/oversight/gates/rule` (plan 100 P2 Phase D). `has_rule` is
+/// the unambiguous signal of rule presence — `approval_rule` is `None` whenever
+/// `has_rule` is `false`, mirroring govder's `GateApprovalRuleResponse`.
+#[derive(Debug, Clone, Deserialize)]
+struct GateApprovalRuleResponse {
+    #[serde(default)]
+    has_rule: bool,
+    #[serde(default)]
+    approval_rule: Option<crate::approval::ApprovalRule>,
+}
+
 /// HTTP client for govder delegation endpoints.
 #[derive(Clone)]
 pub struct GovderClient {
@@ -282,6 +293,75 @@ impl GovderClient {
             },
             veto_window_secs: out.veto_window_secs,
         })
+    }
+
+    /// Fetch the stamped `ApprovalRule` (if any) for `(agent_id, action_class)` at
+    /// approval-open (plan 100 P2 Phase D; docs/design/approval-recipes.md §6 D5).
+    /// `GET /v1/oversight/gates/rule` — 404 (no gate configured) and a 2xx body
+    /// with `has_rule: false` (gate exists, no rule) both map to `Ok(None)`: from
+    /// vultrino's side these are a CONFIRMED "no rule" → today's numeric-threshold
+    /// path, unchanged.
+    ///
+    /// Any GENUINE fetch failure — a transport/`signed_json` error, a non-2xx
+    /// status other than 404 (5xx etc.), a body-read error, or a JSON parse
+    /// error — returns `Err` instead. Unlike the stale contract this replaced,
+    /// such a failure must NOT be treated as "no rule": vultrino never confirmed
+    /// the gate's oversight requirement, so silently falling back to the (weaker)
+    /// numeric-threshold path would let a transient govder blip downgrade a
+    /// recipe-gated approval (e.g. "1 senior + 2 agent-reviewers") to a plain
+    /// headcount. This now matches [`Self::evaluate_delegate_decision`]'s
+    /// fail-closed posture: both are per-open/per-decision AUTHORITY checks with
+    /// no safe fallback on a failure vultrino cannot confirm.
+    pub async fn fetch_gate_rule(
+        &self,
+        tenant: &str,
+        agent_id: &str,
+        action_class: &str,
+    ) -> Result<Option<crate::approval::ApprovalRule>, GovderError> {
+        let agent_id = agent_id.trim();
+        let action_class = action_class.trim();
+        if tenant.trim().is_empty() || agent_id.is_empty() || action_class.is_empty() {
+            // Shape issue, not a fetch failure: there is no identity to query
+            // govder with, so there is nothing to confirm either way — parity
+            // with today's numeric-threshold path.
+            return Ok(None);
+        }
+        let query = format!(
+            "agent_id={}&action_class={}",
+            urlencoding::encode(agent_id),
+            urlencoding::encode(action_class)
+        );
+        let resp = self
+            .signed_json(tenant, "GET", "/v1/oversight/gates/rule", &query, None)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, %agent_id, %action_class,
+                    "govder gate-rule fetch failed; failing closed (blocking the approval-open) rather than falling back to the numeric-threshold path");
+                error
+            })?;
+        let status = resp.status().as_u16();
+        if status == 404 {
+            return Ok(None); // no gate configured for this agent_id/action_class: confirmed no rule
+        }
+        let body = resp.text().await.map_err(|error| {
+            tracing::error!(%error, %agent_id, %action_class,
+                "govder gate-rule response body could not be read; failing closed");
+            GovderError::Request(error)
+        })?;
+        if !(200..300).contains(&status) {
+            tracing::error!(status, %agent_id, %action_class, body,
+                "govder gate-rule fetch returned a non-2xx status; failing closed");
+            return Err(GovderError::Http { status, body });
+        }
+        let parsed: GateApprovalRuleResponse = serde_json::from_str(&body).map_err(|error| {
+            tracing::error!(%error, %agent_id, %action_class,
+                "govder gate-rule response failed to parse; failing closed");
+            GovderError::Decode(error.to_string())
+        })?;
+        if !parsed.has_rule {
+            return Ok(None); // confirmed: gate exists, no rule stamped
+        }
+        Ok(parsed.approval_rule)
     }
 
     async fn signed_json(

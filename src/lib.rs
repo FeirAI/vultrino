@@ -57,6 +57,13 @@ pub enum VultrinoError {
     #[error("Request denied by policy: {0}")]
     PolicyDenied(String),
 
+    /// A downstream policy/oversight consult (e.g. govder) could not be
+    /// completed — distinct from [`Self::PolicyDenied`] (an explicit deny
+    /// verdict): this is "we don't know", not "no". Fails closed: callers must
+    /// treat this as blocked, never as a permissive fallback.
+    #[error("Policy engine unavailable: {0}")]
+    PolicyUnavailable(String),
+
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 }

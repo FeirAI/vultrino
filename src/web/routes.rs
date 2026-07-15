@@ -1466,6 +1466,8 @@ pub async fn approval_approve(
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
     let _ = regenerate_csrf_token(&session).await;
@@ -1504,6 +1506,8 @@ pub async fn approval_deny(
             "admin panel",
             &auth.session.username,
             enforce_sod,
+            None,
+            None,
             None,
             None,
             None,
@@ -1640,6 +1644,8 @@ pub async fn approval_decide_submit(
             "out-of-band link",
             approver_identity,
             enforce_sod,
+            None,
+            None,
             None,
             None,
             None,

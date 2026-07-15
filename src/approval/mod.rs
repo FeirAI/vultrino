@@ -251,10 +251,155 @@ pub struct NewApproval {
     /// any). `None` when the capability declares no spec — the approver falls
     /// back to `summary`.
     pub preview: Option<crate::capability::ApprovalPreview>,
+    /// The govder-authored `ApprovalRule` for this (agent, action_class), fetched
+    /// at open (plan 100 P2 Phase D; approval-recipes.md §6 D5). `None` when govder
+    /// has no rule configured (or is unreachable/unconfigured) — the numeric
+    /// threshold applies, byte-identical to today.
+    pub approval_rule: Option<ApprovalRule>,
 }
 
 fn default_approver_kind() -> String {
     "human".to_string()
+}
+
+/// serde default for `Signoff::approve` (pre-Phase-D records never carried this
+/// field — see that field's doc for why `true` is the safe default).
+fn default_true() -> bool {
+    true
+}
+
+/// Approver class for approval-recipe slot matching (plan 100 P2 Phase D;
+/// docs/design/approval-recipes.md §2 D1). Mirrors govder's
+/// `internal/enums.ApproverClass` wire values exactly (`senior` / `teammate` /
+/// `agent-reviewer`) so a rule fetched from `GET /v1/oversight/gates/rule` round-trips
+/// without translation. `Unknown` is a deserialize-only catch-all (`#[serde(other)]`):
+/// an unrecognized class value on a fetched `RecipeTerm` must disqualify only THAT
+/// recipe (see `recipe_well_formed`), never fail the whole `ApprovalRule` fetch —
+/// govder's own `recipeComposition` has the same "malformed recipe is skipped, not a
+/// hard error" contract. `Unknown` never satisfies any slot and is never intentionally
+/// produced by [`ApproverClass::parse_wire`] (the `DecideReq` boundary resolves an
+/// unrecognized wire string to `None`, not `Unknown` — see that method's doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApproverClass {
+    /// A human whose IdP groups intersect the org's configured senior-groups list
+    /// AND who holds the `approve` action.
+    Senior,
+    /// Any human whose groups grant the `approve` action.
+    Teammate,
+    /// A delegate agent holding an active `DelegationGrant` whose scope covers the
+    /// action. Counts exactly 1 in v1 (model-tiered counting is deferred).
+    AgentReviewer,
+    /// Deserialize-only catch-all for an unrecognized wire value (see doc above).
+    #[serde(other)]
+    Unknown,
+}
+
+impl ApproverClass {
+    /// Whether the class is human-accountable (`senior`/`teammate`) as opposed to
+    /// `agent-reviewer`/`Unknown` — mirrors govder's `ApproverClass.IsHuman`.
+    pub fn is_human(self) -> bool {
+        matches!(self, ApproverClass::Senior | ApproverClass::Teammate)
+    }
+
+    /// Parse a wire class string resolved by the feir-os broker from VERIFIED IdP
+    /// groups (docs/design/approval-recipes.md §6 D5 "human-class evidence
+    /// contract"). Returns `None` for blank/unrecognized input — an unresolved class
+    /// is never counted toward a stamped `ApprovalRule` (fail-closed; mirrors
+    /// govder's `ApproverClass.Valid()` gate in `classifySignOffs`). Deliberately
+    /// distinct from the `Unknown` deserialize variant above: a sign-off with an
+    /// unparseable class is simply unresolved (`None`), never stored as `Unknown`.
+    pub fn parse_wire(s: &str) -> Option<Self> {
+        match s.trim() {
+            "senior" => Some(ApproverClass::Senior),
+            "teammate" => Some(ApproverClass::Teammate),
+            "agent-reviewer" => Some(ApproverClass::AgentReviewer),
+            _ => None,
+        }
+    }
+}
+
+/// The sub-Extreme partial-dissent semantics knob on an [`ApprovalRule`] (P2 build
+/// decision #1, approval-recipes.md). Extreme risk (`CriticalityClass::Critical`) and
+/// any irreversible action ALWAYS behave as `DenyOnAnyDeny` regardless of this field
+/// (`ApprovalRequest::transition` forces it) — see approval-recipes.md §3/§5 D4a.
+/// Deserializes fail-closed: any value other than the exact
+/// `majority-with-dissent-recorded` string (including a missing field, an empty
+/// string, or a future/unknown value) becomes `DenyOnAnyDeny`, mirroring govder's
+/// `RecipeDecisionMode.Valid()` fallback in `evaluateApprovalRule` — but resolved ONCE
+/// at deserialize time here rather than re-checked at every evaluation, since Rust's
+/// enum makes an invalid in-memory value unrepresentable (a divergence-by-construction
+/// from govder's raw-string type, not a behavior difference).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecipeDecisionMode {
+    /// DEFAULT (conservative/fail-closed): any single explicit deny halts collection
+    /// regardless of the accumulated positive count.
+    DenyOnAnyDeny,
+    /// Opt-in per org: the recipe may still be satisfied by its required positive set
+    /// even with a dissenter. The dissent is always recorded on the sign-off set,
+    /// never lost.
+    MajorityWithDissentRecorded,
+}
+
+impl Default for RecipeDecisionMode {
+    fn default() -> Self {
+        RecipeDecisionMode::DenyOnAnyDeny
+    }
+}
+
+impl<'de> Deserialize<'de> for RecipeDecisionMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Any non-string, unrecognized, or empty value falls back to the
+        // conservative default rather than erroring — a malformed decision_mode
+        // must never make the whole ApprovalRule fetch fail (fail-closed).
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            Some("majority-with-dissent-recorded") => {
+                RecipeDecisionMode::MajorityWithDissentRecorded
+            }
+            _ => RecipeDecisionMode::DenyOnAnyDeny,
+        })
+    }
+}
+
+/// One alternative sign-off composition within an [`ApprovalRule`] (plan 100 P2 Phase
+/// D). A recipe is satisfied when the accumulated sign-off set can be injectively
+/// assigned to its terms, senior slots first — see [`recipe_satisfied`]'s doc for the
+/// swap-argument proof (approval-recipes.md §2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Recipe {
+    pub terms: Vec<RecipeTerm>,
+}
+
+/// One class + count slot in a [`Recipe`], e.g. `{class: senior, count: 1}`. Multiple
+/// terms of the same class within one recipe are additive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeTerm {
+    pub class: ApproverClass,
+    pub count: u32,
+}
+
+/// The govder-authored approval-recipe rule (plan 100 P2 Phase D;
+/// docs/design/approval-recipes.md §6 D5). govder is the system of record — it
+/// validates every recipe against the action's risk-tier/autonomy/irreversibility
+/// floor at write time AND re-validates it at its own terminal re-check; vultrino
+/// receives this ALREADY-VALIDATED shape at approval-open (`GET
+/// /v1/oversight/gates/rule`), stamps it onto the `ApprovalRequest`, and evaluates
+/// SATISFACTION ONLY in-lock (`ApprovalRequest::transition`) — it never re-derives the
+/// D2 risk-tier floor (that would risk Rust/Go drift; see [`approval_rule_satisfied`]'s
+/// doc for exactly which D4 axes vultrino does and does not evaluate).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalRule {
+    /// Alternative sign-off compositions; the approval is granted when the
+    /// accumulated sign-off set satisfies AT LEAST ONE recipe in full.
+    pub recipes: Vec<Recipe>,
+    /// The partial-dissent semantics knob (see [`RecipeDecisionMode`]).
+    #[serde(default)]
+    pub decision_mode: RecipeDecisionMode,
 }
 
 /// One approver's sign-off on a dual-control (M-of-N) approval (V12).
@@ -273,6 +418,34 @@ pub struct Signoff {
     /// DelegationGrant reference when `approver_kind` is `delegate-agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_grant_ref: Option<String>,
+    /// RESOLVED approver class, received from the caller (feir-os broker, from
+    /// VERIFIED IdP groups) and recorded as a snapshot-at-sign-off value — vultrino
+    /// trusts + records it, never re-resolves it later (plan 100 P2 Phase D;
+    /// approval-recipes.md §6 D5 "human-class evidence contract"). `None` when the
+    /// caller didn't supply one (every pre-Phase-D caller, and the admin panel/
+    /// OOB-link/CLI decision paths): such a sign-off is never counted toward a
+    /// stamped `ApprovalRule` (fail-closed), though it still counts toward the plain
+    /// numeric threshold when no rule is stamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_class: Option<ApproverClass>,
+    /// Controller-domain key for D4(f) collapse (agent-reviewer sign-offs sharing a
+    /// controller count as ONE toward any recipe) — the grant's delegator (human) or
+    /// the delegate `AgentRecord`'s owner, resolved and snapshotted by the caller at
+    /// sign-off time. Ignored for human sign-offs. `None`/blank collapses into a
+    /// single sentinel "unknown controller" domain at evaluation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<String>,
+    /// Whether this sign-off was itself an approve (`true`) or an explicit
+    /// deny/dissent (`false`). Recipe evaluation counts only `true` entries toward
+    /// any recipe — see `ApprovalRequest::transition`'s
+    /// `RecipeDecisionMode::MajorityWithDissentRecorded` handling. Defaults to
+    /// `true` for records predating this field: before Phase D a deny was ALWAYS
+    /// immediately terminal, so every `Signoff` still reachable on an OPEN request
+    /// was necessarily an approval; the one historical exception (the trailing
+    /// `Signoff` on an already-`Denied` request) is inert, since a `Denied`
+    /// request's sign-offs are never re-evaluated.
+    #[serde(default = "default_true")]
+    pub approve: bool,
 }
 
 /// A human decision on an approval request (V5). Carries the channel it arrived
@@ -294,6 +467,12 @@ pub struct Decision {
     pub approver_kind: String,
     /// DelegationGrant reference when `approver_kind` is `delegate-agent`.
     pub delegation_grant_ref: Option<String>,
+    /// Resolved approver class for recipe satisfaction (plan 100 P2 Phase D; see
+    /// [`Signoff::resolved_class`]).
+    pub resolved_class: Option<ApproverClass>,
+    /// Controller-domain key for recipe D4(f) collapse (plan 100 P2 Phase D; see
+    /// [`Signoff::controller`]).
+    pub controller: Option<String>,
 }
 
 impl Decision {
@@ -306,6 +485,8 @@ impl Decision {
             enforce_sod: false,
             approver_kind: default_approver_kind(),
             delegation_grant_ref: None,
+            resolved_class: None,
+            controller: None,
         }
     }
 
@@ -325,6 +506,18 @@ impl Decision {
     pub fn as_delegate(mut self, grant_ref: impl Into<String>) -> Self {
         self.approver_kind = "delegate-agent".to_string();
         self.delegation_grant_ref = Some(grant_ref.into());
+        self
+    }
+
+    /// Attach the resolved approver class (plan 100 P2 Phase D recipe satisfaction).
+    pub fn with_resolved_class(mut self, class: ApproverClass) -> Self {
+        self.resolved_class = Some(class);
+        self
+    }
+
+    /// Attach the controller-domain key (plan 100 P2 Phase D D4(f) collapse).
+    pub fn with_controller(mut self, controller: impl Into<String>) -> Self {
+        self.controller = Some(controller.into());
         self
     }
 }
@@ -393,6 +586,14 @@ pub struct ApprovalRequest {
     /// `required_approvals` is met.
     #[serde(default)]
     pub signoffs: Vec<Signoff>,
+    /// The govder-authored `ApprovalRule` stamped at open (plan 100 P2 Phase D;
+    /// approval-recipes.md §6 D5). `None` preserves today's numeric-threshold
+    /// behavior byte-identically — recipes are strictly opt-in per action class.
+    /// When present, `transition()` evaluates recipe satisfaction IN-LOCK against
+    /// this stamped copy instead of the numeric threshold (govder does its own
+    /// terminal re-validation independently; see [`approval_rule_satisfied`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_rule: Option<ApprovalRule>,
     /// Criticality class (V5) — drives the escalation/expiry windows and is
     /// recorded for separation-of-duty / complacency analytics.
     #[serde(default)]
@@ -516,6 +717,7 @@ impl ApprovalRequest {
             dual_control: params.dual_control,
             required_approvals: params.required_approvals.max(1),
             signoffs: Vec::new(),
+            approval_rule: params.approval_rule,
             criticality: params.criticality,
             trusted_irreversible: params.trusted_irreversible.unwrap_or(false),
             trusted_spend_amount_minor: None,
@@ -638,8 +840,32 @@ impl ApprovalRequest {
         let sod = self.sod_for(&identity);
 
         if to == ApprovalStatus::Denied {
+            // Plan 100 P2 Phase D: with a stamped ApprovalRule in
+            // `RecipeDecisionMode::MajorityWithDissentRecorded`, a dissent is
+            // recorded but does NOT by itself terminate the request — the recipe
+            // may still be satisfiable by the remaining positive sign-offs
+            // (approval-recipes.md §3 P2 build decision #1). This carve-out NEVER
+            // applies to:
+            //  - the numeric-threshold path (no rule stamped) — deny-wins stays
+            //    verbatim, byte-identical parity with today;
+            //  - Extreme risk or an irreversible action (forced deny-on-any-deny
+            //    regardless of the configured knob — approval-recipes.md §3/§5 D4a);
+            //  - a veto of an ALREADY-Approved request (`is_delegate_veto`) —
+            //    vetoing is always terminal, never a "dissent" on a still-open
+            //    collection.
+            let terminal_deny = is_delegate_veto
+                || match &self.approval_rule {
+                    None => true,
+                    Some(rule) => {
+                        self.trusted_irreversible
+                            || self.criticality == CriticalityClass::Critical
+                            || rule.decision_mode == RecipeDecisionMode::DenyOnAnyDeny
+                    }
+                };
             // A single veto denies, regardless of how many approvals were gathered
-            // (M-of-N is for granting, not denying). A self-denial is harmless.
+            // (M-of-N is for granting, not denying). A self-denial is harmless. The
+            // sign-off is recorded either way — dissent is NEVER lost, even when it
+            // doesn't (yet) terminate the request.
             self.signoffs.push(Signoff {
                 approver_identity: identity.clone(),
                 channel: decision.channel.clone(),
@@ -647,21 +873,28 @@ impl ApprovalRequest {
                 note: decision.note.clone(),
                 approver_kind: decision.approver_kind.clone(),
                 delegation_grant_ref: decision.delegation_grant_ref.clone(),
+                resolved_class: decision.resolved_class,
+                controller: decision.controller.clone(),
+                approve: false,
             });
-            self.status = ApprovalStatus::Denied;
-            self.decided_at = Some(now);
-            self.decided_by = Some(decision.channel);
-            self.approver_identity = Some(identity);
             // Sticky-true, consistent with the approval path.
             self.sod_violation = match (self.sod_violation, sod) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (a, b) => a.or(b),
             };
+            if !terminal_deny {
+                // Dissent recorded; the request stays open awaiting more sign-offs.
+                return Ok(());
+            }
+            self.status = ApprovalStatus::Denied;
+            self.decided_at = Some(now);
+            self.decided_by = Some(decision.channel);
+            self.approver_identity = Some(identity);
             self.decision_note = decision.note;
             return Ok(());
         }
 
-        // Approval path (V12 dual-control / M-of-N).
+        // Approval path (V12 dual-control / M-of-N, and plan 100 P2 Phase D recipes).
         // Optionally hard-reject a self-approval (don't record it; the request
         // stays cleanly awaiting other approvers).
         if decision.enforce_sod && sod == Some(true) {
@@ -688,7 +921,7 @@ impl ApprovalRequest {
             }
         }
         // Approvers must be DISTINCT — the same identity can't satisfy two of the
-        // required M sign-offs.
+        // required M sign-offs (nor dissent once and later approve, or vice versa).
         if self
             .signoffs
             .iter()
@@ -703,6 +936,9 @@ impl ApprovalRequest {
             note: decision.note.clone(),
             approver_kind: decision.approver_kind.clone(),
             delegation_grant_ref: decision.delegation_grant_ref.clone(),
+            resolved_class: decision.resolved_class,
+            controller: decision.controller.clone(),
+            approve: true,
         });
         self.approver_identity = Some(identity);
         // Sticky SoD: a violation by ANY of the M approvers flags the decision.
@@ -711,8 +947,15 @@ impl ApprovalRequest {
             (a, b) => a.or(b),
         };
         // Threshold met → grant; otherwise stay open awaiting more distinct
-        // approvers. Use the authoritative threshold (dual_control forces >= 2).
-        if self.signoffs.len() as u32 >= self.effective_required_approvals() {
+        // approvers/recipe slots. A stamped ApprovalRule REPLACES the numeric
+        // threshold with in-lock recipe satisfaction (plan 100 P2 Phase D); with
+        // no rule, the authoritative numeric threshold is unchanged (dual_control
+        // forces >= 2) — byte-identical parity with today.
+        let granted = match &self.approval_rule {
+            None => self.signoffs.len() as u32 >= self.effective_required_approvals(),
+            Some(rule) => approval_rule_satisfied(rule, &self.signoffs),
+        };
+        if granted {
             self.status = ApprovalStatus::Approved;
             self.decided_at = Some(now);
             self.decided_by = Some(decision.channel);
@@ -865,6 +1108,194 @@ impl ApprovalRequest {
             panel_url: format!("{}/approvals", base),
         }
     }
+}
+
+// ==================== Approval-recipe in-lock evaluator (plan 100 P2 Phase D) ====
+
+/// Evaluate whether `rule` is satisfied by the accumulated `signoffs` — vultrino's
+/// RACE-SAFE, in-lock RUNTIME evaluator (called from `ApprovalRequest::transition`,
+/// which always runs under the storage write lock — see `storage/file.rs`'s
+/// `decide_approval_atomic`/`locked_mutate`). Mirrors govder's
+/// `internal/oversight/recipes.go` `evaluateApprovalRule`/`recipeSatisfied` for the
+/// axes vultrino can evaluate WITHOUT a govder store round-trip:
+///
+/// - positive-only (a deny/dissent sign-off never counts toward a recipe — the
+///   deny-wins / dissent-recorded split happens in `transition()` before this is
+///   ever called for the approval path);
+/// - D4(b) distinct-principal dedupe;
+/// - D4(f) agent-reviewer controller-domain collapse;
+/// - D2 injective senior-first slot matching (`recipe_satisfied`).
+///
+/// It deliberately does **NOT** re-derive: the D2 risk-tier floor (govder validates
+/// this at write time AND at its own terminal re-validation — re-deriving it here
+/// would risk Rust/Go drift), D4(c) the per-sign-off grant-floor recheck (needs
+/// govder's `EvaluateDecision`; the delegate-decide path already consults it
+/// per-signoff, see `web/api.rs::api_delegate_decide_approval`), D4(d) pairwise-
+/// lineage-unrelatedness, or D4(e) requester exclusion (both need govder's agent-
+/// hierarchy store, which vultrino does not have). Those three axes stay govder's
+/// job at write time and terminal re-validation (docs/design/approval-recipes.md §6
+/// D5) — a divergence from the ORIGINAL Phase-C/D design sketch (which had asked for
+/// D4(d) in-lock too), recorded here explicitly rather than silently narrowed.
+///
+/// A malformed sign-off (blank identity, an unresolved/unknown class, an
+/// agent-reviewer with no grant ref, or a kind/class mismatch) is silently dropped —
+/// never counted, never erroring the whole evaluation (fail-closed per-entry, mirrors
+/// govder's `classifySignOffs`). A structurally malformed recipe (no terms, a
+/// non-positive count, or an unknown class) is permanently disqualified — skipped,
+/// per `recipeComposition`. If every recipe is disqualified this way, the rule can
+/// never be satisfied (fail-closed): the request simply stays open, never auto-denied
+/// (deny-wins already handles denial separately in `transition()`).
+fn approval_rule_satisfied(rule: &ApprovalRule, signoffs: &[Signoff]) -> bool {
+    let mut humans: Vec<&Signoff> = Vec::new();
+    let mut agent_reviewers: Vec<&Signoff> = Vec::new();
+    for so in signoffs.iter().filter(|s| s.approve) {
+        if so.approver_identity.trim().is_empty() {
+            continue; // malformed: fail-closed, drop
+        }
+        let Some(class) = so.resolved_class else {
+            continue; // unresolved class: never counted (fail-closed)
+        };
+        // Kind/Class cross-check (defense in depth), mirrors govder's
+        // classifySignOffs: a "human" Kind must resolve to senior/teammate and a
+        // "delegate-agent" Kind must resolve to agent-reviewer; a mismatch (or an
+        // unrecognized Kind) is malformed and dropped. An empty Kind skips the
+        // cross-check (older callers that never set approver_kind default to
+        // "human" via `default_approver_kind`, which is intentionally permissive
+        // here — only an EXPLICIT mismatch is treated as malformed).
+        match so.approver_kind.trim() {
+            "human" if !class.is_human() => continue,
+            "delegate-agent" if class != ApproverClass::AgentReviewer => continue,
+            _ => {}
+        }
+        match class {
+            ApproverClass::Senior | ApproverClass::Teammate => humans.push(so),
+            ApproverClass::AgentReviewer => {
+                let has_grant_ref = so
+                    .delegation_grant_ref
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if !has_grant_ref {
+                    continue; // agent-reviewer sign-off with no grant ref: malformed, drop
+                }
+                agent_reviewers.push(so);
+            }
+            ApproverClass::Unknown => continue,
+        }
+    }
+
+    // D4(b) distinct principals: dedupe by identity, first occurrence wins.
+    let humans = dedupe_by_identity(humans);
+    let agent_reviewers = dedupe_by_identity(agent_reviewers);
+
+    // D4(f) controller-domain collapse (agent-reviewers only). NOTE: this does NOT
+    // also fold in govder's D4(d) pairwise-lineage-unrelatedness (see this
+    // function's doc) — that axis needs govder's agent-hierarchy store.
+    let agent_reviewers = collapse_by_controller(agent_reviewers);
+
+    let avail_senior = humans
+        .iter()
+        .filter(|s| s.resolved_class == Some(ApproverClass::Senior))
+        .count() as u32;
+    let avail_teammate = humans
+        .iter()
+        .filter(|s| s.resolved_class == Some(ApproverClass::Teammate))
+        .count() as u32;
+    let avail_agent_reviewer = agent_reviewers.len() as u32;
+
+    rule.recipes
+        .iter()
+        .any(|r| recipe_satisfied(r, avail_senior, avail_teammate, avail_agent_reviewer))
+}
+
+/// Injective senior-first slot matching (mirrors govder's `recipeSatisfied` exactly).
+/// Senior slots are filled by senior sign-offs first; any senior LEFT OVER after that
+/// may fill a teammate slot (a senior is a fortiori a teammate); agent-reviewer slots
+/// are filled only by agent-reviewer sign-offs (disjoint from both human classes).
+/// Greedy senior-first assignment is provably sufficient for this two-human-class
+/// system — see approval-recipes.md §2 for the swap argument (a senior placed in a
+/// teammate slot while a senior slot goes unfilled can always be swapped with a plain
+/// teammate, so greedy never fails where a matching exists). A structurally malformed
+/// recipe (see [`recipe_well_formed`]) can never be satisfied.
+fn recipe_satisfied(
+    r: &Recipe,
+    avail_senior: u32,
+    avail_teammate: u32,
+    avail_agent_reviewer: u32,
+) -> bool {
+    if !recipe_well_formed(r) {
+        return false;
+    }
+    let mut need_senior = 0u32;
+    let mut need_teammate = 0u32;
+    let mut need_agent_reviewer = 0u32;
+    for t in &r.terms {
+        match t.class {
+            ApproverClass::Senior => need_senior += t.count,
+            ApproverClass::Teammate => need_teammate += t.count,
+            ApproverClass::AgentReviewer => need_agent_reviewer += t.count,
+            ApproverClass::Unknown => return false, // recipe_well_formed already excludes this
+        }
+    }
+    if avail_senior < need_senior {
+        return false; // senior slots can ONLY be filled by seniors
+    }
+    let leftover_senior = avail_senior - need_senior;
+    if leftover_senior + avail_teammate < need_teammate {
+        return false;
+    }
+    avail_agent_reviewer >= need_agent_reviewer
+}
+
+/// Structural well-formedness (mirrors govder's `recipeComposition`'s `ok` return): a
+/// recipe with no terms, any non-positive count, or any unknown class can never be
+/// satisfied — permanently disqualified rather than erroring the whole rule.
+fn recipe_well_formed(r: &Recipe) -> bool {
+    if r.terms.is_empty() {
+        return false;
+    }
+    r.terms.iter().all(|t| {
+        t.count > 0
+            && matches!(
+                t.class,
+                ApproverClass::Senior | ApproverClass::Teammate | ApproverClass::AgentReviewer
+            )
+    })
+}
+
+/// D4(b) distinct principals: keep the FIRST occurrence per distinct identity
+/// (trimmed comparison — mirrors govder's `dedupeByIdentity`).
+fn dedupe_by_identity<'a>(signoffs: Vec<&'a Signoff>) -> Vec<&'a Signoff> {
+    let mut seen = std::collections::HashSet::new();
+    signoffs
+        .into_iter()
+        .filter(|s| seen.insert(s.approver_identity.trim().to_string()))
+        .collect()
+}
+
+/// D4(f) controller-domain collapse ONLY — not the joint D4(d) lineage collapse
+/// govder also performs (that needs govder's agent-hierarchy store; see
+/// [`approval_rule_satisfied`]'s doc for why that axis stays govder's job). Agent-
+/// reviewer sign-offs sharing a controller collapse to the FIRST representative; an
+/// empty/unresolved controller joins a single sentinel domain, so unknowns collapse
+/// together rather than each counting (fail-closed) — mirrors govder's
+/// `collapseAgentReviewers`'s `controllerKey` helper.
+fn collapse_by_controller<'a>(agent_reviewers: Vec<&'a Signoff>) -> Vec<&'a Signoff> {
+    const UNKNOWN_CONTROLLER: &str = "\u{0}unknown-controller";
+    let mut seen = std::collections::HashSet::new();
+    agent_reviewers
+        .into_iter()
+        .filter(|s| {
+            let key = s
+                .controller
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .unwrap_or(UNKNOWN_CONTROLLER)
+                .to_string();
+            seen.insert(key)
+        })
+        .collect()
 }
 
 /// Errors when transitioning an approval request.
@@ -1392,7 +1823,57 @@ mod tests {
             oob_identity: None,
             reauth_interval_secs: None,
             required_approvals: 1,
+            approval_rule: None,
         })
+    }
+
+    /// Build a request with a stamped `ApprovalRule` (plan 100 P2 Phase D tests).
+    fn new_approval_with_rule(rule: ApprovalRule) -> ApprovalRequest {
+        let (mut a, _) = new_approval();
+        a.approval_rule = Some(rule);
+        a
+    }
+
+    /// A one-recipe rule requiring `1 senior + 2 agent-reviewer` sign-offs.
+    fn senior_plus_two_reviewers_rule() -> ApprovalRule {
+        ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![
+                    RecipeTerm {
+                        class: ApproverClass::Senior,
+                        count: 1,
+                    },
+                    RecipeTerm {
+                        class: ApproverClass::AgentReviewer,
+                        count: 2,
+                    },
+                ],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        }
+    }
+
+    fn approve_as(
+        a: &mut ApprovalRequest,
+        identity: &str,
+        class: ApproverClass,
+        controller: Option<&str>,
+        grant_ref: Option<&str>,
+    ) -> Result<(), ApprovalError> {
+        let kind = if class == ApproverClass::AgentReviewer {
+            "delegate-agent"
+        } else {
+            "human"
+        };
+        let mut decision = Decision::new("admin panel", identity).with_resolved_class(class);
+        decision.approver_kind = kind.to_string();
+        if let Some(c) = controller {
+            decision = decision.with_controller(c);
+        }
+        if let Some(g) = grant_ref {
+            decision.delegation_grant_ref = Some(g.to_string());
+        }
+        a.approve(decision)
     }
 
     #[test]
@@ -2025,5 +2506,246 @@ mod tests {
         assert!(links.approve_url.contains("decision=approve"));
         assert!(links.deny_url.contains("decision=deny"));
         assert!(links.panel_url.ends_with("/approvals"));
+    }
+
+    // ============ Plan 100 P2 Phase D: approval-recipe in-lock evaluator ========
+
+    #[test]
+    fn recipe_one_senior_plus_two_agent_reviewers_needs_all_three_distinct() {
+        let mut a = new_approval_with_rule(senior_plus_two_reviewers_rule());
+
+        // A senior alone is not enough (still needs 2 agent-reviewers).
+        approve_as(&mut a, "senior@corp", ApproverClass::Senior, None, None).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Pending);
+
+        // One agent-reviewer: still short by one.
+        approve_as(
+            &mut a,
+            "ep_reviewer_a",
+            ApproverClass::AgentReviewer,
+            Some("controller-a"),
+            Some("dg_a"),
+        )
+        .unwrap();
+        assert_eq!(a.status, ApprovalStatus::Pending, "1 of 2 reviewers");
+
+        // A second agent-reviewer under a DISTINCT controller completes the recipe.
+        approve_as(
+            &mut a,
+            "ep_reviewer_b",
+            ApproverClass::AgentReviewer,
+            Some("controller-b"),
+            Some("dg_b"),
+        )
+        .unwrap();
+        assert_eq!(a.status, ApprovalStatus::Approved);
+        assert_eq!(a.signoffs.len(), 3);
+    }
+
+    #[test]
+    fn recipe_two_agent_reviewers_sharing_a_controller_count_as_one() {
+        let mut a = new_approval_with_rule(senior_plus_two_reviewers_rule());
+        approve_as(&mut a, "senior@corp", ApproverClass::Senior, None, None).unwrap();
+        approve_as(
+            &mut a,
+            "ep_reviewer_a",
+            ApproverClass::AgentReviewer,
+            Some("same-controller"),
+            Some("dg_a"),
+        )
+        .unwrap();
+        // Distinct identity, distinct grant ref, but the SAME controller — D4(f)
+        // collapses these to ONE toward the recipe's "2 agent-reviewer" slot.
+        approve_as(
+            &mut a,
+            "ep_reviewer_b",
+            ApproverClass::AgentReviewer,
+            Some("same-controller"),
+            Some("dg_b"),
+        )
+        .unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "two reviewers behind one controller must not satisfy a 2-reviewer recipe"
+        );
+        assert_eq!(a.signoffs.len(), 3, "both sign-offs are still recorded");
+    }
+
+    #[test]
+    fn recipe_any_deny_denies_under_default_deny_on_any_deny_mode() {
+        let mut a = new_approval_with_rule(senior_plus_two_reviewers_rule());
+        approve_as(
+            &mut a,
+            "ep_reviewer_a",
+            ApproverClass::AgentReviewer,
+            Some("controller-a"),
+            Some("dg_a"),
+        )
+        .unwrap();
+        assert_eq!(a.status, ApprovalStatus::Pending);
+        a.deny(Decision::new("admin panel", "senior@corp")).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Denied);
+    }
+
+    #[test]
+    fn recipe_present_but_unsatisfied_stays_pending_never_auto_approves() {
+        // A rule that can never be satisfied (an agent-reviewer-only recipe with no
+        // agent-reviewer sign-off ever recorded) must leave the request pending
+        // forever — never auto-approve just because a stamped rule exists.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::AgentReviewer,
+                    count: 1,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        };
+        let mut a = new_approval_with_rule(rule);
+        // A human approval does NOT satisfy an agent-reviewer-only recipe, even
+        // though a single approval would have sufficed under the numeric path.
+        approve_as(&mut a, "senior@corp", ApproverClass::Senior, None, None).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn recipe_unresolved_class_never_counts_even_though_numeric_path_would_allow_it() {
+        // No `approver_class` supplied (e.g. an admin-panel/OOB/CLI decision, or a
+        // pre-Phase-D broker) must never count toward a stamped rule, even though
+        // the SAME sign-off would have satisfied the plain numeric threshold.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Senior,
+                    count: 1,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        };
+        let mut a = new_approval_with_rule(rule);
+        a.approve(Decision::new("admin panel", "alice")).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "an unresolved class must never count toward a stamped rule"
+        );
+    }
+
+    #[test]
+    fn recipe_majority_with_dissent_recorded_lets_the_recipe_clear_despite_a_dissent() {
+        // Opt-in majority mode: a single dissent is recorded but does not, by
+        // itself, terminate the request — the recipe may still clear via the
+        // remaining positive sign-offs (approval-recipes.md §3 P2 build decision #1).
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        };
+        let mut a = new_approval_with_rule(rule);
+        approve_as(&mut a, "alice@corp", ApproverClass::Teammate, None, None).unwrap();
+        // A dissent: recorded, but NOT terminal under majority mode.
+        a.deny(Decision::new("admin panel", "carol@corp")).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "a dissent under majority-with-dissent-recorded must not terminate the request"
+        );
+        assert_eq!(a.signoffs.len(), 2, "the dissent is recorded, never lost");
+        // A second distinct teammate approval completes the recipe despite the dissent.
+        approve_as(&mut a, "bob@corp", ApproverClass::Teammate, None, None).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Approved);
+        assert!(
+            a.signoffs.iter().any(|s| !s.approve),
+            "the dissent stays on the recorded sign-off set even once approved"
+        );
+    }
+
+    #[test]
+    fn recipe_extreme_criticality_forces_deny_on_any_deny_despite_majority_mode() {
+        // Extreme/irreversible actions ALWAYS behave as deny-on-any-deny, regardless
+        // of the configured decision_mode (approval-recipes.md §3/§5 D4a).
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        };
+        let mut a = new_approval_with_rule(rule);
+        a.criticality = CriticalityClass::Critical;
+        approve_as(&mut a, "alice@corp", ApproverClass::Teammate, None, None).unwrap();
+        a.deny(Decision::new("admin panel", "carol@corp")).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Denied,
+            "Extreme criticality forces deny-on-any-deny even under majority mode"
+        );
+    }
+
+    #[test]
+    fn recipe_none_path_numeric_threshold_unchanged() {
+        // Parity: with no ApprovalRule stamped, behavior is byte-identical to the
+        // pre-Phase-D numeric threshold (already exercised by
+        // test_dual_control_requires_distinct_approvers above; this test pins the
+        // `approval_rule` field itself).
+        let (a, _) = new_approval();
+        assert!(a.approval_rule.is_none());
+    }
+
+    #[test]
+    fn recipe_decision_mode_deserializes_fail_closed() {
+        // A missing, empty, or unrecognized decision_mode must normalize to the
+        // conservative default rather than erroring the whole ApprovalRule parse
+        // (mirrors govder's RecipeDecisionMode.Valid() fallback).
+        let rule: ApprovalRule =
+            serde_json::from_str(r#"{"recipes":[{"terms":[{"class":"senior","count":1}]}]}"#)
+                .expect("missing decision_mode must not error");
+        assert_eq!(rule.decision_mode, RecipeDecisionMode::DenyOnAnyDeny);
+
+        let rule: ApprovalRule = serde_json::from_str(
+            r#"{"recipes":[{"terms":[{"class":"senior","count":1}]}],"decision_mode":""}"#,
+        )
+        .expect("empty decision_mode must not error");
+        assert_eq!(rule.decision_mode, RecipeDecisionMode::DenyOnAnyDeny);
+
+        let rule: ApprovalRule = serde_json::from_str(
+            r#"{"recipes":[{"terms":[{"class":"senior","count":1}]}],"decision_mode":"bogus"}"#,
+        )
+        .expect("unrecognized decision_mode must not error");
+        assert_eq!(rule.decision_mode, RecipeDecisionMode::DenyOnAnyDeny);
+
+        let rule: ApprovalRule = serde_json::from_str(
+            r#"{"recipes":[{"terms":[{"class":"senior","count":1}]}],"decision_mode":"majority-with-dissent-recorded"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rule.decision_mode,
+            RecipeDecisionMode::MajorityWithDissentRecorded
+        );
+    }
+
+    #[test]
+    fn recipe_unknown_class_disqualifies_only_that_recipe() {
+        // An unrecognized class value on a fetched RecipeTerm must disqualify only
+        // THAT recipe, never fail the whole ApprovalRule deserialization/fetch.
+        let rule: ApprovalRule = serde_json::from_str(
+            r#"{"recipes":[
+                {"terms":[{"class":"galactic-overlord","count":1}]},
+                {"terms":[{"class":"teammate","count":1}]}
+            ],"decision_mode":"deny-on-any-deny"}"#,
+        )
+        .expect("an unknown class must not error the whole rule");
+        let mut a = new_approval_with_rule(rule);
+        // The malformed recipe (bad class) is unsatisfiable; the second, well-formed
+        // recipe (1 teammate) still lets the approval clear.
+        approve_as(&mut a, "bob@corp", ApproverClass::Teammate, None, None).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Approved);
     }
 }

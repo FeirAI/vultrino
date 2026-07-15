@@ -741,6 +741,19 @@ pub struct DecideReq {
     /// meaningful; falls back to the acting api-key id when absent/blank.
     #[serde(default)]
     pub approver: Option<String>,
+    /// Resolved approver class for approval-recipe satisfaction (plan 100 P2 Phase
+    /// D): `senior` | `teammate` | `agent-reviewer`. Resolved by the feir-os broker
+    /// from VERIFIED IdP groups (never edge-supplied) and recorded as a
+    /// snapshot-at-sign-off value — vultrino trusts + records it, never re-resolves
+    /// it later. An unset/unrecognized value never counts toward a stamped
+    /// `ApprovalRule` (fail-closed); it still counts toward the plain numeric
+    /// threshold when no rule is stamped.
+    #[serde(default)]
+    pub approver_class: Option<String>,
+    /// Controller-domain key for D4(f) collapse (agent-reviewer sign-offs sharing a
+    /// controller count as ONE toward any recipe). Ignored for human sign-offs.
+    #[serde(default)]
+    pub controller: Option<String>,
 }
 
 /// `POST /api/v1/approvals/{id}/decision` — approve or deny an approval over JSON
@@ -885,6 +898,14 @@ pub async fn api_decide_approval(
         }
     }
 
+    // Plan 100 P2 Phase D: the broker resolves the approver's class from VERIFIED
+    // IdP groups and sends it here; vultrino trusts + records it (snapshot at
+    // sign-off), never re-resolves it. An unrecognized/blank value resolves to
+    // `None` — never counted toward a stamped ApprovalRule (fail-closed).
+    let resolved_class = body
+        .approver_class
+        .as_deref()
+        .and_then(crate::approval::ApproverClass::parse_wire);
     match state
         .storage
         .decide_approval(
@@ -896,6 +917,8 @@ pub async fn api_decide_approval(
             body.note,
             None,
             None,
+            resolved_class,
+            body.controller,
         )
         .await
     {
@@ -2729,6 +2752,9 @@ pub async fn api_delegate_decide_approval(
             enforce_sod,
             body.note,
             &grant_ref,
+            // Plan 100 P2 Phase D: the delegate path's controller-domain (D4(f)) is
+            // deterministic — the token's delegator, never broker-supplied.
+            &token.delegator_identity,
             veto_until,
         )
         .await
@@ -3707,6 +3733,7 @@ mod tests {
             tenant: Some("acme".to_string()),
             workload_id: None,
             preview: None,
+            approval_rule: None,
         });
         approval
     }

@@ -524,6 +524,18 @@ pub struct VultrinoServer {
     /// Default-off: `None`, and both hooks are no-ops — `/execute` and mint stay
     /// byte-identical to today. See `docs/dev/averin-sealing.md`.
     averin: Option<Arc<crate::averin::AverinClient>>,
+    /// Govder decide-plane client (plan 100 P2 Phase D), used ONLY to fetch the
+    /// stamped `ApprovalRule` (if any) at approval-open — see
+    /// [`Self::fetch_gate_rule_for_action`]. `None` when govder isn't configured
+    /// (`GOVDER_BASE_URL`/`GOVDER_TENANT_ASSERTION_SECRET` unset) or failed to
+    /// construct; every approval-open call already handles that as "no rule", so
+    /// this is never a hard startup dependency. A SEPARATE `GovderClient` instance
+    /// from the one `web/server.rs` builds for `AppState` (that one backs the
+    /// delegate-decide consult) — both are built from the SAME `Config::govder`
+    /// source of truth, just via two independent constructions, since
+    /// `VultrinoServer::new` and `AppState::new` are wired at different points in
+    /// startup (see `web/server.rs`'s own construction for the mirrored pattern).
+    govder: Option<Arc<crate::govder::GovderClient>>,
 }
 
 /// A wired inbound workload-identity resolver (V10/R6): the request header to
@@ -616,6 +628,19 @@ impl VultrinoServer {
             }
         };
 
+        // Govder gate-rule client (plan 100 P2 Phase D). `None` when unconfigured or
+        // invalid — every approval-open call treats that as "no rule stamped",
+        // exactly today's numeric-threshold behavior (see the field's doc).
+        let govder = config.govder.as_ref().and_then(|cfg| {
+            match crate::govder::GovderClient::new(cfg.clone()) {
+                Ok(client) => Some(Arc::new(client)),
+                Err(e) => {
+                    warn!(error = %e, "govder gate-rule client disabled: config invalid");
+                    None
+                }
+            }
+        });
+
         Self {
             config,
             resolver,
@@ -633,6 +658,7 @@ impl VultrinoServer {
             detect_emit_gate: parking_lot::RwLock::new(std::collections::HashMap::new()),
             outbox_metrics: Arc::new(OutboxMetrics::default()),
             averin,
+            govder,
         }
     }
 
@@ -1128,6 +1154,24 @@ impl VultrinoServer {
             let preview = self
                 .approval_preview_for_action(&full_action, action_label.as_deref(), &request.params)
                 .await;
+            // Plan 100 P2 Phase D: fetch the govder-authored ApprovalRule (if any)
+            // for this (agent, action_class) and stamp it onto the approval at open
+            // — vultrino evaluates recipe satisfaction IN-LOCK against this SAME
+            // stamped copy on every subsequent sign-off (never re-fetched, never
+            // re-derived — see approval-recipes.md §6 D5).
+            let agent_id_for_rule = principal.as_ref().and_then(|p| p.agent_label.clone());
+            // A genuine govder fetch failure here `?`-propagates: vultrino could
+            // not confirm the gate's oversight requirement, so it must fail this
+            // approval-open closed rather than silently opening under the
+            // (possibly weaker) numeric-threshold path. `Ok(None)`/`Ok(Some(_))`
+            // both flow straight into `NewApproval` exactly as before.
+            let approval_rule = self
+                .fetch_gate_rule_for_action(
+                    principal_tenant.as_deref(),
+                    agent_id_for_rule.as_deref(),
+                    &full_action,
+                )
+                .await?;
             let (mut approval, decision_token) = ApprovalRequest::open(NewApproval {
                 credential: credential.alias.clone(),
                 action: full_action.clone(),
@@ -1156,6 +1200,7 @@ impl VultrinoServer {
                 } else {
                     1
                 },
+                approval_rule,
             });
             // Spend is extracted by the trusted policy layer above. Stamp it only
             // after opening so requester-authored params can never supply these
@@ -2684,6 +2729,47 @@ impl VultrinoServer {
         // call it and will be told to await approval, exactly like a generic gated
         // tool. Only an outright `Deny` hides it.
         !matches!(decision, crate::policy::PolicyDecision::Deny(_))
+    }
+
+    /// Fetch the govder-authored `ApprovalRule` (if any) to stamp onto a new
+    /// approval at open (plan 100 P2 Phase D; docs/design/approval-recipes.md §6
+    /// D5). No govder client wired, no tenant, or no resolved agent_id are all a
+    /// CONFIRMED "no rule" (`Ok(None)`) — there is no recipe authority to consult
+    /// in the first place, so this is exactly today's numeric-threshold approval
+    /// flow, unchanged. A wired govder client that FAILS to answer is different:
+    /// see [`crate::govder::GovderClient::fetch_gate_rule`]'s doc — that is a
+    /// genuine fetch failure, mapped to `Err` here too, so the caller fails the
+    /// approval-open closed instead of silently downgrading to the numeric path.
+    async fn fetch_gate_rule_for_action(
+        &self,
+        tenant: Option<&str>,
+        agent_id: Option<&str>,
+        action_class: &str,
+    ) -> Result<Option<crate::approval::ApprovalRule>, VultrinoError> {
+        let govder = match self.govder.as_ref() {
+            Some(g) => g,
+            None => return Ok(None),
+        };
+        let tenant = match tenant.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let agent_id = match agent_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+        govder
+            .fetch_gate_rule(tenant, agent_id, action_class)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, %tenant, %agent_id, %action_class,
+                    "govder gate-rule fetch failed at approval-open; failing closed");
+                VultrinoError::PolicyUnavailable(
+                    "could not confirm the approval requirement with the policy engine \
+                     (fail-closed)"
+                        .to_string(),
+                )
+            })
     }
 
     /// Trusted irreversibility for D3 floors: resolve from stored capability metadata

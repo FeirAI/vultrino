@@ -186,6 +186,27 @@ fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
         "agent_label": a.agent_label,
         "spend_amount_minor": a.trusted_spend_amount_minor,
         "spend_asset": a.trusted_spend_asset,
+        // Plan 100 P2 Phase D: the FULL ordered sign-off set (kind + resolved class +
+        // controller + grant ref + approve/dissent), so averin seals the whole
+        // collected-verdicts trail rather than only the finalizing sign-off above.
+        // Additive — the pre-existing `approver_kind`/`delegation_grant_ref` fields
+        // (derived from `.last()`) are UNCHANGED for existing consumers.
+        "signoffs": a
+            .signoffs
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "approver_identity": s.approver_identity,
+                    "channel": s.channel,
+                    "decided_at": s.decided_at,
+                    "approver_kind": s.approver_kind,
+                    "resolved_class": s.resolved_class,
+                    "controller": s.controller,
+                    "delegation_grant_ref": s.delegation_grant_ref,
+                    "approve": s.approve,
+                })
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -819,6 +840,8 @@ impl FileStorage {
         note: Option<String>,
         delegation_grant_ref: Option<&str>,
         delegate_pep_ok: Option<bool>,
+        resolved_class: Option<crate::approval::ApproverClass>,
+        controller: Option<String>,
         veto_until: Option<DateTime<Utc>>,
     ) -> Result<ApprovalRequest, StorageError> {
         use crate::approval::Decision;
@@ -840,6 +863,12 @@ impl FileStorage {
                     .enforcing_sod(enforce_sod);
                 if let Some(grant_ref) = delegation_grant_ref {
                     decision = decision.as_delegate(grant_ref);
+                }
+                if let Some(class) = resolved_class {
+                    decision = decision.with_resolved_class(class);
+                }
+                if let Some(ctrl) = controller {
+                    decision = decision.with_controller(ctrl);
                 }
                 let result = if approve {
                     approval.approve(decision)
@@ -1772,6 +1801,7 @@ impl StorageBackend for FileStorage {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn decide_approval(
         &self,
         id: &str,
@@ -1782,6 +1812,8 @@ impl StorageBackend for FileStorage {
         note: Option<String>,
         delegation_grant_ref: Option<&str>,
         delegate_pep_ok: Option<bool>,
+        resolved_class: Option<crate::approval::ApproverClass>,
+        controller: Option<String>,
     ) -> Result<ApprovalRequest, StorageError> {
         self.decide_approval_atomic(
             id,
@@ -1792,11 +1824,14 @@ impl StorageBackend for FileStorage {
             note,
             delegation_grant_ref,
             delegate_pep_ok,
+            resolved_class,
+            controller,
             None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn decide_delegate_approval(
         &self,
         id: &str,
@@ -1805,8 +1840,10 @@ impl StorageBackend for FileStorage {
         enforce_sod: bool,
         note: Option<String>,
         delegation_grant_ref: &str,
+        controller: &str,
         veto_until: Option<DateTime<Utc>>,
     ) -> Result<ApprovalRequest, StorageError> {
+        let controller = controller.trim();
         self.decide_approval_atomic(
             id,
             approve,
@@ -1816,6 +1853,12 @@ impl StorageBackend for FileStorage {
             note,
             Some(delegation_grant_ref),
             if approve { Some(true) } else { None },
+            Some(crate::approval::ApproverClass::AgentReviewer),
+            if controller.is_empty() {
+                None
+            } else {
+                Some(controller.to_string())
+            },
             veto_until,
         )
         .await
@@ -2442,6 +2485,7 @@ mod tests {
                 oob_identity: None,
                 reauth_interval_secs: None,
                 required_approvals: 1,
+                approval_rule: None,
             });
             req
         }
@@ -2776,6 +2820,7 @@ mod tests {
             oob_identity: None,
             reauth_interval_secs: None,
             required_approvals: 1,
+            approval_rule: None,
         });
         req.id = format!("appr_{id_suffix}");
         req

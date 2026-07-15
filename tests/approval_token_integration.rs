@@ -957,6 +957,8 @@ async fn test_ownership_check_blocks_foreign_principal() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1012,7 +1014,18 @@ async fn test_preflight_failure_is_retryable_and_does_not_burn_token() {
         _ => panic!("expected pending"),
     };
     storage
-        .decide_approval(&approval.id, true, "t", "secops", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "t",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -1052,7 +1065,18 @@ async fn test_stale_execution_claim_is_terminal_not_rerun() {
         _ => panic!("expected pending"),
     };
     storage
-        .decide_approval(&approval.id, true, "t", "secops", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "t",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -1111,7 +1135,18 @@ async fn test_heartbeat_prevents_stale_reclaim() {
         _ => panic!("expected pending"),
     };
     storage
-        .decide_approval(&approval.id, true, "t", "secops", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "t",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -1167,7 +1202,18 @@ async fn test_resume_with_unusable_token_is_terminal() {
         _ => panic!("expected pending"),
     };
     storage
-        .decide_approval(&approval.id, true, "t", "secops", false, None, None, None)
+        .decide_approval(
+            &approval.id,
+            true,
+            "t",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -1361,6 +1407,8 @@ async fn test_deny_pushed_after_approval_blocks_resume() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1469,6 +1517,8 @@ async fn test_default_deny_approved_action_still_resumes() {
             "test approver",
             "secops",
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -1679,6 +1729,8 @@ async fn test_per_agent_deny_refires_at_resume() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1777,6 +1829,8 @@ async fn test_spend_capped_approval_resumes_without_recheck() {
             "approver",
             "secops",
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -2195,6 +2249,8 @@ async fn test_v5_approver_identity_recorded_and_sod_computable() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2214,6 +2270,8 @@ async fn test_v5_approver_identity_recorded_and_sod_computable() {
             "admin panel",
             "agent-x",
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -2267,6 +2325,8 @@ async fn test_v5_distinct_approver_satisfies_sod() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -2311,6 +2371,8 @@ async fn test_v5_reauth_lapse_expires_on_poll() {
             "admin panel",
             "secops",
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -2389,6 +2451,8 @@ async fn test_v5_enforce_sod_rejects_self_approval_end_to_end() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2409,6 +2473,8 @@ async fn test_v5_enforce_sod_rejects_self_approval_end_to_end() {
             "admin panel",
             "secops-oncall",
             true,
+            None,
+            None,
             None,
             None,
             None,
@@ -2456,6 +2522,8 @@ async fn test_v5_decide_past_deadline_is_rejected() {
             "admin panel",
             "secops",
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -2507,6 +2575,8 @@ async fn test_v5_poll_refresh_does_not_clobber_a_decision() {
             "admin panel",
             "secops",
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -2564,6 +2634,8 @@ async fn test_v5_sweep_expires_reauth_lapsed_grant_preserving_approver() {
             "admin panel",
             "alice",
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -2782,6 +2854,8 @@ async fn test_v6_halt_denies_approved_action_on_resume() {
             "admin panel",
             "secops",
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -3186,6 +3260,8 @@ async fn test_v9_lifecycle_events_emitted_to_outbox() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -3257,6 +3333,8 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -3272,6 +3350,8 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
             "admin panel",
             "alice",
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -3301,6 +3381,8 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
             "admin panel",
             "bob",
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -3867,6 +3949,7 @@ async fn test_v11_approvals_are_tenant_scoped() {
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 1,
+        approval_rule: None,
     })
     .0;
     assert!(shared.visible_to_tenant(Some("team-a")) && shared.visible_to_tenant(Some("team-b")));

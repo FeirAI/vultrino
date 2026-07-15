@@ -488,12 +488,16 @@ pub trait StorageBackend: Send + Sync {
         _note: Option<String>,
         _delegation_grant_ref: Option<&str>,
         _delegate_pep_ok: Option<bool>,
+        _resolved_class: Option<crate::approval::ApproverClass>,
+        _controller: Option<String>,
     ) -> Result<ApprovalRequest, StorageError> {
         Err(StorageError::ApprovalNotFound(_id.to_string()))
     }
 
     /// Atomically record a govder-authorized delegate decision and its optional
     /// veto deadline. A backend that cannot commit both together fails closed.
+    /// `controller` is the token's `delegator_identity` (plan 100 P2 Phase D D4(f)
+    /// collapse) — the delegate path always resolves class as `agent-reviewer`.
     async fn decide_delegate_approval(
         &self,
         id: &str,
@@ -502,6 +506,7 @@ pub trait StorageBackend: Send + Sync {
         _enforce_sod: bool,
         _note: Option<String>,
         _delegation_grant_ref: &str,
+        _controller: &str,
         _veto_until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<ApprovalRequest, StorageError> {
         Err(StorageError::ApprovalNotFound(id.to_string()))

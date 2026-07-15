@@ -1598,6 +1598,7 @@ async fn test_out_of_band_decide_flow() {
         oob_identity: Some("oncall".to_string()),
         reauth_interval_secs: None,
         required_approvals: 1,
+        approval_rule: None,
     });
     storage.store_approval(&approval).await.unwrap();
 
@@ -1683,6 +1684,7 @@ async fn test_out_of_band_decide_without_named_identity_is_refused() {
         oob_identity: None, // no named identity bound
         reauth_interval_secs: None,
         required_approvals: 1,
+        approval_rule: None,
     });
     storage.store_approval(&approval).await.unwrap();
 
@@ -2077,6 +2079,7 @@ async fn store_test_approval(
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 1,
+        approval_rule: None,
     });
     storage.store_approval(&approval).await.unwrap();
     approval.id
@@ -2725,6 +2728,7 @@ async fn test_json_decision_hard_sod_blocks_same_key_second_signoff() {
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 2,
+        approval_rule: None,
     });
     let id = approval.id.clone();
     storage.store_approval(&approval).await.unwrap();
@@ -2841,6 +2845,7 @@ async fn build_hard_sod_dual_control_fixture(
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 2,
+        approval_rule: None,
     });
     let id = approval.id.clone();
     storage.store_approval(&approval).await.unwrap();
@@ -3021,6 +3026,7 @@ async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 1,
+        approval_rule: None,
     });
     // Make sure the requester owner is what we expect after open().
     approval.requester.owner = Some("alice@example.com".to_string());
@@ -3136,6 +3142,7 @@ async fn test_json_decision_idempotent_for_coapprover_retry_on_granted_mofn() {
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 2,
+        approval_rule: None,
     });
     let id = approval.id.clone();
     storage.store_approval(&approval).await.unwrap();
@@ -4313,6 +4320,7 @@ async fn store_pending_approval(
         oob_identity: None,
         reauth_interval_secs: None,
         required_approvals: 1,
+        approval_rule: None,
         tenant: tenant.map(str::to_string),
         workload_id: None,
         preview: None,
@@ -4753,4 +4761,240 @@ async fn test_would_deny_reports_requires_auth_and_tenant() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// -------- Plan 100 P2 Phase D: govder gate-rule fetch must fail CLOSED --------
+//
+// `fetch_gate_rule`/`fetch_gate_rule_for_action` distinguish a CONFIRMED "no
+// rule" (404, or a 2xx body with `has_rule:false`, or govder simply not
+// configured) from a genuine FETCH FAILURE (transport error, a non-2xx/non-404
+// status, a body-read error, or a parse error). Only the former may fall back
+// to today's numeric-threshold approval; the latter must block the
+// approval-open entirely — a transient govder blip must never silently
+// downgrade a recipe-gated approval to a weaker numeric one.
+
+/// Store a `require_approval` credential plus a tenant+agent_label-bound use
+/// token, then POST `/api/v1/execute` against it — the minimal fixture that
+/// drives `prepare_execution` into the `fetch_gate_rule_for_action` call with a
+/// non-empty tenant AND agent_id (both required for it to actually consult
+/// govder rather than short-circuiting to `Ok(None)`).
+async fn execute_against_require_approval_credential(
+    router: axum::Router,
+    storage: &Arc<dyn StorageBackend>,
+) -> axum::response::Response {
+    use vultrino::{Credential, CredentialData, Secret};
+
+    let cred = Credential::new(
+        "api-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("secret"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    )
+    .with_metadata("require_approval", "true");
+    storage.store(&cred).await.unwrap();
+
+    let (secret, mut token) = UseToken::create(NewUseToken {
+        name: "gate-rule-fixture".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.tenant = Some("acme".to_string());
+    token.agent_label = Some("agent-x".to_string());
+    storage.store_use_token(&token).await.unwrap();
+
+    let body = serde_json::json!({
+        "credential": "api-cred", "method": "GET", "url": "https://api.example.com/x"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/execute")
+        .header("authorization", format!("Bearer {}", secret))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    router.oneshot(req).await.unwrap()
+}
+
+/// A mock govder that answers `GET /v1/oversight/gates/rule` with a caller-fixed
+/// status + JSON body — used to drive both the "confirmed no rule" parity cases
+/// (404, or 2xx `has_rule:false`) and (via a 5xx) a genuine fetch failure.
+async fn start_mock_govder_gate_rule(status: StatusCode, body: serde_json::Value) -> GovderConfig {
+    async fn handler(
+        axum::extract::State((status, body)): axum::extract::State<(StatusCode, serde_json::Value)>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        (status, axum::Json(body)).into_response()
+    }
+    let app = axum::Router::new()
+        .route(
+            "/v1/oversight/gates/rule",
+            axum::routing::get(handler),
+        )
+        .with_state((status, body));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    GovderConfig {
+        base_url: format!("http://{addr}"),
+        assertion_secret: "test-govder-assertion-secret".to_string(),
+        assertion_ttl: Duration::from_secs(90),
+        http_timeout: Duration::from_secs(5),
+    }
+}
+
+fn approval_open_test_config(govder: GovderConfig) -> Config {
+    let mut config = Config::default();
+    // Fail-closed default (Deny) would deny before the credential-level
+    // require_approval flag is ever consulted — Allow lets it through to the
+    // gating branch, exactly like the existing OIDC approval-open test.
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.approval.enabled = true;
+    config.govder = Some(govder);
+    config
+}
+
+/// THE FIX: a genuine govder gate-rule fetch failure (here, connection refused
+/// against a dead port — the same "provably unreachable" technique the
+/// existing `test_delegate_decide_503s_when_govder_unreachable` test uses) must
+/// FAIL THE APPROVAL-OPEN CLOSED. Before the fix, `fetch_gate_rule` swallowed
+/// this into `None` and the action opened anyway under the numeric-threshold
+/// path — a transient outage silently downgrading the effective oversight
+/// requirement. Proven two ways: the HTTP call does not return 202 Accepted,
+/// AND (load-bearing) no approval is ever persisted to storage at all.
+#[tokio::test]
+async fn execute_open_fails_closed_when_gate_rule_fetch_is_unreachable() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let govder_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener); // provably unreachable: connection refused, no listener ever stands up
+
+    let config = approval_open_test_config(GovderConfig {
+        base_url: govder_url,
+        assertion_secret: "test-govder-assertion-secret".to_string(),
+        assertion_ttl: Duration::from_secs(90),
+        http_timeout: Duration::from_secs(5),
+    });
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential(router, &storage).await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a genuine govder gate-rule fetch failure must NOT open an approval"
+    );
+
+    assert!(
+        storage.list_approvals().await.unwrap().is_empty(),
+        "no approval may be persisted when the gate-rule fetch failed — fail-closed means the \
+         action is blocked, not silently downgraded to the numeric-threshold path"
+    );
+}
+
+/// A non-2xx/non-404 govder gate-rule status (a 500 here) is likewise a genuine
+/// fetch failure, not a confirmed "no rule" — same fail-closed assertion as the
+/// unreachable-transport case above, but exercising the HTTP-status branch of
+/// `fetch_gate_rule` instead of the transport-error branch.
+#[tokio::test]
+async fn execute_open_fails_closed_when_gate_rule_returns_5xx() {
+    let govder = start_mock_govder_gate_rule(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({ "error": "boom" }),
+    )
+    .await;
+    let config = approval_open_test_config(govder);
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential(router, &storage).await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a govder gate-rule 5xx must NOT open an approval"
+    );
+    assert!(
+        storage.list_approvals().await.unwrap().is_empty(),
+        "no approval may be persisted when the gate-rule fetch returned a 5xx"
+    );
+}
+
+/// PARITY (unchanged behavior): a 404 — no gate configured for this
+/// agent/action — is a CONFIRMED no-rule answer, so the action must still open
+/// via today's numeric-threshold path exactly as if govder weren't configured
+/// at all.
+#[tokio::test]
+async fn execute_open_numeric_path_parity_when_gate_rule_is_404() {
+    let govder = start_mock_govder_gate_rule(StatusCode::NOT_FOUND, serde_json::json!({})).await;
+    let config = approval_open_test_config(govder);
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential(router, &storage).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a 404 (confirmed no gate) must still open via the numeric-threshold path"
+    );
+
+    let approvals = storage.list_approvals().await.unwrap();
+    assert_eq!(approvals.len(), 1);
+    assert!(approvals[0].approval_rule.is_none());
+    assert_eq!(approvals[0].required_approvals, 1);
+}
+
+/// PARITY (unchanged behavior): a 2xx body with `has_rule:false` — a gate
+/// exists but has no rule stamped — is likewise a CONFIRMED no-rule answer.
+#[tokio::test]
+async fn execute_open_numeric_path_parity_when_gate_has_rule_false() {
+    let govder = start_mock_govder_gate_rule(
+        StatusCode::OK,
+        serde_json::json!({ "has_rule": false }),
+    )
+    .await;
+    let config = approval_open_test_config(govder);
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential(router, &storage).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a confirmed has_rule:false must still open via the numeric-threshold path"
+    );
+
+    let approvals = storage.list_approvals().await.unwrap();
+    assert_eq!(approvals.len(), 1);
+    assert!(approvals[0].approval_rule.is_none());
+    assert_eq!(approvals[0].required_approvals, 1);
+}
+
+/// PARITY (unchanged behavior, pre-existing coverage restated here for
+/// discoverability): govder simply not configured (`config.govder = None`,
+/// `Config::default()`'s value) is ALSO a confirmed "no rule" — the
+/// `fetch_gate_rule_for_action` short-circuit before ever calling govder. This
+/// is the same shape `test_v10_inbound_oidc_resolves_subject_and_binds_owner`
+/// (above) already exercises; restated as its own test so the three
+/// "confirmed no rule" legs (404 / has_rule:false / not-configured) are each
+/// independently visible.
+#[tokio::test]
+async fn execute_open_numeric_path_parity_when_govder_not_configured() {
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.approval.enabled = true;
+    assert!(config.govder.is_none());
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential(router, &storage).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "no govder configured must still open via the numeric-threshold path"
+    );
+
+    let approvals = storage.list_approvals().await.unwrap();
+    assert_eq!(approvals.len(), 1);
+    assert!(approvals[0].approval_rule.is_none());
+    assert_eq!(approvals[0].required_approvals, 1);
 }
