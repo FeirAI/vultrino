@@ -1201,15 +1201,16 @@ fn approval_rule_satisfied(rule: &ApprovalRule, signoffs: &[Signoff]) -> bool {
         // malformed and dropped. An EXPLICIT, non-empty, unrecognized Kind is ALSO
         // dropped (Codex P2 review MINOR): the previous wildcard silently accepted
         // it, more permissive than govder — which only ever classifies
-        // human/delegate-agent. An empty Kind still skips the cross-check (older
-        // callers that never set approver_kind default to "human" via
-        // `default_approver_kind`; a genuinely-empty stored value is treated
-        // permissively, matching govder's empty-Kind path).
+        // human/delegate-agent. A genuinely EMPTY/blank stored Kind is now ALSO
+        // DROPPED (Codex P2 RE-REVIEW MINOR), matching govder's recipes.go which
+        // drops an empty `approver_kind` during recipe evaluation — closing the
+        // old/corrupt-record divergence. Normal new decisions default to "human"
+        // via `default_approver_kind`, so this only affects malformed/legacy records.
         match so.approver_kind.trim() {
             "human" if !class.is_human() => continue,
             "delegate-agent" if class != ApproverClass::AgentReviewer => continue,
-            "human" | "delegate-agent" | "" => {}
-            _ => continue, // explicit unknown Kind: fail-closed, drop
+            "human" | "delegate-agent" => {}
+            _ => continue, // empty/blank OR explicit unknown Kind: fail-closed, drop
         }
         match class {
             ApproverClass::Senior | ApproverClass::Teammate => humans.push(so),
@@ -1369,11 +1370,23 @@ fn recipe_well_formed(r: &Recipe) -> bool {
 
 /// D4(b) distinct principals: keep the FIRST occurrence per distinct identity
 /// (trimmed comparison — mirrors govder's `dedupeByIdentity`).
+///
+/// Recipe-slot distinctness keys on the BARE immutable subject, NOT the full
+/// `agg:<key-id>:<subject>` wrapper vultrino stamps on aggregator-asserted identities
+/// (Codex P2 RE-REVIEW RE-BLOCKER 1). vultrino rewrites the broker's immutable subject
+/// into `agg:<api-key-id>:<subject>` at `web/api.rs`; comparing the FULL namespaced
+/// value would let ONE OIDC subject fill TWO recipe slots when signed through two
+/// different broker/admin keys (key rotation or an HA broker) — `agg:A:sub-alice` and
+/// `agg:B:sub-alice` reading as distinct principals, so one person could clear a
+/// `{teammate:2}` recipe. Stripping to the bare subject via `bare_approver_identity`
+/// collapses those to ONE slot regardless of which key routed the sign-off. This does
+/// NOT touch the aggregator-SoD `agg:` scheme itself (the `SameAggregatorKey` /
+/// `DuplicateApprover` checks in `transition`) — only the recipe-satisfaction dedupe.
 fn dedupe_by_identity<'a>(signoffs: Vec<&'a Signoff>) -> Vec<&'a Signoff> {
     let mut seen = std::collections::HashSet::new();
     signoffs
         .into_iter()
-        .filter(|s| seen.insert(s.approver_identity.trim().to_string()))
+        .filter(|s| seen.insert(bare_approver_identity(&s.approver_identity).trim().to_string()))
         .collect()
 }
 
@@ -1438,7 +1451,12 @@ pub const AGG_IDENTITY_PREFIX: &str = "agg:";
 /// return the un-namespaced operator (everything after the second colon) for SoD
 /// comparison; otherwise return it unchanged. A malformed `agg:`-prefixed value
 /// with no second colon is returned as-is (treated as an opaque identity).
-fn bare_approver_identity(identity: &str) -> &str {
+///
+/// Public so the outbox/webhook payload builder (`storage/file.rs`) can emit each
+/// sign-off's BARE subject — govder's terminal backstop must re-validate recipe
+/// distinctness on the immutable subject, not vultrino's per-key `agg:` wrapper
+/// (Codex P2 RE-REVIEW RE-BLOCKER 1 / payload item).
+pub fn bare_approver_identity(identity: &str) -> &str {
     let Some(rest) = identity.strip_prefix(AGG_IDENTITY_PREFIX) else {
         return identity;
     };
@@ -2861,6 +2879,86 @@ mod tests {
         );
         approve_as(&mut a, "bob@corp", ApproverClass::Teammate, None, None).unwrap();
         assert_eq!(a.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn recipe_same_bare_subject_across_aggregator_keys_fills_one_slot() {
+        // RE-BLOCKER 1: vultrino stamps `agg:<key-id>:<subject>` on aggregator-asserted
+        // identities. The SAME OIDC subject signed through TWO DIFFERENT broker/admin
+        // keys (key rotation or an HA broker) — `agg:key-a:alice@corp` and
+        // `agg:key-b:alice@corp` — must fill ONLY ONE recipe slot, never two; otherwise
+        // one person alone could clear a {teammate:2} recipe. Recipe-slot distinctness
+        // keys on the BARE subject via `bare_approver_identity`.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        };
+        let mut a = new_approval_with_rule(rule);
+        a.authoritative_risk_tier = "Medium".to_string();
+        // Same bare subject `alice@corp` via two DIFFERENT aggregator keys. Both are
+        // recorded (distinct full identities, so DuplicateApprover doesn't reject), but
+        // they collapse to ONE bare teammate for recipe matching.
+        approve_as(&mut a, "agg:key-a:alice@corp", ApproverClass::Teammate, None, None).unwrap();
+        approve_as(&mut a, "agg:key-b:alice@corp", ApproverClass::Teammate, None, None).unwrap();
+        assert_eq!(
+            a.signoffs.len(),
+            2,
+            "both sign-offs are recorded (distinct full identities)"
+        );
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "one bare subject via two aggregator keys fills only ONE of the two teammate slots"
+        );
+        // A GENUINELY distinct bare subject fills the second slot and clears the recipe.
+        approve_as(&mut a, "agg:key-a:bob@corp", ApproverClass::Teammate, None, None).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Approved,
+            "a second DISTINCT bare subject satisfies the two-teammate recipe"
+        );
+    }
+
+    #[test]
+    fn recipe_empty_approver_kind_signoff_is_dropped() {
+        // RE-REVIEW MINOR: a genuinely EMPTY/blank stored `approver_kind` is DROPPED
+        // during recipe evaluation (matching govder's recipes.go), never counted.
+        // Normal new decisions default to "human", so this only affects malformed/legacy
+        // records.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 1,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        };
+        let mut a = new_approval_with_rule(rule);
+        a.authoritative_risk_tier = "Medium".to_string();
+        // A sign-off with a RESOLVED Teammate class but a BLANK Kind (corrupt/legacy).
+        let mut decision = Decision::new("admin panel", "alice@corp")
+            .with_resolved_class(ApproverClass::Teammate);
+        decision.approver_kind = "  ".to_string(); // blank/whitespace
+        a.approve(decision).unwrap();
+        assert_eq!(a.signoffs.len(), 1, "the sign-off is still recorded");
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "a blank approver_kind sign-off is DROPPED from recipe matching (fail-closed, matches govder)"
+        );
+        // A well-formed human Teammate sign-off then satisfies the {teammate:1} recipe.
+        approve_as(&mut a, "bob@corp", ApproverClass::Teammate, None, None).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Approved,
+            "a well-formed human Teammate then clears the recipe"
+        );
     }
 
     #[test]

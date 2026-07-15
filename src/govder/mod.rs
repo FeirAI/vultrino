@@ -152,15 +152,25 @@ struct EvaluateResponse {
 /// deny-wins force uses govder's judgement rather than vultrino's LOCAL criticality.
 /// `risk_tier == ""` means govder could not resolve it — the consumer treats that as
 /// the fail-closed worst case (Extreme).
+///
+/// Both `risk_tier` and `irreversible` are REQUIRED whenever `has_rule:true` (Codex P2
+/// RE-REVIEW RE-BLOCKER 2). They are modelled as `Option` here ONLY so their ABSENCE is
+/// distinguishable from a present-but-empty/false value: `interpret_2xx_gate_rule_body`
+/// rejects a `has_rule:true` body that omits EITHER (missing → Decode error → fail
+/// closed, exactly like `has_rule`). Without this, a `has_rule:true` response that OMITS
+/// `irreversible` would decode as `false` and an authoritatively-irreversible gate would
+/// silently lose its forced deny-on-any-deny (fail-OPEN). `risk_tier: ""` is a VALID
+/// present value (govder emits it for unresolved agents → Extreme); only true absence of
+/// the field errors.
 #[derive(Debug, Clone, Deserialize)]
 struct GateApprovalRuleResponse {
     has_rule: bool,
     #[serde(default)]
     approval_rule: Option<crate::approval::ApprovalRule>,
     #[serde(default)]
-    risk_tier: String,
+    risk_tier: Option<String>,
     #[serde(default)]
-    irreversible: bool,
+    irreversible: Option<bool>,
 }
 
 /// A fetched, PRESENT approval rule plus govder's AUTHORITATIVE risk facts for it
@@ -446,10 +456,16 @@ impl GovderClient {
 /// - a body whose `has_rule`/`approval_rule` pair is INTERNALLY INCONSISTENT
 ///   (`has_rule:true` with no rule, or `has_rule:false` WITH a rule present) is
 ///   likewise `Err(Decode)`;
+/// - a `has_rule:true` body that OMITS either authoritative risk fact — `risk_tier` or
+///   `irreversible` — is `Err(Decode)` and fails closed (Codex P2 RE-REVIEW RE-BLOCKER
+///   2). A missing `irreversible` must NEVER stamp `false` (that would drop the forced
+///   deny-on-any-deny on an irreversible gate); a missing `risk_tier` must NEVER be
+///   confused with the resolved-but-empty `""` sentinel. Both must be PRESENT on the
+///   wire when a rule is present;
 /// - only a clean `has_rule:false` (no rule) → `Ok(None)` (confirmed no rule → numeric
 ///   parity);
-/// - `has_rule:true` with a rule → `Ok(Some(FetchedGateRule))`, carrying govder's
-///   authoritative `risk_tier`/`irreversible`.
+/// - `has_rule:true` with a rule (and BOTH risk facts present) → `Ok(Some(FetchedGateRule))`,
+///   carrying govder's authoritative `risk_tier`/`irreversible`.
 fn interpret_2xx_gate_rule_body(body: &str) -> Result<Option<FetchedGateRule>, GovderError> {
     let parsed: GateApprovalRuleResponse =
         serde_json::from_str(body).map_err(|e| GovderError::Decode(e.to_string()))?;
@@ -467,11 +483,30 @@ fn interpret_2xx_gate_rule_body(body: &str) -> Result<Option<FetchedGateRule>, G
         (true, None) => Err(GovderError::Decode(
             "gate-rule response inconsistent: has_rule=true but approval_rule missing".to_string(),
         )),
-        (true, Some(rule)) => Ok(Some(FetchedGateRule {
-            rule,
-            risk_tier,
-            irreversible,
-        })),
+        (true, Some(rule)) => {
+            // RE-BLOCKER 2: a rule-present response MUST carry BOTH authoritative risk
+            // facts. Their ABSENCE (not a present `""`/`false`) fails the fetch closed,
+            // exactly like a missing `has_rule` — never a silent downgrade.
+            let risk_tier = risk_tier.ok_or_else(|| {
+                GovderError::Decode(
+                    "gate-rule response inconsistent: has_rule=true but risk_tier missing \
+                     (fail-closed — required authoritative risk fact)"
+                        .to_string(),
+                )
+            })?;
+            let irreversible = irreversible.ok_or_else(|| {
+                GovderError::Decode(
+                    "gate-rule response inconsistent: has_rule=true but irreversible missing \
+                     (fail-closed — required authoritative risk fact)"
+                        .to_string(),
+                )
+            })?;
+            Ok(Some(FetchedGateRule {
+                rule,
+                risk_tier,
+                irreversible,
+            }))
+        }
     }
 }
 
@@ -565,6 +600,41 @@ mod tests {
         assert_eq!(fetched.risk_tier, "High");
         assert!(fetched.irreversible);
         assert_eq!(fetched.rule.recipes.len(), 1);
+    }
+
+    // ===== RE-BLOCKER 2: has_rule:true MUST carry BOTH risk_tier and irreversible =====
+
+    #[test]
+    fn gate_rule_body_has_rule_true_missing_irreversible_fails_closed() {
+        // A rule-present body that OMITS `irreversible` must fail the fetch closed —
+        // NEVER silently decode as `false` (which would drop the forced deny-on-any-deny
+        // on an authoritatively-irreversible gate).
+        let body = r#"{"has_rule":true,"risk_tier":"High",
+            "approval_rule":{"recipes":[{"terms":[{"class":"senior","count":1}]}],"decision_mode":"deny-on-any-deny"}}"#;
+        let err = interpret_2xx_gate_rule_body(body).unwrap_err();
+        assert!(matches!(err, GovderError::Decode(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn gate_rule_body_has_rule_true_missing_risk_tier_fails_closed() {
+        // A rule-present body that OMITS `risk_tier` must fail closed — a missing field
+        // must never be confused with the resolved-but-empty `""` sentinel.
+        let body = r#"{"has_rule":true,"irreversible":false,
+            "approval_rule":{"recipes":[{"terms":[{"class":"senior","count":1}]}],"decision_mode":"deny-on-any-deny"}}"#;
+        let err = interpret_2xx_gate_rule_body(body).unwrap_err();
+        assert!(matches!(err, GovderError::Decode(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn gate_rule_body_present_empty_risk_tier_is_valid_only_absence_errors() {
+        // `risk_tier:""` is govder's RESOLVED-unresolved sentinel (→ Extreme downstream),
+        // a VALID PRESENT value: only true ABSENCE of the field fails closed. `irreversible`
+        // is present-and-false, likewise valid.
+        let body = r#"{"has_rule":true,"risk_tier":"","irreversible":false,
+            "approval_rule":{"recipes":[{"terms":[{"class":"senior","count":1}]}],"decision_mode":"deny-on-any-deny"}}"#;
+        let fetched = interpret_2xx_gate_rule_body(body).unwrap().unwrap();
+        assert_eq!(fetched.risk_tier, "");
+        assert!(!fetched.irreversible);
     }
 
     #[test]

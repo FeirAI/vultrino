@@ -160,7 +160,7 @@ fn stage_event(
 /// Cross-plane contract (plan 031 D3): `risk_tier` + `irreversible` mirror
 /// govder enforce/approvalPayload and feed delegate D3 floors on the webhook path.
 fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "approval_id": a.id,
         "status": a.status.to_string(),
         "credential": a.credential,
@@ -196,7 +196,12 @@ fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
             .iter()
             .map(|s| {
                 serde_json::json!({
-                    "approver_identity": s.approver_identity,
+                    // BARE immutable subject (Codex P2 RE-REVIEW RE-BLOCKER 1 /
+                    // payload item): strip vultrino's per-key `agg:<key-id>:` wrapper
+                    // so govder's terminal backstop re-validates recipe distinctness on
+                    // the same subject that satisfied the recipe in-lock — one subject
+                    // = one slot regardless of which broker/admin key routed it.
+                    "approver_identity": crate::approval::bare_approver_identity(&s.approver_identity),
                     "channel": s.channel,
                     "decided_at": s.decided_at,
                     "approver_kind": s.approver_kind,
@@ -207,7 +212,23 @@ fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
                 })
             })
             .collect::<Vec<_>>(),
-    })
+    });
+    // Codex P2 RE-REVIEW payload item: emit the STAMPED rule + govder's authoritative
+    // risk facts PRESENT IFF this approval was opened with a stamped ApprovalRule. This
+    // lets govder's terminal backstop trigger re-validation on `recipe` PRESENCE (not
+    // sign-off count — so even an empty/`[]` sign-off set for a recipe gate is
+    // re-evaluated) and evaluate against the EXACT rule the approval opened with (its
+    // snapshot), not whatever the gate reads at terminal time. The key is OMITTED
+    // entirely (not `null`) for a non-recipe approval, so `recipe` presence is an
+    // unambiguous "this was a recipe gate" signal.
+    if let Some(rule) = a.approval_rule.as_ref() {
+        payload["recipe"] = serde_json::json!({
+            "approval_rule": rule,
+            "risk_tier": a.authoritative_risk_tier,
+            "irreversible": a.authoritative_irreversible,
+        });
+    }
+    payload
 }
 
 /// Refuse to open a vault written by a newer binary.
@@ -2515,6 +2536,100 @@ mod tests {
         let p2 = approval_event_payload(&mk(None));
         assert!(p2.get("tenant").is_some(), "tenant key must be present");
         assert!(p2["tenant"].is_null(), "untenanted ⇒ null");
+    }
+
+    #[test]
+    fn approval_event_payload_recipe_object_and_bare_identities() {
+        // Codex P2 RE-REVIEW payload item: the decided-event payload for a RECIPE
+        // approval must (a) carry each sign-off's BARE subject (no `agg:<key>:` wrapper)
+        // and (b) carry a `recipe` object mirroring the STAMPED rule + govder's
+        // authoritative risk facts — so govder's terminal backstop can re-validate
+        // against the exact snapshot, triggering on `recipe` PRESENCE (not sign-off
+        // count).
+        use crate::approval::{
+            ApprovalRule, ApproverClass, Recipe, RecipeDecisionMode, RecipeTerm, Signoff,
+        };
+
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        };
+
+        let mut rec = mk_approval("recipe-payload");
+        rec.approval_rule = Some(rule.clone());
+        rec.authoritative_risk_tier = "High".to_string();
+        rec.authoritative_irreversible = true;
+        // Two sign-offs recorded under DIFFERENT aggregator keys — the payload strips the
+        // `agg:<key-id>:` wrapper down to the bare immutable subject.
+        rec.signoffs = vec![
+            Signoff {
+                approver_identity: "agg:key-a:alice@corp".to_string(),
+                channel: "admin panel".to_string(),
+                decided_at: chrono::Utc::now(),
+                note: None,
+                approver_kind: "human".to_string(),
+                delegation_grant_ref: None,
+                resolved_class: Some(ApproverClass::Teammate),
+                controller: None,
+                approve: true,
+            },
+            Signoff {
+                approver_identity: "agg:key-b:bob@corp".to_string(),
+                channel: "admin panel".to_string(),
+                decided_at: chrono::Utc::now(),
+                note: None,
+                approver_kind: "human".to_string(),
+                delegation_grant_ref: None,
+                resolved_class: Some(ApproverClass::Teammate),
+                controller: None,
+                approve: true,
+            },
+        ];
+
+        let p = approval_event_payload(&rec);
+
+        // (b) the `recipe` object is present and mirrors the stamped rule + facts.
+        let recipe = p
+            .get("recipe")
+            .expect("recipe object present for a recipe approval");
+        assert_eq!(recipe["risk_tier"], "High");
+        assert_eq!(recipe["irreversible"], true);
+        assert_eq!(
+            recipe["approval_rule"],
+            serde_json::to_value(&rule).unwrap(),
+            "the stamped ApprovalRule is emitted verbatim (same JSON as fetched)"
+        );
+
+        // (a) each sign-off's approver_identity is the BARE subject.
+        let signoffs = p["signoffs"].as_array().unwrap();
+        assert_eq!(signoffs[0]["approver_identity"], "alice@corp");
+        assert_eq!(signoffs[1]["approver_identity"], "bob@corp");
+
+        // Presence-not-count: a recipe approval with an EMPTY sign-off set STILL carries
+        // the `recipe` object (govder triggers re-validation on presence).
+        let mut empty = mk_approval("recipe-empty");
+        empty.approval_rule = Some(rule.clone());
+        empty.authoritative_risk_tier = "Extreme".to_string();
+        let pe = approval_event_payload(&empty);
+        assert!(
+            pe.get("recipe").is_some(),
+            "recipe object present even with zero sign-offs"
+        );
+        assert!(pe["signoffs"].as_array().unwrap().is_empty());
+
+        // A NON-recipe approval OMITS the `recipe` key entirely (not null) so presence
+        // is an unambiguous "this was a recipe gate" signal.
+        let plain = mk_approval("plain-payload");
+        let p2 = approval_event_payload(&plain);
+        assert!(
+            p2.get("recipe").is_none(),
+            "a non-recipe approval must OMIT the recipe key"
+        );
     }
 
     #[tokio::test]
