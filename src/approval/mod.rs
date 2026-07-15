@@ -949,7 +949,7 @@ impl ApprovalRequest {
         // to aggregator-asserted identities (`agg:<key-id>:…`); bare identities
         // are unaffected. The aggregator's claim of distinct HUMAN operators is
         // unverifiable, so under hard SoD one key counts once.
-        if decision.enforce_sod && self.effective_required_approvals() > 1 {
+        if self.same_aggregator_key_guard_active(decision.enforce_sod) {
             if let Some(prefix) = aggregator_key_prefix(&identity) {
                 if self
                     .signoffs
@@ -1015,6 +1015,29 @@ impl ApprovalRequest {
         } else {
             self.required_approvals.max(1)
         }
+    }
+
+    /// Whether the hard-SoD "one aggregator key counts once" guard is ACTIVE for
+    /// this request. Active under `enforce_sod` whenever MORE THAN ONE distinct
+    /// approver can be required to grant: either the legacy numeric threshold is
+    /// > 1, OR a recipe `ApprovalRule` is stamped.
+    ///
+    /// The recipe arm is load-bearing (Codex P2 RE-REVIEW-3 BLOCKER 1): a stamped
+    /// rule REPLACES the numeric threshold in `transition`'s grant check, but
+    /// `effective_required_approvals()` still reflects ONLY `dual_control`/
+    /// `required_approvals` — which stays 1 for an ordinary `require_approval`
+    /// token. Gating the same-key guard on `effective_required_approvals() > 1`
+    /// alone therefore SKIPS it for a `{teammate:2}` (or any multi-slot) recipe
+    /// opened with an ordinary token, letting ONE aggregator key invent two
+    /// distinct operator names to fill both human slots — one key fabricating
+    /// M-of-N. Under hard SoD the aggregator's claim of distinct operators is
+    /// unverifiable (that is the whole point of the guard), so ANY stamped recipe
+    /// makes one key count once, regardless of the recipe's exact slot counts:
+    /// the guard only ever rejects a SECOND same-key sign-off, and a single-slot
+    /// recipe is already granted by the first (a second sign-off is superfluous),
+    /// so activating for all recipes never wrongly blocks a legitimate grant.
+    pub fn same_aggregator_key_guard_active(&self, enforce_sod: bool) -> bool {
+        enforce_sod && (self.approval_rule.is_some() || self.effective_required_approvals() > 1)
     }
 
     /// How many more distinct approvals this request needs before it is granted
@@ -2922,6 +2945,61 @@ mod tests {
             ApprovalStatus::Approved,
             "a second DISTINCT bare subject satisfies the two-teammate recipe"
         );
+    }
+
+    #[test]
+    fn recipe_hard_sod_rejects_second_signoff_from_same_aggregator_key() {
+        // RE-REVIEW-3 BLOCKER 1: a stamped recipe REPLACES the numeric threshold,
+        // which stays 1 for an ordinary require_approval token (dual_control=false,
+        // required_approvals=1 — the EXACT shape the recipe e2e uses). Gating the
+        // same-aggregator-key SoD guard on effective_required_approvals() > 1 alone
+        // SKIPPED it under a recipe, letting ONE aggregator key invent two distinct
+        // operator names to fill both {teammate:2} slots (one key fabricating M-of-N).
+        // same_aggregator_key_guard_active now activates whenever a rule is stamped.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        };
+        let mut a = new_approval_with_rule(rule);
+        a.authoritative_risk_tier = "Medium".to_string();
+        // Ordinary token: no dual_control, numeric threshold is 1 — the guard would be
+        // skipped if it keyed on effective_required_approvals() alone.
+        assert_eq!(a.effective_required_approvals(), 1);
+        assert!(a.same_aggregator_key_guard_active(true), "recipe activates the guard");
+        // First teammate via aggregator key A, under HARD SoD.
+        let mut d1 = Decision::new("json-api", "agg:keyA:fake-alice@corp")
+            .with_resolved_class(ApproverClass::Teammate)
+            .enforcing_sod(true);
+        d1.approver_kind = "human".to_string();
+        a.approve(d1).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Pending);
+        // A SECOND, differently-named operator on the SAME aggregator key is rejected —
+        // the aggregator's claim of a distinct human is unverifiable under hard SoD.
+        let mut d2 = Decision::new("json-api", "agg:keyA:fake-bob@corp")
+            .with_resolved_class(ApproverClass::Teammate)
+            .enforcing_sod(true);
+        d2.approver_kind = "human".to_string();
+        let err = a.approve(d2).unwrap_err();
+        assert!(matches!(err, ApprovalError::SameAggregatorKey));
+        assert_eq!(a.signoffs.len(), 1, "the same-key second sign-off was not recorded");
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "one aggregator key cannot clear a {{teammate:2}} recipe"
+        );
+        // A DISTINCT aggregator key supplies a genuinely different human → recipe clears.
+        let mut d3 = Decision::new("json-api", "agg:keyB:carol@corp")
+            .with_resolved_class(ApproverClass::Teammate)
+            .enforcing_sod(true);
+        d3.approver_kind = "human".to_string();
+        a.approve(d3).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Approved);
+        assert_eq!(a.signoffs.len(), 2);
     }
 
     #[test]

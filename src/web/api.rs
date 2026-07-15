@@ -869,8 +869,10 @@ pub async fn api_decide_approval(
     }
 
     // M-of-N hardening (#2/#7): when separation-of-duty is hard-enforced, a single
-    // aggregator key must NOT be able to satisfy a dual-control threshold by
-    // inventing two distinct operator names. Distinctness across DIFFERENT human
+    // aggregator key must NOT be able to satisfy a dual-control OR recipe M-of-N
+    // threshold by inventing two distinct operator names (the recipe arm closes
+    // Codex P2 RE-REVIEW-3 BLOCKER 1 — see same_aggregator_key_guard_active).
+    // Distinctness across DIFFERENT human
     // approvers on one aggregator key is a CLAIM the aggregator makes; we cannot
     // verify it, so under hard SoD a SECOND sign-off from the SAME api key (the
     // `agg:<key-id>:` prefix) is rejected before it can satisfy threshold M.
@@ -882,7 +884,7 @@ pub async fn api_decide_approval(
     // sign. (Without hard SoD this is left to the aggregator's own dual-control.)
     // Runs AFTER the idempotency check so a co-approver's legitimate retry isn't
     // caught here as a same-key duplicate.
-    if enforce_sod && existing.effective_required_approvals() > 1 {
+    if existing.same_aggregator_key_guard_active(enforce_sod) {
         let key_prefix = format!("agg:{}:", admin.0.api_key.id);
         if existing
             .signoffs
