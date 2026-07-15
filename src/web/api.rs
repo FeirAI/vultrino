@@ -868,46 +868,48 @@ pub async fn api_decide_approval(
         }
     }
 
-    // M-of-N hardening (#2/#7): when separation-of-duty is hard-enforced, a single
-    // aggregator key must NOT be able to satisfy a dual-control OR recipe M-of-N
-    // threshold by inventing two distinct operator names (the recipe arm closes
-    // Codex P2 RE-REVIEW-3 BLOCKER 1 — see same_aggregator_key_guard_active).
-    // Distinctness across DIFFERENT human
-    // approvers on one aggregator key is a CLAIM the aggregator makes; we cannot
-    // verify it, so under hard SoD a SECOND sign-off from the SAME api key (the
-    // `agg:<key-id>:` prefix) is rejected before it can satisfy threshold M.
+    // Plan 100 P2 Phase D: the broker resolves the approver's class from VERIFIED
+    // IdP groups and sends it here; vultrino trusts + records it (snapshot at
+    // sign-off), never re-resolves it. An unrecognized/blank value resolves to
+    // `None` — never counted toward a stamped ApprovalRule (fail-closed). Computed
+    // HERE, before the same-key fast-fail, because that guard now keys on whether
+    // this sign-off CONTRIBUTES a positive recipe slot.
+    let resolved_class = body
+        .approver_class
+        .as_deref()
+        .and_then(crate::approval::ApproverClass::parse_wire);
+
+    // M-of-N hardening (#2/#7): under hard SoD one aggregator key may contribute
+    // AT MOST ONE positive recipe slot — its claim of distinct HUMAN operators is
+    // unverifiable, so a SECOND positive-CONTRIBUTING sign-off from the SAME api
+    // key (the `agg:<key-id>:` prefix) is rejected before it can satisfy an M-of-N
+    // (dual-control OR recipe) threshold. Both sides key on POSITIVE, slot-
+    // contributing sign-offs (Codex RE-REVIEW-4): a recorded majority-mode DISSENT,
+    // or a positive whose class the recipe does not use, must NOT poison the
+    // per-tenant key into a permanent veto.
     //
     // This is a FAST-FAIL on the (reloaded) read snapshot for a clean 409; the
     // AUTHORITATIVE, TOCTOU-safe enforcement is inside `transition()` under the
     // storage write lock (ApprovalError::SameAggregatorKey → Conflict → 409), so
     // two concurrent same-key requests can't both pass this pre-check and double-
-    // sign. (Without hard SoD this is left to the aggregator's own dual-control.)
-    // Runs AFTER the idempotency check so a co-approver's legitimate retry isn't
-    // caught here as a same-key duplicate.
-    if existing.same_aggregator_key_guard_active(enforce_sod) {
+    // sign. Runs AFTER the idempotency check so a co-approver's legitimate retry
+    // isn't caught here as a same-key duplicate.
+    if existing.same_aggregator_key_guard_active(enforce_sod)
+        && existing.contributes_positive_slot(body.approve, resolved_class)
+    {
         let key_prefix = format!("agg:{}:", admin.0.api_key.id);
-        if existing
-            .signoffs
-            .iter()
-            .any(|s| s.approver_identity.starts_with(&key_prefix))
-        {
+        if existing.signoffs.iter().any(|s| {
+            s.approver_identity.starts_with(&key_prefix)
+                && existing.contributes_positive_slot(s.approve, s.resolved_class)
+        }) {
             return error_response(
                 StatusCode::CONFLICT,
                 "separation_of_duty",
-                "Separation of duty: this approval already has a sign-off from this \
-                 aggregator key; a distinct co-approver must use a different key.",
+                "Separation of duty: this approval already has a positive sign-off from \
+                 this aggregator key; a distinct co-approver must use a different key.",
             );
         }
     }
-
-    // Plan 100 P2 Phase D: the broker resolves the approver's class from VERIFIED
-    // IdP groups and sends it here; vultrino trusts + records it (snapshot at
-    // sign-off), never re-resolves it. An unrecognized/blank value resolves to
-    // `None` — never counted toward a stamped ApprovalRule (fail-closed).
-    let resolved_class = body
-        .approver_class
-        .as_deref()
-        .and_then(crate::approval::ApproverClass::parse_wire);
     match state
         .storage
         .decide_approval(

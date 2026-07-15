@@ -940,22 +940,30 @@ impl ApprovalRequest {
         if decision.enforce_sod && sod == Some(true) {
             return Err(ApprovalError::SeparationOfDuty);
         }
-        // Hard-SoD M-of-N (in-lock, TOCTOU-safe): when more than one distinct
-        // approver is required, a SECOND sign-off may not come from the SAME
-        // aggregator key as an existing one. The api-layer fast-fail also checks
-        // this, but it is racy across concurrent requests; this check runs inside
-        // the storage write lock (transition() executes under locked_mutate), so
-        // two concurrent same-key decisions can't both slip through. Only applies
-        // to aggregator-asserted identities (`agg:<key-id>:…`); bare identities
-        // are unaffected. The aggregator's claim of distinct HUMAN operators is
-        // unverifiable, so under hard SoD one key counts once.
-        if self.same_aggregator_key_guard_active(decision.enforce_sod) {
+        // Hard-SoD M-of-N (in-lock, TOCTOU-safe): under hard SoD one aggregator
+        // key may contribute AT MOST ONE positive recipe slot — the aggregator's
+        // claim of distinct HUMAN operators is unverifiable, so a SECOND
+        // positive-contributing sign-off from the SAME key is rejected. The
+        // api-layer fast-fail mirrors this, but is racy across concurrent
+        // requests; this check runs inside the storage write lock (transition()
+        // executes under locked_mutate), so two concurrent same-key decisions
+        // can't both slip through. Only aggregator-asserted identities
+        // (`agg:<key-id>:…`) are affected; bare identities are unaffected.
+        //
+        // The guard keys on POSITIVE, SLOT-CONTRIBUTING sign-offs on BOTH sides
+        // (contributes_positive_slot): a recorded majority-mode DISSENT, or a
+        // positive whose class the recipe does not use, neither contributes nor
+        // poisons the key (Codex RE-REVIEW-4 — the per-tenant-key permanent-veto
+        // regression). This positive-contributing sign-off is being added now, so
+        // its own contribution is evaluated with approve=true.
+        if self.same_aggregator_key_guard_active(decision.enforce_sod)
+            && self.contributes_positive_slot(true, decision.resolved_class)
+        {
             if let Some(prefix) = aggregator_key_prefix(&identity) {
-                if self
-                    .signoffs
-                    .iter()
-                    .any(|s| s.approver_identity.starts_with(prefix))
-                {
+                if self.signoffs.iter().any(|s| {
+                    s.approver_identity.starts_with(prefix)
+                        && self.contributes_positive_slot(s.approve, s.resolved_class)
+                }) {
                     return Err(ApprovalError::SameAggregatorKey);
                 }
             }
@@ -1038,6 +1046,41 @@ impl ApprovalRequest {
     /// so activating for all recipes never wrongly blocks a legitimate grant.
     pub fn same_aggregator_key_guard_active(&self, enforce_sod: bool) -> bool {
         enforce_sod && (self.approval_rule.is_some() || self.effective_required_approvals() > 1)
+    }
+
+    /// Whether a sign-off with this `approve`/`class` CONTRIBUTES a positive slot
+    /// toward the request's threshold — the exact unit the hard-SoD
+    /// same-aggregator-key guard protects (Codex P2 RE-REVIEW-4). A DISSENT
+    /// (approve=false) contributes nothing. Under a stamped recipe, a positive
+    /// contributes only if its resolved class is named by SOME recipe term (a
+    /// teammate positive on a `{senior:1}` rule fills no slot); with no recipe,
+    /// every positive counts toward the numeric M-of-N.
+    ///
+    /// The guard rejects a new positive-contributing sign-off from an aggregator
+    /// key that ALREADY holds a positive-contributing one — enforcing "one key
+    /// contributes AT MOST one positive slot", NOT "one key may record only one
+    /// verdict". The prior (RE-REVIEW-4 blocker) form keyed on ANY existing
+    /// sign-off sharing the key, so a recorded majority-mode DISSENT — or a
+    /// positive of a class the recipe does not use — poisoned the per-tenant key
+    /// (Feir OS uses ONE vultrino key per tenant, not per human) into a permanent
+    /// veto: a distinct real approver on the same key could never complete the
+    /// recipe. Restricting BOTH the new and the existing sign-off to
+    /// positive-and-contributing closes that without reopening same-key
+    /// fabrication (two counting positives from one key still collide).
+    pub fn contributes_positive_slot(&self, approve: bool, class: Option<ApproverClass>) -> bool {
+        if !approve {
+            return false;
+        }
+        match &self.approval_rule {
+            None => true, // numeric M-of-N: every positive is a vote
+            Some(rule) => match class {
+                Some(c) => rule
+                    .recipes
+                    .iter()
+                    .any(|r| r.terms.iter().any(|t| t.class == c)),
+                None => false, // unresolved class fills no recipe slot
+            },
+        }
     }
 
     /// How many more distinct approvals this request needs before it is granted
@@ -3000,6 +3043,86 @@ mod tests {
         a.approve(d3).unwrap();
         assert_eq!(a.status, ApprovalStatus::Approved);
         assert_eq!(a.signoffs.len(), 2);
+    }
+
+    #[test]
+    fn recipe_hard_sod_majority_dissent_does_not_poison_aggregator_key() {
+        // RE-REVIEW-4 BLOCKER (fail-closed-too-hard): a recorded majority-mode
+        // DISSENT must NOT poison the aggregator key. Feir OS uses ONE vultrino key
+        // per TENANT (not per human), so a dissent and a later DISTINCT approval
+        // routinely share a key. The guard must key on POSITIVE, slot-CONTRIBUTING
+        // sign-offs — never "one verdict per key" — or the dissent becomes a
+        // permanent veto no distinct approver can overcome.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 1,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        };
+        let mut a = new_approval_with_rule(rule);
+        a.authoritative_risk_tier = "High".to_string(); // majority honored: dissent non-terminal
+        // Carol DISSENTS through tenant aggregator key K.
+        let carol = Decision::new("json-api", "agg:keyK:carol@corp")
+            .with_resolved_class(ApproverClass::Teammate);
+        a.deny(carol).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "High-risk majority mode: the dissent is non-terminal"
+        );
+        // Alice — a DISTINCT real teammate — approves through the SAME tenant key K,
+        // under hard SoD. Her single positive is all {teammate:1} requires; the
+        // recorded dissent must not veto it.
+        let mut alice = Decision::new("json-api", "agg:keyK:alice@corp")
+            .with_resolved_class(ApproverClass::Teammate)
+            .enforcing_sod(true);
+        alice.approver_kind = "human".to_string();
+        a.approve(alice).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Approved,
+            "a dissent on the per-tenant key must not veto a distinct approver on that key"
+        );
+    }
+
+    #[test]
+    fn recipe_hard_sod_offclass_positive_does_not_poison_aggregator_key() {
+        // RE-REVIEW-4 BLOCKER (second form): a POSITIVE that fills no recipe slot
+        // (wrong class) must not poison the key either. A teammate positive on a
+        // {senior:1} rule contributes nothing, so a later SENIOR on the same tenant
+        // key — the first CONTRIBUTING positive — must still clear the recipe.
+        let rule = ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Senior,
+                    count: 1,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        };
+        let mut a = new_approval_with_rule(rule);
+        a.authoritative_risk_tier = "Medium".to_string();
+        // A teammate approves through tenant key K — recorded, but fills no {senior:1} slot.
+        let mut bob = Decision::new("json-api", "agg:keyK:bob@corp")
+            .with_resolved_class(ApproverClass::Teammate)
+            .enforcing_sod(true);
+        bob.approver_kind = "human".to_string();
+        a.approve(bob).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Pending, "a teammate does not satisfy {{senior:1}}");
+        // A senior approves through the SAME key K — the first CONTRIBUTING positive.
+        let mut alice = Decision::new("json-api", "agg:keyK:alice@corp")
+            .with_resolved_class(ApproverClass::Senior)
+            .enforcing_sod(true);
+        alice.approver_kind = "human".to_string();
+        a.approve(alice).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Approved,
+            "an off-class positive on the key must not veto the required senior on that key"
+        );
     }
 
     #[test]
