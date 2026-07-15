@@ -3217,6 +3217,21 @@ mod tests {
             "senior-then-teammate on one key must not fabricate two teammate slots"
         );
 
+        // Teammate + Senior on ONE key K (the REVERSE ordering): equally rejected —
+        // the existing teammate contributes and the senior would too (senior fills a
+        // teammate slot), so the guard is order-independent (Codex RE-REVIEW-6 minor).
+        let mut d = new_approval_with_rule(make_rule());
+        d.authoritative_risk_tier = "High".to_string();
+        d.approve(signoff("agg:keyK:fake-erin@corp", ApproverClass::Teammate))
+            .unwrap();
+        let err3 = d
+            .approve(signoff("agg:keyK:fake-frank@corp", ApproverClass::Senior))
+            .unwrap_err();
+        assert!(
+            matches!(err3, ApprovalError::SameAggregatorKey),
+            "teammate-then-senior on one key must not fabricate two teammate slots"
+        );
+
         // Two DISTINCT keys still clear it — a senior is a valid teammate-slot filler.
         let mut c = new_approval_with_rule(make_rule());
         c.authoritative_risk_tier = "High".to_string();
