@@ -509,11 +509,72 @@ pub struct ApprovalSummary {
     /// aggregator then falls back to `summary` (unchanged today's behavior).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<crate::capability::ApprovalPreview>,
+    /// Approval-recipe requirement snapshot (plan 100 P3 Slice A;
+    /// approval-recipes.md §6 D5) — directly the govder-authored
+    /// `ApprovalRule.recipes` this request was opened against: each `Recipe` is
+    /// one alternative sign-off composition, each `RecipeTerm` a class+count
+    /// slot. `None` when NO rule is stamped on this request (the plain numeric
+    /// `required_approvals`/`approvals_received` apply instead, unchanged from
+    /// today). Emitted together with (never independently of) [`Self::signoffs`]
+    /// so a consumer can never observe one without the other. FAIL-CLOSED: a
+    /// product aggregator MUST treat `None` as "no recipe" and never synthesize
+    /// an empty recipe of its own — that would read as a satisfied/no-requirement
+    /// state that was never actually granted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<Vec<crate::approval::Recipe>>,
+    /// Reduced sign-off list for recipe-progress projection (plan 100 P3 Slice
+    /// A). One entry per recorded [`crate::approval::Signoff`], in the same
+    /// order. `None` exactly when [`Self::recipe`] is `None` (no rule stamped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signoffs: Option<Vec<SignoffSummary>>,
+}
+
+/// One recorded sign-off, reduced for the recipe-progress projection (plan 100
+/// P3 Slice A). See [`ApprovalSummary::signoffs`].
+#[derive(Serialize)]
+pub struct SignoffSummary {
+    /// Bare display identity: [`crate::approval::bare_approver_identity`]
+    /// applied (and trimmed) to the stored `approver_identity`, so an
+    /// aggregator's `agg:<key-id>:` wrapper — and any raw credential — never
+    /// leaks into this projection.
+    pub display: String,
+    /// Resolved approver class, or `None` when unresolved. NEVER coerced to a
+    /// class the caller didn't actually resolve (fail-closed) — an unresolved
+    /// sign-off never counted toward recipe satisfaction either, see
+    /// `approval_rule_satisfied`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_class: Option<crate::approval::ApproverClass>,
+    /// Whether this sign-off was an approve (`true`) or an explicit deny/dissent
+    /// (`false`) — mirrors [`crate::approval::Signoff::approve`].
+    pub approve: bool,
 }
 
 impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
     fn from(a: &crate::approval::ApprovalRequest) -> Self {
         let last = a.signoffs.last();
+        // FAIL-CLOSED (approval-recipes.md §6 D5 / plan 100 P3 Slice A): the
+        // recipe requirement and the reduced sign-off list are emitted ONLY
+        // together, and ONLY when a rule is actually stamped on this request —
+        // never an empty recipe standing in for "no requirement", which would
+        // read to the UI as satisfied/clean when it is simply absent.
+        let (recipe, signoffs) = match &a.approval_rule {
+            Some(rule) => (
+                Some(rule.recipes.clone()),
+                Some(
+                    a.signoffs
+                        .iter()
+                        .map(|s| SignoffSummary {
+                            display: crate::approval::bare_approver_identity(&s.approver_identity)
+                                .trim()
+                                .to_string(),
+                            resolved_class: s.resolved_class,
+                            approve: s.approve,
+                        })
+                        .collect(),
+                ),
+            ),
+            None => (None, None),
+        };
         ApprovalSummary {
             id: a.id.clone(),
             status: a.status.to_string(),
@@ -548,6 +609,8 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
             risk_tier: a.criticality.to_govder_risk_tier().to_string(),
             irreversible: crate::approval::approval_irreversible(a),
             preview: a.preview.clone(),
+            recipe,
+            signoffs,
         }
     }
 }
@@ -3783,6 +3846,95 @@ mod tests {
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["risk_tier"], "Extreme");
         assert_eq!(json["irreversible"], true);
+    }
+
+    /// Plan 100 P3 Slice A: when NO `ApprovalRule` is stamped, the projection
+    /// must NOT synthesize an empty `recipe`/`signoffs` — that would read to a
+    /// downstream aggregator as "no requirement" (a false clean value) rather
+    /// than "not a recipe-governed approval". Both fields must be entirely
+    /// absent from the wire (not `null`, not `[]`), byte-identical to the
+    /// pre-Slice-A projection for a plain numeric approval.
+    #[test]
+    fn test_approval_summary_omits_recipe_fields_without_stamped_rule() {
+        let approval = sample_approval(crate::approval::CriticalityClass::Medium, false);
+        assert!(approval.approval_rule.is_none());
+        let summary = ApprovalSummary::from(&approval);
+        let json = serde_json::to_value(&summary).unwrap();
+        assert!(
+            json.get("recipe").is_none(),
+            "recipe must be OMITTED (not null/[]) when no rule is stamped"
+        );
+        assert!(
+            json.get("signoffs").is_none(),
+            "signoffs must be OMITTED (not null/[]) when no rule is stamped"
+        );
+    }
+
+    /// Plan 100 P3 Slice A: with a stamped `ApprovalRule`, `ApprovalSummary`
+    /// projects (a) the recipe requirement verbatim (govder-authored terms) and
+    /// (b) a reduced sign-off list keyed on the BARE display identity (never the
+    /// raw `agg:<key-id>:` wrapper vultrino stamps on aggregator-asserted
+    /// identities), with an unresolved class carried as absent — NEVER coerced
+    /// to a real class.
+    #[test]
+    fn test_approval_summary_projects_recipe_and_bare_signoffs_when_rule_stamped() {
+        use crate::approval::{
+            ApprovalRule, ApproverClass, Recipe, RecipeDecisionMode, RecipeTerm, Signoff,
+        };
+        let mut approval = sample_approval(crate::approval::CriticalityClass::Medium, false);
+        approval.approval_rule = Some(ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Senior,
+                    count: 1,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        });
+        approval.signoffs.push(Signoff {
+            approver_identity: "agg:00000000-0000-0000-0000-000000000000:alice@example.com"
+                .to_string(),
+            channel: "admin panel".to_string(),
+            decided_at: chrono::Utc::now(),
+            note: None,
+            approver_kind: "human".to_string(),
+            delegation_grant_ref: None,
+            resolved_class: Some(ApproverClass::Senior),
+            controller: None,
+            approve: true,
+        });
+        // An unresolved-class sign-off must be carried as absent, never coerced.
+        approval.signoffs.push(Signoff {
+            approver_identity: "bob@example.com".to_string(),
+            channel: "admin panel".to_string(),
+            decided_at: chrono::Utc::now(),
+            note: None,
+            approver_kind: "human".to_string(),
+            delegation_grant_ref: None,
+            resolved_class: None,
+            controller: None,
+            approve: true,
+        });
+
+        let summary = ApprovalSummary::from(&approval);
+        let json = serde_json::to_value(&summary).unwrap();
+
+        assert_eq!(json["recipe"][0]["terms"][0]["class"], "senior");
+        assert_eq!(json["recipe"][0]["terms"][0]["count"], 1);
+
+        assert_eq!(
+            json["signoffs"][0]["display"], "alice@example.com",
+            "the agg:<key-id>: wrapper must be stripped to the bare subject"
+        );
+        assert_eq!(json["signoffs"][0]["resolved_class"], "senior");
+        assert_eq!(json["signoffs"][0]["approve"], true);
+
+        assert_eq!(json["signoffs"][1]["display"], "bob@example.com");
+        assert!(
+            json["signoffs"][1].get("resolved_class").is_none(),
+            "an unresolved class must be OMITTED, never coerced to a real class"
+        );
+        assert_eq!(json["signoffs"][1]["approve"], true);
     }
 
     #[test]
