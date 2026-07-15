@@ -5110,11 +5110,15 @@ async fn test_would_deny_reports_tenant_filtered_and_redacted() {
     let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
     storage.store_api_key(&tenant_key).await.unwrap();
 
-    // Two would-deny events for team-a, one for team-b, one unrelated event.
-    for (tenant, action) in [
-        ("team-a", "db.write"),
-        ("team-a", "email.send"),
-        ("team-b", "money.payout"),
+    // Would-deny events for team-a (one with an agent_label, one with only a
+    // principal_id, one with neither — FU1 must OMIT `agent` rather than
+    // fabricate it), plus one for team-b carrying its own agent identity that
+    // must never leak into team-a's redacted view.
+    for (tenant, action, agent_label, principal_id) in [
+        ("team-a", "db.write", Some("checkout-agent"), Some("vk_abc123")),
+        ("team-a", "email.send", None, Some("vk_xyz789")),
+        ("team-a", "report.export", None, None),
+        ("team-b", "money.payout", Some("team-b-secret-agent"), Some("vk_teamb")),
     ] {
         storage
             .append_event(
@@ -5127,6 +5131,8 @@ async fn test_would_deny_reports_tenant_filtered_and_redacted() {
                     "reason": "policy denies this action",
                     "would_have": "deny",
                     "outcome": "allowed_observe_mode",
+                    "agent_label": agent_label,
+                    "principal_id": principal_id,
                 }),
             )
             .await
@@ -5176,9 +5182,21 @@ async fn test_would_deny_reports_tenant_filtered_and_redacted() {
     let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(body["tenant"], "team-a");
     let reports = body["reports"].as_array().unwrap();
-    assert_eq!(reports.len(), 2, "only team-a's would-deny events: {}", raw);
+    assert_eq!(reports.len(), 3, "only team-a's would-deny events: {}", raw);
     assert_eq!(reports[0]["action"], "db.write");
+    // FU1: agent_label is preferred when the enforcement path stamped one.
+    assert_eq!(reports[0]["agent"], "checkout-agent");
     assert_eq!(reports[1]["action"], "email.send");
+    // FU1: no agent_label was stamped, so principal_id is the fallback.
+    assert_eq!(reports[1]["agent"], "vk_xyz789");
+    assert_eq!(reports[2]["action"], "report.export");
+    // FU1 fail-closed honesty: neither was stamped, so `agent` is OMITTED
+    // entirely — never fabricated as a placeholder.
+    assert!(
+        reports[2].get("agent").is_none(),
+        "agent field must be omitted when the acting agent is unknown: {}",
+        raw
+    );
     // Redaction: the credential alias and other tenants never cross the wire.
     assert!(
         !raw.contains("super-secret-alias"),
@@ -5189,9 +5207,17 @@ async fn test_would_deny_reports_tenant_filtered_and_redacted() {
         !raw.contains("money.payout"),
         "another tenant's action leaked"
     );
+    assert!(
+        !raw.contains("team-b-secret-agent"),
+        "another tenant's agent identity leaked"
+    );
+    assert!(
+        !raw.contains("vk_teamb"),
+        "another tenant's principal id leaked"
+    );
     // Bounded-retention metadata + cursor are present.
     assert!(body["retention_secs"].as_u64().unwrap() > 0);
-    assert!(body["next_after"].as_u64().unwrap() >= 4);
+    assert!(body["next_after"].as_u64().unwrap() >= 5);
     assert_eq!(body["truncated"], false);
 
     // Cursor replay: after the last sequence there is nothing new.

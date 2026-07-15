@@ -1083,6 +1083,8 @@ impl VultrinoServer {
                             "reason": reason,
                             "would_have": "deny",
                             "outcome": "allowed_observe_mode",
+                            "agent_label": principal.as_ref().and_then(|p| p.agent_label.as_deref()),
+                            "principal_id": principal.as_ref().map(|p| p.id.as_str()),
                         }),
                     )
                     .await;

@@ -2961,9 +2961,11 @@ const WOULD_DENY_REPORT_CAP: usize = 200;
 /// would-deny events (feir-os plan 077 / shadow-onboarding phase B). Key rules
 /// mirror [`api_tenant_mode`]: a tenant-scoped key reads its OWN tenant's
 /// reports; a global key must name the tenant. Rows are REDACTED at the source:
-/// only `sequence`, `created_at`, `action`, and `reason` cross the wire — the
-/// credential alias and raw payload never leave vultrino, and another tenant's
-/// events are filtered out here rather than trusting any downstream filter.
+/// only `sequence`, `created_at`, `action`, `reason`, and an optional `agent`
+/// (FU1: the acting agent's label, else its principal id, else the field is
+/// OMITTED rather than fabricated) cross the wire — the credential alias and
+/// raw payload never leave vultrino, and another tenant's events are filtered
+/// out here rather than trusting any downstream filter.
 /// The signed outbox prunes delivered events past `outbox.retention_secs`, so
 /// the response carries that bound — a consumer must present totals as
 /// "over the retention window", never as all-time.
@@ -3026,12 +3028,25 @@ pub async fn api_would_deny_reports(
             report_capped = true;
             break;
         }
-        reports.push(serde_json::json!({
+        let mut report = serde_json::json!({
             "sequence": e.sequence,
             "created_at": e.created_at,
             "action": e.payload.get("action").and_then(|v| v.as_str()).unwrap_or(""),
             "reason": e.payload.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
-        }));
+        });
+        // FU1: attribute the report to the acting agent when the enforcement
+        // path recorded one — prefer the human-readable agent_label, fall back
+        // to the opaque principal_id, and OMIT the field entirely rather than
+        // fabricate an identity when neither was stamped (fail-closed honesty).
+        let agent = e
+            .payload
+            .get("agent_label")
+            .and_then(|v| v.as_str())
+            .or_else(|| e.payload.get("principal_id").and_then(|v| v.as_str()));
+        if let Some(agent) = agent {
+            report["agent"] = serde_json::json!(agent);
+        }
+        reports.push(report);
     }
 
     (
