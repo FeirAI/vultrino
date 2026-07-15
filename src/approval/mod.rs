@@ -1074,10 +1074,13 @@ impl ApprovalRequest {
         match &self.approval_rule {
             None => true, // numeric M-of-N: every positive is a vote
             Some(rule) => match class {
-                Some(c) => rule
-                    .recipes
-                    .iter()
-                    .any(|r| r.terms.iter().any(|t| t.class == c)),
+                // Uses class_fills_a_slot — the SAME hierarchy + satisfiability logic
+                // recipe_satisfied counts by — so a Senior on a `{teammate:N}` recipe
+                // is (correctly) contributing (senior ⊇ teammate) and cannot slip the
+                // guard, while a positive toward an unsatisfiable branch is not
+                // (Codex RE-REVIEW-5). A bare `.class == term.class` scan here was the
+                // fabrication/over-rejection bug.
+                Some(c) => rule.recipes.iter().any(|r| class_fills_a_slot(r, c)),
                 None => false, // unresolved class fills no recipe slot
             },
         }
@@ -1354,27 +1357,14 @@ fn recipe_satisfied(
     avail_teammate: u32,
     avail_agent_reviewer: u32,
 ) -> bool {
-    if !recipe_well_formed(r) {
-        return false;
-    }
-    let mut need_senior = 0u32;
-    let mut need_teammate = 0u32;
-    let mut need_agent_reviewer = 0u32;
-    for t in &r.terms {
-        // Saturating arithmetic (BLOCKER 3): `recipe_well_formed` already caps every
-        // count and the running total at `MAX_RECIPE_TERM_COUNT`, so this can never
-        // actually saturate — but `saturating_add` GUARANTEES that even a rule that
-        // somehow slipped past the cap can only make a requirement HARDER (never wrap
-        // a `u32` down to a smaller need that fewer approvers would satisfy).
-        match t.class {
-            ApproverClass::Senior => need_senior = need_senior.saturating_add(t.count),
-            ApproverClass::Teammate => need_teammate = need_teammate.saturating_add(t.count),
-            ApproverClass::AgentReviewer => {
-                need_agent_reviewer = need_agent_reviewer.saturating_add(t.count)
-            }
-            ApproverClass::Unknown => return false, // recipe_well_formed already excludes this
-        }
-    }
+    // Shared need computation (recipe_needs) so this and class_fills_a_slot — the
+    // hard-SoD same-key contribution check — can NEVER diverge on well-formedness or
+    // the senior⊇teammate hierarchy (that drift is what let Codex RE-REVIEW-5's
+    // senior-fills-teammate fabrication through when the guard hand-rolled its own,
+    // exact-match contribution rule).
+    let Some((need_senior, need_teammate, need_agent_reviewer)) = recipe_needs(r) else {
+        return false; // malformed / unknown class: never satisfiable
+    };
     // Agent-reviewer recipe terms are disabled system-wide (Codex P2 review finding 6;
     // mirrors govder's `recipeSatisfied` hard guard). govder rejects agent-reviewer
     // terms at WRITE time, so a fetched rule should only ever contain {senior,
@@ -1394,6 +1384,55 @@ fn recipe_satisfied(
     // Moot past the hard guard above (`need_agent_reviewer == 0`), kept for signature
     // parity with govder's `recipeSatisfied` and the collect machinery.
     avail_agent_reviewer >= need_agent_reviewer
+}
+
+/// The `(senior, teammate, agent-reviewer)` slot counts a WELL-FORMED recipe requires,
+/// or `None` if the recipe is structurally malformed (per [`recipe_well_formed`], incl.
+/// an unknown class) and thus never satisfiable. Extracted so [`recipe_satisfied`] and
+/// [`class_fills_a_slot`] share ONE source of truth for well-formedness + the need
+/// totals — they must never disagree about which recipes/slots are real (Codex
+/// RE-REVIEW-5). Saturating arithmetic mirrors the BLOCKER-3 overflow guard.
+fn recipe_needs(r: &Recipe) -> Option<(u32, u32, u32)> {
+    if !recipe_well_formed(r) {
+        return None;
+    }
+    let (mut need_senior, mut need_teammate, mut need_agent_reviewer) = (0u32, 0u32, 0u32);
+    for t in &r.terms {
+        match t.class {
+            ApproverClass::Senior => need_senior = need_senior.saturating_add(t.count),
+            ApproverClass::Teammate => need_teammate = need_teammate.saturating_add(t.count),
+            ApproverClass::AgentReviewer => {
+                need_agent_reviewer = need_agent_reviewer.saturating_add(t.count)
+            }
+            ApproverClass::Unknown => return None, // recipe_well_formed already excludes this
+        }
+    }
+    Some((need_senior, need_teammate, need_agent_reviewer))
+}
+
+/// Whether a POSITIVE sign-off of `class` can fill a slot in recipe `r`, using the
+/// EXACT rules [`recipe_satisfied`] counts by (Codex RE-REVIEW-5). This is the unit the
+/// hard-SoD same-aggregator-key guard protects, so it MUST agree with satisfaction:
+///   * the recipe must be satisfiable-in-principle — well-formed AND requiring no
+///     agent-reviewer term (those are disabled, so such a branch clears via NO one and
+///     fills no VIABLE slot — a positive toward it must not poison the key, RE-REVIEW-5
+///     Blocker 2);
+///   * a Senior may fill a senior OR a teammate slot (senior ⊇ teammate — the hierarchy
+///     recipe_satisfied's leftover-senior rule encodes; missing this let a Senior look
+///     "non-contributing" on `{teammate:N}` and slip the guard, RE-REVIEW-5 Blocker 1);
+///   * a Teammate fills only a teammate slot; agent-reviewer / unknown fill none.
+fn class_fills_a_slot(r: &Recipe, class: ApproverClass) -> bool {
+    let Some((need_senior, need_teammate, need_agent_reviewer)) = recipe_needs(r) else {
+        return false;
+    };
+    if need_agent_reviewer > 0 {
+        return false; // unsatisfiable branch (agent-reviewers disabled): no viable slot
+    }
+    match class {
+        ApproverClass::Senior => need_senior > 0 || need_teammate > 0,
+        ApproverClass::Teammate => need_teammate > 0,
+        ApproverClass::AgentReviewer | ApproverClass::Unknown => false,
+    }
 }
 
 /// Structural well-formedness (mirrors govder's `recipeComposition`'s `ok` return): a
@@ -3122,6 +3161,123 @@ mod tests {
             a.status,
             ApprovalStatus::Approved,
             "an off-class positive on the key must not veto the required senior on that key"
+        );
+    }
+
+    #[test]
+    fn recipe_hard_sod_senior_cannot_fabricate_teammate_slots_via_one_key() {
+        // RE-REVIEW-5 BLOCKER 1 (fail-OPEN): a Senior fills a Teammate slot
+        // (senior ⊇ teammate), so a Senior positive DOES contribute to a {teammate:2}
+        // recipe. An EXACT class-match contribution check wrongly called Seniors
+        // non-contributing, so the guard skipped them and ONE aggregator key could
+        // submit two Seniors (or senior+teammate) and clear {teammate:2} without two
+        // distinct real humans. class_fills_a_slot now mirrors recipe_satisfied's
+        // hierarchy, so both interleavings are rejected on the same key.
+        let make_rule = || ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        };
+        let signoff = |ident: &str, class| {
+            let mut d = Decision::new("json-api", ident)
+                .with_resolved_class(class)
+                .enforcing_sod(true);
+            d.approver_kind = "human".to_string();
+            d
+        };
+        // Senior + Senior on ONE key K: the second must be rejected.
+        let mut a = new_approval_with_rule(make_rule());
+        a.authoritative_risk_tier = "High".to_string();
+        a.approve(signoff("agg:keyK:fake-alice@corp", ApproverClass::Senior))
+            .unwrap();
+        assert_eq!(a.status, ApprovalStatus::Pending);
+        let err = a
+            .approve(signoff("agg:keyK:fake-bob@corp", ApproverClass::Senior))
+            .unwrap_err();
+        assert!(
+            matches!(err, ApprovalError::SameAggregatorKey),
+            "two seniors on one key must not fabricate two teammate slots"
+        );
+        assert_eq!(a.status, ApprovalStatus::Pending);
+
+        // Senior + Teammate on ONE key K: also rejected (the existing senior contributes).
+        let mut b = new_approval_with_rule(make_rule());
+        b.authoritative_risk_tier = "High".to_string();
+        b.approve(signoff("agg:keyK:fake-carol@corp", ApproverClass::Senior))
+            .unwrap();
+        let err2 = b
+            .approve(signoff("agg:keyK:fake-dave@corp", ApproverClass::Teammate))
+            .unwrap_err();
+        assert!(
+            matches!(err2, ApprovalError::SameAggregatorKey),
+            "senior-then-teammate on one key must not fabricate two teammate slots"
+        );
+
+        // Two DISTINCT keys still clear it — a senior is a valid teammate-slot filler.
+        let mut c = new_approval_with_rule(make_rule());
+        c.authoritative_risk_tier = "High".to_string();
+        c.approve(signoff("agg:keyA:alice@corp", ApproverClass::Senior))
+            .unwrap();
+        c.approve(signoff("agg:keyB:bob@corp", ApproverClass::Teammate))
+            .unwrap();
+        assert_eq!(
+            c.status,
+            ApprovalStatus::Approved,
+            "a senior + a teammate on DISTINCT keys legitimately fill {{teammate:2}}"
+        );
+    }
+
+    #[test]
+    fn recipe_hard_sod_unsatisfiable_branch_positive_does_not_poison_key() {
+        // RE-REVIEW-5 BLOCKER 2 (fail-closed-too-hard): a positive toward an
+        // UNSATISFIABLE branch (one requiring a disabled agent-reviewer term) fills no
+        // VIABLE slot, so it must not poison the key. Rule: {teammate:1, agent-reviewer:1}
+        // OR {senior:1}. A teammate positive (branch 1, never clears) on key K must not
+        // block a later senior (branch 2) on key K.
+        let rule = ApprovalRule {
+            recipes: vec![
+                Recipe {
+                    terms: vec![
+                        RecipeTerm {
+                            class: ApproverClass::Teammate,
+                            count: 1,
+                        },
+                        RecipeTerm {
+                            class: ApproverClass::AgentReviewer,
+                            count: 1,
+                        },
+                    ],
+                },
+                Recipe {
+                    terms: vec![RecipeTerm {
+                        class: ApproverClass::Senior,
+                        count: 1,
+                    }],
+                },
+            ],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        };
+        let mut a = new_approval_with_rule(rule);
+        a.authoritative_risk_tier = "High".to_string();
+        let mut tm = Decision::new("json-api", "agg:keyK:bob@corp")
+            .with_resolved_class(ApproverClass::Teammate)
+            .enforcing_sod(true);
+        tm.approver_kind = "human".to_string();
+        a.approve(tm).unwrap();
+        assert_eq!(a.status, ApprovalStatus::Pending);
+        let mut sr = Decision::new("json-api", "agg:keyK:alice@corp")
+            .with_resolved_class(ApproverClass::Senior)
+            .enforcing_sod(true);
+        sr.approver_kind = "human".to_string();
+        a.approve(sr).unwrap();
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Approved,
+            "a positive toward an unsatisfiable branch must not veto the senior on that key"
         );
     }
 
