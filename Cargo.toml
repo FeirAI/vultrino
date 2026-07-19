@@ -50,8 +50,8 @@ k256 = { version = "0.13", features = ["ecdsa", "ecdsa-core", "schnorr"] }  # EC
 sha3 = "0.10"  # Keccak256 for Ethereum
 
 # WASM runtime for plugins
-wasmtime = "29"
-wasmtime-wasi = "29"
+wasmtime = "44"
+wasmtime-wasi = "44"
 
 # OS integration (for future keychain support)
 # keyring = "3"

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use wasmtime::*;
-use wasmtime_wasi::preview1::WasiP1Ctx;
+use wasmtime_wasi::p1::WasiP1Ctx;
 
 /// Wall-clock ceiling for a single WASM plugin call (instantiation + execute).
 /// A plugin that exceeds this is trapped via epoch interruption and its action denied.
@@ -177,7 +177,7 @@ impl WasmtimeRuntime {
     /// Create a linker with WASI imports
     fn create_linker(&self) -> Result<Linker<WasmState>, PluginError> {
         let mut linker = Linker::new(&self.engine);
-        wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |state: &mut WasmState| {
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut WasmState| {
             &mut state.wasi
         })
         .map_err(|e| PluginError::Wasm(format!("Failed to add WASI to linker: {}", e)))?;
