@@ -1484,14 +1484,27 @@ fn recipe_well_formed(r: &Recipe) -> bool {
 /// different broker/admin keys (key rotation or an HA broker) — `agg:A:sub-alice` and
 /// `agg:B:sub-alice` reading as distinct principals, so one person could clear a
 /// `{teammate:2}` recipe. Stripping to the bare subject via `bare_approver_identity`
-/// collapses those to ONE slot regardless of which key routed the sign-off. This does
-/// NOT touch the aggregator-SoD `agg:` scheme itself (the `SameAggregatorKey` /
-/// `DuplicateApprover` checks in `transition`) — only the recipe-satisfaction dedupe.
+/// collapses those to ONE slot regardless of which key routed the sign-off. The
+/// dedupe key is also ASCII-case-folded: the aggregator only `trim()`s the asserted
+/// operator string before embedding it, never case-normalizes it, so
+/// `agg:A:Alice@corp.com` and `agg:B:alice@corp.com` must still collapse to one
+/// principal — matching the `eq_ignore_ascii_case` convention already used by the
+/// sibling `DuplicateApprover` guard (`transition()`) and `sod_for`. `to_ascii_lowercase`
+/// (not Unicode `to_lowercase`) is used deliberately, for parity with that same
+/// `eq_ignore_ascii_case` semantics. This does NOT touch the aggregator-SoD `agg:`
+/// scheme itself (the `SameAggregatorKey` / `DuplicateApprover` checks in
+/// `transition`) — only the recipe-satisfaction dedupe.
 fn dedupe_by_identity<'a>(signoffs: Vec<&'a Signoff>) -> Vec<&'a Signoff> {
     let mut seen = std::collections::HashSet::new();
     signoffs
         .into_iter()
-        .filter(|s| seen.insert(bare_approver_identity(&s.approver_identity).trim().to_string()))
+        .filter(|s| {
+            seen.insert(
+                bare_approver_identity(&s.approver_identity)
+                    .trim()
+                    .to_ascii_lowercase(),
+            )
+        })
         .collect()
 }
 
@@ -3026,6 +3039,83 @@ mod tests {
             a.status,
             ApprovalStatus::Approved,
             "a second DISTINCT bare subject satisfies the two-teammate recipe"
+        );
+    }
+
+    /// Minimal teammate Signoff for direct `dedupe_by_identity` / `approval_rule_satisfied`
+    /// unit tests (bypasses `transition()` so case-varied full identities can be staged
+    /// without hitting DuplicateApprover on the bare non-aggregator path).
+    fn teammate_signoff(identity: &str) -> Signoff {
+        Signoff {
+            approver_identity: identity.to_string(),
+            channel: "test".to_string(),
+            decided_at: Utc::now(),
+            note: None,
+            approver_kind: "human".to_string(),
+            delegation_grant_ref: None,
+            resolved_class: Some(ApproverClass::Teammate),
+            controller: None,
+            approve: true,
+        }
+    }
+
+    fn two_teammate_rule() -> ApprovalRule {
+        ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        }
+    }
+
+    #[test]
+    fn dedupe_collapses_case_varied_bare_subject_across_aggregator_keys() {
+        // Case-varied spellings of ONE principal via two aggregator keys must fill
+        // ONE recipe slot (parity with DuplicateApprover / sod_for ASCII case-fold).
+        let a = teammate_signoff("agg:key-a:Alice@corp.com");
+        let b = teammate_signoff("agg:key-b:alice@corp.com");
+        let out = dedupe_by_identity(vec![&a, &b]);
+        assert_eq!(
+            out.len(),
+            1,
+            "Alice@corp.com and alice@corp.com via distinct keys are one principal"
+        );
+    }
+
+    #[test]
+    fn dedupe_case_varied_same_principal_does_not_satisfy_two_slot_recipe() {
+        let a = teammate_signoff("agg:key-a:Alice@corp.com");
+        let b = teammate_signoff("agg:key-b:alice@corp.com");
+        assert!(
+            !approval_rule_satisfied(&two_teammate_rule(), &[a, b]),
+            "one principal with case-varied spellings must not clear {{teammate:2}}"
+        );
+    }
+
+    #[test]
+    fn dedupe_keeps_genuinely_distinct_principals() {
+        let a = teammate_signoff("agg:key-a:alice@corp.com");
+        let b = teammate_signoff("agg:key-b:bob@corp.com");
+        let out = dedupe_by_identity(vec![&a, &b]);
+        assert_eq!(out.len(), 2, "alice and bob remain two distinct principals");
+        assert!(
+            approval_rule_satisfied(&two_teammate_rule(), &[a, b]),
+            "two distinct principals must still clear {{teammate:2}}"
+        );
+    }
+
+    #[test]
+    fn dedupe_collapses_case_varied_non_aggregator_identities() {
+        let a = teammate_signoff("Alice@corp.com");
+        let b = teammate_signoff("alice@corp.com");
+        let out = dedupe_by_identity(vec![&a, &b]);
+        assert_eq!(
+            out.len(),
+            1,
+            "non-aggregator identities differing only by ASCII case collapse to one"
         );
     }
 
