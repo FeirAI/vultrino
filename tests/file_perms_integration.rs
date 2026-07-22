@@ -26,6 +26,14 @@ async fn test_vault_and_outbox_written_owner_only() {
     let pw = SecretString::from("pw");
     let storage: Arc<dyn StorageBackend> = Arc::new(FileStorage::new(&vault, &pw).await.unwrap());
 
+    // Vault parent must be owner-only (0700) so local users cannot list/read sidecars.
+    assert_eq!(
+        mode_of(dir.path()),
+        0o700,
+        "vault parent directory must be owner-only (0700), got {:o}",
+        mode_of(dir.path())
+    );
+
     // Storing a credential persists the vault via the temp-file + atomic rename path.
     let cred = Credential::new(
         "api-cred".to_string(),

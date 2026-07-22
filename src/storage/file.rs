@@ -642,9 +642,25 @@ impl FileStorage {
     ) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
 
-        // Ensure parent directory exists
+        // Ensure parent directory exists and is owner-only. Fail closed on chmod
+        // failure — a world/group-readable vault parent undermines the 0600 file mode.
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |e| {
+                        StorageError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "failed to set vault parent directory mode 0700 on {}: {e}",
+                                parent.display()
+                            ),
+                        ))
+                    },
+                )?;
+            }
         }
 
         // Check if file exists

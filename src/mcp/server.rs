@@ -16,6 +16,134 @@ use tracing::{debug, error, info, warn};
 
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
+const REDACTED: &str = "[REDACTED]";
+
+/// JSON object keys whose values must never appear in logs (case-insensitive).
+fn is_sensitive_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "api_key"
+            | "token"
+            | "password"
+            | "secret"
+            | "authorization"
+            | "access_token"
+            | "refresh_token"
+            | "bearer"
+            | "client_secret"
+            | "private_key"
+            | "x-api-key"
+            | "x-auth-token"
+            | "webhook_secret"
+            | "hmac_secret"
+            | "admin_password"
+            | "cookie"
+            | "set-cookie"
+    )
+}
+
+fn looks_like_secret_value(s: &str) -> bool {
+    let t = s.trim();
+    let lower = t.to_ascii_lowercase();
+    t.starts_with("vk_")
+        || t.starts_with("vut_")
+        || t.starts_with("vwa_")
+        || lower.starts_with("bearer ")
+}
+
+/// Scrub vultrino secret prefixes / Bearer tokens from non-JSON log text.
+fn scrub_plaintext_secrets(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while !rest.is_empty() {
+        let lower = rest.to_ascii_lowercase();
+        let candidates = [
+            lower.find("vk_").map(|i| (i, 3usize)),
+            lower.find("vut_").map(|i| (i, 4)),
+            lower.find("vwa_").map(|i| (i, 4)),
+            lower.find("bearer ").map(|i| (i, 7)),
+        ];
+        let Some((idx, prefix_len)) = candidates.into_iter().flatten().min_by_key(|(i, _)| *i) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..idx]);
+        out.push_str(REDACTED);
+        rest = &rest[idx + prefix_len..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '=')))
+            .unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    out
+}
+
+fn redact_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                let Some(child) = map.get_mut(&key) else {
+                    continue;
+                };
+                if is_sensitive_key(&key) {
+                    *child = json!(REDACTED);
+                    continue;
+                }
+                // Upstream proxy headers routinely carry Authorization / API keys —
+                // redact every string value under a "headers" object.
+                if key.eq_ignore_ascii_case("headers") {
+                    if let Some(headers) = child.as_object_mut() {
+                        for hv in headers.values_mut() {
+                            if hv.is_string() {
+                                *hv = json!(REDACTED);
+                            } else {
+                                redact_json_value(hv);
+                            }
+                        }
+                    } else {
+                        redact_json_value(child);
+                    }
+                    continue;
+                }
+                redact_json_value(child);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                redact_json_value(v);
+            }
+        }
+        serde_json::Value::String(s) => {
+            if looks_like_secret_value(s) {
+                *s = REDACTED.to_string();
+            } else if s.contains("vk_")
+                || s.contains("vut_")
+                || s.contains("vwa_")
+                || s.to_ascii_lowercase().contains("bearer ")
+            {
+                *s = scrub_plaintext_secrets(s);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_log_value(mut value: serde_json::Value) -> serde_json::Value {
+    redact_json_value(&mut value);
+    value
+}
+
+fn sanitize_log_str(input: &str) -> String {
+    if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(input) {
+        redact_json_value(&mut json);
+        if let Ok(s) = serde_json::to_string(&json) {
+            return s;
+        }
+    }
+    scrub_plaintext_secrets(input)
+}
+
 /// A successfully authenticated MCP caller — either a long-lived API key or a
 /// narrow, ephemeral use token.
 enum McpPrincipal {
@@ -255,13 +383,15 @@ impl McpServer {
                 continue;
             }
 
-            debug!(request = %line, "Received MCP request");
+            let sanitized_request = sanitize_log_str(line);
+            debug!(request = %sanitized_request, "Received MCP request");
 
             let response = self.handle_message(line).await;
 
             if let Some(response) = response {
                 let response_str = serde_json::to_string(&response)?;
-                debug!(response = %response_str, "Sending MCP response");
+                let sanitized_response = sanitize_log_str(&response_str);
+                debug!(response = %sanitized_response, "Sending MCP response");
                 stdout.write_all(response_str.as_bytes()).await?;
                 stdout.write_all(b"\n").await?;
                 stdout.flush().await?;
@@ -308,7 +438,12 @@ impl McpServer {
                 // Execution cancellation is cooperative. HTTP disconnects cancel
                 // the request future; this notification is accepted for MCP
                 // conformance and intentionally has no response.
-                info!(params = ?request.params, "MCP client cancelled a request");
+                let sanitized_params = request
+                    .params
+                    .as_ref()
+                    .map(|p| sanitize_log_value(p.clone()))
+                    .unwrap_or(json!({}));
+                info!(params = %sanitized_params, "MCP client cancelled a request");
                 return None;
             }
             "tools/list" => self.handle_tools_list(&request).await,
@@ -1267,6 +1402,49 @@ impl McpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_redacts_auth_fields_and_headers() {
+        let raw = r#"{
+            "jsonrpc":"2.0",
+            "method":"tools/call",
+            "params":{
+                "name":"http_request",
+                "arguments":{
+                    "api_key":"vk_live_secret",
+                    "headers":{"Authorization":"Bearer upstream-secret","X-Custom":"keep-shape"},
+                    "body":"token=vut_abc123&ok=1",
+                    "url":"https://example.com"
+                }
+            }
+        }"#;
+        let out = sanitize_log_str(raw);
+        assert!(!out.contains("vk_live_secret"), "api_key must be redacted: {out}");
+        assert!(!out.contains("upstream-secret"), "Authorization header must be redacted: {out}");
+        assert!(!out.contains("vut_abc123"), "body secret prefix must be scrubbed: {out}");
+        assert!(out.contains(REDACTED), "redaction marker expected: {out}");
+        assert!(out.contains("https://example.com"), "non-secret fields must survive: {out}");
+        // Header values are redacted; keys remain so logs stay diagnosable.
+        assert!(out.contains("Authorization"), "header names should remain: {out}");
+    }
+
+    #[test]
+    fn sanitize_redacts_response_shaped_secrets() {
+        let raw = r#"{"jsonrpc":"2.0","result":{"token":"vut_resp","nested":{"authorization":"secret"}}}"#;
+        let out = sanitize_log_str(raw);
+        assert!(!out.contains("vut_resp"), "{out}");
+        assert!(!out.contains("\"secret\""), "{out}");
+        assert!(out.contains(REDACTED), "{out}");
+    }
+
+    #[test]
+    fn sanitize_scrubs_non_json_plaintext() {
+        let out = sanitize_log_str("debug dump vk_abc vut_def Bearer tok and ok");
+        assert!(!out.contains("vk_abc"), "{out}");
+        assert!(!out.contains("vut_def"), "{out}");
+        assert!(!out.contains("tok"), "{out}");
+        assert!(out.contains("and ok"), "{out}");
+    }
 
     #[test]
     fn pending_approval_has_structured_content() {

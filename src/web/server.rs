@@ -422,6 +422,10 @@ impl WebServer {
                 HeaderValue::from_static("strict-origin-when-cross-origin"),
             ))
             .layer(SetResponseHeaderLayer::if_not_present(
+                axum::http::HeaderName::from_static("permissions-policy"),
+                HeaderValue::from_static("accelerometer=(), camera=(), microphone=(), geolocation=()"),
+            ))
+            .layer(SetResponseHeaderLayer::if_not_present(
                 header::CONTENT_SECURITY_POLICY,
                 HeaderValue::from_static(
                     "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'"
