@@ -177,15 +177,30 @@ async fn body_value(resp: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 async fn http_rejects_unsupported_protocol_version_and_cross_origin_requests() {
     let (router, _) = build_router_with(config_with_policies(vec![])).await;
+    // A malformed (non-date-shaped) version header is still rejected outright.
     let mut bad_version = mcp_req(
         None,
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
     );
     bad_version
         .headers_mut()
-        .insert("mcp-protocol-version", "2099-01-01".parse().unwrap());
+        .insert("mcp-protocol-version", "not-a-version".parse().unwrap());
     assert_eq!(
         router.clone().oneshot(bad_version).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    // A well-formed but UNKNOWN (newer) version is negotiated down, not rejected:
+    // real SDKs stamp their own LATEST on every request regardless of what
+    // initialize negotiated (e.g. the python `mcp` client's 2025-11-25).
+    let mut newer_version = mcp_req(
+        None,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+    );
+    newer_version
+        .headers_mut()
+        .insert("mcp-protocol-version", "2099-01-01".parse().unwrap());
+    assert_ne!(
+        router.clone().oneshot(newer_version).await.unwrap().status(),
         StatusCode::BAD_REQUEST
     );
 

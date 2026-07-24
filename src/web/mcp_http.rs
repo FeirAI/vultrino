@@ -241,7 +241,21 @@ fn validate_transport_headers(headers: &HeaderMap) -> Result<(), Box<Response>> 
         .get("mcp-protocol-version")
         .and_then(|v| v.to_str().ok())
     {
-        if !matches!(version, "2025-06-18" | "2025-03-26" | "2024-11-05") {
+        // Known versions pass. A well-formed but UNKNOWN (typically newer) version is
+        // negotiated DOWN rather than rejected: real SDKs (e.g. the python `mcp` client
+        // hermes bundles) stamp their own LATEST_PROTOCOL_VERSION header on every
+        // request regardless of what initialize negotiated, and the JSON-RPC subset
+        // served here (initialize / tools/list / tools/call / notifications) is
+        // wire-stable across protocol revisions — the initialize response still states
+        // the server's actual supported version. Anything not shaped like a protocol
+        // date remains a 400 (header hygiene).
+        let known = matches!(version, "2025-06-18" | "2025-03-26" | "2024-11-05");
+        let date_shaped = version.len() == 10
+            && version.bytes().enumerate().all(|(i, b)| match i {
+                4 | 7 => b == b'-',
+                _ => b.is_ascii_digit(),
+            });
+        if !known && !date_shaped {
             return Err(Box::new(transport_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported MCP-Protocol-Version",
