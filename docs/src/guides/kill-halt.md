@@ -5,7 +5,8 @@ When an agent misbehaves you need to **stop it now**, not at the end of its run.
 ## Halting an agent
 
 ```bash
-# Admin API (Permission::Admin). Idempotent via Idempotency-Key.
+# Admin API (Permission::Admin). Convergent: a repeat under the same
+# Idempotency-Key RE-ASSERTS the halt rather than replaying it.
 curl -XPOST https://vultrino.example.com/api/v1/agents/bot-7/halt \
   -H "Authorization: Bearer vk_admin_..."
 ```

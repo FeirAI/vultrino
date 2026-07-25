@@ -1126,6 +1126,395 @@ async fn test_admin_put_policy_idempotency_bound_to_path() {
     assert!(storage.get_policy("id2").await.unwrap().is_none());
 }
 
+/// Build an admin request carrying an `Idempotency-Key` (the convergent-replay
+/// tests below all drive the wrapper, so they need the header `admin_req` omits).
+fn admin_req_idem(
+    method: &str,
+    uri: &str,
+    key: &str,
+    idem: &str,
+    body: serde_json::Value,
+) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {}", key))
+        .header("content-type", "application/json")
+        .header("idempotency-key", idem)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+/// F11 (plan 103 §0/§9): a repeated (Idempotency-Key, body) on a CONVERGENT route
+/// must RE-APPLY the body, not replay a stale 2xx. The A → B → A churn below is the
+/// exact F1 shape: a content-derived key makes the third write a repeat of the
+/// first, and short-circuiting it leaves **B** enforced — here a strictly WIDER rule
+/// set than the declared A, i.e. fail-open, while the caller is told A is live.
+#[tokio::test]
+async fn test_convergent_put_policy_reapplies_declared_body_on_repeat() {
+    let (router, storage, server, key) = build_admin_router().await;
+    let narrow = serde_json::json!({
+        "name": "p-narrow",
+        "credential_pattern": "github-*",
+        "default_action": "deny",
+        "rules": [ { "condition": { "method_match": ["GET"] }, "action": "allow" } ]
+    });
+    let wide = serde_json::json!({
+        "name": "p-wide",
+        "credential_pattern": "github-*",
+        "default_action": "deny",
+        "rules": [ { "condition": { "method_match": ["GET", "DELETE"] }, "action": "allow" } ]
+    });
+    let put = |idem: &str, body: serde_json::Value| {
+        admin_req_idem("PUT", "/api/v1/policies/pol-churn", &key, idem, body)
+    };
+
+    // A (key kA) → the narrow policy is stored.
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(put("kA", narrow.clone()))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // B (its own key) → the WIDER policy supersedes it at the same id.
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(put("kB", wide.clone()))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // A again under the ORIGINAL key kA — a content-derived key repeats verbatim.
+    let resp = router
+        .clone()
+        .oneshot(put("kA", narrow.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The declared (narrow) body is what is stored AND what the engine enforces.
+    let stored = storage.get_policy("pol-churn").await.unwrap().unwrap();
+    assert_eq!(stored.name, "p-narrow", "the repeat must re-apply body A");
+    assert_eq!(
+        serde_json::to_value(&stored.rules).unwrap(),
+        narrow["rules"],
+        "a replayed convergent key left the superseded WIDER rule set enforced (F1 fail-open)"
+    );
+    let live = server.policy_engine().list_policies();
+    let live = live.iter().find(|p| p.id == "pol-churn").unwrap();
+    assert_eq!(
+        serde_json::to_value(&live.rules).unwrap(),
+        narrow["rules"],
+        "the live engine must also carry the re-applied body"
+    );
+
+    // Declared cost of the class (plan 103 §9 F11): the re-applied write emits its own
+    // `policy.changed(replaced)` on the signed outbox, so a repeat is audit NOISE, not
+    // a silent no-op. Three writes → three events. This is deliberate: an enforcement
+    // change that really happened must be on the tamper-evident record, and a consumer
+    // that wants to collapse repeats has `content_hash` to do it with.
+    let events = storage.list_events_after(0, 1000).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type == vultrino::outbox::EVENT_POLICY_CHANGED
+                && e.subject == "pol-churn")
+            .count(),
+        3,
+        "each applied convergent write emits its own policy.changed"
+    );
+
+    // Same key after the object was DELETED out from under it → re-created, not a
+    // phantom 2xx for a policy that no longer exists.
+    storage.delete_policy("pol-churn").await.unwrap();
+    assert!(storage.get_policy("pol-churn").await.unwrap().is_none());
+    assert_eq!(
+        router.oneshot(put("kA", narrow)).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert!(
+        storage.get_policy("pol-churn").await.unwrap().is_some(),
+        "a repeat after a delete must re-create the declared policy"
+    );
+}
+
+/// The convergent class must not weaken the `Mismatch` signal: the key is still
+/// bound to its body, so a same-key-DIFFERENT-body request is still a 409 and the
+/// stored object is untouched (a wrong replay would be worse than either).
+#[tokio::test]
+async fn test_convergent_put_policy_still_mismatches_on_different_body() {
+    let (router, storage, _server, key) = build_admin_router().await;
+    let put = |idem: &str, name: &str| {
+        admin_req_idem(
+            "PUT",
+            "/api/v1/policies/pol-mismatch",
+            &key,
+            idem,
+            serde_json::json!({
+                "name": name, "credential_pattern": "*", "default_action": "deny"
+            }),
+        )
+    };
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(put("mk", "first"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let resp = router.clone().oneshot(put("mk", "second")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert!(body_string(resp).await.contains("idempotency_key_reused"));
+    assert_eq!(
+        storage
+            .get_policy("pol-mismatch")
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        "first",
+        "a mismatched repeat must not write anything"
+    );
+}
+
+/// Convergent `PUT /api/v1/capabilities/{id}`: the same A → B → A churn must leave
+/// the declared capability stored, not the superseded one.
+#[tokio::test]
+async fn test_convergent_put_capability_reapplies_declared_body_on_repeat() {
+    let (router, storage, _server, key) = build_admin_router().await;
+    let declared = serde_json::json!({
+        "tool_name": "send_email",
+        "action": "email.send",
+        "credential_ref": "cred-sendgrid",
+        "target": { "url_glob": "https://api.sendgrid.example/v3/mail/send", "methods": ["POST"] }
+    });
+    let superseded = serde_json::json!({
+        "tool_name": "send_email_wide",
+        "action": "http.request",
+        "credential_ref": "cred-sendgrid",
+        "target": { "url_glob": "https://api.sendgrid.example/**", "methods": ["POST", "DELETE"] }
+    });
+    let put = |idem: &str, body: serde_json::Value| {
+        admin_req_idem("PUT", "/api/v1/capabilities/cap-churn", &key, idem, body)
+    };
+    for (idem, body) in [
+        ("kA", declared.clone()),
+        ("kB", superseded),
+        ("kA", declared.clone()),
+    ] {
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(put(idem, body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let stored = storage.get_capability("cap-churn").await.unwrap().unwrap();
+    assert_eq!(
+        (stored.tool_name.as_str(), stored.action.as_str()),
+        ("send_email", "email.send"),
+        "a replayed convergent key left the superseded capability registered"
+    );
+    assert_eq!(
+        serde_json::to_value(&stored.target).unwrap()["methods"],
+        serde_json::json!(["POST"]),
+        "the wider method envelope must not survive the re-apply"
+    );
+}
+
+/// Convergent `PUT /api/v1/roles/{name}`: the upsert exists so a provisioner can
+/// re-author an agent's `credential_scopes` on every pass. A short-circuited repeat
+/// silently pins the role to whatever an in-between write left behind.
+#[tokio::test]
+async fn test_convergent_put_role_reapplies_declared_body_on_repeat() {
+    let (router, storage, _server, key) = build_admin_router().await;
+    let declared = serde_json::json!({
+        "name": "agent-role", "permissions": ["read"], "credential_scopes": ["github-*"]
+    });
+    let superseded = serde_json::json!({
+        "name": "agent-role", "permissions": ["read", "execute"], "credential_scopes": ["*"]
+    });
+    let put = |idem: &str, body: serde_json::Value| {
+        admin_req_idem("PUT", "/api/v1/roles/agent-role", &key, idem, body)
+    };
+    for (idem, body) in [
+        ("kA", declared.clone()),
+        ("kB", superseded),
+        ("kA", declared),
+    ] {
+        assert!(router
+            .clone()
+            .oneshot(put(idem, body))
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+    }
+    let role = storage
+        .get_role_by_name("agent-role")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        role.credential_scopes,
+        vec!["github-*".to_string()],
+        "a replayed convergent key left the WIDER credential scope on the role"
+    );
+    assert!(
+        !role
+            .permissions
+            .contains(&vultrino::auth::Permission::Execute),
+        "a replayed convergent key left the superseded permission set on the role"
+    );
+}
+
+/// Convergent `POST /api/v1/agents/{label}/halt` — the sharpest case. Halt →
+/// unhalt → halt under ONE Idempotency-Key used to replay the first halt's 200 and
+/// leave the agent uncontained (no kill policy, un-revoked new token) while
+/// reporting success. Containment must be re-asserted instead.
+#[tokio::test]
+async fn test_convergent_halt_reasserts_containment_on_repeat() {
+    let (router, storage, server, key) = build_admin_router().await;
+    let halt = || {
+        admin_req_idem(
+            "POST",
+            "/api/v1/agents/bot-9/halt",
+            &key,
+            "kH",
+            serde_json::json!({}),
+        )
+    };
+    // A live token bound to bot-9, so leg 1 (revoke) is observable on each halt.
+    let token_for_bot9 = |name: &str| {
+        let (_plain, mut token) = UseToken::create(NewUseToken {
+            name: name.into(),
+            credential_scope: "*".into(),
+            action_scope: None,
+            max_uses: None,
+            require_approval: false,
+            expires_in: None,
+        });
+        token.agent_label = Some("bot-9".into());
+        token
+    };
+
+    let first_token = token_for_bot9("t1");
+    storage.store_use_token(&first_token).await.unwrap();
+    assert_eq!(
+        router.clone().oneshot(halt()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert!(storage.get_policy("halt:bot-9").await.unwrap().is_some());
+    assert!(
+        storage
+            .get_use_token(&first_token.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked
+    );
+
+    // The halt is lifted (an operator DELETE) and the agent gets a fresh token.
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(admin_req(
+                "DELETE",
+                "/api/v1/agents/bot-9/halt",
+                &key,
+                serde_json::json!({})
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(storage.get_policy("halt:bot-9").await.unwrap().is_none());
+    let second_token = token_for_bot9("t2");
+    storage.store_use_token(&second_token).await.unwrap();
+
+    // Re-halt under the SAME Idempotency-Key → containment is re-asserted.
+    assert_eq!(
+        router.clone().oneshot(halt()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert!(
+        storage.get_policy("halt:bot-9").await.unwrap().is_some(),
+        "a replayed halt left the agent with NO kill policy (containment gap)"
+    );
+    assert!(server
+        .policy_engine()
+        .list_policies()
+        .iter()
+        .any(|p| p.id == "halt:bot-9" && p.kill));
+    assert!(
+        storage
+            .get_use_token(&second_token.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked,
+        "a replayed halt left the agent's post-unhalt token LIVE"
+    );
+}
+
+/// The at-most-once class must stay at-most-once, including across state change:
+/// a mint replayed AFTER its token was revoked replays the redacted body — it does
+/// NOT "converge" by issuing a second live credential (which is precisely why mints
+/// are not in the convergent class).
+#[tokio::test]
+async fn test_at_most_once_mint_replays_redacted_even_after_revoke() {
+    let (router, storage, _server, key) = build_admin_router().await;
+    let mint = || {
+        admin_req_idem(
+            "POST",
+            "/api/v1/tokens",
+            &key,
+            "kM",
+            serde_json::json!({"name": "deploy", "credential_scope": "deploy-*", "max_uses": 1}),
+        )
+    };
+    let resp = router.clone().oneshot(mint()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let token_id = v["metadata"]["id"].as_str().unwrap().to_string();
+    assert!(v["token"].as_str().unwrap().starts_with("vut_"));
+
+    storage.set_use_token_revoked(&token_id).await.unwrap();
+
+    let resp = router.oneshot(mint()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        v["token"].is_null(),
+        "a replayed mint must never re-expose (or re-issue) plaintext"
+    );
+    assert_eq!(
+        storage.list_use_tokens().await.unwrap().len(),
+        1,
+        "a replayed mint must not issue a second credential"
+    );
+    assert!(
+        storage
+            .get_use_token(&token_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked,
+        "a replayed mint must not resurrect a revoked token"
+    );
+}
+
 #[tokio::test]
 async fn test_admin_token_strictness_compiles() {
     let (router, storage, _server, key) = build_admin_router().await;

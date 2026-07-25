@@ -90,7 +90,7 @@ There is no `GET /api/v1/credentials/{alias}` route.
 
 ## Admin routes (API key with `admin` only)
 
-Use tokens are rejected. Create/mint routes honor an optional `Idempotency-Key`.
+Use tokens are rejected. Mutating routes honor an optional `Idempotency-Key`.
 See [Admin API](./admin.md) for bodies and semantics.
 
 | Method | Path | Purpose |

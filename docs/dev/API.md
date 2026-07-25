@@ -153,7 +153,7 @@ returned.** Requires the `read` permission.
 ## Admin JSON routes (API key with `admin` only)
 
 All require `Authorization: Bearer vk_…` whose role holds `Permission::Admin`. Use
-tokens are rejected with `403 not_admin`. Create/mint routes honor an optional
+tokens are rejected with `403 not_admin`. Mutating routes honor an optional
 `Idempotency-Key` header (see below). Status codes: `401` (missing/invalid key),
 `403` (valid key without `admin`, or a use token), `400` (invalid body),
 `404` (no such resource), `409` (duplicate / in-flight idempotency / body
@@ -344,14 +344,30 @@ delivery uses, plus its `Govder-Signature` when a signing secret is configured):
 `next_cursor` is what a consumer persists for the next poll. See
 [METERING.md](METERING.md) for the `meter.observed` payloads.
 
-## Idempotency (create/mint admin routes)
+## Idempotency (mutating admin routes)
 
-Send an `Idempotency-Key` header. A repeat with the **same key + same body**
-replays the original `2xx` response (a retried token mint never creates a second
-token). While the first call is in flight, a repeat gets `409
-idempotency_in_progress`; the same key with a **different** body gets `409
+Send an `Idempotency-Key` header. While the first call is in flight, a repeat gets
+`409 idempotency_in_progress`; the same key with a **different** body gets `409
 idempotency_key_reused`. Non-success responses release the reservation so the
 client can retry. Records are retained 24h.
+
+What a repeat with the **same key + same body** does depends on the route's class:
+
+| Class | Routes | Repeat behavior |
+|---|---|---|
+| **At-most-once create** | `POST /policies`, `POST /capabilities`, `POST /tokens`, `POST /approval-tokens`, `POST /roles`, `POST /credentials` | **Replays** the original `2xx` without acting again (a retried token mint never issues a second credential; the id is server-generated or the name/alias is create-only). |
+| **Convergent write** | `PUT /policies/{id}`, `PUT /capabilities/{id}`, `PUT /roles/{name}`, `POST /agents/{label}/halt` | **Re-applies the body** and returns the fresh result. The target is a caller-supplied deterministic id, so a second application only converges. |
+
+Convergence on the `PUT`-at-id class is deliberate and load-bearing. A replayed
+`2xx` claims "your declared state is enforced"; if anything changed the object in
+between (another admin, a `DELETE`, a reload-failure rollback, an in-between
+wider version) that claim is false, and the failure has a **fail-open** direction
+— a superseded *wider* policy left enforced under a narrowed tier, or a lifted
+kill policy never re-installed. A caller therefore cannot brick its own
+enforcement state by deriving `Idempotency-Key`s from request content. The cost
+is that each applied repeat emits its own `policy.changed`/`capability.changed`
+outbox event; consumers that want to collapse repeats compare `content_hash`.
+Mints keep at-most-once because their plaintext is shown exactly once.
 
 > **At-least-once on crash.** Reserve → operate → record-completion are three
 > separate atomic writes, not one transaction. A crash after the operation

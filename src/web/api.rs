@@ -1220,6 +1220,12 @@ pub async fn api_ready(State(state): State<AppState>) -> impl IntoResponse {
 // use tokens are rejected outright. Mutations persist to storage and take effect
 // on the next request without a restart. Creates/mints honor an optional
 // `Idempotency-Key` header so a retried request never double-creates.
+//
+// Every wrapped route declares its [`IdempotencyClass`]: an `AtMostOnce` create
+// (a repeat replays the recorded response) or a `Convergent` write-at-a-
+// caller-supplied-id (a repeat RE-APPLIES the body). Read that type's docs
+// before adding a route — picking the wrong class is a fail-open defect on the
+// convergent side and a duplicate-secret defect on the create side.
 // ============================================================================
 
 /// Extractor that authenticates an admin caller from request headers **before**
@@ -1415,10 +1421,84 @@ fn redact_for_replay(body: &serde_json::Value) -> serde_json::Value {
     stored
 }
 
-/// Run an admin mutation under optional `Idempotency-Key` dedup, bound to
-/// `body_hash`. On a repeated key with the same body it replays the stored 2xx
-/// response (409 while in flight, 409 on a body mismatch); non-success responses
-/// release the reservation so the client can retry.
+/// What a route's operation does when the SAME `Idempotency-Key` **and** body
+/// arrive again. Declared per route as a required argument of [`idempotent`] —
+/// deliberately not defaulted, because the two answers are not interchangeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdempotencyClass {
+    /// **At-most-once create.** Re-running the operation would either hand out a
+    /// second secret (`POST /tokens`, `POST /approval-tokens` — the plaintext is
+    /// shown exactly once) or create a second object / collide on a unique
+    /// alias-or-name (`POST /policies` and `POST /capabilities` mint a fresh
+    /// server-side uuid; `POST /roles` and `POST /credentials` are create-only
+    /// and would 409 on the second run). A repeat therefore replays the recorded
+    /// response, with any mint plaintext nulled by [`redact_for_replay`].
+    AtMostOnce,
+    /// **Convergent write.** The operation is a create-or-replace addressed by a
+    /// **caller-supplied deterministic id** (a path id / label), so re-running it
+    /// is defined to leave exactly the declared body stored — nothing duplicates
+    /// and no secret is re-issued. A repeat therefore **RE-APPLIES the body**
+    /// instead of short-circuiting on the recorded response.
+    ///
+    /// This is a fail-closed correctness requirement, not a nicety. A stored 2xx
+    /// says "your declared state is enforced"; if anything changed the object
+    /// between the two calls — another admin, a `DELETE`, a reload-failure
+    /// rollback, an in-between wider/narrower version — a short-circuited replay
+    /// makes that claim false, and in this plane it has a **fail-open**
+    /// direction: a superseded *wider* policy stays enforced under a narrowed
+    /// tier, or a lifted kill policy is never re-installed. (This is the
+    /// enforcement-state drift that govder's content-derived keys hit: plan 103
+    /// §10 item 7 / F1 and its F11 hardening.) The at-most-once guarantee being
+    /// traded away is worth nothing here, because the second application of a
+    /// convergent write has no observable effect beyond convergence.
+    ///
+    /// The key is still bound to its body for this class: `Mismatch` (same key,
+    /// different body) and in-flight `Pending` behave exactly as before. Only the
+    /// write-suppression is dropped.
+    Convergent,
+}
+
+/// Run an [`IdempotencyClass::AtMostOnce`] admin create/mint under an optional
+/// `Idempotency-Key`: a repeat with the same body replays the recorded response
+/// instead of running the operation a second time.
+async fn idempotent_at_most_once<F, Fut>(
+    state: &AppState,
+    key: Option<String>,
+    body_hash: String,
+    op: F,
+) -> Response
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = (StatusCode, serde_json::Value)>,
+{
+    idempotent(state, IdempotencyClass::AtMostOnce, key, body_hash, op).await
+}
+
+/// Run an [`IdempotencyClass::Convergent`] admin write (create-or-replace at a
+/// caller-supplied deterministic id) under an optional `Idempotency-Key`: a
+/// repeat with the same body **re-applies** it, so the stored object converges on
+/// the declared state instead of the key suppressing the write. Read
+/// [`IdempotencyClass::Convergent`] for why short-circuiting here is fail-open.
+async fn idempotent_convergent<F, Fut>(
+    state: &AppState,
+    key: Option<String>,
+    body_hash: String,
+    op: F,
+) -> Response
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = (StatusCode, serde_json::Value)>,
+{
+    idempotent(state, IdempotencyClass::Convergent, key, body_hash, op).await
+}
+
+/// Shared body of the two class-specific wrappers above. Call those, not this —
+/// naming the class at the call site is what keeps a new route from silently
+/// inheriting the wrong replay semantics.
+///
+/// Either way a same-key-different-body request is a 409 mismatch and a
+/// concurrent in-flight one is a 409, and a non-success response releases the
+/// reservation so the client can retry.
 ///
 /// **Crash semantics:** the reserve → operate → complete sequence is three
 /// separate atomic storage writes, not one transaction. If the process crashes
@@ -1427,6 +1507,7 @@ fn redact_for_replay(body: &serde_json::Value) -> serde_json::Value {
 /// exactly-once). True exactly-once would require transactional storage.
 async fn idempotent<F, Fut>(
     state: &AppState,
+    class: IdempotencyClass,
     key: Option<String>,
     body_hash: String,
     op: F,
@@ -1444,7 +1525,20 @@ where
         .idempotency_check_or_reserve(&key, &body_hash)
         .await
     {
-        Ok(IdempotencyState::Done { status, body }) => return replay_json(status, body),
+        Ok(IdempotencyState::Done { status, body }) => match class {
+            // Replaying is the whole point for a create/mint: never run it twice.
+            IdempotencyClass::AtMostOnce => return replay_json(status, body),
+            // Convergent: DISCARD the recorded response and fall through to run
+            // the operation again, so the stored object equals the declared body
+            // whatever happened in between. The fresh run's own status/body is
+            // returned (and re-recorded below, keeping the record's original
+            // created_at so the retention window can't be slid forward by
+            // repeats). A failure re-applying is surfaced as itself rather than
+            // masked by the stale 2xx — `idempotency_release` below is a no-op on
+            // an already-completed record, so the body binding (and therefore the
+            // `Mismatch` signal) survives a failed re-application.
+            IdempotencyClass::Convergent => {}
+        },
         Ok(IdempotencyState::Pending) => {
             return error_response(
                 StatusCode::CONFLICT,
@@ -1743,7 +1837,10 @@ pub async fn api_create_policy(
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
-    idempotent(&state, key, body_hash, move || async move {
+    // At-most-once: `build_policy(req, None)` mints a fresh uuid, so re-applying
+    // would install a SECOND copy of the policy (a reconcile orphan on govder's
+    // sweep). A caller that wants convergence must PUT at its own id.
+    idempotent_at_most_once(&state, key, body_hash, move || async move {
         match build_policy(req, None) {
             Ok(policy) => store_and_reload_policy(&st, &policy, true).await,
             Err(e) => (
@@ -1772,7 +1869,10 @@ pub async fn api_put_policy(
     // under the same Idempotency-Key isn't replayed as the first id's result.
     let body_hash = idempotency_body_hash(&(id.as_str(), &req));
     let st = state.clone();
-    idempotent(&state, key, body_hash, move || async move {
+    // Convergent: the path id fixes the target, so a repeat RE-STORES the declared
+    // policy. Short-circuiting here is the F1 fail-open (a superseded wider policy
+    // left enforced under a narrowed tier) — see `IdempotencyClass::Convergent`.
+    idempotent_convergent(&state, key, body_hash, move || async move {
         match build_policy(req, Some(id)) {
             Ok(policy) => store_and_reload_policy(&st, &policy, false).await,
             Err(e) => (
@@ -1941,7 +2041,9 @@ pub async fn api_create_capability(
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
-    idempotent(&state, key, body_hash, move || async move {
+    // At-most-once: `build_capability(req, None)` mints a fresh `cap-<uuid>`, so a
+    // re-apply would register a duplicate tool under a second id.
+    idempotent_at_most_once(&state, key, body_hash, move || async move {
         match build_capability(req, None) {
             Ok(capability) => store_capability_and_emit(&st, &capability, true).await,
             Err(e) => (
@@ -1966,7 +2068,10 @@ pub async fn api_put_capability(
     // different id under one Idempotency-Key isn't replayed as the first.
     let body_hash = idempotency_body_hash(&(id.as_str(), &req));
     let st = state.clone();
-    idempotent(&state, key, body_hash, move || async move {
+    // Convergent: the path id fixes the target, so a repeat RE-STORES the declared
+    // capability (same target/credential_ref/approval shape) rather than trusting a
+    // stale 2xx that a later edit or delete may have invalidated.
+    idempotent_convergent(&state, key, body_hash, move || async move {
         match build_capability(req, Some(id)) {
             Ok(capability) => store_capability_and_emit(&st, &capability, false).await,
             Err(e) => (
@@ -2121,7 +2226,10 @@ pub async fn api_create_token(
     let st = state.clone();
     // Admin audit (item 4 / #17): the acting admin key id, never the key material.
     let actor = admin.0.api_key.id.clone();
-    idempotent(&state, key, body_hash, move || async move {
+    // At-most-once: a MINT. The plaintext is returned exactly once and re-running
+    // would issue a second live credential, so a repeat must replay (redacted) —
+    // this is the class the wrapper exists for and it must never be weakened.
+    idempotent_at_most_once(&state, key, body_hash, move || async move {
         // Bound the raw seconds before converting, so a huge value can't panic
         // chrono's Duration::seconds (admin-triggerable). NewUseToken::validate
         // also rejects a non-positive lifetime as a second guard.
@@ -2498,7 +2606,9 @@ pub async fn api_create_approval_token(
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
-    idempotent(&state, key, body_hash, move || async move {
+    // At-most-once: a MINT (approval-token plaintext, returned once). Same reason as
+    // `api_create_token` — never weaken this to a re-apply.
+    idempotent_at_most_once(&state, key, body_hash, move || async move {
         let expires_in = match req.expires_in_secs {
             None => None,
             Some(v) if (1..=MAX_TOKEN_LIFETIME_SECS).contains(&v) => Some(Duration::seconds(v)),
@@ -2879,7 +2989,13 @@ pub async fn api_halt_agent(
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&label);
     let st = state.clone();
-    idempotent(&state, key, body_hash, move || async move {
+    // Convergent: `halt_agent` is addressed by the path label and is idempotent by
+    // construction (it revokes still-active tokens and stores the kill policy at the
+    // fixed id `halt:<label>`), so a repeat RE-ASSERTS containment. This is the
+    // sharpest case for the class: halt → unhalt → halt under one Idempotency-Key
+    // used to replay the first halt's 200 and leave the agent UNCONTAINED while
+    // reporting success.
+    idempotent_convergent(&state, key, body_hash, move || async move {
         match st.server.halt_agent(&label).await {
             Ok(outcome) => (
                 StatusCode::OK,
@@ -3421,7 +3537,10 @@ pub async fn api_create_role(
     let st = state.clone();
     // Admin audit (item 4 / #17): the acting admin key id, never the key material.
     let actor = admin.0.api_key.id.clone();
-    idempotent(&state, key, body_hash, move || async move {
+    // At-most-once: create-ONLY (`store_role` 409s `role_exists` on a second run, and
+    // the id is server-minted), so a repeat replays the 201. `PUT /roles/{name}` is
+    // the convergent route for a provisioner that re-authors on every pass.
+    idempotent_at_most_once(&state, key, body_hash, move || async move {
         if req.name.trim().is_empty() {
             return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_role","error":"role name must not be empty"}));
         }
@@ -3501,7 +3620,11 @@ pub async fn api_upsert_role(
     let st = state.clone();
     // Admin audit (item 4 / #17): the acting admin key id, never the key material.
     let actor = admin.0.api_key.id.clone();
-    idempotent(&state, key, body_hash, move || async move {
+    // Convergent: the path name fixes the target and the handler reuses the existing
+    // role's id, so a repeat RE-STORES the declared permissions/credential_scopes.
+    // Short-circuiting here silently leaves an agent on a stale scope set — the
+    // widen-then-replay case this route exists to serve.
+    idempotent_convergent(&state, key, body_hash, move || async move {
         if name.trim().is_empty() {
             return (StatusCode::BAD_REQUEST, serde_json::json!({"code":"invalid_role","error":"role name must not be empty"}));
         }
@@ -3655,7 +3778,11 @@ pub async fn api_create_credential(
     let st = state.clone();
     // Admin audit (item 4 / #17): the acting admin key id, never the key material.
     let actor = admin.0.api_key.id.clone();
-    idempotent(&state, key, body_hash, move || async move {
+    // At-most-once: create-ONLY on the unique alias (`store` returns AlreadyExists →
+    // 409 on a second run) and the request body carries SECRET material, so a repeat
+    // replays the metadata-only 201. There is no PUT-at-alias route to converge on;
+    // rotating a credential is an explicit delete + create by design.
+    idempotent_at_most_once(&state, key, body_hash, move || async move {
         if req.alias.trim().is_empty() {
             return (
                 StatusCode::BAD_REQUEST,

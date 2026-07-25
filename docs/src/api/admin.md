@@ -22,9 +22,7 @@ an in-flight idempotency key), `201`/`200` on success.
 
 ## Idempotency
 
-Create/mint endpoints accept an optional `Idempotency-Key` header. A repeated
-request with the same key **replays the original response** instead of acting
-again (so a retried token mint never creates a second token). While the first
+Mutating endpoints accept an optional `Idempotency-Key` header. While the first
 request is still in flight, a second with the same key gets `409`. Keys are
 remembered for 24h.
 
@@ -33,9 +31,23 @@ Idempotency-Key: 5f3c…unique-per-logical-request
 ```
 
 The key is bound to a hash of the request body: reusing a key with a *different*
-body returns `409` rather than replaying the original response. Minted token
-plaintext is **not** retained in the idempotency record — a replayed mint returns
-metadata plus a note (revoke and re-mint if you lost the original response).
+body returns `409` rather than replaying the original response.
+
+A repeat with the **same key and body** is handled per route class:
+
+- **Creates and mints** (`POST /policies`, `POST /capabilities`, `POST /tokens`,
+  `POST /approval-tokens`, `POST /roles`, `POST /credentials`) **replay the
+  original response** instead of acting again, so a retried token mint never
+  creates a second token. Minted token plaintext is **not** retained in the
+  idempotency record — a replayed mint returns metadata plus a note (revoke and
+  re-mint if you lost the original response).
+- **Convergent writes** (`PUT /policies/{id}`, `PUT /capabilities/{id}`,
+  `PUT /roles/{name}`, `POST /agents/{label}/halt`) **re-apply the body** and
+  return the fresh result. These address a caller-supplied deterministic id, so a
+  second application only converges — and short-circuiting them would let a
+  content-derived key silently leave an in-between (possibly *wider*) version
+  enforced while reporting success. Each applied repeat emits its own
+  `policy.changed`/`capability.changed` outbox event.
 
 > **At-least-once on crash.** Reserve → operate → record-completion are three
 > separate atomic storage writes, not one transaction. If the process crashes
