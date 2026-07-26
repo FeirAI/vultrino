@@ -5900,3 +5900,103 @@ async fn execute_open_numeric_path_parity_when_govder_not_configured() {
     assert!(approvals[0].approval_rule.is_none());
     assert_eq!(approvals[0].required_approvals, 1);
 }
+
+/// `GET /api/v1/credentials` must report the `internal_http` binding a credential
+/// carries, and nothing else from its metadata.
+///
+/// Why this is load-bearing rather than cosmetic. The destination a vault secret may
+/// be sent to lives ONLY in credential metadata (`plugins::internal_http`), authored
+/// by an admin. `orgpack apply` deliberately does not overwrite a credential that is
+/// already in the vault, because overwriting means delete-then-create, i.e. a
+/// rotation that breaks every running agent holding the old material. So without a
+/// read-back, a credential that exists with the WRONG binding (or none) sails through
+/// apply and then refuses the call at the worst possible moment: after a human has
+/// approved a payment.
+///
+/// The response is an allowlist of three keys, not the metadata map, because metadata
+/// is a free-form operator field: whatever anyone ever put in it must not become
+/// readable to every read-permission key.
+#[tokio::test]
+async fn credential_list_reports_the_internal_binding_and_no_other_metadata() {
+    let (router, _storage, _server, key) = build_admin_router().await;
+
+    // A pinned money credential, exactly as `orgpack apply` seeds one, plus a
+    // metadata key that must NOT be published.
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/credentials",
+            &key,
+            serde_json::json!({
+                "alias": "cred-finsandbox-refund",
+                "data": {"type":"api_key","key":"sbx-refund-token","header_name":"Authorization","header_prefix":"Bearer "},
+                "metadata": {
+                    "tenant": "acme",
+                    "internal_destination": "finsandbox",
+                    "internal_path_prefix": "/v1/refunds",
+                    "internal_allow_methods": "POST",
+                    "operator_note": "do-not-publish-me",
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+
+    // A credential with no destination at all: it cannot be used with internal_http,
+    // and the absence must be visible as an absence, not as an empty string.
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/credentials",
+            &key,
+            serde_json::json!({
+                "alias": "cred-public-none",
+                "data": {"type":"api_key","key":"public-key","header_name":"Authorization","header_prefix":"Bearer "},
+                "metadata": {"tenant": "acme"},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+
+    let r = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/credentials",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let raw = body_string(r).await;
+    let listed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let creds = listed["credentials"].as_array().unwrap();
+
+    let refund = creds
+        .iter()
+        .find(|c| c["alias"] == "cred-finsandbox-refund")
+        .expect("the pinned credential is missing from the list");
+    assert_eq!(refund["internal_binding"]["destination"], "finsandbox");
+    assert_eq!(refund["internal_binding"]["path_prefix"], "/v1/refunds");
+    assert_eq!(refund["internal_binding"]["allow_methods"], "POST");
+
+    let public = creds
+        .iter()
+        .find(|c| c["alias"] == "cred-public-none")
+        .expect("the unpinned credential is missing from the list");
+    assert!(
+        public.get("internal_binding").is_none(),
+        "a credential with no destination must report NO binding (an empty one would read \
+         as 'pinned to nothing in particular'): {public}"
+    );
+
+    assert!(
+        !raw.contains("do-not-publish-me"),
+        "the credential list published an unrelated metadata key; the projection must be an \
+         allowlist of the three routing keys: {raw}"
+    );
+}

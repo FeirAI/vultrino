@@ -1033,6 +1033,54 @@ pub struct CredentialInfo {
     pub alias: String,
     pub credential_type: String,
     pub description: Option<String>,
+    /// The `internal_http` binding this credential carries, when it carries one.
+    ///
+    /// Why it is exposed and why it is an ALLOWLIST. A credential's
+    /// `internal_destination` metadata is what decides where the vault secret may
+    /// be sent (`plugins::internal_http`), and it is authored by an admin — govder
+    /// or `orgpack apply` — never by a caller. An apply tool that cannot READ it
+    /// back has only two options: rotate every credential on every apply (which
+    /// breaks running agents) or hope. Hoping fails in the worst possible place:
+    /// a credential that exists with the wrong (or no) binding passes apply and
+    /// then refuses the call AFTER a human has approved a payment.
+    ///
+    /// Only the three routing keys are returned, by name. Credential metadata is a
+    /// free-form operator map, so returning it whole would publish whatever anyone
+    /// ever put in it to every read-permission key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_binding: Option<InternalBindingInfo>,
+}
+
+/// The non-secret routing facts pinned on a credential for the `internal_http`
+/// plugin. Read-only projection of credential metadata; see [`CredentialInfo`].
+#[derive(Serialize)]
+pub struct InternalBindingInfo {
+    /// Operator-declared destination name (`[[internal_destinations]].name`).
+    pub destination: String,
+    /// Optional path narrowing (exact path, or a prefix when it ends in '/').
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    /// Optional method narrowing, as authored (comma/space separated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_methods: Option<String>,
+}
+
+impl InternalBindingInfo {
+    /// Project one credential's metadata, or None when it names no destination
+    /// (i.e. the credential cannot be used with `internal_http` at all).
+    fn from_metadata(metadata: &std::collections::HashMap<String, String>) -> Option<Self> {
+        let pick = |key: &str| -> Option<String> {
+            metadata
+                .get(key)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        Some(Self {
+            destination: pick(crate::plugins::META_DESTINATION)?,
+            path_prefix: pick(crate::plugins::META_PATH_PREFIX),
+            allow_methods: pick(crate::plugins::META_ALLOW_METHODS),
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -1086,6 +1134,7 @@ pub async fn api_list_credentials(
         .into_iter()
         .filter(|c| auth_result.can_access_credential(&c.alias))
         .map(|c| CredentialInfo {
+            internal_binding: InternalBindingInfo::from_metadata(&c.metadata),
             alias: c.alias,
             credential_type: format!("{:?}", c.credential_type).to_lowercase(),
             description: c.metadata.get("description").cloned(),
@@ -4285,12 +4334,31 @@ mod tests {
             alias: "test-cred".to_string(),
             credential_type: "api_key".to_string(),
             description: Some("Test credential".to_string()),
+            internal_binding: None,
         };
 
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"alias\":\"test-cred\""));
         assert!(json.contains("\"credential_type\":\"api_key\""));
         assert!(json.contains("\"description\":\"Test credential\""));
+        // A credential with no internal destination omits the key entirely rather
+        // than reporting a blank one (see InternalBindingInfo).
+        assert!(!json.contains("internal_binding"));
+
+        let pinned = CredentialInfo {
+            alias: "cred-finsandbox-refund".to_string(),
+            credential_type: "api_key".to_string(),
+            description: None,
+            internal_binding: Some(InternalBindingInfo {
+                destination: "finsandbox".to_string(),
+                path_prefix: Some("/v1/refunds".to_string()),
+                allow_methods: Some("POST".to_string()),
+            }),
+        };
+        let json = serde_json::to_string(&pinned).unwrap();
+        assert!(json.contains("\"internal_binding\":{\"destination\":\"finsandbox\""));
+        assert!(json.contains("\"path_prefix\":\"/v1/refunds\""));
+        assert!(json.contains("\"allow_methods\":\"POST\""));
     }
 
     #[test]
@@ -4301,11 +4369,13 @@ mod tests {
                     alias: "cred1".to_string(),
                     credential_type: "api_key".to_string(),
                     description: None,
+                    internal_binding: None,
                 },
                 CredentialInfo {
                     alias: "cred2".to_string(),
                     credential_type: "basic_auth".to_string(),
                     description: Some("Second cred".to_string()),
+                    internal_binding: None,
                 },
             ],
         };
