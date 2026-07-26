@@ -13,6 +13,7 @@ mod ecdsa;
 mod hmac;
 mod http;
 pub mod installer;
+mod internal_http;
 pub mod loader;
 mod postgres;
 mod ssh;
@@ -24,6 +25,10 @@ pub use hmac::HmacPlugin;
 pub use http::HttpPlugin;
 pub(crate) use http::{build_guarded_client, read_body_capped, REQUEST_TIMEOUT};
 pub use installer::PluginInstaller;
+pub(crate) use internal_http::is_internal_destination_ip;
+pub use internal_http::{
+    InternalHttpParams, InternalHttpPlugin, META_ALLOW_METHODS, META_DESTINATION, META_PATH_PREFIX,
+};
 pub use loader::{PluginLoader, PluginRegistryExt};
 pub use postgres::PostgresPlugin;
 pub use ssh::SshPlugin;

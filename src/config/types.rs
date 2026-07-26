@@ -36,6 +36,33 @@ pub struct RawConfig {
     pub llm_proxy: Option<RawLlmProxyConfig>,
     /// averin seal-client (plan 086, the "fourth contract"). Absent → disabled.
     pub averin: Option<RawAverinConfig>,
+    /// Operator-pinned internal destinations for the `internal_http` plugin
+    /// (plan 103 D8/F8). Absent/empty → the plugin refuses every call.
+    #[serde(default)]
+    pub internal_destinations: Vec<RawInternalDestination>,
+}
+
+/// TOML shape for `[[internal_destinations]]` (plan 103 D8/F8).
+///
+/// ```toml
+/// [[internal_destinations]]
+/// name = "finsandbox"
+/// base_url = "http://127.0.0.1:18099"
+/// allow_methods = ["GET", "POST"]
+/// allow_paths = ["/v1/refunds", "/v1/payouts", "/v1/ledger", "/v1/accounts/"]
+/// ```
+///
+/// Every field is OPERATOR authority. There is no glob on scheme/host/port and no
+/// way for a request to name a destination that is not declared here.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawInternalDestination {
+    pub name: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub allow_methods: Vec<String>,
+    #[serde(default)]
+    pub allow_paths: Vec<String>,
 }
 
 /// TOML shape for `[identity]` (V10/R6): `kind = "spiffe"|"oidc"`,

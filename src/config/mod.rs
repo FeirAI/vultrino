@@ -84,6 +84,231 @@ pub struct Config {
     /// path is off and `/execute` is byte-identical unless explicitly turned on.
     /// The API key is filled from `AVERIN_API_KEY` at startup (never TOML).
     pub averin: crate::averin::AverinConfig,
+    /// Operator-pinned internal destinations for the `internal_http` plugin
+    /// (plan 103 D8/F8). Empty = the plugin is registered but refuses every
+    /// call ("no internal destination is configured"), which is the fail-closed
+    /// posture: a money capability pointed at `internal_http.request` on a
+    /// vultrino with no declared destination fails, it does not fall back to the
+    /// `http` plugin.
+    pub internal_destinations: Vec<InternalDestination>,
+}
+
+/// One operator-pinned internal destination (plan 103 D8/F8), validated at
+/// config load. The caller/agent never supplies any part of this: the request
+/// carries only a path (+ optional query), method and body.
+#[derive(Debug, Clone)]
+pub struct InternalDestination {
+    /// The name a vault credential binds to via its `internal_destination`
+    /// metadata. Lower-case `[a-z0-9_-]+`, unique.
+    pub name: String,
+    /// Normalized absolute base: scheme + host + port (+ optional base path,
+    /// no trailing slash). No userinfo, no query, no fragment, no glob.
+    pub base_url: url::Url,
+    /// Uppercase HTTP verbs this destination accepts. Non-empty (a destination
+    /// with no methods would accept nothing, which is an authoring error).
+    pub allow_methods: Vec<String>,
+    /// Path allowlist. An entry ending in `/` is a prefix match; any other
+    /// entry is an exact match. Non-empty, no globs, no dot segments.
+    pub allow_paths: Vec<String>,
+}
+
+impl InternalDestination {
+    /// Whether `method` (already uppercased) is on this destination's verb list.
+    pub fn method_allowed(&self, method: &str) -> bool {
+        self.allow_methods.iter().any(|m| m == method)
+    }
+
+    /// Whether the NORMALIZED request path is on this destination's path
+    /// allowlist. Prefix entries (`/v1/accounts/`) match anything beneath them;
+    /// every other entry must match exactly.
+    pub fn path_allowed(&self, path: &str) -> bool {
+        self.allow_paths.iter().any(|p| {
+            if let Some(prefix) = p.strip_suffix('/') {
+                path == prefix || path.starts_with(p)
+            } else {
+                path == p
+            }
+        })
+    }
+}
+
+/// Validate + normalize one `[[internal_destinations]]` entry. Fail-closed: every
+/// rejection here is an operator error surfaced at startup rather than a
+/// request-time surprise.
+fn parse_internal_destination(
+    raw: types::RawInternalDestination,
+) -> Result<InternalDestination, ConfigError> {
+    let name = raw.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ConfigError::Invalid(
+            "internal_destinations: name must not be empty".to_string(),
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(ConfigError::Invalid(format!(
+            "internal_destinations: name '{}' must be lower-case [a-z0-9_-] (no globs, no dots)",
+            name
+        )));
+    }
+
+    // Base URL: an EXACT origin. Anything glob-ish, credential-bearing or
+    // query/fragment-bearing is rejected — the destination is a pinned origin,
+    // not a pattern.
+    let base_raw = raw.base_url.trim();
+    if base_raw.contains('*') || base_raw.contains('?') || base_raw.contains('#') {
+        return Err(ConfigError::Invalid(format!(
+            "internal_destinations '{}': base_url must be an exact scheme://host[:port][/base-path] \
+             with no glob, query or fragment",
+            name
+        )));
+    }
+    let base = url::Url::parse(base_raw.trim_end_matches('/')).map_err(|e| {
+        ConfigError::Invalid(format!(
+            "internal_destinations '{}': base_url is not a valid URL: {}",
+            name, e
+        ))
+    })?;
+    match base.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(ConfigError::Invalid(format!(
+                "internal_destinations '{}': base_url scheme '{}' is not allowed (http|https only)",
+                name, other
+            )))
+        }
+    }
+    if base.host_str().unwrap_or("").is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "internal_destinations '{}': base_url must have a host",
+            name
+        )));
+    }
+    if !base.username().is_empty() || base.password().is_some() {
+        return Err(ConfigError::Invalid(format!(
+            "internal_destinations '{}': base_url must not carry userinfo",
+            name
+        )));
+    }
+    if base.query().is_some() || base.fragment().is_some() {
+        return Err(ConfigError::Invalid(format!(
+            "internal_destinations '{}': base_url must not carry a query or fragment",
+            name
+        )));
+    }
+    if base.path().contains("..") {
+        return Err(ConfigError::Invalid(format!(
+            "internal_destinations '{}': base_url path must not contain dot segments",
+            name
+        )));
+    }
+    // An IP-LITERAL host must be in the internal address space, checked HERE
+    // because it is the only place it can be: hyper-util skips a custom DNS
+    // resolver entirely for IP literals (`connect/http.rs:541` →
+    // `dns::SocketAddrs::try_parse`), so `internal_http`'s connect-time
+    // internal-space filter never sees them. Without this check an operator could
+    // point `internal_http` — whose whole premise is "internal only" — at
+    // 169.254.169.254 or at a public host, and the vault credential would go there
+    // with no guard at all. A NAME-addressed destination is checked at connect time.
+    if let Ok(ip) = base
+        .host_str()
+        .unwrap_or("")
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    {
+        if !crate::plugins::is_internal_destination_ip(&ip) {
+            return Err(ConfigError::Invalid(format!(
+                "internal_destinations '{}': base_url host {} is not an internal address. \
+                 internal_http reaches ONLY loopback, RFC1918, CGNAT and IPv6 \
+                 unique-local/loopback space; a public, link-local or cloud-metadata \
+                 address is refused (use the `http` plugin for public destinations, \
+                 which enforces the mirror-image guard)",
+                name, ip
+            )));
+        }
+    }
+
+    // Methods: non-empty, real verbs, uppercased.
+    const VERBS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+    let mut allow_methods = Vec::new();
+    for m in &raw.allow_methods {
+        let m = m.trim().to_ascii_uppercase();
+        if !VERBS.contains(&m.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "internal_destinations '{}': allow_methods entry '{}' is not an HTTP verb",
+                name, m
+            )));
+        }
+        if !allow_methods.contains(&m) {
+            allow_methods.push(m);
+        }
+    }
+    if allow_methods.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "internal_destinations '{}': allow_methods must list at least one HTTP verb",
+            name
+        )));
+    }
+
+    // Paths: non-empty, rooted, no globs, no dot segments, no percent-encoding
+    // (an encoded separator in an ALLOWLIST entry can only obscure what it
+    // permits — the request-side check rejects encoded separators too).
+    let mut allow_paths = Vec::new();
+    for p in &raw.allow_paths {
+        let p = p.trim().to_string();
+        if !p.starts_with('/') {
+            return Err(ConfigError::Invalid(format!(
+                "internal_destinations '{}': allow_paths entry '{}' must start with '/'",
+                name, p
+            )));
+        }
+        if p.contains('*') || p.contains('?') || p.contains('[') || p.contains(']') {
+            return Err(ConfigError::Invalid(format!(
+                "internal_destinations '{}': allow_paths entry '{}' must not contain a glob \
+                 (use a trailing '/' for a prefix)",
+                name, p
+            )));
+        }
+        if p.contains("..") || p.contains('%') || p.contains('\\') {
+            return Err(ConfigError::Invalid(format!(
+                "internal_destinations '{}': allow_paths entry '{}' must not contain dot segments, \
+                 percent-encoding or backslashes",
+                name, p
+            )));
+        }
+        // A bare "/" is a SILENT allow-all: it is a prefix entry whose prefix is the
+        // empty string, so `path_allowed` returns true for every path an operator
+        // believed they had enumerated. Refuse it loudly instead — the whole point
+        // of the allowlist is that reading the config tells you the blast radius.
+        if p == "/" {
+            return Err(ConfigError::Invalid(format!(
+                "internal_destinations '{}': allow_paths entry '/' would allow EVERY path on \
+                 this destination (it is a prefix whose prefix is empty). List the paths or \
+                 prefixes the destination really exposes",
+                name
+            )));
+        }
+        if !allow_paths.contains(&p) {
+            allow_paths.push(p);
+        }
+    }
+    if allow_paths.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "internal_destinations '{}': allow_paths must list at least one path (a destination \
+             with no path allowlist would accept nothing)",
+            name
+        )));
+    }
+
+    Ok(InternalDestination {
+        name,
+        base_url: base,
+        allow_methods,
+        allow_paths,
+    })
 }
 
 /// Tunables for the metered LLM proxy's streaming path (connector M1).
@@ -423,6 +648,23 @@ impl Config {
 
         let llm_proxy = raw.llm_proxy.map(Into::into).unwrap_or_default();
 
+        // Operator-pinned internal destinations (plan 103 D8/F8). Validated here so
+        // a malformed/over-broad destination is a startup failure, never a
+        // request-time surprise; duplicate names are rejected (an ambiguous
+        // destination name is exactly the kind of silent drift this stack fails
+        // closed on).
+        let mut internal_destinations: Vec<InternalDestination> = Vec::new();
+        for raw_dest in raw.internal_destinations {
+            let dest = parse_internal_destination(raw_dest)?;
+            if internal_destinations.iter().any(|d| d.name == dest.name) {
+                return Err(ConfigError::Invalid(format!(
+                    "internal_destinations: duplicate name '{}'",
+                    dest.name
+                )));
+            }
+            internal_destinations.push(dest);
+        }
+
         Ok(Self {
             server,
             storage,
@@ -446,6 +688,7 @@ impl Config {
             // Plan 088 D6 — `TryInto` (was `Into`): the `[averin] durable = true` +
             // `mode = "require_evidence"` combination is rejected here at config load.
             averin: raw.averin.map(TryInto::try_into).transpose()?.unwrap_or_default(),
+            internal_destinations,
         })
     }
 
@@ -469,6 +712,7 @@ impl Config {
             llm_proxy: LlmProxyConfig::default(),
             govder: None,
             averin: crate::averin::AverinConfig::default(),
+            internal_destinations: vec![],
         }
     }
 

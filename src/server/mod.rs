@@ -555,6 +555,16 @@ impl VultrinoServer {
         resolver: CredentialResolver,
     ) -> Self {
         let plugins = Arc::new(PluginRegistry::new());
+        // Plan 103 D8/F8 — the operator-pinned internal-destination plugin. Always
+        // registered, even with ZERO declared destinations: a capability routed to
+        // `internal_http.request` on a vultrino with no destination then fails with
+        // a terminal "no destination pinned on the credential / not declared" error
+        // instead of a `PluginError::NotFound` (which the execute path classifies as
+        // RETRYABLE, so a gated action would sit resumable forever). The `http`
+        // plugin and its SSRF guard are untouched.
+        plugins.register(Arc::new(crate::plugins::InternalHttpPlugin::new(
+            config.internal_destinations.clone(),
+        )));
         let policy_engine = Arc::new(PolicyEngine::new());
         let auth_manager = Arc::new(AuthManager::new());
 
