@@ -768,8 +768,14 @@ async fn plugin_itself_refuses_every_steering_attempt_under_a_permissive_policy(
             "unknown field `destination`",
         ),
         (
+            // The `headers` FIELD is accepted (the shipped /api/v1/execute route always
+            // sends one), but any ENTRY is refused: the caller supplies no headers here.
             serde_json::json!({"url": "/v1/refunds", "method": "POST", "headers": {"Host": "evil"}}),
-            "unknown field `headers`",
+            "may not supply request headers",
+        ),
+        (
+            serde_json::json!({"url": "/v1/refunds", "method": "POST", "headers": {"Authorization": "Bearer stolen"}}),
+            "may not supply request headers",
         ),
         (
             serde_json::json!({"url": "/v1/refunds/../../admin", "method": "POST"}),

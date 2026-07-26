@@ -129,9 +129,19 @@ const VERBS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTI
 /// Request params for `internal_http.request`.
 ///
 /// `deny_unknown_fields` is load-bearing: it is what makes a caller-supplied
-/// `destination`, `base_url`, `host` or `headers` a hard, *pre-side-effect*
-/// refusal instead of a silently ignored field. It also means an operator's
-/// capability `input_schema` must expose exactly these names.
+/// `destination`, `base_url` or `host` a hard, *pre-side-effect* refusal instead of
+/// a silently ignored field. It also means an operator's capability `input_schema`
+/// must expose exactly these names.
+///
+/// `headers` is the ONE exception, and it is declared rather than denied for a
+/// measured reason: the shipped `POST /api/v1/execute` route unconditionally puts a
+/// `headers` key (defaulting to `{}`) into the plugin params
+/// (`web/api.rs:269-278`), so denying the FIELD makes this plugin unreachable
+/// through the product's own REST surface. Found by the plan 103 P2 end-to-end run,
+/// after the P0 spike's tests missed it by calling `execute_gated` with hand-built
+/// params. The security property is unchanged and is now enforced on the VALUE: an
+/// empty map is accepted, a non-empty one is refused, so a caller still cannot put a
+/// single header on the wire.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InternalHttpParams {
@@ -149,6 +159,11 @@ pub struct InternalHttpParams {
     /// JSON request body.
     #[serde(default)]
     pub body: Option<serde_json::Value>,
+    /// Caller headers. MUST be empty. Accepted as a field only because the shipped
+    /// `/api/v1/execute` route always sends one (see the type doc); any entry is
+    /// refused, so the credential's own header stays the only header on the wire.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 /// Connect-time resolver for declared destinations addressed by NAME.
@@ -323,6 +338,23 @@ impl InternalHttpPlugin {
         Ok(())
     }
 
+    /// Refuse a NON-EMPTY caller headers map. See `InternalHttpParams::headers`: the
+    /// field exists because the shipped REST route always sends one, but the caller
+    /// supplies no headers on this plugin, ever. The credential's own header is the
+    /// only header that reaches the destination.
+    fn reject_caller_headers(headers: &HashMap<String, String>) -> Result<(), PluginError> {
+        if headers.is_empty() {
+            return Ok(());
+        }
+        let mut names: Vec<&str> = headers.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        Err(PluginError::InvalidParams(format!(
+            "internal_http: the caller may not supply request headers (got {}); the vault \
+             credential's own header is the only header sent to the pinned destination",
+            names.join(", ")
+        )))
+    }
+
     /// Uppercase + verb-check the caller's method (also pre-side-effect).
     fn normalize_method(raw: &str) -> Result<String, PluginError> {
         let m = raw.trim().to_ascii_uppercase();
@@ -487,6 +519,7 @@ impl InternalHttpPlugin {
         //    them on the request path; re-running here keeps the plugin sound if
         //    it is ever invoked directly).
         Self::validate_relative_reference(&params.url)?;
+        Self::reject_caller_headers(&params.headers)?;
         let method_str = Self::normalize_method(&params.method)?;
 
         // 3. Compose + containment. The raw `url` is used verbatim (not trimmed):
@@ -655,6 +688,7 @@ impl Plugin for InternalHttpPlugin {
                 let params: InternalHttpParams = serde_json::from_value(params.clone())
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
                 Self::validate_relative_reference(&params.url)?;
+                Self::reject_caller_headers(&params.headers)?;
                 Self::normalize_method(&params.method)?;
                 Ok(())
             }
@@ -773,6 +807,7 @@ mod tests {
             serde_json::json!({"url":"/v1/refunds","method":"POST","base_url":"http://evil"}),
             serde_json::json!({"url":"/v1/refunds","method":"POST","host":"evil"}),
             serde_json::json!({"url":"/v1/refunds","method":"POST","headers":{"Host":"evil"}}),
+            serde_json::json!({"url":"/v1/refunds","method":"POST","headers":{"Authorization":"Bearer stolen"}}),
             serde_json::json!({"url":"http://evil/v1","method":"POST"}),
             serde_json::json!({"url":"/v1/refunds","method":"CONNECT"}),
             serde_json::json!({"method":"POST"}),
@@ -788,6 +823,16 @@ mod tests {
                 &serde_json::json!({"url":"/v1/refunds","method":"post","body":{"amount":1}})
             )
             .is_ok());
+        // The EMPTY headers map the shipped `/api/v1/execute` route always sends must be
+        // accepted, or this plugin is unreachable through the product's own REST surface
+        // (the defect the plan 103 P2 end-to-end run found).
+        assert!(plugin
+            .validate_params(
+                "request",
+                &serde_json::json!({"url":"/v1/refunds","method":"POST","headers":{},"query":{},"body":null})
+            )
+            .is_ok(),
+            "the shipped /api/v1/execute param shape must be accepted");
     }
 
     #[test]
