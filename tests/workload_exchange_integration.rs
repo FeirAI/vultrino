@@ -356,3 +356,209 @@ async fn enabled_without_secret_is_503() {
     let resp = router.oneshot(exchange_req(&assertion)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+// ---------------------------------------------------------------------------
+// TOKEN MULTIPLICATION BOUNDS (plan 103 §10 item 6 / P4d)
+//
+// Everything below was measured before it was fixed, on an isolated vultrino and on a
+// real eve pod, and the numbers are in the assertions' failure messages so a
+// regression reads as the finding rather than as "an assert flipped".
+
+/// PREDECESSOR-RETIRE: a second exchange leaves exactly ONE live generation.
+///
+/// Before this, every exchange left its predecessor live with a full `max_uses`
+/// allowance until that generation's own TTL: N=10 exchanges measured 10 independent
+/// live MCP tokens (aggregate 50 uses against an intended per-generation 5) plus 10
+/// UNBOUNDED-use model tokens, and a real eve pod accumulated 38 in 19 minutes.
+#[tokio::test]
+async fn second_exchange_retires_its_predecessor() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    enable_exchange();
+    let (router, storage, admin_key) = build_router().await;
+    author_grant(&router, &admin_key).await;
+
+    let first = mint_assertion(VERIFIER_SECRET, valid_claims("jti-retire-1"));
+    let resp = router.clone().oneshot(exchange_req(&first)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "first exchange must succeed");
+    let live_after_first = live_tokens(&storage, "t1", "ep_agent").await;
+    assert_eq!(live_after_first.len(), 1, "one exchange = one live generation");
+
+    let second = mint_assertion(VERIFIER_SECRET, valid_claims("jti-retire-2"));
+    let resp = router.clone().oneshot(exchange_req(&second)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "second exchange must succeed");
+
+    let live = live_tokens(&storage, "t1", "ep_agent").await;
+    assert_eq!(
+        live.len(),
+        1,
+        "after a second exchange there must be exactly ONE live generation \
+         (mint-then-retire). Found {}: the predecessor was left usable, which is the \
+         measured defect — 10 exchanges produced 10 live tokens with 10x the intended \
+         aggregate allowance, and a real pod reached 38 in 19 minutes, past the ~150-200 \
+         crossover where the W2 grant-delete revoke exceeds govder's 10s timeout.",
+        live.len()
+    );
+    assert_ne!(
+        live[0].id, live_after_first[0].id,
+        "the surviving generation must be the NEW one — retire must never revoke the \
+         credential the caller was just handed"
+    );
+}
+
+/// The retired predecessor is REVOKED, not merely absent from a list: a stale
+/// generation must stop being usable, which is what makes the bound a security
+/// property rather than bookkeeping.
+#[tokio::test]
+async fn the_retired_predecessor_is_revoked() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    enable_exchange();
+    let (router, storage, admin_key) = build_router().await;
+    author_grant(&router, &admin_key).await;
+
+    let a = mint_assertion(VERIFIER_SECRET, valid_claims("jti-rev-1"));
+    router.clone().oneshot(exchange_req(&a)).await.unwrap();
+    let first_id = live_tokens(&storage, "t1", "ep_agent").await[0].id.clone();
+
+    let b = mint_assertion(VERIFIER_SECRET, valid_claims("jti-rev-2"));
+    router.clone().oneshot(exchange_req(&b)).await.unwrap();
+
+    let prior = storage.get_use_token(&first_id).await.unwrap().unwrap();
+    assert!(
+        prior.revoked,
+        "the predecessor generation must be REVOKED after the next exchange; an \
+         unrevoked stale token keeps executing real actions until its own TTL"
+    );
+}
+
+/// `max_live_generations` is a FAIL-CLOSED refusal, and it is reached even when the
+/// grant omits the field — an omitted field must not restore unbounded behaviour.
+#[tokio::test]
+async fn max_live_generations_refuses_an_over_cap_exchange() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    enable_exchange();
+    let (router, storage, admin_key) = build_router().await;
+    // cap = 1 makes the SECOND exchange the one over the bound, which is the smallest
+    // configuration that exercises the refusal.
+    let grant = serde_json::json!({
+        "tenant": "t1", "agent_label": "ep_agent", "issuer": "https://issuer",
+        "subject": "workload", "audience": "vultrino", "mcp_credential_scope": "cred-*",
+        "mcp_action_scope": "tool.*", "ttl_secs": 300, "max_live_generations": 1
+    });
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/workload-grants/ep_agent")
+                .header("authorization", format!("Bearer {admin_key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&grant).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let a = mint_assertion(VERIFIER_SECRET, valid_claims("jti-cap-1"));
+    let resp = router.clone().oneshot(exchange_req(&a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the first exchange is under the cap");
+
+    // Leave the predecessor live so the cap is what is being measured, not retire.
+    let live = live_tokens(&storage, "t1", "ep_agent").await;
+    assert_eq!(live.len(), 1);
+
+    // A second exchange now sees 1 live >= cap 1 and must REFUSE, before minting.
+    let b = mint_assertion(VERIFIER_SECRET, valid_claims("jti-cap-2"));
+    let resp = router.clone().oneshot(exchange_req(&b)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "an exchange at the live-generation cap must be REFUSED, not granted: an \
+         unbounded live set degrades the W2 containment leg past its own timeout"
+    );
+    let body = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        body.contains("live_generation_cap"),
+        "the refusal must be machine-identifiable, got: {body}"
+    );
+    assert_eq!(
+        live_tokens(&storage, "t1", "ep_agent").await.len(),
+        1,
+        "the refused exchange must have minted NOTHING — a cap checked after the mint \
+         would let the very request that breached the bound add to it"
+    );
+}
+
+/// Deprovisioning revokes every live generation in ONE pass and reports the count.
+#[tokio::test]
+async fn deleting_the_grant_revokes_every_live_generation() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    enable_exchange();
+    let (router, storage, admin_key) = build_router().await;
+    author_grant(&router, &admin_key).await;
+
+    let a = mint_assertion(VERIFIER_SECRET, valid_claims("jti-del-1"));
+    router.clone().oneshot(exchange_req(&a)).await.unwrap();
+    assert_eq!(live_tokens(&storage, "t1", "ep_agent").await.len(), 1);
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/workload-grants/ep_agent?tenant=t1")
+                .header("authorization", format!("Bearer {admin_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        body.contains("\"removed\":true"),
+        "grant delete must report removal, got: {body}"
+    );
+    assert!(
+        body.contains("\"revoked_tokens\":1"),
+        "W2 must report the tokens it revoked so a caller can tell containment from a \
+         no-op, got: {body}"
+    );
+    assert_eq!(
+        live_tokens(&storage, "t1", "ep_agent").await.len(),
+        0,
+        "no live generation may survive a grant delete — that is the W2 kill leg"
+    );
+}
+
+/// Live = unrevoked AND unexpired, for one (tenant, agent_label).
+async fn live_tokens(
+    storage: &Arc<dyn StorageBackend>,
+    tenant: &str,
+    agent_label: &str,
+) -> Vec<vultrino::auth::UseToken> {
+    storage
+        .list_use_tokens()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| {
+            t.tenant.as_deref() == Some(tenant)
+                && t.agent_label.as_deref() == Some(agent_label)
+                && !t.revoked
+                && !t.is_expired()
+        })
+        .collect()
+}

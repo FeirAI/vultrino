@@ -312,6 +312,54 @@ pub trait StorageBackend: Send + Sync {
         Err(StorageError::UseTokenNotFound(_id.to_string()))
     }
 
+    /// Count the LIVE (unrevoked, unexpired) use-token generations bound to one
+    /// workload agent, and revoke every one of them EXCEPT the ids in `keep`, in a
+    /// SINGLE locked read-modify-write pass.
+    ///
+    /// WHY THIS IS ONE METHOD AND NOT A LOOP OVER
+    /// [`Self::set_use_token_revoked`] (plan 103 §10 item 6 — measured, not
+    /// reasoned):
+    ///
+    /// * **Cost.** Each `set_use_token_revoked` is a full encrypted-vault rewrite
+    ///   under the exclusive fd lock. Measured: 4.6s at 120 tokens, 20.8s at 240 —
+    ///   against govder's 10s enforce-client timeout, so past ~150 accumulated
+    ///   tokens the W2 kill leg stops completing inside its own budget. Containment
+    ///   still holds (grant delete precedes the loop, W3 is independent) but W2
+    ///   stops being a durable independent leg. One pass is one rewrite.
+    /// * **Expiry.** The loop had no `is_expired()` filter, so it rewrote the vault
+    ///   for tokens that were already dead (they linger for the dead-token grace
+    ///   window). Skipping them is free correctness: an expired token grants
+    ///   nothing, so revoking it changes no authority.
+    /// * **Atomicity.** A partial retire leaves a set of live generations nobody
+    ///   counted. One `locked_mutate` makes "retired the predecessors" a single
+    ///   observable state change.
+    ///
+    /// Returns `(live_before, retired)`: how many live generations existed when the
+    /// pass began (including the `keep` set) and how many this call revoked.
+    /// `agent_label` is control-plane-bound at mint time, never caller-supplied.
+    async fn retire_workload_generations(
+        &self,
+        _tenant: &str,
+        _agent_label: &str,
+        _keep: &[String],
+    ) -> Result<(usize, usize), StorageError> {
+        Err(StorageError::Unavailable(
+            "use tokens not supported by this storage backend".to_string(),
+        ))
+    }
+
+    /// Count LIVE (unrevoked, unexpired) use tokens bound to one workload agent,
+    /// without mutating anything. This is the read the `max_live_generations`
+    /// backstop is evaluated against BEFORE a mint, so an exchange can be refused
+    /// instead of adding to an already-unbounded set.
+    async fn count_live_workload_tokens(
+        &self,
+        _tenant: &str,
+        _agent_label: &str,
+    ) -> Result<usize, StorageError> {
+        Ok(0)
+    }
+
     /// Atomically consume a workload-identity assertion JTI. Returns false for
     /// a replay. Implementations must persist unexpired JTIs across restarts and
     /// coordinate across processes sharing the backend.

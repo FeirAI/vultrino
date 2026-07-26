@@ -1637,6 +1637,61 @@ impl StorageBackend for FileStorage {
         .await
     }
 
+    async fn retire_workload_generations(
+        &self,
+        tenant: &str,
+        agent_label: &str,
+        keep: &[String],
+    ) -> Result<(usize, usize), StorageError> {
+        // ONE locked pass: count the live set, then revoke everything in it that is not `keep`.
+        // See the trait doc for why this is not a loop of single revokes (a full vault rewrite each,
+        // measured at 20.8s for 240 tokens against govder's 10s W2 timeout).
+        let tenant = tenant.to_string();
+        let agent_label = agent_label.to_string();
+        let keep: Vec<String> = keep.to_vec();
+        self.locked_mutate(move |cache| {
+            let mut live_before = 0usize;
+            let mut retired = 0usize;
+            for token in cache.use_tokens.values_mut() {
+                if token.tenant.as_deref() != Some(tenant.as_str())
+                    || token.agent_label.as_deref() != Some(agent_label.as_str())
+                {
+                    continue;
+                }
+                // An expired token grants nothing, so it is neither counted as live nor rewritten.
+                if token.revoked || token.is_expired() {
+                    continue;
+                }
+                live_before += 1;
+                if keep.iter().any(|k| k == &token.id) {
+                    continue;
+                }
+                token.revoked = true;
+                retired += 1;
+            }
+            Ok((live_before, retired))
+        })
+        .await
+    }
+
+    async fn count_live_workload_tokens(
+        &self,
+        tenant: &str,
+        agent_label: &str,
+    ) -> Result<usize, StorageError> {
+        Ok(self
+            .list_use_tokens()
+            .await?
+            .into_iter()
+            .filter(|t| {
+                t.tenant.as_deref() == Some(tenant)
+                    && t.agent_label.as_deref() == Some(agent_label)
+                    && !t.revoked
+                    && !t.is_expired()
+            })
+            .count())
+    }
+
     async fn set_use_token_revoked_scoped(
         &self,
         id: &str,

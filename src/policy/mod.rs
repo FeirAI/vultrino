@@ -117,6 +117,35 @@ struct RateLimitState {
 /// credential still shares one counter — the correct behavior when there is no
 /// principal to isolate. The unit separator (`\x1f`) can't appear in an alias or
 /// principal id, so the parts can't be confused.
+/// The rate-limit IDENTITY of a principal: its `agent_label` when it has one, else its token id.
+///
+/// WHY THIS IS NOT `principal.id` (plan 103 P4b/P4d — measured, not reasoned). For a use token the
+/// principal id IS the token id, so every credential ROTATION started a fresh counter. Measured on an
+/// isolated vultrino: 6 requests in ~1s under a 2-per-hour cap, by re-exchanging between requests.
+/// The doc comment on `rate_limit_key` already stated per-AGENT isolation as the intent
+/// ("two agents sharing one credential each get their own budget"), so this is the intent finally
+/// being implemented — and it matters most at L1/L2-low, where `max_uses` is None and the compiled
+/// rate cap is the ONLY volume bound on an agent.
+///
+/// It matters far more for a pod-native agent than for a host one: a workload-exchange agent re-mints
+/// on its own schedule with no operator involvement, so "one counter per generation" is not a corner
+/// case, it is the normal mode. The multiplier is workload-controlled.
+///
+/// FALLBACK, and why it is the id and not the empty string: a principal with no `agent_label` is an
+/// operator/admin key or an untagged legacy token. Keying those on the empty string would merge every
+/// such caller into ONE shared counter — a cross-principal denial-of-service in the fail-open
+/// direction for the noisy one and the fail-closed direction for the quiet one. The id keeps them
+/// isolated, exactly as before this change.
+///
+/// `agent_label` is bound by the control plane at mint time and is not caller-supplied, so it cannot
+/// be spoofed to escape a counter.
+fn rate_limit_principal(principal: &Principal) -> &str {
+    match principal.agent_label.as_deref() {
+        Some(label) if !label.trim().is_empty() => label,
+        _ => principal.id.as_str(),
+    }
+}
+
 fn rate_limit_key(
     credential_alias: &str,
     principal_id: Option<&str>,
@@ -485,7 +514,7 @@ impl PolicyEngine {
                 if record {
                     self.check_rate_limit(
                         input.credential_alias,
-                        input.principal.map(|p| p.id.as_str()),
+                        input.principal.map(rate_limit_principal),
                         *max,
                         *window_secs,
                     )

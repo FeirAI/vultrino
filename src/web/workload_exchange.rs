@@ -35,7 +35,36 @@ pub struct WorkloadGrantTemplate {
     pub model_channels: HashMap<String, ChannelGrant>,
     #[serde(default = "default_ttl")]
     pub ttl_secs: i64,
+    /// FAIL-CLOSED BACKSTOP on token multiplication (plan 103 §10 item 6).
+    ///
+    /// Predecessor-retire below is the primary control, but it is a best-effort
+    /// mutation: if it ever fails or regresses, an exchange-driven agent accumulates
+    /// live generations LINEARLY IN UPTIME with nothing to stop it. Measured on a
+    /// real eve pod: `revoked_tokens: 38` after 19 minutes at a 60s refresh, i.e.
+    /// ~1,150 tokens/day/agent at a realistic L3 TTL — far past the ~150-200
+    /// crossover where the grant-delete W2 leg exceeds govder's 10s enforce timeout.
+    ///
+    /// So the exchange REFUSES to mint once this many LIVE (unrevoked, unexpired)
+    /// generations already exist for the agent. It is deliberately a refusal and not
+    /// a warning: an unbounded live set degrades an authoritative containment leg,
+    /// and the alternative failure (an agent that cannot refresh) is fail-closed and
+    /// SELF-HEALING — expired tokens do not count, so the cap clears within one TTL.
+    ///
+    /// `None` means the default below, never "unbounded": the whole point is that an
+    /// omitted field cannot restore the pre-fix behaviour.
+    #[serde(default)]
+    pub max_live_generations: Option<u32>,
 }
+
+/// Default `max_live_generations` when a grant does not declare one.
+///
+/// The honest invariant predecessor-retire provides is **<= 2 live generations during
+/// rotation** (mint-then-retire means the new and old generation coexist briefly), not
+/// "exactly one". The default leaves headroom above that for legitimate transients — a
+/// pod restarting while its predecessor's token is still unexpired, a rollout overlap —
+/// while keeping the set small enough that a W2 grant-delete revoke stays far inside
+/// govder's 10s budget. It is a bound, not a target: steady state is 1.
+const DEFAULT_MAX_LIVE_GENERATIONS: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelGrant {
@@ -227,38 +256,37 @@ pub async fn delete_workload_grant(
             )
         }
     };
-    let mut revoked = 0usize;
-    let mut revoke_failures = 0usize;
-    match state.storage.list_use_tokens().await {
-        Ok(tokens) => {
-            for token in tokens {
-                if token.tenant.as_deref() == Some(query.tenant.as_str())
-                    && token.agent_label.as_deref() == Some(agent.as_str())
-                    && !token.revoked
-                {
-                    if state.storage.set_use_token_revoked(&token.id).await.is_ok() {
-                        revoked += 1;
-                    } else {
-                        revoke_failures += 1;
-                    }
-                }
-            }
-        }
+    // W2's token leg, now ONE locked pass instead of one full vault rewrite per token (plan 103
+    // §10 item 6). This is the same helper the exchange's predecessor-retire uses, with an EMPTY keep
+    // set — "retire every live generation" is exactly what deprovisioning means.
+    //
+    // Why the shape mattered: the previous per-token loop was measured at 4.6s for 120 tokens and
+    // 20.8s for 240, against govder's 10s enforce-client timeout — so on an agent that had
+    // accumulated generations (which, before predecessor-retire, was every long-running pod-native
+    // agent) the W2 leg stopped completing inside its own budget. Containment still held, because the
+    // grant delete above precedes this and W3 is independent, but W2 stopped being a durable
+    // independent leg. It also skips already-expired tokens, which grant nothing and were being
+    // rewritten for no authority change.
+    let revoked = match state
+        .storage
+        .retire_workload_generations(&query.tenant, &agent, &[])
+        .await
+    {
+        Ok((_live_before, retired)) => retired,
         Err(e) => {
+            // Fail LOUD. A caller that heard "removed" while live tokens survive would believe the
+            // agent is contained when it is not — and the grant is already gone, so nothing will
+            // retry this on its own.
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "storage_error",
-                e.to_string(),
-            )
+                "token_revocation_incomplete",
+                format!(
+                    "the workload grant was removed but its live token generations could NOT be revoked ({}). The agent's already-issued tokens remain usable until their own TTL: revoke them individually via POST /api/v1/tokens/{{id}}/revoke, or install a deny policy for agent_label {}.",
+                    e, agent
+                ),
+            );
         }
-    }
-    if revoke_failures > 0 {
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "token_revocation_incomplete",
-            format!("{} workload token(s) could not be revoked", revoke_failures),
-        );
-    }
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({"removed": removed, "revoked_tokens": revoked})),
@@ -443,6 +471,37 @@ pub async fn exchange_workload_token(
             "workload assertion was already exchanged",
         );
     }
+    // GENERATION CAP, evaluated BEFORE anything is minted (plan 103 §10 item 6). Checking after the
+    // mint would mean the very request that breached the bound had already added to it.
+    let gen_cap = template
+        .max_live_generations
+        .unwrap_or(DEFAULT_MAX_LIVE_GENERATIONS)
+        .max(1) as usize;
+    match state
+        .storage
+        .count_live_workload_tokens(&template.tenant, &template.agent_label)
+        .await
+    {
+        Ok(live) if live >= gen_cap => {
+            return error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "live_generation_cap",
+                format!(
+                    "{} live token generation(s) already exist for this agent (cap {}). Refusing to mint another: an unbounded live set makes the grant-delete kill leg exceed its own timeout. Expired generations do not count, so this clears within one token TTL ({}s); if it does not, predecessor-retire is failing — check for revoke errors in this process's log.",
+                    live, gen_cap, template.ttl_secs
+                ),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Fail CLOSED: an uncountable live set is exactly the state the cap exists to prevent.
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "grant_store_unavailable",
+                format!("could not count live token generations: {}", e),
+            );
+        }
+    }
     let mint = |name: String,
                 credential_scope: String,
                 action_scope: String,
@@ -507,6 +566,63 @@ pub async fn exchange_workload_token(
         state.server.seal_mint(&token).await;
         model_tokens.insert(channel, plain);
         metadata.push(UseTokenMetadata::from(&token));
+    }
+    // PREDECESSOR-RETIRE, MINT-THEN-RETIRE (plan 103 §10 item 6, and the reason vultrino is a code
+    // target for plan 103 at all).
+    //
+    // Before this, every exchange left its predecessor LIVE with a full `max_uses` allowance until
+    // that generation's own TTL. Measured: N=10 exchanges produced 10 independent live MCP tokens
+    // with an aggregate 50 uses against an intended per-generation 5, plus 10 UNBOUNDED-use model
+    // tokens; a real eve pod accumulated 38 in 19 minutes. Three consequences, all measured:
+    //   * the aggregate authority of an agent grew without limit while every individual token looked
+    //     correctly scoped;
+    //   * the grant-delete W2 kill leg (one full vault rewrite per token) took 4.6s at 120 tokens and
+    //     20.8s at 240, against govder's 10s enforce-client timeout — so W2 stopped completing inside
+    //     its own budget, and stopped being a durable independent containment leg;
+    //   * every exchange token is a reconcile `trueOrphan` (workload mode leaves govder's TokenID
+    //     empty), so the orphan fraction approached 100% and tripped the MaxRevokeFraction circuit
+    //     breaker into RemediationHeld — suppressing auto-revoke for genuinely rogue tokens
+    //     TENANT-WIDE.
+    //
+    // ORDER IS MINT-THEN-RETIRE, not retire-then-mint: a retire that succeeded and a mint that then
+    // failed would leave the agent with NO usable credential, converting a hygiene action into an
+    // outage. This way a retire failure is a bounded excess (caught by the cap above) rather than a
+    // denial of service. The retire is one locked pass, skips already-expired tokens, and keeps
+    // exactly the generation this request just minted.
+    //
+    // The host-path eve re-mint has revoked its predecessor since plan 102; this restores parity for
+    // the k8s workload-exchange path, which was the only one without it.
+    let keep = minted_ids.clone();
+    match state
+        .storage
+        .retire_workload_generations(&template.tenant, &template.agent_label, &keep)
+        .await
+    {
+        Ok((live_before, retired)) => {
+            if retired > 0 {
+                tracing::info!(
+                    tenant = %template.tenant,
+                    agent_label = %template.agent_label,
+                    live_before,
+                    retired,
+                    "workload exchange retired predecessor generation(s)"
+                );
+            }
+        }
+        Err(e) => {
+            // NOT fatal, and deliberately so: the fresh credential is already stored and usable, and
+            // failing the exchange here would hand the caller an error for a mint that succeeded —
+            // which a retrying workload turns into more generations, the opposite of the goal. It IS
+            // logged at warn and it IS bounded: the cap above refuses the next exchange once the
+            // uncollected set reaches the limit, so a persistent retire failure becomes a visible
+            // refusal within one TTL rather than silent unbounded growth.
+            tracing::warn!(
+                tenant = %template.tenant,
+                agent_label = %template.agent_label,
+                error = %e,
+                "workload exchange could not retire predecessor generations — the live set will be bounded by max_live_generations instead"
+            );
+        }
     }
     (
         StatusCode::OK,
