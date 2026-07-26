@@ -91,6 +91,53 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   resurrecting an in-flight event — it defers reclamation until a lull. Averin
   durable sealing is default-OFF.
 
+- **Workload-exchange token multiplication is BOUNDED, not eliminated: the honest
+  invariant is ≤2 live generations DURING ROTATION, not "exactly one".** Predecessor-retire
+  (mint-then-retire, expired-token-skipping, one bulk `locked_mutate` pass) is the primary
+  control, and it is deliberately **best effort**: if the retire fails, the exchange still
+  returns the credential it already stored, because failing there would hand a retrying
+  workload an error for a mint that succeeded — which produces *more* generations, the
+  opposite of the goal. The failure is logged at `warn` and backstopped by
+  `max_live_generations` (grant-declared; `None` means the default **4**, never
+  "unbounded"), which **refuses** the next exchange once that many live, unrevoked,
+  unexpired generations exist. That refusal is fail-closed and self-healing: expired
+  tokens do not count, so the cap clears within one TTL. Steady state is 1; the default
+  leaves headroom for a pod restarting while its predecessor is still unexpired.
+  Why the bound exists at all, measured: an unbounded live set grows **linearly in
+  uptime** (`revoked_tokens: 38` after 19 minutes at a 60s refresh, ~1,150 tokens/day/agent
+  at a realistic L3 TTL), and grant-delete revoke is one full-vault rewrite per token
+  (4.6s at 120 tokens, 20.8s at 240) against govder's 10s enforce-client timeout — so past
+  roughly 150–200 accumulated tokens the **W2 containment leg stops completing inside its
+  own budget.** A sidecar restart cap is an availability guard, never a security bound: the
+  multiplier is workload-controlled and unthrottled (120 exchanges in 22.4s measured), and
+  jti replay protection forbids replay, not fresh minting.
+- **The rate-limit counter now keys on the agent, not the token — which is a change of
+  meaning, not just a fix.** It previously charged `principal_id`, which for a use token is
+  the token id, so every rotation minted a fresh counter and a compiled cap reset per
+  generation (measured: 6 requests in ~1s under a 2-per-hour cap). The doc comment already
+  stated per-agent isolation as the intent. It is now keyed on `agent_label` with an id
+  fallback, so a rotating workload shares one window. The **per-process, per-replica** bound
+  below still applies on top of it.
+- **`VULTRINO_WORKLOAD_ASSERTION_SECRET` is read PER REQUEST, not at startup, and vultrino
+  has no startup validation of it.** A missing, blank or too-short value yields
+  `503 exchange_unconfigured` at exchange time; a wrong value yields
+  `401 invalid_workload_identity`. Neither is visible until an agent actually runs, and the
+  process starts and reports healthy either way. A comma-separated list is accepted as a
+  rotation overlap (every entry trimmed and ≥32 bytes, element 0 primary, a match against
+  any entry verifies). The counterpart signer refuses a short secret at *its* startup, which
+  is the only loud case in the relationship.
+- **`VULTRINO_POLICY_HASH_SECRET` is env-only and its absence is silent.** Unset or blank,
+  every policy `content_hash` is emitted **EMPTY** — it never falls back to a bare unkeyed
+  digest — so every consumer that compares a stored hash against a re-read one degrades to no
+  check at all. It is not parsed from `config.toml`, and because the TOML loader ignores
+  unknown keys, putting it there *looks right and does nothing*. It must also be stable across
+  restarts: rotating it makes every previously-authored hash mismatch, i.e. false drift.
+- **There is no per-policy rules read-back.** `GET /api/v1/policies/{id}` does not exist and
+  the collection GET returns a reduced DTO with no rules, so an external verifier cannot
+  read back what a policy actually enforces. It can only compare `content_hash` (see above)
+  and assert on the grant set the decide plane reports. Any claim of the form "we verified
+  the compiled rules" is really "we verified the hash and the grant set".
+
 ## Documented-not-enforced / posture notes
 
 - **Observe mode is a deliberate downgrade.** A tenant in `observe` mode lets
