@@ -6000,3 +6000,103 @@ async fn credential_list_reports_the_internal_binding_and_no_other_metadata() {
          allowlist of the three routing keys: {raw}"
     );
 }
+
+/// A RETRYABLE resume failure must be VISIBLE on the agent's poll.
+///
+/// The failure mode this closes cost 45 minutes of a real investigation. When a resumed
+/// approval fails retryably (the canonical case: the action's plugin is not present in
+/// this build, which `run_action` classifies as transient because a plugin can load
+/// later), vultrino releases the execution claim, records `result_error`, and
+/// deliberately leaves `executed = false` so a later poll retries. The poll response
+/// used to report only "the action is being executed now" in that state — identical to
+/// an action that really is about to run. So an approved money action that can NEVER
+/// start looked exactly like one in flight, forever, and the recorded reason was never
+/// shown to anyone.
+#[tokio::test]
+async fn a_retryable_resume_failure_is_reported_on_the_poll_not_hidden() {
+    let (router, storage, _server, _admin_key) = build_admin_router().await;
+
+    // An approval that is Approved, not executed, and carries the reason its last
+    // attempt failed — the exact state a retryable resume leaves behind.
+    let (secret, token) = UseToken::create(NewUseToken {
+        name: "refund-processor".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: Some(5),
+        require_approval: true,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    let (mut approval, _decision_token) = ApprovalRequest::open(NewApproval {
+        credential: "cred-finsandbox-refund".to_string(),
+        action: "internal_http.request".to_string(),
+        params: serde_json::json!({"url": "/v1/refunds", "method": "POST"}),
+        requester: RequesterInfo {
+            principal_kind: "use_token".to_string(),
+            principal_id: Some(token.id.clone()),
+            principal_name: Some(token.name.clone()),
+            role: None,
+            owner: None,
+        },
+        use_token_id: Some(token.id.clone()),
+        principal_id: Some(token.id.clone()),
+        agent_label: None,
+        tenant: None,
+        workload_id: None,
+        preview: None,
+        action_label: Some("money.refund".to_string()),
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::High,
+        trusted_irreversible: None,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+        approval_rule: None,
+    });
+    approval
+        .approve(vultrino::approval::Decision::new("admin panel", "dana"))
+        .unwrap();
+    approval.result_error =
+        Some("Plugin error: Plugin not found: internal_http (will retry)".to_string());
+    approval.executed = false;
+    // A claim is in flight (or was, and the retry window has not opened yet), which is
+    // exactly the state a poll finds between attempts: it cannot re-claim, so all it can
+    // do is REPORT. That is the state the old message made indistinguishable from
+    // healthy progress.
+    approval.executing = true;
+    approval.executing_since = Some(chrono::Utc::now());
+    let id = approval.id.clone();
+    storage.store_approval(&approval).await.unwrap();
+
+    let r = router
+        .oneshot(admin_req(
+            "GET",
+            &format!("/api/v1/approvals/{id}"),
+            &secret,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = body_string(r).await;
+    let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(seen["executed"], false);
+    assert!(
+        seen["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("internal_http"),
+        "the recorded failure reason must be on the poll response, or an action that can never \
+         start is indistinguishable from one in flight: {body}"
+    );
+    assert!(
+        !seen["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("being executed now"),
+        "an approval whose last attempt FAILED must not be reported as being executed now: {body}"
+    );
+}

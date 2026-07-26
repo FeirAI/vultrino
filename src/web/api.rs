@@ -411,10 +411,26 @@ pub async fn api_check_approval(
         }
         ApprovalStatus::Approved => {
             if !approval.executed {
-                body["message"] = serde_json::json!(
-                    "Approved; the action is being executed now. Poll again in ~10-30 seconds to \
-                     get the result."
-                );
+                // A RETRYABLE resume failure (e.g. the plugin was not loaded yet)
+                // releases the claim, records `result_error` and deliberately leaves
+                // `executed = false` so a later poll retries. Reporting only "being
+                // executed now" in that state is how an approved action that can NEVER
+                // start looks identical to one that is about to: the agent polls
+                // forever and the recorded reason is never shown to anyone. So the
+                // reason is surfaced whenever there is one, while still telling the
+                // caller it will be retried.
+                if let Some(err) = &approval.result_error {
+                    body["message"] = serde_json::json!(
+                        "Approved, but the action has not started yet. The last attempt failed \
+                         and will be retried on the next check."
+                    );
+                    body["error"] = serde_json::json!(err);
+                } else {
+                    body["message"] = serde_json::json!(
+                        "Approved; the action is being executed now. Poll again in ~10-30 seconds \
+                         to get the result."
+                    );
+                }
             } else if let Some(err) = &approval.result_error {
                 body["message"] = serde_json::json!("Approved, but the action failed to execute.");
                 body["error"] = serde_json::json!(err);

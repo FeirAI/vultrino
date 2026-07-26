@@ -1260,3 +1260,116 @@ async fn a_read_credential_cannot_write_even_to_a_path_it_may_read() {
 // A `HashMap` import keeps the recorder tuple readable in failures.
 #[allow(dead_code)]
 fn _unused(_: HashMap<String, String>) {}
+
+// ===========================================================================
+// (n) The APPROVAL RESUME path — the one the money packs actually take
+// ===========================================================================
+
+/// A gated `internal_http` action must RUN when the approval is granted.
+///
+/// Why this test exists: the twelve cases above all drive `execute_gated` on an
+/// UNGATED token, so every one of them completes inline. A money capability in a
+/// shipped pack is approval-gated by construction (its ratchet plus the compiled
+/// policy), which means the call that matters is the DEFERRED one: `execute_gated`
+/// opens an approval and returns, and the action runs later inside
+/// `check_and_resume_approval`. That is a different code path with a different param
+/// source (the stored `approval.params` rather than the live request), and nothing
+/// covered it. The plan-103 pack-driven money leg is what surfaced the gap.
+#[tokio::test]
+async fn a_gated_internal_http_action_runs_when_the_approval_is_granted() {
+    let (port, rec) = start_sandbox().await;
+    let mut config = operator_config(port, "");
+    config.approval.enabled = true;
+    let (server, storage) = build_server(config).await;
+
+    // The credential is pinned to the destination and to the refund path, exactly as
+    // `orgpack apply` seeds one from a pack's internal_credentials block.
+    let mut cred = Credential::new(
+        "finsandbox-refund".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new(SANDBOX_KEY),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    );
+    cred.metadata
+        .insert(META_DESTINATION.to_string(), "finsandbox".to_string());
+    storage.store(&cred).await.unwrap();
+
+    // An L3-shaped action token: scoped to the one write verb, and require_approval,
+    // which is what govder compiles for a write at an approval tier.
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "refund-processor".to_string(),
+        credential_scope: "finsandbox-refund".to_string(),
+        action_scope: Some("money.refund".to_string()),
+        max_uses: Some(5),
+        require_approval: true,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    let params = serde_json::json!({
+        "url": "/v1/refunds",
+        "method": "POST",
+        "headers": {},
+        "query": {},
+        "body": {"transaction_id": "txn_10003", "amount": "89.00", "currency": "USD", "reason": "after sign-off"},
+    });
+    let approval = match server
+        .execute_gated(
+            refund_request("finsandbox-refund", params),
+            ExecAuth::from_use_token(token.clone()),
+        )
+        .await
+        .expect("the gated request itself must succeed")
+    {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected a pending approval, got {other:?}"),
+    };
+    assert_eq!(
+        rec.hits.lock().unwrap().len(),
+        0,
+        "the gate must hold: nothing may reach the destination before the approval"
+    );
+
+    // A human approves.
+    let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    stored
+        .approve(vultrino::approval::Decision::new("admin panel", "dana"))
+        .unwrap();
+    storage.update_approval(&stored).await.unwrap();
+
+    // The poll the agent makes. This is where the action runs.
+    let resumed = server
+        .check_and_resume_approval(&approval.id, Some(token.id.as_str()))
+        .await
+        .expect("the resume poll must not error");
+    assert!(
+        resumed.executed,
+        "an approved gated action never ran. result_error={:?} executing={} \
+         (a resume that leaves executed=false polls forever, and the API reports \
+         'the action is being executed now' with no error, so this is silent)",
+        resumed.result_error, resumed.executing
+    );
+    assert_eq!(
+        resumed.result_status,
+        Some(200),
+        "the destination answered {:?}: {:?}",
+        resumed.result_status,
+        resumed.result_body
+    );
+    let hits = rec.hits.lock().unwrap().clone();
+    assert_eq!(
+        hits.len(),
+        1,
+        "the approved action must have reached the pinned destination exactly once"
+    );
+    let (method, path, auth, _body) = &hits[0];
+    assert_eq!(method, "POST");
+    assert_eq!(path, "/v1/refunds");
+    assert_eq!(
+        auth.as_deref(),
+        Some(format!("Bearer {SANDBOX_KEY}").as_str()),
+        "the vault credential must be injected on the RESUME path too"
+    );
+}
