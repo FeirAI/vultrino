@@ -30,3 +30,10 @@ jobs:
       - run: cargo test --features mock-govder
       # Zero clippy warnings is a repo convention; -D warnings makes it a hard gate.
       - run: cargo clippy --all-targets -- -D warnings
+      # ...and the same gate over the feature-gated targets, which the line above does NOT
+      # compile. `tests/delegate_approval_integration.rs` only exists under `mock-govder`, so
+      # a lint regression in it was invisible to the "zero-warning gate" — measured
+      # 2026-07-27: the default invocation was clean while --all-features still had a
+      # clippy::type_complexity error. A gate that skips a third of the test tree is the
+      # inert-gate class this repo keeps finding.
+      - run: cargo clippy --all-targets --all-features -- -D warnings

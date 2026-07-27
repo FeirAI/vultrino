@@ -3250,7 +3250,7 @@ pub async fn api_would_deny_reports(
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "storage_error",
-                &format!("Failed to read events: {}", e),
+                format!("Failed to read events: {}", e),
             )
         }
     };

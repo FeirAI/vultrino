@@ -330,22 +330,19 @@ impl ApproverClass {
 /// at deserialize time here rather than re-checked at every evaluation, since Rust's
 /// enum makes an invalid in-memory value unrepresentable (a divergence-by-construction
 /// from govder's raw-string type, not a behavior difference).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum RecipeDecisionMode {
     /// DEFAULT (conservative/fail-closed): any single explicit deny halts collection
-    /// regardless of the accumulated positive count.
+    /// regardless of the accumulated positive count. `#[default]` is the fail-closed
+    /// choice and must stay on this variant: `RecipeDecisionMode::default()` is what a
+    /// recipe with no explicit `decision_mode` gets.
+    #[default]
     DenyOnAnyDeny,
     /// Opt-in per org: the recipe may still be satisfied by its required positive set
     /// even with a dissenter. The dissent is always recorded on the sign-off set,
     /// never lost.
     MajorityWithDissentRecorded,
-}
-
-impl Default for RecipeDecisionMode {
-    fn default() -> Self {
-        RecipeDecisionMode::DenyOnAnyDeny
-    }
 }
 
 impl<'de> Deserialize<'de> for RecipeDecisionMode {
@@ -1494,7 +1491,7 @@ fn recipe_well_formed(r: &Recipe) -> bool {
 /// `eq_ignore_ascii_case` semantics. This does NOT touch the aggregator-SoD `agg:`
 /// scheme itself (the `SameAggregatorKey` / `DuplicateApprover` checks in
 /// `transition`) — only the recipe-satisfaction dedupe.
-fn dedupe_by_identity<'a>(signoffs: Vec<&'a Signoff>) -> Vec<&'a Signoff> {
+fn dedupe_by_identity(signoffs: Vec<&Signoff>) -> Vec<&Signoff> {
     let mut seen = std::collections::HashSet::new();
     signoffs
         .into_iter()
@@ -1515,7 +1512,7 @@ fn dedupe_by_identity<'a>(signoffs: Vec<&'a Signoff>) -> Vec<&'a Signoff> {
 /// empty/unresolved controller joins a single sentinel domain, so unknowns collapse
 /// together rather than each counting (fail-closed) — mirrors govder's
 /// `collapseAgentReviewers`'s `controllerKey` helper.
-fn collapse_by_controller<'a>(agent_reviewers: Vec<&'a Signoff>) -> Vec<&'a Signoff> {
+fn collapse_by_controller(agent_reviewers: Vec<&Signoff>) -> Vec<&Signoff> {
     const UNKNOWN_CONTROLLER: &str = "\u{0}unknown-controller";
     let mut seen = std::collections::HashSet::new();
     agent_reviewers

@@ -371,6 +371,9 @@ async fn enabled_without_secret_is_503() {
 /// live MCP tokens (aggregate 50 uses against an intended per-generation 5) plus 10
 /// UNBOUNDED-use model tokens, and a real eve pod accumulated 38 in 19 minutes.
 #[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
 async fn second_exchange_retires_its_predecessor() {
     let _guard = ENV_LOCK.lock().unwrap();
     enable_exchange();
@@ -409,6 +412,9 @@ async fn second_exchange_retires_its_predecessor() {
 /// generation must stop being usable, which is what makes the bound a security
 /// property rather than bookkeeping.
 #[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
 async fn the_retired_predecessor_is_revoked() {
     let _guard = ENV_LOCK.lock().unwrap();
     enable_exchange();
@@ -433,6 +439,9 @@ async fn the_retired_predecessor_is_revoked() {
 /// `max_live_generations` is a FAIL-CLOSED refusal, and it is reached even when the
 /// grant omits the field — an omitted field must not restore unbounded behaviour.
 #[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
 async fn max_live_generations_refuses_an_over_cap_exchange() {
     let _guard = ENV_LOCK.lock().unwrap();
     enable_exchange();
@@ -497,6 +506,9 @@ async fn max_live_generations_refuses_an_over_cap_exchange() {
 
 /// Deprovisioning revokes every live generation in ONE pass and reports the count.
 #[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
 async fn deleting_the_grant_revokes_every_live_generation() {
     let _guard = ENV_LOCK.lock().unwrap();
     enable_exchange();

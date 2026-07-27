@@ -921,15 +921,17 @@ mod tests {
     fn disabled_config_builds_no_client() {
         // The default-off guarantee: a disabled config yields no client, so both
         // hooks are unreachable and mint/execute stay byte-identical to today.
-        assert!(AverinConfig::default().enabled == false);
+        assert!(!AverinConfig::default().enabled);
         assert!(AverinClient::new(AverinConfig::default()).unwrap().is_none());
     }
 
     #[test]
     fn enabled_config_requires_base_url_and_resource_id() {
-        let mut cfg = AverinConfig::default();
-        cfg.enabled = true;
-        cfg.resource_id = "orders-db".into();
+        let mut cfg = AverinConfig {
+            enabled: true,
+            resource_id: "orders-db".into(),
+            ..AverinConfig::default()
+        };
         assert!(matches!(
             AverinClient::new(cfg.clone()),
             Err(AverinError::MissingBaseUrl)

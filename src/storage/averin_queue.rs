@@ -904,6 +904,11 @@ fn acquire_owner_lock(dir: &Path) -> Result<std::fs::File, StorageError> {
     let path = dir.join("queue.owner.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
+        // truncate(false) is LOAD-BEARING and must stay explicit: this file is a pure flock
+        // anchor shared with any other live process holding the directory. Truncating it on
+        // open would be a write to a file another owner has open, and `.create(true)` without
+        // a stated truncate policy is exactly what clippy::suspicious_open_options flags.
+        .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)

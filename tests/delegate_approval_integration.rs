@@ -312,9 +312,13 @@ async fn delegate_approval_records_approver_kind_in_outbox() {
     assert_eq!(approved.payload["irreversible"], false);
 }
 
+/// One captured delivery: the `X-Vultrino-Signature` header value and the raw body bytes
+/// (raw, not parsed — the signature is over the exact bytes).
+type CapturedDelivery = (String, Vec<u8>);
+
 /// Mock govder webhook consumer: records every signed delivery vultrino's outbox pushes.
 #[derive(Clone, Default)]
-struct WebhookCapture(Arc<Mutex<Vec<(String, Vec<u8>)>>>);
+struct WebhookCapture(Arc<Mutex<Vec<CapturedDelivery>>>);
 
 async fn mock_govder_webhook(
     State(cap): State<WebhookCapture>,

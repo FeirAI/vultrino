@@ -547,6 +547,19 @@ struct InboundIdentity {
     resolver: Arc<dyn crate::identity::IdentityResolver>,
 }
 
+/// The four token-describing inputs `enqueue_durable_mint_grant` freezes into the durable
+/// mint record. Grouped into one struct rather than passed as four positional parameters:
+/// `token_id`/`scope`/`action` are all `&str`, so a transposition at the call site would
+/// compile silently and only surface as a mis-keyed PoP entry or a wrong `action` on the
+/// sealed grant. (It also keeps the function under clippy's `too_many_arguments` bound,
+/// which is CI's zero-warning gate.)
+struct DurableMintSeed<'a> {
+    token_id: &'a str,
+    scope: &'a str,
+    action: &'a str,
+    use_limit: Option<u32>,
+}
+
 impl VultrinoServer {
     /// Create a new Vultrino server
     pub fn new(
@@ -721,10 +734,12 @@ impl VultrinoServer {
                         av,
                         &queue,
                         &popkeys,
-                        &token.id,
-                        &scope,
-                        &action,
-                        token.max_uses,
+                        DurableMintSeed {
+                            token_id: &token.id,
+                            scope: &scope,
+                            action: &action,
+                            use_limit: token.max_uses,
+                        },
                     )
                     .await;
                     return;
@@ -751,11 +766,14 @@ impl VultrinoServer {
         av: &crate::averin::AverinClient,
         queue: &crate::storage::AverinQueue,
         popkeys: &crate::storage::PopKeyStore,
-        token_id: &str,
-        scope: &str,
-        action: &str,
-        use_limit: Option<u32>,
+        seed: DurableMintSeed<'_>,
     ) {
+        let DurableMintSeed {
+            token_id,
+            scope,
+            action,
+            use_limit,
+        } = seed;
         let keypair = crate::averin::pop::PopKeypair::generate();
         let entry = crate::storage::PopKeyEntry {
             pop_seed: keypair.seed_bytes(),
@@ -5685,14 +5703,16 @@ mod averin_worker_tests {
                 "this process must own the durable queue"
             );
 
-            let mut config = Config::default();
-            config.averin = AverinConfig {
-                enabled: true,
-                base_url: base_url.clone(),
-                resource_id: resource_id.to_string(),
-                mode: AverinMode::Observe,
-                durable: true,
-                ..AverinConfig::default()
+            let config = Config {
+                averin: AverinConfig {
+                    enabled: true,
+                    base_url: base_url.clone(),
+                    resource_id: resource_id.to_string(),
+                    mode: AverinMode::Observe,
+                    durable: true,
+                    ..AverinConfig::default()
+                },
+                ..Default::default()
             };
             let server = VultrinoServer::new(
                 config,
@@ -5866,14 +5886,16 @@ mod averin_worker_tests {
                 "this process must own the durable queue"
             );
 
-            let mut config = Config::default();
-            config.averin = AverinConfig {
-                enabled: true,
-                base_url: base_url.clone(),
-                resource_id: resource_id.to_string(),
-                mode: AverinMode::Observe,
-                durable: true,
-                ..AverinConfig::default()
+            let config = Config {
+                averin: AverinConfig {
+                    enabled: true,
+                    base_url: base_url.clone(),
+                    resource_id: resource_id.to_string(),
+                    mode: AverinMode::Observe,
+                    durable: true,
+                    ..AverinConfig::default()
+                },
+                ..Default::default()
             };
             let server = VultrinoServer::new(
                 config,
@@ -6074,15 +6096,17 @@ mod durable_enqueue_tests {
         );
         assert!(storage.averin_durable_popkeys().is_some());
 
-        let mut config = Config::default();
-        config.averin = AverinConfig {
-            enabled: true,
-            base_url: base_url.to_string(),
-            resource_id: "orders-db".to_string(),
-            mode,
-            durable,
-            timeout,
-            ..AverinConfig::default()
+        let config = Config {
+            averin: AverinConfig {
+                enabled: true,
+                base_url: base_url.to_string(),
+                resource_id: "orders-db".to_string(),
+                mode,
+                durable,
+                timeout,
+                ..AverinConfig::default()
+            },
+            ..Default::default()
         };
 
         let server = VultrinoServer::new(

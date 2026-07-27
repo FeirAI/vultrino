@@ -3115,8 +3115,10 @@ mod averin_worker_spawn_gate_tests {
         storage: Arc<dyn StorageBackend>,
         cfg: AverinConfig,
     ) -> VultrinoServer {
-        let mut config = Config::default();
-        config.averin = cfg;
+        let config = Config {
+            averin: cfg,
+            ..Default::default()
+        };
         let resolver = CredentialResolver::new(storage.clone());
         VultrinoServer::new(config, storage, resolver)
     }
