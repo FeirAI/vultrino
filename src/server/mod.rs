@@ -2739,7 +2739,12 @@ impl VultrinoServer {
         // We pass the capability's target url/method (if pinned) so a url/method
         // gated allow rule can match at list time.
         let url = capability.target.url_glob.as_deref();
-        let method = capability.target.methods.first().map(|m| m.as_str());
+        // The verb list-time evaluation matches on MUST be the verb call time will
+        // send, or a capability is hidden (or shown and then denied) purely because
+        // the two read different fields. For `internal_http` the call-time verb can
+        // come from an operator pin in `plugin_params`, not just from `methods[0]`.
+        let effective_method = capability.effective_http_method();
+        let method = effective_method.as_deref();
         let decision = self
             .policy_engine
             .evaluate_readonly_full(&crate::policy::EvalInput {

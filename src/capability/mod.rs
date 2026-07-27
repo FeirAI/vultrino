@@ -386,7 +386,109 @@ impl Capability {
                 }
             }
         }
+        if self.declares_internal_http() {
+            // Registration-time half of plan 103 §10g FIX 1. An `internal_http`
+            // capability whose verb is not decidable from OPERATOR config is a tool
+            // an agent can see in tools/list and can never call: the plugin requires
+            // `method`, the caller is not allowed to supply it, and nothing else
+            // would fill it. Refusing here turns that into a 400 at provision time
+            // instead of a refusal at money time.
+            self.resolve_pinned_http_method()?;
+        }
         Ok(())
+    }
+
+    /// Whether this capability DECLARES the internal transport. The authoritative
+    /// plugin is resolved from the action at execute time (an action label can
+    /// route anywhere), so this is the best a config-free `validate` can do — it is
+    /// a second layer, not the load-bearing one. The load-bearing check is
+    /// [`build_action_params`], which keys on the RESOLVED plugin name.
+    fn declares_internal_http(&self) -> bool {
+        self.plugin.as_deref().map(str::trim) == Some(INTERNAL_HTTP_PLUGIN)
+            || self.action.trim() == "internal_http.request"
+    }
+
+    /// The HTTP verb an `internal_http` capability executes with — decided by the
+    /// OPERATOR, never by the caller.
+    ///
+    /// Sources, in order, and they must not disagree:
+    /// 1. `target.plugin_params.method` — the explicit pin govder's `ToCapUpsert`
+    ///    writes from the pack's declared method;
+    /// 2. a `target.methods` list of exactly ONE verb.
+    ///
+    /// Every other shape is an error: no verb (nothing to send), two verbs (an
+    /// ambiguity that could only be resolved by the agent, which is the thing we
+    /// are refusing), a pin that is not a verb, or a pin that contradicts the
+    /// declared list (two operator statements that disagree is a config bug, and
+    /// silently preferring one of them is how an inert control is born).
+    pub fn resolve_pinned_http_method(&self) -> Result<String, String> {
+        let declared: Vec<String> = self
+            .target
+            .methods
+            .iter()
+            .map(|m| m.trim().to_ascii_uppercase())
+            .filter(|m| !m.is_empty())
+            .collect();
+        let pinned = self
+            .target
+            .plugin_params
+            .get("method")
+            .map(|v| match v.as_str() {
+                Some(s) => Ok(s.trim().to_ascii_uppercase()),
+                None => Err(format!(
+                    "capability '{}' target.plugin_params.method must be a string verb, got {}",
+                    self.tool_name, v
+                )),
+            })
+            .transpose()?;
+
+        let method = match (&pinned, declared.as_slice()) {
+            (Some(p), []) => p.clone(),
+            (Some(p), [one]) if p == one => p.clone(),
+            (Some(p), many) => {
+                return Err(format!(
+                    "capability '{}' pins target.plugin_params.method = {p:?} but declares target.methods = {many:?}; \
+                     the operator's two statements must agree (or drop one)",
+                    self.tool_name
+                ))
+            }
+            (None, [one]) => one.clone(),
+            (None, []) => {
+                return Err(format!(
+                    "capability '{}' backs the internal transport but declares no method: \
+                     the plugin requires one, the agent is not allowed to supply one, so this tool could be listed and never called. \
+                     Declare exactly one target.methods entry (or pin target.plugin_params.method)",
+                    self.tool_name
+                ))
+            }
+            (None, many) => {
+                return Err(format!(
+                    "capability '{}' declares {} methods {many:?} on the internal transport: the verb must be unambiguous on the OPERATOR side, \
+                     because resolving it at call time means the AGENT resolves it. Split it into one capability per verb",
+                    self.tool_name,
+                    many.len()
+                ))
+            }
+        };
+        if !INTERNAL_HTTP_VERBS.contains(&method.as_str()) {
+            return Err(format!(
+                "capability '{}' method {method:?} is not an HTTP verb",
+                self.tool_name
+            ));
+        }
+        Ok(method)
+    }
+
+    /// The verb list-time policy evaluation should match on. It must be the SAME
+    /// verb call time will send, or a capability can be hidden from `tools/list`
+    /// (or shown and then denied) purely because the two read different fields.
+    pub fn effective_http_method(&self) -> Option<String> {
+        if self.declares_internal_http() {
+            if let Ok(m) = self.resolve_pinned_http_method() {
+                return Some(m);
+            }
+        }
+        self.target.methods.first().cloned()
     }
 
     /// Whether this capability is an LLM-proxy channel (it backs `POST /llm`
@@ -525,6 +627,14 @@ impl Capability {
     }
 }
 
+/// The plugin name of the operator-pinned internal transport (F8). Kept here as
+/// well as in `plugins::internal_http` because the capability layer must key on
+/// it without depending on the plugin registry.
+pub const INTERNAL_HTTP_PLUGIN: &str = "internal_http";
+
+/// The verbs `internal_http` accepts. Mirrors `plugins::internal_http::VERBS`.
+const INTERNAL_HTTP_VERBS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+
 /// Built-in generic MCP tool names a capability must not shadow.
 const RESERVED_TOOL_NAMES: &[&str] = &[
     "list_credentials",
@@ -572,13 +682,23 @@ impl From<&Capability> for CapabilityMetadata {
 /// Build the action params for a capability's `tools/call`, given the LLM's args.
 ///
 /// The result is the params object handed to the backing plugin (via
-/// [`crate::ExecuteRequest`]). For the `http` plugin we shape the canonical
-/// `{method, url, headers, body, query}` request from the capability's target
-/// scope plus the LLM args (the LLM may supply `method`/`url`/`body`/`headers`/
-/// `query`; the capability's pinned `url_glob`/`methods` are advisory defaults
-/// that policy then enforces). For other plugins we pass the LLM args through and
-/// overlay the capability's fixed `plugin_params` (which take precedence so a
-/// pinned target can't be overridden by the agent).
+/// [`crate::ExecuteRequest`]). Three shapes:
+///
+/// - **`http`**: the canonical `{method, url, headers, body, query}` request,
+///   composed from the capability's target scope plus the LLM args (the LLM may
+///   supply `method`/`url`/`body`/`headers`/`query`; the capability's pinned
+///   `url_glob`/`methods` are advisory defaults that policy then enforces).
+/// - **`internal_http`**: the same canonical shape, but the VERB IS THE
+///   OPERATOR'S — see [`build_internal_http_params`]. This branch exists because
+///   the generic passthrough below produced a tool that could be listed and never
+///   called (plan 103 §10g FIX 1).
+/// - **everything else**: pass the LLM args through and overlay the capability's
+///   fixed `plugin_params` (which take precedence so a pinned target can't be
+///   overridden by the agent).
+///
+/// Returns `Err` when the agent's args cannot be composed into a legal request
+/// for this capability. The caller must surface that as a tool error: it is a
+/// refusal, and it happens BEFORE the use token is consumed.
 ///
 /// The caller is responsible for having stripped the `api_key` from `args`
 /// before this (it must never reach a plugin).
@@ -586,7 +706,7 @@ pub fn build_action_params(
     capability: &Capability,
     plugin_name: &str,
     args: &serde_json::Value,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
     let args_obj = args.as_object().cloned().unwrap_or_default();
 
     if plugin_name == "http" {
@@ -620,7 +740,11 @@ pub fn build_action_params(
         if let Some(query) = args_obj.get("query") {
             params.insert("query".to_string(), query.clone());
         }
-        return serde_json::Value::Object(params);
+        return Ok(serde_json::Value::Object(params));
+    }
+
+    if plugin_name == INTERNAL_HTTP_PLUGIN {
+        return build_internal_http_params(capability, args_obj);
     }
 
     // Non-http plugin: pass the LLM args through, then overlay the capability's
@@ -629,7 +753,51 @@ pub fn build_action_params(
     for (k, v) in &capability.target.plugin_params {
         params.insert(k.clone(), v.clone());
     }
-    serde_json::Value::Object(params)
+    Ok(serde_json::Value::Object(params))
+}
+
+/// Compose the `internal_http.request` params for a `tools/call`.
+///
+/// **The agent supplies the path and the payload. The operator supplies the
+/// verb.** That asymmetry is the whole point, and it is why this is not the
+/// generic passthrough:
+///
+/// - `internal_http` requires `method` with no serde default, so the generic
+///   passthrough handed the plugin a request with no verb and every shipped money
+///   capability was refused before the use token was consumed — an agent could see
+///   `issue_refund` in `tools/list` and never execute it (plan 103 §10g FIX 1);
+/// - the only way an agent COULD execute one was to invent a `method` field its
+///   schema never mentioned, i.e. the caller would be choosing the HTTP verb of a
+///   money action. A declared GET capability turning into a POST is exactly the
+///   escalation the pinned destination exists to prevent.
+///
+/// So a caller-supplied `method` is REFUSED rather than overwritten. Overwriting
+/// would execute a money action the agent did not ask for; honouring it would let
+/// the agent pick the verb. Refusing is the only fail-closed answer, and it costs
+/// nothing: the schema the agent is handed never declares `method`.
+fn build_internal_http_params(
+    capability: &Capability,
+    args_obj: serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    if args_obj.contains_key("method") {
+        return Err(format!(
+            "capability '{}' does not take a 'method' argument: the HTTP method of an internal-transport action is pinned by the operator, \
+             not chosen by the caller. Call it with the fields in this tool's schema",
+            capability.tool_name
+        ));
+    }
+    let method = capability.resolve_pinned_http_method()?;
+
+    let mut params = args_obj;
+    // The operator's fixed params win over anything the agent sent...
+    for (k, v) in &capability.target.plugin_params {
+        params.insert(k.clone(), v.clone());
+    }
+    // ...and the resolved verb is written LAST, so what reaches the plugin, the
+    // policy engine's MethodMatch, the approval line and the audit record is one
+    // normalized uppercase string rather than however the operator spelled it.
+    params.insert("method".to_string(), serde_json::json!(method));
+    Ok(serde_json::Value::Object(params))
 }
 
 /// Reserved generic tool names (exported for callers that need to skip them).
@@ -753,7 +921,7 @@ mod tests {
         let c = cap("send_email");
         // LLM supplies only a body; method/url default from the capability target.
         let args = serde_json::json!({ "body": { "to": "a@b.com" } });
-        let params = build_action_params(&c, "http", &args);
+        let params = build_action_params(&c, "http", &args).unwrap();
         assert_eq!(params["method"], "POST");
         assert_eq!(params["url"], "https://api.sendgrid.com/v3/mail/send");
         assert_eq!(params["body"]["to"], "a@b.com");
@@ -763,7 +931,7 @@ mod tests {
     fn test_build_http_params_llm_can_override_within_policy() {
         let c = cap("send_email");
         let args = serde_json::json!({ "method": "get", "url": "https://api.sendgrid.com/v3/x" });
-        let params = build_action_params(&c, "http", &args);
+        let params = build_action_params(&c, "http", &args).unwrap();
         // Method upper-cased; url is the LLM's (policy then enforces the glob).
         assert_eq!(params["method"], "GET");
         assert_eq!(params["url"], "https://api.sendgrid.com/v3/x");
@@ -1013,7 +1181,7 @@ mod tests {
         };
         // The agent tries to override the pinned database; the capability wins.
         let args = serde_json::json!({ "sql": "SELECT 1", "database": "evil" });
-        let params = build_action_params(&c, "postgres", &args);
+        let params = build_action_params(&c, "postgres", &args).unwrap();
         assert_eq!(params["sql"], "SELECT 1");
         assert_eq!(params["database"], "prod");
     }
