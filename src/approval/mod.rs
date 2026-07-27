@@ -3840,6 +3840,12 @@ mod finding_6a_startup_warning_tests {
     }
 }
 
+// MERGE NOTE (2026-07-27): FIX A's FINDING 6a startup-warning tests above and FIX B's FINDING 4
+// TTL/clamp tests below were appended at the SAME point in this file by two concurrent streams,
+// and this was the only textual conflict in the whole vultrino merge. Both are kept in full: they
+// assert different properties of the same subsystem (whether a DISABLED approval subsystem
+// announces itself at startup, vs whether an approval can outlive the use token that would
+// execute it) and neither is a superset of the other.
 #[cfg(test)]
 mod finding4_tests {
     use super::*;
