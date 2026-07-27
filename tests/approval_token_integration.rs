@@ -4886,3 +4886,167 @@ async fn test_v13b_token_event_decodes_into_leria_wire_shape() {
         "dims.model_ref selects leria's rate card"
     );
 }
+
+// ==================== FINDING 4: the approval window vs the credential ====================
+//
+// plan 103 §10h FINDING 4, measured on the live stack: `approvals.ttl_secs` defaults
+// to 3600s while govder's scope table compiles an L3·High use token at **900s**
+// (`internal/enforce/scope.go`). A browser approval ~21 minutes after the request
+// therefore landed inside the advertised window and outside the credential's life:
+// the plane returned "Approved, but the action failed to execute / use token has
+// expired" and the money never moved.
+//
+// These drive the REAL `execute_gated` open path (not the pure helper) so the
+// property proven is the one the product depends on: what `expires_at` an approver's
+// card can ever show.
+
+/// The final deadline of an opened approval is the CREDENTIAL's deadline, never the
+/// (4× longer) configured approval TTL.
+#[tokio::test]
+async fn test_approval_window_never_outlives_the_use_token() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred", true).await;
+
+    // An L3·High-shaped token: 900s, capped uses — exactly what govder compiles.
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "l3-high".to_string(),
+        credential_scope: "api-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: Some(5),
+        require_approval: true,
+        expires_in: Some(Duration::seconds(900)),
+    });
+    storage.store_use_token(&token).await.unwrap();
+    let token_deadline = token.expires_at.expect("the L3 token carries an expiry");
+
+    let exec_auth = ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+    let outcome = server
+        .execute_gated(echo_request("api-cred"), exec_auth)
+        .await
+        .unwrap();
+    let approval = match outcome {
+        ExecutionOutcome::Pending(a) => *a,
+        ExecutionOutcome::Completed(_) => {
+            panic!("expected an approval to be opened, the action ran instead")
+        }
+    };
+
+    // The property: an approver can never be offered a window the credential cannot
+    // honour. `<=` (not `==`) because the clamp works in whole seconds.
+    assert!(
+        approval.expires_at <= token_deadline,
+        "the approval deadline {} outlives the credential {} — an approver would sign \
+         an action that cannot run",
+        approval.expires_at,
+        token_deadline,
+    );
+    // And it is genuinely bound by the CREDENTIAL, not merely inside the config: the
+    // configured window (ttl_secs = 3600 -> Medium 1800+1800) is far longer.
+    let held = approval.expires_at - approval.created_at;
+    assert!(
+        held.num_seconds() <= 900,
+        "expected the 900s credential to bind the window, got {}s",
+        held.num_seconds()
+    );
+    assert!(
+        held.num_seconds() >= 890,
+        "the clamp must use the credential's remaining life, not shrink it to nothing \
+         (got {}s)",
+        held.num_seconds()
+    );
+    // The escalate boundary stays strictly inside the deadline, so a clamped request
+    // still escalates before it expires rather than degenerating.
+    assert!(approval.escalate_at < approval.expires_at);
+}
+
+/// A token whose remaining life is not a decidable window at all: the open is
+/// REFUSED. Nothing executes, and no human is invited to authorize an action that is
+/// already impossible.
+#[tokio::test]
+async fn test_approval_open_is_refused_when_the_credential_is_about_to_die() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred", true).await;
+
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "dying".to_string(),
+        credential_scope: "api-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: Some(5),
+        require_approval: true,
+        // Still VALID (check_usable passes) but under a second of life left.
+        expires_in: Some(Duration::milliseconds(400)),
+    });
+    storage.store_use_token(&token).await.unwrap();
+    assert!(token.check_usable().is_ok(), "the token is not yet expired");
+
+    let exec_auth = ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+    let err = server
+        .execute_gated(echo_request("api-cred"), exec_auth)
+        .await
+        .expect_err("an approval that cannot outlive its credential must be refused");
+    let msg = format!("{}", err).to_lowercase();
+    assert!(
+        msg.contains("expires too soon"),
+        "the refusal must name the credential deadline as the reason, got: {}",
+        msg
+    );
+    // Fail-closed: no approval record was created, so no notifier fired and no
+    // approver can be shown a request that could never run.
+    let approvals = storage.list_approvals().await.unwrap();
+    assert!(
+        approvals.is_empty(),
+        "the refused open must not leave an approval behind: {:?}",
+        approvals.iter().map(|a| a.id.clone()).collect::<Vec<_>>()
+    );
+}
+
+/// A token with NO expiry (bounded only by `max_uses`) is unchanged by the clamp —
+/// the configured SLA still governs, so the fix narrows nothing it should not.
+#[tokio::test]
+async fn test_approval_window_is_unchanged_for_a_non_expiring_token() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "api-cred", true).await;
+
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: "no-expiry".to_string(),
+        credential_scope: "api-*".to_string(),
+        action_scope: Some("mock.echo".to_string()),
+        max_uses: Some(5),
+        require_approval: true,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+
+    let exec_auth = ExecAuth {
+        auth: Some(AuthResult::for_use_token(&token)),
+        use_token: Some(token.clone()),
+        force_approval: false,
+        requester: RequesterInfo::default(),
+    };
+    let outcome = server
+        .execute_gated(echo_request("api-cred"), exec_auth)
+        .await
+        .unwrap();
+    let approval = match outcome {
+        ExecutionOutcome::Pending(a) => *a,
+        ExecutionOutcome::Completed(_) => {
+            panic!("expected an approval to be opened, the action ran instead")
+        }
+    };
+    // ttl_secs = 3600 -> the Medium class splits it 1800 + 1800.
+    let held = (approval.expires_at - approval.created_at).num_seconds();
+    assert_eq!(
+        held, 3600,
+        "an unbounded credential must leave the configured window intact"
+    );
+}

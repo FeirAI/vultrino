@@ -507,10 +507,24 @@ pub struct ApprovalSummary {
     pub decided_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub veto_until: Option<String>,
-    /// Govder risk_tier (`Low` | `Medium` | `High` | `Extreme`) computed from the
-    /// approval's criticality class via the SAME mapping the delegate-decide path
-    /// evaluates against (`CriticalityClass::to_govder_risk_tier`) — lets a product
-    /// aggregator render the same risk chip the D3 PEP floor actually enforced.
+    /// Govder's **AUTHORITATIVE** risk_tier (`Low` | `Medium` | `High` | `Extreme`)
+    /// for this request — the value `GET /v1/oversight/gates/rule` returned and
+    /// [`ApprovalRequest::authoritative_risk_tier`] stamped at open, i.e. the same
+    /// fact the recipe deny-wins force evaluates against.
+    ///
+    /// FINDING 8 (plan 103 §10h): this used to be derived from vultrino's LOCAL
+    /// `CriticalityClass` (`to_govder_risk_tier`), which is a *guess* — an action no
+    /// `criticality_rules` entry matches falls to `Medium`. A refund govder
+    /// authoritatively rated **High** therefore rendered "Medium risk" on the
+    /// approver's card: precisely the divergence govder's router comment says the
+    /// authoritative field was added to prevent, and a WRONG risk label on a money
+    /// approval is worse than a blank one.
+    ///
+    /// `""` means UNKNOWN (no rule was stamped, so govder asserted no tier) and the
+    /// consumer MUST render an honest "not rated" — never a locally-guessed word,
+    /// and never "safe". feir-os already does exactly that
+    /// (`approvalRiskTierMeta` → empty word → "Not rated", and `approvalRiskRank`
+    /// sorts unrated WITH High because unknown ≠ safe).
     /// Always emitted (not `skip_serializing_if`) so consumers get a stable shape.
     pub risk_tier: String,
     /// Trusted irreversibility stamp (D3 floor input), computed the same way the
@@ -622,7 +636,9 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
                 .or_else(|| a.approver_identity.clone())
                 .or_else(|| a.decided_by.clone()),
             veto_until: a.delegate_veto_until.map(|t| t.to_rfc3339()),
-            risk_tier: a.criticality.to_govder_risk_tier().to_string(),
+            // FINDING 8: govder's stamped authoritative tier, or "" for an honest
+            // unknown — NEVER vultrino's local criticality guess. See the field doc.
+            risk_tier: a.authoritative_risk_tier.trim().to_string(),
             irreversible: crate::approval::approval_irreversible(a),
             preview: a.preview.clone(),
             recipe,
@@ -676,6 +692,39 @@ async fn require_tenant_scoped(admin: &AdminApiAuth) -> Result<&str, Response> {
              key must use the admin console instead.",
         )
     })
+}
+
+/// Look up the use token that would execute `approval`, so a decision response can
+/// state whether the action can still run at all (plan 103 §10h FINDING 4, layer 3).
+///
+/// Deliberately conservative in three directions:
+/// * no `use_token_id` → `NotApplicable` (a local/API-key caller needs none);
+/// * a named token that no longer EXISTS → `Unusable` (it can never execute);
+/// * a storage error → `Unknown`, never `Usable` — a blip must not manufacture a
+///   "this will run" claim.
+async fn credential_check_for(
+    state: &AppState,
+    approval: &crate::approval::ApprovalRequest,
+) -> crate::approval::CredentialCheck {
+    use crate::approval::CredentialCheck;
+    let token_id = match approval.use_token_id.as_deref() {
+        Some(id) if !id.trim().is_empty() => id,
+        _ => return CredentialCheck::NotApplicable,
+    };
+    match state.storage.get_use_token(token_id).await {
+        Ok(Some(token)) => match token.check_usable() {
+            Ok(()) => CredentialCheck::Usable,
+            Err(reason) => CredentialCheck::Unusable(reason.to_string()),
+        },
+        Ok(None) => CredentialCheck::Unusable(
+            "the credential this action would run with no longer exists".to_string(),
+        ),
+        Err(error) => {
+            tracing::error!(%error, approval_id = %approval.id,
+                "could not read the approval's use token; reporting the execution state as unknown");
+            CredentialCheck::Unknown
+        }
+    }
 }
 
 /// Require the acting admin key to be **global** (operator/root, `tenant == None`)
@@ -1005,9 +1054,19 @@ pub async fn api_decide_approval(
         )
         .await
     {
-        Ok(decided) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok(decided) => {
+            // FINDING 4 layer 3 (plan 103 §10h): `executed` alone cannot tell an
+            // aggregator whether it may claim the action happened. On EVERY successful
+            // grant it is false (the requester's next poll is what executes), so a
+            // product UI that keys its receipt on status+executed paints the same
+            // green "Approved. Recorded just now." for a grant that is about to run,
+            // one that will never run, and one that already failed. `execution_state`
+            // is the explicit, non-collapsing answer; `execution_error` carries the
+            // reason whenever one is known.
+            let credential = credential_check_for(&state, &decided).await;
+            let (exec_state, exec_error) =
+                crate::approval::execution_state_at_decision(&decided, &credential);
+            let mut out = serde_json::json!({
                 "id": decided.id,
                 "status": decided.status.to_string(),
                 "executed": decided.executed,
@@ -1015,9 +1074,13 @@ pub async fn api_decide_approval(
                 // effect immediately or an approval is still awaiting co-approvers.
                 "required_approvals": decided.effective_required_approvals(),
                 "approvals_received": decided.signoffs.len(),
-            })),
-        )
-            .into_response(),
+                "execution_state": exec_state.as_wire(),
+            });
+            if let Some(err) = exec_error {
+                out["execution_error"] = serde_json::json!(err);
+            }
+            (StatusCode::OK, Json(out)).into_response()
+        }
         // decide_approval returns Conflict for an already-decided/expired request
         // AND for a hard-enforced separation-of-duty self-approval. 409 conveys
         // "not actionable in the current state"; the message distinguishes them.
@@ -4014,15 +4077,18 @@ mod tests {
 
     /// Pins `ApprovalSummary`'s JSON field names/values for the decide-time
     /// governance annotations (`risk_tier` / `irreversible`) that feir-os renders
-    /// Risk/irreversible chips from. Both fields must be computed via the SAME
-    /// mapping the delegate-decide PEP evaluates against
-    /// (`CriticalityClass::to_govder_risk_tier` / `approval::approval_irreversible`)
-    /// and must be emitted unconditionally (never omitted), so a low-risk
-    /// reversible approval and a high-risk irreversible approval both carry a
-    /// stable, always-present shape.
+    /// Risk/irreversible chips from. Both must be emitted unconditionally (never
+    /// omitted) so the shape is stable.
+    ///
+    /// `risk_tier` is govder's AUTHORITATIVE stamp (plan 103 §10h FINDING 8), NOT
+    /// vultrino's local `CriticalityClass` mapping: the local class is a guess that
+    /// falls to `Medium` for any action no `criticality_rules` entry matches, which
+    /// is how an approval card came to advertise "Medium risk" for a refund govder
+    /// authoritatively rated High.
     #[test]
     fn test_approval_summary_emits_risk_tier_and_irreversible() {
-        let low_reversible = sample_approval(crate::approval::CriticalityClass::Low, false);
+        let mut low_reversible = sample_approval(crate::approval::CriticalityClass::Low, false);
+        low_reversible.authoritative_risk_tier = "Low".to_string();
         let summary = ApprovalSummary::from(&low_reversible);
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["risk_tier"], "Low");
@@ -4033,11 +4099,55 @@ mod tests {
         assert!(json.get("risk_tier").is_some());
         assert!(json.get("irreversible").is_some());
 
-        let high_irreversible = sample_approval(crate::approval::CriticalityClass::Critical, true);
+        let mut high_irreversible =
+            sample_approval(crate::approval::CriticalityClass::Critical, true);
+        high_irreversible.authoritative_risk_tier = "Extreme".to_string();
         let summary = ApprovalSummary::from(&high_irreversible);
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["risk_tier"], "Extreme");
         assert_eq!(json["irreversible"], true);
+    }
+
+    /// FINDING 8 (plan 103 §10h), the wrong-value half: the wire `risk_tier` an
+    /// approval card renders must be govder's AUTHORITATIVE tier, and when govder
+    /// asserted none it must be an honest UNKNOWN (`""`) — never vultrino's local
+    /// criticality guess.
+    ///
+    /// Measured symptom this pins: a card showed "Medium risk" for an action govder
+    /// authoritatively returns as High. `Medium` is exactly what an UNMATCHED action
+    /// falls to locally (`criticality_for`'s default), so the label was not a
+    /// mis-mapping — it was a locally invented value presented as a policy fact.
+    #[test]
+    fn test_approval_summary_risk_tier_is_authoritative_never_local_criticality() {
+        // govder says High; vultrino's local class is the unmatched-action default.
+        let mut authoritative_high =
+            sample_approval(crate::approval::CriticalityClass::Medium, true);
+        authoritative_high.authoritative_risk_tier = "High".to_string();
+        let json = serde_json::to_value(ApprovalSummary::from(&authoritative_high)).unwrap();
+        assert_eq!(
+            json["risk_tier"], "High",
+            "the card must show govder's authoritative tier, not the local Medium guess"
+        );
+
+        // No authoritative stamp (no gate rule fetched): honest unknown, and
+        // specifically NOT the word the local criticality would have produced.
+        let unstamped = sample_approval(crate::approval::CriticalityClass::Medium, true);
+        assert_eq!(unstamped.authoritative_risk_tier, "");
+        let json = serde_json::to_value(ApprovalSummary::from(&unstamped)).unwrap();
+        assert_eq!(
+            json["risk_tier"], "",
+            "with no authoritative tier the wire must say UNKNOWN, never a local guess"
+        );
+        assert_ne!(
+            json["risk_tier"],
+            serde_json::json!(crate::approval::CriticalityClass::Medium
+                .to_govder_risk_tier()
+                .to_string()),
+            "an unknown tier must not be reported as the locally derived word"
+        );
+        // The key still exists — the consumer distinguishes "" (unknown) from a
+        // missing field, and feir-os renders "" as "Not rated".
+        assert!(json.get("risk_tier").is_some());
     }
 
     /// Plan 100 P3 Slice A: when NO `ApprovalRule` is stamped, the projection

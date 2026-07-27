@@ -6100,3 +6100,192 @@ async fn a_retryable_resume_failure_is_reported_on_the_poll_not_hidden() {
         "an approval whose last attempt FAILED must not be reported as being executed now: {body}"
     );
 }
+
+// ============ FINDING 4 layer 3: the A4 decision response must not read as success ============
+//
+// plan 103 §10h: a browser approval landed after the L3 use token had expired. The
+// plane's own poll said "Approved, but the action failed to execute / use token has
+// expired", while the product UI painted a green "Approved. Recorded just now." —
+// because the A4 decision body carried only `status` + `executed`, and `executed` is
+// false on EVERY successful grant (the requester's next poll is what runs the
+// action). One value therefore had to mean three different things.
+//
+// `execution_state` is the non-collapsing answer. These tests drive the REAL A4 route.
+
+/// Open + store an approval bound to a specific use token, so the decision route can
+/// look the credential up. (The shared `store_test_approval` deliberately binds none.)
+async fn store_approval_bound_to_token(
+    storage: &Arc<dyn StorageBackend>,
+    tenant: &str,
+    use_token_id: &str,
+) -> String {
+    let (approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo::local(),
+        use_token_id: Some(use_token_id.to_string()),
+        principal_id: None,
+        agent_label: None,
+        tenant: Some(tenant.to_string()),
+        workload_id: None,
+        preview: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::Medium,
+        trusted_irreversible: Some(true),
+        escalate_after: chrono::Duration::minutes(15),
+        escalate_window: chrono::Duration::minutes(15),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+        approval_rule: None,
+    });
+    storage.store_approval(&approval).await.unwrap();
+    approval.id
+}
+
+async fn store_token(
+    storage: &Arc<dyn StorageBackend>,
+    name: &str,
+    expires_in: Option<chrono::Duration>,
+) -> UseToken {
+    let (_full, token) = UseToken::create(NewUseToken {
+        name: name.to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: Some(5),
+        require_approval: true,
+        expires_in,
+    });
+    storage.store_use_token(&token).await.unwrap();
+    token
+}
+
+/// The measured misreport: the grant is recorded, and the credential that would run
+/// it is dead. The response must say BLOCKED and name the reason — never a state a UI
+/// can paint as a completed action.
+#[tokio::test]
+async fn test_a4_decision_reports_blocked_when_the_credential_expired() {
+    let (router, storage, key) = build_tenant_admin_router("team-a").await;
+    let token = store_token(&storage, "dead", Some(chrono::Duration::seconds(-60))).await;
+    let id = store_approval_bound_to_token(&storage, "team-a", &token.id).await;
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+
+    // The decision itself IS recorded — that part was never wrong.
+    assert_eq!(body["status"], "approved");
+    assert_eq!(body["executed"], false);
+    // ...but the response must not stop there, which is the whole defect.
+    assert_eq!(
+        body["execution_state"], "blocked",
+        "a grant whose credential has expired must be reported as blocked, not as a \
+         plain recorded approval"
+    );
+    let reason = body["execution_error"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("expired"),
+        "the response must carry the reason the action cannot run, got {:?}",
+        reason
+    );
+}
+
+/// Same shape for the kill switch: an operator revokes the agent's token while the
+/// approval is pending. Clamping the window (FINDING 4 layer 1) cannot cover this
+/// case, so the state has to.
+#[tokio::test]
+async fn test_a4_decision_reports_blocked_when_the_credential_was_revoked() {
+    let (router, storage, key) = build_tenant_admin_router("team-a").await;
+    let token = store_token(&storage, "killed", Some(chrono::Duration::seconds(3600))).await;
+    let id = store_approval_bound_to_token(&storage, "team-a", &token.id).await;
+    storage.set_use_token_revoked(&token.id).await.unwrap();
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "approved");
+    assert_eq!(body["execution_state"], "blocked");
+    assert!(body["execution_error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("revoked"));
+}
+
+/// The DISCRIMINATING control. The same recorded grant with a LIVE credential is
+/// `awaiting_execution` with no error — if the route answered "blocked" here the
+/// state would be worthless, and if it answered "executed" it would be the original
+/// lie in a new field.
+#[tokio::test]
+async fn test_a4_decision_reports_awaiting_execution_for_a_live_credential() {
+    let (router, storage, key) = build_tenant_admin_router("team-a").await;
+    let token = store_token(&storage, "live", Some(chrono::Duration::seconds(3600))).await;
+    let id = store_approval_bound_to_token(&storage, "team-a", &token.id).await;
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "approved");
+    assert_eq!(body["executed"], false);
+    assert_eq!(
+        body["execution_state"], "awaiting_execution",
+        "a healthy grant must not be flagged as blocked"
+    );
+    assert!(
+        body.get("execution_error").is_none(),
+        "no reason may be invented when there is none: {:?}",
+        body.get("execution_error")
+    );
+}
+
+/// A DENIAL implies nothing about execution — it must not borrow either the success
+/// or the failure vocabulary.
+#[tokio::test]
+async fn test_a4_denial_reports_not_applicable_execution_state() {
+    let (router, storage, key) = build_tenant_admin_router("team-a").await;
+    let token = store_token(&storage, "live", Some(chrono::Duration::seconds(3600))).await;
+    let id = store_approval_bound_to_token(&storage, "team-a", &token.id).await;
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": false, "approver": "alice@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "denied");
+    assert_eq!(body["execution_state"], "not_applicable");
+}

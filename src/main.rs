@@ -1798,7 +1798,10 @@ transport = "stdio"
 #   vultrino meta set <alias> require_approval true
 # [approvals]
 # enabled = true
-# ttl_secs = 3600
+# ttl_secs = 3600   # a CEILING: the real deadline is min(this, the presenting use
+#                   # token's remaining life). An approval is never offerable past
+#                   # the life of the credential that would execute it, so this can
+#                   # be shortened by the credential but never lengthens it.
 # public_base_url = "https://vultrino.example.com"  # used in approve/deny links
 # oob_approver_identity = "oncall@example.com"  # REQUIRED when a notifier is set:
 #                                               # the named approver OOB links are
