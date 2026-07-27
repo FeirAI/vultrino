@@ -145,6 +145,24 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   Security/financial boundaries (halt, cross-tenant isolation, SpendCap/RateLimit)
   still enforce — but operators must understand observe mode is non-blocking for
   ordinary denials.
+- **An `internal_http` capability's HTTP verb is operator authority, and the agent
+  may not send one.** The transport requires `method`, so a capability registered
+  through the admin API must make it decidable: exactly one `target.methods` entry,
+  or an explicit `target.plugin_params.method` pin (govder writes the pin). Neither,
+  both-in-disagreement, or two declared methods is refused at registration
+  (`POST`/`PUT /capabilities` 400s), because a verb resolved at call time is a verb
+  resolved by the agent. A `tools/call` that carries a `method` argument is refused
+  before the use token is consumed — not silently overridden, since executing a
+  money action the caller did not ask for is its own defect. This is asymmetric with
+  the `http` plugin on purpose: there the caller may still supply `method`/`url`
+  within the target scope and policy enforces them independently.
+- **A capability's `input_schema` is not checked against the plugin it composes
+  into.** vultrino surfaces the operator's schema verbatim in `tools/list`; nothing
+  in this plane refuses a schema declaring an argument the backing plugin drops
+  (`http`) or refuses (`internal_http`, which deserializes with
+  `deny_unknown_fields`). The check exists one plane over, in feir-os's
+  `orgpack validate` (`capability-schema-uninvokable`), and only for org packs — a
+  capability registered by any other client is unchecked.
 - **Resume does not re-check tenant isolation or the observe downgrade.**
   Cross-tenant isolation is enforced at open time (a cross-tenant request can't
   create an approval); a credential whose `tenant` tag changes *between* approval

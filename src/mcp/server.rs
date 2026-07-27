@@ -997,7 +997,18 @@ impl McpServer {
             .unwrap_or("http")
             .to_string();
 
-        let params = crate::capability::build_action_params(capability, &plugin_name, &clean_args);
+        // A composition failure is a REFUSAL, and it happens before the use token
+        // is consumed: the agent is told what it did wrong, nothing is executed.
+        let params =
+            match crate::capability::build_action_params(capability, &plugin_name, &clean_args) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(format!(
+                        "Capability '{}' refused: {}",
+                        capability.tool_name, e
+                    ))
+                }
+            };
 
         // The request carries the capability's action label (V8) verbatim;
         // execute_gated resolves it to the canonical action and enforces the
