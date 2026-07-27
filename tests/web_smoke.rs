@@ -6280,12 +6280,6 @@ async fn a_two_key_money_recipe_requires_two_distinct_humans_not_one() {
     let approvals = storage.list_approvals().await.unwrap();
     assert_eq!(approvals.len(), 1, "exactly one approval should be open");
     let approval_id = approvals[0].id.clone();
-    assert!(
-        approvals[0].approval_rule.is_some(),
-        "the govder-authored recipe must be STAMPED on the approval at open — without it the \
-         approval falls back to a plain approver count and the two-key requirement is not in \
-         force at execute time (§10h FINDING 1)"
-    );
 
     // FIRST distinct human signs off.
     let first = router
@@ -6328,6 +6322,12 @@ async fn a_two_key_money_recipe_requires_two_distinct_humans_not_one() {
     assert!(
         !after_one.executed,
         "nothing may execute on one signature of a two-key money action"
+    );
+    assert!(
+        after_one.approval_rule.is_some(),
+        "and the MECHANISM behind that count: the govder-authored recipe must be STAMPED on the \
+         approval at open. Without it the approval falls back to a plain approver count and the \
+         two-key requirement is not in force at execute time (§10h FINDING 1)"
     );
 
     // SECOND, DISTINCT human signs off → now it grants.
