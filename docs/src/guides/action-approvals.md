@@ -92,6 +92,8 @@ Every request is assigned a **criticality class** (`low` | `medium` | `high` | `
 
 Higher criticality uses shorter windows (built-in defaults: `critical` 5m+5m, `high` 15m+15m, `low` 4h+4h; `medium` splits the legacy `ttl_secs` across both phases). Override any class with `[[approvals.sla]]`. Lifecycle advancement happens both on each agent poll and via a background sweep, so a request nobody is polling still escalates and expires on time. From the agent's side `escalated` behaves exactly like `pending` — keep polling.
 
+**The credential can shorten the window, and it wins.** Whatever the class SLA says, an approval's final deadline is clamped to the remaining life of the **use token** that will execute the action — an approval must never be offerable past the point where the credential can still honour it. Both phases scale proportionally, so a clamped request still escalates before it expires. If a request arrives with a credential that has under a second left, the approval is **refused** rather than opened (nothing runs, and nobody is asked to authorize an impossible action). So: to give approvers more time, lengthen the credential, not `ttl_secs`.
+
 Set `reauth_interval_secs` to require **continuous re-authorization**: an approved grant that has not yet run within that window is treated as lapsed and must be re-approved before it can execute, rather than running on a stale decision.
 
 ## Approver identity and separation of duty (V5)

@@ -1166,6 +1166,60 @@ impl VultrinoServer {
                 .approval_config
                 .criticality_for(&credential.alias, &full_action);
             let sla = self.approval_config.sla_for(criticality);
+            // FINDING 4 (plan 103 §10h): an approval must never be offerable beyond
+            // the life of the credential that would execute it. The configured SLA
+            // (`approvals.ttl_secs`, 3600s by default) is INDEPENDENT of the use
+            // token's TTL (govder compiles L3·High at 900s), so the two diverged by
+            // 4× and a human decided inside the advertised window on an action that
+            // then failed at resume with `use token has expired`.
+            //
+            // The bound is applied HERE, at open, because this is the only place that
+            // holds both facts at once — the presented token and the class SLA — and
+            // because clamping AT OPEN is the only option that keeps every downstream
+            // surface honest for free: `expires_at` is what the notifier links, the
+            // approver's card copy ("Expires in …") and the agent's poll all read, so
+            // one clamp makes all of them state a deadline the credential can honour.
+            // The alternatives were rejected: RE-MINTING a fresh token on approval
+            // would let a human decision extend a credential past the TTL govder's
+            // decide-path compiled for it (the approval would become a policy bypass,
+            // and vultrino is the enforcement plane, not the issuer); REFUSING every
+            // approval whose token cannot cover the full configured window would
+            // refuse every L3·High money approval on today's shipped config, i.e.
+            // "fail closed" into never governing money at all. Clamp + refuse only
+            // when even the clamped window is dead keeps the fail-closed property
+            // (the window can only ever SHRINK here, never grow) at no availability
+            // cost.
+            let credential_remaining = exec_auth
+                .use_token
+                .as_ref()
+                .and_then(|t| t.expires_at)
+                .map(|exp| exp - chrono::Utc::now());
+            let (escalate_after, escalate_window) = match sla
+                .clamped_to_credential(credential_remaining)
+            {
+                Some(w) => w,
+                None => {
+                    // The credential is already dead (or dies within this second).
+                    // Refusing is fail-closed in both directions: nothing executes,
+                    // AND no human is invited to authorize an action that cannot run.
+                    return Err(VultrinoError::PolicyDenied(
+                        "the credential presented for this action expires too soon to hold a \
+                         human approval, so no approval was opened and nothing ran — retry \
+                         with a freshly issued credential"
+                            .to_string(),
+                    ));
+                }
+            };
+            if escalate_after + escalate_window < sla.escalate_after() + sla.escalate_window() {
+                tracing::info!(
+                    credential = %credential.alias,
+                    action = %full_action,
+                    configured_secs = (sla.escalate_after() + sla.escalate_window()).num_seconds(),
+                    clamped_secs = (escalate_after + escalate_window).num_seconds(),
+                    "approval window clamped to the presenting credential's remaining life \
+                     (the credential, not approvals.ttl_secs, is the binding deadline)"
+                );
+            }
             // V10: record the requester's IdP-resolvable owner (if bound) on the
             // approval so separation-of-duty compares the approver against the
             // directory owner, not just the agent label.
@@ -1264,8 +1318,10 @@ impl VultrinoServer {
                 dual_control,
                 criticality,
                 trusted_irreversible: Some(trusted_irreversible),
-                escalate_after: sla.escalate_after(),
-                escalate_window: sla.escalate_window(),
+                // Clamped to the presenting credential's remaining life (FINDING 4) —
+                // NEVER the raw class SLA, which can outlive the token 4×.
+                escalate_after,
+                escalate_window,
                 oob_identity: self.approval_config.oob_approver_identity.clone(),
                 reauth_interval_secs: self.approval_config.reauth_interval_secs,
                 // V12: dual control requires a second distinct approver (M-of-N,

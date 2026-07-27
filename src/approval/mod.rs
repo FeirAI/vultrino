@@ -130,6 +130,100 @@ pub fn approval_irreversible(a: &ApprovalRequest) -> bool {
     a.trusted_irreversible
 }
 
+/// Whether the use token that would execute an approved action is still usable —
+/// the caller's lookup result, so [`execution_state_at_decision`] stays pure.
+///
+/// The four states are deliberately distinct: `Unknown` must NEVER collapse into
+/// `Usable` (that is how a storage blip becomes a false "this will run"), and
+/// `NotApplicable` must never collapse into `Unusable` (a local/API-key caller
+/// needs no use token, so its absence is not a defect).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialCheck {
+    /// The request names no use token: execution does not depend on one.
+    NotApplicable,
+    /// Loaded and usable right now.
+    Usable,
+    /// Loaded and NOT usable, with the reason (expired / revoked / exhausted), or
+    /// named by the request but no longer present in the vault.
+    Unusable(String),
+    /// The lookup itself failed — genuinely undetermined, claimed neither way.
+    Unknown,
+}
+
+/// What a caller may TRUTHFULLY claim about EXECUTION at the instant a decision was
+/// recorded (plan 103 §10h FINDING 4, layer 3).
+///
+/// Recording a decision and running the action are two separate events in this
+/// design: `POST /api/v1/approvals/{id}/decision` only commits the sign-off, and the
+/// requesting agent's next poll is what actually executes. The decision response
+/// therefore carried `executed: false` on EVERY successful grant, which the product
+/// UI collapsed into one green "Approved. Recorded just now." receipt — the same
+/// receipt it painted for an approval whose action had already failed. An approver
+/// signed an irreversible refund, saw success, and nothing ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionState {
+    /// This state implies nothing about execution: the request is still open, or was
+    /// denied/expired (in which case nothing was supposed to run).
+    NotApplicable,
+    /// The action RAN and reported success.
+    Executed,
+    /// The action was attempted and FAILED terminally. Never a completed action.
+    Failed,
+    /// Granted; nothing has run yet. The outcome is genuinely unknown, so a caller
+    /// may claim the DECISION was recorded and must not claim the ACTION happened.
+    AwaitingExecution,
+    /// Granted, but it can no longer run: the credential that would execute it is
+    /// expired / revoked / exhausted / gone. This is the FINDING 4 state — the one
+    /// that read as success while the action was already impossible.
+    Blocked,
+}
+
+impl ExecutionState {
+    /// Stable wire word (mirrored by feir-os `brokerapi.Decision.ExecutionState`).
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            ExecutionState::NotApplicable => "not_applicable",
+            ExecutionState::Executed => "executed",
+            ExecutionState::Failed => "failed",
+            ExecutionState::AwaitingExecution => "awaiting_execution",
+            ExecutionState::Blocked => "blocked",
+        }
+    }
+}
+
+/// Classify what may be claimed about execution for `a`, given the lookup result for
+/// the use token that would execute it. Pure: all I/O belongs to the caller.
+///
+/// The returned reason is present whenever one is KNOWN (the recorded
+/// `result_error`, or why the credential is unusable) and is always safe to show an
+/// approver — it is vultrino's own text, never requester-authored params.
+pub fn execution_state_at_decision(
+    a: &ApprovalRequest,
+    credential: &CredentialCheck,
+) -> (ExecutionState, Option<String>) {
+    // Open / denied / expired: nothing was supposed to run, so there is no execution
+    // claim to make either way.
+    if a.status != ApprovalStatus::Approved {
+        return (ExecutionState::NotApplicable, None);
+    }
+    if a.executed {
+        return match &a.result_error {
+            // Terminal and failed — INCLUDING the "outcome unknown, re-approve to
+            // retry" finalize, whose text says so explicitly. Never "completed".
+            Some(err) => (ExecutionState::Failed, Some(err.clone())),
+            None => (ExecutionState::Executed, None),
+        };
+    }
+    // Granted but not run. A dead credential means it CANNOT run — surface that
+    // rather than an optimistic "awaiting", which is the exact misreport measured.
+    if let CredentialCheck::Unusable(reason) = credential {
+        return (ExecutionState::Blocked, Some(reason.clone()));
+    }
+    // A retryable start failure leaves `executed = false` WITH a recorded reason:
+    // still awaiting, but the reason is known and must not be swallowed.
+    (ExecutionState::AwaitingExecution, a.result_error.clone())
+}
+
 /// Map a capability/policy reversibility label to the D3 irreversible floor.
 pub fn reversibility_requires_human_floor(reversibility: &str) -> bool {
     matches!(
@@ -1652,6 +1746,64 @@ impl CriticalitySla {
     /// Second window as a duration.
     pub fn escalate_window(&self) -> chrono::Duration {
         chrono::Duration::seconds(self.escalate_window_secs.max(1) as i64)
+    }
+
+    /// Clamp the two SLA windows so an approval's FINAL DEADLINE can never outlive
+    /// the credential that would execute it (plan 103 §10h FINDING 4).
+    ///
+    /// The measured defect: `approvals.ttl_secs` defaults to 3600s while govder
+    /// compiles an L3·High use token with a **900s** TTL, so vultrino offered an
+    /// approval for four times as long as the credential could honour it. A human
+    /// who decided inside the advertised window got `Approved` recorded and the
+    /// action refused at resume with `use token has expired` — an approver signing
+    /// an irreversible money action that then never ran.
+    ///
+    /// `credential_remaining` is the time left on the use token driving the request:
+    /// * `None` — the request is not use-token-driven (a local/API-key caller), or
+    ///   the token carries no expiry (`max_uses` alone bounds it). There is no
+    ///   credential deadline to clamp against, so the configured SLA stands.
+    /// * `Some(d)` — the deadline. The returned windows always sum to `min(total, d)`.
+    ///
+    /// Returns `None` when the credential is ALREADY dead (or dies inside the same
+    /// second): the caller must then REFUSE to open the approval rather than create
+    /// one no approver could ever make good on. That is fail-closed in both
+    /// directions — nothing executes, and no human is invited to authorize something
+    /// that cannot run.
+    ///
+    /// Both phases are scaled by `remaining / total` rather than truncating the
+    /// second window, so a clamped request keeps its two-phase escalate-then-expire
+    /// shape (a High request clamped from 900+900 to 900 total escalates at 450s)
+    /// instead of degenerating into "escalates exactly when it expires".
+    pub fn clamped_to_credential(
+        &self,
+        credential_remaining: Option<chrono::Duration>,
+    ) -> Option<(chrono::Duration, chrono::Duration)> {
+        let after = self.escalate_after();
+        let window = self.escalate_window();
+        let remaining = match credential_remaining {
+            None => return Some((after, window)),
+            Some(r) => r,
+        };
+        // Whole seconds only: `open()` stamps `expires_at` from these durations and
+        // a sub-second remainder is not a window any human can decide inside, so it
+        // is treated as "already dead" (refuse) rather than rounded up into one.
+        let rem_secs = remaining.num_seconds();
+        if rem_secs <= 0 {
+            return None;
+        }
+        let total_secs = (after + window).num_seconds().max(1);
+        if total_secs <= rem_secs {
+            return Some((after, window));
+        }
+        // i128 so the product cannot overflow for any credential TTL an operator
+        // can express.
+        let scaled_after =
+            (after.num_seconds() as i128 * rem_secs as i128 / total_secs as i128) as i64;
+        let after_secs = scaled_after.clamp(0, rem_secs);
+        Some((
+            chrono::Duration::seconds(after_secs),
+            chrono::Duration::seconds(rem_secs - after_secs),
+        ))
     }
 }
 
@@ -3685,5 +3837,201 @@ mod finding_6a_startup_warning_tests {
             "a correctly configured deployment must not be warned; a warning that always fires \
              is one nobody reads"
         );
+    }
+}
+
+#[cfg(test)]
+mod finding4_tests {
+    use super::*;
+
+    fn sla(after: u64, window: u64) -> CriticalitySla {
+        CriticalitySla {
+            escalate_after_secs: after,
+            escalate_window_secs: window,
+        }
+    }
+
+    /// FINDING 4 (plan 103 §10h): the SHIPPED divergence, in numbers. govder's
+    /// scope table compiles an L3·High use token at **900s**
+    /// (`internal/enforce/scope.go`), while the High criticality SLA is 15+15
+    /// minutes (**1800s**) and the legacy `approvals.ttl_secs` default is 3600s. An
+    /// approval offered for 1800s (or 3600s) against a 900s credential is an
+    /// approval a human can sign and nothing can execute.
+    #[test]
+    fn clamp_binds_the_approval_window_to_an_l3_high_use_token() {
+        let high = sla(15 * 60, 15 * 60);
+        let (after, window) = high
+            .clamped_to_credential(Some(chrono::Duration::seconds(900)))
+            .expect("a 900s credential is alive, so the approval must open");
+        assert_eq!(
+            (after + window).num_seconds(),
+            900,
+            "the final deadline must equal the credential's remaining life, not 1800s"
+        );
+        // Both phases survive proportionally: escalate at the halfway point, so a
+        // clamped request still escalates BEFORE it expires.
+        assert_eq!(after.num_seconds(), 450);
+        assert_eq!(window.num_seconds(), 450);
+    }
+
+    /// The clamp only ever SHRINKS the window. A credential with more life left than
+    /// the configured SLA must not extend the approval — the SLA is still a real
+    /// policy bound, and widening it here would be fail-open.
+    #[test]
+    fn clamp_never_extends_the_window_past_the_configured_sla() {
+        let high = sla(15 * 60, 15 * 60);
+        let (after, window) = high
+            .clamped_to_credential(Some(chrono::Duration::seconds(86_400)))
+            .unwrap();
+        assert_eq!(after.num_seconds(), 900);
+        assert_eq!(window.num_seconds(), 900);
+    }
+
+    /// No credential deadline to clamp against (a local/API-key caller, or a token
+    /// bounded only by `max_uses`): the configured SLA stands, byte-identical to the
+    /// pre-fix behavior.
+    #[test]
+    fn clamp_is_a_no_op_without_a_credential_deadline() {
+        let medium = sla(1800, 1800);
+        let (after, window) = medium.clamped_to_credential(None).unwrap();
+        assert_eq!(after.num_seconds(), 1800);
+        assert_eq!(window.num_seconds(), 1800);
+    }
+
+    /// A dead (or sub-second) credential yields `None` — the caller must REFUSE to
+    /// open. Opening a 0-second approval would invite a human to authorize an action
+    /// that is already impossible; refusing executes nothing and says so.
+    #[test]
+    fn clamp_refuses_when_the_credential_is_already_dead() {
+        let high = sla(900, 900);
+        assert!(high
+            .clamped_to_credential(Some(chrono::Duration::seconds(0)))
+            .is_none());
+        assert!(high
+            .clamped_to_credential(Some(chrono::Duration::seconds(-30)))
+            .is_none());
+        assert!(
+            high.clamped_to_credential(Some(chrono::Duration::milliseconds(800)))
+                .is_none(),
+            "a sub-second remainder is not a decidable window"
+        );
+    }
+
+    /// A very short but real window still opens, with both phases inside it.
+    #[test]
+    fn clamp_keeps_a_short_window_inside_the_credential() {
+        let high = sla(900, 900);
+        let (after, window) = high
+            .clamped_to_credential(Some(chrono::Duration::seconds(30)))
+            .unwrap();
+        assert_eq!((after + window).num_seconds(), 30);
+        assert!(after.num_seconds() >= 0 && window.num_seconds() >= 0);
+    }
+
+    fn approved_request() -> ApprovalRequest {
+        let (mut a, _t) = tests_support::open_minimal();
+        a.status = ApprovalStatus::Approved;
+        a
+    }
+
+    /// FINDING 4 layer 3: the measured misreport. The approval is granted, the
+    /// credential that would execute it is dead, and the decision response must say
+    /// BLOCKED — never a state a UI can paint as a completed action.
+    #[test]
+    fn execution_state_is_blocked_when_the_credential_cannot_execute() {
+        let a = approved_request();
+        assert!(!a.executed);
+        let (state, reason) = execution_state_at_decision(
+            &a,
+            &CredentialCheck::Unusable("use token has expired".to_string()),
+        );
+        assert_eq!(state, ExecutionState::Blocked);
+        assert_eq!(state.as_wire(), "blocked");
+        assert_eq!(reason.as_deref(), Some("use token has expired"));
+    }
+
+    /// The discriminating control: the SAME granted, unexecuted approval with a
+    /// LIVE credential is `awaiting_execution`. If the classifier answered "blocked"
+    /// here, the state would be worthless (it would flag every healthy grant).
+    #[test]
+    fn execution_state_is_awaiting_when_the_credential_is_alive() {
+        let a = approved_request();
+        let (state, reason) = execution_state_at_decision(&a, &CredentialCheck::Usable);
+        assert_eq!(state, ExecutionState::AwaitingExecution);
+        assert_eq!(state.as_wire(), "awaiting_execution");
+        assert!(reason.is_none());
+    }
+
+    /// An unreadable credential lookup is `awaiting_execution` with no invented
+    /// reason — never `Usable`-by-default and never a "will run" claim.
+    #[test]
+    fn execution_state_never_claims_a_dead_credential_is_fine_on_an_unknown_lookup() {
+        let a = approved_request();
+        let (state, _) = execution_state_at_decision(&a, &CredentialCheck::Unknown);
+        assert_eq!(state, ExecutionState::AwaitingExecution);
+    }
+
+    /// A terminal failure is `failed`, carrying vultrino's own recorded reason —
+    /// this is the state the product UI painted as "Approved. Recorded just now."
+    #[test]
+    fn execution_state_separates_a_failed_run_from_a_completed_one() {
+        let mut failed = approved_request();
+        failed.executed = true;
+        failed.result_error = Some("use token has expired".to_string());
+        let (state, reason) = execution_state_at_decision(&failed, &CredentialCheck::NotApplicable);
+        assert_eq!(state, ExecutionState::Failed);
+        assert_eq!(state.as_wire(), "failed");
+        assert_eq!(reason.as_deref(), Some("use token has expired"));
+
+        let mut ok = approved_request();
+        ok.executed = true;
+        ok.result_status = Some(200);
+        let (state, reason) = execution_state_at_decision(&ok, &CredentialCheck::NotApplicable);
+        assert_eq!(state, ExecutionState::Executed);
+        assert_eq!(state.as_wire(), "executed");
+        assert!(reason.is_none());
+    }
+
+    /// A still-open or denied request implies nothing about execution.
+    #[test]
+    fn execution_state_is_not_applicable_for_a_non_approved_request() {
+        let (mut pending, _t) = tests_support::open_minimal();
+        assert_eq!(pending.status, ApprovalStatus::Pending);
+        let (state, _) = execution_state_at_decision(&pending, &CredentialCheck::Usable);
+        assert_eq!(state, ExecutionState::NotApplicable);
+        assert_eq!(state.as_wire(), "not_applicable");
+
+        pending.status = ApprovalStatus::Denied;
+        let (state, _) = execution_state_at_decision(&pending, &CredentialCheck::Usable);
+        assert_eq!(state, ExecutionState::NotApplicable);
+    }
+
+    mod tests_support {
+        use super::*;
+
+        pub fn open_minimal() -> (ApprovalRequest, String) {
+            ApprovalRequest::open(NewApproval {
+                credential: "stripe-prod".to_string(),
+                action: "http.request".to_string(),
+                params: serde_json::json!({"method": "post"}),
+                requester: RequesterInfo::local(),
+                use_token_id: Some("ut_1".to_string()),
+                principal_id: None,
+                agent_label: None,
+                tenant: None,
+                workload_id: None,
+                preview: None,
+                action_label: Some("payments.refund".to_string()),
+                dual_control: false,
+                criticality: CriticalityClass::Medium,
+                trusted_irreversible: None,
+                escalate_after: chrono::Duration::minutes(15),
+                escalate_window: chrono::Duration::minutes(15),
+                oob_identity: None,
+                reauth_interval_secs: None,
+                required_approvals: 1,
+                approval_rule: None,
+            })
+        }
     }
 }
