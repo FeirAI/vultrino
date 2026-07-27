@@ -659,30 +659,54 @@ async fn llm_proxy_impl(
 mod tests {
     use super::{clamp_max_output_tokens, is_openai_chat_endpoint, provider_feature_enabled};
     use serde_json::json;
+    use std::sync::Mutex;
+
+    /// Serialises the two tests that touch VULTRINO_PROVIDER_NVIDIA_ENABLED.
+    ///
+    /// Both of their comments claimed to use "a switch no other test touches", and both were
+    /// WRONG about each other: `nvidia_gate_is_independent_of_openai` set_var's that key while
+    /// `provider_gate_fails_closed_for_unmapped_protocols` asserts the same key is unset. The
+    /// process environment is global and cargo runs these on parallel threads, so the reader
+    /// failed whenever it sampled inside the writer's set/remove window.
+    ///
+    /// This is NOT new code (the pair predates plan 103's integration: both are present at
+    /// `d62f718` lines 664/679/682, and the writer arrived in `907e4f7`). It became VISIBLE at
+    /// merge time because the merged lib carries more tests, which changes the scheduler's timing
+    /// and widens the window: measured 2 failures in 5 runs on the merged tree against 0 in 6 on
+    /// the pre-merge tree. A latent race that only some builds lose is worse than a loud one, so
+    /// it is closed here rather than left to reappear as an unexplained red.
+    ///
+    /// A mutex rather than dropping the assertion: "an unset NVIDIA switch denies" is a real
+    /// fail-closed property and deleting it to dodge the race would trade a flake for a hole.
+    /// Same shape as tests/workload_exchange_integration.rs's ENV_LOCK.
+    static PROVIDER_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn provider_gate_fails_closed_for_unmapped_protocols() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // No VULTRINO_PROVIDER_* switch maps these, so they must be DENIED even though
-        // "observed-only" passes capability validation. Uses protocols whose env flags
-        // no other test touches, to stay race-free under parallel test execution.
+        // "observed-only" passes capability validation.
         assert!(!provider_feature_enabled("observed-only"));
         assert!(!provider_feature_enabled("openai_chat")); // typo'd / unknown
         assert!(!provider_feature_enabled(""));
         // A mapped protocol whose switch is unset is also denied (default-deny).
         assert!(!provider_feature_enabled("vertex-ai"));
         // nvidia is a real, separately-gated provider: unset => denied (does NOT ride
-        // the generic OpenAI switch).
+        // the generic OpenAI switch). Held under PROVIDER_ENV_LOCK because
+        // nvidia_gate_is_independent_of_openai sets this very switch.
         assert!(!provider_feature_enabled("nvidia"));
     }
 
     #[test]
     fn nvidia_gate_is_independent_of_openai() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Enabling NVIDIA must not require (or imply) the generic OpenAI provider, and
-        // vice-versa. Uses a switch no other test touches to stay race-free.
+        // vice-versa.
         std::env::set_var("VULTRINO_PROVIDER_NVIDIA_ENABLED", "1");
         assert!(provider_feature_enabled("nvidia"));
         // openai-chat stays denied unless ITS own switch is set.
         assert!(!provider_feature_enabled("openai-chat"));
+        // Restored before the lock drops, so the reader above never observes it set.
         std::env::remove_var("VULTRINO_PROVIDER_NVIDIA_ENABLED");
     }
 
