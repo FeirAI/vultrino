@@ -337,6 +337,17 @@ async fn build_admin_router_full(
 async fn build_tenant_admin_router(
     tenant: &str,
 ) -> (axum::Router, Arc<dyn StorageBackend>, String) {
+    build_tenant_admin_router_with_config(tenant, Config::default()).await
+}
+
+/// [`build_tenant_admin_router`] with a caller-supplied [`Config`] for BOTH the exec
+/// server and the web state, so a test can drive `/api/v1/execute` (approvals enabled,
+/// govder wired) and then decide the resulting approval through the same router — the
+/// two halves of an approval's life, in one process.
+async fn build_tenant_admin_router_with_config(
+    tenant: &str,
+    config: Config,
+) -> (axum::Router, Arc<dyn StorageBackend>, String) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
     std::mem::forget(dir);
@@ -356,7 +367,7 @@ async fn build_tenant_admin_router(
     let admin = AdminAuth::new("admin", "password123").unwrap();
     let resolver = vultrino::router::CredentialResolver::new(storage.clone());
     let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
-        Config::default(),
+        config.clone(),
         storage.clone(),
         resolver,
     ));
@@ -365,7 +376,7 @@ async fn build_tenant_admin_router(
             bind: "127.0.0.1:0".to_string(),
             enabled: true,
         },
-        Config::default(),
+        config,
         storage.clone(),
         auth_manager,
         admin,
@@ -5684,6 +5695,21 @@ async fn execute_against_require_approval_credential(
     router: axum::Router,
     storage: &Arc<dyn StorageBackend>,
 ) -> axum::response::Response {
+    execute_against_require_approval_credential_with_reversibility(router, storage, None).await
+}
+
+/// As above, but optionally register a stored capability for the action so vultrino's
+/// TRUSTED irreversibility (`trusted_irreversible_for_action`) resolves to a known
+/// value instead of the fail-closed "no capability metadata matched → assume the human
+/// floor" default. Pass `Some("reversible")` to exercise the reversible arm of the
+/// inconclusive-gate decision, `Some("irreversible")` for the money arm, and `None` to
+/// keep the historical fixture (no catalog at all → irreversible by fail-closed
+/// default).
+async fn execute_against_require_approval_credential_with_reversibility(
+    router: axum::Router,
+    storage: &Arc<dyn StorageBackend>,
+    reversibility: Option<&str>,
+) -> axum::response::Response {
     use vultrino::{Credential, CredentialData, Secret};
 
     let cred = Credential::new(
@@ -5696,6 +5722,30 @@ async fn execute_against_require_approval_credential(
     )
     .with_metadata("require_approval", "true");
     storage.store(&cred).await.unwrap();
+
+    if let Some(rev) = reversibility {
+        use vultrino::capability::{Capability, CapabilityTarget};
+        storage
+            .store_capability(&Capability {
+                id: "cap-gate-rule-fixture".to_string(),
+                tool_name: "fixture_call".to_string(),
+                description: "gate-rule fixture".to_string(),
+                action: "http.request".to_string(),
+                plugin: Some("http".to_string()),
+                target: CapabilityTarget {
+                    url_glob: Some("https://api.example.com/*".to_string()),
+                    methods: vec!["GET".to_string()],
+                    plugin_params: serde_json::Map::new(),
+                },
+                credential_ref: "api-cred".to_string(),
+                input_schema: serde_json::json!({"type":"object"}),
+                reversibility: rev.to_string(),
+                llm: None,
+                approval_preview: None,
+            })
+            .await
+            .unwrap();
+    }
 
     let (secret, mut token) = UseToken::create(NewUseToken {
         name: "gate-rule-fixture".to_string(),
@@ -5720,6 +5770,75 @@ async fn execute_against_require_approval_credential(
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     router.oneshot(req).await.unwrap()
+}
+
+/// A mock govder that mirrors the REAL gate store's key axes: it serves a stamped rule
+/// ONLY for the exact `(agent_id, action_class)` pair it was seeded with, and answers a
+/// reason-coded 404 for anything else — which is what govder does for a key it holds no
+/// record under. It also records every `action_class` it was asked for, so a test can
+/// assert WHICH name the execute path used.
+///
+/// This exists because the FINDING 1 axis defects are invisible to a mock that answers
+/// the same body regardless of the query: both halves of the bug were "vultrino asked
+/// under a name nothing was filed under", and only a key-sensitive fake can catch that.
+async fn start_mock_govder_keyed_gate(
+    want_agent_id: &str,
+    want_action_class: &str,
+    rule_body: serde_json::Value,
+) -> (GovderConfig, Arc<std::sync::Mutex<Vec<String>>>) {
+    #[derive(Clone)]
+    struct S {
+        agent: String,
+        class: String,
+        body: serde_json::Value,
+        asked: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    async fn handler(
+        axum::extract::State(s): axum::extract::State<S>,
+        axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let agent = q.get("agent_id").cloned().unwrap_or_default();
+        let class = q.get("action_class").cloned().unwrap_or_default();
+        s.asked.lock().unwrap().push(class.clone());
+        if agent == s.agent && class == s.class {
+            return (StatusCode::OK, axum::Json(s.body.clone())).into_response();
+        }
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "no gate configured for this agent_id/action_class",
+                // The agent id matched, so govder would know the agent; only the action
+                // class is unfiled. Durable, so the absence is definitive per-name.
+                "reason": "no_gate_for_action_class",
+                "gate_store_durable": true,
+            })),
+        )
+            .into_response()
+    }
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = axum::Router::new()
+        .route("/v1/oversight/gates/rule", axum::routing::get(handler))
+        .with_state(S {
+            agent: want_agent_id.to_string(),
+            class: want_action_class.to_string(),
+            body: rule_body,
+            asked: asked.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (
+        GovderConfig {
+            base_url: format!("http://{addr}"),
+            assertion_secret: "test-govder-assertion-secret".to_string(),
+            assertion_ttl: Duration::from_secs(90),
+            http_timeout: Duration::from_secs(5),
+        },
+        asked,
+    )
 }
 
 /// A mock govder that answers `GET /v1/oversight/gates/rule` with a caller-fixed
@@ -5824,13 +5943,23 @@ async fn execute_open_fails_closed_when_gate_rule_returns_5xx() {
     );
 }
 
-/// PARITY (unchanged behavior): a 404 — no gate configured for this
-/// agent/action — is a CONFIRMED no-rule answer, so the action must still open
-/// via today's numeric-threshold path exactly as if govder weren't configured
-/// at all.
+/// PARITY (unchanged behavior): a CONFIRMED absence — govder reports it holds an agent
+/// record under this key, has no gate for this action class, and its gate store is
+/// DURABLE (so it cannot have lost one) — still opens via the numeric-threshold path.
+///
+/// This is what the old bare-404 parity test asserted, now with govder actually
+/// CONFIRMING the absence rather than the client inferring it from a status code.
 #[tokio::test]
-async fn execute_open_numeric_path_parity_when_gate_rule_is_404() {
-    let govder = start_mock_govder_gate_rule(StatusCode::NOT_FOUND, serde_json::json!({})).await;
+async fn execute_open_numeric_path_parity_when_gate_absence_is_confirmed() {
+    let govder = start_mock_govder_gate_rule(
+        StatusCode::NOT_FOUND,
+        serde_json::json!({
+            "error": "no gate configured for this agent_id/action_class",
+            "reason": "no_gate_for_action_class",
+            "gate_store_durable": true,
+        }),
+    )
+    .await;
     let config = approval_open_test_config(govder);
     let (router, storage) = build_router_with_config(config).await;
 
@@ -5838,12 +5967,442 @@ async fn execute_open_numeric_path_parity_when_gate_rule_is_404() {
     assert_eq!(
         resp.status(),
         StatusCode::ACCEPTED,
-        "a 404 (confirmed no gate) must still open via the numeric-threshold path"
+        "a CONFIRMED absence (known agent, no gate, durable store) must still open via the \
+         numeric-threshold path"
     );
 
     let approvals = storage.list_approvals().await.unwrap();
     assert_eq!(approvals.len(), 1);
     assert!(approvals[0].approval_rule.is_none());
+    assert_eq!(approvals[0].required_approvals, 1);
+}
+
+// ===== plan 103 §10h FINDING 1/2: an INCONCLUSIVE gate lookup is not "no rule" =====
+//
+// The defect these pin: govder's 404 covered BOTH "this agent has no gate for this
+// action class" and "I cannot resolve that identity at all", and vultrino mapped the
+// status straight to "CONFIRMED no rule". The live measurement was that vultrino asks
+// under the EnforcementPrincipal (`ep_…`, the label on the use token) while the gate is
+// keyed by the AgentDefinition id, so EVERY money call took the 404 branch, fell back to
+// the numeric threshold, and required ONE approver for a refund the operator had gated
+// at two distinct humans.
+//
+// The refusal is scoped to IRREVERSIBLE actions on purpose: for a reversible action an
+// unconfirmed recipe costs a reviewer, not a payment, so the numeric path stays exactly
+// as it was and the whole non-money world is unaffected.
+
+/// An UNQUALIFIED 404 (the shape every govder before this fix returned, and the shape a
+/// future build that drops the reason field would return) must NOT run an irreversible
+/// action under the weaker single-approver path. Proven two ways: the call is not
+/// accepted, AND no approval is persisted — so no notification fires and the use token is
+/// not consumed.
+#[tokio::test]
+async fn execute_refuses_an_irreversible_action_when_a_bare_404_cannot_confirm_the_recipe() {
+    let govder = start_mock_govder_gate_rule(
+        StatusCode::NOT_FOUND,
+        serde_json::json!({ "error": "no gate configured for this agent_id/action_class" }),
+    )
+    .await;
+    let config = approval_open_test_config(govder);
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential_with_reversibility(
+        router,
+        &storage,
+        Some("irreversible"),
+    )
+    .await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "an unqualified 404 must not open an irreversible action under the numeric path — that \
+         is exactly how one approver cleared a two-key refund"
+    );
+    assert!(
+        storage.list_approvals().await.unwrap().is_empty(),
+        "no approval may be opened when the recipe could not be confirmed: an opened approval \
+         reserves a use and notifies humans as if the requirement were known"
+    );
+}
+
+/// The FINDING 1 shape, named by govder: the identity could not be resolved under the
+/// key vultrino asked with. An irreversible action must refuse.
+#[tokio::test]
+async fn execute_refuses_an_irreversible_action_when_the_agent_is_unresolvable_to_govder() {
+    let govder = start_mock_govder_gate_rule(
+        StatusCode::NOT_FOUND,
+        serde_json::json!({
+            "error": "no agent record under this agent_id",
+            "reason": "agent_unknown_under_this_key",
+            "gate_store_durable": true,
+        }),
+    )
+    .await;
+    let config = approval_open_test_config(govder);
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential_with_reversibility(
+        router,
+        &storage,
+        Some("irreversible"),
+    )
+    .await;
+    assert_ne!(resp.status(), StatusCode::ACCEPTED);
+    assert!(storage.list_approvals().await.unwrap().is_empty());
+}
+
+/// The FINDING 2 shape: govder's gate store is VOLATILE, so "no gate" is
+/// indistinguishable from "a restart dropped the six money recipes". An irreversible
+/// action must refuse rather than silently run on one signature.
+#[tokio::test]
+async fn execute_refuses_an_irreversible_action_when_the_gate_store_is_volatile() {
+    let govder = start_mock_govder_gate_rule(
+        StatusCode::NOT_FOUND,
+        serde_json::json!({
+            "error": "no gate configured for this agent_id/action_class",
+            "reason": "no_gate_for_action_class",
+            "gate_store_durable": false,
+        }),
+    )
+    .await;
+    let config = approval_open_test_config(govder);
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential_with_reversibility(
+        router,
+        &storage,
+        Some("irreversible"),
+    )
+    .await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a volatile gate store cannot tell an unconfigured gate from a dropped one, so an \
+         irreversible action must not run on the weaker path"
+    );
+    assert!(storage.list_approvals().await.unwrap().is_empty());
+}
+
+/// Drive `/api/v1/execute` with an ACTION LABEL (`money.refund`) that the operator config
+/// maps to a canonical plugin verb, against a `require_approval` credential and an
+/// irreversible capability — the shipped money shape.
+async fn execute_labelled_money_action(
+    router: axum::Router,
+    storage: &Arc<dyn StorageBackend>,
+    agent_label: &str,
+) -> axum::response::Response {
+    use vultrino::capability::{Capability, CapabilityTarget};
+    use vultrino::{Credential, CredentialData, Secret};
+
+    let cred = Credential::new(
+        "money-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("secret"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    )
+    .with_metadata("require_approval", "true");
+    storage.store(&cred).await.unwrap();
+
+    // The capability declares the LABEL as its action, exactly as a pack does, and is
+    // irreversible — so `trusted_irreversible_for_action` resolves to the money floor
+    // from stored metadata rather than the fail-closed default.
+    storage
+        .store_capability(&Capability {
+            id: "cap-payments-refund".to_string(),
+            tool_name: "issue_refund".to_string(),
+            description: "Issue a refund".to_string(),
+            action: "money.refund".to_string(),
+            plugin: Some("http".to_string()),
+            target: CapabilityTarget {
+                url_glob: Some("https://api.example.com/*".to_string()),
+                methods: vec!["POST".to_string()],
+                plugin_params: serde_json::Map::new(),
+            },
+            credential_ref: "money-cred".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+            reversibility: "irreversible".to_string(),
+            llm: None,
+            approval_preview: None,
+        })
+        .await
+        .unwrap();
+
+    let (secret, mut token) = UseToken::create(NewUseToken {
+        name: "refund-sender".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.tenant = Some("acme".to_string());
+    token.agent_label = Some(agent_label.to_string());
+    storage.store_use_token(&token).await.unwrap();
+
+    let body = serde_json::json!({
+        "credential": "money-cred", "action": "money.refund",
+        "method": "POST", "url": "https://api.example.com/v1/refunds"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/execute")
+        .header("authorization", format!("Bearer {}", secret))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    router.oneshot(req).await.unwrap()
+}
+
+/// THE ACTION-CLASS AXIS (§10h FINDING 1's unrecorded second half). Every writer of a
+/// gate names the action class with the govder ACTION LABEL — the broker's
+/// set-approval-recipe op, the template instantiate, and `orgpack apply`'s own recipe
+/// verify all use `capability.Action` (`money.refund`). The execute path resolved the
+/// label to its canonical plugin verb first and asked govder for THAT
+/// (`http.request`/`internal_http.request`), a name no writer ever wrote — so the gate
+/// was unfindable on this axis too, independently of the agent id.
+///
+/// The mock is KEY-SENSITIVE: it serves the rule only for the exact pair it was seeded
+/// with. If the execute path asks under the canonical verb only, it gets a 404 and no
+/// rule is stamped.
+#[tokio::test]
+async fn the_gate_is_found_when_it_is_keyed_by_the_govder_action_label() {
+    let (govder, asked) = start_mock_govder_keyed_gate(
+        "ep_refundprocessor",
+        "money.refund", // authored under the LABEL, as every writer does
+        serde_json::json!({
+            "gate_id": "gate-money-refund",
+            "agent_id": "refund-processor@1.0",
+            "action_class": "money.refund",
+            "has_rule": true,
+            "risk_tier": "High",
+            "irreversible": true,
+            "approval_rule": {
+                "recipes": [{"terms": [
+                    {"class": "senior", "count": 1},
+                    {"class": "teammate", "count": 1},
+                ]}],
+                "decision_mode": "deny-on-any-deny",
+            },
+        }),
+    )
+    .await;
+    let mut config = approval_open_test_config(govder);
+    // The operator config the fintech packs ship: the money verbs are LABELS that resolve
+    // to one canonical transport verb.
+    config
+        .action_labels
+        .insert("money.refund".to_string(), "http.request".to_string());
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_labelled_money_action(router, &storage, "ep_refundprocessor").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "the gated money action must open an approval"
+    );
+
+    let names = asked.lock().unwrap().clone();
+    assert!(
+        names.contains(&"money.refund".to_string()),
+        "the execute path must ask govder for the gate under the ACTION LABEL every writer \
+         authored it with; it asked for {names:?}"
+    );
+
+    let approvals = storage.list_approvals().await.unwrap();
+    assert_eq!(approvals.len(), 1);
+    assert!(
+        approvals[0].approval_rule.is_some(),
+        "the two-key recipe must be STAMPED on the approval. It was not found under the \
+         canonical plugin verb, only under the label — asking for one name only is how this \
+         gate was never in force at execute time (§10h FINDING 1)"
+    );
+    assert!(
+        approvals[0].authoritative_irreversible,
+        "govder's authoritative risk facts must ride along with the found rule"
+    );
+}
+
+/// THE CONTRACT TEST: how many DISTINCT humans a two-key money recipe actually requires.
+///
+/// WHY IT IS WRITTEN THIS WAY. Every earlier approval proof in plan 103 asserted that the
+/// gate PAUSED the action — a 202, an approval row, an empty ledger. All of those are
+/// true when the recipe requires two humans AND when it has silently degraded to one, so
+/// 121 cluster assertions and a passing money e2e both missed that a single approver
+/// cleared an irreversible refund. The only assertion that distinguishes the two is a
+/// COUNT of distinct approvers, so that is what this asserts: after ONE human signs, the
+/// approval is still Pending and nothing has executed; only the SECOND, distinct human
+/// grants it.
+///
+/// The mock returns the shipped Payments recipe shape (`senior:1` + `teammate:1`,
+/// deny-on-any-deny) under the EnforcementPrincipal-shaped `agent_label` a real `vut_`
+/// token carries — the identity axis of §10h FINDING 1.
+#[tokio::test]
+async fn a_two_key_money_recipe_requires_two_distinct_humans_not_one() {
+    let govder = start_mock_govder_gate_rule(
+        StatusCode::OK,
+        serde_json::json!({
+            "gate_id": "gate-money-refund",
+            "agent_id": "refund-processor@1.0",
+            "action_class": "http.request",
+            "has_rule": true,
+            "risk_tier": "High",
+            "irreversible": true,
+            "approval_rule": {
+                "recipes": [{"terms": [
+                    {"class": "senior", "count": 1},
+                    {"class": "teammate", "count": 1},
+                ]}],
+                "decision_mode": "deny-on-any-deny",
+            },
+        }),
+    )
+    .await;
+    let config = approval_open_test_config(govder);
+    let (router, storage, admin_key) =
+        build_tenant_admin_router_with_config("acme", config.clone()).await;
+
+    // The agent asks. Its token carries the EnforcementPrincipal as `agent_label`,
+    // exactly as govder mints it, and the capability is irreversible.
+    let resp = execute_against_require_approval_credential_with_reversibility(
+        router.clone(),
+        &storage,
+        Some("irreversible"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a gated money action must open an approval"
+    );
+
+    let approvals = storage.list_approvals().await.unwrap();
+    assert_eq!(approvals.len(), 1, "exactly one approval should be open");
+    let approval_id = approvals[0].id.clone();
+    assert!(
+        approvals[0].approval_rule.is_some(),
+        "the govder-authored recipe must be STAMPED on the approval at open — without it the \
+         approval falls back to a plain approver count and the two-key requirement is not in \
+         force at execute time (§10h FINDING 1)"
+    );
+
+    // FIRST distinct human signs off.
+    let first = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{approval_id}/decision"),
+            &admin_key,
+            serde_json::json!({"approve": true, "approver": "dana.reeve@acme.test",
+                               "approver_class": "senior"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "the first sign-off must be accepted: {}",
+        body_string(first).await
+    );
+
+    // THE ASSERTION THAT WOULD HAVE CAUGHT THE DEFECT: one signature is not enough.
+    let after_one = storage
+        .get_approval(&approval_id)
+        .await
+        .unwrap()
+        .expect("approval still present");
+    assert_eq!(
+        after_one.signoffs.len(),
+        1,
+        "exactly one sign-off should be recorded"
+    );
+    assert!(
+        !matches!(after_one.status, vultrino::approval::ApprovalStatus::Approved),
+        "ONE human must NOT be able to clear a two-key money action — status is {:?} after a \
+         single sign-off. This is the exact failure the live run measured: the recipe was \
+         declared, `orgpack status` reported it MATCHing, and the enforced requirement was one \
+         approver.",
+        after_one.status
+    );
+    assert!(
+        !after_one.executed,
+        "nothing may execute on one signature of a two-key money action"
+    );
+
+    // SECOND, DISTINCT human signs off → now it grants.
+    let second = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{approval_id}/decision"),
+            &admin_key,
+            serde_json::json!({"approve": true, "approver": "sam.okafor@acme.test",
+                               "approver_class": "teammate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::OK,
+        "the second sign-off must be accepted: {}",
+        body_string(second).await
+    );
+
+    let after_two = storage
+        .get_approval(&approval_id)
+        .await
+        .unwrap()
+        .expect("approval still present");
+    assert_eq!(
+        after_two.signoffs.len(),
+        2,
+        "two sign-offs should be recorded"
+    );
+    assert!(
+        matches!(after_two.status, vultrino::approval::ApprovalStatus::Approved),
+        "two DISTINCT humans filling the recipe's two slots must grant it; got {:?}",
+        after_two.status
+    );
+    let identities: std::collections::BTreeSet<String> = after_two
+        .signoffs
+        .iter()
+        .map(|s| s.approver_identity.to_ascii_lowercase())
+        .collect();
+    assert_eq!(
+        identities.len(),
+        2,
+        "the two sign-offs must come from two DISTINCT identities, got {identities:?}"
+    );
+}
+
+/// The other side of the scoping, and the reason this change is not a flag day: a
+/// REVERSIBLE action with the same unconfirmable gate answer still opens on the numeric
+/// path, exactly as before. Only irreversible actions are refused.
+#[tokio::test]
+async fn execute_still_opens_a_reversible_action_when_the_gate_answer_is_inconclusive() {
+    let govder = start_mock_govder_gate_rule(
+        StatusCode::NOT_FOUND,
+        serde_json::json!({ "error": "no gate configured" }),
+    )
+    .await;
+    let config = approval_open_test_config(govder);
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential_with_reversibility(
+        router,
+        &storage,
+        Some("reversible"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a reversible action must be unaffected: an unconfirmed recipe there costs a reviewer, \
+         not a payment"
+    );
+    let approvals = storage.list_approvals().await.unwrap();
+    assert_eq!(approvals.len(), 1);
     assert_eq!(approvals[0].required_approvals, 1);
 }
 

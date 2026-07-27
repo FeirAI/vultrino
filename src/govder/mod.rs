@@ -188,6 +188,55 @@ pub struct FetchedGateRule {
     pub irreversible: bool,
 }
 
+/// Wire shape of the 404 body of `GET /v1/oversight/gates/rule` (govder's
+/// `GateApprovalRuleAbsence`, plan 103 §10h FINDING 1/2). Every field is optional
+/// because an OLDER govder answers a bare `{"error": …}` — and the whole point of this
+/// type is that such a body is NOT a confirmed absence.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GateApprovalRuleAbsence {
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    gate_store_durable: Option<bool>,
+}
+
+/// govder's reason code for "this known agent has no gate bound to this action class".
+/// The ONLY absence that can be definitive, and only when the gate store is durable.
+const GATE_ABSENCE_NO_GATE_FOR_ACTION_CLASS: &str = "no_gate_for_action_class";
+
+/// The three ANSWERS a gate-rule lookup can produce (plan 103 §10h FINDING 1/2).
+///
+/// This type exists because the previous two-state result (`Option<FetchedGateRule>`)
+/// could not express the state that actually mattered. `None` meant "govder CONFIRMED
+/// there is no rule", and a 404 was mapped to it — but govder's 404 also covered "I
+/// cannot resolve that identity at all", which is what the FINDING 1 key-axis mismatch
+/// produced on every single money call. So an UNANSWERED question was recorded as an
+/// answered one, vultrino fell back to its numeric threshold, and an irreversible refund
+/// that the operator had gated at two distinct humans executed on ONE approval.
+///
+/// The distinction is not cosmetic: `NoRule` is a licence to use the weaker numeric
+/// path, and only govder can grant it.
+#[derive(Debug, Clone)]
+pub enum GateRuleAnswer {
+    /// govder returned a stamped rule plus its authoritative risk facts.
+    Rule(FetchedGateRule),
+    /// govder CONFIRMED there is no recipe for this (agent, action_class): either a gate
+    /// exists with no rule (`has_rule:false`), or no gate exists for an agent govder
+    /// knows AND govder's gate store is durable (so the absence cannot be a loss), or
+    /// this deployment wires no govder at all (there is no recipe authority to consult).
+    /// The numeric-threshold path is correct here.
+    NoRule,
+    /// govder did NOT confirm anything: it could not resolve the identity under the key
+    /// it was given, its gate store is volatile so an absent gate may be a dropped one,
+    /// or it answered a 404 with no reason code at all (an older govder — an unqualified
+    /// 404, which is precisely the ambiguity the reason code removes).
+    ///
+    /// This is NOT an error: govder answered, and for a REVERSIBLE action the numeric
+    /// path remains the right, unchanged behaviour. For an irreversible/money action the
+    /// caller must fail closed — see `ServerState::execute`.
+    Inconclusive { reason: String },
+}
+
 /// HTTP client for govder delegation endpoints.
 #[derive(Clone)]
 pub struct GovderClient {
@@ -337,10 +386,16 @@ impl GovderClient {
 
     /// Fetch the stamped `ApprovalRule` (if any) for `(agent_id, action_class)` at
     /// approval-open (plan 100 P2 Phase D; docs/design/approval-recipes.md §6 D5).
-    /// `GET /v1/oversight/gates/rule` — 404 (no gate configured) and a 2xx body
-    /// with `has_rule: false` (gate exists, no rule) both map to `Ok(None)`: from
-    /// vultrino's side these are a CONFIRMED "no rule" → today's numeric-threshold
-    /// path, unchanged.
+    /// `GET /v1/oversight/gates/rule` — a 2xx body with `has_rule: false` (gate exists,
+    /// no rule) is a CONFIRMED `NoRule` → today's numeric-threshold path, unchanged.
+    ///
+    /// A **404 is NOT automatically a confirmed absence** (plan 103 §10h FINDING 1/2 —
+    /// it used to be, and that is what let one approver clear an irreversible refund).
+    /// It is `NoRule` only when govder says BOTH that the agent is known to it and that
+    /// its gate store is durable (`reason: "no_gate_for_action_class"`,
+    /// `gate_store_durable: true`). Any other 404 — an unresolvable identity, a volatile
+    /// gate store that may have dropped the recipe, or no reason code at all — is
+    /// `Inconclusive`: govder answered, but confirmed nothing.
     ///
     /// Any GENUINE fetch failure — a transport/`signed_json` error, a non-2xx
     /// status other than 404 (5xx etc.), a body-read error, or a JSON parse
@@ -357,14 +412,21 @@ impl GovderClient {
         tenant: &str,
         agent_id: &str,
         action_class: &str,
-    ) -> Result<Option<FetchedGateRule>, GovderError> {
+    ) -> Result<GateRuleAnswer, GovderError> {
         let agent_id = agent_id.trim();
         let action_class = action_class.trim();
         if tenant.trim().is_empty() || agent_id.is_empty() || action_class.is_empty() {
-            // Shape issue, not a fetch failure: there is no identity to query
-            // govder with, so there is nothing to confirm either way — parity
-            // with today's numeric-threshold path.
-            return Ok(None);
+            // There is no identity to query govder WITH, so govder confirmed nothing —
+            // and this client only exists because a govder IS wired. Calling that a
+            // confirmed absence is the same fail-open as the old bare-404 mapping, one
+            // layer up: an unnameable principal executing an irreversible action would
+            // silently take the numeric path (plan 103 §10h FINDING 1).
+            return Ok(GateRuleAnswer::Inconclusive {
+                reason: "the request carries no tenant/agent label/action class to identify the \
+                         agent to the policy engine, so no oversight requirement could be \
+                         confirmed"
+                    .to_string(),
+            });
         }
         let query = format!(
             "agent_id={}&action_class={}",
@@ -381,7 +443,14 @@ impl GovderClient {
             })?;
         let status = resp.status().as_u16();
         if status == 404 {
-            return Ok(None); // no gate configured for this agent_id/action_class: confirmed no rule
+            // Read the body BEFORE deciding: the discriminator lives in it. A body-read
+            // failure here is a genuine fetch failure (below), never a silent absence.
+            let body = resp.text().await.map_err(|error| {
+                tracing::error!(%error, %agent_id, %action_class,
+                    "govder gate-rule 404 body could not be read; failing closed");
+                GovderError::Request(error)
+            })?;
+            return Ok(interpret_404_gate_rule_body(&body, agent_id, action_class));
         }
         let body = resp.text().await.map_err(|error| {
             tracing::error!(%error, %agent_id, %action_class,
@@ -462,11 +531,12 @@ impl GovderClient {
 ///   deny-on-any-deny on an irreversible gate); a missing `risk_tier` must NEVER be
 ///   confused with the resolved-but-empty `""` sentinel. Both must be PRESENT on the
 ///   wire when a rule is present;
-/// - only a clean `has_rule:false` (no rule) → `Ok(None)` (confirmed no rule → numeric
-///   parity);
-/// - `has_rule:true` with a rule (and BOTH risk facts present) → `Ok(Some(FetchedGateRule))`,
-///   carrying govder's authoritative `risk_tier`/`irreversible`.
-fn interpret_2xx_gate_rule_body(body: &str) -> Result<Option<FetchedGateRule>, GovderError> {
+/// - only a clean `has_rule:false` (no rule) → `Ok(GateRuleAnswer::NoRule)` (confirmed no
+///   rule → numeric parity);
+/// - `has_rule:true` with a rule (and BOTH risk facts present) →
+///   `Ok(GateRuleAnswer::Rule(..))`, carrying govder's authoritative
+///   `risk_tier`/`irreversible`.
+fn interpret_2xx_gate_rule_body(body: &str) -> Result<GateRuleAnswer, GovderError> {
     let parsed: GateApprovalRuleResponse =
         serde_json::from_str(body).map_err(|e| GovderError::Decode(e.to_string()))?;
     let GateApprovalRuleResponse {
@@ -476,7 +546,7 @@ fn interpret_2xx_gate_rule_body(body: &str) -> Result<Option<FetchedGateRule>, G
         irreversible,
     } = parsed;
     match (has_rule, approval_rule) {
-        (false, None) => Ok(None),
+        (false, None) => Ok(GateRuleAnswer::NoRule),
         (false, Some(_)) => Err(GovderError::Decode(
             "gate-rule response inconsistent: has_rule=false but approval_rule present".to_string(),
         )),
@@ -501,13 +571,55 @@ fn interpret_2xx_gate_rule_body(body: &str) -> Result<Option<FetchedGateRule>, G
                         .to_string(),
                 )
             })?;
-            Ok(Some(FetchedGateRule {
+            Ok(GateRuleAnswer::Rule(FetchedGateRule {
                 rule,
                 risk_tier,
                 irreversible,
             }))
         }
     }
+}
+
+/// Classify a 404 gate-rule body into `NoRule` (confirmed) or `Inconclusive` (plan 103
+/// §10h FINDING 1/2).
+///
+/// A 404 is DEFINITIVE only when govder asserts BOTH halves of the claim:
+///
+/// - `reason: "no_gate_for_action_class"` — it holds an agent record under this exact
+///   key, so the key axis is right and the absence is a real, authored absence; and
+/// - `gate_store_durable: true` — a gate it once held could not have vanished, so an
+///   absence is evidence that none was ever configured.
+///
+/// Everything else is inconclusive, INCLUDING an unparseable or reason-less body. That
+/// last case is the old behaviour's entire failure: an unqualified 404 was read as a
+/// confirmation. It is deliberately NOT a `GovderError` — govder answered the call, and
+/// for a reversible action the numeric path is still correct; the caller decides, using
+/// the irreversibility of the action, whether "unconfirmed" is survivable.
+fn interpret_404_gate_rule_body(body: &str, agent_id: &str, action_class: &str) -> GateRuleAnswer {
+    let parsed: GateApprovalRuleAbsence = serde_json::from_str(body).unwrap_or_default();
+    let reason = parsed.reason.unwrap_or_default();
+    let durable = parsed.gate_store_durable.unwrap_or(false);
+    if reason == GATE_ABSENCE_NO_GATE_FOR_ACTION_CLASS && durable {
+        return GateRuleAnswer::NoRule;
+    }
+    let detail = if reason.is_empty() {
+        "the policy engine reported no gate but gave no machine-readable reason (an older \
+         build), so an absent gate cannot be distinguished from an unresolvable agent id"
+            .to_string()
+    } else if reason == GATE_ABSENCE_NO_GATE_FOR_ACTION_CLASS {
+        "the policy engine reports no gate for this action class, but its gate store is \
+         VOLATILE — an absent gate is indistinguishable from an approval recipe dropped by a \
+         restart"
+            .to_string()
+    } else {
+        format!(
+            "the policy engine could not confirm an oversight requirement for this agent \
+             (reason: {reason})"
+        )
+    };
+    tracing::warn!(%agent_id, %action_class, %reason, durable,
+        "govder gate-rule 404 is INCONCLUSIVE, not a confirmed absence of a recipe");
+    GateRuleAnswer::Inconclusive { reason: detail }
 }
 
 fn grant_canonical_delegate(grant: &DelegationGrant) -> String {
@@ -558,7 +670,9 @@ struct GrantsListResponse {
 #[cfg(test)]
 mod tests {
     use super::tenant_assert::sign_tenant_assertion;
-    use super::{interpret_2xx_gate_rule_body, GovderError};
+    use super::{
+        interpret_2xx_gate_rule_body, interpret_404_gate_rule_body, GateRuleAnswer, GovderError,
+    };
     use chrono::TimeZone;
 
     // ===== BLOCKER 6: a semantically-malformed 2xx rule body must fail closed =====
@@ -587,16 +701,20 @@ mod tests {
     #[test]
     fn gate_rule_body_clean_no_rule_is_numeric_parity() {
         // Only a clean `has_rule:false` (no rule) confirms "no rule" → numeric path.
-        assert!(interpret_2xx_gate_rule_body(r#"{"has_rule":false}"#)
-            .unwrap()
-            .is_none());
+        assert!(matches!(
+            interpret_2xx_gate_rule_body(r#"{"has_rule":false}"#).unwrap(),
+            GateRuleAnswer::NoRule
+        ));
     }
 
     #[test]
     fn gate_rule_body_present_carries_authoritative_risk_facts() {
         let body = r#"{"has_rule":true,"risk_tier":"High","irreversible":true,
             "approval_rule":{"recipes":[{"terms":[{"class":"senior","count":1}]}],"decision_mode":"deny-on-any-deny"}}"#;
-        let fetched = interpret_2xx_gate_rule_body(body).unwrap().unwrap();
+        let fetched = match interpret_2xx_gate_rule_body(body).unwrap() {
+            GateRuleAnswer::Rule(f) => f,
+            other => panic!("expected a stamped rule, got {other:?}"),
+        };
         assert_eq!(fetched.risk_tier, "High");
         assert!(fetched.irreversible);
         assert_eq!(fetched.rule.recipes.len(), 1);
@@ -632,9 +750,75 @@ mod tests {
         // is present-and-false, likewise valid.
         let body = r#"{"has_rule":true,"risk_tier":"","irreversible":false,
             "approval_rule":{"recipes":[{"terms":[{"class":"senior","count":1}]}],"decision_mode":"deny-on-any-deny"}}"#;
-        let fetched = interpret_2xx_gate_rule_body(body).unwrap().unwrap();
+        let fetched = match interpret_2xx_gate_rule_body(body).unwrap() {
+            GateRuleAnswer::Rule(f) => f,
+            other => panic!("expected a stamped rule, got {other:?}"),
+        };
         assert_eq!(fetched.risk_tier, "");
         assert!(!fetched.irreversible);
+    }
+
+    // ===== plan 103 §10h FINDING 1/2: a 404 is not automatically a confirmed absence =====
+
+    fn absence(body: &str) -> GateRuleAnswer {
+        interpret_404_gate_rule_body(body, "ep_test", "money.refund")
+    }
+
+    #[test]
+    fn gate_absence_is_definitive_only_when_agent_known_and_store_durable() {
+        // The ONLY 404 that licenses the weaker numeric-threshold path: govder holds an
+        // agent record under this exact key (so the key axis is right and the absence is
+        // real) AND its gate store is durable (so a gate it once held cannot have
+        // vanished). Both halves are required.
+        assert!(matches!(
+            absence(r#"{"error":"no gate","reason":"no_gate_for_action_class","gate_store_durable":true}"#),
+            GateRuleAnswer::NoRule
+        ));
+    }
+
+    #[test]
+    fn gate_absence_with_a_volatile_store_is_inconclusive() {
+        // §10h FINDING 2: govder's gate store was in-memory, so every restart dropped all
+        // six money recipes and the next money call found "no gate". A volatile store
+        // cannot distinguish a gate nobody configured from one it lost, so it must not
+        // claim the absence is definitive.
+        let reason = match absence(
+            r#"{"error":"no gate","reason":"no_gate_for_action_class","gate_store_durable":false}"#,
+        ) {
+            GateRuleAnswer::Inconclusive { reason } => reason,
+            other => panic!("a volatile gate store's absence must be inconclusive, got {other:?}"),
+        };
+        assert!(
+            reason.contains("VOLATILE"),
+            "the reason must name the volatile store so an operator can fix it: {reason}"
+        );
+    }
+
+    #[test]
+    fn gate_absence_for_an_unresolvable_agent_is_inconclusive() {
+        // §10h FINDING 1's exact shape: the gate is keyed by AgentDefinition id and the
+        // lookup arrives under the EnforcementPrincipal, so govder holds neither a gate
+        // nor an agent record under that key. It confirmed nothing.
+        assert!(matches!(
+            absence(
+                r#"{"error":"unknown","reason":"agent_unknown_under_this_key","gate_store_durable":true}"#
+            ),
+            GateRuleAnswer::Inconclusive { .. }
+        ));
+    }
+
+    #[test]
+    fn a_bare_404_with_no_reason_is_inconclusive_not_confirmed() {
+        // THE ORIGINAL DEFECT, pinned. A 404 carrying only prose (every govder before
+        // §10h, and any future build that drops the field) was read as a CONFIRMED "no
+        // rule" and downgraded an irreversible refund to one approver. An unqualified
+        // answer is now an unanswered one.
+        for body in [r#"{"error":"no gate configured"}"#, "{}", "not json at all"] {
+            assert!(
+                matches!(absence(body), GateRuleAnswer::Inconclusive { .. }),
+                "a 404 body with no reason code must be inconclusive: {body}"
+            );
+        }
     }
 
     #[test]

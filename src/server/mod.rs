@@ -1202,15 +1202,50 @@ impl VultrinoServer {
                     principal_tenant.as_deref(),
                     agent_id_for_rule.as_deref(),
                     &full_action,
+                    action_label.as_deref(),
                 )
                 .await?
             {
-                Some(fetched) => (
+                crate::govder::GateRuleAnswer::Rule(fetched) => (
                     Some(fetched.rule),
                     fetched.risk_tier,
                     fetched.irreversible,
                 ),
-                None => (None, String::new(), false),
+                crate::govder::GateRuleAnswer::NoRule => (None, String::new(), false),
+                // INCONCLUSIVE (plan 103 §10h FINDING 1/2): govder answered, but did
+                // not confirm whether a recipe exists. The numeric-threshold fallback
+                // is not a neutral default — it is a WEAKER oversight requirement (one
+                // approver), and this exact silent downgrade let ONE human clear an
+                // irreversible refund the operator had gated at two.
+                //
+                // The decision keys on `trusted_irreversible`, which is derived above
+                // from vultrino's OWN stored capability metadata (never requester
+                // params) and already fails to `true` when that catalog is unreadable.
+                // For an irreversible action, refuse: no approval is opened, so no
+                // notification is sent, no use is reserved, and the use token is NOT
+                // consumed — the caller can retry once the recipe is confirmable. For a
+                // reversible action the numeric path stays exactly as it was (this is
+                // the whole non-money world, and an unconfirmed recipe there costs a
+                // reviewer, not a payment), with the reason logged.
+                crate::govder::GateRuleAnswer::Inconclusive { reason } => {
+                    if trusted_irreversible {
+                        tracing::error!(%reason, %full_action,
+                            agent_id = agent_id_for_rule.as_deref().unwrap_or("<none>"),
+                            "REFUSING an irreversible action: the approval recipe could not be \
+                             confirmed, and falling back to a single approver would enforce \
+                             weaker oversight than is declared");
+                        return Err(VultrinoError::PolicyUnavailable(format!(
+                            "this action cannot be undone, so it may only run under a confirmed \
+                             approval requirement: {reason}. Nothing was executed and no \
+                             approval was opened."
+                        )));
+                    }
+                    tracing::warn!(%reason, %full_action,
+                        agent_id = agent_id_for_rule.as_deref().unwrap_or("<none>"),
+                        "the approval recipe could not be confirmed; this action is reversible, \
+                         so it opens under the ordinary approver-count path");
+                    (None, String::new(), false)
+                }
             };
             let (mut approval, decision_token) = ApprovalRequest::open(NewApproval {
                 credential: credential.alias.clone(),
@@ -2784,43 +2819,82 @@ impl VultrinoServer {
 
     /// Fetch the govder-authored `ApprovalRule` (if any) to stamp onto a new
     /// approval at open (plan 100 P2 Phase D; docs/design/approval-recipes.md §6
-    /// D5). No govder client wired, no tenant, or no resolved agent_id are all a
-    /// CONFIRMED "no rule" (`Ok(None)`) — there is no recipe authority to consult
-    /// in the first place, so this is exactly today's numeric-threshold approval
-    /// flow, unchanged. A wired govder client that FAILS to answer is different:
-    /// see [`crate::govder::GovderClient::fetch_gate_rule`]'s doc — that is a
-    /// genuine fetch failure, mapped to `Err` here too, so the caller fails the
-    /// approval-open closed instead of silently downgrading to the numeric path.
+    /// D5).
+    ///
+    /// NO GOVDER CLIENT WIRED is the one remaining CONFIRMED `NoRule`: there is no
+    /// recipe authority in this deployment at all, so this is exactly today's
+    /// numeric-threshold approval flow, unchanged.
+    ///
+    /// A wired govder that cannot be REACHED, or answers malformed, is still `Err` —
+    /// the caller fails the approval-open closed. But a wired govder that answers "no
+    /// gate" WITHOUT confirming it (plan 103 §10h FINDING 1/2) is neither of those: it
+    /// is `GateRuleAnswer::Inconclusive`, and the caller decides on the action's
+    /// irreversibility. A missing tenant or agent label is folded into the same
+    /// inconclusive answer inside `fetch_gate_rule`, because with a govder wired the
+    /// inability to NAME the agent to it is a failure to confirm, not a confirmation.
     async fn fetch_gate_rule_for_action(
         &self,
         tenant: Option<&str>,
         agent_id: Option<&str>,
         action_class: &str,
-    ) -> Result<Option<crate::govder::FetchedGateRule>, VultrinoError> {
+        action_label: Option<&str>,
+    ) -> Result<crate::govder::GateRuleAnswer, VultrinoError> {
         let govder = match self.govder.as_ref() {
             Some(g) => g,
-            None => return Ok(None),
+            None => return Ok(crate::govder::GateRuleAnswer::NoRule),
         };
-        let tenant = match tenant.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-        let agent_id = match agent_id.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(a) => a,
-            None => return Ok(None),
-        };
-        govder
-            .fetch_gate_rule(tenant, agent_id, action_class)
-            .await
-            .map_err(|error| {
-                tracing::error!(%error, %tenant, %agent_id, %action_class,
-                    "govder gate-rule fetch failed at approval-open; failing closed");
-                VultrinoError::PolicyUnavailable(
-                    "could not confirm the approval requirement with the policy engine \
-                     (fail-closed)"
-                        .to_string(),
-                )
-            })
+        let tenant = tenant.map(str::trim).unwrap_or_default();
+        let agent_id = agent_id.map(str::trim).unwrap_or_default();
+
+        // THE ACTION-CLASS AXIS (plan 103 §10h FINDING 1, second half — measured while
+        // fixing the agent-id half, and NOT recorded in the finding). Every writer of a
+        // gate names the action class with the GOVDER ACTION LABEL, because that is the
+        // name it has in the pack catalog: the broker's set-approval-recipe op and the
+        // template instantiate both send `capability.Action` (`money.refund`), and
+        // `orgpack apply`'s own recipe verify READS with the same string, which is why the
+        // verify passed. But `full_action` here is the CANONICAL plugin verb the label
+        // resolves to (`internal_http.request` — every money/data/kyc label in the shipped
+        // packs resolves to that one verb), so the execute-time read asked for an action
+        // class no writer ever wrote. Fixing only the agent id would have left the lookup
+        // missing, and the fix would have measured as correct against the agent-id axis
+        // alone — which is precisely how the original defect survived.
+        //
+        // Both spellings are therefore tried. Finding a gate under EITHER counts as found:
+        // a found gate can only ADD an oversight requirement, so accepting both names is
+        // the more-oversight direction. The label goes first because it is what every
+        // writer uses. `NoRule` is returned ONLY when BOTH names are DEFINITIVELY absent —
+        // a single definitive absence beside an inconclusive one confirms nothing.
+        let label = action_label
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && *l != action_class);
+        let mut first_inconclusive: Option<String> = None;
+        for class in label.into_iter().chain(std::iter::once(action_class)) {
+            match govder
+                .fetch_gate_rule(tenant, agent_id, class)
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, %tenant, %agent_id, %class,
+                        "govder gate-rule fetch failed at approval-open; failing closed");
+                    VultrinoError::PolicyUnavailable(
+                        "could not confirm the approval requirement with the policy engine \
+                         (fail-closed)"
+                            .to_string(),
+                    )
+                })?
+            {
+                answer @ crate::govder::GateRuleAnswer::Rule(_) => return Ok(answer),
+                crate::govder::GateRuleAnswer::NoRule => {}
+                crate::govder::GateRuleAnswer::Inconclusive { reason } => {
+                    if first_inconclusive.is_none() {
+                        first_inconclusive = Some(reason);
+                    }
+                }
+            }
+        }
+        Ok(match first_inconclusive {
+            Some(reason) => crate::govder::GateRuleAnswer::Inconclusive { reason },
+            None => crate::govder::GateRuleAnswer::NoRule,
+        })
     }
 
     /// Trusted irreversibility for D3 floors: resolve from stored capability metadata
