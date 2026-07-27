@@ -1111,6 +1111,8 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
             approval_cfg.public_base_url.clone(),
             std::time::Duration::from_secs(vultrino::server::APPROVAL_SWEEP_SECS),
         ));
+    } else if let Some(w) = approval_cfg.startup_warning() {
+        warn!("{}", w);
     }
     // Deliver + GC the signed event outbox (V9). Counters (observability item 4 / #3) are
     // shared with this process's VultrinoServer so the JSON metrics read-back sees them too.
@@ -1187,6 +1189,9 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
             config.approval.public_base_url.clone(),
             std::time::Duration::from_secs(vultrino::server::APPROVAL_SWEEP_SECS),
         ));
+    } else if let Some(w) = config.approval.startup_warning() {
+        // The ONLY notice before an agent's first gated action (feir-os plan 103 §10h 6a).
+        warn!("{}", w);
     }
     // Deliver + GC the signed event outbox (V9). Counters (observability item 4 / #3) are
     // shared with this process's VultrinoServer so the JSON metrics read-back sees them too.

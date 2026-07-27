@@ -1703,6 +1703,36 @@ pub struct ApprovalConfig {
 }
 
 impl ApprovalConfig {
+    /// The startup warning to print when approvals are DISABLED, or `None` when they
+    /// are on.
+    ///
+    /// Why a startup warning exists at all (feir-os plan 103 §10h FINDING 6a). `enabled =
+    /// false` is fail-closed but it does NOT mean "hold for a human" — it means an action
+    /// the compiled policy marks `require_approval` is **refused outright** at execute.
+    /// Nothing upstream inspects the flag: measured on a live single-host stack, an org
+    /// pack applied with exit 0, its status read IN SYNC across all 44 declared items, the
+    /// product's approvals inbox rendered, and the first refund an agent requested came
+    /// back `400 … approvals are not enabled on this Vultrino instance`. So the only place
+    /// this is knowable before an agent acts is here, at startup.
+    ///
+    /// It is deliberately a WARNING and not a startup refusal: a deployment with no
+    /// human-gated action is a legitimate configuration, and refusing to boot would break
+    /// every such deployment to fix a documentation problem.
+    pub fn startup_warning(&self) -> Option<String> {
+        if self.enabled {
+            return None;
+        }
+        Some(
+            "[approvals] enabled is FALSE (the default). Actions whose policy requires human \
+             approval will be REFUSED at execute, not held for a human: \
+             `400 Request denied by policy: This action requires human approval, but approvals \
+             are not enabled on this Vultrino instance`. Nothing upstream reports this, so an \
+             org pack can apply cleanly and then fail on its first gated action. Set \
+             `[approvals] enabled = true` if any agent on this deployment needs a human."
+                .to_string(),
+        )
+    }
+
     /// Effective default TTL as a `chrono::Duration`. `ttl_secs == 0` is treated
     /// as the sentinel for "use the default of 1 hour" (a zero-TTL approval would
     /// expire before anyone could decide).
@@ -3607,5 +3637,53 @@ mod tests {
         // Positive control: a well-formed human senior sign-off DOES satisfy it.
         approve_as(&mut a, "senior@corp", ApproverClass::Senior, None, None).unwrap();
         assert_eq!(a.status, ApprovalStatus::Approved);
+    }
+}
+
+#[cfg(test)]
+mod finding_6a_startup_warning_tests {
+    use super::*;
+
+    /// feir-os plan 103 §10h FINDING 6a. `[approvals] enabled` absent from a shipped runbook's
+    /// config yields a stack that applies clean and then refuses every money verb, and nothing
+    /// upstream of the agent's first action reports it. The startup warning is the only place it
+    /// is knowable in time, so it must exist, must name the CONSEQUENCE (not just the flag), and
+    /// must be silent when approvals are on.
+    #[test]
+    fn disabled_approvals_warn_and_name_the_consequence() {
+        let cfg = ApprovalConfig::default();
+        assert!(
+            !cfg.enabled,
+            "the default must stay DISABLED (this test's premise); if this ever flips, the \
+             warning becomes dead code and the docs change too"
+        );
+        let w = cfg
+            .startup_warning()
+            .expect("disabled approvals must produce a startup warning");
+        for needle in [
+            "REFUSED at execute",
+            "not held for a human",
+            "approvals are not enabled on this Vultrino instance",
+            "enabled = true",
+        ] {
+            assert!(
+                w.contains(needle),
+                "the startup warning does not mention {needle:?}; an operator reading it cannot \
+                 tell what breaks or how to fix it.\nwarning: {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_approvals_warn_about_nothing() {
+        let cfg = ApprovalConfig {
+            enabled: true,
+            ..ApprovalConfig::default()
+        };
+        assert!(
+            cfg.startup_warning().is_none(),
+            "a correctly configured deployment must not be warned; a warning that always fires \
+             is one nobody reads"
+        );
     }
 }
