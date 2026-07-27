@@ -91,11 +91,21 @@ run the same PEP path locally (no server) and are handy for testing a policy.
 
 ## Contributing
 
-- **Build/lint before sending changes:** `cargo build`, `cargo test`, `cargo test
-  --features mock-govder` (both are required — see above), `cargo clippy`,
-  `cargo fmt`. The code uses fail-closed validation extensively — preserve it (a
-  malformed glob/regex/config should error at load, never silently degrade to
-  never-matching).
+- **Build/lint before sending changes:** run `./ci-local.sh` from the repo root. It is
+  `.github/workflows/ci.yml`'s job, step for step, with every exit code captured into a
+  variable rather than read through a pipe: `cargo build`, `cargo test`, `cargo test
+  --features mock-govder` (both test invocations are required — see above), and the
+  zero-warning clippy gate **twice** — `cargo clippy --all-targets -- -D warnings` and
+  `cargo clippy --all-targets --all-features -- -D warnings`. The second is not optional:
+  the first does not compile the `mock-govder`-only test target, so it cannot lint it, and
+  on 2026-07-27 a `clippy::type_complexity` error was sitting in that target while the gate
+  read green. Add `cargo fmt` yourself; `ci-local.sh` deliberately runs nothing that
+  rewrites files.
+  Why the script exists at all: that same day the zero-warning gate was found RED with 11
+  errors, of unknown age, because the documented loop was build+test and clippy lived only
+  in a workflow no runner executes on the branches the work happens on.
+  The code uses fail-closed validation extensively — preserve it (a malformed
+  glob/regex/config should error at load, never silently degrade to never-matching).
 - **Accuracy of these docs:** if you change a route, env var, config key, payload
   shape, default, or guarantee, update the corresponding `docs/dev/*` file in the
   same change — this set is the implementation-accurate reference and is checked
