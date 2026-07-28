@@ -962,6 +962,109 @@ async fn test_admin_role_create_and_credential_delete_and_put_policy() {
     assert!(storage.get_by_alias("c1").await.unwrap().is_none());
 }
 
+/// The credential DELETE key is the UUID `id`, NOT the alias — and the id has to be
+/// READABLE from the inventory, or an admin client that did not create the credential
+/// cannot address it at all.
+///
+/// This is the wire fact `orgpack apply --rotate-credentials` was written against a
+/// FAKE of: it sent `DELETE /api/v1/credentials/<alias>`, which resolves no id here,
+/// answers 404, and leaves the pre-rotation secret live. Three assertions, because all
+/// three have to hold for a rotation to be possible against a real vault:
+///
+///  1. `GET /api/v1/credentials` reports `id` for every row (it did not, so the id was
+///     obtainable ONLY from the create response — useless to a later process);
+///  2. that id is the SAME one create returned (an inventory id that addresses nothing
+///     would be worse than none);
+///  3. `DELETE` keyed on the ALIAS is a 404 that deletes nothing, while `DELETE` keyed
+///     on the listed id succeeds — i.e. the alias is not, and must never become, a
+///     second accepted key.
+#[tokio::test]
+async fn test_credential_list_reports_the_id_delete_keys_on_and_alias_is_not_a_key() {
+    let (router, storage, _server, key) = build_admin_router().await;
+
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/credentials",
+            &key,
+            serde_json::json!({"alias":"rotate-me","data":{"type":"api_key","key":"k1","header_name":"Authorization","header_prefix":"Bearer "}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let created_id = created["id"].as_str().unwrap().to_string();
+    assert_ne!(
+        created_id, "rotate-me",
+        "precondition: the id must not be the alias, or this test proves nothing"
+    );
+
+    // (1) + (2): the inventory carries the id, and it is the create-time id.
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/credentials",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let row = listed["credentials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["alias"] == "rotate-me")
+        .expect("the credential just created is missing from the inventory");
+    let listed_id = row["id"].as_str().expect(
+        "GET /api/v1/credentials does not report `id`. DELETE /api/v1/credentials/{id} keys on \
+         that UUID and accepts nothing else, so a client that did not create the credential in \
+         its own process cannot address it — every delete-then-create rotation 404s on the delete \
+         and then collides with the still-live old secret",
+    );
+    assert_eq!(
+        listed_id, created_id,
+        "the inventory id must be the id DELETE keys on"
+    );
+
+    // (3a): the ALIAS is not a key — 404, and the credential is untouched.
+    let r = router
+        .clone()
+        .oneshot(admin_req(
+            "DELETE",
+            "/api/v1/credentials/rotate-me",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::NOT_FOUND,
+        "DELETE keyed on the alias must 404 — the alias is the EXECUTION index, never an admin key"
+    );
+    assert!(
+        storage.get_by_alias("rotate-me").await.unwrap().is_some(),
+        "the alias-keyed DELETE 404'd but removed the credential anyway"
+    );
+
+    // (3b): the listed id is a key.
+    let r = router
+        .oneshot(admin_req(
+            "DELETE",
+            &format!("/api/v1/credentials/{}", listed_id),
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(storage.get_by_alias("rotate-me").await.unwrap().is_none());
+}
+
 #[tokio::test]
 async fn test_admin_crud_emits_audit_events() {
     // Observability item 4 / #17: a successful admin create/delete/revoke emits a

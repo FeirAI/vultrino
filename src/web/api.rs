@@ -1109,6 +1109,28 @@ pub async fn api_decide_approval(
 
 #[derive(Serialize)]
 pub struct CredentialInfo {
+    /// The credential's server-side UUID — the key EVERY id-addressed credential
+    /// route uses (`DELETE /api/v1/credentials/{id}`, `storage.get`,
+    /// `storage.delete_scoped`). The alias is NOT that key: it is the index the
+    /// router resolves for EXECUTION, and no admin route accepts it.
+    ///
+    /// Why it has to be here. It was previously returned exactly once, in the
+    /// `201` body of `POST /api/v1/credentials`, and nowhere else. So an admin
+    /// client that did not create the credential in its own process could not
+    /// address it at all: an `orgpack apply --rotate-credentials` (delete-then-
+    /// create, because there is no credential UPDATE) sent
+    /// `DELETE /api/v1/credentials/<alias>`, which resolves no id, answers
+    /// `404 credential_not_found`, and leaves the OLD secret live — after which
+    /// the re-create collides with it. A rotation that cannot address its target
+    /// is not a rotation, and the id being unreadable is what made it unaddressable.
+    ///
+    /// Non-secret: a random v4 UUID with no credential material in it, already
+    /// disclosed at create, already the public handle in every admin audit event
+    /// (`admin_audit_payload(actor, &cred.id, …)`). It is emitted only on this
+    /// route, which requires `Permission::Read` AND passes the same
+    /// `can_access_credential(alias)` scope filter as every other field here — a
+    /// key that may not see the credential still sees no id.
+    pub id: String,
     pub alias: String,
     pub credential_type: String,
     pub description: Option<String>,
@@ -1214,6 +1236,7 @@ pub async fn api_list_credentials(
         .filter(|c| auth_result.can_access_credential(&c.alias))
         .map(|c| CredentialInfo {
             internal_binding: InternalBindingInfo::from_metadata(&c.metadata),
+            id: c.id,
             alias: c.alias,
             credential_type: format!("{:?}", c.credential_type).to_lowercase(),
             description: c.metadata.get("description").cloned(),

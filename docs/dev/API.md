@@ -144,11 +144,18 @@ principal); `403 token_revoked`; `404 approval_not_found`.
 ### `GET /api/v1/credentials` — list (API key, `read`)
 
 ```json
-{ "credentials": [ { "alias": "github-api", "credential_type": "api_key", "description": "…" } ] }
+{ "credentials": [ { "id": "9b1f…-uuid", "alias": "github-api", "credential_type": "api_key", "description": "…" } ] }
 ```
 
 Filtered to credentials the caller's role scope allows. **Secrets are never
 returned.** Requires the `read` permission.
+
+`id` is the server-side UUID, and it is the key **every id-addressed credential route
+uses** — `DELETE /api/v1/credentials/{id}` resolves the id map and never the alias index,
+so an alias sent there is a `404`. The alias is the *execution* index (what a capability
+and a use token name). This list is the only place a client that did not create the
+credential can learn the id, which is what makes an out-of-band rotation (delete + create,
+since there is no credential UPDATE) possible at all.
 
 ## Admin JSON routes (API key with `admin` only)
 
