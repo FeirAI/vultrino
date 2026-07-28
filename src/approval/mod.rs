@@ -2211,6 +2211,12 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Cross-plane conformance vectors for approval-recipe satisfaction, shared
+/// byte-identically with `govder/internal/oversight` (see that file's header).
+/// Test-only: this declaration compiles to nothing outside `cargo test`.
+#[cfg(test)]
+mod recipe_conformance;
+
 #[cfg(test)]
 mod tests {
     use super::*;
