@@ -129,6 +129,7 @@ async fn setup_with_policies(
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
 
     (server, storage)
 }
@@ -155,8 +156,74 @@ async fn setup_deny_mode(
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
 
     (server, storage)
+}
+
+/// Declare, in vultrino's OWN capability catalog, what the actions this suite drives
+/// actually are.
+///
+/// WHY THIS IS NEEDED, and why it is a statement of fact rather than a green-run
+/// convenience. `VultrinoServer::trusted_irreversible_for_action` resolves
+/// irreversibility from stored capability metadata (never requester-authored params)
+/// and fails CLOSED: an action that matches NO capability is assumed to need the human
+/// floor, i.e. treated as irreversible. Separately, these fixtures wire no govder
+/// (`Config::default().govder == None`), so no approval recipe can be CONFIRMED for
+/// anything they gate. An assumed-irreversible action whose recipe is unconfirmable is
+/// refused at approval-open rather than opened on the weaker single-approver numeric
+/// path. Both of those are correct, and the second is the fix this branch carries.
+///
+/// What was wrong is that this suite never said which kind of action it drives — it
+/// inherited the answer from a short-circuit that read "no govder is wired" as "govder
+/// confirmed there is no recipe". Saying it out loud is the fix here.
+///
+/// All of these are reversible in the strict sense: none of them has any effect
+/// outside this test process, so there is nothing that could need undoing.
+///   * `mock.echo` — [`MockPlugin`] serialises the request params straight back as the
+///     response body. It writes nothing, anywhere.
+///   * `count.run` — [`CountingPlugin`] increments an in-process `AtomicUsize` so a
+///     double-run is observable. Nothing leaves the process.
+///   * `ghost.do` — deliberately has NO plugin registered. It exists only so a
+///     PREFLIGHT failure can be observed on the resume path, so it never executes at
+///     all and can have no effect to reverse.
+///
+/// SCOPE OF THE CLAIM. This declares the mock actions reversible; it does not claim
+/// anything about the business verbs some fixtures label them with. The V8 label tests
+/// map `payments.refund` onto `mock.echo` because they are testing label→canonical
+/// resolution and the approver-visible summary string — the label is arbitrary test
+/// data, no money moves anywhere in this file, and no test here asserts how many
+/// approvers a refund needs. The irreversible arm (and the refusal itself) is covered
+/// in `web_smoke.rs`, against fixtures that declare irreversibility explicitly.
+///
+/// These capabilities are never DISPATCHED: every test in this file calls
+/// `execute_gated` with an explicit credential, so `credential_ref`/`target` are
+/// inert here and exist only because the struct requires them.
+async fn declare_reversible_fixture_capabilities(storage: &Arc<dyn StorageBackend>) {
+    for (id, tool_name, action) in [
+        ("cap-fixture-mock-echo", "mock_echo", "mock.echo"),
+        ("cap-fixture-count-run", "count_run", "count.run"),
+        ("cap-fixture-ghost-do", "ghost_do", "ghost.do"),
+    ] {
+        storage
+            .store_capability(&vultrino::capability::Capability {
+                id: id.to_string(),
+                tool_name: tool_name.to_string(),
+                description: format!(
+                    "in-process test double for {action}; no effect outside this process"
+                ),
+                action: action.to_string(),
+                plugin: None,
+                target: vultrino::capability::CapabilityTarget::default(),
+                credential_ref: "*".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                reversibility: "reversible".to_string(),
+                llm: None,
+                approval_preview: None,
+            })
+            .await
+            .unwrap();
+    }
 }
 
 /// Store a credential, optionally flagged to require approval.
@@ -1249,6 +1316,7 @@ async fn test_approvals_disabled_denies_gated_action() {
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
 
     store_credential(&storage, "gated-cred", true).await;
 
@@ -1590,6 +1658,7 @@ async fn test_spend_cap_enforced_end_to_end() {
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
     store_credential(&storage, "pay-cred", false).await;
 
     let req = |amount: i64| ExecuteRequest {
@@ -1785,6 +1854,7 @@ async fn test_spend_capped_approval_resumes_without_recheck() {
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
     store_credential(&storage, "pay-cred", true).await; // require_approval
 
     // Within cap (60 ≤ 100): checked at open, then gated on approval.
@@ -1949,6 +2019,7 @@ async fn test_egress_block_withholds_response_end_to_end() {
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
     store_credential(&storage, "sts-cred", false).await;
 
     let req = ExecuteRequest {
@@ -1989,6 +2060,7 @@ async fn test_action_label_token_scope_and_approval_summary() {
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
     store_credential(&storage, "pay-cred", true).await; // require_approval → gates
 
     let (_f, token) = UseToken::create(NewUseToken {
@@ -2047,6 +2119,7 @@ async fn test_action_label_scope_isolation() {
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
     store_credential(&storage, "pay-cred", false).await;
 
     let mint = |action_scope: &str| {
@@ -2134,6 +2207,7 @@ async fn setup_v5(
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
     (server, storage)
 }
 
@@ -3467,6 +3541,7 @@ async fn setup_tenants(
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
     (server, storage)
 }
 
@@ -3793,6 +3868,7 @@ async fn test_v11_observe_does_not_downgrade_spend_cap() {
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
     store_credential(&storage, "pay-cred", false).await;
 
     let token = {
@@ -3845,6 +3921,7 @@ async fn test_v11_approvals_are_tenant_scoped() {
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
     store_credential(&storage, "api-cred", true).await; // require_approval
 
     let ta = tenant_token("team-a");
@@ -4763,6 +4840,7 @@ async fn test_v13b_token_read_is_from_raw_body_before_egress_redaction() {
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
+    declare_reversible_fixture_capabilities(&storage).await;
 
     store_tenanted_credential(&storage, "api-cred", None).await;
     let exec_auth = auth_for_agent(&storage, "agent_llm", None).await;

@@ -1265,6 +1265,65 @@ fn _unused(_: HashMap<String, String>) {}
 // (n) The APPROVAL RESUME path — the one the money packs actually take
 // ===========================================================================
 
+/// A mock govder that CONFIRMS there is no approval recipe for whatever it is asked
+/// about (`200 {"has_rule": false}` — the "a gate exists and carries no rule" answer),
+/// and records every `action_class` it was queried under.
+///
+/// It exists so the resume-path test below can state the ONE thing that licenses a
+/// single approver on an irreversible action: not a missing config, but the recipe
+/// authority itself answering. The recorded action classes are asserted on, so a
+/// future change that stops consulting govder cannot pass this test by silently
+/// short-circuiting again — which is exactly how the original fail-open survived.
+async fn start_mock_govder_confirming_no_recipe(
+) -> (vultrino::govder::GovderConfig, Arc<Mutex<Vec<String>>>) {
+    #[derive(Clone)]
+    struct GateState {
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+    async fn handler(
+        axum::extract::State(state): axum::extract::State<GateState>,
+        axum::extract::RawQuery(query): axum::extract::RawQuery,
+    ) -> axum::response::Response {
+        if let Some(q) = query {
+            for pair in q.split('&') {
+                if let Some(v) = pair.strip_prefix("action_class=") {
+                    state
+                        .asked
+                        .lock()
+                        .unwrap()
+                        .push(urlencoding::decode(v).unwrap_or_default().into_owned());
+                }
+            }
+        }
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "has_rule": false })),
+        )
+            .into_response()
+    }
+
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/v1/oversight/gates/rule", axum::routing::get(handler))
+        .with_state(GateState {
+            asked: asked.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (
+        vultrino::govder::GovderConfig {
+            base_url: format!("http://{addr}"),
+            assertion_secret: "test-govder-assertion-secret".to_string(),
+            assertion_ttl: std::time::Duration::from_secs(90),
+            http_timeout: std::time::Duration::from_secs(5),
+        },
+        asked,
+    )
+}
+
 /// A gated `internal_http` action must RUN when the approval is granted.
 ///
 /// Why this test exists: the twelve cases above all drive `execute_gated` on an
@@ -1275,11 +1334,32 @@ fn _unused(_: HashMap<String, String>) {}
 /// `check_and_resume_approval`. That is a different code path with a different param
 /// source (the stored `approval.params` rather than the live request), and nothing
 /// covered it. The plan-103 pack-driven money leg is what surfaced the gap.
+///
+/// WHAT THIS FIXTURE HAD TO SAY OUT LOUD, and why it is not cosmetic. As originally
+/// written this test opened and cleared a `money.refund` on ONE approval with NO
+/// recipe authority present anywhere in the fixture — `config.govder` was `None` and
+/// no capability declared the action's reversibility. It passed only because an
+/// unwired govder used to be read as govder CONFIRMING "there is no recipe", so
+/// vultrino silently took the numeric single-approver path. That is the fail-open this
+/// branch closes, and this test was asserting it as correct behaviour.
+///
+/// The fixture now states both facts it was leaning on without declaring:
+///   1. `money.refund` is IRREVERSIBLE. It moves money out; nothing here can undo it.
+///      Declared in the capability catalog, which is the only source
+///      `trusted_irreversible_for_action` trusts (never requester params).
+///   2. A recipe authority IS wired, and it ANSWERS: govder confirms it holds no
+///      recipe for this (agent, action class). That confirmed absence — not an unset
+///      env var — is what licenses the numeric path and its single approver.
+///
+/// The subject of the test is unchanged: an approved gated action must actually run on
+/// the resume path, against the stored params, with the vault credential injected.
 #[tokio::test]
 async fn a_gated_internal_http_action_runs_when_the_approval_is_granted() {
     let (port, rec) = start_sandbox().await;
+    let (govder, asked) = start_mock_govder_confirming_no_recipe().await;
     let mut config = operator_config(port, "");
     config.approval.enabled = true;
+    config.govder = Some(govder);
     let (server, storage) = build_server(config).await;
 
     // The credential is pinned to the destination and to the refund path, exactly as
@@ -1296,9 +1376,38 @@ async fn a_gated_internal_http_action_runs_when_the_approval_is_granted() {
         .insert(META_DESTINATION.to_string(), "finsandbox".to_string());
     storage.store(&cred).await.unwrap();
 
+    // Say what a refund IS. A refund posts money out of the account; there is no
+    // compensating call in this pack, and the sandbox has no undo. `irreversible` is
+    // the true value, and it is deliberately the one that makes vultrino REFUSE if the
+    // approval requirement ever becomes unconfirmable — which is the whole point of
+    // declaring it rather than letting the catalog stay empty and the answer be
+    // inferred.
+    storage
+        .store_capability(&vultrino::capability::Capability {
+            id: "cap-money-refund".to_string(),
+            tool_name: "post_refund".to_string(),
+            description: "post a refund to the payments sandbox".to_string(),
+            action: "money.refund".to_string(),
+            plugin: Some("internal_http".to_string()),
+            target: vultrino::capability::CapabilityTarget {
+                url_glob: Some("/v1/refunds".to_string()),
+                methods: vec!["POST".to_string()],
+                plugin_params: serde_json::Map::new(),
+            },
+            credential_ref: "finsandbox-refund".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            reversibility: "irreversible".to_string(),
+            llm: None,
+            approval_preview: None,
+        })
+        .await
+        .unwrap();
+
     // An L3-shaped action token: scoped to the one write verb, and require_approval,
-    // which is what govder compiles for a write at an approval tier.
-    let (_full, token) = UseToken::create(NewUseToken {
+    // which is what govder compiles for a write at an approval tier. It also carries
+    // the tenant + agent label, because those ARE the key the recipe is filed under: a
+    // request that cannot name its agent to govder gets no confirmed answer either.
+    let (_full, mut token) = UseToken::create(NewUseToken {
         name: "refund-processor".to_string(),
         credential_scope: "finsandbox-refund".to_string(),
         action_scope: Some("money.refund".to_string()),
@@ -1306,6 +1415,8 @@ async fn a_gated_internal_http_action_runs_when_the_approval_is_granted() {
         require_approval: true,
         expires_in: None,
     });
+    token.tenant = Some("acme".to_string());
+    token.agent_label = Some("refund-processor".to_string());
     storage.store_use_token(&token).await.unwrap();
 
     let params = serde_json::json!({
@@ -1330,6 +1441,29 @@ async fn a_gated_internal_http_action_runs_when_the_approval_is_granted() {
         rec.hits.lock().unwrap().len(),
         0,
         "the gate must hold: nothing may reach the destination before the approval"
+    );
+
+    // The three facts that make ONE approver correct HERE, pinned so they cannot drift
+    // back into being assumed. Without all three this test is asserting the fail-open
+    // it used to assert.
+    let asked = asked.lock().unwrap().clone();
+    assert!(
+        asked.contains(&"money.refund".to_string()),
+        "the recipe authority must actually have been CONSULTED, under the name the \
+         recipe is filed as; asked: {asked:?}"
+    );
+    assert!(
+        approval.trusted_irreversible,
+        "this fixture declares money.refund irreversible; if that ever resolves to \
+         false the single approver below is no longer licensed by anything"
+    );
+    assert_eq!(
+        approval.required_approvals, 1,
+        "one approver is correct ONLY because govder confirmed it holds no recipe for \
+         this (agent, action class). An operator who wants two keys writes a recipe, \
+         and this same code path then stamps and enforces it — see the recipe legs in \
+         web_smoke.rs. What must never license one approver again is govder simply \
+         not having been asked."
     );
 
     // A human approves.
