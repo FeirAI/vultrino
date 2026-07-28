@@ -4272,6 +4272,33 @@ async fn test_v10_inbound_oidc_resolves_subject_and_binds_owner() {
     )
     .with_metadata("require_approval", "true");
     storage.store(&cred).await.unwrap();
+    // This test is about OIDC subject/owner resolution, and it needs an approval to OPEN so
+    // it can read those two fields off it. Say out loud what it executes: a GET, which is
+    // reversible. Without a capability declaring that, `trusted_irreversible_for_action`
+    // fails closed to "assume irreversible" — and since this fixture wires no govder, the
+    // recipe is unconfirmable, so an irreversible action is refused and no approval opens.
+    // Both of those are correct; what was wrong was the fixture never stating which kind of
+    // action it was, and quietly relying on an unwired govder answering "no recipe".
+    storage
+        .store_capability(&vultrino::capability::Capability {
+            id: "cap-oidc-fixture".to_string(),
+            tool_name: "oidc_fixture_call".to_string(),
+            description: "reversible GET used to observe the resolved OIDC identity".to_string(),
+            action: "http.request".to_string(),
+            plugin: Some("http".to_string()),
+            target: vultrino::capability::CapabilityTarget {
+                url_glob: Some("https://api.example.com/*".to_string()),
+                methods: vec!["GET".to_string()],
+                plugin_params: serde_json::Map::new(),
+            },
+            credential_ref: "api-cred".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+            reversibility: "reversible".to_string(),
+            llm: None,
+            approval_preview: None,
+        })
+        .await
+        .unwrap();
     let (secret, token) = UseToken::create(NewUseToken {
         name: "oidc-bot".to_string(),
         credential_scope: "*".to_string(),
@@ -6431,33 +6458,127 @@ async fn execute_open_numeric_path_parity_when_gate_has_rule_false() {
     assert_eq!(approvals[0].required_approvals, 1);
 }
 
-/// PARITY (unchanged behavior, pre-existing coverage restated here for
-/// discoverability): govder simply not configured (`config.govder = None`,
-/// `Config::default()`'s value) is ALSO a confirmed "no rule" — the
-/// `fetch_gate_rule_for_action` short-circuit before ever calling govder. This
-/// is the same shape `test_v10_inbound_oidc_resolves_subject_and_binds_owner`
-/// (above) already exercises; restated as its own test so the three
-/// "confirmed no rule" legs (404 / has_rule:false / not-configured) are each
-/// independently visible.
+// ---------------------------------------------------------------------------
+// NO GOVDER WIRED AT ALL. The last leg of the same fail-open.
+//
+// This pair replaces a test that asserted the opposite. That test
+// (`execute_open_numeric_path_parity_when_govder_not_configured`) claimed
+// `config.govder == None` was a third CONFIRMED "no rule", alongside a clean
+// `has_rule:false` and a fully-qualified 404 — and it passed, which is how the
+// downgrade stayed invisible through the whole FINDING 1/2 fix. But those two are
+// govder SPEAKING; this one is vultrino never asking. An operator who wrote a
+// two-key recipe for `money.refund` did not withdraw it by leaving GOVDER_BASE_URL
+// unset on the box that enforces it, and reading consent into an unset env var is
+// the identical fail-open as the bare-404 mapping, one layer further out.
+//
+// The scoping is the seam the codebase already draws, not a new one: refuse the
+// IRREVERSIBLE action, leave the reversible one exactly as it was. And it is not a
+// new REFUSAL either — `probe`-measured, a WIRED govder that answers unconfirmably
+// already refuses this identical fixture (no capability catalog, so trusted
+// irreversibility takes its fail-closed default). Being unwired is strictly LESS
+// informed than being wired-and-unconfirmable, so it cannot be allowed to be MORE
+// permissive: that would make "unset GOVDER_BASE_URL" the supported bypass for the
+// control this whole change exists to enforce.
+// ---------------------------------------------------------------------------
+
+/// An IRREVERSIBLE action with no govder wired must NOT run under the weaker
+/// single-approver path. Proven two ways, like its wired-govder siblings: the call is
+/// not accepted, AND no approval is persisted — so no human is notified and the use is
+/// not reserved for a requirement vultrino never confirmed.
+///
+/// The fixture deliberately registers NO capability catalog, which is the exact fixture
+/// the deleted test used: `trusted_irreversible_for_action` fails closed to `true` when
+/// nothing matches, so this is precisely the shape that test asserted a 202 for.
 #[tokio::test]
-async fn execute_open_numeric_path_parity_when_govder_not_configured() {
+async fn execute_refuses_an_irreversible_action_when_no_govder_is_wired() {
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.approval.enabled = true;
+    assert!(
+        config.govder.is_none(),
+        "fixture precondition: this deployment wires no recipe authority"
+    );
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential(router, &storage).await;
+    let status = resp.status();
+    let body = body_string(resp).await;
+    assert_ne!(
+        status,
+        StatusCode::ACCEPTED,
+        "an unwired govder must not open an irreversible action on the numeric path: not \
+         having asked the recipe authority is not the same as it answering 'no recipe'. \
+         body: {body}"
+    );
+    assert!(
+        body.contains("cannot be undone"),
+        "the refusal must tell the caller WHY it was refused and that nothing ran; got: {body}"
+    );
+    assert!(
+        storage.list_approvals().await.unwrap().is_empty(),
+        "no approval may be opened when the recipe could not be confirmed: an opened approval \
+         reserves a use and notifies humans as if the requirement were known"
+    );
+}
+
+/// The other side of the same scoping, and the reason this is not a flag day for
+/// standalone deployments: a REVERSIBLE action with no govder wired still opens on the
+/// numeric path, one approver, no stamped rule — byte-identical to before.
+#[tokio::test]
+async fn execute_still_opens_a_reversible_action_when_no_govder_is_wired() {
     let mut config = Config::default();
     config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
     config.approval.enabled = true;
     assert!(config.govder.is_none());
     let (router, storage) = build_router_with_config(config).await;
 
-    let resp = execute_against_require_approval_credential(router, &storage).await;
+    let resp = execute_against_require_approval_credential_with_reversibility(
+        router,
+        &storage,
+        Some("reversible"),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         StatusCode::ACCEPTED,
-        "no govder configured must still open via the numeric-threshold path"
+        "a reversible action must be unaffected by there being no recipe authority: an \
+         unconfirmed recipe there costs a reviewer, not a payment"
     );
 
     let approvals = storage.list_approvals().await.unwrap();
     assert_eq!(approvals.len(), 1);
     assert!(approvals[0].approval_rule.is_none());
     assert_eq!(approvals[0].required_approvals, 1);
+}
+
+/// THE SEAM, stated as a test so it cannot be quietly re-argued: a WIRED govder that
+/// answers unconfirmably ALREADY refuses this identical no-catalog fixture on shipped
+/// main. It is recorded here beside the unwired pair because it is the measurement that
+/// settles the scoping question — without it, "unwired refuses too" reads like a new and
+/// aggressive control, when it is actually the removal of the single configuration in
+/// which the existing control silently did not fire.
+#[tokio::test]
+async fn wired_govder_already_refuses_the_same_fixture_the_unwired_case_now_refuses() {
+    let govder = start_mock_govder_gate_rule(
+        StatusCode::NOT_FOUND,
+        serde_json::json!({ "error": "no gate configured" }),
+    )
+    .await;
+    let config = approval_open_test_config(govder);
+    assert!(
+        config.govder.is_some(),
+        "fixture precondition: this leg DOES wire a recipe authority"
+    );
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential(router, &storage).await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a wired-but-unconfirmable govder refuses this fixture today; the unwired case is \
+         strictly less informed, so it must not be more permissive"
+    );
+    assert!(storage.list_approvals().await.unwrap().is_empty());
 }
 
 /// `GET /api/v1/credentials` must report the `internal_http` binding a credential

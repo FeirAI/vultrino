@@ -528,8 +528,12 @@ pub struct VultrinoServer {
     /// stamped `ApprovalRule` (if any) at approval-open — see
     /// [`Self::fetch_gate_rule_for_action`]. `None` when govder isn't configured
     /// (`GOVDER_BASE_URL`/`GOVDER_TENANT_ASSERTION_SECRET` unset) or failed to
-    /// construct; every approval-open call already handles that as "no rule", so
-    /// this is never a hard startup dependency. A SEPARATE `GovderClient` instance
+    /// construct. That is NOT read as "no rule": it is read as "no recipe authority was
+    /// consulted", i.e. `GateRuleAnswer::Inconclusive` — which refuses IRREVERSIBLE
+    /// actions at approval-open and leaves reversible ones on the numeric path. So this
+    /// is still never a hard STARTUP dependency (the process boots and serves), but it
+    /// IS a hard dependency for running an action that cannot be undone. Both `None`
+    /// paths warn at startup, by name. A SEPARATE `GovderClient` instance
     /// from the one `web/server.rs` builds for `AppState` (that one backs the
     /// delegate-decide consult) — both are built from the SAME `Config::govder`
     /// source of truth, just via two independent constructions, since
@@ -652,17 +656,63 @@ impl VultrinoServer {
         };
 
         // Govder gate-rule client (plan 100 P2 Phase D). `None` when unconfigured or
-        // invalid — every approval-open call treats that as "no rule stamped",
-        // exactly today's numeric-threshold behavior (see the field's doc).
-        let govder = config.govder.as_ref().and_then(|cfg| {
-            match crate::govder::GovderClient::new(cfg.clone()) {
+        // invalid — approval RECIPES are then unenforceable, so every approval-open
+        // treats the gate answer as INCONCLUSIVE: irreversible actions refuse,
+        // reversible ones keep the numeric path (see `fetch_gate_rule_for_action`).
+        //
+        // BOTH no-client paths are logged, at the same volume. The absent-config path
+        // used to be the silent one: an operator who never set the two env vars got a
+        // clean startup and a stack that answered every recipe query with a confident
+        // "no recipe". A deployment running with recipes disabled has to SAY so, out
+        // loud and by name, because the entire failure mode is that it looks exactly
+        // like a deployment where they are in force.
+        let govder = match config.govder.as_ref() {
+            Some(cfg) => match crate::govder::GovderClient::new(cfg.clone()) {
                 Ok(client) => Some(Arc::new(client)),
                 Err(e) => {
-                    warn!(error = %e, "govder gate-rule client disabled: config invalid");
+                    warn!(error = %e,
+                        "govder gate-rule client disabled: config invalid — approval RECIPES are \
+                         NOT in force; irreversible actions will be REFUSED at approval-open and \
+                         reversible ones fall back to the numeric approver-count path");
                     None
                 }
+            },
+            None => {
+                warn!(
+                    "no govder policy engine configured (GOVDER_BASE_URL and/or \
+                     GOVDER_TENANT_ASSERTION_SECRET unset) — approval RECIPES are NOT in force on \
+                     this deployment; irreversible actions will be REFUSED at approval-open and \
+                     reversible ones fall back to the numeric approver-count path. Set both vars \
+                     to point at your decide plane, or declare each gated action's \
+                     `reversibility` in the capability catalog so vultrino stops having to \
+                     assume the worst about actions it cannot look up"
+                );
+                None
             }
-        });
+        };
+
+        // The policy `content_hash` oracle (D2). With no `VULTRINO_POLICY_HASH_SECRET`,
+        // `policy_content_hash` returns an EMPTY string — deliberately, because a bare
+        // unkeyed digest over a low-entropy policy would itself be a brute-force oracle.
+        // But govder's reconciliation sweep skips its drift comparison whenever either
+        // side is empty (internal/reconcile: `tp.hash != "" && lp.ContentHash != ""`), so
+        // an unset secret does not weaken drift detection, it DELETES it: a policy whose
+        // deny rule was stripped in place reads as clean forever. Degrading silently is
+        // what made that invisible, so say it.
+        if config
+            .policy_hash_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            warn!(
+                "VULTRINO_POLICY_HASH_SECRET is unset — policies will be served with an EMPTY \
+                 content_hash, and every consumer's drift check (govder's reconciliation sweep \
+                 included) SKIPS rather than fails on an empty hash. In-place policy mutation \
+                 (same id, deny rule stripped) is undetectable until this is set"
+            );
+        }
 
         Self {
             config,
@@ -2877,9 +2927,22 @@ impl VultrinoServer {
     /// approval at open (plan 100 P2 Phase D; docs/design/approval-recipes.md §6
     /// D5).
     ///
-    /// NO GOVDER CLIENT WIRED is the one remaining CONFIRMED `NoRule`: there is no
-    /// recipe authority in this deployment at all, so this is exactly today's
-    /// numeric-threshold approval flow, unchanged.
+    /// NO GOVDER CLIENT WIRED is `Inconclusive`, NOT a confirmed `NoRule`. It used to
+    /// be the latter, and that was the same fail-open as the bare-404 mapping one layer
+    /// out: "this process holds no address for the recipe authority" is ABSENCE OF
+    /// EVIDENCE, not evidence of absence. Only govder can license the weaker numeric
+    /// path, and an unwired vultrino has never asked it. The operator who wrote a
+    /// two-key recipe for `money.refund` did not withdraw it by failing to set
+    /// `GOVDER_BASE_URL` on the box that enforces it — but the old short-circuit read
+    /// exactly that consent into an unset env var, and one approver cleared the refund.
+    ///
+    /// The caller's `trusted_irreversible` seam then does the scoping, unchanged and
+    /// deliberately: an IRREVERSIBLE action refuses (nothing runs, no approval opens),
+    /// a REVERSIBLE one still opens on the numeric path. So a standalone vultrino with
+    /// no decide plane keeps working for the entire non-money world, and only loses the
+    /// ability to silently under-approve the actions that cannot be undone. That is the
+    /// correct trade: a deployment that runs irreversible money actions with no recipe
+    /// authority reachable is not a supported configuration, it is an unenforced one.
     ///
     /// A wired govder that cannot be REACHED, or answers malformed, is still `Err` —
     /// the caller fails the approval-open closed. But a wired govder that answers "no
@@ -2897,7 +2960,15 @@ impl VultrinoServer {
     ) -> Result<crate::govder::GateRuleAnswer, VultrinoError> {
         let govder = match self.govder.as_ref() {
             Some(g) => g,
-            None => return Ok(crate::govder::GateRuleAnswer::NoRule),
+            None => {
+                return Ok(crate::govder::GateRuleAnswer::Inconclusive {
+                    reason: "this vultrino has no policy engine wired \
+                             (GOVDER_BASE_URL/GOVDER_TENANT_ASSERTION_SECRET are unset), so no \
+                             approval recipe could be confirmed for this action — an unset \
+                             address is not a statement that no recipe exists"
+                        .to_string(),
+                })
+            }
         };
         let tenant = tenant.map(str::trim).unwrap_or_default();
         let agent_id = agent_id.map(str::trim).unwrap_or_default();

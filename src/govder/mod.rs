@@ -222,14 +222,20 @@ pub enum GateRuleAnswer {
     Rule(FetchedGateRule),
     /// govder CONFIRMED there is no recipe for this (agent, action_class): either a gate
     /// exists with no rule (`has_rule:false`), or no gate exists for an agent govder
-    /// knows AND govder's gate store is durable (so the absence cannot be a loss), or
-    /// this deployment wires no govder at all (there is no recipe authority to consult).
+    /// knows AND govder's gate store is durable (so the absence cannot be a loss).
     /// The numeric-threshold path is correct here.
+    ///
+    /// EVERY `NoRule` is spoken by govder. There is no way to reach this variant without
+    /// an answer from the decide plane — in particular, a deployment that wires NO govder
+    /// does not produce it (that used to be listed here as a third case, and it was the
+    /// last fail-open: silence from an authority you never contacted is not that
+    /// authority saying "nothing"). See `ServerState::fetch_gate_rule_for_action`.
     NoRule,
     /// govder did NOT confirm anything: it could not resolve the identity under the key
     /// it was given, its gate store is volatile so an absent gate may be a dropped one,
-    /// or it answered a 404 with no reason code at all (an older govder — an unqualified
-    /// 404, which is precisely the ambiguity the reason code removes).
+    /// it answered a 404 with no reason code at all (an older govder — an unqualified
+    /// 404, which is precisely the ambiguity the reason code removes), or this deployment
+    /// wires no govder at all, so nothing was ever asked.
     ///
     /// This is NOT an error: govder answered, and for a REVERSIBLE action the numeric
     /// path remains the right, unchanged behaviour. For an irreversible/money action the
