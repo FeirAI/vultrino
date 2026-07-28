@@ -4480,6 +4480,7 @@ mod tests {
     #[test]
     fn test_credential_info_serialization() {
         let info = CredentialInfo {
+            id: "11111111-2222-4333-8444-555555555555".to_string(),
             alias: "test-cred".to_string(),
             credential_type: "api_key".to_string(),
             description: Some("Test credential".to_string()),
@@ -4487,6 +4488,10 @@ mod tests {
         };
 
         let json = serde_json::to_string(&info).unwrap();
+        // `id` is the key every id-addressed credential route uses; a client that did
+        // not create the credential can learn it ONLY from this projection, so its
+        // presence on the wire is a contract, not an implementation detail.
+        assert!(json.contains("\"id\":\"11111111-2222-4333-8444-555555555555\""));
         assert!(json.contains("\"alias\":\"test-cred\""));
         assert!(json.contains("\"credential_type\":\"api_key\""));
         assert!(json.contains("\"description\":\"Test credential\""));
@@ -4495,6 +4500,7 @@ mod tests {
         assert!(!json.contains("internal_binding"));
 
         let pinned = CredentialInfo {
+            id: "66666666-7777-4888-8999-aaaaaaaaaaaa".to_string(),
             alias: "cred-finsandbox-refund".to_string(),
             credential_type: "api_key".to_string(),
             description: None,
@@ -4515,12 +4521,14 @@ mod tests {
         let response = ListCredentialsResponse {
             credentials: vec![
                 CredentialInfo {
+                    id: "aaaaaaaa-0000-4000-8000-000000000001".to_string(),
                     alias: "cred1".to_string(),
                     credential_type: "api_key".to_string(),
                     description: None,
                     internal_binding: None,
                 },
                 CredentialInfo {
+                    id: "aaaaaaaa-0000-4000-8000-000000000002".to_string(),
                     alias: "cred2".to_string(),
                     credential_type: "basic_auth".to_string(),
                     description: Some("Second cred".to_string()),
@@ -4533,5 +4541,9 @@ mod tests {
         assert!(json.contains("\"credentials\":["));
         assert!(json.contains("\"alias\":\"cred1\""));
         assert!(json.contains("\"alias\":\"cred2\""));
+        // Every ROW carries its own id, not just the first: an inventory that reported
+        // the id for some entries would leave the rest unaddressable for deletion.
+        assert!(json.contains("\"id\":\"aaaaaaaa-0000-4000-8000-000000000001\""));
+        assert!(json.contains("\"id\":\"aaaaaaaa-0000-4000-8000-000000000002\""));
     }
 }
