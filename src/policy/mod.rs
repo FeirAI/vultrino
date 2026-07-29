@@ -1780,4 +1780,95 @@ mod tests {
             PolicyDecision::Deny(_)
         ));
     }
+
+    /// Two `RateLimit`s AND-clamped onto ONE rule are two INDEPENDENT counters, and the
+    /// tighter one governs.
+    ///
+    /// This is the enforcement fact govder's overshoot bound is computed against. govder sizes
+    /// an agent's model channel with a long limit (the budget window's own call count) AND a
+    /// short burst limit whose window sits just above the deny-install lag, so the worst case a
+    /// budget breach can spend before the deny lands is a small fraction of the cap rather than
+    /// a whole budget period's allowance. The bound it prints is the MINIMUM of what the two
+    /// limits admit — which is only sound while:
+    ///
+    ///   1. the two limits are separate counters (`rate_limit_key` includes max + window_secs,
+    ///      so identical dimensions would collapse them into one), and
+    ///   2. an admitted call has passed BOTH (`And` short-circuits only on a deny).
+    ///
+    /// Both are asserted here, on the real engine, so a future change to `And` evaluation or to
+    /// the counter key fails HERE rather than silently doubling a published bound.
+    #[test]
+    fn test_two_and_clamped_rate_limits_are_independent_counters() {
+        let engine = PolicyEngine::new();
+        engine.add_policy(Policy {
+            id: "companion".to_string(),
+            name: "companion".to_string(),
+            credential_pattern: "*".to_string(),
+            principal_pattern: None,
+            rules: vec![PolicyRule {
+                // The shape govder compiles: action match first (so an ungranted action never
+                // charges allowance), then the BURST limit, then the budget-window limit.
+                condition: PolicyCondition::And(vec![
+                    PolicyCondition::ActionMatch("llm.*".to_string()),
+                    PolicyCondition::RateLimit {
+                        max: 2,
+                        window_secs: 6,
+                    },
+                    PolicyCondition::RateLimit {
+                        max: 5,
+                        window_secs: 86400,
+                    },
+                ]),
+                action: PolicyAction::Allow,
+            }],
+            default_action: PolicyAction::Deny,
+            kill: false,
+        });
+        let call = || {
+            engine.evaluate_full(&EvalInput {
+                credential_alias: "cred-llm",
+                url: None,
+                method: None,
+                action: Some("llm.openai"),
+                principal: None,
+                spend: None,
+            })
+        };
+
+        // The BURST limit is the tighter one inside a single window, so it governs: 2 admits,
+        // then a deny — even though the budget-window limit still has 3 of its 5 unspent.
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert!(
+            matches!(call(), PolicyDecision::Deny(_)),
+            "the tighter of two AND-clamped limits must govern; if the burst limit did not \
+             bite here, govder's bound (which takes the minimum of the two) would be a \
+             number nothing enforces"
+        );
+
+        // A DENIED call must not have charged the limit that never got evaluated. `And`
+        // short-circuits on the first false, so the budget-window counter is still at 2 — not
+        // 3. This is why govder emits the burst clamp BEFORE the long one: a call denied for
+        // bursting must not also burn a slot out of the day's allowance.
+        //
+        // Prove it by exhausting the day limit through a fresh burst counter: register the
+        // same policy shape under different burst dimensions is not needed — instead check the
+        // counters directly, which is the unambiguous statement.
+        let limits = engine.rate_limits.read();
+        let burst = limits
+            .get(&rate_limit_key("cred-llm", None, 2, 6))
+            .expect("the burst limit must have its own counter keyed on its own dimensions");
+        let long = limits
+            .get(&rate_limit_key("cred-llm", None, 5, 86400))
+            .expect("the budget-window limit must have its own counter, NOT share the burst one");
+        assert_eq!(
+            burst.count, 2,
+            "the burst counter should hold the 2 admits plus the denied attempt's charge"
+        );
+        assert_eq!(
+            long.count, 2,
+            "the budget-window counter must hold ONLY the 2 admitted calls — a call denied by \
+             the burst limit must not consume day-long allowance it never got to use"
+        );
+    }
 }
