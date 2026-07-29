@@ -1,0 +1,1313 @@
+{
+  "_comment": "SHARED CONFORMANCE VECTORS -- FROZEN. Read byte-identically by govder/internal/oversight (Go) and vultrino/src/approval (Rust). They pin approval-recipe SATISFACTION, which is implemented TWICE on purpose (govder recipeSatisfied / vultrino recipe_satisfied) and has already diverged once. A failing row is a CROSS-PLANE DIVERGENCE: govder and vultrino now disagree about whether an approval is complete. Do NOT regenerate this file to make a test pass.",
+  "_shared_copies": [
+    "govder/internal/oversight/testdata/recipe_vectors.json",
+    "vultrino/src/approval/testdata/recipe_vectors.json"
+  ],
+  "_contract": "satisfied(recipe, avail) is the COMPOSED contract each plane must implement: (1) a structurally malformed recipe (empty, count outside [1,64], summed total > 64, unknown class) is permanently unsatisfiable; (2) any agent-reviewer term makes the recipe unsatisfiable regardless of availability (system-wide disable); (3) otherwise an INJECTIVE sign-off -> slot matching must exist, where a senior may fill a senior OR a teammate slot, a teammate only a teammate slot, and an agent-reviewer only an agent-reviewer slot. Rust folds (1) into recipe_satisfied via recipe_well_formed. Go does NOT: govder's recipeSatisfied assumes its caller already dropped malformed recipes (evaluateApprovalRule's validRecipes filter, via recipeFloorOK -> recipeComposition). go_raw_satisfied records what govder's recipeSatisfied returns WITHOUT that filter -- it is pinned so the precondition can never be quietly removed, and the rows where it differs from `satisfied` are exactly the load-bearing ones.",
+  "_domain": "MAX_RECIPE_TERM_COUNT = 64 bounds both the per-term count and the summed total, so the recipe side of this contract is a FINITE domain and the sweeps below are EXHAUSTIVE over it, not samples. See each sweep's own `exhaustive_over` / `sampled_over` fields for exactly which axes are which.",
+  "cap": 64,
+  "u32_max": 4294967295,
+  "vectors": [
+    {
+      "id": "senior-1-met",
+      "note": "one senior slot, one senior sign-off",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 1,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "senior-1-unmet-teammate",
+      "note": "a plain teammate can NEVER fill a senior slot",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 5,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "teammate-1-by-senior",
+      "note": "a senior IS a fortiori a teammate (senior fills a teammate slot)",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 1,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "teammate-1-met",
+      "note": "one teammate slot, one teammate sign-off",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 1,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "teammate-1-unmet",
+      "note": "no humans at all",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "injective-senior-cannot-double-count",
+      "note": "REGRESSION: ONE senior must not fill BOTH the senior and the teammate slot",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          },
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 1,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "injective-two-seniors-ok",
+      "note": "two seniors DO fill {senior:1, teammate:1} (the second fills the teammate slot)",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          },
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 2,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "injective-senior-plus-teammate-ok",
+      "note": "the natural fill of {senior:1, teammate:1}",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          },
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 1,
+        "teammate": 1,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "leftover-senior-spills-into-teammate",
+      "note": "3 seniors on {senior:1, teammate:2}: the 2 leftover seniors fill both teammate slots",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          },
+          {
+            "class": "teammate",
+            "count": 2
+          }
+        ]
+      },
+      "avail": {
+        "senior": 3,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "leftover-senior-one-short",
+      "note": "2 seniors on {senior:1, teammate:2}: one teammate slot goes unfilled",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          },
+          {
+            "class": "teammate",
+            "count": 2
+          }
+        ]
+      },
+      "avail": {
+        "senior": 2,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "mixed-fill-exact",
+      "note": "{senior:2, teammate:3} filled by 2 seniors + 3 teammates exactly",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 2
+          },
+          {
+            "class": "teammate",
+            "count": 3
+          }
+        ]
+      },
+      "avail": {
+        "senior": 2,
+        "teammate": 3,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "mixed-fill-senior-short",
+      "note": "{senior:2, teammate:3} with only 1 senior: seniors are not substitutable downward",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 2
+          },
+          {
+            "class": "teammate",
+            "count": 3
+          }
+        ]
+      },
+      "avail": {
+        "senior": 1,
+        "teammate": 9,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "same-class-terms-additive-met",
+      "note": "{teammate:1, teammate:1} needs TWO teammates, not one",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 1
+          },
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 2,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "same-class-terms-additive-unmet",
+      "note": "{teammate:1, teammate:1} is NOT satisfied by a single teammate",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 1
+          },
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 1,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "same-class-senior-additive",
+      "note": "{senior:2, senior:1} needs three seniors",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 2
+          },
+          {
+            "class": "senior",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 3,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "same-class-senior-additive-unmet",
+      "note": "{senior:2, senior:1} with two seniors and a hundred teammates still fails",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 2
+          },
+          {
+            "class": "senior",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 2,
+        "teammate": 60,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "agent-reviewer-alone-never-satisfies",
+      "note": "item-7 hard guard: an agent-reviewer term is unsatisfiable no matter how many agents signed",
+      "recipe": {
+        "terms": [
+          {
+            "class": "agent-reviewer",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 64
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "agent-reviewer-alone-with-humans",
+      "note": "same, with a full house of humans present",
+      "recipe": {
+        "terms": [
+          {
+            "class": "agent-reviewer",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 64,
+        "teammate": 64,
+        "agent_reviewer": 64
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "agent-reviewer-mixed-poisons-recipe",
+      "note": "one agent-reviewer term makes the WHOLE recipe unsatisfiable, humans notwithstanding",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          },
+          {
+            "class": "agent-reviewer",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 64,
+        "teammate": 64,
+        "agent_reviewer": 64
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "agent-reviewer-at-cap",
+      "note": "agent-reviewer at the cap: still unsatisfiable",
+      "recipe": {
+        "terms": [
+          {
+            "class": "agent-reviewer",
+            "count": 64
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 64
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-teammate-64-met",
+      "note": "at the cap: {teammate:64} with exactly 64 teammates",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 64
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 64,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-teammate-64-one-short",
+      "note": "at the cap, one short",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 64
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 63,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-teammate-64-by-seniors",
+      "note": "at the cap, filled entirely by seniors",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 64
+          }
+        ]
+      },
+      "avail": {
+        "senior": 64,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-senior-64-met",
+      "note": "at the cap: {senior:64} with exactly 64 seniors",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 64
+          }
+        ]
+      },
+      "avail": {
+        "senior": 64,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-senior-64-teammates-cannot-help",
+      "note": "seniors are not substitutable downward, at the cap",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 64
+          }
+        ]
+      },
+      "avail": {
+        "senior": 63,
+        "teammate": 1000,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-split-63-1-met",
+      "note": "summed total exactly at the cap across two classes",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 63
+          },
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 63,
+        "teammate": 1,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-split-63-1-by-seniors",
+      "note": "same, filled by 64 seniors",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 63
+          },
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 64,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-over-single-65",
+      "note": "OVER the per-term cap by one: permanently unsatisfiable",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 65
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 65,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-over-single-65-empty-signoffs",
+      "note": "REGRESSION (BLOCKER 3): the over-cap recipe must not clear with NO sign-offs either",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 65
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-over-sum-65",
+      "note": "summed total OVER the cap by one: permanently unsatisfiable",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 64
+          },
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 1000,
+        "teammate": 1000,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-over-sum-65-empty-signoffs",
+      "note": "same, with no sign-offs",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 64
+          },
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-over-sum-many-small",
+      "note": "many small terms whose running total crosses the cap",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 32
+          },
+          {
+            "class": "teammate",
+            "count": 32
+          },
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 1000,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "cap-sum-exactly-64-many-terms",
+      "note": "many small terms summing exactly to the cap: still well-formed",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 32
+          },
+          {
+            "class": "teammate",
+            "count": 32
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 64,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "malformed-empty-recipe",
+      "note": "ASYMMETRY: an EMPTY recipe is vacuously satisfied by govder's raw recipeSatisfied (all needs 0) and is only unsatisfiable because validRecipes drops it first",
+      "recipe": {
+        "terms": []
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "malformed-zero-count",
+      "note": "ASYMMETRY: a zero-count term contributes nothing, so govder's raw recipeSatisfied returns true with NO sign-offs",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 0
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "malformed-unknown-class",
+      "note": "ASYMMETRY: govder's raw recipeSatisfied has no default branch, so an UNKNOWN class contributes nothing and the recipe clears with NO sign-offs",
+      "recipe": {
+        "terms": [
+          {
+            "class": "supervisor",
+            "count": 5
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "malformed-unknown-class-mixed",
+      "note": "an unknown class beside a real one: the real term still counts on the raw Go path",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          },
+          {
+            "class": "supervisor",
+            "count": 5
+          }
+        ]
+      },
+      "avail": {
+        "senior": 1,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "malformed-unknown-class-mixed-unmet",
+      "note": "same shape, unmet even on the raw Go path",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          },
+          {
+            "class": "supervisor",
+            "count": 5
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "malformed-negative-count",
+      "note": "a negative count is unrepresentable on the Rust wire (u32); on the raw Go path it makes the need NEGATIVE, which trivially clears",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": -1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": true,
+      "rust_representable": false
+    },
+    {
+      "id": "blocker3-overflow-wrap-to-one",
+      "note": "a recipe naming 2xMaxInt+3 seniors wraps to needSenior=1 on the raw Go path and clears with ONE senior",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 3
+          },
+          {
+            "class": "senior",
+            "count": 9223372036854775807
+          },
+          {
+            "class": "senior",
+            "count": 9223372036854775807
+          }
+        ]
+      },
+      "avail": {
+        "senior": 1,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": true,
+      "rust_representable": false
+    },
+    {
+      "id": "blocker3-overflow-wrap-to-one-unmet",
+      "note": "the same recipe with no sign-offs: even the wrapped need of 1 is unmet",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 3
+          },
+          {
+            "class": "senior",
+            "count": 9223372036854775807
+          },
+          {
+            "class": "senior",
+            "count": 9223372036854775807
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": false
+    },
+    {
+      "id": "blocker3-overflow-wrap-to-negative-senior",
+      "note": "two MaxInt senior terms wrap the need NEGATIVE, so the raw Go path clears with NOBODY at all",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 9223372036854775807
+          },
+          {
+            "class": "senior",
+            "count": 9223372036854775807
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": true,
+      "rust_representable": false
+    },
+    {
+      "id": "blocker3-overflow-wrap-to-negative-teammate",
+      "note": "same wrap on the teammate axis: cleared by an empty sign-off set",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 9223372036854775807
+          },
+          {
+            "class": "teammate",
+            "count": 9223372036854775807
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": true,
+      "rust_representable": false
+    },
+    {
+      "id": "malformed-maxint-count",
+      "note": "math.MaxInt count: rejected structurally; the raw Go path needs MaxInt seniors",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 9223372036854775807
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": false,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": false
+    },
+    {
+      "id": "saturation-u32max-avail",
+      "note": "u32::MAX sign-offs: Rust saturating_add must not change the answer",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 64
+          }
+        ]
+      },
+      "avail": {
+        "senior": 4294967295,
+        "teammate": 4294967295,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "saturation-u32max-senior-only",
+      "note": "u32::MAX seniors on a full-cap senior recipe",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 64
+          }
+        ]
+      },
+      "avail": {
+        "senior": 4294967295,
+        "teammate": 0,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "saturation-u32max-teammates-cannot-fill-senior",
+      "note": "u32::MAX TEAMMATES still cannot fill a single senior slot",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 0,
+        "teammate": 4294967295,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    },
+    {
+      "id": "saturation-leftover-plus-u32max",
+      "note": "leftover-senior + u32::MAX teammates saturates but still clears",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 1
+          },
+          {
+            "class": "teammate",
+            "count": 63
+          }
+        ]
+      },
+      "avail": {
+        "senior": 1,
+        "teammate": 4294967295,
+        "agent_reviewer": 0
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "single-teammate-slot-huge-supply",
+      "note": "one slot, plenty of supply",
+      "recipe": {
+        "terms": [
+          {
+            "class": "teammate",
+            "count": 1
+          }
+        ]
+      },
+      "avail": {
+        "senior": 5,
+        "teammate": 5,
+        "agent_reviewer": 5
+      },
+      "well_formed": true,
+      "satisfied": true,
+      "go_raw_satisfied": true,
+      "rust_representable": true
+    },
+    {
+      "id": "agent-reviewer-supply-is-irrelevant-when-no-ar-term",
+      "note": "agent-reviewer sign-offs never help a humans-only recipe",
+      "recipe": {
+        "terms": [
+          {
+            "class": "senior",
+            "count": 2
+          }
+        ]
+      },
+      "avail": {
+        "senior": 1,
+        "teammate": 0,
+        "agent_reviewer": 63
+      },
+      "well_formed": true,
+      "satisfied": false,
+      "go_raw_satisfied": false,
+      "rust_representable": true
+    }
+  ],
+  "sweeps": [
+    {
+      "id": "human-axis",
+      "note": "EXHAUSTIVE over the entire humans-only sub-domain -- every well-formed (need_senior, need_teammate) pair with sum <= 64 crossed with every (avail_senior, avail_teammate) in [0,65] plus u32::MAX. Agent-reviewer terms are hard-disabled, so this domain contains EVERY recipe the shipped system can ever satisfy.",
+      "exhaustive_over": "need_senior, need_teammate (full simplex, sum<=64); avail in [0,65]",
+      "sampled_over": "avail values above 65 are represented by u32::MAX only. Sound: satisfaction is monotone non-decreasing in each avail, and every need is <= 64, so any avail >= 64 behaves identically to 64.",
+      "avail_values": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        4294967295
+      ],
+      "loop_order": "need_senior asc, need_teammate asc, avail_senior asc, avail_teammate asc; avail_agent_reviewer fixed 0",
+      "need_rule": "terms = [(senior,ns) if ns>0] ++ [(teammate,nt) if nt>0]",
+      "points": 9628905,
+      "satisfied_count": 5792016,
+      "sha256": "d7d0faab78f9115310d3be674e2a0cf2b7c311b822e43dcc00913a92f9bad875"
+    },
+    {
+      "id": "agent-reviewer-simplex",
+      "note": "EXHAUSTIVE over the whole THREE-class need simplex (ns+nt+na <= 64), pinning the item-7 hard guard: every need triple with na >= 1 must be unsatisfiable at every availability.",
+      "exhaustive_over": "need_senior, need_teammate, need_agent_reviewer (full simplex, sum<=64)",
+      "sampled_over": "avail triples are sampled at {0,1,64,65,u32::MAX}^3. Sound for the na>=1 rows because both implementations return before reading any avail; the na==0 rows are covered exhaustively by the human-axis sweep.",
+      "avail_values": [
+        0,
+        1,
+        64,
+        65,
+        4294967295
+      ],
+      "loop_order": "na asc, ns asc, nt asc, avail_senior asc, avail_teammate asc, avail_agent_reviewer asc",
+      "need_rule": "terms = [(senior,ns) if ns>0] ++ [(teammate,nt) if nt>0] ++ [(agent-reviewer,na) if na>0]",
+      "points": 5988125,
+      "satisfied_count": 163715,
+      "sha256": "c31a8d10a2c2e80d24537e1955b32b512e489487894069c618f57c9a696ffeaa"
+    },
+    {
+      "id": "cap-cliff",
+      "note": "EXHAUSTIVE over the 64-cap cliff: every single-term recipe for each of the three classes at every count 0..66, plus every (senior c1, teammate c2) pair with c1,c2 in 0..66 -- crossing the per-term cap and the summed-total cap from below, at, and above. Zero-count terms are kept EXPLICIT (count==0 is itself under test).",
+      "exhaustive_over": "term counts 0..66 (per-term and summed, single- and two-term recipes)",
+      "sampled_over": "avail triples at {0,1,64,65,u32::MAX}^3",
+      "avail_values": [
+        0,
+        1,
+        64,
+        65,
+        4294967295
+      ],
+      "loop_order": "recipes in order: for class in [senior,teammate,agent-reviewer] for count in 0..66 -> [(class,count)]; then for c1 in 0..66 for c2 in 0..66 -> [(senior,c1),(teammate,c2)]. Then avail_senior asc, avail_teammate asc, avail_agent_reviewer asc.",
+      "recipes": 4690,
+      "points": 586250,
+      "satisfied_count": 163715,
+      "sha256": "fc9365053cb4b2dc9461a27d388f1b4909faeb94b7a6dfdf7d2622ebbbc0a648"
+    },
+    {
+      "id": "matching-oracle",
+      "note": "EXHAUSTIVE small cube where the greedy senior-first shortcut is checked against a REAL maximum-bipartite-matching search over individual sign-off units (augmenting paths), not against the Hall-condition algebra the larger sweeps use. This is what makes approval-recipes.md's swap argument empirical.",
+      "exhaustive_over": "need_senior+need_teammate <= 8; avail in [0,9]^3; need_agent_reviewer = 0",
+      "sampled_over": "nothing -- full cross product",
+      "avail_values": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "need_max": 8,
+      "loop_order": "ns asc, nt asc, avail_senior asc, avail_teammate asc, avail_agent_reviewer asc",
+      "need_rule": "terms = [(senior,ns) if ns>0] ++ [(teammate,nt) if nt>0]",
+      "points": 45000,
+      "satisfied_count": 28700,
+      "greedy_vs_optimal_mismatches": 0,
+      "sha256": "4de8d89cb1746ea56ab876b5d1991cdc116eabdc3a79a0d658cd67ced48141eb"
+    }
+  ]
+}
