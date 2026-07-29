@@ -613,13 +613,199 @@ impl Decision {
     }
 }
 
+/// Unforgeable evidence that a grant was **re-derived from the persisted
+/// sign-off set** and held (Stage 1 V2).
+///
+/// The type carries no public constructor, no `Clone`, no `Copy`, no `Default`
+/// and no `Deserialize`. Its single field is private and its only producer is
+/// [`ApprovalRequest::grant_witness`]. Therefore *possession of a `Granted` is
+/// itself the proof* — a caller cannot manufacture one, cannot deserialize one
+/// out of the vault, and cannot duplicate one it was handed.
+///
+/// Everything that actually runs an approved action requires one by value or by
+/// reference ([`crate::storage::ExecutionClaim`] holds one;
+/// `VultrinoServer::resume_approved` takes one), so **"execute an approved action
+/// without a re-derived grant" is not expressible** — it is a type error, not a
+/// convention. That is the founder's sentence in type form: no action executes
+/// unless the sign-off set that vultrino actually holds satisfies the rule.
+///
+/// # What it is not
+///
+/// It is not a capability token and it is not unforgeable across a process
+/// boundary — it never leaves the process and is never serialized. It is a
+/// compile-time obligation on in-process control flow. The cross-process half is
+/// the re-derivation itself, which is why the witness is minted from stored bytes
+/// rather than handed down from `transition`.
+///
+/// # The demonstration that the seal is load-bearing
+///
+/// Everything below is a **doc-test**. rustdoc compiles each snippet as a
+/// standalone crate that depends on `vultrino` — which is precisely the adversary
+/// the seal is aimed at ("a downstream consumer of the `vultrino` crate") — and
+/// `compile_fail` makes rustdoc **fail the test if the snippet compiles**. So
+/// "the bad state cannot be constructed" is re-checked by the compiler on every
+/// `cargo test`, rather than asserted in a comment. Measured on this toolchain
+/// (rustc 1.92.0): turning the positive control below into a `compile_fail`
+/// makes the doc-test suite go red, so `compile_fail` itself binds.
+///
+/// ## Why there is a positive control, and why it is shaped the way it is
+///
+/// A `compile_fail` test passes when the snippet fails to compile **for any
+/// reason at all**. A renamed module, a moved type, a typo in a path — any of
+/// those silently converts every one of the five tests below into a test that
+/// passes while checking nothing. That is this codebase's measured failure class
+/// (*a control that reads as live and is inert*), so a bare pile of
+/// `compile_fail` snippets would be an instance of the very defect this work
+/// exists to close.
+///
+/// **The obvious fix does not work, and it was measured rather than assumed.**
+/// rustdoc accepts `` ```compile_fail,E0616 ``, which reads as pinning the
+/// *reason*. On stable rustc 1.92.0 it does not: replacing a snippet's real
+/// `E0599` with a deliberately wrong `E0424` left the suite green. **The error
+/// code annotation is inert here — do not use it as a pin anywhere in this
+/// repository.**
+///
+/// So the reason is pinned structurally instead. The positive control below
+/// names **every symbol** and exercises **every syntactic shape** the five
+/// failing snippets use — `&mut ApprovalRequest`, a `GrantBasis` struct-variant
+/// literal, `Vec::<Signoff>::push`, a `Granted` in a signature — and it **must
+/// compile**. Each failing snippet then differs from it by exactly one token: the
+/// sealed operation. If a rename or a bad path were the real cause of a failure,
+/// the positive control would fail too and the suite would go red.
+///
+/// ```
+/// use vultrino::approval::{ApprovalRequest, ApprovalStatus, GrantBasis, Granted, Signoff};
+///
+/// // Every shape the compile_fail snippets below use, in its sanctioned form.
+/// fn sanctioned(a: &mut ApprovalRequest, s: Signoff) -> (ApprovalStatus, usize, Option<Granted>) {
+///     let mut local: Vec<Signoff> = Vec::new();
+///     local.push(s);                      // `push` on a Vec<Signoff> is fine...
+///     let _ = local.len();                // ...it is `a.signoffs` that is sealed.
+///     let _basis = GrantBasis::NumericThreshold { need: 1, have: 1 };
+///     (a.status(), a.signoffs().len(), a.grant_witness())
+/// }
+/// fn holds_a_grant(_g: &Granted) {}
+/// ```
+///
+/// A downstream holder of `&mut ApprovalRequest` **cannot write the status**.
+/// This is the exact one-liner plan 105 §2.3 names: it would bypass, in one
+/// compile-clean line, the blank-identity check, the TTL check, the SoD guard,
+/// the same-aggregator-key guard, the duplicate-approver guard, and recipe
+/// satisfaction:
+///
+/// ```compile_fail
+/// use vultrino::approval::{ApprovalRequest, ApprovalStatus};
+/// fn forge(a: &mut ApprovalRequest) {
+///     a.status = ApprovalStatus::Approved;
+/// }
+/// ```
+///
+/// Nor **read** it as a field, so no consumer can come to depend on the field's
+/// existence and make a future re-sealing a breaking change:
+///
+/// ```compile_fail
+/// use vultrino::approval::{ApprovalRequest, ApprovalStatus};
+/// fn peek(a: &ApprovalRequest) -> ApprovalStatus {
+///     a.status
+/// }
+/// ```
+///
+/// Nor **fabricate the evidence** the grant is derived from — sealing the
+/// conclusion while leaving the premise writable would be the same hole with an
+/// extra step:
+///
+/// ```compile_fail
+/// use vultrino::approval::{ApprovalRequest, Signoff};
+/// fn stuff(a: &mut ApprovalRequest, s: Signoff) {
+///     a.signoffs.push(s);
+/// }
+/// ```
+///
+/// Nor **construct a `Granted` directly**, which is what makes possession of one
+/// evidence rather than decoration:
+///
+/// ```compile_fail
+/// use vultrino::approval::{GrantBasis, Granted};
+/// fn forge_grant() -> Granted {
+///     Granted { basis: GrantBasis::NumericThreshold { need: 1, have: 1 } }
+/// }
+/// ```
+///
+/// Nor **duplicate one it was legitimately handed**, which is what keeps a single
+/// grant from authorising two executions:
+///
+/// ```compile_fail
+/// use vultrino::approval::Granted;
+/// fn duplicate(g: &Granted) -> Granted {
+///     g.clone()
+/// }
+/// ```
+///
+/// # What this does NOT prove, stated so nobody reads it as more
+///
+/// It is rung 1 for *every module outside `src/approval/mod.rs` and every
+/// downstream crate*. Inside this module the six write sites remain, and their
+/// correctness is a rung-2/3 claim carried by the lifecycle enumeration and the
+/// cross-language conformance suite, not by the type system. And it says nothing
+/// about an adversary who edits the vault ciphertext: that adversary is met by
+/// [`ApprovalRequest::grant_witness`]'s re-derivation, one rung lower, and the
+/// residual is recorded in `docs/dev/LIMITATIONS.md`.
+#[derive(Debug)]
+#[must_use = "a Granted is the authority to execute; dropping it silently discards the grant"]
+pub struct Granted {
+    #[allow(dead_code)] // carried for diagnostics/audit; the VALUE's existence is the claim
+    basis: GrantBasis,
+}
+
+impl Granted {
+    /// Why the grant held — for logs and for the audit record. Never a decision
+    /// input: the *existence* of the `Granted` is the decision.
+    pub fn basis(&self) -> &GrantBasis {
+        &self.basis
+    }
+}
+
+/// The predicate that produced a [`Granted`]. Subsumes plan 104 rank 13 / N-2a
+/// (*"`Approved` carries no evidence of why"*): the grant now names its own
+/// reason, so an audit consumer reads it rather than trusting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantBasis {
+    /// No rule was stamped; the V12 numeric threshold cleared.
+    NumericThreshold { need: u32, have: u32 },
+    /// A govder-stamped [`ApprovalRule`] was satisfied by the stored sign-offs.
+    Recipe {
+        recipes: usize,
+        counted_signoffs: usize,
+    },
+}
+
 /// A request for a human to approve (or deny) a specific authenticated action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     /// Unique id, format `appr_<uuid>` — this is what the agent polls with.
     pub id: String,
     /// Current lifecycle state.
-    pub status: ApprovalStatus,
+    ///
+    /// **SEALED (Stage 1 V2).** This field was `pub` until 2026-07-29. A public
+    /// mutable field on a public struct in a library crate meant any holder of a
+    /// `&mut ApprovalRequest` — a new call site in another module, or any
+    /// downstream consumer of the `vultrino` crate — could write
+    /// `approval.status = ApprovalStatus::Approved` in one compile-clean line and
+    /// bypass, at once: the blank-identity check, the TTL check, the SoD guard,
+    /// the same-aggregator-key guard, the duplicate-approver guard, and recipe
+    /// satisfaction. The discipline existed (every production write was already
+    /// inside this module) but it was enforced by convention, not by the compiler.
+    ///
+    /// Now: read it with [`ApprovalRequest::status`]; write it only through
+    /// [`ApprovalRequest::transition`] and the lifecycle helpers in this module.
+    /// Outside `src/approval/mod.rs` **no** write is expressible at all — that is
+    /// a compiler-checked fact, not a grep.
+    ///
+    /// Serde still round-trips it (the derive expands in this module, so field
+    /// privacy does not affect it), which is precisely why sealing is necessary
+    /// but not sufficient — see [`Granted`] for the half the type system cannot
+    /// reach across the vault boundary.
+    status: ApprovalStatus,
     /// Credential alias the action would use.
     pub credential: String,
     /// Fully-qualified action (`http.request`, `postgres.run_sql`, ...).
@@ -675,8 +861,16 @@ pub struct ApprovalRequest {
     /// Recorded approver sign-offs (V12). For a single-approval request this holds
     /// the one decision; for dual control it accumulates distinct approvers until
     /// `required_approvals` is met.
+    ///
+    /// **SEALED (Stage 1 V2), for the same reason [`Self::status`] is.** The
+    /// sign-off set is the *evidence* the grant rests on; leaving it publicly
+    /// mutable while sealing `status` would seal the conclusion and leave the
+    /// premise writable, which is the weaker half of the same hole (push a
+    /// fabricated `Signoff`, then let `transition` grant honestly on it). Read it
+    /// with [`ApprovalRequest::signoffs`]; it is appended only by
+    /// [`ApprovalRequest::transition`], after every guard has run.
     #[serde(default)]
-    pub signoffs: Vec<Signoff>,
+    signoffs: Vec<Signoff>,
     /// The govder-authored `ApprovalRule` stamped at open (plan 100 P2 Phase D;
     /// approval-recipes.md §6 D5). `None` preserves today's numeric-threshold
     /// behavior byte-identically — recipes are strictly opt-in per action class.
@@ -859,6 +1053,119 @@ impl ApprovalRequest {
         };
 
         (request, decision_token)
+    }
+
+    /// Current lifecycle state. Read-only accessor for the sealed
+    /// [`Self::status`] field (Stage 1 V2).
+    pub fn status(&self) -> ApprovalStatus {
+        self.status
+    }
+
+    /// The recorded sign-off set, in the order it accumulated. Read-only accessor
+    /// for the sealed [`Self::signoffs`] field (Stage 1 V2).
+    pub fn signoffs(&self) -> &[Signoff] {
+        &self.signoffs
+    }
+
+    /// Re-derive the grant from the PERSISTED state and, if it holds, mint the
+    /// one witness that the execution path requires. `None` means **refuse**.
+    ///
+    /// # Why this exists, and why sealing the field alone is not enough
+    ///
+    /// Sealing [`Self::status`] makes an illegal *in-memory* write inexpressible.
+    /// It does nothing about the vault: `ApprovalRequest` is `Deserialize`, and a
+    /// deserialize reconstructs `status` **from bytes**, so a type-level state
+    /// parameter cannot survive the round-trip (this is the structural blocker
+    /// that rules out textbook typestate — plan 105 §2.3 blocker 1). The persisted
+    /// transition — the one that matters across a crash, or between two processes
+    /// — is out of reach of the type system by construction.
+    ///
+    /// So the invariant is re-established at the only point where it is
+    /// load-bearing: **immediately before execution**, from the stored evidence,
+    /// under the storage write lock. `Granted` is the proof object. Its
+    /// constructor is private to this module and it is neither `Clone` nor
+    /// `Copy` nor `Default` nor `Deserialize`, so the ONLY way any caller
+    /// anywhere can obtain one is to call this function and have it say yes.
+    ///
+    /// # What it re-derives, and what it deliberately does not
+    ///
+    /// It re-runs exactly the predicate `transition` granted on:
+    /// [`approval_rule_satisfied`] against the stamped rule when one is present,
+    /// otherwise the numeric threshold. That is E1's clause — *the sign-off set
+    /// vultrino held when it wrote `Approved` satisfies at least one whole recipe*
+    /// — and re-deriving it is total and deterministic (the sign-off set is frozen
+    /// once the request leaves an open state, and neither predicate reads a clock).
+    ///
+    /// It does **not** re-run the *decision-time* guards (TTL, SoD, the
+    /// same-aggregator-key guard, duplicate-approver). Those are properties of the
+    /// act of deciding, not of the resulting evidence, and cannot be recomputed
+    /// from a stored record. Their bypass remains inexpressible only inside this
+    /// crate's compile unit; see `LIMITATIONS.md`.
+    ///
+    /// # Fail-closed direction
+    ///
+    /// A record whose stored `status` is `Approved` but whose stored sign-off set
+    /// does not satisfy its stored rule yields `None` and therefore does not run.
+    /// That includes a pre-V12 record with an empty `signoffs` array, which is the
+    /// one benign shape this refuses; it is refused deliberately, because
+    /// "approved, with no recorded evidence of by whom" is exactly the state a
+    /// vault edit produces and there is no way to tell the two apart from the
+    /// record.
+    pub fn grant_witness(&self) -> Option<Granted> {
+        if self.status != ApprovalStatus::Approved {
+            return None;
+        }
+        match &self.approval_rule {
+            None => {
+                let need = self.effective_required_approvals();
+                let have = self.signoffs.iter().filter(|s| s.approve).count() as u32;
+                if have < need {
+                    return None;
+                }
+                Some(Granted {
+                    basis: GrantBasis::NumericThreshold { need, have },
+                })
+            }
+            Some(rule) => {
+                if !approval_rule_satisfied(rule, &self.signoffs) {
+                    return None;
+                }
+                Some(Granted {
+                    basis: GrantBasis::Recipe {
+                        recipes: rule.recipes.len(),
+                        counted_signoffs: self.signoffs.iter().filter(|s| s.approve).count(),
+                    },
+                })
+            }
+        }
+    }
+
+    /// Test-only escape hatch for the sealed [`Self::status`] field.
+    ///
+    /// Gated on `cfg(test)`, so it does not exist in any shipped binary and
+    /// cannot be called by a downstream consumer of the crate: the rung-1 claim
+    /// "no production write site outside this module" is unaffected by it. It
+    /// exists so that in-crate tests in sibling modules can still fabricate the
+    /// adversarial records they are *supposed* to fabricate (a stale approved
+    /// grant, a vault record with a forged status) without any of them being able
+    /// to do so by accident.
+    #[cfg(test)]
+    pub(crate) fn set_status_for_test(&mut self, status: ApprovalStatus) {
+        self.status = status;
+    }
+
+    /// Test-only escape hatch for the sealed [`Self::signoffs`] field. Same
+    /// `cfg(test)` reasoning as [`Self::set_status_for_test`].
+    #[cfg(test)]
+    pub(crate) fn set_signoffs_for_test(&mut self, signoffs: Vec<Signoff>) {
+        self.signoffs = signoffs;
+    }
+
+    /// Test-only append to the sealed [`Self::signoffs`] field. Same `cfg(test)`
+    /// reasoning as [`Self::set_status_for_test`].
+    #[cfg(test)]
+    pub(crate) fn push_signoff_for_test(&mut self, signoff: Signoff) {
+        self.signoffs.push(signoff);
     }
 
     /// Whether this approval is visible to (and decidable by) an admin acting in
@@ -1349,8 +1656,33 @@ fn approval_rule_satisfied(rule: &ApprovalRule, signoffs: &[Signoff]) -> bool {
     let mut humans: Vec<&Signoff> = Vec::new();
     let mut agent_reviewers: Vec<&Signoff> = Vec::new();
     for so in signoffs.iter().filter(|s| s.approve) {
-        if so.approver_identity.trim().is_empty() {
-            continue; // malformed: fail-closed, drop
+        // Stage 1 V4. This guard MUST read the same function the D4(b)
+        // distinctness key reads (`bare_approver_identity`), because those two are
+        // the pair that decides *what a principal is* and they must never hold
+        // different opinions.
+        //
+        // It used to test the FULL namespaced identity. That let
+        // `agg:<key-id>:` with an EMPTY operator through — non-empty as a whole
+        // string, so it survived the drop — and `dedupe_by_identity` then filed it
+        // under the bare key `""`, so an UNNAMED principal filled a recipe slot.
+        // That is a direct obligation-X (non-substitution) violation. No shipped
+        // entry point produces the shape (`web/api.rs` substitutes
+        // `NO_OPERATOR_SENTINEL`, the panel uses the session user, the OOB link
+        // filters non-empty, the CLI stamps `cli:<user>`), but `Signoff`
+        // deserializes from the vault with no identity validation at all, so it is
+        // reachable across the persistence boundary — and "unreachable by
+        // convention in four places" is exactly the reasoning this codebase has
+        // measured to be wrong.
+        //
+        // Strictly fail-closed: it can only drop MORE sign-offs than before, never
+        // fewer, so it can never newly satisfy a recipe. See
+        // `stage1_proofs::an_unnamed_principal_fills_no_slot` and
+        // `the_drop_and_the_distinctness_key_agree_about_what_a_principal_is`.
+        if bare_approver_identity(&so.approver_identity)
+            .trim()
+            .is_empty()
+        {
+            continue; // malformed / unnamed: fail-closed, drop
         }
         let Some(class) = so.resolved_class else {
             continue; // unresolved class: never counted (fail-closed)
@@ -2216,6 +2548,9 @@ fn html_escape(s: &str) -> String {
 /// Test-only: this declaration compiles to nothing outside `cargo test`.
 #[cfg(test)]
 mod recipe_conformance;
+
+#[cfg(test)]
+mod stage1_proofs;
 
 #[cfg(test)]
 mod tests {

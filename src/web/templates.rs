@@ -384,7 +384,7 @@ pub struct ApprovalDisplay {
 impl From<&crate::approval::ApprovalRequest> for ApprovalDisplay {
     fn from(a: &crate::approval::ApprovalRequest) -> Self {
         use crate::approval::ApprovalStatus;
-        let status_class = match a.status {
+        let status_class = match a.status() {
             ApprovalStatus::Pending => "badge-pending",
             ApprovalStatus::Escalated => "badge-warning",
             ApprovalStatus::Approved => "badge-success",
@@ -395,7 +395,7 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalDisplay {
             format!("execution error: {}", err)
         } else if let Some(status) = a.result_status {
             format!("executed, status {}", status)
-        } else if a.status == ApprovalStatus::Approved {
+        } else if a.status() == ApprovalStatus::Approved {
             "approved, awaiting agent poll to execute".to_string()
         } else {
             String::new()
@@ -403,7 +403,7 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalDisplay {
         let params_pretty = serde_json::to_string_pretty(&a.params).unwrap_or_default();
         Self {
             id: a.id.clone(),
-            status: a.status.to_string(),
+            status: a.status().to_string(),
             status_class: status_class.to_string(),
             summary: a.summary.clone(),
             credential: a.credential.clone(),
@@ -412,7 +412,7 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalDisplay {
             created_at: a.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
             expires_at: a.expires_at.format("%Y-%m-%d %H:%M UTC").to_string(),
             // Open (Pending or Escalated) and not past deadline → still decidable.
-            is_pending: a.status.is_open() && !a.is_past_ttl(),
+            is_pending: a.status().is_open() && !a.is_past_ttl(),
             // Show the channel plus the authenticated approver identity (V5).
             decided_by: match (&a.decided_by, &a.approver_identity) {
                 (Some(ch), Some(id)) => format!("{} ({})", ch, id),

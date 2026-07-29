@@ -1321,17 +1321,17 @@ impl McpServer {
         // awaiting additional distinct approvers, not stalled (only meaningful
         // while the request is still open — it's only used by the open arms below).
         let dual_control_note =
-            if approval.status.is_open() && approval.effective_required_approvals() > 1 {
+            if approval.status().is_open() && approval.effective_required_approvals() > 1 {
                 format!(
                     " Dual control: {} of {} distinct approvals so far ({} more needed).",
-                    approval.signoffs.len(),
+                    approval.signoffs().len(),
                     approval.effective_required_approvals(),
                     approval.approvals_remaining(),
                 )
             } else {
                 String::new()
             };
-        let human_text = match approval.status {
+        let human_text = match approval.status() {
             ApprovalStatus::Pending => format!(
                 "\u{23F3} Approval {} is still PENDING. A human has not decided yet.{} Wait about \
                  10-30 seconds, then call `check_approval` again with the same approval_id.\nExpires: {}",
@@ -1401,9 +1401,9 @@ impl McpServer {
             "{}\n\napproval_id: {}\nstatus: {}\nexpires: {}\nprogress: {}/{}",
             human_text,
             approval.id,
-            format!("{:?}", approval.status).to_ascii_lowercase(),
+            format!("{:?}", approval.status()).to_ascii_lowercase(),
             approval.expires_at.to_rfc3339(),
-            approval.signoffs.len(),
+            approval.signoffs().len(),
             approval.effective_required_approvals(),
         );
         Ok(vec![ToolContent::Text { text }])

@@ -290,16 +290,16 @@ async fn delegate_approval_records_approver_kind_in_outbox() {
 
     approval = storage.get_approval(&approval.id).await.unwrap().unwrap();
     assert_eq!(
-        approval.status,
+        approval.status(),
         vultrino::approval::ApprovalStatus::Approved
     );
-    assert_eq!(approval.signoffs.len(), 1);
-    assert_eq!(approval.signoffs[0].approver_kind, "delegate-agent");
+    assert_eq!(approval.signoffs().len(), 1);
+    assert_eq!(approval.signoffs()[0].approver_kind, "delegate-agent");
     assert_eq!(
-        approval.signoffs[0].delegation_grant_ref.as_deref(),
+        approval.signoffs()[0].delegation_grant_ref.as_deref(),
         Some("grant_test_001")
     );
-    assert_eq!(approval.signoffs[0].channel, "delegate-agent");
+    assert_eq!(approval.signoffs()[0].channel, "delegate-agent");
 
     let events = storage.list_events_after(0, 100).await.unwrap();
     let approved = events
@@ -653,7 +653,7 @@ async fn delegate_decide_high_risk_blocked_at_pep() {
     assert_eq!(decide_resp.status(), StatusCode::FORBIDDEN);
 
     let stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
     assert!(!stored.executed);
     let events = storage.list_events_after(0, 100).await.unwrap();
     assert!(
@@ -773,6 +773,6 @@ async fn delegate_decide_irreversible_blocked_at_pep() {
     assert_eq!(decide_resp.status(), StatusCode::FORBIDDEN);
 
     let stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
     assert!(!stored.executed);
 }

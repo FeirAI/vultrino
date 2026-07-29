@@ -74,8 +74,8 @@ const DEAD_USE_TOKEN_GRACE_SECS: i64 = 24 * 60 * 60;
 /// `needs_reauth()`; this only gates whether to take that locked path.
 fn approval_is_due(a: &ApprovalRequest, now: DateTime<Utc>) -> bool {
     use crate::approval::ApprovalStatus;
-    (a.status.is_open()
-        && (now >= a.expires_at || (a.status == ApprovalStatus::Pending && now >= a.escalate_at)))
+    (a.status().is_open()
+        && (now >= a.expires_at || (a.status() == ApprovalStatus::Pending && now >= a.escalate_at)))
         || a.needs_reauth()
 }
 
@@ -86,7 +86,7 @@ fn approval_is_due(a: &ApprovalRequest, now: DateTime<Utc>) -> bool {
 fn approval_result_body_prunable(a: &ApprovalRequest, now: DateTime<Utc>) -> bool {
     a.executed
         && a.result_body.is_some()
-        && !a.status.is_open()
+        && !a.status().is_open()
         && !a.executing
         && a.decided_at
             .map(|t| (now - t).num_seconds() > TERMINAL_APPROVAL_BODY_RETENTION_SECS)
@@ -162,7 +162,7 @@ fn stage_event(
 fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "approval_id": a.id,
-        "status": a.status.to_string(),
+        "status": a.status().to_string(),
         "credential": a.credential,
         "action": a.action,
         "summary": a.summary,
@@ -173,12 +173,12 @@ fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
         // rides as JSON null, which govder treats as no-per-delivery-tenant.
         "tenant": a.tenant,
         "approver_kind": a
-            .signoffs
+            .signoffs()
             .last()
             .map(|s| s.approver_kind.as_str())
             .unwrap_or("human"),
         "delegation_grant_ref": a
-            .signoffs
+            .signoffs()
             .last()
             .and_then(|s| s.delegation_grant_ref.clone()),
         "risk_tier": a.criticality.to_govder_risk_tier(),
@@ -192,7 +192,7 @@ fn approval_event_payload(a: &ApprovalRequest) -> serde_json::Value {
         // Additive — the pre-existing `approver_kind`/`delegation_grant_ref` fields
         // (derived from `.last()`) are UNCHANGED for existing consumers.
         "signoffs": a
-            .signoffs
+            .signoffs()
             .iter()
             .map(|s| {
                 serde_json::json!({
@@ -932,7 +932,7 @@ impl FileStorage {
                 // terminal decision event; the sign-off is still carried on the eventual
                 // terminal event's `signoffs` set (never lost).
                 use crate::approval::ApprovalStatus;
-                let event_type = match decided.status {
+                let event_type = match decided.status() {
                     ApprovalStatus::Approved => Some(crate::outbox::EVENT_APPROVAL_APPROVED),
                     ApprovalStatus::Denied => Some(crate::outbox::EVENT_APPROVAL_DENIED),
                     ApprovalStatus::Expired => Some(crate::outbox::EVENT_APPROVAL_EXPIRED),
@@ -1859,7 +1859,7 @@ impl StorageBackend for FileStorage {
                 .approvals
                 .values()
                 .filter(|a| {
-                    a.status == ApprovalStatus::Pending
+                    a.status() == ApprovalStatus::Pending
                         && !a.is_past_ttl()
                         && a.use_token_id.as_deref() == Some(token_id)
                 })
@@ -2120,7 +2120,7 @@ impl StorageBackend for FileStorage {
                     .executing_since
                     .map(|t| (Utc::now() - t).num_seconds() > STALE_EXECUTING_SECS)
                     .unwrap_or(true);
-            if approval.status != ApprovalStatus::Approved
+            if approval.status() != ApprovalStatus::Approved
                 || approval.executed
                 || (approval.executing && !stale)
                 // Defense-in-depth (V5): never claim a grant whose continuous
@@ -2131,6 +2131,25 @@ impl StorageBackend for FileStorage {
             {
                 Ok(None)
             } else {
+                // Stage 1 V2, and it runs BEFORE the epoch is advanced or
+                // `executing` is set, so a refusal leaves the record untouched:
+                // re-derive the grant from the PERSISTED sign-off set under this
+                // same write lock. `status == Approved` is a stored byte; the
+                // witness is the recomputation of the predicate that byte is
+                // supposed to stand for. A record whose stored status says
+                // Approved but whose stored evidence does not satisfy its stored
+                // rule — the exact shape a vault edit or a hypothetical
+                // `status = Approved` write site produces — yields no witness and
+                // is refused here rather than executed.
+                let Some(grant) = approval.grant_witness() else {
+                    tracing::error!(
+                        approval_id = %id,
+                        "REFUSING to execute an approval whose stored status is Approved but whose \
+                         stored sign-off set does not re-satisfy its stored rule; the record is \
+                         inconsistent and the action will not run"
+                    );
+                    return Ok(None);
+                };
                 // A re-take of a stale in-flight claim: the prior worker set
                 // `executing` but never finalized (it likely crashed mid-flight).
                 // The caller must finalize this TERMINALLY without re-running — the
@@ -2147,6 +2166,7 @@ impl StorageBackend for FileStorage {
                     approval: approval.clone(),
                     epoch,
                     stale_retake,
+                    grant,
                 }))
             }
         })
@@ -2637,7 +2657,7 @@ mod tests {
         rec.authoritative_irreversible = true;
         // Two sign-offs recorded under DIFFERENT aggregator keys — the payload strips the
         // `agg:<key-id>:` wrapper down to the bare immutable subject.
-        rec.signoffs = vec![
+        rec.set_signoffs_for_test(vec![
             Signoff {
                 approver_identity: "agg:key-a:alice@corp".to_string(),
                 channel: "admin panel".to_string(),
@@ -2660,7 +2680,7 @@ mod tests {
                 controller: None,
                 approve: true,
             },
-        ];
+        ]);
 
         let p = approval_event_payload(&rec);
 
@@ -2773,7 +2793,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            after_dissent.status,
+            after_dissent.status(),
             ApprovalStatus::Pending,
             "a majority-mode dissent must not terminate the request"
         );
@@ -2801,7 +2821,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(approved.status, ApprovalStatus::Approved);
+        assert_eq!(approved.status(), ApprovalStatus::Approved);
         let evs = storage.list_events_after(0, 100).await.unwrap();
         assert_eq!(denied_events(&evs), 0, "still no terminal denial event");
         assert_eq!(
@@ -3153,7 +3173,7 @@ mod tests {
 
         // Old terminal: decided 8 days ago, executed, has a body → prunable.
         let mut old = mk_approval("old");
-        old.status = ApprovalStatus::Approved;
+        old.set_status_for_test(ApprovalStatus::Approved);
         old.executed = true;
         old.result_body = Some("x".repeat(2000));
         old.decided_at = Some(Utc::now() - chrono::Duration::days(8));
@@ -3161,7 +3181,7 @@ mod tests {
 
         // Recent terminal: decided just now, executed, has a body → NOT prunable (inside window).
         let mut recent = mk_approval("recent");
-        recent.status = ApprovalStatus::Approved;
+        recent.set_status_for_test(ApprovalStatus::Approved);
         recent.executed = true;
         recent.result_body = Some("y".repeat(2000));
         recent.decided_at = Some(Utc::now());
@@ -3179,7 +3199,7 @@ mod tests {
         let got_old = s.get_approval("appr_old").await.unwrap().unwrap();
         assert!(got_old.result_body.is_none(), "old terminal body shed");
         assert_eq!(
-            got_old.status,
+            got_old.status(),
             ApprovalStatus::Approved,
             "audit row (status) kept"
         );

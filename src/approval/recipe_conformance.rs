@@ -428,15 +428,15 @@ fn can_fill(unit: u8, slot: u8) -> bool {
 /// and NO algebra with [`super::recipe_satisfied`] — no leftover-senior
 /// arithmetic, no Hall condition, just a search. It is the thing
 /// approval-recipes.md §2's swap argument is a claim ABOUT.
-fn max_matching_exists(ns: u32, nt: u32, na: u32, avs: u32, avt: u32, ava: u32) -> bool {
+pub(super) fn max_matching_exists(ns: u32, nt: u32, na: u32, avs: u32, avt: u32, ava: u32) -> bool {
     let mut units: Vec<u8> = Vec::new();
-    units.extend(std::iter::repeat(UNIT_SENIOR).take(avs as usize));
-    units.extend(std::iter::repeat(UNIT_TEAMMATE).take(avt as usize));
-    units.extend(std::iter::repeat(UNIT_AGENT_REVIEWER).take(ava as usize));
+    units.extend(std::iter::repeat_n(UNIT_SENIOR, avs as usize));
+    units.extend(std::iter::repeat_n(UNIT_TEAMMATE, avt as usize));
+    units.extend(std::iter::repeat_n(UNIT_AGENT_REVIEWER, ava as usize));
     let mut slots: Vec<u8> = Vec::new();
-    slots.extend(std::iter::repeat(UNIT_SENIOR).take(ns as usize));
-    slots.extend(std::iter::repeat(UNIT_TEAMMATE).take(nt as usize));
-    slots.extend(std::iter::repeat(UNIT_AGENT_REVIEWER).take(na as usize));
+    slots.extend(std::iter::repeat_n(UNIT_SENIOR, ns as usize));
+    slots.extend(std::iter::repeat_n(UNIT_TEAMMATE, nt as usize));
+    slots.extend(std::iter::repeat_n(UNIT_AGENT_REVIEWER, na as usize));
     if units.len() < slots.len() {
         return false;
     }
@@ -529,7 +529,9 @@ fn greedy_senior_first_is_optimal() {
 /// vacuous) by asserting cases it must get right by construction.
 #[test]
 fn matching_oracle_is_discriminating() {
-    let cases: &[(u32, u32, u32, u32, u32, u32, bool, &str)] = &[
+    /// `(need_s, need_t, need_a, avail_s, avail_t, avail_a, want, why)`.
+    type OracleCase = (u32, u32, u32, u32, u32, u32, bool, &'static str);
+    let cases: &[OracleCase] = &[
         (1, 0, 0, 0, 5, 0, false, "no teammate can ever fill a senior slot"),
         (0, 1, 0, 1, 0, 0, true, "a senior fills a teammate slot"),
         (1, 1, 0, 1, 0, 0, false, "ONE senior cannot fill BOTH slots (injectivity)"),

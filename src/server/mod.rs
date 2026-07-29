@@ -2363,9 +2363,18 @@ impl VultrinoServer {
 
     /// Run a previously-approved action. Builds the request from the stored
     /// approval and executes it (consuming the use token, if any).
+    ///
+    /// **Requires a [`crate::approval::Granted`] (Stage 1 V2).** The witness is
+    /// not read — its *existence* is the precondition. It can only be minted by
+    /// [`crate::approval::ApprovalRequest::grant_witness`], which re-derives
+    /// recipe satisfaction from the persisted sign-off set under the storage write
+    /// lock, so "run an approved action whose stored evidence does not satisfy its
+    /// stored rule" has no expressible call. Nothing here needs to remember to
+    /// check: the compiler refuses the call.
     async fn resume_approved(
         &self,
         approval: &ApprovalRequest,
+        _grant: &crate::approval::Granted,
     ) -> Result<ExecuteResponse, RunError> {
         // V11 note: cross-tenant credential isolation is enforced at request time
         // in `execute_gated` (before an approval is ever opened), so a cross-tenant
@@ -2558,16 +2567,17 @@ impl VultrinoServer {
         let mut approval = self.storage.poll_refresh_approval(id).await?;
         // Surface the new state to the polling agent unless it's an executable
         // (Approved + not yet run) grant, which we run below.
-        if approval.status != ApprovalStatus::Approved || approval.executed {
+        if approval.status() != ApprovalStatus::Approved || approval.executed {
             return Ok(approval);
         }
 
         // Approved but not yet executed → run it now (claiming first to avoid a
         // double-run if two polls race).
-        if approval.status == ApprovalStatus::Approved && !approval.executed {
+        if approval.status() == ApprovalStatus::Approved && !approval.executed {
             match self.storage.claim_approval_for_execution(id).await? {
                 Some(claim) => {
                     let epoch = claim.epoch;
+                    let grant = claim.grant;
                     let mut claimed = claim.approval;
 
                     // FAIL-CLOSED at-most-once (#8): a STALE re-take means the
@@ -2604,7 +2614,7 @@ impl VultrinoServer {
                     let resume_input = claimed.clone();
                     let hb_storage = self.storage.clone();
                     let hb_id = id.to_string();
-                    let resume_fut = self.resume_approved(&resume_input);
+                    let resume_fut = self.resume_approved(&resume_input, &grant);
                     tokio::pin!(resume_fut);
                     let outcome = loop {
                         tokio::select! {

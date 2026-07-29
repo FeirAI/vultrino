@@ -460,7 +460,7 @@ async fn test_credential_flag_gates_then_executes_on_approval() {
         ExecutionOutcome::Pending(a) => a,
         ExecutionOutcome::Completed(_) => panic!("expected pending approval"),
     };
-    assert_eq!(approval.status, ApprovalStatus::Pending);
+    assert_eq!(approval.status(), ApprovalStatus::Pending);
     assert_eq!(approval.action, "mock.echo");
 
     // Polling before a decision keeps it pending.
@@ -468,7 +468,7 @@ async fn test_credential_flag_gates_then_executes_on_approval() {
         .check_and_resume_approval(&approval.id, None)
         .await
         .unwrap();
-    assert_eq!(polled.status, ApprovalStatus::Pending);
+    assert_eq!(polled.status(), ApprovalStatus::Pending);
     assert!(!polled.executed);
 
     // 2. A human approves (as the admin panel / CLI would).
@@ -483,7 +483,7 @@ async fn test_credential_flag_gates_then_executes_on_approval() {
         .check_and_resume_approval(&approval.id, None)
         .await
         .unwrap();
-    assert_eq!(resumed.status, ApprovalStatus::Approved);
+    assert_eq!(resumed.status(), ApprovalStatus::Approved);
     assert!(resumed.executed);
     assert_eq!(resumed.result_status, Some(200));
     assert!(resumed.result_body.as_deref().unwrap().contains("world"));
@@ -513,7 +513,7 @@ async fn test_requested_outbox_event_carries_tenant_key() {
         ExecutionOutcome::Pending(a) => a,
         ExecutionOutcome::Completed(_) => panic!("expected pending approval"),
     };
-    assert_eq!(approval.status, ApprovalStatus::Pending);
+    assert_eq!(approval.status(), ApprovalStatus::Pending);
 
     // The requested event's payload carries the `tenant` key on the wire (null for
     // this untenanted open); govder reads payload.tenant to route + seal.
@@ -556,7 +556,7 @@ async fn test_denied_approval_never_executes() {
         .check_and_resume_approval(&approval.id, None)
         .await
         .unwrap();
-    assert_eq!(resumed.status, ApprovalStatus::Denied);
+    assert_eq!(resumed.status(), ApprovalStatus::Denied);
     assert!(!resumed.executed);
     assert!(resumed.result_status.is_none());
 }
@@ -939,7 +939,7 @@ async fn test_approval_expires_when_undecided() {
         .check_and_resume_approval(&approval.id, None)
         .await
         .unwrap();
-    assert_eq!(polled.status, ApprovalStatus::Expired);
+    assert_eq!(polled.status(), ApprovalStatus::Expired);
     assert!(!polled.executed);
 }
 
@@ -1598,7 +1598,7 @@ async fn test_default_deny_approved_action_still_resumes() {
         .check_and_resume_approval(&approval_id, None)
         .await
         .unwrap();
-    assert_eq!(resumed.status, ApprovalStatus::Approved);
+    assert_eq!(resumed.status(), ApprovalStatus::Approved);
     assert!(resumed.executed, "approved action must run in deny mode");
     assert!(
         resumed.result_error.is_none(),
@@ -2267,7 +2267,7 @@ async fn test_v5_criticality_sla_escalation_then_expiry() {
         "should escalate"
     );
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(a.status, ApprovalStatus::Escalated);
+    assert_eq!(a.status(), ApprovalStatus::Escalated);
     assert!(a.escalated_at.is_some());
 
     // Back-date the final deadline → the next sweep expires (denies) it (window 2).
@@ -2280,7 +2280,7 @@ async fn test_v5_criticality_sla_escalation_then_expiry() {
         "should expire"
     );
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(a.status, ApprovalStatus::Expired);
+    assert_eq!(a.status(), ApprovalStatus::Expired);
 }
 
 #[tokio::test]
@@ -2463,7 +2463,7 @@ async fn test_v5_reauth_lapse_expires_on_poll() {
         .check_and_resume_approval(&approval.id, None)
         .await
         .unwrap();
-    assert_eq!(polled.status, ApprovalStatus::Expired);
+    assert_eq!(polled.status(), ApprovalStatus::Expired);
     assert!(!polled.executed, "a lapsed grant must not run");
     assert_eq!(
         polled.approver_identity.as_deref(),
@@ -2537,7 +2537,7 @@ async fn test_v5_enforce_sod_rejects_self_approval_end_to_end() {
         "got: {err}"
     );
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(a.status, ApprovalStatus::Pending, "must stay undecided");
+    assert_eq!(a.status(), ApprovalStatus::Pending, "must stay undecided");
 
     // A distinct approver succeeds even with enforcement on.
     storage
@@ -2556,7 +2556,7 @@ async fn test_v5_enforce_sod_rejects_self_approval_end_to_end() {
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(a.status, ApprovalStatus::Approved);
+    assert_eq!(a.status(), ApprovalStatus::Approved);
     assert_eq!(a.violates_sod(), Some(false));
 }
 
@@ -2610,13 +2610,13 @@ async fn test_v5_decide_past_deadline_is_rejected() {
     );
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
     assert_ne!(
-        a.status,
+        a.status(),
         ApprovalStatus::Approved,
         "a past-deadline request must never approve"
     );
     // A subsequent atomic refresh expires it.
     let refreshed = storage.poll_refresh_approval(&approval.id).await.unwrap();
-    assert_eq!(refreshed.status, ApprovalStatus::Expired);
+    assert_eq!(refreshed.status(), ApprovalStatus::Expired);
 }
 
 #[tokio::test]
@@ -2667,7 +2667,7 @@ async fn test_v5_poll_refresh_does_not_clobber_a_decision() {
 
     let refreshed = storage.poll_refresh_approval(&approval.id).await.unwrap();
     assert_eq!(
-        refreshed.status,
+        refreshed.status(),
         ApprovalStatus::Approved,
         "a decision must survive a poll"
     );
@@ -2727,7 +2727,7 @@ async fn test_v5_sweep_expires_reauth_lapsed_grant_preserving_approver() {
         "sweep should expire it"
     );
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(a.status, ApprovalStatus::Expired);
+    assert_eq!(a.status(), ApprovalStatus::Expired);
     // Approver attribution preserved; lapse recorded in the note.
     assert_eq!(
         a.decided_by.as_deref(),
@@ -3413,8 +3413,8 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(a.status, ApprovalStatus::Pending, "1 of 2 → still pending");
-    assert_eq!(a.signoffs.len(), 1);
+    assert_eq!(a.status(), ApprovalStatus::Pending, "1 of 2 → still pending");
+    assert_eq!(a.signoffs().len(), 1);
 
     // The same approver can't satisfy the second sign-off.
     let err = storage
@@ -3444,7 +3444,7 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
         .check_and_resume_approval(&approval.id, None)
         .await
         .unwrap();
-    assert_eq!(polled.status, ApprovalStatus::Pending);
+    assert_eq!(polled.status(), ApprovalStatus::Pending);
     assert!(!polled.executed);
 
     // A second DISTINCT approver meets the threshold → Approved → runs on next poll.
@@ -3464,8 +3464,8 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(a.status, ApprovalStatus::Approved);
-    assert_eq!(a.signoffs.len(), 2);
+    assert_eq!(a.status(), ApprovalStatus::Approved);
+    assert_eq!(a.signoffs().len(), 2);
 
     let polled = server
         .check_and_resume_approval(&approval.id, None)
@@ -3514,7 +3514,7 @@ async fn test_v12_dual_control_forces_gating_on_allow_path() {
         2,
         "dual control needs 2 approvers"
     );
-    assert!(approval.status.is_open());
+    assert!(approval.status().is_open());
 }
 
 // ==================== V11: multi-tenancy / per-team partition ====================

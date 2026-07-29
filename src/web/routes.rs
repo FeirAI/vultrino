@@ -1417,8 +1417,8 @@ pub async fn approvals_list(
     // Pending first, then most recent.
     approvals.sort_by(|a, b| {
         let pending = |s: &ApprovalStatus| *s == ApprovalStatus::Pending;
-        pending(&b.status)
-            .cmp(&pending(&a.status))
+        pending(&b.status())
+            .cmp(&pending(&a.status()))
             .then(b.created_at.cmp(&a.created_at))
     });
     let approval_displays: Vec<ApprovalDisplay> =

@@ -2477,7 +2477,7 @@ async fn list_approvals(config: Config, format: String) -> Result<(), Box<dyn st
                 println!(
                     "{:<40} {:<10} {:<24} {}",
                     a.id,
-                    a.status.to_string(),
+                    a.status().to_string(),
                     summary,
                     a.requester.describe()
                 );
@@ -2505,7 +2505,7 @@ async fn approval_status(
         // None = trusted local/admin caller (no principal ownership check).
         let approval = server.check_and_resume_approval(&id, None).await?;
 
-        match approval.status {
+        match approval.status() {
             ApprovalStatus::Pending | ApprovalStatus::Escalated => {
                 if wait {
                     eprint!(".");
@@ -2513,7 +2513,7 @@ async fn approval_status(
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
                 }
-                let label = if approval.status == ApprovalStatus::Escalated {
+                let label = if approval.status() == ApprovalStatus::Escalated {
                     "ESCALATED (awaiting decision)"
                 } else {
                     "PENDING"

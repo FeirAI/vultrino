@@ -144,11 +144,23 @@ pub struct ApprovalSweep {
 /// crashed mid-execution). A stale re-take must be finalized TERMINALLY without
 /// re-running the side effect: the crashed attempt's outcome is unknown, so
 /// re-running would risk a duplicate side effect.
-#[derive(Debug, Clone)]
+///
+/// It also carries the [`crate::approval::Granted`] witness (Stage 1 V2). The
+/// witness is **not** `Clone`, so `ExecutionClaim` is not `Clone` either — which
+/// is deliberate and is part of the guarantee: a claim, and therefore the
+/// authority to run the action, cannot be duplicated. Every backend that returns
+/// a claim must have obtained the witness from
+/// [`crate::approval::ApprovalRequest::grant_witness`] on the record it is
+/// claiming, which re-derives satisfaction from the persisted sign-off set. A
+/// backend that cannot produce one must refuse the claim.
+#[derive(Debug)]
 pub struct ExecutionClaim {
     pub approval: ApprovalRequest,
     pub epoch: u64,
     pub stale_retake: bool,
+    /// Proof that the grant re-derived from the stored evidence. Consumed by the
+    /// execution path; see [`crate::approval::Granted`].
+    pub grant: crate::approval::Granted,
 }
 
 /// Trait for credential storage backends
@@ -474,7 +486,7 @@ pub trait StorageBackend: Send + Sync {
             .unwrap_or_default()
             .into_iter()
             .filter(|a| {
-                a.status == ApprovalStatus::Pending
+                a.status() == ApprovalStatus::Pending
                     && !a.is_past_ttl()
                     && a.use_token_id.as_deref() == Some(token_id)
             })

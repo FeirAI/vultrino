@@ -363,7 +363,7 @@ pub async fn api_check_approval(
 
     let mut body = serde_json::json!({
         "approval_id": approval.id,
-        "status": approval.status.to_string(),
+        "status": approval.status().to_string(),
         "summary": approval.summary,
         "executed": approval.executed,
     });
@@ -371,14 +371,14 @@ pub async fn api_check_approval(
     // additional distinct approvers, not stalled — only while still open (a denied
     // or expired request isn't "awaiting" anyone).
     let required = approval.effective_required_approvals();
-    if required > 1 && approval.status.is_open() {
+    if required > 1 && approval.status().is_open() {
         body["required_approvals"] = serde_json::json!(required);
-        body["approvals_received"] = serde_json::json!(approval.signoffs.len());
+        body["approvals_received"] = serde_json::json!(approval.signoffs().len());
         body["approvals_remaining"] = serde_json::json!(approval.approvals_remaining());
     }
     // Per-status guidance, mirroring the MCP `check_approval` tool so the two
     // transports present the same contract to an agent.
-    match approval.status {
+    match approval.status() {
         ApprovalStatus::Pending => {
             body["message"] = serde_json::json!(
                 "Awaiting human approval. The action has NOT run. Poll this endpoint again \
@@ -581,7 +581,7 @@ pub struct SignoffSummary {
 
 impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
     fn from(a: &crate::approval::ApprovalRequest) -> Self {
-        let last = a.signoffs.last();
+        let last = a.signoffs().last();
         // FAIL-CLOSED (approval-recipes.md §6 D5 / plan 100 P3 Slice A): the
         // recipe requirement and the reduced sign-off list are emitted ONLY
         // together, and ONLY when a rule is actually stamped on this request —
@@ -591,7 +591,7 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
             Some(rule) => (
                 Some(rule.recipes.clone()),
                 Some(
-                    a.signoffs
+                    a.signoffs()
                         .iter()
                         .map(|s| SignoffSummary {
                             display: crate::approval::bare_approver_identity(&s.approver_identity)
@@ -607,7 +607,7 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
         };
         ApprovalSummary {
             id: a.id.clone(),
-            status: a.status.to_string(),
+            status: a.status().to_string(),
             summary: a.summary.clone(),
             // Same display precedence as ApprovalDisplay: the business verb when
             // present, otherwise the canonical action.
@@ -618,11 +618,11 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
             created_at: a.created_at.to_rfc3339(),
             expires_at: a.expires_at.to_rfc3339(),
             required_approvals: a.effective_required_approvals(),
-            approvals_received: a.signoffs.len() as u32,
-            is_open: a.status.is_open() && !a.is_past_ttl(),
+            approvals_received: a.signoffs().len() as u32,
+            is_open: a.status().is_open() && !a.is_past_ttl(),
             tenant: a.tenant.clone(),
             approver_kind: last.map(|s| s.approver_kind.clone()).or_else(|| {
-                if a.status.is_open() {
+                if a.status().is_open() {
                     None
                 } else {
                     a.decided_by.as_ref().map(|_| "human".to_string())
@@ -827,13 +827,13 @@ pub async fn api_list_approvals(
     // nothing rather than erroring — the contract is "filter to this status".
     if let Some(status) = q.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let want = status.to_ascii_lowercase();
-        approvals.retain(|a| a.status.to_string() == want);
+        approvals.retain(|a| a.status().to_string() == want);
     }
     // Pending first, then most recent — same ordering as the admin panel list.
     approvals.sort_by(|a, b| {
         let pending = |s: &ApprovalStatus| *s == ApprovalStatus::Pending;
-        pending(&b.status)
-            .cmp(&pending(&a.status))
+        pending(&b.status())
+            .cmp(&pending(&a.status()))
             .then(b.created_at.cmp(&a.created_at))
     });
     // Bound the response so a tenant with a huge backlog can't return an
@@ -971,13 +971,13 @@ pub async fn api_decide_approval(
     // legitimate CO-APPROVER's retry on an already-granted M-of-N also replays
     // idempotently rather than 409-ing. (Only fires when !is_open, so it never
     // short-circuits a genuine fresh sign-off on a still-open request.)
-    if !existing.status.is_open() {
+    if !existing.status().is_open() {
         let same_outcome = matches!(
-            (existing.status, body.approve),
+            (existing.status(), body.approve),
             (ApprovalStatus::Approved, true) | (ApprovalStatus::Denied, false)
         );
         let approver_already_signed = existing
-            .signoffs
+            .signoffs()
             .iter()
             .any(|s| s.approver_identity.eq_ignore_ascii_case(&approver));
         if same_outcome && approver_already_signed {
@@ -985,10 +985,10 @@ pub async fn api_decide_approval(
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "id": existing.id,
-                    "status": existing.status.to_string(),
+                    "status": existing.status().to_string(),
                     "executed": existing.executed,
                     "required_approvals": existing.effective_required_approvals(),
-                    "approvals_received": existing.signoffs.len(),
+                    "approvals_received": existing.signoffs().len(),
                     "idempotent_replay": true,
                 })),
             )
@@ -1026,7 +1026,7 @@ pub async fn api_decide_approval(
         && existing.contributes_positive_slot(body.approve, resolved_class)
     {
         let key_prefix = format!("agg:{}:", admin.0.api_key.id);
-        if existing.signoffs.iter().any(|s| {
+        if existing.signoffs().iter().any(|s| {
             s.approver_identity.starts_with(&key_prefix)
                 && existing.contributes_positive_slot(s.approve, s.resolved_class)
         }) {
@@ -1068,12 +1068,12 @@ pub async fn api_decide_approval(
                 crate::approval::execution_state_at_decision(&decided, &credential);
             let mut out = serde_json::json!({
                 "id": decided.id,
-                "status": decided.status.to_string(),
+                "status": decided.status().to_string(),
                 "executed": decided.executed,
                 // Dual-control progress, so the caller knows whether a denial took
                 // effect immediately or an approval is still awaiting co-approvers.
                 "required_approvals": decided.effective_required_approvals(),
-                "approvals_received": decided.signoffs.len(),
+                "approvals_received": decided.signoffs().len(),
                 "execution_state": exec_state.as_wire(),
             });
             if let Some(err) = exec_error {
@@ -2968,11 +2968,11 @@ pub async fn api_delegate_decide_approval(
         }
     };
 
-    if !existing.status.is_open() {
+    if !existing.status().is_open() {
         return error_response(
             StatusCode::CONFLICT,
             "approval_not_decidable",
-            format!("Approval is already {}", existing.status),
+            format!("Approval is already {}", existing.status()),
         );
     }
 
@@ -3091,10 +3091,10 @@ pub async fn api_delegate_decide_approval(
             StatusCode::OK,
             Json(serde_json::json!({
                 "id": decided.id,
-                "status": decided.status.to_string(),
+                "status": decided.status().to_string(),
                 "executed": decided.executed,
                 "required_approvals": decided.effective_required_approvals(),
-                "approvals_received": decided.signoffs.len(),
+                "approvals_received": decided.signoffs().len(),
                 "delegation_grant_ref": grant_ref,
                 "veto_until": decided.delegate_veto_until.map(|t| t.to_rfc3339()),
             })),
@@ -3414,14 +3414,14 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
     let mut latencies_secs: Vec<i64> = Vec::new();
     let mut dual_control_awaiting = 0u64;
     for a in &approvals {
-        *by_status.entry(a.status.to_string()).or_default() += 1;
+        *by_status.entry(a.status().to_string()).or_default() += 1;
         // Decision latency for decided requests (approved or denied).
         if let Some(decided) = a.decided_at {
-            if matches!(a.status, ApprovalStatus::Approved | ApprovalStatus::Denied) {
+            if matches!(a.status(), ApprovalStatus::Approved | ApprovalStatus::Denied) {
                 latencies_secs.push((decided - a.created_at).num_seconds().max(0));
             }
         }
-        if a.effective_required_approvals() > 1 && a.status.is_open() {
+        if a.effective_required_approvals() > 1 && a.status().is_open() {
             dual_control_awaiting += 1;
         }
     }
@@ -4216,7 +4216,7 @@ mod tests {
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
         });
-        approval.signoffs.push(Signoff {
+        approval.push_signoff_for_test(Signoff {
             approver_identity: "agg:00000000-0000-0000-0000-000000000000:alice@example.com"
                 .to_string(),
             channel: "admin panel".to_string(),
@@ -4229,7 +4229,7 @@ mod tests {
             approve: true,
         });
         // An unresolved-class sign-off must be carried as absent, never coerced.
-        approval.signoffs.push(Signoff {
+        approval.push_signoff_for_test(Signoff {
             approver_identity: "bob@example.com".to_string(),
             channel: "admin panel".to_string(),
             decided_at: chrono::Utc::now(),

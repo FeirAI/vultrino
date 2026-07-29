@@ -2160,7 +2160,7 @@ async fn test_out_of_band_decide_flow() {
     assert!(body_string(submit).await.contains("Approved"));
 
     let stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
     assert_eq!(stored.decided_by.as_deref(), Some("out-of-band link"));
 }
 
@@ -2213,7 +2213,7 @@ async fn test_out_of_band_decide_without_named_identity_is_refused() {
 
     // The approval was NOT decided.
     let stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
     assert!(stored.decided_by.is_none());
 }
 
@@ -2675,7 +2675,7 @@ async fn test_a3_a4_json_approvals_list_and_decision() {
     assert_eq!(body["status"], "approved");
     assert_eq!(body["approvals_received"], 1);
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
     // The decision is recorded as an AGGREGATOR-ASSERTED identity:
     // `agg:<api-key-id>:<operator>` — the human operator is preserved (and is a
     // CLAIM by the acting key, not a first-party verified identity), namespaced by
@@ -2816,7 +2816,7 @@ async fn test_a4_decision_enforces_tenant_partition() {
     );
     let stored = storage.get_approval(&b_id).await.unwrap().unwrap();
     assert_eq!(
-        stored.status,
+        stored.status(),
         vultrino::approval::ApprovalStatus::Pending,
         "the cross-tenant approval must remain undecided"
     );
@@ -2889,7 +2889,7 @@ async fn test_json_approvals_reject_untenanted_key() {
     );
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(
-        stored.status,
+        stored.status(),
         vultrino::approval::ApprovalStatus::Pending,
         "decision by an untenanted key must not take effect",
     );
@@ -3280,9 +3280,9 @@ async fn test_json_decision_hard_sod_blocks_same_key_second_signoff() {
 
     // The approval is still pending (not granted by the single key).
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
     assert_eq!(
-        stored.signoffs.len(),
+        stored.signoffs().len(),
         1,
         "the second same-key sign-off was not recorded"
     );
@@ -3404,9 +3404,9 @@ async fn test_json_decision_hard_sod_blocks_same_key_no_operator_then_operator()
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["code"], "separation_of_duty");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
     assert_eq!(
-        stored.signoffs.len(),
+        stored.signoffs().len(),
         1,
         "the second same-key sign-off was not recorded"
     );
@@ -3543,9 +3543,9 @@ async fn test_json_decision_recipe_hard_sod_senior_pair_one_key_409() {
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["code"], "separation_of_duty");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
     assert_eq!(
-        stored.signoffs.len(),
+        stored.signoffs().len(),
         1,
         "the second same-key sign-off was not recorded"
     );
@@ -3597,8 +3597,8 @@ async fn test_json_decision_recipe_hard_sod_senior_then_teammate_one_key_409() {
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["code"], "separation_of_duty");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
-    assert_eq!(stored.signoffs.len(), 1);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.signoffs().len(), 1);
 }
 
 #[tokio::test]
@@ -3646,8 +3646,8 @@ async fn test_json_decision_recipe_hard_sod_teammate_then_senior_one_key_409() {
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["code"], "separation_of_duty");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
-    assert_eq!(stored.signoffs.len(), 1);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.signoffs().len(), 1);
 }
 
 #[tokio::test]
@@ -3715,7 +3715,7 @@ async fn test_json_decision_recipe_hard_sod_unsatisfiable_branch_then_senior_all
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
 }
 
 #[tokio::test]
@@ -3772,7 +3772,7 @@ async fn test_json_decision_recipe_hard_sod_dissent_then_distinct_approve_allowe
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
 }
 
 #[tokio::test]
@@ -3893,7 +3893,7 @@ async fn test_json_decision_recipe_hard_sod_two_distinct_keys_allowed() {
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
 }
 
 #[tokio::test]
@@ -3938,9 +3938,9 @@ async fn test_json_decision_hard_sod_blocks_same_key_operator_then_no_operator()
         "operator-then-no-operator from one key must NOT satisfy 2-of-N",
     );
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
     assert_eq!(
-        stored.signoffs.len(),
+        stored.signoffs().len(),
         1,
         "the second same-key sign-off was not recorded"
     );
@@ -4041,7 +4041,7 @@ async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
     );
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(
-        stored.status,
+        stored.status(),
         vultrino::approval::ApprovalStatus::Pending,
         "the self-approval must not take effect",
     );
@@ -4062,7 +4062,7 @@ async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
         "a distinct operator may approve"
     );
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status, vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
 }
 
 #[tokio::test]
@@ -6437,17 +6437,17 @@ async fn a_two_key_money_recipe_requires_two_distinct_humans_not_one() {
         .unwrap()
         .expect("approval still present");
     assert_eq!(
-        after_one.signoffs.len(),
+        after_one.signoffs().len(),
         1,
         "exactly one sign-off should be recorded"
     );
     assert!(
-        !matches!(after_one.status, vultrino::approval::ApprovalStatus::Approved),
+        !matches!(after_one.status(), vultrino::approval::ApprovalStatus::Approved),
         "ONE human must NOT be able to clear a two-key money action — status is {:?} after a \
          single sign-off. This is the exact failure the live run measured: the recipe was \
          declared, `orgpack status` reported it MATCHing, and the enforced requirement was one \
          approver.",
-        after_one.status
+        after_one.status()
     );
     assert!(
         !after_one.executed,
@@ -6485,17 +6485,17 @@ async fn a_two_key_money_recipe_requires_two_distinct_humans_not_one() {
         .unwrap()
         .expect("approval still present");
     assert_eq!(
-        after_two.signoffs.len(),
+        after_two.signoffs().len(),
         2,
         "two sign-offs should be recorded"
     );
     assert!(
-        matches!(after_two.status, vultrino::approval::ApprovalStatus::Approved),
+        matches!(after_two.status(), vultrino::approval::ApprovalStatus::Approved),
         "two DISTINCT humans filling the recipe's two slots must grant it; got {:?}",
-        after_two.status
+        after_two.status()
     );
     let identities: std::collections::BTreeSet<String> = after_two
-        .signoffs
+        .signoffs()
         .iter()
         .map(|s| s.approver_identity.to_ascii_lowercase())
         .collect();
