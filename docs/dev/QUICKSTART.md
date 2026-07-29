@@ -132,8 +132,8 @@ curl -s http://127.0.0.1:7879/api/v1/health
 ## 5. End-to-end: broker a credential without exposing it
 
 Register a credential, allow it with a policy (default-deny means it is blocked
-until you do), then have an agent use it through `/api/v1/execute` — the agent
-never sees the key.
+until you do), then have an agent use it through `/api/v1/execute`; the request
+and confined response schemas do not contain the key.
 
 ```bash
 ADMIN="vk_xxxxxxxxxxxxxxxx"

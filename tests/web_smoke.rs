@@ -348,6 +348,18 @@ async fn build_tenant_admin_router_with_config(
     tenant: &str,
     config: Config,
 ) -> (axum::Router, Arc<dyn StorageBackend>, String) {
+    let (router, storage, admin_key, _second_admin_key) =
+        build_tenant_two_admin_router_with_config(tenant, config).await;
+    (router, storage, admin_key)
+}
+
+/// Build the same tenant-scoped router with two independently authenticated
+/// aggregator keys. Multi-person approval tests must not treat two operator
+/// strings asserted through one shared key as two controllers.
+async fn build_tenant_two_admin_router_with_config(
+    tenant: &str,
+    config: Config,
+) -> (axum::Router, Arc<dyn StorageBackend>, String, String) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
     std::mem::forget(dir);
@@ -358,11 +370,19 @@ async fn build_tenant_admin_router_with_config(
     // Mint an admin key, then re-seed the auth manager with a tenant-scoped clone
     // (same plaintext/hash, tenant set) — public API only.
     let seed = AuthManager::new();
-    let (admin_key_plain, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let (admin_key_plain, api_key) = seed.create_api_key("agg-a", "admin", None).unwrap();
+    let (second_admin_key_plain, second_api_key) =
+        seed.create_api_key("agg-b", "admin", None).unwrap();
     let mut tenant_key = api_key.clone();
     tenant_key.tenant = Some(tenant.to_string());
-    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    let mut second_tenant_key = second_api_key.clone();
+    second_tenant_key.tenant = Some(tenant.to_string());
+    let auth_manager = AuthManager::from_data(
+        seed.list_roles(),
+        vec![tenant_key.clone(), second_tenant_key.clone()],
+    );
     storage.store_api_key(&tenant_key).await.unwrap();
+    storage.store_api_key(&second_tenant_key).await.unwrap();
 
     let admin = AdminAuth::new("admin", "password123").unwrap();
     let resolver = vultrino::router::CredentialResolver::new(storage.clone());
@@ -383,7 +403,12 @@ async fn build_tenant_admin_router_with_config(
         exec_server,
     )
     .into_router();
-    (router, storage, admin_key_plain)
+    (
+        router,
+        storage,
+        admin_key_plain,
+        second_admin_key_plain,
+    )
 }
 
 fn admin_req(method: &str, uri: &str, key: &str, body: serde_json::Value) -> Request<Body> {
@@ -6390,8 +6415,8 @@ async fn a_two_key_money_recipe_requires_two_distinct_humans_not_one() {
     )
     .await;
     let config = approval_open_test_config(govder);
-    let (router, storage, admin_key) =
-        build_tenant_admin_router_with_config("acme", config.clone()).await;
+    let (router, storage, admin_key, second_admin_key) =
+        build_tenant_two_admin_router_with_config("acme", config.clone()).await;
 
     // The agent asks. Its token carries the EnforcementPrincipal as `agent_label`,
     // exactly as govder mints it, and the capability is irreversible.
@@ -6460,8 +6485,9 @@ async fn a_two_key_money_recipe_requires_two_distinct_humans_not_one() {
          two-key requirement is not in force at execute time (§10h FINDING 1)"
     );
 
-    // SECOND, DISTINCT human signs off → now it grants.
-    let second = router
+    // A second operator name through the SAME authenticated controller is not a
+    // second human. The approval must remain pending and unchanged.
+    let same_controller = router
         .clone()
         .oneshot(admin_req(
             "POST",
@@ -6473,9 +6499,40 @@ async fn a_two_key_money_recipe_requires_two_distinct_humans_not_one() {
         .await
         .unwrap();
     assert_eq!(
+        same_controller.status(),
+        StatusCode::CONFLICT,
+        "one shared aggregator key must not manufacture a second controller: {}",
+        body_string(same_controller).await
+    );
+    let after_same_controller = storage
+        .get_approval(&approval_id)
+        .await
+        .unwrap()
+        .expect("approval still present");
+    assert_eq!(after_same_controller.signoffs().len(), 1);
+    assert!(matches!(
+        after_same_controller.status(),
+        vultrino::approval::ApprovalStatus::Pending
+    ));
+    assert!(!after_same_controller.executed);
+
+    // The same second human claim through a DISTINCT authenticated aggregator
+    // controller can fill the remaining slot and grant the approval.
+    let second = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{approval_id}/decision"),
+            &second_admin_key,
+            serde_json::json!({"approve": true, "approver": "sam.okafor@acme.test",
+                               "approver_class": "teammate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
         second.status(),
         StatusCode::OK,
-        "the second sign-off must be accepted: {}",
+        "the independently authenticated second sign-off must be accepted: {}",
         body_string(second).await
     );
 

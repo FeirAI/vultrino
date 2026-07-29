@@ -483,7 +483,7 @@ pub async fn credential_create(
                 .unwrap_or(5000);
 
             CredentialData::HmacApiKey {
-                api_key,
+                api_key: Secret::new(api_key),
                 api_secret: Secret::new(api_secret),
                 header_name,
                 recv_window,

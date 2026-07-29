@@ -187,6 +187,9 @@ async fn setup_deny_mode(
 ///   * `ghost.do` — deliberately has NO plugin registered. It exists only so a
 ///     PREFLIGHT failure can be observed on the resume path, so it never executes at
 ///     all and can have no effect to reverse.
+///   * `error_reflect.fail` — fails in-process after reflecting its credential in
+///     the private error value; it exists only to prove that diagnostic confinement
+///     holds on direct and approval-resume paths.
 ///
 /// SCOPE OF THE CLAIM. This declares the mock actions reversible; it does not claim
 /// anything about the business verbs some fixtures label them with. The V8 label tests
@@ -204,6 +207,11 @@ async fn declare_reversible_fixture_capabilities(storage: &Arc<dyn StorageBacken
         ("cap-fixture-mock-echo", "mock_echo", "mock.echo"),
         ("cap-fixture-count-run", "count_run", "count.run"),
         ("cap-fixture-ghost-do", "ghost_do", "ghost.do"),
+        (
+            "cap-fixture-error-reflect",
+            "error_reflect_fail",
+            "error_reflect.fail",
+        ),
     ] {
         storage
             .store_capability(&vultrino::capability::Capability {
@@ -930,9 +938,14 @@ async fn test_approval_expires_when_undecided() {
         _ => panic!("expected pending"),
     };
 
-    // Force the TTL into the past, then poll: it should flip to Expired.
+    // Force the ordered lifecycle into the past, then poll: it should flip to
+    // Expired. Preserve `created <= escalate <= expires`; the encrypted-vault
+    // boundary now rejects impossible timestamp shapes before they become live.
     let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    stored.expires_at = chrono::Utc::now() - Duration::minutes(1);
+    let now = chrono::Utc::now();
+    stored.created_at = now - Duration::minutes(3);
+    stored.escalate_at = now - Duration::minutes(2);
+    stored.expires_at = now - Duration::minutes(1);
     storage.update_approval(&stored).await.unwrap();
 
     let polled = server
@@ -1945,16 +1958,127 @@ impl Plugin for SecretReflectorPlugin {
             "X-Echoed-Auth".to_string(),
             format!("Bearer {}", strs.first().copied().unwrap_or_default()),
         );
-        Ok(ExecuteResponse {
-            status: 200,
-            headers,
-            body,
-            updated_credential: None,
-        })
+        Ok(ExecuteResponse::new(200, headers, body))
     }
     fn validate_params(&self, _a: &str, _p: &serde_json::Value) -> Result<(), PluginError> {
         Ok(())
     }
+}
+
+/// A malicious/buggy connector that puts the vault secret in its error text.
+/// The server must treat connector diagnostics as a secret-bearing high sink.
+struct ErrorReflectorPlugin;
+
+#[async_trait]
+impl Plugin for ErrorReflectorPlugin {
+    fn name(&self) -> &str {
+        "error_reflect"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["fail"]
+    }
+    async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        let reflected = request
+            .credential
+            .data
+            .secret_material()
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        Err(PluginError::ExecutionFailed(format!(
+            "upstream reflected vault secret: {}",
+            reflected.as_str()
+        )))
+    }
+    fn validate_params(&self, _a: &str, _p: &serde_json::Value) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+async fn store_error_credential(storage: &Arc<dyn StorageBackend>, require_approval: bool) {
+    let mut credential = Credential::new(
+        "error-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("boundary-error-secret-7da9"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    );
+    if require_approval {
+        credential = credential.with_metadata("require_approval", "true");
+    }
+    storage.store(&credential).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_connector_error_cannot_leak_secret_to_direct_caller() {
+    let (server, storage) = setup().await;
+    server.plugins().register(Arc::new(ErrorReflectorPlugin));
+    store_error_credential(&storage, false).await;
+
+    let err = server
+        .execute_gated(
+            ExecuteRequest {
+                credential: "error-cred".to_string(),
+                action: "error_reflect.fail".to_string(),
+                params: serde_json::json!({}),
+            },
+            ExecAuth::default(),
+        )
+        .await
+        .expect_err("the connector deliberately fails")
+        .to_string();
+
+    assert!(
+        !err.contains("boundary-error-secret-7da9"),
+        "connector error leaked: {err}"
+    );
+    assert!(err.contains("details withheld"));
+}
+
+#[tokio::test]
+async fn test_connector_error_cannot_leak_secret_to_approval_record() {
+    let (server, storage) = setup().await;
+    server.plugins().register(Arc::new(ErrorReflectorPlugin));
+    store_error_credential(&storage, true).await;
+
+    let approval = match server
+        .execute_gated(
+            ExecuteRequest {
+                credential: "error-cred".to_string(),
+                action: "error_reflect.fail".to_string(),
+                params: serde_json::json!({}),
+            },
+            ExecAuth::default(),
+        )
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(approval) => approval,
+        ExecutionOutcome::Completed(_) => panic!("expected pending approval"),
+    };
+    let mut decided = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    decided
+        .approve(Decision::new("admin panel", "secops"))
+        .unwrap();
+    storage.update_approval(&decided).await.unwrap();
+
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
+    let error = resumed
+        .result_error
+        .expect("failure is persisted terminally");
+    assert!(resumed.executed);
+    assert!(
+        !error.contains("boundary-error-secret-7da9"),
+        "approval leaked: {error}"
+    );
+    assert!(error.contains("details withheld"));
 }
 
 #[tokio::test]
@@ -1989,7 +2113,7 @@ async fn test_egress_redacts_reflected_secret_end_to_end() {
         !body.contains("super-secret-value"),
         "secret leaked in body: {body}"
     );
-    assert!(body.contains("[REDACTED:api-cred]"));
+    assert!(body.contains("[REDACTED]"));
     // Header reflection is scrubbed too.
     assert!(!resp
         .headers
@@ -2037,7 +2161,10 @@ async fn test_egress_block_withholds_response_end_to_end() {
     };
     let body = String::from_utf8_lossy(&resp.body);
     assert!(!body.contains("abc123"), "blocked body leaked: {body}");
-    assert!(body.contains("withheld by egress policy"));
+    assert!(
+        body.contains("response withheld"),
+        "the exact diagnostic may itself contain a credential form and is then replaced by the generic confinement message: {body}"
+    );
 }
 
 #[tokio::test]
@@ -2257,9 +2384,12 @@ async fn test_v5_criticality_sla_escalation_then_expiry() {
         200
     );
 
-    // Back-date the first window → the SLA sweep escalates it (window 1 elapsed).
+    // Back-date the first window while preserving lifecycle order → the SLA
+    // sweep escalates it (window 1 elapsed).
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    a.escalate_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let now = chrono::Utc::now();
+    a.created_at = now - chrono::Duration::seconds(2);
+    a.escalate_at = now - chrono::Duration::seconds(1);
     storage.update_approval(&a).await.unwrap();
     let sweep = server.sweep_approvals_once().await.unwrap();
     assert!(
@@ -2581,9 +2711,12 @@ async fn test_v5_decide_past_deadline_is_rejected() {
         other => panic!("expected Pending, got {other:?}"),
     };
 
-    // Back-date the final deadline so the request is past expiry.
+    // Back-date the whole lifecycle in order so the request is past expiry.
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    a.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let now = chrono::Utc::now();
+    a.created_at = now - chrono::Duration::seconds(3);
+    a.escalate_at = now - chrono::Duration::seconds(2);
+    a.expires_at = now - chrono::Duration::seconds(1);
     storage.update_approval(&a).await.unwrap();
 
     // The decision is refused (the request expired under the lock first); it is
@@ -2659,10 +2792,13 @@ async fn test_v5_poll_refresh_does_not_clobber_a_decision() {
         .unwrap();
 
     // A subsequent poll_refresh must NOT revert the decision (advance_lifecycle is
-    // a no-op on a decided request), even if its boundaries are now in the past.
+    // a no-op on a decided request), even if its ordered boundaries are now in
+    // the past.
     let mut a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    a.escalate_at = chrono::Utc::now() - chrono::Duration::seconds(10);
-    a.expires_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+    let now = chrono::Utc::now();
+    a.created_at = now - chrono::Duration::seconds(15);
+    a.escalate_at = now - chrono::Duration::seconds(10);
+    a.expires_at = now - chrono::Duration::seconds(5);
     storage.update_approval(&a).await.unwrap();
 
     let refreshed = storage.poll_refresh_approval(&approval.id).await.unwrap();
@@ -4077,11 +4213,10 @@ impl Plugin for RotatingMockPlugin {
             }
             _ => None,
         };
-        Ok(ExecuteResponse {
-            status: 200,
-            headers: std::collections::HashMap::new(),
-            body: b"ok".to_vec(),
-            updated_credential: updated,
+        let response = ExecuteResponse::new(200, std::collections::HashMap::new(), b"ok".to_vec());
+        Ok(match updated {
+            Some(credential) => response.with_updated_credential(credential),
+            None => response,
         })
     }
     fn validate_params(&self, _a: &str, _p: &serde_json::Value) -> Result<(), PluginError> {

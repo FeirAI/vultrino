@@ -4,7 +4,7 @@
 
 ## What is Vultrino?
 
-Vultrino is a secure credential proxy that allows AI agents, LLMs, and automated systems to make authenticated API requests without ever exposing the actual credentials. Instead of giving your AI agent direct access to API keys, you give it access to Vultrino, which injects the authentication on behalf of the agent.
+Vultrino is a credential proxy that keeps raw credential fields out of the agent-facing API and injects authentication inside trusted connectors. Instead of giving an agent an API key, you give it a credential alias and an action surface.
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
@@ -15,12 +15,12 @@ Vultrino is a secure credential proxy that allows AI agents, LLMs, and automated
         │ "Use github-api       │ Authorization: Bearer ghp_xxx...
         │  credential"          │
         ▼                       ▼
-   Never sees the key     Handles authentication
+   Alias-only request     Handles authentication
 ```
 
 ## Features
 
-- **Credential Isolation** — AI agents never see actual API keys or secrets
+- **Credential Isolation** — agent-facing schemas carry aliases and confined responses, not raw credential fields
 - **Role-Based Access Control** — Fine-grained permissions with credential scoping
 - **Multiple Credential Types** — API keys, Basic Auth, OAuth2 (with automatic token refresh), and extensible via plugins
 - **OAuth2 Support** — Client credentials and refresh token flows with automatic token refresh
@@ -122,7 +122,6 @@ vultrino request <alias> <url> -X POST -d '{}'  # POST with body
 
 # Plugin Actions
 vultrino action <credential> <plugin.action>    # Execute plugin action
-vultrino action my-pgp pgp-signing.sign_cleartext -p '{"data":"Hello"}'
 vultrino action my-server ssh.deploy            # Rsync via stored SSH credential
 vultrino action my-server ssh.run               # Run a configured command sequence
 vultrino action my-db postgres.run_sql          # Apply the configured migration script
@@ -262,7 +261,7 @@ Available MCP tools:
 - `list_credentials` — List available credentials
 - `get_credential_info` — Get credential metadata
 - `check_approval` — Poll a pending action approval and retrieve its result once approved
-- Plugin tools (e.g., `pgp_sign`, `pgp_verify`)
+- ABI-v2 plugin tools whose actions need only public parameters and a non-secret credential handle
 
 **Example MCP Request:**
 ```json
@@ -306,8 +305,8 @@ Manage tokens in the **Use Tokens** page of the web UI or with
 ## Action Approvals
 
 Some actions are too consequential to let an agent run unsupervised. Mark them and
-Vultrino will pause for a human before the action executes — the agent never sees
-the result until someone signs off.
+Vultrino will pause for a human before the action executes — no action result is
+returned until someone signs off.
 
 **What triggers approval** (any of):
 - A credential flagged with `vultrino meta set <alias> require_approval true`
@@ -391,9 +390,6 @@ The `postgres` plugin requires `psql` and `pg_dump` (from `postgresql-client` or
 ### Installing Plugins
 
 ```bash
-# From local path
-vultrino plugin install ./plugins/pgp-signing
-
 # From git URL
 vultrino plugin install https://github.com/user/vultrino-plugin-example
 ```
@@ -403,29 +399,17 @@ vultrino plugin install https://github.com/user/vultrino-plugin-example
 > so the API picks it up. The CLI and MCP entry points load plugins on launch, so
 > they see newly installed plugins on their next invocation.
 
-### Example: PGP Signing Plugin
+### WASM credential boundary
 
-The included PGP signing plugin adds:
+WASM ABI v2 treats installed guests as untrusted. The execute request contains
+only the selected credential's alias and type; no vault field or secret is
+serialized into guest memory. ABI v1 modules fail installation and loading.
 
-**Credential Type:** `pgp_key`
-- Private key (PEM/ASCII-armored)
-- Optional passphrase
-
-**Actions:**
-- `sign` — Create detached signature
-- `sign_cleartext` — Create cleartext signed message
-- `verify` — Verify a signature
-- `get_public_key` — Extract public key
-
-```bash
-# Install the plugin
-vultrino plugin install ./plugins/pgp-signing
-
-# Add a PGP credential via web UI or create via plugin
-
-# Sign a message
-vultrino action my-pgp pgp-signing.sign_cleartext -p '{"data":"Hello, World!"}'
-```
+No secret-using host capabilities exist yet, so WASM plugins may operate only on
+public action parameters and the non-secret handle. The former PGP signing sample
+under `plugins/pgp-signing/` is retained solely as an ABI v1 rejection fixture and
+must not be installed. Secret-backed PGP signing will require a narrow host-side
+sign operation; it will not be restored by exposing a private key to the guest.
 
 ### Developing Plugins
 
@@ -444,11 +428,11 @@ name = "my_credential"
 display_name = "My Credential Type"
 
 [[credential_types.fields]]
-name = "secret_field"
-label = "Secret Field"
-type = "password"
+name = "profile"
+label = "Public profile"
+type = "text"
 required = true
-secret = true
+secret = false
 
 [[actions]]
 name = "my_action"
@@ -498,8 +482,8 @@ cargo build --release --target wasm32-wasip1
 | `oauth2` | OAuth2 client credentials | Automatic token fetch/refresh, `Authorization: Bearer <token>` |
 | `hmac_api_key` | HMAC-signed API key (e.g. Binance-style exchanges) | SHA-256 signature over query string / body |
 | `ecdsa_key` | ECDSA private key (Ethereum / Hyperliquid) | On-the-fly signing of requests or arbitrary payloads |
-| `ssh_password` | SSH host + password (for `ssh` plugin) | `sshpass`-fed password to `ssh` / `rsync`; password never leaves Vultrino |
-| `postgres` | PostgreSQL connection (for `postgres` plugin) | Password passed to `psql`/`pg_dump` via `PGPASSWORD` env; never leaves Vultrino |
+| `ssh_password` | SSH host + password (for `ssh` plugin) | Passed only to the trusted `sshpass`/`ssh` connector process; not returned to the agent |
+| `postgres` | PostgreSQL connection (for `postgres` plugin) | Passed only to the trusted `psql`/`pg_dump` child through `PGPASSWORD`; not returned to the agent |
 
 ### Best Practices
 

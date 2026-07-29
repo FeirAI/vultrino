@@ -6,6 +6,7 @@
 //! - URLs (tar.gz archives)
 
 use super::types::{InstalledPluginInfo, PluginManifest};
+use super::wasm::WasmPlugin;
 use super::PluginError;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -161,6 +162,17 @@ impl PluginInstaller {
                 )));
             }
         }
+
+        // Validate the compiled module, including the credential-confining ABI,
+        // before copying anything into the installed-plugin directory. ABI v1
+        // carried plaintext credential data into the guest and is intentionally
+        // rejected by ABI v2; an obsolete module must fail at install time rather
+        // than appear installed and only fail on the next server restart.
+        WasmPlugin::from_directory(staging_path.clone()).map_err(|e| {
+            PluginError::Installation(format!(
+                "WASM module is incompatible with the active security ABI: {e}"
+            ))
+        })?;
 
         // Copy to plugins directory
         self.copy_plugin(&staging_path, &target_dir).await?;
@@ -547,5 +559,44 @@ mod tests {
 
         let source = PluginSource::parse("https://example.com/plugin.tgz").unwrap();
         assert!(matches!(source, PluginSource::Archive(_)));
+    }
+
+    #[tokio::test]
+    async fn abi_v1_is_rejected_before_any_installed_directory_is_created() {
+        let source = tempfile::tempdir().unwrap();
+        let installed = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("plugin.toml"),
+            r#"
+[plugin]
+name = "legacy-abi"
+version = "1.0.0"
+format = "wasm"
+wasm_module = "legacy.wasm"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.path().join("legacy.wasm"),
+            br#"(module
+              (memory (export "memory") 1)
+              (func (export "vultrino_plugin_version") (result i32) (i32.const 1))
+              (func (export "vultrino_alloc") (param i32) (result i32) (i32.const 0))
+              (func (export "vultrino_free") (param i32 i32))
+              (func (export "vultrino_execute") (param i32 i32) (result i64) (i64.const 0)))"#,
+        )
+        .unwrap();
+
+        let installer = PluginInstaller::new(installed.path().to_path_buf());
+        let error = installer
+            .install(source.path().to_str().unwrap())
+            .await
+            .expect_err("ABI v1 must fail at install time")
+            .to_string();
+        assert!(error.contains("expected 2, got 1"), "{error}");
+        assert!(
+            !installed.path().join("legacy-abi").exists(),
+            "an incompatible module must not appear installed"
+        );
     }
 }

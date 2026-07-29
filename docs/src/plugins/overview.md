@@ -1,83 +1,38 @@
 # Plugin System
 
-Vultrino's plugin system enables extending functionality with new credential types, actions, and MCP tools. Plugins are distributed as WebAssembly (WASM) modules that run in a sandboxed environment.
+Vultrino supports trusted built-in Rust connectors and sandboxed WASM extensions.
+They occupy different credential trust boundaries.
 
-## Architecture
-
-```
+```text
 PluginRegistry
-      │
-      ├── HttpPlugin (built-in)
-      │
-      └── WasmPlugin (from installed plugins)
-              │
-              ├── PluginManifest (parsed from plugin.toml)
-              │
-              └── WasmRuntime (wasmtime)
+├── built-in Rust plugin ── receives CredentialData as a trusted injector
+└── WASM plugin
+    ├── PluginManifest
+    └── Wasmtime ABI v2 ─── receives alias + credential type only
 ```
 
-## What Plugins Can Do
+## WASM ABI v2 boundary
 
-- **Define new credential types** — Store custom data like PGP keys, SSH certificates, or OAuth tokens
-- **Provide custom actions** — Execute plugin-specific operations like signing or encryption
-- **Register MCP tools** — Expose new tools to AI agents via the MCP protocol
+Installed WASM is untrusted. The host sends public action parameters and a
+non-secret credential handle. It never serializes a vault credential, metadata,
+or a general-purpose secret map into guest memory. ABI v1 modules fail
+installation and loading.
 
-## Plugin Directory Structure
+WASM plugins can provide public transformations, validation, actions, and MCP
+tools. They cannot currently perform an operation that needs private credential
+bytes because no secret-using host capability exists. Such functionality must be
+implemented as a reviewed built-in connector or wait for a narrow host operation
+specific to the credential type.
 
-Plugins are installed to `~/.vultrino/plugins/`:
+Installed plugins live under the platform data directory's `vultrino/plugins/`
+folder and contain `plugin.toml`, the declared `.wasm` module, and
+`.installed.json`. The web server loads them at startup.
 
-```
-~/.vultrino/
-├── credentials.enc
-└── plugins/
-    └── pgp-signing/
-        ├── plugin.toml      # Manifest
-        ├── plugin.wasm      # WASM module
-        └── .installed.json  # Installation metadata
-```
+The old [PGP signing module](./pgp.md) is an archived ABI v1 rejection fixture,
+not an available plugin.
 
-## Plugin Manifest
+## Next steps
 
-Each plugin requires a `plugin.toml` manifest:
-
-```toml
-[plugin]
-name = "pgp-signing"
-version = "1.0.0"
-description = "PGP/GPG signing and verification"
-author = "Your Name"
-format = "wasm"
-wasm_module = "pgp_signing.wasm"
-
-[[credential_types]]
-name = "pgp_key"
-display_name = "PGP/GPG Key"
-
-[[credential_types.fields]]
-name = "private_key"
-label = "Private Key"
-type = "textarea"
-required = true
-secret = true
-
-[[actions]]
-name = "sign"
-description = "Sign data with PGP"
-
-[[mcp_tools]]
-name = "pgp_sign"
-action = "sign"
-description = "Sign data with PGP"
-```
-
-## Available Plugins
-
-| Plugin | Description | Credential Types |
-|--------|-------------|------------------|
-| [PGP Signing](./pgp.md) | PGP/GPG signing and verification | `pgp_key` |
-
-## Next Steps
-
-- [Installing Plugins](./installing.md) — How to install and manage plugins
-- [Developing Plugins](./developing.md) — Create your own plugins
-- [PGP Plugin](./pgp.md) — Use the PGP signing plugin
+- [Installing Plugins](./installing.md)
+- [Developing Plugins](./developing.md)
+- [Archived PGP fixture](./pgp.md)

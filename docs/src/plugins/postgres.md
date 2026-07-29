@@ -3,9 +3,9 @@
 The `postgres` plugin holds PostgreSQL connection credentials and drives
 the two most common "run it from an automation system" operations: SQL
 execution (migrations, maintenance) and `pg_dump`-based backups. The
-stored password is never exposed to the calling agent — Vultrino passes
-it to `psql` / `pg_dump` via the `PGPASSWORD` environment variable of the
-spawned child process, then forgets it. It ships as a built-in plugin;
+stored password is absent from the calling agent's schema — Vultrino passes it
+to the trusted `psql` / `pg_dump` child via the `PGPASSWORD` environment
+variable, then drops its exposed copy. It ships as a built-in plugin;
 no separate installation step.
 
 Two actions are exposed:
@@ -180,9 +180,9 @@ Response body:
 
 ## Security model
 
-- **Password never leaves Vultrino.** Agents present a credential alias;
-  the plugin decrypts the password and hands it to `psql` / `pg_dump`
-  via the `PGPASSWORD` env var of the child process — not visible in
+- **Password stays out of the agent response.** Agents present a credential
+  alias; the trusted plugin decrypts the password and hands it to `psql` /
+  `pg_dump` via the `PGPASSWORD` env var of the child process — not visible in
   `ps`, not on disk.
 - **SQL overrides are locked by default.** Raw SQL is code. An agent
   cannot pass a custom `sql` string or `file` path unless the

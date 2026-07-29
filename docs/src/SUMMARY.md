@@ -40,7 +40,7 @@
 - [Overview](./plugins/overview.md)
 - [Installing Plugins](./plugins/installing.md)
 - [Developing Plugins](./plugins/developing.md)
-- [PGP Signing](./plugins/pgp.md)
+- [PGP Signing (archived ABI v1)](./plugins/pgp.md)
 - [SSH (Deploy & Remote Exec)](./plugins/ssh.md)
 - [Postgres (SQL & Backup)](./plugins/postgres.md)
 

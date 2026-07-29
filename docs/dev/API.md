@@ -490,8 +490,9 @@ token → `401 missing_runtime_token`, an unknown token → `401 invalid_runtime
 
 ## Metered LLM proxy (connector M1, decision 5)
 
-A harness points its model `base_url` at Vultrino so the provider key never leaves
-the vault and token spend is metered (V13). Authenticate with the same `vut_`/`vk_`
+A harness points its model `base_url` at Vultrino so the provider key never enters
+the harness/model request; a trusted connector injects it only on the bound upstream
+request, and token spend is metered (V13). Authenticate with the same `vut_`/`vk_`
 bearer used for `/mcp`.
 
 | Method | Path | Notes |

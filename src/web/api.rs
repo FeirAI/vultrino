@@ -3942,13 +3942,13 @@ pub async fn api_create_credential(
         }
         let mut cred = Credential::new(req.alias, req.data);
         cred.metadata = req.metadata;
-        // Warn if a secret is below the egress redaction floor: its reflection
-        // would not be auto-scrubbed (use an egress `block` rule for it).
+        // Warn if a secret is below the byte-redaction floor. Execution remains
+        // fail-closed: the complete response is withheld for such a credential.
         if crate::egress::has_unredactable_secret(&cred.data.secret_material()) {
             tracing::warn!(
                 credential = %cred.alias,
-                "credential has a secret shorter than the egress redaction floor; a reflected \
-                 copy would not be auto-redacted — consider an [[egress]] block rule"
+                "credential has a secret shorter than the egress redaction floor; responses \
+                 will be withheld because absence of a reflected copy cannot be established"
             );
         }
         if let Err(e) = st.storage.store(&cred).await {

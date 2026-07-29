@@ -514,6 +514,50 @@ struct StorageCache {
 }
 
 impl StorageCache {
+    /// Validate decrypted primary records before rebuilding indexes or making
+    /// any of them reachable by the enforcement path. A malformed ciphertext
+    /// therefore fails closed at vault open instead of becoming a live object
+    /// whose secondary indexes silently disagree with its embedded identity.
+    fn validate_primary_shapes(&self) -> Result<(), StorageError> {
+        let mut aliases = std::collections::HashSet::new();
+        for (map_id, credential) in &self.credentials {
+            if map_id != &credential.id {
+                return Err(StorageError::Serialization(format!(
+                    "credential map key {:?} does not match embedded id {:?}",
+                    map_id, credential.id
+                )));
+            }
+            credential.validate_vault_shape().map_err(|reason| {
+                StorageError::Serialization(format!(
+                    "credential {:?} has invalid vault shape: {reason}",
+                    credential.alias
+                ))
+            })?;
+            if !aliases.insert(credential.alias.clone()) {
+                return Err(StorageError::Serialization(format!(
+                    "duplicate credential alias {:?} in vault",
+                    credential.alias
+                )));
+            }
+        }
+
+        for (map_id, approval) in &self.approvals {
+            if map_id != &approval.id {
+                return Err(StorageError::Serialization(format!(
+                    "approval map key {:?} does not match embedded id {:?}",
+                    map_id, approval.id
+                )));
+            }
+            approval.validate_vault_shape().map_err(|reason| {
+                StorageError::Serialization(format!(
+                    "approval {:?} has an invalid persisted shape: {reason}",
+                    approval.id
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Rebuild all secondary indexes from primary data
     fn rebuild_indexes(&mut self) {
         // Clear existing indexes
@@ -976,6 +1020,7 @@ impl FileStorage {
                 ..Default::default()
             })
         })?;
+        cache.validate_primary_shapes()?;
         cache.rebuild_indexes();
         Ok(cache)
     }
@@ -995,8 +1040,9 @@ impl FileStorage {
 
     /// Encrypt and atomically write a cache to disk (blocking).
     fn write_cache_to_disk_sync(&self, cache: &StorageCache) -> Result<(), StorageError> {
-        let data =
-            serde_json::to_vec(cache).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        cache.validate_primary_shapes()?;
+        let data = crate::with_vault_secret_serialization(|| serde_json::to_vec(cache))
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let encrypted = encrypt(&data, &self.master_key)?;
         let storage_file = StorageFile {
             version: STORAGE_VERSION,
@@ -1245,8 +1291,8 @@ impl FileStorage {
         let new_key = derive_key(new_password, &new_salt, self.kdf)?;
 
         // 3. Prepare the vault tmp (re-encrypted with the new key + new salt), fsynced, NOT yet renamed.
-        let data =
-            serde_json::to_vec(&cache).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data = crate::with_vault_secret_serialization(|| serde_json::to_vec(&cache))
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let encrypted = encrypt(&data, &new_key)?;
         let storage_file = StorageFile {
             version: STORAGE_VERSION, // PRESERVED — key rotates, format does not
@@ -2141,7 +2187,14 @@ impl StorageBackend for FileStorage {
                 // rule — the exact shape a vault edit or a hypothetical
                 // `status = Approved` write site produces — yields no witness and
                 // is refused here rather than executed.
-                let Some(grant) = approval.grant_witness() else {
+                let Some(epoch) = crate::formal_kernel::next_epoch(approval.execution_epoch) else {
+                    tracing::error!(
+                        approval_id = %id,
+                        "REFUSING approval execution because the one-shot claim epoch exhausted"
+                    );
+                    return Ok(None);
+                };
+                let Some(grant) = approval.grant_witness_for_epoch(epoch) else {
                     tracing::error!(
                         approval_id = %id,
                         "REFUSING to execute an approval whose stored status is Approved but whose \
@@ -2158,10 +2211,9 @@ impl StorageBackend for FileStorage {
                 // Fence every claim (fresh OR re-take): a superseded worker that
                 // comes back finds the epoch advanced and its finalize-CAS fails,
                 // so it can't overwrite this claim's outcome (#8).
-                approval.execution_epoch = approval.execution_epoch.wrapping_add(1);
+                approval.execution_epoch = epoch;
                 approval.executing = true;
                 approval.executing_since = Some(Utc::now());
-                let epoch = approval.execution_epoch;
                 Ok(Some(ExecutionClaim {
                     approval: approval.clone(),
                     epoch,
@@ -3164,7 +3216,7 @@ mod tests {
         // #2: a terminal (executed) approval past the body-retention window has its 64 KiB result_body
         // shed (audit row kept); a recently-decided terminal approval keeps its body; an open one is
         // untouched.
-        use crate::approval::ApprovalStatus;
+        use crate::approval::{ApprovalStatus, Decision};
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.enc");
         let s = FileStorage::new(&path, &SecretString::from("pw"))
@@ -3173,16 +3225,20 @@ mod tests {
 
         // Old terminal: decided 8 days ago, executed, has a body → prunable.
         let mut old = mk_approval("old");
-        old.set_status_for_test(ApprovalStatus::Approved);
+        old.approve(Decision::new("test", "alice@corp")).unwrap();
         old.executed = true;
+        old.result_status = Some(200);
         old.result_body = Some("x".repeat(2000));
         old.decided_at = Some(Utc::now() - chrono::Duration::days(8));
         s.store_approval(&old).await.unwrap();
 
         // Recent terminal: decided just now, executed, has a body → NOT prunable (inside window).
         let mut recent = mk_approval("recent");
-        recent.set_status_for_test(ApprovalStatus::Approved);
+        recent
+            .approve(Decision::new("test", "bob@corp"))
+            .unwrap();
         recent.executed = true;
+        recent.result_status = Some(200);
         recent.result_body = Some("y".repeat(2000));
         recent.decided_at = Some(Utc::now());
         s.store_approval(&recent).await.unwrap();
@@ -3373,7 +3429,68 @@ mod tests {
 
             let cred = cred.unwrap();
             assert_eq!(cred.alias, "test-api");
+            match cred.data {
+                CredentialData::ApiKey { key, .. } => assert_eq!(key.expose(), "secret-key-123"),
+                other => panic!("round-trip changed credential variant: {other:?}"),
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_credential_shape_is_refused_before_vault_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.enc");
+        let storage = FileStorage::new(&path, &SecretString::from("test-password"))
+            .await
+            .unwrap();
+        let invalid = Credential::new(
+            "bad".to_string(),
+            CredentialData::ApiKey {
+                key: Secret::new(""),
+                header_name: "Authorization".to_string(),
+                header_prefix: "Bearer ".to_string(),
+            },
+        );
+        let before = std::fs::read(&path).unwrap();
+        let error = storage.store(&invalid).await.unwrap_err();
+        assert!(matches!(error, StorageError::Serialization(_)));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a rejected credential must not rewrite the encrypted vault"
+        );
+    }
+
+    #[test]
+    fn decrypted_map_key_mismatch_fails_closed() {
+        let credential = test_credential("key-mismatch");
+        let mut cache = StorageCache::default();
+        cache
+            .credentials
+            .insert("different-id".to_string(), credential);
+        let bytes = crate::with_vault_secret_serialization(|| serde_json::to_vec(&cache)).unwrap();
+        assert!(matches!(
+            FileStorage::parse_cache(&bytes),
+            Err(StorageError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn decrypted_approval_without_grant_evidence_fails_closed() {
+        use crate::approval::ApprovalStatus;
+
+        let mut approval = mk_approval("forged-approved");
+        approval.set_status_for_test(ApprovalStatus::Approved);
+        approval.decided_at = Some(Utc::now());
+        approval.decided_by = Some("forged".to_string());
+        approval.approver_identity = Some("alice@corp".to_string());
+        let mut cache = StorageCache::default();
+        cache.approvals.insert(approval.id.clone(), approval);
+        let bytes = crate::with_vault_secret_serialization(|| serde_json::to_vec(&cache)).unwrap();
+        assert!(matches!(
+            FileStorage::parse_cache(&bytes),
+            Err(StorageError::Serialization(_))
+        ));
     }
 
     #[tokio::test]

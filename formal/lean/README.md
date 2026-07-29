@@ -40,21 +40,46 @@ The second command exports the complete environment and rechecks it with the
 independently implemented nanoda kernel. Its exporter and checker revisions are
 full-commit pinned, and `sorryAx` is deliberately not permitted.
 
-## What is not yet proved
+## Rust refinement status
 
-These are model theorems, not yet a refinement proof of the async Rust server.
-The current Rust implementation does not satisfy the credential model:
-`PluginRequest` owns a full `Credential`, and the WASM runtime serializes
-`credential.data` into guest JSON. Until that boundary is changed to a
-non-secret handle plus narrow trusted host capabilities, the honest system
-claim is weaker than the Lean theorem.
+These remain model theorems, not a complete semantic refinement proof of the
+async Rust server. The implementation now contains, however, a deliberately
+small safe-Rust enforcement kernel and machine-enforced choke points matching
+the model:
+
+- `ExecutionBinding` contains the same eight fields as `RequestBinding`;
+- a private, non-cloneable `ExecutionPermit` is minted only from a direct allow
+  or a persisted exact-binding `Granted` witness and is consumed to produce the
+  `Authorized<ActionPayload>` accepted by the only two dispatch variants;
+- approval claims derive the epoch-bound grant while holding the vault lock and
+  refuse epoch overflow;
+- WASM ABI v2 serializes only an alias/type credential handle. ABI v1 modules,
+  including the archived PGP fixture, fail installation and loading;
+- plaintext `Secret` serialization requires a crate-private, dynamically scoped
+  vault capability; refreshed credentials are neither public fields nor
+  serializable response fields;
+- buffered responses require a private `PublicResponse` confinement result,
+  short secrets force whole-response withholding, streaming errors are generic,
+  and post-dispatch connector diagnostics are either proven free of every
+  declared credential form or discarded; and
+- the library security core forbids unsafe Rust.
+
+`formal/check-refinement.sh` is a structural drift gate over those exact Rust
+objects and seams. Nine Kani harnesses check the direct-permit truth table,
+prove execution-epoch increment cannot wrap, and discharge the planned P1–P7
+recipe properties against the private production predicates (including explicit
+unwind assertions). Property, unit, integration, race, and fault tests exercise
+the adapter. These are meaningful implementation evidence; they are not a
+substitute for a full Rust operational-semantics proof.
+
+## What is not yet proved
 
 The proof also makes these assumptions explicit:
 
-- the authorized upstream is trusted with the credential. An upstream that can
-  see a secret can encode it into status, timing, length, or response bytes;
-  information-theoretic noninterference is impossible without suppressing all
-  upstream-controlled observations;
+- the trusted built-in connector and the specifically authorized upstream are
+  allowed to receive the credential. An upstream can encode it into status,
+  timing, length, or response bytes; information-theoretic noninterference is
+  impossible without suppressing all upstream-controlled observations;
 - `secretForms` is the complete finite set promised by the implementation. The
   theorem covers exactly those forms, not arbitrary encryption, compression,
   hashing, or other transformations;
@@ -63,14 +88,20 @@ The proof also makes these assumptions explicit:
 - digest equality is exact in the model, but SHA-256 collision resistance and
   the producer's authentication of the rule digest are cryptographic/composition
   assumptions rather than theorems about the hash implementation;
-- the async adapter linearizes claim/consume/finalize correctly. A pure Rust
-  transition kernel and race tests must connect that implementation seam to the
-  Lean state transition.
+- the async adapter linearizes claim/consume/finalize correctly. The pure Rust
+  kernel, structural gate, and race tests constrain this seam, but do not prove
+  Tokio/storage behavior refines the Lean transition relation;
+- the incremental streaming scrubber implements the abstract public-payload
+  predicate for all unbounded byte streams. It is supported by adversarial and
+  property tests, while short or whole-body-policy cases fall back to the
+  buffered confinement constructor.
 
-No production claim should say “credentials can never leak” until the Rust
-refinement obligations above are discharged. The precise eventual claim is:
-raw credential material never reaches a low sink, under the enumerated trusted
-upstream, platform, cryptographic, and declared-transform assumptions.
+No production claim should use an assumption-free “credentials can never
+leak.” The precise claim being implemented and checked is: raw credential
+material does not reach an agent-visible, MCP, HTTP-response, log, error, metric,
+audit, or untrusted-WASM sink through the modeled execution paths, under the
+enumerated trusted-connector, authorized-upstream, platform, cryptographic, and
+declared-transform assumptions.
 
 ## Refinement plan
 
@@ -80,10 +111,10 @@ upstream, platform, cryptographic, and declared-transform assumptions.
 | `ExecutionPermit` | non-cloneable, private-constructor `ExecutionPermit` consumed at the side-effect call |
 | `Evidence.validFor` | one pure function run under the storage claim lock |
 | `Approval.Step.execute` | the single buffered/streaming dispatch seam |
-| `Credentials.Operation` | a sealed capability API; plugins receive handles, never `CredentialData` |
+| `Credentials.Operation` | built-ins are trusted declassification points; untrusted WASM receives only a handle |
 | `PublicPayload` | fail-closed egress result whose constructor checks every declared form |
 | `Credentials.Step.apply` | the only module allowed to expose raw secret bytes |
 
-Aeneas is intentionally deferred until this pure, safe Rust kernel exists. Its
-documented translator does not cover concurrency or unsafe Rust, so Tokio lock
-linearization remains a separate proof/test obligation.
+Aeneas evaluation is now isolated to the pure, safe Rust kernel. Tokio lock
+linearization remains a separate proof/test obligation because the concurrent
+adapter is outside that kernel.

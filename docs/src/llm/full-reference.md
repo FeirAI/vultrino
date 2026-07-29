@@ -264,7 +264,7 @@ Parse it according to the content-type:
 ## Security Notes
 
 1. **Never ask for actual secrets** - only use aliases
-2. **Credentials are never returned** - only metadata
+2. **Credential payload fields are absent** - listing endpoints return metadata
 3. **All requests are logged** - audit trail exists
 4. **Policies may restrict access** - some URLs/methods may be blocked
 5. **Scopes limit visibility** - you may not see all credentials

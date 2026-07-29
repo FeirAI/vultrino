@@ -59,23 +59,22 @@ Example output:
 ```
 Installed plugins:
 
-  pgp-signing v1.0.0
-    Source: https://github.com/vultrino/plugin-pgp#v1.0.0
+  public-transform v2.0.0
+    Source: https://github.com/example/public-transform#v2.0.0
     Installed: 2024-01-15
-    Credential types: pgp_key
-    MCP tools: pgp_sign, pgp_verify, pgp_get_public_key
+    MCP tools: normalize_payload
 ```
 
 ### View Plugin Details
 
 ```bash
-vultrino plugin info pgp-signing
+vultrino plugin info public-transform
 ```
 
 ### Remove a Plugin
 
 ```bash
-vultrino plugin remove pgp-signing
+vultrino plugin remove public-transform
 ```
 
 ### Reload a Plugin
@@ -83,7 +82,7 @@ vultrino plugin remove pgp-signing
 Reload a plugin's WASM module without restarting:
 
 ```bash
-vultrino plugin reload pgp-signing
+vultrino plugin reload public-transform
 ```
 
 ## Plugin Discovery
@@ -101,6 +100,10 @@ If the WASM build fails:
 3. Install the target manually: `rustup target add wasm32-wasip1`
 
 ### Plugin Not Loading
+
+Vultrino requires the credential-confining WASM ABI v2. ABI v1 modules are
+rejected because they accepted plaintext credential data. Installation validates
+the module and ABI before it is copied into the plugin directory.
 
 Check the plugin manifest is valid:
 

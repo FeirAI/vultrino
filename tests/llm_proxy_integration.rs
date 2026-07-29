@@ -115,12 +115,11 @@ impl Plugin for MockLlmPlugin {
                 "usage": { "prompt_tokens": 57, "completion_tokens": 13, "total_tokens": 70 }
             })
         };
-        Ok(ExecuteResponse {
-            status: 200,
-            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
-            body: serde_json::to_vec(&body).unwrap(),
-            updated_credential: None,
-        })
+        Ok(ExecuteResponse::new(
+            200,
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            serde_json::to_vec(&body).unwrap(),
+        ))
     }
     fn validate_params(
         &self,
@@ -152,12 +151,7 @@ impl Plugin for MockStreamingPlugin {
     }
     async fn execute(&self, _request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
         // Buffered fallback (unused by the streaming test, required by the trait).
-        Ok(ExecuteResponse {
-            status: 200,
-            headers: HashMap::new(),
-            body: b"{}".to_vec(),
-            updated_credential: None,
-        })
+        Ok(ExecuteResponse::new(200, HashMap::new(), b"{}".to_vec()))
     }
     async fn execute_streaming(
         &self,
@@ -192,12 +186,11 @@ impl Plugin for MockStreamingPlugin {
             Ok(bytes::Bytes::from(chunk1)),
             Ok(bytes::Bytes::from(chunk2)),
         ]);
-        Ok(vultrino::StreamingResponse {
-            status: 200,
-            headers: HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]),
-            body: Box::pin(body),
-            updated_credential: None,
-        })
+        Ok(vultrino::StreamingResponse::new(
+            200,
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]),
+            Box::pin(body),
+        ))
     }
     fn validate_params(
         &self,
@@ -1131,7 +1124,7 @@ async fn llm_streamed_real_sse_passthrough_scrubs_split_key() {
         "the provider key was split across SSE chunks and LEAKED through the stream: {body_str}"
     );
     assert!(
-        body_str.contains("[REDACTED:cred-openai]"),
+        body_str.contains("[REDACTED]"),
         "the boundary-straddling secret should be replaced by the scrub marker: {body_str}"
     );
     // The SSE framing flows through untouched (the [DONE] sentinel survives).

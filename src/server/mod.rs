@@ -184,6 +184,27 @@ impl RunError {
     }
 }
 
+/// Admit a post-dispatch connector failure to a public sink only after checking
+/// it against every declared credential form.
+///
+/// A connector has already received the credential at this point. Its error may
+/// therefore contain a reflected response body, a secret-bearing URL, command
+/// output, or another credential-derived value. Safe operator-authored refusal
+/// details remain useful, but a diagnostic containing a declared secret form (or
+/// paired with an unredactable short secret) is replaced wholesale.
+fn confine_plugin_execution_error(
+    error: crate::plugins::PluginError,
+    secrets: &[zeroize::Zeroizing<String>],
+) -> VultrinoError {
+    if crate::egress::diagnostic_may_contain_secret(&error.to_string(), secrets) {
+        VultrinoError::Plugin(crate::plugins::PluginError::ExecutionFailed(
+            "trusted connector execution failed; details withheld".to_string(),
+        ))
+    } else {
+        VultrinoError::Plugin(error)
+    }
+}
+
 /// The outcome of gating a request, produced once by
 /// [`VultrinoServer::prepare_execution`] and consumed by either the buffered
 /// (`run_action`) or the streaming (`run_action_streaming`) tail — so both share
@@ -192,11 +213,12 @@ enum PreparedAction {
     /// Gated on human approval; nothing ran.
     Pending(Box<ApprovalRequest>),
     /// Passed every gate; carries everything an action tail needs to run.
-    Ready(Box<ReadyAction>),
+    Ready(Box<crate::formal_kernel::Authorized<ActionPayload>>),
 }
 
-/// A resolved, gate-passed action ready for its side-effecting tail.
-struct ReadyAction {
+/// The data protected by an exact-request [`crate::formal_kernel::ExecutionPermit`].
+/// It reaches plugin dispatch only inside `Authorized<ActionPayload>`.
+struct ActionPayload {
     credential: Credential,
     plugin_name: String,
     action_name: String,
@@ -1457,14 +1479,45 @@ impl VultrinoServer {
         // `run_action_streaming` (via `execute_gated_streaming`). The use token is
         // NOT consumed here; the tail reserves it fail-closed just before the side
         // effect, identical on both paths.
-        Ok(PreparedAction::Ready(Box::new(ReadyAction {
+        let params_bytes = serde_json::to_vec(&request.params).map_err(|_| {
+            VultrinoError::PolicyDenied(
+                "execution parameters could not be bound; nothing ran".to_string(),
+            )
+        })?;
+        let binding = crate::formal_kernel::ExecutionBinding::new(
+            format!("direct:{}", context.request_id),
+            0,
+            principal_tenant.unwrap_or_default(),
+            principal
+                .as_ref()
+                .map(|value| value.id.clone())
+                .unwrap_or_default(),
+            credential.alias.clone(),
+            full_action,
+            crate::formal_kernel::digest_bytes(&params_bytes),
+            crate::formal_kernel::digest_bytes(b"effective-direct/no-approval"),
+        );
+        let permit = crate::formal_kernel::ExecutionPermit::direct(binding.clone(), true, false)
+            .map_err(|_| {
+                VultrinoError::PolicyDenied(
+                    "the execution permit kernel refused the effective policy decision; nothing ran"
+                        .to_string(),
+                )
+            })?;
+        let payload = ActionPayload {
             credential,
             plugin_name: plugin_name.to_string(),
             action_name: action_name.to_string(),
             params: request.params.clone(),
             context,
             use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
-        })))
+        };
+        let authorized = permit.authorize(&binding, payload).map_err(|_| {
+            VultrinoError::PolicyDenied(
+                "the execution payload did not match its permit; nothing ran".to_string(),
+            )
+        })?;
+        Ok(PreparedAction::Ready(Box::new(authorized)))
     }
 
     /// Execute a request, gating it on human approval when required (buffered).
@@ -1480,25 +1533,7 @@ impl VultrinoServer {
         match self.prepare_execution(request, exec_auth).await? {
             PreparedAction::Pending(approval) => Ok(ExecutionOutcome::Pending(approval)),
             PreparedAction::Ready(ready) => {
-                let ReadyAction {
-                    credential,
-                    plugin_name,
-                    action_name,
-                    params,
-                    context,
-                    use_token_id,
-                } = *ready;
-                let response = self
-                    .run_action(
-                        credential,
-                        &plugin_name,
-                        &action_name,
-                        params,
-                        context,
-                        use_token_id.as_deref(),
-                    )
-                    .await
-                    .map_err(|re| re.error)?;
+                let response = self.run_action(*ready).await.map_err(|re| re.error)?;
                 Ok(ExecutionOutcome::Completed(response))
             }
         }
@@ -1667,13 +1702,21 @@ impl VultrinoServer {
     /// retryable preflight failure from a terminal post-side-effect one.
     async fn run_action(
         &self,
-        credential: Credential,
-        plugin_name: &str,
-        action_name: &str,
-        params: serde_json::Value,
-        context: RequestContext,
-        use_token_id: Option<&str>,
+        authorized: crate::formal_kernel::Authorized<ActionPayload>,
     ) -> Result<ExecuteResponse, RunError> {
+        // Consuming this wrapper consumes the non-cloneable permit at the only
+        // buffered side-effect seam. No raw `ActionPayload` is accepted here.
+        let ActionPayload {
+            credential,
+            plugin_name,
+            action_name,
+            params,
+            context,
+            use_token_id,
+        } = authorized.into_payload();
+        let plugin_name = plugin_name.as_str();
+        let action_name = action_name.as_str();
+        let use_token_id = use_token_id.as_deref();
         // Preflight (no side effects yet, no token consumed): resolve + validate.
         // A not-loaded plugin is *transient* (it may load later → retryable);
         // invalid params are *permanent* (a retry can't fix them → terminal).
@@ -1812,10 +1855,12 @@ impl VultrinoServer {
         };
 
         // Point of no return: the action may now have side effects.
-        let mut response = plugin
+        let response = plugin
             .execute(plugin_request)
             .await
-            .map_err(|e| RunError::committed(e.into()))?;
+            .map_err(|error| {
+                RunError::committed(confine_plugin_execution_error(error, &secret_material))
+            })?;
 
         // V13b (leria metering, token counts): read the provider usage block from
         // the RAW response body NOW — BEFORE `scrub_response` (below) redacts /
@@ -1838,16 +1883,17 @@ impl VultrinoServer {
         // closed on a still-compressed body, else scrub the credential's own
         // reflected secret and apply operator egress classification, dropping
         // stale framing if the body changed. See `egress::scrub_response`.
-        crate::egress::scrub_response(
-            &mut response,
+        let response = crate::egress::confine_response(
+            response,
             &secret_material,
             &credential_alias,
             &self.config.egress,
             &full_action,
-        );
+        )
+        .into_inner();
 
         // Persist any credential update (e.g. OAuth2 token refresh).
-        if let Some(updated_data) = &response.updated_credential {
+        if let Some(updated_data) = response.updated_credential() {
             let updated_credential = crate::Credential {
                 id: credential_id,
                 alias: credential_alias.clone(),
@@ -1945,46 +1991,24 @@ impl VultrinoServer {
         match self.prepare_execution(request, exec_auth).await? {
             PreparedAction::Pending(approval) => Ok(StreamingOutcome::Pending(approval)),
             PreparedAction::Ready(ready) => {
-                let ReadyAction {
-                    credential,
-                    plugin_name,
-                    action_name,
-                    params,
-                    context,
-                    use_token_id,
-                } = *ready;
-                let full_action = format!("{}.{}", plugin_name, action_name);
+                let payload = ready.payload();
+                let full_action = format!("{}.{}", payload.plugin_name, payload.action_name);
                 // An operator `block`/`redact_patterns` egress rule on this
                 // (credential, action) can't be honored incrementally, so serve
                 // BUFFERED (full whole-body egress runs) as a single chunk — a safe,
                 // documented fallback rather than a partial scrub.
-                if !crate::egress::stream_is_egress_safe(
+                if crate::egress::has_unredactable_secret(
+                    &payload.credential.data.secret_material(),
+                ) || !crate::egress::stream_is_egress_safe(
                     &self.config.egress,
-                    &credential.alias,
+                    &payload.credential.alias,
                     &full_action,
                 ) {
-                    let response = self
-                        .run_action(
-                            credential,
-                            &plugin_name,
-                            &action_name,
-                            params,
-                            context,
-                            use_token_id.as_deref(),
-                        )
-                        .await
-                        .map_err(|re| re.error)?;
+                    let response = self.run_action(*ready).await.map_err(|re| re.error)?;
                     return Ok(StreamingOutcome::Streaming(buffered_as_stream(response)));
                 }
                 let exec = self
-                    .run_action_streaming(
-                        credential,
-                        &plugin_name,
-                        &action_name,
-                        params,
-                        context,
-                        use_token_id.as_deref(),
-                    )
+                    .run_action_streaming(*ready)
                     .await
                     .map_err(|re| re.error)?;
                 Ok(StreamingOutcome::Streaming(exec))
@@ -2007,13 +2031,20 @@ impl VultrinoServer {
     /// on in later phases.)
     async fn run_action_streaming(
         &self,
-        credential: Credential,
-        plugin_name: &str,
-        action_name: &str,
-        params: serde_json::Value,
-        context: RequestContext,
-        use_token_id: Option<&str>,
+        authorized: crate::formal_kernel::Authorized<ActionPayload>,
     ) -> Result<StreamingExecution, RunError> {
+        // Same permit type and consumption point as the buffered tail.
+        let ActionPayload {
+            credential,
+            plugin_name,
+            action_name,
+            params,
+            context,
+            use_token_id,
+        } = authorized.into_payload();
+        let plugin_name = plugin_name.as_str();
+        let action_name = action_name.as_str();
+        let use_token_id = use_token_id.as_deref();
         // Preflight (no side effects, no token consumed): resolve + validate.
         let plugin = self.plugins.get(plugin_name).ok_or_else(|| {
             RunError::retryable(VultrinoError::Plugin(
@@ -2135,7 +2166,9 @@ impl VultrinoServer {
         let streaming = plugin
             .execute_streaming(plugin_request)
             .await
-            .map_err(|e| RunError::committed(e.into()))?;
+            .map_err(|error| {
+                RunError::committed(confine_plugin_execution_error(error, &secret_material))
+            })?;
 
         let status = streaming.status;
 
@@ -2172,7 +2205,7 @@ impl VultrinoServer {
 
         // Persist any credential update (e.g. OAuth2 refresh), known before the body
         // streams — identical to the buffered path.
-        if let Some(updated_data) = &streaming.updated_credential {
+        if let Some(updated_data) = streaming.updated_credential() {
             let updated_credential = crate::Credential {
                 id: credential_id,
                 alias: credential_alias.clone(),
@@ -2374,7 +2407,7 @@ impl VultrinoServer {
     async fn resume_approved(
         &self,
         approval: &ApprovalRequest,
-        _grant: &crate::approval::Granted,
+        grant: crate::approval::Granted,
     ) -> Result<ExecuteResponse, RunError> {
         // V11 note: cross-tenant credential isolation is enforced at request time
         // in `execute_gated` (before an approval is ever opened), so a cross-tenant
@@ -2511,15 +2544,39 @@ impl VultrinoServer {
             return Err(RunError::terminal(VultrinoError::PolicyDenied(reason)));
         }
 
-        self.run_action(
-            credential,
-            plugin_name,
-            action_name,
-            approval.params.clone(),
-            context,
-            approval.use_token_id.as_deref(),
+        let binding = approval
+            .execution_binding(grant.binding().epoch)
+            .ok_or_else(|| {
+                RunError::terminal(VultrinoError::PolicyDenied(
+                    "approved execution could not be exactly bound; nothing ran".to_string(),
+                ))
+            })?;
+        let permit = crate::formal_kernel::ExecutionPermit::approved(
+            binding.clone(),
+            true,
+            true,
+            grant,
+            chrono::Utc::now().timestamp(),
         )
-        .await
+        .map_err(|reason| {
+            RunError::terminal(VultrinoError::PolicyDenied(format!(
+                "approved execution permit refused ({reason:?}); nothing ran"
+            )))
+        })?;
+        let payload = ActionPayload {
+            credential,
+            plugin_name: plugin_name.to_string(),
+            action_name: action_name.to_string(),
+            params: approval.params.clone(),
+            context,
+            use_token_id: approval.use_token_id.clone(),
+        };
+        let authorized = permit.authorize(&binding, payload).map_err(|reason| {
+            RunError::terminal(VultrinoError::PolicyDenied(format!(
+                "approved execution binding mismatch ({reason:?}); nothing ran"
+            )))
+        })?;
+        self.run_action(authorized).await
     }
 
     /// Look up an approval and, if it has been approved but not yet run, execute
@@ -2614,7 +2671,7 @@ impl VultrinoServer {
                     let resume_input = claimed.clone();
                     let hb_storage = self.storage.clone();
                     let hb_id = id.to_string();
-                    let resume_fut = self.resume_approved(&resume_input, &grant);
+                    let resume_fut = self.resume_approved(&resume_input, grant);
                     tokio::pin!(resume_fut);
                     let outcome = loop {
                         tokio::select! {

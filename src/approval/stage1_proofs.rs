@@ -1,6 +1,6 @@
 //! STAGE 1 — proving vultrino's approval core on its own.
 //!
-//! Plan `feir-os/plans/105-staged-verification.md` §2, obligations V1/V2/V4/V5.
+//! Plan `feir-os/plans/105-staged-verification.md` §2, obligations V1–V6.
 //! Every test in this file states **which rung of the proof ladder it lands on
 //! and why the stronger rungs do not apply**:
 //!
@@ -33,6 +33,9 @@
 //!   independently written legality oracle, including its **guard order**.
 //! * **V2/V4** — the runtime half of the sealed-field work, and the identity
 //!   asymmetry that lets an unnamed principal fill a recipe slot.
+//! * **V3** — 20,000 generated transition/serde/load-shape cases pin the vault
+//!   boundary to the same invariants as the live state machine.
+//! * **V6** — all five finite wire/state domains are exhaustively table-checked.
 
 use super::*;
 
@@ -745,4 +748,313 @@ fn the_drop_and_the_distinctness_key_agree_about_what_a_principal_is() {
              thinks this is a principal and the other does not."
         );
     }
+}
+
+// ============================================================================
+// V3 — persisted shape validation and 20,000-case reachable round-trip property
+// ============================================================================
+
+/// **Rung 4.** Generate reachable numeric- and recipe-gated approvals by driving
+/// the real transition function, serialize them through the exact serde boundary
+/// used inside the encrypted vault, and require byte-model identity plus a
+/// successful load-shape check. Identity strings and decision sequences are
+/// unbounded domains, so property testing with shrinking is the appropriate rung.
+#[test]
+fn reachable_approval_vault_roundtrip_preserves_invariants_20k() {
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+
+    let identity = prop_oneof![
+        "[a-z]{1,12}@[a-z]{1,8}\\.[a-z]{2,4}",
+        "agg:key-[a-z]{1,4}:[a-z]{1,12}@[a-z]{1,8}",
+        ".{0,20}",
+    ];
+    let decisions = proptest::collection::vec((identity, any::<bool>(), 0u8..3), 0..7);
+    let strategy = (
+        any::<bool>(),
+        any::<bool>(),
+        1u32..=3,
+        0u8..2,
+        decisions,
+    );
+    let mut runner = TestRunner::new(Config {
+        cases: 20_000,
+        failure_persistence: None,
+        ..Config::default()
+    });
+    let completed = std::cell::Cell::new(0u32);
+
+    runner
+        .run(
+            &strategy,
+            |(use_recipe, majority_mode, required, recipe_class, decisions)| {
+                let (mut approval, _) = fresh();
+                approval.required_approvals = required;
+                approval.dual_control = required > 1;
+                if use_recipe {
+                    approval.approval_rule = Some(ApprovalRule {
+                        recipes: vec![Recipe {
+                            terms: vec![RecipeTerm {
+                                class: if recipe_class == 0 {
+                                    ApproverClass::Senior
+                                } else {
+                                    ApproverClass::Teammate
+                                },
+                                count: required,
+                            }],
+                        }],
+                        decision_mode: if majority_mode {
+                            RecipeDecisionMode::MajorityWithDissentRecorded
+                        } else {
+                            RecipeDecisionMode::DenyOnAnyDeny
+                        },
+                    });
+                    approval.authoritative_risk_tier = "Medium".to_string();
+                }
+
+                for (identity, approve, class_tag) in decisions {
+                    let class = match class_tag {
+                        0 => ApproverClass::Senior,
+                        1 => ApproverClass::Teammate,
+                        _ => ApproverClass::AgentReviewer,
+                    };
+                    let mut decision =
+                        Decision::new("property", identity).with_resolved_class(class);
+                    if class == ApproverClass::AgentReviewer {
+                        decision.approver_kind = "delegate-agent".to_string();
+                        decision.delegation_grant_ref = Some("grant:property".to_string());
+                    }
+                    let _ = if approve {
+                        approval.approve(decision)
+                    } else {
+                        approval.deny(decision)
+                    };
+                }
+
+                prop_assert!(
+                    approval.validate_vault_shape().is_ok(),
+                    "a state produced by transition failed its own vault invariant: {approval:?}"
+                );
+                let before = serde_json::to_value(&approval).unwrap();
+                let bytes = serde_json::to_vec(&approval).unwrap();
+                let decoded: ApprovalRequest = serde_json::from_slice(&bytes).unwrap();
+                prop_assert!(decoded.validate_vault_shape().is_ok());
+                prop_assert_eq!(serde_json::to_value(decoded).unwrap(), before);
+                completed.set(completed.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        completed.get(),
+        20_000,
+        "the declared V3 property domain was not fully exercised"
+    );
+}
+
+#[test]
+fn persisted_approved_status_requires_named_sufficient_evidence() {
+    let (mut approval, _) = fresh();
+    approval.set_status_for_test(ApprovalStatus::Approved);
+    approval.decided_at = Some(chrono::Utc::now());
+    approval.decided_by = Some("forged".to_string());
+    approval.approver_identity = Some("alice@corp".to_string());
+    assert!(
+        approval.validate_vault_shape().is_err(),
+        "Approved with no sign-off evidence crossed the vault boundary"
+    );
+
+    approval.set_signoffs_for_test(vec![Signoff {
+        approver_identity: "agg:key-a:".to_string(),
+        channel: "forged".to_string(),
+        decided_at: chrono::Utc::now(),
+        note: None,
+        approver_kind: "human".to_string(),
+        delegation_grant_ref: None,
+        resolved_class: Some(ApproverClass::Teammate),
+        controller: None,
+        approve: true,
+    }]);
+    assert!(
+        approval.validate_vault_shape().is_err(),
+        "an unnamed bare principal crossed the vault boundary"
+    );
+}
+
+// ============================================================================
+// V6 — every bounded wire/state decision is enumerated fail-closed
+// ============================================================================
+
+#[test]
+fn risk_tier_and_approver_class_wire_tables_fail_closed() {
+    let risk_cases = [
+        ("Low", false),
+        (" Medium ", false),
+        ("High", false),
+        ("Extreme", true),
+        ("", true),
+        ("   ", true),
+        ("low", true),
+        ("HIGH", true),
+        ("Critical", true),
+        ("future-tier", true),
+    ];
+    assert_eq!(risk_cases.len(), 10);
+    for (wire, expected) in risk_cases {
+        assert_eq!(risk_tier_forces_deny_on_any_deny(wire), expected, "{wire:?}");
+    }
+
+    let class_cases = [
+        ("senior", Some(ApproverClass::Senior)),
+        (" teammate ", Some(ApproverClass::Teammate)),
+        ("agent-reviewer", Some(ApproverClass::AgentReviewer)),
+        ("", None),
+        ("unknown", None),
+        ("Senior", None),
+    ];
+    assert_eq!(class_cases.len(), 6);
+    for (wire, expected) in class_cases {
+        assert_eq!(ApproverClass::parse_wire(wire), expected, "{wire:?}");
+    }
+    let decoded: ApproverClass = serde_json::from_str("\"future-class\"").unwrap();
+    assert_eq!(decoded, ApproverClass::Unknown);
+    assert_eq!(ApproverClass::parse_wire("future-class"), None);
+}
+
+#[test]
+fn recipe_decision_mode_json_shapes_fail_closed() {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        #[serde(default)]
+        mode: RecipeDecisionMode,
+    }
+
+    let values = [
+        serde_json::json!("majority-with-dissent-recorded"),
+        serde_json::json!("deny-on-any-deny"),
+        serde_json::json!("future-mode"),
+        serde_json::json!(""),
+        serde_json::Value::Null,
+        serde_json::json!(true),
+        serde_json::json!(7),
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ];
+    assert_eq!(values.len(), 9);
+    for value in values {
+        let mode: RecipeDecisionMode = serde_json::from_value(value.clone()).unwrap();
+        let expected = if value == serde_json::json!("majority-with-dissent-recorded") {
+            RecipeDecisionMode::MajorityWithDissentRecorded
+        } else {
+            RecipeDecisionMode::DenyOnAnyDeny
+        };
+        assert_eq!(mode, expected, "{value}");
+    }
+    let missing: Doc = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(missing.mode, RecipeDecisionMode::DenyOnAnyDeny);
+}
+
+#[test]
+fn execution_state_table_is_total_over_all_closed_axes() {
+    let statuses = [
+        ApprovalStatus::Pending,
+        ApprovalStatus::Escalated,
+        ApprovalStatus::Approved,
+        ApprovalStatus::Denied,
+        ApprovalStatus::Expired,
+    ];
+    let credentials = [
+        CredentialCheck::NotApplicable,
+        CredentialCheck::Usable,
+        CredentialCheck::Unusable("revoked".to_string()),
+        CredentialCheck::Unknown,
+    ];
+    let mut points = 0;
+    for status in statuses {
+        for executed in [false, true] {
+            for failed in [false, true] {
+                for credential in &credentials {
+                    let (mut approval, _) = fresh();
+                    approval.set_status_for_test(status);
+                    approval.executed = executed;
+                    approval.result_error = failed.then(|| "failed".to_string());
+                    let (actual, _) = execution_state_at_decision(&approval, credential);
+                    let expected = if status != ApprovalStatus::Approved {
+                        ExecutionState::NotApplicable
+                    } else if executed && failed {
+                        ExecutionState::Failed
+                    } else if executed {
+                        ExecutionState::Executed
+                    } else if matches!(credential, CredentialCheck::Unusable(_)) {
+                        ExecutionState::Blocked
+                    } else {
+                        ExecutionState::AwaitingExecution
+                    };
+                    assert_eq!(actual, expected);
+                    points += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(points, 80, "the closed execution-state product changed");
+}
+
+#[test]
+fn policy_decision_precedence_is_total_over_three_representative_slots() {
+    use crate::policy::{
+        Policy, PolicyAction, PolicyCondition, PolicyDecision, PolicyEngine, PolicyRule,
+    };
+
+    let options = [
+        None,
+        Some(PolicyAction::Allow),
+        Some(PolicyAction::Prompt),
+        Some(PolicyAction::Deny),
+    ];
+    let mut points = 0;
+    for a in options {
+        for b in options {
+            for c in options {
+                let actions = [a, b, c];
+                let rules = actions
+                    .into_iter()
+                    .flatten()
+                    .map(|action| PolicyRule {
+                        condition: PolicyCondition::Always,
+                        action,
+                    })
+                    .collect();
+                let engine = PolicyEngine::new();
+                engine.add_policy(Policy {
+                    id: format!("precedence-{points}"),
+                    name: "precedence".to_string(),
+                    credential_pattern: "*".to_string(),
+                    principal_pattern: None,
+                    rules,
+                    default_action: PolicyAction::Allow,
+                    kill: false,
+                });
+                let actual = engine.evaluate_readonly("cred", None, None);
+                let expected = if actions.contains(&Some(PolicyAction::Deny)) {
+                    PolicyAction::Deny
+                } else if actions.contains(&Some(PolicyAction::Prompt)) {
+                    PolicyAction::Prompt
+                } else {
+                    PolicyAction::Allow
+                };
+                assert!(
+                    matches!(
+                        (actual, expected),
+                        (PolicyDecision::Deny(_), PolicyAction::Deny)
+                            | (PolicyDecision::Prompt, PolicyAction::Prompt)
+                            | (PolicyDecision::Allow, PolicyAction::Allow)
+                    ),
+                    "precedence mismatch for {actions:?}"
+                );
+                points += 1;
+            }
+        }
+    }
+    assert_eq!(points, 64, "the three-slot precedence product changed");
 }

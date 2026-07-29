@@ -8,8 +8,13 @@ mod runtime;
 
 pub use runtime::{WasmPlugin, WasmRuntime, WasmtimeRuntime};
 
-/// WASM plugin ABI version
-pub const WASM_ABI_VERSION: u32 = 1;
+/// WASM plugin ABI version.
+///
+/// Version 2 is the credential-confining ABI: guests receive only an opaque
+/// credential handle (alias + type), never serialized [`crate::CredentialData`].
+/// Secret-using operations must be added as narrow host capabilities; until a
+/// capability exists, the guest must fail closed rather than receive plaintext.
+pub const WASM_ABI_VERSION: u32 = 2;
 
 /// Memory allocation result from WASM
 #[repr(C)]

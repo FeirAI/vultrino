@@ -19,18 +19,16 @@ use regex::Regex;
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
-/// Secrets shorter than this are not byte-scrubbed from responses: a very short
-/// secret would over-redact common substrings, and such "secrets" carry little
-/// entropy anyway. High-risk short secrets should use an egress `block` rule.
+/// Secrets shorter than this are not byte-redacted because replacement would
+/// over-redact common substrings. The enforcement seam therefore withholds the
+/// complete response whenever one is present; this is no longer warning-only.
 pub const MIN_REDACT_LEN: usize = 5;
 
 /// Whether any of these secrets is non-empty but below the redaction floor (so
 /// the always-on scrubbing would NOT catch a reflection of it). Used to warn
 /// operators at credential-store time.
 pub fn has_unredactable_secret(secrets: &[Zeroizing<String>]) -> bool {
-    secrets
-        .iter()
-        .any(|s| !s.is_empty() && s.len() < MIN_REDACT_LEN)
+    secrets.iter().any(|s| s.len() < MIN_REDACT_LEN)
 }
 
 /// Build the set of forms to scrub for a credential's secret material: the raw
@@ -211,9 +209,9 @@ fn json_unicode_escaped(s: &str, upper: bool, html_safe: bool) -> String {
 pub fn redact_secret_material(
     resp: &mut ExecuteResponse,
     secrets: &[Zeroizing<String>],
-    alias: &str,
+    _alias: &str,
 ) -> bool {
-    let marker = format!("[REDACTED:{}]", alias);
+    let marker = "[REDACTED]".to_string();
     // Forms to scrub, deduped and longest-first (shared with StreamScrubber so the
     // buffered and streaming paths can never disagree on what counts as a secret).
     let mut forms: Vec<String> = derive_secret_forms(secrets);
@@ -400,6 +398,106 @@ pub fn scrub_response(
     }
 }
 
+/// Proof-carrying result of the buffered egress boundary.
+///
+/// The field is private and this module exposes no unchecked constructor. The
+/// server must obtain one through [`confine_response`], which withholds an
+/// unredactable response and rechecks every declared form after all replacement
+/// and classification steps. This is the Rust refinement object corresponding
+/// to Lean's `Credentials.PublicPayload` for buffered responses.
+pub(crate) struct PublicResponse(ExecuteResponse);
+
+impl PublicResponse {
+    pub(crate) fn into_inner(self) -> ExecuteResponse {
+        self.0
+    }
+}
+
+fn withhold_unredactable(resp: &mut ExecuteResponse) {
+    resp.body =
+        b"[vultrino: response withheld - credential material could not be proven absent]".to_vec();
+    resp.headers.clear();
+    resp.headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+}
+
+fn response_contains_form(resp: &ExecuteResponse, form: &str) -> bool {
+    (!form.is_empty() && find_bytes(&resp.body, form.as_bytes()))
+        || resp.headers.values().any(|value| {
+            !form.is_empty()
+                && value
+                    .as_bytes()
+                    .windows(form.len())
+                    .any(|w| w == form.as_bytes())
+        })
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// Whether a connector-controlled diagnostic is unsafe for a public/error sink.
+///
+/// A short or empty credential form cannot be reliably distinguished from
+/// ordinary text, so its presence in the credential forces the conservative
+/// result even when the particular diagnostic does not visibly contain it.
+/// Otherwise every declared raw/derived form is checked byte-exactly.
+pub(crate) fn diagnostic_may_contain_secret(
+    diagnostic: &str,
+    secrets: &[Zeroizing<String>],
+) -> bool {
+    if has_unredactable_secret(secrets) {
+        return true;
+    }
+    let mut forms = derive_secret_forms(secrets);
+    forms.extend(secrets.iter().map(|secret| secret.to_string()));
+    forms.sort();
+    forms.dedup();
+    let contains = forms
+        .iter()
+        .any(|form| find_bytes(diagnostic.as_bytes(), form.as_bytes()));
+    forms.iter_mut().for_each(Zeroize::zeroize);
+    contains
+}
+
+/// Convert a raw connector response into the only buffered response type the
+/// server is allowed to release to a low sink.
+pub(crate) fn confine_response(
+    mut resp: ExecuteResponse,
+    secrets: &[Zeroizing<String>],
+    alias: &str,
+    rules: &[EgressRule],
+    action: &str,
+) -> PublicResponse {
+    if has_unredactable_secret(secrets) {
+        withhold_unredactable(&mut resp);
+        return PublicResponse(resp);
+    }
+
+    scrub_response(&mut resp, secrets, alias, rules, action);
+
+    // Recheck the final bytes, including all raw forms and every derived form.
+    // Replacement markers and later classification therefore cannot
+    // accidentally reintroduce a credential form without forcing withholding.
+    let mut forms = derive_secret_forms(secrets);
+    forms.extend(secrets.iter().map(|secret| secret.to_string()));
+    forms.sort();
+    forms.dedup();
+    if forms.iter().any(|form| response_contains_form(&resp, form)) {
+        tracing::error!(
+            credential = %alias,
+            action = %action,
+            "egress postcondition failed after scrubbing; withholding the complete response"
+        );
+        withhold_unredactable(&mut resp);
+    }
+    forms.iter_mut().for_each(Zeroize::zeroize);
+    PublicResponse(resp)
+}
+
 /// Replace every non-overlapping occurrence of `needle`; returns the new bytes
 /// and whether any replacement happened.
 fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec<u8>, bool) {
@@ -431,9 +529,9 @@ fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec<u8>
 pub fn scrub_headers(
     headers: &mut std::collections::HashMap<String, String>,
     forms: &[String],
-    alias: &str,
+    _alias: &str,
 ) -> bool {
-    let marker = format!("[REDACTED:{}]", alias);
+    let marker = "[REDACTED]".to_string();
     scrub_header_values(headers, forms, &marker)
 }
 
@@ -536,7 +634,8 @@ impl std::error::Error for ScrubError {}
 pub struct StreamScrubber {
     /// Secret byte-forms, longest-first, each ≥ [`MIN_REDACT_LEN`]. Zeroized on drop.
     forms: Vec<Zeroizing<Vec<u8>>>,
-    /// The `[REDACTED:alias]` replacement bytes.
+    /// Constant replacement bytes. The credential alias is deliberately absent:
+    /// aliases are operator input and must not be able to reintroduce a secret form.
     marker: Vec<u8>,
     /// Raw, not-yet-emittable trailing bytes carried to the next chunk. Zeroized.
     carry: Zeroizing<Vec<u8>>,
@@ -549,7 +648,7 @@ pub struct StreamScrubber {
 impl StreamScrubber {
     /// Build a scrubber for a credential's secret material. `max_buffer` bounds the
     /// working buffer so a delimiter-less giant chunk fails closed instead of OOMing.
-    pub fn new(secrets: &[Zeroizing<String>], alias: &str, max_buffer: usize) -> Self {
+    pub fn new(secrets: &[Zeroizing<String>], _alias: &str, max_buffer: usize) -> Self {
         let forms: Vec<Zeroizing<Vec<u8>>> = derive_secret_forms(secrets)
             .into_iter()
             .map(|s| Zeroizing::new(s.into_bytes()))
@@ -557,7 +656,7 @@ impl StreamScrubber {
         let max_form_len = forms.iter().map(|f| f.len()).max().unwrap_or(0);
         Self {
             forms,
-            marker: format!("[REDACTED:{}]", alias).into_bytes(),
+            marker: b"[REDACTED]".to_vec(),
             carry: Zeroizing::new(Vec::new()),
             keep: max_form_len.saturating_sub(1),
             max_buffer,
@@ -689,8 +788,8 @@ mod tests {
         ));
         let body = String::from_utf8_lossy(&r.body);
         assert!(!body.contains("sk-supersecret-123"));
-        assert!(body.contains("[REDACTED:stripe]"));
-        assert_eq!(r.headers.get("X-Echo").unwrap(), "Bearer [REDACTED:stripe]");
+        assert!(body.contains("[REDACTED]"));
+        assert_eq!(r.headers.get("X-Echo").unwrap(), "Bearer [REDACTED]");
     }
 
     #[test]
@@ -722,7 +821,7 @@ mod tests {
             !body.contains(&encoded),
             "percent-encoded secret survived: {body}"
         );
-        assert!(body.contains("[REDACTED:x]"));
+        assert!(body.contains("[REDACTED]"));
     }
 
     #[test]
@@ -757,7 +856,7 @@ mod tests {
             !body.contains(composed.as_str()),
             "composed secret form survived: {body}"
         );
-        assert!(body.contains("[REDACTED:x]"));
+        assert!(body.contains("[REDACTED]"));
     }
 
     #[test]
@@ -834,7 +933,53 @@ mod tests {
     fn test_unredactable_secret_detection() {
         assert!(has_unredactable_secret(&secrets(&["pin"])));
         assert!(!has_unredactable_secret(&secrets(&["longenough"])));
-        assert!(!has_unredactable_secret(&secrets(&[""])));
+        assert!(has_unredactable_secret(&secrets(&[""])));
+    }
+
+    #[test]
+    fn confined_response_withholds_for_a_short_secret() {
+        let public = confine_response(
+            resp("the pin is 1234"),
+            &secrets(&["1234"]),
+            "pin",
+            &[],
+            "http.request",
+        )
+        .into_inner();
+        assert_eq!(
+            String::from_utf8(public.body).unwrap(),
+            "[vultrino: response withheld - credential material could not be proven absent]"
+        );
+    }
+
+    #[test]
+    fn constant_marker_cannot_reintroduce_a_secret_through_the_alias() {
+        let secret = "credential-secret";
+        let public = confine_response(
+            resp(secret),
+            &secrets(&[secret]),
+            secret,
+            &[],
+            "http.request",
+        )
+        .into_inner();
+        assert_eq!(String::from_utf8(public.body).unwrap(), "[REDACTED]");
+    }
+
+    #[test]
+    fn connector_diagnostic_is_classified_against_declared_forms() {
+        assert!(!diagnostic_may_contain_secret(
+            "path allowlist refused the request",
+            &secrets(&["long-credential-secret"]),
+        ));
+        assert!(diagnostic_may_contain_secret(
+            "upstream echoed long-credential-secret",
+            &secrets(&["long-credential-secret"]),
+        ));
+        assert!(diagnostic_may_contain_secret(
+            "otherwise safe text",
+            &secrets(&["1234"]),
+        ));
     }
 
     #[test]
@@ -959,7 +1104,7 @@ mod tests {
             &secrets(&["sk-supersecret-123"]),
             "x"
         ));
-        assert!(r.headers.get("X-Echo").unwrap().contains("[REDACTED:x]"));
+        assert!(r.headers.get("X-Echo").unwrap().contains("[REDACTED]"));
         assert_eq!(String::from_utf8_lossy(&r.body), "clean body");
     }
 
@@ -1106,7 +1251,7 @@ mod tests {
             .insert("Content-Length".to_string(), "99".to_string());
         scrub_response(&mut r, &secrets(&[secret]), "github-1", &[], "http.request");
         assert!(!String::from_utf8_lossy(&r.body).contains(secret));
-        assert!(String::from_utf8_lossy(&r.body).contains("[REDACTED:github-1]"));
+        assert!(String::from_utf8_lossy(&r.body).contains("[REDACTED]"));
         assert!(!r
             .headers
             .keys()
@@ -1222,7 +1367,7 @@ mod tests {
         );
         let s = String::from_utf8_lossy(&out);
         assert!(!s.contains("sk-supersecret-123"));
-        assert!(s.contains("[REDACTED:x]"));
+        assert!(s.contains("[REDACTED]"));
     }
 
     #[test]
@@ -1233,7 +1378,7 @@ mod tests {
         let out = run_stream(&[secret], "x", body.as_bytes(), &[at]);
         let s = String::from_utf8_lossy(&out);
         assert!(!s.contains(secret), "boundary-split secret leaked: {s}");
-        assert!(s.contains("[REDACTED:x]"));
+        assert!(s.contains("[REDACTED]"));
     }
 
     #[test]

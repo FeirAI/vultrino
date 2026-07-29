@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Vultrino CLI - A credential proxy for the AI era
 //!
 //! Run `vultrino --help` for usage information.
@@ -971,7 +973,16 @@ async fn init_storage(
     config: &Config,
 ) -> Result<Arc<dyn StorageBackend>, Box<dyn std::error::Error>> {
     let password = get_storage_password()?;
+    init_storage_with_password(config, &password).await
+}
 
+/// Password-injected half of [`init_storage`]. Keeping environment access outside
+/// storage construction makes the gate testable without unsafe process-wide
+/// environment mutation.
+async fn init_storage_with_password(
+    config: &Config,
+    password: &SecretString,
+) -> Result<Arc<dyn StorageBackend>, Box<dyn std::error::Error>> {
     match config.storage.backend {
         StorageBackendType::File => {
             let path = config
@@ -995,7 +1006,7 @@ async fn init_storage(
             // durable path, so `None` here correctly falls back to `seal_after_consume`/`seal_mint`'s
             // 087 in-memory path.
             let averin_durable = config.averin.enabled && config.averin.durable;
-            let storage = FileStorage::new_with_averin(&path, &password, averin_durable).await?;
+            let storage = FileStorage::new_with_averin(&path, password, averin_durable).await?;
             Ok(Arc::new(storage))
         }
         StorageBackendType::Keychain => {
@@ -1468,7 +1479,7 @@ async fn add_credential(
                 rpassword::read_password()?
             };
             CredentialData::HmacApiKey {
-                api_key,
+                api_key: Secret::new(api_key),
                 api_secret: Secret::new(api_secret),
                 header_name: args.hmac_header_name,
                 recv_window: args.hmac_recv_window,
@@ -3223,16 +3234,9 @@ mod averin_worker_spawn_gate_tests {
     /// still built + replayed the durable queue and took its process-lifetime lock — behavior that
     /// should be reserved for `enabled && durable`, per the exact contract
     /// `spawn_averin_worker_if_enabled`/`rekey_vault` already use.
-    ///
-    /// Run single-threaded within this one test (never spawned in parallel with another test that
-    /// touches `VULTRINO_PASSWORD`) so the env var this exercises can't race another test.
     #[tokio::test]
     async fn init_storage_gates_durable_averin_construction_on_enabled_and_durable() {
-        // SAFETY: no other test in this crate reads or writes VULTRINO_PASSWORD, and this test does
-        // not await across the mutation, so there is no concurrent access to race with.
-        unsafe {
-            std::env::set_var("VULTRINO_PASSWORD", "test-password-088-fixes");
-        }
+        let password = SecretString::from("test-password-088-fixes");
 
         // Case 1: enabled=true, durable=false -> the 087-only path. No averin queue dir, no popkey
         // file, no quarantine file, and no durable-queue lock acquired.
@@ -3241,7 +3245,7 @@ mod averin_worker_spawn_gate_tests {
         let mut config = Config::default();
         config.storage.file_path = Some(path.clone());
         config.averin = averin_cfg(true, false);
-        let storage = init_storage(&config).await.unwrap();
+        let storage = init_storage_with_password(&config, &password).await.unwrap();
         assert!(
             storage.averin_durable_queue().is_none(),
             "enabled=true, durable=false must NOT construct the durable averin queue"
@@ -3262,7 +3266,7 @@ mod averin_worker_spawn_gate_tests {
         let mut config2 = Config::default();
         config2.storage.file_path = Some(path.clone());
         config2.averin = averin_cfg(true, true);
-        let storage2 = init_storage(&config2).await.unwrap();
+        let storage2 = init_storage_with_password(&config2, &password).await.unwrap();
         assert!(
             storage2.averin_durable_queue().is_some(),
             "enabled=true, durable=true must construct the durable averin queue"
@@ -3317,9 +3321,5 @@ mod averin_worker_spawn_gate_tests {
             .await
             .unwrap();
         assert!(path.with_file_name("averin-deadletter.enc").exists());
-
-        unsafe {
-            std::env::remove_var("VULTRINO_PASSWORD");
-        }
     }
 }

@@ -223,7 +223,8 @@ analogous revoke-by-`(tenant, agent_label)` when an exchange grant is deprovisio
 ### Metered LLM proxy & streaming (connector M1)
 
 `POST /llm` (`src/web/llm_proxy.rs`) points a harness's OpenAI-compatible model
-`base_url` at Vultrino so the provider key never leaves the vault and token spend is
+`base_url` at Vultrino so the provider key stays out of the harness/model request;
+the trusted connector injects it only on the bound upstream request, and token spend is
 metered (V13). The inbound `vut_`/`vk_` bearer resolves the principal's bound
 LLM-proxy capability, and the request is driven through the **same** `execute_gated`
 → `run_action` path as a named tool (default-deny policy, single-use consumption,

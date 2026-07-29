@@ -245,7 +245,7 @@ The MCP server provides rich tool descriptions to help AI agents understand capa
 ```json
 {
   "name": "http_request",
-  "description": "Make an authenticated HTTP request using a stored credential. The credential's actual value is never exposed - only the alias is needed.",
+  "description": "Make an authenticated HTTP request using a stored credential alias; authentication is injected inside the trusted connector.",
   "inputSchema": {
     "type": "object",
     "properties": {

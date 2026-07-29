@@ -132,7 +132,6 @@
 //! safe under this lock because only the one owning process ever creates/rolls segments here.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -913,17 +912,21 @@ fn acquire_owner_lock(dir: &Path) -> Result<std::fs::File, StorageError> {
         .write(true)
         .mode(0o600)
         .open(&path)?;
-    // SAFETY: `file` owns a valid fd for the duration of the call; `flock` only reads it. `LOCK_NB`
-    // makes contention report via `EWOULDBLOCK` instead of blocking the caller forever.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(file);
+    // rustix exposes the OS operation through a safe OwnedFd/BorrowedFd API, so
+    // the library can enforce `forbid(unsafe_code)` without weakening the
+    // process-lifetime advisory-lock semantics.
+    match rustix::fs::flock(
+        &file,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    ) {
+        Ok(()) => Ok(file),
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+            Err(StorageError::AverinQueueBusy(dir.display().to_string()))
+        }
+        Err(error) => Err(StorageError::Io(std::io::Error::from_raw_os_error(
+            error.raw_os_error(),
+        ))),
     }
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        return Err(StorageError::AverinQueueBusy(dir.display().to_string()));
-    }
-    Err(StorageError::Io(err))
 }
 
 impl AverinQueue {

@@ -20,8 +20,8 @@ verified as a precondition in P0 (§7), not changed here.
 
 **Drop-in promise:** an app points any OpenAI/Anthropic-compatible client's `base_url` at
 vultrino's `/llm` endpoint and uses a vultrino key (`vut_…` use-token or `vk_…` API key) as
-its API key. Vultrino injects the real provider credential server-side; the agent never sees
-it. Streaming completions now flow through **incrementally** (true SSE passthrough), not
+its API key. The agent-facing request contains no provider credential; Vultrino injects it in
+the trusted upstream connector. Streaming completions now flow through **incrementally** (true SSE passthrough), not
 buffered-then-dumped.
 
 **Trigger (DECIDED):** streaming engages purely on the wire flag `request_body["stream"] ==
@@ -217,7 +217,7 @@ sets — a divergence here is a silent secret-leak vector.
 ```rust
 pub struct StreamScrubber {
     forms: Vec<Zeroizing<String>>,   // longest-first, all >= MIN_REDACT_LEN
-    marker: String,                  // [REDACTED:alias]
+    marker: String,                  // constant [REDACTED]
     carry: Vec<u8>,
     max_form_len: usize,             // = longest BYTE len over ALL forms (0 => pass-through)
 }
@@ -230,7 +230,7 @@ pub struct StreamScrubber {
 - **`push(chunk)`**: append `chunk` to `carry`; run non-overlapping `replace_bytes` over the
   whole working buffer for every form (longest-first); split off and **emit all but the
   trailing `CARRY` bytes**; retain the trailing `CARRY` as the new carry. Re-scanning the
-  retained tail next round is safe/idempotent because the marker `[REDACTED:alias]` cannot
+  retained tail next round is safe/idempotent because the constant marker `[REDACTED]` cannot
   contain a secret form.
 - **`finish()`**: run the forms over the residual carry and emit it fully (flushes a trailing
   partial secret).

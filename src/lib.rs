@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Vultrino - A credential proxy for the AI era
 //!
 //! Vultrino enables AI agents to use credentials without seeing them.
@@ -12,6 +14,7 @@ pub mod config;
 pub mod crypto;
 pub mod delegation;
 pub mod egress;
+mod formal_kernel;
 pub mod govder;
 pub mod identity;
 pub mod mcp;
@@ -32,6 +35,27 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use thiserror::Error;
 use uuid::Uuid;
+
+thread_local! {
+    /// Depth rather than a bool so a vault serializer can safely call a helper
+    /// that also enters the scope. Thread-local keeps unrelated concurrent
+    /// serializers unable to borrow the authority.
+    static VAULT_SECRET_SERIALIZATION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run one synchronous private-vault serialization with plaintext-secret
+/// authority. The guard restores the prior depth during unwinding as well.
+pub(crate) fn with_vault_secret_serialization<T>(f: impl FnOnce() -> T) -> T {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            VAULT_SECRET_SERIALIZATION_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+    VAULT_SECRET_SERIALIZATION_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let _guard = Guard;
+    f()
+}
 
 /// Core error types for Vultrino
 #[derive(Error, Debug)]
@@ -156,6 +180,12 @@ impl Serialize for Secret {
     where
         S: Serializer,
     {
+        let allowed = VAULT_SECRET_SERIALIZATION_DEPTH.with(|depth| depth.get() > 0);
+        if !allowed {
+            return Err(serde::ser::Error::custom(
+                "plaintext Secret serialization is restricted to the encrypted vault codec",
+            ));
+        }
         self.0.expose_secret().serialize(serializer)
     }
 }
@@ -218,7 +248,7 @@ pub enum CredentialData {
     /// HMAC-signed API key (e.g., Binance, AsterDex)
     HmacApiKey {
         /// API key (sent in header)
-        api_key: String,
+        api_key: Secret,
         /// API secret (used for HMAC signing)
         api_secret: Secret,
         /// Header name for API key (default: "X-MBX-APIKEY")
@@ -329,6 +359,93 @@ fn default_postgres_sslmode() -> String {
 }
 
 impl CredentialData {
+    /// Validate the decrypted vault shape before it can enter the live resolver.
+    /// Empty secret material is rejected: it cannot inhabit the Lean
+    /// `PublicPayload` postcondition because the empty byte string occurs in
+    /// every response.
+    pub(crate) fn validate_vault_shape(&self) -> Result<(), &'static str> {
+        let secret = |value: &Secret| !value.expose().is_empty();
+        let text = |value: &str| !value.trim().is_empty();
+        let optional_secret = |value: &Option<Secret>| value.as_ref().is_none_or(secret);
+        let valid = match self {
+            CredentialData::ApiKey {
+                key, header_name, ..
+            } => secret(key) && text(header_name),
+            CredentialData::OAuth2 {
+                client_id,
+                client_secret,
+                refresh_token,
+                access_token,
+                token_url,
+                ..
+            } => {
+                text(client_id)
+                    && secret(client_secret)
+                    && optional_secret(refresh_token)
+                    && optional_secret(access_token)
+                    && text(token_url)
+            }
+            CredentialData::BasicAuth { username, password } => text(username) && secret(password),
+            CredentialData::PrivateKey {
+                key_pem,
+                passphrase,
+            } => secret(key_pem) && optional_secret(passphrase),
+            CredentialData::Certificate { cert_pem, key_pem } => {
+                text(cert_pem) && secret(key_pem)
+            }
+            CredentialData::HmacApiKey {
+                api_key,
+                api_secret,
+                header_name,
+                ..
+            } => secret(api_key) && secret(api_secret) && text(header_name),
+            CredentialData::AwsSigV4 {
+                access_key_id,
+                secret_access_key,
+                session_token,
+                region,
+                service,
+            } => {
+                text(access_key_id)
+                    && secret(secret_access_key)
+                    && optional_secret(session_token)
+                    && text(region)
+                    && text(service)
+            }
+            CredentialData::EcdsaKey { private_key, .. } => secret(private_key),
+            CredentialData::SshPassword {
+                host,
+                user,
+                password,
+                ..
+            } => text(host) && text(user) && secret(password),
+            CredentialData::Postgres {
+                host,
+                database,
+                user,
+                password,
+                sslmode,
+                ..
+            } => {
+                text(host)
+                    && text(database)
+                    && text(user)
+                    && secret(password)
+                    && text(sslmode)
+            }
+            CredentialData::UrlToken { token } => secret(token),
+            CredentialData::Custom(values) => {
+                !values.is_empty()
+                    && values
+                        .iter()
+                        .all(|(name, value)| text(name) && secret(value))
+            }
+        };
+        valid
+            .then_some(())
+            .ok_or("credential contains a blank required field or empty secret")
+    }
+
     /// The exposed secret strings this credential injects or uses, for **egress
     /// redaction** (V7): if a proxied endpoint reflects the credential's own
     /// secret back in its response, the server scrubs these before returning the
@@ -369,8 +486,15 @@ impl CredentialData {
                 }
                 v
             }
-            CredentialData::HmacApiKey { api_secret, .. } => {
-                vec![z(api_secret.expose().to_string())]
+            CredentialData::HmacApiKey {
+                api_key,
+                api_secret,
+                ..
+            } => {
+                vec![
+                    z(api_key.expose().to_string()),
+                    z(api_secret.expose().to_string()),
+                ]
             }
             CredentialData::AwsSigV4 {
                 secret_access_key,
@@ -464,6 +588,23 @@ impl Credential {
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
+    }
+
+    pub(crate) fn validate_vault_shape(&self) -> Result<(), &'static str> {
+        if self.id.trim().is_empty() || self.alias.trim().is_empty() {
+            return Err("credential id and alias must be non-empty");
+        }
+        let type_matches = match (&self.credential_type, self.data.credential_type()) {
+            (CredentialType::Custom(_), CredentialType::Custom(_)) => true,
+            (declared, actual) => declared == &actual,
+        };
+        if !type_matches {
+            return Err("credential type does not match credential data");
+        }
+        if self.updated_at < self.created_at {
+            return Err("credential updated_at predates created_at");
+        }
+        self.data.validate_vault_shape()
     }
 }
 
@@ -561,7 +702,12 @@ pub struct ExecuteRequest {
     pub params: serde_json::Value,
 }
 
-/// Response from executing a plugin action
+/// Agent-safe response from executing a plugin action.
+///
+/// Credential refresh material is intentionally not part of this public wire
+/// shape. Plugins may attach an update with [`Self::with_updated_credential`],
+/// but only the server can read it for encrypted persistence; a caller receiving
+/// the completed response cannot inspect or serialize the replacement secret.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteResponse {
     /// HTTP status code (or equivalent)
@@ -572,11 +718,21 @@ pub struct ExecuteResponse {
     #[serde(with = "base64_bytes")]
     pub body: Vec<u8>,
     /// Updated credential data (e.g., after OAuth2 token refresh)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_credential: Option<CredentialData>,
+    #[serde(skip)]
+    pub(crate) updated_credential: Option<CredentialData>,
 }
 
 impl ExecuteResponse {
+    /// Create a response without any credential refresh material.
+    pub fn new(status: u16, headers: HashMap<String, String>, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            headers,
+            body,
+            updated_credential: None,
+        }
+    }
+
     /// Create a success response
     pub fn success(body: impl Into<Vec<u8>>) -> Self {
         Self {
@@ -601,6 +757,11 @@ impl ExecuteResponse {
     pub fn with_updated_credential(mut self, credential: CredentialData) -> Self {
         self.updated_credential = Some(credential);
         self
+    }
+
+    /// Read a connector-produced refresh only inside the enforcement crate.
+    pub(crate) fn updated_credential(&self) -> Option<&CredentialData> {
+        self.updated_credential.as_ref()
     }
 }
 
@@ -630,10 +791,36 @@ pub struct StreamingResponse {
     >,
     /// Updated credential data (e.g. after OAuth2 token refresh) — captured before
     /// the body streams, persisted by the server exactly as on the buffered path.
-    pub updated_credential: Option<CredentialData>,
+    pub(crate) updated_credential: Option<CredentialData>,
 }
 
 impl StreamingResponse {
+    /// Create a streaming response without credential refresh material.
+    pub fn new(
+        status: u16,
+        headers: HashMap<String, String>,
+        body: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<bytes::Bytes, plugins::PluginError>> + Send>,
+        >,
+    ) -> Self {
+        Self {
+            status,
+            headers,
+            body,
+            updated_credential: None,
+        }
+    }
+
+    /// Attach a connector-produced refresh for encrypted server-side persistence.
+    pub fn with_updated_credential(mut self, credential: CredentialData) -> Self {
+        self.updated_credential = Some(credential);
+        self
+    }
+
+    pub(crate) fn updated_credential(&self) -> Option<&CredentialData> {
+        self.updated_credential.as_ref()
+    }
+
     /// Wrap a fully-buffered [`ExecuteResponse`] as a single-chunk stream. This is
     /// the default `Plugin::execute_streaming` behavior: a plugin that only
     /// implements buffered `execute` still satisfies the streaming contract by
@@ -770,14 +957,18 @@ mod tests {
     }
 
     #[test]
-    fn test_secret_serialization() {
+    fn test_secret_serialization_is_vault_capability_only() {
         let cred = CredentialData::ApiKey {
             key: Secret::new("my-secret-key"),
             header_name: "Authorization".to_string(),
             header_prefix: "Bearer ".to_string(),
         };
 
-        let json = serde_json::to_string(&cred).unwrap();
+        assert!(
+            serde_json::to_string(&cred).is_err(),
+            "general-purpose serialization must not expose Secret"
+        );
+        let json = with_vault_secret_serialization(|| serde_json::to_string(&cred)).unwrap();
         assert!(json.contains("my-secret-key")); // Serialized for storage
 
         let parsed: CredentialData = serde_json::from_str(&json).unwrap();
@@ -786,6 +977,20 @@ mod tests {
         } else {
             panic!("Wrong variant");
         }
+    }
+
+    #[test]
+    fn execution_response_never_serializes_refresh_credentials() {
+        let response = ExecuteResponse::success("ok").with_updated_credential(
+            CredentialData::ApiKey {
+                key: Secret::new("fresh-secret-token"),
+                header_name: "Authorization".to_string(),
+                header_prefix: "Bearer ".to_string(),
+            },
+        );
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(!wire.contains("updated_credential"));
+        assert!(!wire.contains("fresh-secret-token"));
     }
 
     #[test]
@@ -825,5 +1030,22 @@ mod tests {
             .collect();
         assert!(mats.iter().any(|m| m == "p4ssword"));
         assert!(mats.iter().any(|m| m == &STANDARD.encode("user:p4ssword")));
+    }
+
+    #[test]
+    fn hmac_api_key_and_secret_are_both_private_egress_material() {
+        let data = CredentialData::HmacApiKey {
+            api_key: Secret::new("exchange-api-key"),
+            api_secret: Secret::new("exchange-api-secret"),
+            header_name: "X-MBX-APIKEY".to_string(),
+            recv_window: 5000,
+        };
+        let material: Vec<String> = data
+            .secret_material()
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
+        assert!(material.iter().any(|value| value == "exchange-api-key"));
+        assert!(material.iter().any(|value| value == "exchange-api-secret"));
     }
 }

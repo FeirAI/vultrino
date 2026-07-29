@@ -176,8 +176,8 @@ none timed out.
 
 ## Security model
 
-- **Password never leaves Vultrino.** Agents present a credential alias; the
-  plugin resolves it, decrypts the password, and passes it to `sshpass`
+- **Password stays out of the agent response.** Agents present a credential
+  alias; the trusted plugin resolves it, decrypts the password, and passes it to `sshpass`
   via the `SSHPASS` environment variable — never visible in `ps` output,
   never on disk.
 - **Override-locked by default.** An agent cannot pass a custom command

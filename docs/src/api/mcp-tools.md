@@ -75,7 +75,7 @@ Make an authenticated HTTP request using a stored credential.
 ```json
 {
   "name": "http_request",
-  "description": "Make an authenticated HTTP request. The credential's actual value is never exposed - only the alias is needed. Vultrino automatically injects the appropriate authentication header.",
+  "description": "Make an authenticated HTTP request. Agent input carries only the credential alias; Vultrino injects authentication inside the trusted connector.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -378,7 +378,7 @@ The `body` field is a string. Parse it as appropriate:
 
 ## Security Notes
 
-1. **Credentials are never exposed** — The AI only sees aliases
+1. **Alias-only schema** — Raw credential fields are not present in MCP tool input/output
 2. **All requests are logged** — Audit trail of all tool usage
 3. **Policies are enforced** — URL and method restrictions apply
 4. **Rate limits apply** — Prevent abuse

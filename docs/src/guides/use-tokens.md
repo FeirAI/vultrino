@@ -2,7 +2,7 @@
 
 A **use token** is a narrow, ephemeral grant — the opposite of a durable API key. Where an API key is a long-lived identity scoped by a role, a use token authorizes *one kind of action* against *one credential (or glob)*, optionally capped to a number of uses and/or a time window. It is designed to be handed to an agent for a single task and then forgotten.
 
-Use tokens are recognized by their `vut_` prefix and are presented in exactly the same place as an API key — the `api_key` tool argument (MCP) or an `Authorization: Bearer <token>` header (HTTP). The agent still never sees the underlying credential secret.
+Use tokens are recognized by their `vut_` prefix and are presented in exactly the same place as an API key — the `api_key` tool argument (MCP) or an `Authorization: Bearer <token>` header (HTTP). The underlying credential secret is not part of that agent-facing schema.
 
 ## Creating a token
 

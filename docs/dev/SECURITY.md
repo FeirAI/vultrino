@@ -26,17 +26,19 @@ In scope:
 - Brute-force / enumeration against the admin login.
 
 Out of scope (relied on the deployment): the host OS and disk integrity, the
-vault password's secrecy, TLS termination at the edge, and the correctness of any
-WASM plugin you install.
+vault password's secrecy, TLS termination at the edge, the trusted built-in
+connector implementations, and covert channels controlled by an authorized
+upstream.
 
 ## Invariants Vultrino upholds
 
-1. **The caller never sees the secret.** Secrets are stored encrypted, injected
-   server-side, and never returned by any endpoint (credential reads return
-   metadata only). A credential's own reflected secret is scrubbed from the
-   response body and headers before it reaches the caller (egress layer 1), and a
-   response that can't be scrubbed (still-compressed body) is **withheld
-   entirely** (fail-closed).
+1. **Raw credential material is confined from caller-visible sinks.** Secrets are
+   stored encrypted, injected server-side, and never returned by credential-read
+   endpoints. A credential's declared raw/derived forms are scrubbed from response
+   bodies and headers; responses that cannot be safely scrubbed (including a
+   still-compressed body or a secret shorter than five bytes) are **withheld
+   entirely**. Connector-provided post-dispatch error detail is also withheld from
+   live and persisted approval responses.
 2. **Default-deny.** A credential matching no policy is denied (`no_policy`
    reason). Fail-open is opt-in (`[enforcement] default_action = "allow"`) and
    warned about loudly at startup.
@@ -139,7 +141,8 @@ WASM plugin you install.
 | The bearer token presented | Authenticated | `vk_`/`vut_` validated by hash; scope enforced server-side. |
 | The `[identity]` header | **Trusted (edge-verified)** | The deployment MUST terminate mTLS / verify the token and pass the verified document. Vultrino does not itself verify the SVID/OIDC signature. |
 | The host / disk / vault password | Trusted | Vault confidentiality rests on the password's secrecy and OS file protection. |
-| Installed WASM plugins | Trusted code | A plugin runs with the credential's secret; install only plugins you trust. |
+| Built-in Rust plugins | **Trusted declassification boundary** | They receive `CredentialData` to inject/use it. Review them as part of Vultrino's TCB. |
+| Installed WASM plugins | **No** | ABI v2 receives only alias + credential type, never `CredentialData`; ABI v1 is rejected. No secret-using host capability exists yet. |
 | The upstream the proxy calls | **No** | Treated as hostile for read-back: secret scrubbing + egress block/redact + SSRF guard. |
 | The outbox consumer | Authenticated by HMAC | Deliveries are signed; the consumer verifies. |
 
@@ -156,24 +159,30 @@ metadata endpoint is denied at the transport step.
 
 ## Egress / read-back defense (V7)
 
-Two layers at the execution seam, run by `egress::scrub_response` before the body
-reaches the caller:
+Two layers at the execution seam, obtained through the private
+`egress::confine_response` constructor before a buffered body reaches the caller:
 
 1. **Always-on secret scrubbing.** The credential's own injected secret — and its
    percent-encoded and JSON-escaped forms, and derived forms like the Basic-auth
-   base64 — is replaced with `[REDACTED:<alias>]` in the body and headers.
+   base64 — is replaced with the constant `[REDACTED]` marker in the body and headers.
    Framing headers (`Content-Length`/`Transfer-Encoding`) a redaction invalidates
    are stripped so a stale length can't leak the original.
 2. **Operator egress classification.** `[[egress]]` rules `block` a secret-bearing
    endpoint's body+headers entirely, or `redact_patterns` extra regexes.
 
+Post-dispatch plugin failures cross the same finite secret-form boundary. A safe
+operator-authored refusal remains visible; a diagnostic containing any declared
+raw/derived credential form—or paired with an unredactable short secret—is
+replaced wholesale by a constant error before it can reach the caller or an
+approval record.
+
 **Honest bounds (defense-in-depth, not absolute):** scrubbing operates on the
 plaintext response. An endpoint that *transforms* the secret (re-encodes,
 hashes, gzips a reflected copy beyond what the client decompressed) can still leak
 it — use a `block` rule for endpoints you don't trust. Secrets shorter than
-`MIN_REDACT_LEN = 5` are not byte-scrubbed (they'd over-redact and carry little
-entropy); credential-store time warns about these, and they should use a `block`
-rule. A still-compressed body is withheld entirely (fail-closed).
+`MIN_REDACT_LEN = 5` are not byte-scrubbed (they'd over-redact); any execution
+using one is forced through the buffered path and its entire response is withheld.
+A still-compressed body is also withheld entirely (fail-closed).
 
 **Streaming (SSE).** A streamed LLM-proxy turn (`{"stream": true}`) is scrubbed
 **incrementally** — each raw SSE chunk is passed through the always-on

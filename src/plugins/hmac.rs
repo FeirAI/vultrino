@@ -146,7 +146,7 @@ impl HmacPlugin {
                 header_name,
                 recv_window,
             } => (
-                api_key.clone(),
+                api_key.expose().to_string(),
                 api_secret.expose().to_string(),
                 header_name.clone(),
                 *recv_window,
@@ -216,7 +216,9 @@ impl HmacPlugin {
             .timeout(super::REQUEST_TIMEOUT)
             .send()
             .await
-            .map_err(|e| PluginError::Http(e.to_string()))?;
+            // The URL carries a credential-derived HMAC signature. reqwest's
+            // Display includes that URL, so retain only the transport detail.
+            .map_err(|e| PluginError::Http(e.without_url().to_string()))?;
 
         // Extract response details
         let status = response.status().as_u16();
@@ -481,7 +483,7 @@ mod tests {
         let plugin = HmacPlugin::new();
 
         let cred_data = CredentialData::HmacApiKey {
-            api_key: "test_key".to_string(),
+            api_key: Secret::new("test_key"),
             api_secret: Secret::new("test_secret"),
             header_name: "X-MBX-APIKEY".to_string(),
             recv_window: 5000,

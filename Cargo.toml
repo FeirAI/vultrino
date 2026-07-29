@@ -8,6 +8,9 @@ repository = "https://github.com/zachyking/vultrino"
 keywords = ["proxy", "credentials", "security", "ai", "llm"]
 categories = ["authentication", "network-programming"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [dependencies]
 # Core async runtime
 tokio = { version = "1", features = ["full"] }
@@ -85,7 +88,7 @@ shellexpand = "3"
 tempfile = "3"
 fd-lock = "4.0.4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-libc = "0.2.186"
+rustix = { version = "1", features = ["fs"] }
 
 # Future optional features
 # ethers = { version = "2", optional = true }

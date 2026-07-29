@@ -29,10 +29,25 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   admin policy push is synchronous on the web process but reaches the MCP server /
   other replicas only on the periodic refresh (`POLICY_REFRESH_SECS = 5`). For an
   immediate kill, revoke the use token (storage-authoritative).
-- **Idempotency is at-least-once on a mid-operation crash.** Reserve → operate →
-  complete are three atomic writes, not one transaction; a crash between them can
-  re-run the operation after the ~60s stale window. Exactly-once would need
-  transactional storage.
+- **At-most-once execution sacrifices automatic recovery after an ambiguous
+  crash.** Reserve → operate → complete are not one external transaction. If a
+  worker disappears after claiming an approved action, a stale claim is finalized
+  as `outcome unknown` and is never run automatically again. A human must inspect
+  the target and explicitly re-approve if retry is appropriate.
+- **Legacy approved records without sign-off evidence fail closed on upgrade.**
+  Vault load now revalidates approval shapes before exposing any record. A pre-V12
+  `Approved` entry with an empty `signoffs` array is indistinguishable from a vault
+  edit that forged the status byte, so Vultrino refuses to open that vault rather
+  than execute it. Resolve or export such pending legacy approvals with the prior
+  binary before upgrading; denied, expired, pending, and evidence-bearing records
+  remain readable when their stored lifecycle fields are internally consistent.
+- **Vault shape validation proves consistency, not provenance.** The authenticated
+  vault ciphertext detects edits by a party without the vault key, and the loader
+  plus execution witness reject impossible or unsatisfied approval shapes. A party
+  that already controls the vault encryption key can still create a new,
+  internally consistent ciphertext containing fabricated sign-off identities;
+  preventing that requires independently signed decision evidence and belongs to
+  the cross-plane Govder/Averin composition proof.
 - **Egress scrubbing is defense-in-depth, not absolute (byte-exact match against
   derived forms).** It scrubs the credential's own secret and the common *single-pass*
   encoder dialects an upstream might ACCIDENTALLY reflect it through: raw, percent-encoding
@@ -44,9 +59,9 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   arbitrary re-encoding (base64, hashing, chunk-reordering, a novel escape dialect). The
   real protections there are that vultrino never trusts the upstream beyond the injected
   credential, the **buffered-block fallback** for unparseable/compressed bodies, and an
-  operator `block`/`redact_patterns` rule. Secrets shorter than `MIN_REDACT_LEN = 5` are
-  not byte-scrubbed (use a `block` rule). A structural fix (decode-then-match normalization)
-  is a deferred follow-up.
+  operator `block`/`redact_patterns` rule. Secrets shorter than `MIN_REDACT_LEN = 5`
+  force buffered execution and whole-response withholding. A structural fix
+  (decode-then-match normalization) is a deferred follow-up.
 - **Halt abort callbacks are per-process.** The in-flight session registry is
   in-memory per process, so leg 3 of a halt (firing abort callbacks) only preempts
   in-flight work *in the process that received the halt*. The cross-process
@@ -56,6 +71,13 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   **once at startup**; a plugin installed via the CLI while `web` is running is not
   picked up until restart. `vultrino plugin reload` validates a plugin but does not
   hot-swap it into a running server.
+- **WASM ABI v2 has no secret-using host capabilities yet.** An untrusted guest
+  receives only a non-secret credential handle (alias + type), and ABI v1 modules
+  are rejected at installation/loading. Consequently, external WASM actions that
+  need private key or token bytes are unavailable until Vultrino provides a
+  narrow host-side operation for that credential type. The repository's former
+  PGP module is retained only as an ABI v1 rejection fixture, not a deployable
+  plugin.
 - **Inbound workload identity trusts the edge.** Vultrino does **not** verify the
   SVID/OIDC signature; the deployment must terminate mTLS / verify the token and
   pass the verified document in the configured header.

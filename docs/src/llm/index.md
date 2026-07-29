@@ -177,7 +177,7 @@ Authorization: Bearer <vultrino-api-key>
 ## Security Model
 
 1. **Credentials encrypted at rest** — AES-256-GCM
-2. **Aliases only** — Never expose actual secrets
+2. **Aliases only** — Raw credential fields are absent from the LLM-facing schema
 3. **RBAC** — Role-based access control via API keys
 4. **Policies** — URL/method restrictions
 5. **Audit logging** — Track all usage

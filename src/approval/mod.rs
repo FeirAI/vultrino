@@ -755,6 +755,9 @@ impl Decision {
 pub struct Granted {
     #[allow(dead_code)] // carried for diagnostics/audit; the VALUE's existence is the claim
     basis: GrantBasis,
+    binding: crate::formal_kernel::ExecutionBinding,
+    issued_at_unix_seconds: i64,
+    expires_at_unix_seconds: i64,
 }
 
 impl Granted {
@@ -762,6 +765,18 @@ impl Granted {
     /// input: the *existence* of the `Granted` is the decision.
     pub fn basis(&self) -> &GrantBasis {
         &self.basis
+    }
+
+    pub(crate) fn binding(&self) -> &crate::formal_kernel::ExecutionBinding {
+        &self.binding
+    }
+
+    pub(crate) fn issued_at_unix_seconds(&self) -> i64 {
+        self.issued_at_unix_seconds
+    }
+
+    pub(crate) fn expires_at_unix_seconds(&self) -> i64 {
+        self.expires_at_unix_seconds
     }
 }
 
@@ -1067,6 +1082,118 @@ impl ApprovalRequest {
         &self.signoffs
     }
 
+    /// Re-establish the persisted approval invariants after decryption and
+    /// deserialization, before the record becomes reachable by the server.
+    ///
+    /// Serde can reconstruct private fields from bytes, so field privacy alone
+    /// does not protect the vault boundary. This check deliberately rejects
+    /// impossible or execution-ambiguous shapes rather than repairing them.
+    pub(crate) fn validate_vault_shape(&self) -> Result<(), &'static str> {
+        if self.id.trim().is_empty()
+            || self.credential.trim().is_empty()
+            || self.action.trim().is_empty()
+            || self.decision_token_hash.trim().is_empty()
+        {
+            return Err("approval identity/action fields must be non-blank");
+        }
+        if self.escalate_at < self.created_at || self.expires_at < self.escalate_at {
+            return Err("approval lifecycle timestamps are out of order");
+        }
+        for signoff in &self.signoffs {
+            if bare_approver_identity(&signoff.approver_identity)
+                .trim()
+                .is_empty()
+            {
+                return Err("approval contains an unnamed sign-off principal");
+            }
+            if signoff.channel.trim().is_empty() {
+                return Err("approval contains a blank sign-off channel");
+            }
+            match signoff.approver_kind.trim() {
+                "human" => {
+                    if matches!(
+                        signoff.resolved_class,
+                        Some(ApproverClass::AgentReviewer | ApproverClass::Unknown)
+                    ) {
+                        return Err("human sign-off has an incompatible resolved class");
+                    }
+                }
+                "delegate-agent" => {
+                    if signoff.resolved_class != Some(ApproverClass::AgentReviewer)
+                        || signoff
+                            .delegation_grant_ref
+                            .as_deref()
+                            .map(str::trim)
+                            .unwrap_or_default()
+                            .is_empty()
+                    {
+                        return Err("delegate sign-off lacks its class or delegation grant");
+                    }
+                }
+                _ => return Err("approval contains an unknown approver kind"),
+            }
+        }
+
+        if self.executing && self.executed {
+            return Err("approval cannot be executing and executed simultaneously");
+        }
+        if self.executing != self.executing_since.is_some() {
+            return Err("approval execution claim timestamp is inconsistent");
+        }
+        if (self.executing || self.executed) && self.status != ApprovalStatus::Approved {
+            return Err("only an approved request may execute");
+        }
+        if self.executed && self.result_status.is_none() && self.result_error.is_none() {
+            return Err("executed approval has no recorded outcome");
+        }
+
+        match self.status {
+            ApprovalStatus::Pending => {
+                if self.escalated_at.is_some() || self.decided_at.is_some() {
+                    return Err("pending approval carries a later lifecycle timestamp");
+                }
+            }
+            ApprovalStatus::Escalated => {
+                if self.escalated_at.is_none() || self.decided_at.is_some() {
+                    return Err("escalated approval timestamps are inconsistent");
+                }
+            }
+            ApprovalStatus::Approved => {
+                if self.decided_at.is_none()
+                    || self
+                        .decided_by
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .is_empty()
+                    || self
+                        .approver_identity
+                        .as_deref()
+                        .map(bare_approver_identity)
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .is_empty()
+                    || self.grant_witness().is_none()
+                {
+                    return Err("approved status is not backed by executable grant evidence");
+                }
+            }
+            ApprovalStatus::Denied | ApprovalStatus::Expired => {
+                if self.decided_at.is_none()
+                    || self
+                        .decided_by
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .is_empty()
+                {
+                    return Err("terminal approval lacks decision attribution");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Re-derive the grant from the PERSISTED state and, if it holds, mint the
     /// one witness that the execution path requires. `None` means **refuse**.
     ///
@@ -1112,32 +1239,131 @@ impl ApprovalRequest {
     /// vault edit produces and there is no way to tell the two apart from the
     /// record.
     pub fn grant_witness(&self) -> Option<Granted> {
+        self.grant_witness_inner(self.execution_epoch, false)
+    }
+
+    /// Production witness bound to the epoch the storage lock is about to
+    /// commit. Unlike the test-facing re-derivation above, this requires a real
+    /// decision timestamp and a still-live execute-by window.
+    pub(crate) fn grant_witness_for_epoch(&self, epoch: u64) -> Option<Granted> {
+        self.grant_witness_inner(epoch, true)
+    }
+
+    fn grant_witness_inner(&self, epoch: u64, require_live_decision: bool) -> Option<Granted> {
         if self.status != ApprovalStatus::Approved {
             return None;
         }
-        match &self.approval_rule {
+        let basis = match &self.approval_rule {
             None => {
                 let need = self.effective_required_approvals();
-                let have = self.signoffs.iter().filter(|s| s.approve).count() as u32;
+                let positives: Vec<&Signoff> = self.signoffs.iter().filter(|s| s.approve).collect();
+                let have = positives.len() as u32;
                 if have < need {
                     return None;
                 }
-                Some(Granted {
-                    basis: GrantBasis::NumericThreshold { need, have },
-                })
+                // Re-derive the evidence properties a persisted status byte
+                // cannot establish: every counting principal is named and
+                // distinct. For M-of-N, one aggregator key may contribute at
+                // most once; a vault edit cannot fabricate two operators behind
+                // the same controller and have both counted.
+                let mut identities = std::collections::HashSet::new();
+                let mut aggregator_keys = std::collections::HashSet::new();
+                for signoff in positives {
+                    let identity = bare_approver_identity(&signoff.approver_identity)
+                        .trim()
+                        .to_ascii_lowercase();
+                    if identity.is_empty() || !identities.insert(identity) {
+                        return None;
+                    }
+                    if need > 1 {
+                        if let Some(prefix) = aggregator_key_prefix(&signoff.approver_identity) {
+                            if !aggregator_keys.insert(prefix.to_ascii_lowercase()) {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                GrantBasis::NumericThreshold { need, have }
             }
             Some(rule) => {
                 if !approval_rule_satisfied(rule, &self.signoffs) {
                     return None;
                 }
-                Some(Granted {
-                    basis: GrantBasis::Recipe {
-                        recipes: rule.recipes.len(),
-                        counted_signoffs: self.signoffs.iter().filter(|s| s.approve).count(),
-                    },
-                })
+                // Re-establish controller separation from persisted evidence.
+                // One aggregator key cannot manufacture multiple human subjects
+                // for a recipe, even if a vault edit bypassed `transition`.
+                let mut aggregator_keys = std::collections::HashSet::new();
+                for signoff in &self.signoffs {
+                    if self.contributes_positive_slot(signoff.approve, signoff.resolved_class) {
+                        if let Some(prefix) = aggregator_key_prefix(&signoff.approver_identity) {
+                            if !aggregator_keys.insert(prefix.to_ascii_lowercase()) {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                GrantBasis::Recipe {
+                    recipes: rule.recipes.len(),
+                    counted_signoffs: self.signoffs.iter().filter(|s| s.approve).count(),
+                }
             }
+        };
+
+        let issued_at = match self.decided_at {
+            Some(value) => value,
+            None if require_live_decision => return None,
+            None => self.created_at,
+        };
+        let window = self
+            .reauth_interval_secs
+            .filter(|&seconds| seconds > 0)
+            .unwrap_or(DEFAULT_UNRUN_GRANT_WINDOW_SECS);
+        let expires_at = issued_at + chrono::Duration::seconds(i64::try_from(window).ok()?);
+        if require_live_decision && Utc::now() >= expires_at {
+            return None;
         }
+
+        Some(Granted {
+            basis,
+            binding: self.execution_binding(epoch)?,
+            issued_at_unix_seconds: issued_at.timestamp(),
+            expires_at_unix_seconds: expires_at.timestamp(),
+        })
+    }
+
+    /// Exact eight-field approval binding shared with the Lean model.
+    pub(crate) fn execution_binding(
+        &self,
+        epoch: u64,
+    ) -> Option<crate::formal_kernel::ExecutionBinding> {
+        let params = serde_json::to_vec(&self.params).ok()?;
+        let rule = match &self.approval_rule {
+            Some(rule) => serde_json::to_vec(&serde_json::json!({
+                "mode": "recipe",
+                "approval_rule": rule,
+                "authoritative_risk_tier": self.authoritative_risk_tier,
+                "authoritative_irreversible": self.authoritative_irreversible,
+            }))
+            .ok()?,
+            None => serde_json::to_vec(&serde_json::json!({
+                "mode": "numeric",
+                "required_approvals": self.effective_required_approvals(),
+            }))
+            .ok()?,
+        };
+        Some(crate::formal_kernel::ExecutionBinding::new(
+            self.id.clone(),
+            epoch,
+            self.tenant.clone().unwrap_or_default(),
+            self.principal_id
+                .clone()
+                .or_else(|| self.requester.principal_id.clone())
+                .unwrap_or_default(),
+            self.credential.clone(),
+            self.action.clone(),
+            crate::formal_kernel::digest_bytes(&params),
+            crate::formal_kernel::digest_bytes(&rule),
+        ))
     }
 
     /// Test-only escape hatch for the sealed [`Self::status`] field.
@@ -1255,7 +1481,11 @@ impl ApprovalRequest {
         // V5: a human decision must carry an authenticated approver identity, so
         // every decision is attributable and SoD is computable. Reject blanks.
         let identity = decision.approver_identity.trim().to_string();
-        if identity.is_empty() {
+        // The namespaced aggregator spelling is transport provenance, not the
+        // human principal. Reject an empty BARE subject here so the numeric and
+        // recipe paths cannot record `agg:<key>:` as an approving person and
+        // only discover the mismatch when the execution grant is re-derived.
+        if bare_approver_identity(&identity).trim().is_empty() {
             return Err(ApprovalError::MissingApproverIdentity);
         }
         if self.is_past_ttl() {
@@ -1338,7 +1568,7 @@ impl ApprovalRequest {
         if decision.enforce_sod && sod == Some(true) {
             return Err(ApprovalError::SeparationOfDuty);
         }
-        // Hard-SoD M-of-N (in-lock, TOCTOU-safe): under hard SoD one aggregator
+        // Controller separation for M-of-N (in-lock, TOCTOU-safe): one aggregator
         // key may contribute AT MOST ONE positive recipe slot — the aggregator's
         // claim of distinct HUMAN operators is unverifiable, so a SECOND
         // positive-contributing sign-off from the SAME key is rejected. The
@@ -1368,11 +1598,12 @@ impl ApprovalRequest {
         }
         // Approvers must be DISTINCT — the same identity can't satisfy two of the
         // required M sign-offs (nor dissent once and later approve, or vice versa).
-        if self
-            .signoffs
-            .iter()
-            .any(|s| s.approver_identity.eq_ignore_ascii_case(&identity))
-        {
+        let bare_identity = bare_approver_identity(&identity).trim();
+        if self.signoffs.iter().any(|s| {
+            bare_approver_identity(&s.approver_identity)
+                .trim()
+                .eq_ignore_ascii_case(bare_identity)
+        }) {
             return Err(ApprovalError::DuplicateApprover);
         }
         self.signoffs.push(Signoff {
@@ -1423,10 +1654,12 @@ impl ApprovalRequest {
         }
     }
 
-    /// Whether the hard-SoD "one aggregator key counts once" guard is ACTIVE for
-    /// this request. Active under `enforce_sod` whenever MORE THAN ONE distinct
-    /// approver can be required to grant: either the legacy numeric threshold is
-    /// > 1, OR a recipe `ApprovalRule` is stamped.
+    /// Whether the "one aggregator key counts once" guard is ACTIVE for this
+    /// request. It applies whenever MORE THAN ONE distinct approver can be
+    /// required to grant: either the numeric threshold is > 1, or a recipe rule
+    /// is stamped. The `enforce_sod` argument is retained for API compatibility;
+    /// it governs requester-vs-approver self approval, not whether one controller
+    /// may fabricate M distinct people.
     ///
     /// The recipe arm is load-bearing (Codex P2 RE-REVIEW-3 BLOCKER 1): a stamped
     /// rule REPLACES the numeric threshold in `transition`'s grant check, but
@@ -1436,14 +1669,14 @@ impl ApprovalRequest {
     /// alone therefore SKIPS it for a `{teammate:2}` (or any multi-slot) recipe
     /// opened with an ordinary token, letting ONE aggregator key invent two
     /// distinct operator names to fill both human slots — one key fabricating
-    /// M-of-N. Under hard SoD the aggregator's claim of distinct operators is
-    /// unverifiable (that is the whole point of the guard), so ANY stamped recipe
+    /// M-of-N. The aggregator's claim of distinct operators is unverifiable
+    /// regardless of the optional self-approval policy, so ANY stamped recipe
     /// makes one key count once, regardless of the recipe's exact slot counts:
     /// the guard only ever rejects a SECOND same-key sign-off, and a single-slot
     /// recipe is already granted by the first (a second sign-off is superfluous),
     /// so activating for all recipes never wrongly blocks a legitimate grant.
-    pub fn same_aggregator_key_guard_active(&self, enforce_sod: bool) -> bool {
-        enforce_sod && (self.approval_rule.is_some() || self.effective_required_approvals() > 1)
+    pub fn same_aggregator_key_guard_active(&self, _enforce_sod: bool) -> bool {
+        self.approval_rule.is_some() || self.effective_required_approvals() > 1
     }
 
     /// Whether a sign-off with this `approve`/`class` CONTRIBUTES a positive slot
@@ -1894,6 +2127,264 @@ fn recipe_well_formed(r: &Recipe) -> bool {
         }
     }
     true
+}
+
+/// Bounded model checks for the approval predicate itself.
+///
+/// These harnesses intentionally live beside the private production functions:
+/// Kani therefore verifies the code that ships rather than a public test model.
+/// Except for P3's explicitly bounded matching oracle, all counts and
+/// availabilities are symbolic over the complete `u32` domain. The recipe has
+/// three terms because Kani requires a concrete allocation shape; P5 separately
+/// covers the empty shape, while the production predicate reduces every
+/// non-empty shape to the same three need totals in `recipe_needs`.
+#[cfg(kani)]
+mod kani_recipe_proofs {
+    use super::*;
+
+    fn any_class() -> ApproverClass {
+        match kani::any::<u8>() & 3 {
+            0 => ApproverClass::Senior,
+            1 => ApproverClass::Teammate,
+            2 => ApproverClass::AgentReviewer,
+            _ => ApproverClass::Unknown,
+        }
+    }
+
+    fn any_recipe() -> Recipe {
+        Recipe {
+            terms: vec![
+                RecipeTerm {
+                    class: any_class(),
+                    count: kani::any(),
+                },
+                RecipeTerm {
+                    class: any_class(),
+                    count: kani::any(),
+                },
+                RecipeTerm {
+                    class: any_class(),
+                    count: kani::any(),
+                },
+            ],
+        }
+    }
+
+    /// P1: no non-empty recipe can clear without an approver.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn zero_approvers_never_satisfy() {
+        let recipe = any_recipe();
+        assert!(!recipe_satisfied(&recipe, 0, 0, 0));
+    }
+
+    /// P2: success implies every required slot was actually filled. Saturating
+    /// arithmetic makes the assertion itself total at `u32::MAX`.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn satisfaction_never_underfills_a_slot() {
+        let recipe = any_recipe();
+        let avail_senior: u32 = kani::any();
+        let avail_teammate: u32 = kani::any();
+        let avail_agent: u32 = kani::any();
+
+        if recipe_satisfied(&recipe, avail_senior, avail_teammate, avail_agent) {
+            let (need_senior, need_teammate, need_agent) =
+                recipe_needs(&recipe).expect("a satisfied recipe is well formed");
+            assert_eq!(need_agent, 0);
+            assert!(avail_senior >= need_senior);
+            assert!(
+                avail_senior
+                    .saturating_sub(need_senior)
+                    .saturating_add(avail_teammate)
+                    >= need_teammate
+            );
+            assert!(avail_agent >= need_agent);
+        }
+    }
+
+    /// Independent injective-assignment search for P3. `senior_to_teammate`
+    /// is the only non-trivial matching choice in the two-class hierarchy.
+    fn injective_match_exists_bound_5(
+        need_senior: u32,
+        need_teammate: u32,
+        avail_senior: u32,
+        avail_teammate: u32,
+    ) -> bool {
+        for senior_to_teammate in 0..=5u32 {
+            if senior_to_teammate <= avail_senior
+                && senior_to_teammate <= need_teammate
+                && avail_senior - senior_to_teammate >= need_senior
+                && avail_teammate >= need_teammate - senior_to_teammate
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// P3: the production senior-first shortcut is equivalent to an exhaustive
+    /// injective matching search for three symbolic human terms at bound five.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn greedy_matches_exhaustive_assignment_at_bound_5() {
+        let mut terms = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let class = if kani::any::<bool>() {
+                ApproverClass::Senior
+            } else {
+                ApproverClass::Teammate
+            };
+            let count: u32 = kani::any();
+            kani::assume((1..=5).contains(&count));
+            terms.push(RecipeTerm { class, count });
+        }
+        let recipe = Recipe { terms };
+        let avail_senior: u32 = kani::any();
+        let avail_teammate: u32 = kani::any();
+        kani::assume(avail_senior <= 5 && avail_teammate <= 5);
+
+        let (need_senior, need_teammate, need_agent) =
+            recipe_needs(&recipe).expect("bounded human recipe is well formed");
+        assert_eq!(need_agent, 0);
+        assert_eq!(
+            recipe_satisfied(&recipe, avail_senior, avail_teammate, 0),
+            injective_match_exists_bound_5(
+                need_senior,
+                need_teammate,
+                avail_senior,
+                avail_teammate,
+            )
+        );
+    }
+
+    /// P4: increasing any availability cannot turn an approval into a denial,
+    /// including at the integer boundary.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn satisfaction_is_monotone_in_availability() {
+        let recipe = any_recipe();
+        let senior: u32 = kani::any();
+        let teammate: u32 = kani::any();
+        let agent: u32 = kani::any();
+        let more_senior: u32 = kani::any();
+        let more_teammate: u32 = kani::any();
+        let more_agent: u32 = kani::any();
+
+        if recipe_satisfied(&recipe, senior, teammate, agent) {
+            assert!(recipe_satisfied(
+                &recipe,
+                senior.saturating_add(more_senior),
+                teammate.saturating_add(more_teammate),
+                agent.saturating_add(more_agent),
+            ));
+        }
+    }
+
+    /// P5: each structural malformation is permanently unsatisfiable, even
+    /// with maximum apparent availability.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn malformed_recipes_never_satisfy() {
+        let class = any_class();
+        let over_cap: u32 = kani::any();
+        kani::assume(over_cap > MAX_RECIPE_TERM_COUNT);
+        let first: u32 = kani::any();
+        let second: u32 = kani::any();
+        kani::assume(
+            first > 0
+                && first <= MAX_RECIPE_TERM_COUNT
+                && second > 0
+                && second <= MAX_RECIPE_TERM_COUNT
+                && first.saturating_add(second) > MAX_RECIPE_TERM_COUNT,
+        );
+
+        let malformed = [
+            Recipe { terms: vec![] },
+            Recipe {
+                terms: vec![RecipeTerm { class, count: 0 }],
+            },
+            Recipe {
+                terms: vec![RecipeTerm {
+                    class,
+                    count: over_cap,
+                }],
+            },
+            Recipe {
+                terms: vec![
+                    RecipeTerm {
+                        class: ApproverClass::Senior,
+                        count: first,
+                    },
+                    RecipeTerm {
+                        class: ApproverClass::Teammate,
+                        count: second,
+                    },
+                ],
+            },
+            Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Unknown,
+                    count: 1,
+                }],
+            },
+        ];
+
+        for recipe in malformed {
+            assert!(!recipe_well_formed(&recipe));
+            assert!(!recipe_satisfied(&recipe, u32::MAX, u32::MAX, u32::MAX,));
+        }
+    }
+
+    /// P6: well-formedness makes the need sum finite and all additions
+    /// representable; this is the premise that makes the real-cap exhaustive
+    /// sweep in `stage1_proofs` complete.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn recipe_cap_prevents_need_overflow() {
+        let recipe = any_recipe();
+        if recipe_well_formed(&recipe) {
+            let (senior, teammate, agent) =
+                recipe_needs(&recipe).expect("well-formed recipe has needs");
+            let total = senior
+                .checked_add(teammate)
+                .and_then(|n| n.checked_add(agent));
+            assert!(matches!(total, Some(n) if n <= MAX_RECIPE_TERM_COUNT));
+        }
+    }
+
+    /// P7: the same production need decomposition drives both satisfaction and
+    /// the same-controller contribution guard. Adding a class that cannot fill
+    /// a viable slot must never be the step that clears a recipe.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn class_slot_contribution_agrees_with_satisfaction() {
+        let recipe = any_recipe();
+        let class = any_class();
+        let senior: u32 = kani::any();
+        let teammate: u32 = kani::any();
+        let agent: u32 = kani::any();
+        let before = recipe_satisfied(&recipe, senior, teammate, agent);
+        let after = match class {
+            ApproverClass::Senior => {
+                recipe_satisfied(&recipe, senior.saturating_add(1), teammate, agent)
+            }
+            ApproverClass::Teammate => {
+                recipe_satisfied(&recipe, senior, teammate.saturating_add(1), agent)
+            }
+            ApproverClass::AgentReviewer => {
+                recipe_satisfied(&recipe, senior, teammate, agent.saturating_add(1))
+            }
+            ApproverClass::Unknown => before,
+        };
+
+        if !before && after {
+            assert!(class_fills_a_slot(&recipe, class));
+        }
+        if !class_fills_a_slot(&recipe, class) {
+            assert!(!after || before);
+        }
+    }
 }
 
 /// D4(b) distinct principals: keep the FIRST occurrence per distinct identity
@@ -3520,7 +4011,7 @@ mod tests {
     }
 
     #[test]
-    fn recipe_same_bare_subject_across_aggregator_keys_fills_one_slot() {
+    fn recipe_same_bare_subject_across_aggregator_keys_is_rejected() {
         // RE-BLOCKER 1: vultrino stamps `agg:<key-id>:<subject>` on aggregator-asserted
         // identities. The SAME OIDC subject signed through TWO DIFFERENT broker/admin
         // keys (key rotation or an HA broker) — `agg:key-a:alice@corp` and
@@ -3538,15 +4029,23 @@ mod tests {
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "Medium".to_string();
-        // Same bare subject `alice@corp` via two DIFFERENT aggregator keys. Both are
-        // recorded (distinct full identities, so DuplicateApprover doesn't reject), but
-        // they collapse to ONE bare teammate for recipe matching.
+        // Same bare subject `alice@corp` via two DIFFERENT aggregator keys. The
+        // second is rejected at decision time: waiting until grant re-derivation
+        // would leave a misleading stored Approved/Pending history.
         approve_as(&mut a, "agg:key-a:alice@corp", ApproverClass::Teammate, None, None).unwrap();
-        approve_as(&mut a, "agg:key-b:alice@corp", ApproverClass::Teammate, None, None).unwrap();
+        let duplicate = approve_as(
+            &mut a,
+            "agg:key-b:alice@corp",
+            ApproverClass::Teammate,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(duplicate, ApprovalError::DuplicateApprover));
         assert_eq!(
             a.signoffs.len(),
-            2,
-            "both sign-offs are recorded (distinct full identities)"
+            1,
+            "the duplicate bare subject must not be recorded"
         );
         assert_eq!(
             a.status,
@@ -3554,7 +4053,7 @@ mod tests {
             "one bare subject via two aggregator keys fills only ONE of the two teammate slots"
         );
         // A GENUINELY distinct bare subject fills the second slot and clears the recipe.
-        approve_as(&mut a, "agg:key-a:bob@corp", ApproverClass::Teammate, None, None).unwrap();
+        approve_as(&mut a, "agg:key-b:bob@corp", ApproverClass::Teammate, None, None).unwrap();
         assert_eq!(
             a.status,
             ApprovalStatus::Approved,

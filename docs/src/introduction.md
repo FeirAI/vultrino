@@ -4,7 +4,7 @@
 
 ## What is Vultrino?
 
-Vultrino is a secure credential proxy that allows AI agents, LLMs, and automated systems to use credentials without ever exposing them. Instead of giving your AI agent direct access to secrets, you give it access to Vultrino, which performs authenticated actions on behalf of the agent — whether that's making API calls, signing data with PGP keys, or any other credential-based operation.
+Vultrino keeps raw credential fields out of agent-facing requests and performs authenticated operations inside trusted connectors. An agent receives aliases and action results rather than direct access to the stored secret.
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
@@ -15,15 +15,15 @@ Vultrino is a secure credential proxy that allows AI agents, LLMs, and automated
         │ "Use my-credential"   │ Injects auth, signs data, etc.
         │                       │
         ▼                       ▼
-   Never sees secrets    Performs secure actions
+   Alias-only request    Injects inside a trusted connector
 ```
 
 ## Key Features
 
-- **Credential Isolation** — AI agents never see actual secrets or private keys
+- **Credential Isolation** — raw fields are absent from agent/MCP response schemas
 - **Role-Based Access Control** — Fine-grained permissions for different applications
-- **Multiple Credential Types** — API keys, Basic Auth, PGP keys, and more
-- **Plugin System** — Extend with custom credential types and actions via WASM plugins
+- **Multiple Credential Types** — API keys, Basic Auth, OAuth2, signing keys, and more
+- **Plugin System** — Extend public-data actions through the credential-confining WASM ABI v2
 - **MCP Integration** — Native Model Context Protocol support for LLM tools
 - **Web UI** — Clean admin interface for managing credentials and keys
 - **Encrypted Storage** — AES-256-GCM encryption with Argon2 key derivation

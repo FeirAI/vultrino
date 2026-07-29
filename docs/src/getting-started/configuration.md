@@ -159,7 +159,7 @@ applied at the execution seam for **every** plugin:
    credential's own injected secret in its response (a header-echoing reflector,
    an open redirect, etc.), the secret — and its common re-encoded forms
    (percent-encoded, JSON-escaped) — is scrubbed from the body and headers and
-   replaced with `[REDACTED:<alias>]` before the response is returned. This is
+   replaced with the constant `[REDACTED]` marker before the response is returned. This is
    not configurable. It is defense-in-depth, not absolute: an endpoint that
    *transforms* the secret (base64, hashing, splitting it) — or returns a
    **compressed** body (the http plugin requests `Accept-Encoding: identity`,

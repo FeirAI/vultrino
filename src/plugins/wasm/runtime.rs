@@ -42,7 +42,7 @@ pub trait WasmRuntime: Send + Sync {
     fn execute_action(
         &self,
         action: &str,
-        credential: &serde_json::Value,
+        credential: &WasmCredentialHandle,
         params: &serde_json::Value,
     ) -> Result<ExecuteResponse, PluginError>;
 
@@ -50,11 +50,24 @@ pub trait WasmRuntime: Send + Sync {
     fn validate_params(&self, action: &str, params: &serde_json::Value) -> Result<(), PluginError>;
 }
 
-/// Request sent to WASM plugin
+/// Non-secret credential identity sent to an untrusted WASM guest.
+///
+/// Deliberately contains no `CredentialData`, metadata, id, or general-purpose
+/// map: those would either expose plaintext directly or create a future covert
+/// field into which it could accidentally be serialized. The alias lets the
+/// guest identify which configured capability was selected; the type lets it
+/// reject unsupported operations without seeing the credential.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmCredentialHandle {
+    pub alias: String,
+    pub credential_type: String,
+}
+
+/// Request sent to a WASM plugin under ABI v2.
 #[derive(Debug, Serialize, Deserialize)]
 struct WasmRequest {
     action: String,
-    credential: serde_json::Value,
+    credential_handle: WasmCredentialHandle,
     parameters: serde_json::Value,
 }
 
@@ -300,7 +313,7 @@ impl WasmRuntime for WasmtimeRuntime {
     fn execute_action(
         &self,
         action: &str,
-        credential: &serde_json::Value,
+        credential: &WasmCredentialHandle,
         params: &serde_json::Value,
     ) -> Result<ExecuteResponse, PluginError> {
         let module_guard = self.module.read();
@@ -334,7 +347,7 @@ impl WasmRuntime for WasmtimeRuntime {
         // Build request
         let request = WasmRequest {
             action: action.to_string(),
-            credential: credential.clone(),
+            credential_handle: credential.clone(),
             parameters: params.clone(),
         };
 
@@ -532,17 +545,24 @@ impl Plugin for WasmPlugin {
     }
 
     async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
-        // Convert credential to JSON
-        let cred_json = serde_json::to_value(&request.credential.data).map_err(|e| {
-            PluginError::ExecutionFailed(format!("Failed to serialize credential: {}", e))
-        })?;
+        // ABI v2 confinement boundary: an installed WASM module is untrusted and
+        // receives identity only. It never receives `CredentialData`, even when
+        // its manifest declares a custom credential type. A secret-using guest
+        // action therefore remains unavailable until the host exposes a narrow,
+        // operation-specific capability for it.
+        let credential_handle = WasmCredentialHandle {
+            alias: request.credential.alias.clone(),
+            credential_type: request.credential.credential_type.to_string(),
+        };
 
         let runtime = Arc::clone(&self.runtime);
         let action = request.action.clone();
         let params = request.params.clone();
 
         tokio::task::spawn_blocking(move || {
-            runtime.read().execute_action(&action, &cred_json, &params)
+            runtime
+                .read()
+                .execute_action(&action, &credential_handle, &params)
         })
         .await
         .map_err(|e| PluginError::ExecutionFailed(format!("WASM execution task failed: {}", e)))?
@@ -664,11 +684,55 @@ mod tests {
         rt
     }
 
+    fn handle() -> WasmCredentialHandle {
+        WasmCredentialHandle {
+            alias: "test-credential".to_string(),
+            credential_type: "api_key".to_string(),
+        }
+    }
+
+    #[test]
+    fn abi_v2_request_contains_only_a_non_secret_handle() {
+        let request = WasmRequest {
+            action: "sign".to_string(),
+            credential_handle: handle(),
+            parameters: serde_json::json!({"data": "public message"}),
+        };
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(wire["credential_handle"]["alias"], "test-credential");
+        assert_eq!(wire["credential_handle"]["credential_type"], "api_key");
+        assert!(wire.get("credential").is_none());
+        assert!(!wire.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn abi_v1_module_is_rejected_before_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("plugin.toml"),
+            r#"
+[plugin]
+name = "legacy"
+version = "1.0.0"
+format = "wasm"
+wasm_module = "legacy.wasm"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("legacy.wasm"), LOOP_WAT).unwrap();
+
+        let error = WasmPlugin::from_directory(dir.path().to_path_buf())
+            .err()
+            .expect("ABI v1 must fail closed")
+            .to_string();
+        assert!(error.contains("expected 2, got 1"), "{error}");
+    }
+
     #[test]
     fn infinite_loop_plugin_times_out_and_denies() {
         let rt = runtime_with(LOOP_WAT, Duration::from_millis(300));
         let start = std::time::Instant::now();
-        let res = rt.execute_action("do", &serde_json::json!({}), &serde_json::json!({}));
+        let res = rt.execute_action("do", &handle(), &serde_json::json!({}));
         let elapsed = start.elapsed();
         assert!(res.is_err(), "a looping plugin must be denied, got {res:?}");
         assert!(
@@ -683,7 +747,7 @@ mod tests {
         // WITHOUT the limiter this grow would succeed and the call would return Ok,
         // so this asserts the StoreLimits cap is actually enforced.
         let rt = runtime_with(MEMHOG_WAT, WASM_CALL_TIMEOUT);
-        let res = rt.execute_action("do", &serde_json::json!({}), &serde_json::json!({}));
+        let res = rt.execute_action("do", &handle(), &serde_json::json!({}));
         assert!(
             res.is_err(),
             "over-cap memory growth must be denied, got {res:?}"

@@ -122,5 +122,7 @@ run the same PEP path locally (no server) and are handy for testing a policy.
   types must contribute their secret strings to `CredentialData::secret_material`
   so egress scrubbing covers them, and new config secrets must redact in `Debug`
   (see `OutboxConfig`).
-- **Plugins:** built-in plugins are registered in `src/plugins/mod.rs`; custom
-  credential types/actions ship as WASM plugins (`docs/src/plugins/`).
+- **Plugins:** trusted built-ins are registered in `src/plugins/mod.rs`; untrusted
+  WASM ABI-v2 guests receive only alias/type handles and can implement actions
+  that do not require plaintext until a narrow host capability exists
+  (`docs/src/plugins/`).
