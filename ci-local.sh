@@ -55,6 +55,11 @@ step "cargo test --features mock-govder" cargo test --features mock-govder
 # clippy::type_complexity error sit in the tree while the gate read green.
 step "cargo clippy (default features)"  cargo clippy --all-targets -- -D warnings
 step "cargo clippy (--all-features)"    cargo clippy --all-targets --all-features -- -D warnings
+# Universal, unbounded critical-boundary theorems. `--wfail` makes any
+# placeholder/sorry warning fatal locally; CI additionally checks the produced
+# declarations with the independent nanoda kernel.
+step "Lean critical-boundary proofs" bash -c 'cd formal/lean && lake build --wfail'
+step "Lean independent nanoda check" bash formal/lean/check-nanoda.sh
 
 echo
 printf '\033[34m[ci-local]\033[0m %d passed, %d FAILED\n' "${#PASSED[@]}" "${#FAILED[@]}"

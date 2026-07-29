@@ -6,6 +6,25 @@ on:
   pull_request:
 
 jobs:
+  lean:
+    name: Lean critical-boundary proofs (no sorry)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: formal/lean
+          auto-config: false
+          build: true
+          build-args: --wfail
+          test: false
+          lint: false
+          use-mathlib-cache: false
+          leanchecker: true
+      - name: independently check Lean declarations with pinned nanoda
+        working-directory: formal/lean
+        run: bash ./check-nanoda.sh
+
   rust:
     name: build + test + clippy (zero-warning gate)
     runs-on: ubuntu-latest

@@ -29,6 +29,11 @@ cargo test --features mock-govder --test delegate_approval_integration
 
 # A single test by name substring:
 cargo test test_v13a_
+
+# Universal approval-gating and credential-confinement theorems (Lean 4):
+cd formal/lean
+lake build --wfail
+bash check-nanoda.sh       # slower, independent Rust checker; pinned + cached
 ```
 
 The integration suites and their focus:
@@ -100,7 +105,10 @@ run the same PEP path locally (no server) and are handy for testing a policy.
   the first does not compile the `mock-govder`-only test target, so it cannot lint it, and
   on 2026-07-27 a `clippy::type_complexity` error was sitting in that target while the gate
   read green. Add `cargo fmt` yourself; `ci-local.sh` deliberately runs nothing that
-  rewrites files.
+  rewrites files. It also runs `lake build --wfail` over `formal/lean`; CI repeats that
+  proof check, then exports and checks all declarations with the independently
+  implemented nanoda kernel. Both exporter and checker are full-commit pinned;
+  `sorryAx` is not on nanoda's permitted-axiom list.
   Why the script exists at all: that same day the zero-warning gate was found RED with 11
   errors, of unknown age, because the documented loop was build+test and clippy lived only
   in a workflow no runner executes on the branches the work happens on.
