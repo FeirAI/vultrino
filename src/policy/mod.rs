@@ -100,6 +100,49 @@ struct RateLimitState {
     window_start: Instant,
 }
 
+/// Pure state transition for one request against an already-addressed fixed-
+/// window counter. Production computes the elapsed-window predicate with
+/// `Instant`; formal traces drive this same transition with integer ticks.
+///
+/// `max == 0` is an invalid limiter and therefore denies. Keeping that floor in
+/// the transition makes a malformed policy fail closed even if it came from a
+/// legacy stored record that bypassed current config validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FixedWindowTransition {
+    allowed: bool,
+    next_count: u32,
+    reset_window: bool,
+}
+
+fn fixed_window_transition(count: u32, window_elapsed: bool, max: u32) -> FixedWindowTransition {
+    if max == 0 {
+        return FixedWindowTransition {
+            allowed: false,
+            next_count: count,
+            reset_window: false,
+        };
+    }
+    if window_elapsed {
+        FixedWindowTransition {
+            allowed: true,
+            next_count: 1,
+            reset_window: true,
+        }
+    } else if count < max {
+        FixedWindowTransition {
+            allowed: true,
+            next_count: count + 1,
+            reset_window: false,
+        }
+    } else {
+        FixedWindowTransition {
+            allowed: false,
+            next_count: count,
+            reset_window: false,
+        }
+    }
+}
+
 /// Build the composite key a [`RateLimitState`] is stored under. Keying on the
 /// rule discriminator `(max, window_secs)` AND the credential alias AND the
 /// principal id keeps distinct caps and distinct principals from sharing one
@@ -594,6 +637,11 @@ impl PolicyEngine {
         max: u32,
         window_secs: u64,
     ) -> bool {
+        // Invalid dimensions cannot provide a rate bound. Deny before touching state;
+        // in particular, a zero-length window must not reset-and-admit forever.
+        if max == 0 || window_secs == 0 {
+            return false;
+        }
         let mut limits = self.rate_limits.write();
         let now = Instant::now();
         let window = Duration::from_secs(window_secs);
@@ -610,17 +658,16 @@ impl PolicyEngine {
                 window_start: now,
             });
 
-        // Check if we're in a new window
-        if now.duration_since(state.window_start) >= window {
-            state.count = 1;
+        let transition = fixed_window_transition(
+            state.count,
+            now.duration_since(state.window_start) >= window,
+            max,
+        );
+        state.count = transition.next_count;
+        if transition.reset_window {
             state.window_start = now;
-            true
-        } else if state.count < max {
-            state.count += 1;
-            true
-        } else {
-            false // Rate limit exceeded
         }
+        transition.allowed
     }
 
     /// Record a request for rate limiting.
@@ -766,6 +813,171 @@ fn url_matches(url: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
+
+    const TRACE_TICKS_PER_SECOND: i64 = 1000;
+
+    #[derive(Debug, Clone, Copy, Serialize)]
+    struct TraceState {
+        count: u32,
+        window_start_tick: i64,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct TraceStep {
+        now_tick: i64,
+        allowed: bool,
+        count: u32,
+        window_start_tick: i64,
+        reset_window: bool,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct TraceCase {
+        id: &'static str,
+        max: u32,
+        window_secs: u64,
+        lag_secs: u64,
+        interval_start_tick: i64,
+        interval_end_tick: i64,
+        initial: Option<TraceState>,
+        steps: Vec<TraceStep>,
+        admitted_in_interval: u32,
+        tight_witness: bool,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct TraceFixture {
+        format: &'static str,
+        semantics: &'static str,
+        ticks_per_second: i64,
+        cases: Vec<TraceCase>,
+    }
+
+    fn fixed_window_trace_case(
+        id: &'static str,
+        max: u32,
+        window_secs: u64,
+        lag_secs: u64,
+        initial: Option<TraceState>,
+        request_ticks: &[i64],
+    ) -> TraceCase {
+        let interval_start_tick = 0;
+        let interval_end_tick =
+            i64::try_from(lag_secs).expect("fixture lag fits i64") * TRACE_TICKS_PER_SECOND;
+        let window_ticks =
+            i64::try_from(window_secs).expect("fixture window fits i64") * TRACE_TICKS_PER_SECOND;
+        let mut state = initial;
+        let mut steps = Vec::with_capacity(request_ticks.len());
+        let mut admitted_in_interval = 0;
+
+        for &now_tick in request_ticks {
+            let current = state.get_or_insert(TraceState {
+                count: 0,
+                window_start_tick: now_tick,
+            });
+            assert!(
+                now_tick >= current.window_start_tick,
+                "trace time must be monotone"
+            );
+            let transition = fixed_window_transition(
+                current.count,
+                now_tick - current.window_start_tick >= window_ticks,
+                max,
+            );
+            current.count = transition.next_count;
+            if transition.reset_window {
+                current.window_start_tick = now_tick;
+            }
+            if transition.allowed
+                && now_tick >= interval_start_tick
+                && now_tick <= interval_end_tick
+            {
+                admitted_in_interval += 1;
+            }
+            steps.push(TraceStep {
+                now_tick,
+                allowed: transition.allowed,
+                count: current.count,
+                window_start_tick: current.window_start_tick,
+                reset_window: transition.reset_window,
+            });
+        }
+
+        TraceCase {
+            id,
+            max,
+            window_secs,
+            lag_secs,
+            interval_start_tick,
+            interval_end_tick,
+            initial,
+            steps,
+            admitted_in_interval,
+            tight_witness: true,
+        }
+    }
+
+    fn fixed_window_trace_fixture() -> TraceFixture {
+        let carried = Some(TraceState {
+            count: 1,
+            window_start_tick: -5999,
+        });
+        TraceFixture {
+			format: "vultrino.fixed-window.trace.v1",
+			semantics: "production fixed_window_transition; elapsed iff now-start >= window; invalid dimensions deny",
+			ticks_per_second: TRACE_TICKS_PER_SECOND,
+			cases: vec![
+				fixed_window_trace_case("cold-zero-lag", 3, 6, 0, None, &[0, 0, 0, 0]),
+				fixed_window_trace_case(
+					"subwindow-boundary",
+					3,
+					6,
+					5,
+					carried,
+					&[0, 0, 0, 1, 1, 1, 1],
+				),
+                fixed_window_trace_case(
+                    "exact-window-boundary",
+                    3,
+                    6,
+                    6,
+                    None,
+                    &[0, 0, 0, 0, 6000, 6000, 6000, 6000],
+                ),
+				fixed_window_trace_case(
+					"two-window-boundary",
+					3,
+                    6,
+                    12,
+                    None,
+                    &[
+                        0, 0, 0, 0, 6000, 6000, 6000, 6000, 12000, 12000, 12000, 12000,
+                    ],
+                ),
+			],
+		}
+    }
+
+    #[test]
+    fn fixed_window_trace_fixture_is_generated_by_production_transition() {
+        let generated = serde_json::to_string_pretty(&fixed_window_trace_fixture())
+            .expect("serialize fixed-window trace fixture")
+            + "\n";
+        assert_eq!(
+            generated,
+            include_str!("../../formal/vectors/rate_limiter_traces.json"),
+            "regenerate the shared trace fixture when production limiter semantics change"
+        );
+    }
+
+    #[test]
+    fn invalid_rate_limit_dimensions_deny_without_creating_state() {
+        let engine = PolicyEngine::new();
+        assert!(!engine.check_rate_limit("cred", Some("agent"), 0, 60));
+        assert!(!engine.check_rate_limit("cred", Some("agent"), 1, 0));
+        assert!(engine.rate_limits.read().is_empty());
+    }
 
     fn make_context() -> RequestContext {
         RequestContext::new()

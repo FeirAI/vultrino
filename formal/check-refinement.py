@@ -7,6 +7,7 @@ from silently drifting away from the checked model.
 """
 
 from pathlib import Path
+import hashlib
 import re
 import sys
 
@@ -35,6 +36,7 @@ approval = (ROOT / "src/approval/mod.rs").read_text()
 installer = (ROOT / "src/plugins/installer.rs").read_text()
 main = (ROOT / "src/main.rs").read_text()
 kani_runner = (ROOT / "formal/run-kani.sh").read_text()
+policy = (ROOT / "src/policy/mod.rs").read_text()
 
 if not lib.startswith("#![forbid(unsafe_code)]") or not main.startswith("#![forbid(unsafe_code)]"):
     fail("the library and production CLI must both forbid unsafe Rust")
@@ -123,4 +125,21 @@ missing_harnesses = [name for name in required_kani_harnesses if name not in kan
 if missing_harnesses:
     fail(f"Kani runner dropped required harnesses: {missing_harnesses!r}")
 
-print("refinement check: PASS (8 binding fields; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault sinks confined)")
+for hook in (
+    "fn fixed_window_transition(",
+    "let transition = fixed_window_transition(",
+    "if max == 0 || window_secs == 0",
+    'include_str!("../../formal/vectors/rate_limiter_traces.json")',
+):
+    if hook not in policy:
+        fail(f"fixed-window refinement hook missing: {hook}")
+trace_path = ROOT / "formal/vectors/rate_limiter_traces.json"
+trace_sha256 = hashlib.sha256(trace_path.read_bytes()).hexdigest()
+expected_trace_sha256 = "ab102718048eb7fd40d045daf1e5b1c0ab355361e0b5a7352e4cd7ed0f8b86ec"
+if trace_sha256 != expected_trace_sha256:
+    fail(
+        "Rust-generated fixed-window trace fixture drifted: "
+        f"got {trace_sha256}, want {expected_trace_sha256}"
+    )
+
+print("refinement check: PASS (8 binding fields; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

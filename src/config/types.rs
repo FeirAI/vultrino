@@ -546,7 +546,10 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
                 .filter(|&n| n > 0)
                 .map(std::time::Duration::from_secs)
                 .unwrap_or(d.timeout),
-            grant_ttl_secs: raw.grant_ttl_secs.filter(|&n| n > 0).unwrap_or(d.grant_ttl_secs),
+            grant_ttl_secs: raw
+                .grant_ttl_secs
+                .filter(|&n| n > 0)
+                .unwrap_or(d.grant_ttl_secs),
             max_inflight_seals: raw
                 .max_inflight_seals
                 .filter(|&n| n > 0)
@@ -777,7 +780,7 @@ impl TryFrom<RawPolicy> for Policy {
             }
         };
 
-        Ok(Self {
+        let policy = Self {
             id: uuid::Uuid::new_v4().to_string(),
             name: raw.name,
             credential_pattern: raw.credential_pattern,
@@ -787,7 +790,9 @@ impl TryFrom<RawPolicy> for Policy {
             // Kill policies are installed only at runtime via the halt endpoint,
             // never from static config.
             kill: false,
-        })
+        };
+        policy.validate().map_err(ConfigError::Invalid)?;
+        Ok(policy)
     }
 }
 
@@ -921,6 +926,21 @@ action = "deny"
         assert_eq!(config.policies.len(), 1);
         assert_eq!(config.policies[0].name, "github-readonly");
         assert_eq!(config.policies[0].rules.len(), 2);
+    }
+
+    #[test]
+    fn test_static_config_rejects_zero_rate_limit_dimensions() {
+        for rate_limit in ["max = 0, window_secs = 60", "max = 1, window_secs = 0"] {
+            let source = format!(
+				"[[policies]]\nname = \"invalid-rate\"\ncredential_pattern = \"*\"\n\
+                 [[policies.rules]]\ncondition = {{ rate_limit = {{ {rate_limit} }} }}\naction = \"allow\""
+			);
+            let error =
+                Config::parse(&source).expect_err("zero RateLimit dimensions must fail closed");
+            assert!(error
+                .to_string()
+                .contains("RateLimit max and window_secs must both be > 0"));
+        }
     }
 
     #[test]
@@ -1257,7 +1277,12 @@ action = "deny"
         // Absent [averin] (or a present block that never sets `durable`) → false, the
         // byte-identical-to-087 default.
         assert!(!Config::parse("").unwrap().averin.durable);
-        assert!(!Config::parse("[averin]\nenabled = true").unwrap().averin.durable);
+        assert!(
+            !Config::parse("[averin]\nenabled = true")
+                .unwrap()
+                .averin
+                .durable
+        );
         // Explicit durable = true (with the default Observe mode) parses fine.
         let cfg = Config::parse(
             "[averin]\nenabled = true\nbase_url = \"http://x\"\nresource_id = \"r\"\ndurable = true",

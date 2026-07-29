@@ -190,6 +190,8 @@ impl Policy {
     /// - a policy that uses a `SpendCap` rule must be fail-closed
     ///   (`default_action = deny`), so an over-cap or unparseable request falls
     ///   through to deny rather than being allowed.
+    /// - every `RateLimit`, including nested limits, must have `max > 0` and
+    ///   `window_secs > 0`; zero dimensions cannot establish a finite bound.
     pub fn validate(&self) -> Result<(), String> {
         let mut uses_spend_cap = false;
         for rule in &self.rules {
@@ -229,6 +231,12 @@ impl Policy {
                     self.name, start, end
                 ));
             }
+            if let Some((max, window_secs)) = condition_invalid_rate_limit(&rule.condition) {
+                return Err(format!(
+                    "policy '{}': RateLimit max and window_secs must both be > 0 (got max={}, window_secs={})",
+                    self.name, max, window_secs
+                ));
+            }
         }
         if uses_spend_cap && self.default_action != PolicyAction::Deny {
             return Err(format!(
@@ -237,6 +245,21 @@ impl Policy {
             ));
         }
         Ok(())
+    }
+}
+
+/// Find an invalid RateLimit anywhere in a condition tree. RateLimit is valid
+/// inside `And`/`Or`/`Not`, so validation recurses rather than banning nesting.
+fn condition_invalid_rate_limit(c: &PolicyCondition) -> Option<(u32, u64)> {
+    match c {
+        PolicyCondition::RateLimit { max, window_secs } if *max == 0 || *window_secs == 0 => {
+            Some((*max, *window_secs))
+        }
+        PolicyCondition::And(cs) | PolicyCondition::Or(cs) => {
+            cs.iter().find_map(condition_invalid_rate_limit)
+        }
+        PolicyCondition::Not(inner) => condition_invalid_rate_limit(inner),
+        _ => None,
     }
 }
 
@@ -359,5 +382,26 @@ mod tests {
 
         assert_eq!(parsed.id, policy.id);
         assert_eq!(parsed.name, policy.name);
+    }
+
+    #[test]
+    fn test_policy_rejects_zero_rate_limit_dimensions_at_any_depth() {
+        for condition in [
+            PolicyCondition::RateLimit {
+                max: 0,
+                window_secs: 60,
+            },
+            PolicyCondition::And(vec![PolicyCondition::RateLimit {
+                max: 1,
+                window_secs: 0,
+            }]),
+        ] {
+            let policy =
+                Policy::deny_all("invalid-rate", "*").with_rule(condition, PolicyAction::Allow);
+            let error = policy
+                .validate()
+                .expect_err("zero dimensions must fail closed");
+            assert!(error.contains("RateLimit max and window_secs must both be > 0"));
+        }
     }
 }

@@ -1,0 +1,279 @@
+{
+  "format": "vultrino.fixed-window.trace.v1",
+  "semantics": "production fixed_window_transition; elapsed iff now-start >= window; invalid dimensions deny",
+  "ticks_per_second": 1000,
+  "cases": [
+    {
+      "id": "cold-zero-lag",
+      "max": 3,
+      "window_secs": 6,
+      "lag_secs": 0,
+      "interval_start_tick": 0,
+      "interval_end_tick": 0,
+      "initial": null,
+      "steps": [
+        {
+          "now_tick": 0,
+          "allowed": true,
+          "count": 1,
+          "window_start_tick": 0,
+          "reset_window": false
+        },
+        {
+          "now_tick": 0,
+          "allowed": true,
+          "count": 2,
+          "window_start_tick": 0,
+          "reset_window": false
+        },
+        {
+          "now_tick": 0,
+          "allowed": true,
+          "count": 3,
+          "window_start_tick": 0,
+          "reset_window": false
+        },
+        {
+          "now_tick": 0,
+          "allowed": false,
+          "count": 3,
+          "window_start_tick": 0,
+          "reset_window": false
+        }
+      ],
+      "admitted_in_interval": 3,
+      "tight_witness": true
+    },
+    {
+      "id": "subwindow-boundary",
+      "max": 3,
+      "window_secs": 6,
+      "lag_secs": 5,
+      "interval_start_tick": 0,
+      "interval_end_tick": 5000,
+      "initial": {
+        "count": 1,
+        "window_start_tick": -5999
+      },
+      "steps": [
+        {
+          "now_tick": 0,
+          "allowed": true,
+          "count": 2,
+          "window_start_tick": -5999,
+          "reset_window": false
+        },
+        {
+          "now_tick": 0,
+          "allowed": true,
+          "count": 3,
+          "window_start_tick": -5999,
+          "reset_window": false
+        },
+        {
+          "now_tick": 0,
+          "allowed": false,
+          "count": 3,
+          "window_start_tick": -5999,
+          "reset_window": false
+        },
+        {
+          "now_tick": 1,
+          "allowed": true,
+          "count": 1,
+          "window_start_tick": 1,
+          "reset_window": true
+        },
+        {
+          "now_tick": 1,
+          "allowed": true,
+          "count": 2,
+          "window_start_tick": 1,
+          "reset_window": false
+        },
+        {
+          "now_tick": 1,
+          "allowed": true,
+          "count": 3,
+          "window_start_tick": 1,
+          "reset_window": false
+        },
+        {
+          "now_tick": 1,
+          "allowed": false,
+          "count": 3,
+          "window_start_tick": 1,
+          "reset_window": false
+        }
+      ],
+      "admitted_in_interval": 5,
+      "tight_witness": true
+    },
+    {
+      "id": "exact-window-boundary",
+      "max": 3,
+      "window_secs": 6,
+      "lag_secs": 6,
+      "interval_start_tick": 0,
+      "interval_end_tick": 6000,
+      "initial": null,
+      "steps": [
+        {
+          "now_tick": 0,
+          "allowed": true,
+          "count": 1,
+          "window_start_tick": 0,
+          "reset_window": false
+        },
+        {
+          "now_tick": 0,
+          "allowed": true,
+          "count": 2,
+          "window_start_tick": 0,
+          "reset_window": false
+        },
+        {
+          "now_tick": 0,
+          "allowed": true,
+          "count": 3,
+          "window_start_tick": 0,
+          "reset_window": false
+        },
+        {
+          "now_tick": 0,
+          "allowed": false,
+          "count": 3,
+          "window_start_tick": 0,
+          "reset_window": false
+        },
+        {
+          "now_tick": 6000,
+          "allowed": true,
+          "count": 1,
+          "window_start_tick": 6000,
+          "reset_window": true
+        },
+        {
+          "now_tick": 6000,
+          "allowed": true,
+          "count": 2,
+          "window_start_tick": 6000,
+          "reset_window": false
+        },
+        {
+          "now_tick": 6000,
+          "allowed": true,
+          "count": 3,
+          "window_start_tick": 6000,
+          "reset_window": false
+        },
+        {
+          "now_tick": 6000,
+          "allowed": false,
+          "count": 3,
+          "window_start_tick": 6000,
+          "reset_window": false
+        }
+      ],
+      "admitted_in_interval": 6,
+      "tight_witness": true
+    },
+    {
+      "id": "two-window-boundary",
+      "max": 3,
+      "window_secs": 6,
+      "lag_secs": 12,
+      "interval_start_tick": 0,
+      "interval_end_tick": 12000,
+      "initial": null,
+      "steps": [
+        {
+          "now_tick": 0,
+          "allowed": true,
+          "count": 1,
+          "window_start_tick": 0,
+          "reset_window": false
+        },
+        {
+          "now_tick": 0,
+          "allowed": true,
+          "count": 2,
+          "window_start_tick": 0,
+          "reset_window": false
+        },
+        {
+          "now_tick": 0,
+          "allowed": true,
+          "count": 3,
+          "window_start_tick": 0,
+          "reset_window": false
+        },
+        {
+          "now_tick": 0,
+          "allowed": false,
+          "count": 3,
+          "window_start_tick": 0,
+          "reset_window": false
+        },
+        {
+          "now_tick": 6000,
+          "allowed": true,
+          "count": 1,
+          "window_start_tick": 6000,
+          "reset_window": true
+        },
+        {
+          "now_tick": 6000,
+          "allowed": true,
+          "count": 2,
+          "window_start_tick": 6000,
+          "reset_window": false
+        },
+        {
+          "now_tick": 6000,
+          "allowed": true,
+          "count": 3,
+          "window_start_tick": 6000,
+          "reset_window": false
+        },
+        {
+          "now_tick": 6000,
+          "allowed": false,
+          "count": 3,
+          "window_start_tick": 6000,
+          "reset_window": false
+        },
+        {
+          "now_tick": 12000,
+          "allowed": true,
+          "count": 1,
+          "window_start_tick": 12000,
+          "reset_window": true
+        },
+        {
+          "now_tick": 12000,
+          "allowed": true,
+          "count": 2,
+          "window_start_tick": 12000,
+          "reset_window": false
+        },
+        {
+          "now_tick": 12000,
+          "allowed": true,
+          "count": 3,
+          "window_start_tick": 12000,
+          "reset_window": false
+        },
+        {
+          "now_tick": 12000,
+          "allowed": false,
+          "count": 3,
+          "window_start_tick": 12000,
+          "reset_window": false
+        }
+      ],
+      "admitted_in_interval": 9,
+      "tight_witness": true
+    }
+  ]
+}
