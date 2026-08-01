@@ -2760,7 +2760,7 @@ async fn test_a3_a4_json_approvals_list_and_decision() {
             "POST",
             &format!("/api/v1/approvals/{}/decision", id),
             &key,
-            serde_json::json!({"approve": false}),
+            serde_json::json!({"approve": false, "approver": "alice@example.com"}),
         ))
         .await
         .unwrap();
@@ -2772,7 +2772,7 @@ async fn test_a3_a4_json_approvals_list_and_decision() {
             "POST",
             "/api/v1/approvals/appr_does_not_exist/decision",
             &key,
-            serde_json::json!({"approve": true}),
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
         ))
         .await
         .unwrap();
@@ -2867,7 +2867,7 @@ async fn test_a4_decision_enforces_tenant_partition() {
             "POST",
             &format!("/api/v1/approvals/{}/decision", b_id),
             &admin_key_plain,
-            serde_json::json!({"approve": true}),
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
         ))
         .await
         .unwrap();
@@ -2889,7 +2889,7 @@ async fn test_a4_decision_enforces_tenant_partition() {
             "POST",
             &format!("/api/v1/approvals/{}/decision", shared_id),
             &admin_key_plain,
-            serde_json::json!({"approve": true}),
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
         ))
         .await
         .unwrap();
@@ -3421,15 +3421,12 @@ async fn build_hard_sod_dual_control_fixture(
 }
 
 #[tokio::test]
-async fn test_json_decision_hard_sod_blocks_same_key_no_operator_then_operator() {
-    // [HIGH regression] One key must not satisfy 2-of-N by MIXING a no-`approver`
-    // call (recorded `agg:<key>:-`) with an `approver` call (recorded
-    // `agg:<key>:op`). Before the fix the no-approver call recorded the BARE key
-    // id, which neither prefix-based guard recognized → bypass. Now both share the
-    // `agg:<key>:` prefix, so the second is rejected and the request stays Pending.
+async fn test_json_decision_rejects_missing_operator_before_any_slot() {
+    // An unnamed bearer-key holder is not a human approver. Missing and blank
+    // identities fail before transition and therefore occupy zero recipe slots.
     let (router, storage, key, id) = build_hard_sod_dual_control_fixture("team-a").await;
 
-    // (1) no operator → recorded agg:<key>:- , 1 of 2, still Pending.
+    // (1) missing operator → 400 and zero sign-offs.
     let resp = router
         .clone()
         .oneshot(admin_req(
@@ -3440,15 +3437,30 @@ async fn test_json_decision_hard_sod_blocks_same_key_no_operator_then_operator()
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(
-        body["status"], "pending",
-        "first (no-operator) sign-off keeps it open"
-    );
-    assert_eq!(body["approvals_received"], 1);
+    assert_eq!(body["code"], "missing_approver_identity");
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert!(stored.signoffs().is_empty(), "missing identity records no slot");
 
-    // (2) same key, now WITH an operator → must be rejected 409, NOT granted.
+    // (2) whitespace-only operator is the same invalid identity.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "  \t "}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "missing_approver_identity");
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert!(stored.signoffs().is_empty(), "blank identity records no slot");
+
+    // (3) a named operator can contribute the first slot normally.
     let resp = router
         .oneshot(admin_req(
             "POST",
@@ -3458,19 +3470,16 @@ async fn test_json_decision_hard_sod_blocks_same_key_no_operator_then_operator()
         ))
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CONFLICT,
-        "no-operator-then-operator from one key must NOT satisfy 2-of-N",
-    );
+    assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["code"], "separation_of_duty");
+    assert_eq!(body["status"], "pending");
+    assert_eq!(body["approvals_received"], 1);
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
     assert_eq!(
         stored.signoffs().len(),
         1,
-        "the second same-key sign-off was not recorded"
+        "only the named operator occupies a slot"
     );
 }
 
@@ -3620,7 +3629,7 @@ async fn test_json_decision_recipe_hard_sod_senior_pair_one_key_409() {
 }
 
 #[tokio::test]
-async fn test_verified_broker_assertion_allows_two_bound_subjects_on_one_key() {
+async fn test_verified_broker_assertion_requires_named_and_allows_two_bound_subjects() {
     let rule = ApprovalRule {
         recipes: vec![Recipe {
             terms: vec![RecipeTerm {
@@ -3633,6 +3642,33 @@ async fn test_verified_broker_assertion_allows_two_bound_subjects_on_one_key() {
     let (router, storage, key, id) =
         build_hard_sod_recipe_fixture("team-a", rule, "High").await;
     let uri = format!("/api/v1/approvals/{id}/decision");
+
+    // A valid MAC authenticates the exact bytes, but cannot turn an unnamed
+    // subject into a principal. The named-subject premise remains independent.
+    let blank = serde_json::json!({
+        "approve": true,
+        "approver": "  ",
+        "approver_class": "teammate",
+    });
+    let response = router
+        .clone()
+        .oneshot(signed_admin_decision_req(
+            &uri,
+            &key,
+            "team-a",
+            blank.clone(),
+            blank,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["code"], "missing_approver_identity");
+    let after_blank = storage.get_approval(&id).await.unwrap().unwrap();
+    assert!(
+        after_blank.signoffs().is_empty(),
+        "a signed but unnamed subject records no sign-off"
+    );
 
     let alice = serde_json::json!({
         "approve": true,
@@ -4064,13 +4100,8 @@ async fn test_json_decision_recipe_hard_sod_two_distinct_keys_allowed() {
 }
 
 #[tokio::test]
-async fn test_json_decision_hard_sod_blocks_same_key_operator_then_no_operator() {
-    // [HIGH regression] The reverse ordering: an `approver` call first, then a
-    // no-`approver` call (the sentinel) from the same key. Both must count as ONE
-    // key — the second is rejected. Also exercises the AUTHORITATIVE in-lock guard:
-    // the second decision still goes through transition() (which re-checks under
-    // the storage lock), so even if the API fast-fail were bypassed it can't
-    // double-sign.
+async fn test_json_decision_rejects_missing_operator_after_named_signoff() {
+    // A missing identity cannot add a slot even after a legitimate named signoff.
     let (router, storage, key, id) = build_hard_sod_dual_control_fixture("team-a").await;
 
     // (1) with operator → recorded agg:<key>:alice@ , 1 of 2, Pending.
@@ -4089,7 +4120,7 @@ async fn test_json_decision_hard_sod_blocks_same_key_operator_then_no_operator()
     assert_eq!(body["status"], "pending");
     assert_eq!(body["approvals_received"], 1);
 
-    // (2) same key, NO operator (sentinel) → rejected 409, stays Pending.
+    // (2) same key, NO operator → rejected 400 before transition, stays Pending.
     let resp = router
         .oneshot(admin_req(
             "POST",
@@ -4099,17 +4130,15 @@ async fn test_json_decision_hard_sod_blocks_same_key_operator_then_no_operator()
         ))
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CONFLICT,
-        "operator-then-no-operator from one key must NOT satisfy 2-of-N",
-    );
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "missing_approver_identity");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
     assert_eq!(
         stored.signoffs().len(),
         1,
-        "the second same-key sign-off was not recorded"
+        "the unnamed request recorded no second sign-off"
     );
 }
 

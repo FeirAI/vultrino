@@ -651,8 +651,8 @@ fn every_honestly_granted_request_re_derives() {
 /// principal fills a recipe slot**: a direct non-substitution (obligation X)
 /// violation, in a system whose class guarantees are otherwise at rung 1.
 ///
-/// No shipped entry point produces that shape today (`web/api.rs` substitutes
-/// `NO_OPERATOR_SENTINEL`, the admin panel uses the session user, the OOB link
+/// No shipped entry point produces that shape today (`web/api.rs` rejects an
+/// absent/blank operator, the admin panel uses the session user, the OOB link
 /// filters non-empty, the CLI uses `cli:<user>`). But `Signoff` deserializes from
 /// the vault with **no** identity validation, so the shape is reachable through
 /// exactly the boundary V3 names — and "unreachable today, by convention, in four

@@ -52,6 +52,7 @@ inductive IdentityEvidence where
       (received : DecisionBinding)
       (now maxTtl : Instant)
       (valid : evidence.validFor received now maxTtl)
+      (named : received.subject ≠ "")
 
 /-- A verified broker decision has exactly the tenant, approval, outcome,
 subject, class, route, host, and body digest that were MAC-bound. -/
@@ -91,7 +92,7 @@ same key are independently authenticated. Code must keep such identities in the
 `agg:<key>:` namespace and apply the one-positive-slot-per-key guard. -/
 def independentlyAuthenticated : IdentityEvidence → Prop
   | .aggregatorClaim _ _ => False
-  | .verifiedBroker _ _ _ _ _ => True
+  | .verifiedBroker _ _ _ _ _ _ => True
 
 theorem aggregator_claim_is_not_independent (apiKey subject : String) :
     ¬ independentlyAuthenticated (.aggregatorClaim apiKey subject) := by
@@ -101,9 +102,24 @@ theorem verified_broker_claim_is_independent
     {evidence : AssertionEvidence}
     {received : DecisionBinding}
     {now maxTtl : Instant}
-    (valid : evidence.validFor received now maxTtl) :
+    (valid : evidence.validFor received now maxTtl)
+    (named : received.subject ≠ "") :
     independentlyAuthenticated
-      (.verifiedBroker evidence received now maxTtl valid) := by
+      (.verifiedBroker evidence received now maxTtl valid named) := by
   simp [independentlyAuthenticated]
+
+/-- A verified broker identity carries the non-blank-subject premise required by
+the JSON approval boundary. Runtime validation trims before constructing the
+identity, so this proposition is about that canonical post-trim subject. -/
+theorem verified_broker_claim_is_named
+    {evidence : AssertionEvidence}
+    {received : DecisionBinding}
+    {now maxTtl : Instant}
+    (valid : evidence.validFor received now maxTtl)
+    (named : received.subject ≠ "") :
+    independentlyAuthenticated
+        (.verifiedBroker evidence received now maxTtl valid named) ∧
+      received.subject ≠ "" := by
+  exact ⟨verified_broker_claim_is_independent valid named, named⟩
 
 end Vultrino.Approval.Authority

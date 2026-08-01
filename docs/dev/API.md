@@ -386,7 +386,10 @@ Mints keep at-most-once because their plaintext is shown exactly once.
 ### `POST /api/v1/approvals/{id}/decision` — approve or deny over JSON (admin `vk_`)
 
 The JSON counterpart to the HTML console decision (A4), for the per-tenant product
-aggregator. Authenticate with an admin `vk_` key. Body: `{ "approve": true|false, "note": "…" }`.
+aggregator. Authenticate with an admin `vk_` key. Body:
+`{ "approve": true|false, "approver": "subject", "note": "…" }`. `approver` is
+required and must remain non-blank after trimming; an absent or blank identity
+returns `400 missing_approver_identity` before any sign-off is recorded.
 
 The feir-os broker additionally sends `approver` (its immutable authenticated
 ticket subject) and `approver_class`, plus an `X-Govder-Tenant-Assertion` signed

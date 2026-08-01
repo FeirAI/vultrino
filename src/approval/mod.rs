@@ -1899,9 +1899,9 @@ fn approval_rule_satisfied(rule: &ApprovalRule, signoffs: &[Signoff]) -> bool {
         // string, so it survived the drop — and `dedupe_by_identity` then filed it
         // under the bare key `""`, so an UNNAMED principal filled a recipe slot.
         // That is a direct obligation-X (non-substitution) violation. No shipped
-        // entry point produces the shape (`web/api.rs` substitutes
-        // `NO_OPERATOR_SENTINEL`, the panel uses the session user, the OOB link
-        // filters non-empty, the CLI stamps `cli:<user>`), but `Signoff`
+        // entry point produces the shape (`web/api.rs` rejects an absent/blank
+        // operator, the panel uses the session user, the OOB link filters
+        // non-empty, the CLI stamps `cli:<user>`), but `Signoff`
         // deserializes from the vault with no identity validation at all, so it is
         // reachable across the persistence boundary — and "unreachable by
         // convention in four places" is exactly the reasoning this codebase has

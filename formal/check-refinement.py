@@ -114,11 +114,22 @@ for hook in (
     "original_uri.query().unwrap_or(\"\")",
     "&body_bytes",
     "govder.assertion_ttl.min(MAX_BROKER_ASSERTION_TTL)",
-    "verified_broker_assertion && operator != NO_OPERATOR_SENTINEL",
+    '"missing_approver_identity"',
+    "let approver = if verified_broker_assertion",
     "VERIFIED_IDENTITY_PREFIX",
 ):
     if hook not in api and hook not in approval:
         fail(f"broker approval assertion refinement hook missing: {hook!r}")
+missing_identity_guard = api.find('"missing_approver_identity"')
+identity_namespace = api.find("let approver = if verified_broker_assertion")
+approval_transition = api.find(".decide_approval(", identity_namespace)
+if (
+    missing_identity_guard < 0
+    or identity_namespace < 0
+    or approval_transition < 0
+    or not missing_identity_guard < identity_namespace < approval_transition
+):
+    fail("non-blank approval identity guard must precede namespacing and transition")
 for hook in (
     "tenant.as_slice() != expected_tenant.as_bytes()",
     "remaining < 0",
@@ -131,6 +142,8 @@ for theorem in (
     "verified_broker_identity_is_exact",
     "changed_binding_rejected",
     "aggregator_claim_is_not_independent",
+    "verified_broker_claim_is_independent",
+    "verified_broker_claim_is_named",
 ):
     if f"theorem {theorem}" not in authority_lean:
         fail(f"Lean approval authority theorem missing: {theorem}")
@@ -172,4 +185,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: PASS (8 execution binding fields; exact-bound broker approval authority; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

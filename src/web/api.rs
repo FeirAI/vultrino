@@ -665,14 +665,6 @@ pub struct ApprovalsQuery {
 /// pagination.
 const MAX_APPROVALS_LIST: usize = 500;
 
-/// Sentinel operator recorded when the aggregator supplies no `approver` on a JSON
-/// decision, so the identity is STILL namespaced as `agg:<key-id>:-` (never the
-/// bare key id). This keeps every signoff from one key under the same
-/// `agg:<key-id>:` prefix the same-key M-of-N guards key on. `-` can't be a real
-/// operator (no owner email is `-`), so it never collides with a requester
-/// identity in the self-approval SoD check.
-const NO_OPERATOR_SENTINEL: &str = "-";
-
 /// Existing cross-plane assertion wire, reused for broker-authenticated approval
 /// identity. The assertion binds the exact decision route and raw JSON bytes, so
 /// Vultrino may distinguish two verified subjects behind one broker key without
@@ -876,9 +868,9 @@ pub struct DecideReq {
     /// Optional free-text note recorded with the decision.
     #[serde(default)]
     pub note: Option<String>,
-    /// The human operator the aggregator attributes this decision to (their
-    /// email/sub). Used as the approver identity so separation-of-duty stays
-    /// meaningful; falls back to the acting api-key id when absent/blank.
+    /// The non-blank human operator the aggregator attributes this decision to
+    /// (their email/sub). Required so an unnamed principal can never occupy an
+    /// approval slot.
     #[serde(default)]
     pub approver: Option<String>,
     /// Resolved approver class for approval-recipe satisfaction (plan 100 P2 Phase
@@ -1009,6 +1001,27 @@ pub async fn api_decide_approval(
         }
     };
 
+    // An approval is a human-authority transition, so a bearer key by itself is
+    // never an approver. Reject absent and whitespace-only identities before any
+    // approval lookup or state transition. Signed broker calls bind this exact
+    // post-trim subject in the raw body; unsigned legacy calls remain explicit
+    // aggregator claims, but must still name the claimed operator.
+    let operator = match body
+        .approver
+        .as_deref()
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+    {
+        Some(subject) => subject,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing_approver_identity",
+                "Approval decision requires a non-blank approver identity",
+            )
+        }
+    };
+
     // Reload so the existence/visibility check sees the authoritative state.
     let _ = state.storage.reload().await;
 
@@ -1039,25 +1052,12 @@ pub async fn api_decide_approval(
 
     // Unsigned legacy calls remain AGGREGATOR-ASSERTED identities and retain the
     // hard one-positive-slot-per-key guard. A valid request-bound assertion
-    // upgrades only a non-empty operator to `verified:<subject>`: its tenant,
-    // approval id, outcome, subject, and class are all covered by the MAC. This is
-    // what lets a single broker transport two independently authenticated humans
-    // without letting its bearer API key fabricate two caller-supplied strings.
-    //
-    // SECURITY: the namespace MUST be applied unconditionally. When no operator is
-    // supplied we use a sentinel (`agg:<key-id>:-`) rather than the bare key id —
-    // a bare `<key-id>` would NOT carry the `agg:<key-id>:` prefix, so both same-
-    // key M-of-N guards (prefix-based) would fail to recognize it and one key
-    // could satisfy a 2-of-N by mixing a no-approver call with an approver call.
-    // The sentinel `-` can never collide with a requester identity (no owner email
-    // is `-`), so it doesn't spuriously trip the self-approval SoD check either.
-    let operator = body
-        .approver
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(NO_OPERATOR_SENTINEL);
-    let approver = if verified_broker_assertion && operator != NO_OPERATOR_SENTINEL {
+    // upgrades the required, non-blank operator to `verified:<subject>`: its
+    // tenant, approval id, outcome, subject, and class are all covered by the
+    // MAC. This lets a single broker transport two independently authenticated
+    // humans without letting its bearer API key fabricate two caller-supplied
+    // strings.
+    let approver = if verified_broker_assertion {
         format!("{}{}", crate::approval::VERIFIED_IDENTITY_PREFIX, operator)
     } else {
         format!("agg:{}:{}", admin.0.api_key.id, operator)
