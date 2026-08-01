@@ -269,8 +269,21 @@ if "capability_authority: Option<CapabilityAuthorityClass>" not in approval:
     fail("persisted approvals lost the private catalog authority snapshot")
 if "gate_rule_authority: Option<GateRuleAuthorityClass>" not in approval:
     fail("persisted approvals lost the private recipe authority snapshot")
+if "credential_authority: Option<CredentialAuthority>" not in approval:
+    fail("persisted approvals lost the exact credential-revision snapshot")
+for hook in (
+    "id: credential.id.clone()",
+    "credential_type: credential.credential_type.clone()",
+    "created_at: credential.created_at",
+    "updated_at: credential.updated_at",
+    '.metadata\n                .get("tenant")',
+):
+    if hook not in approval:
+        fail(f"credential authority no longer freezes {hook!r}")
 if "approval.bind_gate_rule_authority(gate_rule_authority);" not in server:
     fail("approval-open no longer freezes Govder recipe authority")
+if "approval.bind_credential_authority(CredentialAuthority::from_credential(&credential));" not in server:
+    fail("approval-open no longer freezes the exact credential revision")
 strict_recipe_refusal = server.find(
     "self.config.enforcement.require_declared_capabilities\n                        || trusted_irreversible"
 )
@@ -282,6 +295,13 @@ if min(strict_recipe_refusal, recipe_authority_bind) < 0 or not (
 ):
     fail("strict inconclusive-recipe refusal must precede approval persistence")
 resume = server.find("async fn resume_approved(")
+resume_credential = server.find(
+    "let current_credential_authority = CredentialAuthority::from_credential(&credential);",
+    resume,
+)
+resume_credential_guard = server.find(
+    "if !credential_authority_current || !tenant_still_authorized", resume_credential
+)
 resume_catalog = server.find("let current_capability_authority = self", resume)
 resume_recipe = server.find("let current_gate_rule = self", resume_catalog)
 resume_recipe_guard = server.find(
@@ -291,6 +311,8 @@ resume_policy = server.find("evaluate_readonly_full", resume_recipe_guard)
 resume_permit = server.find("ExecutionPermit::approved", resume_policy)
 if min(
     resume,
+    resume_credential,
+    resume_credential_guard,
     resume_catalog,
     resume_recipe,
     resume_recipe_guard,
@@ -298,13 +320,19 @@ if min(
     resume_permit,
 ) < 0 or not (
     resume
+    < resume_credential
+    < resume_credential_guard
     < resume_catalog
     < resume_recipe
     < resume_recipe_guard
     < resume_policy
     < resume_permit
 ):
-    fail("approval resume must revalidate catalog and recipe authority before policy and permit issuance")
+    fail("approval resume must revalidate credential, catalog, and recipe authority before policy and permit issuance")
+if ".credential_authority()\n            .is_some_and(" not in server:
+    fail("missing legacy credential authority no longer refuses in every posture")
+if "crate::approval::tenant_may_act(" not in server[resume:resume_catalog]:
+    fail("approval resume no longer rechecks current credential tenant authority")
 label_lookup = server.find("async fn resolve_irreversibility_for_action(")
 label_miss = server.find("return IrreversibilityResolution::Undeclared;", label_lookup)
 canonical_ambiguity = server.find(
@@ -349,6 +377,14 @@ for theorem in (
 ):
     if f"theorem {theorem}" not in criticality_lean:
         fail(f"Lean criticality-gating theorem missing: {theorem}")
+for theorem in (
+    "missing_credential_authority_refuses_resume",
+    "changed_credential_authority_refuses_resume",
+    "credential_resume_implies_same_authority",
+    "credential_resume_preserves_tenant_authority",
+):
+    if f"theorem {theorem}" not in action_authority_lean:
+        fail(f"Lean credential-authority theorem missing: {theorem}")
 for test in (
     "declared_irreversible_capability_cannot_take_the_direct_path",
     "disabled_approvals_refuse_declared_irreversible_capability",
@@ -356,6 +392,10 @@ for test in (
     "strict_catalog_refuses_label_that_only_matches_a_canonical_sibling",
     "strict_catalog_refuses_declaration_for_different_credential",
     "approval_resume_refuses_changed_capability_authority",
+    "approval_resume_refuses_recreated_credential_with_same_alias",
+    "approval_resume_refuses_changed_credential_tenant_revision",
+    "approval_resume_refuses_missing_legacy_credential_authority",
+    "approval_resume_accepts_unchanged_credential_revision",
     "shared_canonical_alias_cannot_take_the_direct_path",
     "exact_labels_and_previews_never_borrow_canonical_siblings",
 ):
@@ -541,4 +581,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; credential-bound criticality with open-to-resume catalog continuity; conclusive production recipe authority with exact open-to-resume continuity; declared human-floor capabilities cannot dispatch directly; fail-closed canonical action aliases; operator-pinned internal HTTP method; startup-validated policy/workload secrets; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; exact credential-revision/tenant continuity; credential-bound criticality with open-to-resume catalog continuity; conclusive production recipe authority with exact open-to-resume continuity; declared human-floor capabilities cannot dispatch directly; fail-closed canonical action aliases; operator-pinned internal HTTP method; startup-validated policy/workload secrets; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

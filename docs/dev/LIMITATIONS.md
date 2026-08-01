@@ -208,11 +208,16 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   `deny_unknown_fields`). The check exists one plane over, in feir-os's
   `orgpack validate` (`capability-schema-uninvokable`), and only for org packs — a
   capability registered by any other client is unchecked.
-- **Resume does not re-check tenant isolation or the observe downgrade.**
-  Cross-tenant isolation is enforced at open time (a cross-tenant request can't
-  create an approval); a credential whose `tenant` tag changes *between* approval
-  and resume is not re-validated (a narrow operator-action window — push a
-  Deny/halt to stop an in-flight approval, which resume does honor).
+- **Resume intentionally does not reproduce the observe downgrade.** An
+  observe-tenant action that is both policy-denied and approval-gated is enforced
+  rather than observed-away when it resumes—a safe over-block, not an authority
+  bypass. Credential identity and tenant isolation are revalidated separately:
+  the concrete record revision is frozen at open and must still match, and the
+  opener must remain authorized for its tenant.
+
+- **Legacy approvals without a credential-revision snapshot cannot execute.**
+  They remain readable for diagnosis, but alias equality cannot prove which
+  credential a human reviewed. Re-open them against the current credential.
 
 ## Non-goals (out of scope for this plane)
 

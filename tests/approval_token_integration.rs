@@ -635,6 +635,235 @@ async fn approval_resume_refuses_changed_capability_authority() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
+/// An approval authorizes the concrete credential record resolved at open, not
+/// whichever record later happens to reuse the same human-friendly alias.
+#[tokio::test]
+async fn approval_resume_refuses_recreated_credential_with_same_alias() {
+    let (server, storage) = setup().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    store_credential(&storage, "replaceable-cred", true).await;
+    set_count_capability_reversibility_for_credential(
+        &storage,
+        "count.run",
+        "replaceable-cred",
+        "reversible",
+    )
+    .await;
+
+    let approval = match server
+        .execute_gated(count_request("replaceable-cred"), ExecAuth::default())
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(approval) => approval,
+        ExecutionOutcome::Completed(_) => panic!("expected pending approval"),
+    };
+    let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    stored
+        .approve(Decision::new("admin panel", "secops"))
+        .unwrap();
+    storage.update_approval(&stored).await.unwrap();
+
+    let old = storage
+        .get_by_alias("replaceable-cred")
+        .await
+        .unwrap()
+        .unwrap();
+    storage.delete(&old.id).await.unwrap();
+    // Same alias and action declaration, but a different storage identity and
+    // secret. Alias-only binding would execute this replacement.
+    let replacement = Credential::new(
+        "replaceable-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("different-secret"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    );
+    storage.store(&replacement).await.unwrap();
+
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed, "stale credential authority is terminal");
+    assert!(resumed
+        .result_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("credential revision or tenant authority"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Tenant/routing metadata is part of credential authority. Moving a record to
+/// another tenant after approval must not reuse the earlier decision.
+#[tokio::test]
+async fn approval_resume_refuses_changed_credential_tenant_revision() {
+    let (server, storage) = setup().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    let credential = Credential::new(
+        "tenant-bound-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("tenant-secret"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    )
+    .with_metadata("tenant", "team-a");
+    storage.store(&credential).await.unwrap();
+    set_count_capability_reversibility_for_credential(
+        &storage,
+        "count.run",
+        "tenant-bound-cred",
+        "reversible",
+    )
+    .await;
+
+    let mut token = tenant_token("team-a");
+    token.credential_scope = "tenant-bound-cred".to_string();
+    token.action_scope = Some("count.run".to_string());
+    token.require_approval = true;
+    storage.store_use_token(&token).await.unwrap();
+    let approval = match server
+        .execute_gated(
+            count_request("tenant-bound-cred"),
+            ExecAuth::from_use_token(token),
+        )
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(approval) => approval,
+        ExecutionOutcome::Completed(_) => panic!("expected pending approval"),
+    };
+    let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    stored
+        .approve(Decision::new("admin panel", "secops"))
+        .unwrap();
+    storage.update_approval(&stored).await.unwrap();
+
+    let mut moved = storage
+        .get_by_alias("tenant-bound-cred")
+        .await
+        .unwrap()
+        .unwrap();
+    moved
+        .metadata
+        .insert("tenant".to_string(), "team-b".to_string());
+    moved.updated_at = chrono::Utc::now();
+    storage.update(&moved).await.unwrap();
+
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed, "changed tenant authority is terminal");
+    assert!(resumed
+        .result_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("credential revision or tenant authority"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Pre-snapshot approvals are readable after upgrade but cannot safely execute:
+/// an alias alone does not identify the credential the human reviewed.
+#[tokio::test]
+async fn approval_resume_refuses_missing_legacy_credential_authority() {
+    let (server, storage) = setup().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    store_credential(&storage, "legacy-cred", true).await;
+    set_count_capability_reversibility_for_credential(
+        &storage,
+        "count.run",
+        "legacy-cred",
+        "reversible",
+    )
+    .await;
+
+    let approval = match server
+        .execute_gated(count_request("legacy-cred"), ExecAuth::default())
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(approval) => approval,
+        ExecutionOutcome::Completed(_) => panic!("expected pending approval"),
+    };
+    // Simulate a record written before the credential-authority field existed,
+    // while retaining every other current catalog/recipe stamp.
+    let mut legacy_json = serde_json::to_value(&*approval).unwrap();
+    legacy_json
+        .as_object_mut()
+        .unwrap()
+        .remove("credential_authority");
+    let mut legacy: ApprovalRequest = serde_json::from_value(legacy_json).unwrap();
+    legacy
+        .approve(Decision::new("admin panel", "secops"))
+        .unwrap();
+    storage.update_approval(&legacy).await.unwrap();
+
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed, "unbound legacy authority is terminal");
+    assert!(resumed
+        .result_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("credential revision or tenant authority"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Positive control: an unchanged credential revision still executes after the
+/// exact approval is satisfied, so the continuity check is not always-refuse.
+#[tokio::test]
+async fn approval_resume_accepts_unchanged_credential_revision() {
+    let (server, storage) = setup().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    store_credential(&storage, "stable-cred", true).await;
+    set_count_capability_reversibility_for_credential(
+        &storage,
+        "count.run",
+        "stable-cred",
+        "reversible",
+    )
+    .await;
+
+    let approval = match server
+        .execute_gated(count_request("stable-cred"), ExecAuth::default())
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(approval) => approval,
+        ExecutionOutcome::Completed(_) => panic!("expected pending approval"),
+    };
+    let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    stored
+        .approve(Decision::new("admin panel", "secops"))
+        .unwrap();
+    storage.update_approval(&stored).await.unwrap();
+
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed);
+    assert!(resumed.result_error.is_none());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 /// Approval is authority for the exact Govder recipe that was satisfied, not
 /// for whatever recipe happens to govern the action later. Strengthening the
 /// rule after open invalidates the old grant before the execution permit is

@@ -121,4 +121,82 @@ theorem strict_recipe_resume_implies_conclusive_authority
   cases current <;> simp [approvalRecipeStillAuthorizes,
     recipeAuthorityAllowsOpen] at authorized ⊢
 
+/-!
+An approval also freezes the concrete persisted credential revision that its
+alias resolved to.  `recordId`, `revision`, and `kind` abstract Rust's id,
+created/updated timestamps, and credential type; `tenant` is retained
+separately because it has its own authorization predicate.  The model contains
+no credential bytes or secret-derived digest.
+-/
+structure CredentialAuthoritySnapshot where
+  recordId : Nat
+  revision : Nat
+  kind : Nat
+  tenant : Option Nat
+deriving DecidableEq, Repr
+
+/-- A global principal may act on every tenant; a tenant principal may act on
+its own tenant or on an explicitly shared credential. -/
+def tenantMayAct (acting resource : Option Nat) : Bool :=
+  match acting, resource with
+  | none, _ => true
+  | some _, none => true
+  | some a, some r => a == r
+
+/-- Resume requires a present open-time snapshot, a present current record,
+exact revision equality, and current tenant authorization.  Missing legacy
+authority is refusal in every posture. -/
+def approvalCredentialStillAuthorizes
+    (acting : Option Nat)
+    (opened current : Option CredentialAuthoritySnapshot) : Bool :=
+  match opened, current with
+  | some old, some now => old == now && tenantMayAct acting now.tenant
+  | _, _ => false
+
+/-- A legacy approval with no credential authority cannot execute against any
+current record. -/
+theorem missing_credential_authority_refuses_resume
+    {acting : Option Nat} {current : Option CredentialAuthoritySnapshot} :
+    approvalCredentialStillAuthorizes acting none current = false := by
+  cases current <;> rfl
+
+/-- Delete/recreate, type change, revision change, or tenant change invalidates
+the old approval before permit issuance. -/
+theorem changed_credential_authority_refuses_resume
+    {acting : Option Nat} {opened current : CredentialAuthoritySnapshot}
+    (changed : opened ≠ current) :
+    approvalCredentialStillAuthorizes acting (some opened) (some current) = false := by
+  simp [approvalCredentialStillAuthorizes, changed]
+
+/-- Successful resume proves exact concrete credential continuity. -/
+theorem credential_resume_implies_same_authority
+    {acting : Option Nat}
+    {opened current : Option CredentialAuthoritySnapshot}
+    (authorized : approvalCredentialStillAuthorizes acting opened current = true) :
+    opened = current := by
+  cases opened with
+  | none => simp [approvalCredentialStillAuthorizes] at authorized
+  | some old =>
+      cases current with
+      | none => simp [approvalCredentialStillAuthorizes] at authorized
+      | some now =>
+          simp [approvalCredentialStillAuthorizes] at authorized
+          exact congrArg some authorized.1
+
+/-- Successful resume independently proves that the opener remains authorized
+for the current credential tenant. -/
+theorem credential_resume_preserves_tenant_authority
+    {acting : Option Nat}
+    {opened current : Option CredentialAuthoritySnapshot}
+    (authorized : approvalCredentialStillAuthorizes acting opened current = true) :
+    ∃ authority, current = some authority ∧ tenantMayAct acting authority.tenant = true := by
+  cases opened with
+  | none => simp [approvalCredentialStillAuthorizes] at authorized
+  | some old =>
+      cases current with
+      | none => simp [approvalCredentialStillAuthorizes] at authorized
+      | some now =>
+          simp [approvalCredentialStillAuthorizes] at authorized
+          exact ⟨now, rfl, authorized.2⟩
+
 end Vultrino.Approval.ActionAuthority

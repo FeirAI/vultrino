@@ -4,7 +4,7 @@
 
 use crate::approval::{
     ApprovalLinks, ApprovalNotifier, ApprovalRequest, ApprovalStatus, CapabilityAuthorityClass,
-    GateRuleAuthorityClass, NewApproval, RequesterInfo,
+    CredentialAuthority, GateRuleAuthorityClass, NewApproval, RequesterInfo,
 };
 use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
 use crate::config::Config;
@@ -1502,6 +1502,11 @@ impl VultrinoServer {
                     .expect("available catalog resolution has an authority class"),
             );
             approval.bind_gate_rule_authority(gate_rule_authority);
+            // An alias is not stable authority: it can be deleted/recreated, and
+            // an existing credential's tenant or connector-routing metadata can
+            // be updated. Freeze the exact persisted revision the human is being
+            // asked to authorize; resume requires a fresh resolution to match.
+            approval.bind_credential_authority(CredentialAuthority::from_credential(&credential));
             // Spend is extracted by the trusted policy layer above. Stamp it only
             // after opening so requester-authored params can never supply these
             // grant-cap facts.
@@ -2535,14 +2540,7 @@ impl VultrinoServer {
         approval: &ApprovalRequest,
         grant: crate::approval::Granted,
     ) -> Result<ExecuteResponse, RunError> {
-        // V11 note: cross-tenant credential isolation is enforced at request time
-        // in `execute_gated` (before an approval is ever opened), so a cross-tenant
-        // request can't create an approval to resume. The resume re-evaluates
-        // policy but does NOT re-check tenant isolation — a credential whose
-        // `tenant` metadata is changed *between* approval and resume is not
-        // re-validated here (a narrow operator-action window; an emergency stop
-        // should push a Deny/halt, which the resume policy re-eval does honor).
-        // Likewise the V11 *observe* downgrade is an open-time/live-path concept
+        // The V11 *observe* downgrade is an open-time/live-path concept
         // (the approval record doesn't carry the opener's tenant), so an
         // observe-tenant action that is BOTH policy-denied AND approval-gated is
         // enforced (fail-closed) on resume rather than observed-away — a safe
@@ -2558,6 +2556,29 @@ impl VultrinoServer {
         let (plugin_name, action_name) =
             parse_action(&approval.action).map_err(RunError::terminal)?;
         let mut context = RequestContext::new();
+
+        // Revalidate the exact credential record before consulting any later
+        // authority.  The approval names an alias for usability, but the human
+        // authorized the id/type/revision/tenant that alias resolved to at open.
+        // Missing legacy stamps, delete+recreate, and in-place metadata/tenant
+        // changes all refuse.  The tenant check is repeated independently so a
+        // forged/internally inconsistent snapshot cannot manufacture a
+        // cross-tenant execution even if its equality fields were made to match.
+        let current_credential_authority = CredentialAuthority::from_credential(&credential);
+        let credential_authority_current = approval
+            .credential_authority()
+            .is_some_and(|opened| opened == &current_credential_authority);
+        let tenant_still_authorized = crate::approval::tenant_may_act(
+            approval.tenant.as_deref(),
+            current_credential_authority.tenant(),
+        );
+        if !credential_authority_current || !tenant_still_authorized {
+            return Err(RunError::terminal(VultrinoError::PolicyDenied(
+                "the credential revision or tenant authority governing this approval changed; \
+                 nothing ran — open a new approval against the current credential"
+                    .to_string(),
+            )));
+        }
 
         // Revalidate the exact credential+action catalog authority immediately
         // before execution. Capability PUT/DELETE is live operator authority: an

@@ -63,7 +63,10 @@ upstream.
    which Govder recipe applies: without an exact canonical rule, approval open
    fails closed before the numeric fallback. Production strict mode refuses every
    inconclusive recipe lookup, and resume requires the exact recipe/risk authority
-   frozen at open before it can mint an execution permit.
+   frozen at open before it can mint an execution permit. The approval also
+   freezes the resolved credential id, type, storage revision, and tenant;
+   resume refuses a missing legacy stamp, alias replacement, in-place revision,
+   or loss of tenant authority before consulting the permit kernel.
 6. **Security/financial boundaries hold even in observe mode.** Cross-tenant
    isolation, halts, and SpendCap/RateLimit resource guards always enforce; only
    ordinary policy denials are observable-away.
@@ -225,7 +228,11 @@ every turn with `[llm_proxy] streaming_enabled = false`. See
   exact trusted `reversible` declaration for the executing credential and action
   can reach the direct path. Approval-open freezes that authority class and
   resume re-resolves it before permit issuance; replacement or deletion refuses
-  the stale approval. Production strict approval-open also requires a conclusive
+  the stale approval. Independently, approval-open freezes the concrete credential
+  record revision and resume requires exact equality plus current tenant
+  authorization, so deleting/recreating an alias or changing its metadata cannot
+  transfer a human decision to different credential authority. Production strict
+  approval-open also requires a conclusive
   Govder answer, and resume requires the same normalized recipe plus authoritative
   risk/irreversibility facts; uncertainty or change refuses before permit issuance.
   This proves enforcement and continuity of the stored declaration and received

@@ -28,6 +28,9 @@ The machine-checked entry point for Vultrino's critical-boundary model.
   to weaker numeric approval when no exact canonical rule is found; production
   strict posture also refuses every inconclusive recipe answer, and approval
   resume requires the same conclusive recipe/risk authority frozen at open.
+* an approval can resume only against the exact credential record revision it
+  resolved at open, and the opener must still be authorized for that record's
+  current tenant; absent legacy snapshots and changed revisions both refuse.
 * a named internal-HTTP capability executes only its unique operator-pinned
   method; any caller-supplied method is rejected before composition.
 * a declared human-floor capability, unavailable catalog, shared canonical verb,

@@ -388,7 +388,9 @@ required to approve from Telegram/email.
 - Policy is **re-evaluated when the action finally runs**, so an explicit deny
   rule (URL / method / time-window) still blocks even a human-approved action.
   The exact Govder recipe and risk facts are also re-fetched; an unavailable or
-  changed authority invalidates the old approval and nothing executes.
+  changed authority invalidates the old approval and nothing executes. The exact
+  credential record revision and tenant are revalidated first, so an alias
+  replacement or metadata move cannot inherit the old human decision.
   Rate limits are charged **once, at request time** — a human approval is never
   re-charged against, nor re-denied by, the rate limiter at execution time. When
   a deny does fire on resume, the use token is left unconsumed.

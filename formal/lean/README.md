@@ -54,6 +54,12 @@ cannot infer a numeric recipe from an inconclusive Govder answer.
 `strict_recipe_resume_implies_conclusive_authority` prove that permit issuance
 requires the same normalized recipe/risk snapshot frozen at approval-open and a
 conclusive current answer.
+`missing_credential_authority_refuses_resume`,
+`changed_credential_authority_refuses_resume`,
+`credential_resume_implies_same_authority`, and
+`credential_resume_preserves_tenant_authority` separately prove that an approval
+cannot be transferred through an alias to a recreated or revised credential and
+that the opener remains authorized for the current credential tenant.
 
 `Action.MethodAuthority.successful_method_is_operator_method` proves that every
 successfully composed named internal-HTTP capability request uses its unique
@@ -129,6 +135,10 @@ the model:
   approval resume re-fetches the exact tenant/agent/action authority before policy
   evaluation and permit issuance, requiring equality of the rule and authoritative
   risk/irreversibility facts frozen at open;
+- approval-open freezes the resolved credential id/type/revision/tenant without
+  copying or hashing secret material; resume re-resolves the alias and requires
+  exact equality plus current tenant authorization before catalog, policy, or
+  permit processing. Missing legacy stamps fail closed in every posture;
 - internal-HTTP capability registration requires one unambiguous method source;
   named tool calls reject a caller `method` before resolving and finally
   overwriting the plugin request with the operator method;
@@ -222,6 +232,7 @@ declared-transform assumptions.
 | `Evidence.validFor` | one pure function run under the storage claim lock |
 | `Authority.AssertionEvidence.validFor` | inbound HMAC verifier over raw body plus actual tenant/method/path/query/Host, bounded to five minutes |
 | `ActionAuthority.decideAuthority` / `approvalRecipeStillAuthorizes` | label-first exact Govder lookup, canonical-label ambiguity refusal, production-strict conclusive-open requirement, and exact recipe/risk continuity at resume before permit issuance |
+| `ActionAuthority.approvalCredentialStillAuthorizes` | present exact credential id/type/revision/tenant continuity plus current tenant authorization before later resume gates |
 | `Action.MethodAuthority.composeMethod` | registration-time method-source validation plus caller-method rejection and final operator pin in `build_internal_http_params` |
 | `Approval.decideCriticalGate` / `approvalCatalogStillAuthorizes` | exact credential+action catalog authority; unavailable/strict-undeclared refusal, human-floor/ambiguous approval forcing, and open-to-resume class continuity before permit issuance |
 | `Configuration.decideWebStartup` | production `run_web_server` forces strict catalog posture before validated startup; policy hash and workload verifier are then snapshotted in `AppState` |

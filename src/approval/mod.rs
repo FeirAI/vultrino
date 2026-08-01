@@ -259,6 +259,43 @@ pub(crate) enum GateRuleAuthorityClass {
     Inconclusive,
 }
 
+/// The exact persisted credential revision an approver authorized.
+///
+/// An alias is only a lookup key: an operator can delete/recreate it with a new
+/// credential id, or update the existing record's tenant/routing metadata.  An
+/// approval opened before either mutation must not silently apply to the new
+/// authority.  We therefore freeze the storage identity and revision fields
+/// that every supported mutation updates.  Secret material is deliberately not
+/// copied or hashed into the approval record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CredentialAuthority {
+    id: String,
+    credential_type: crate::CredentialType,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    tenant: Option<String>,
+}
+
+impl CredentialAuthority {
+    pub(crate) fn from_credential(credential: &crate::Credential) -> Self {
+        Self {
+            id: credential.id.clone(),
+            credential_type: credential.credential_type.clone(),
+            created_at: credential.created_at,
+            updated_at: credential.updated_at,
+            tenant: credential
+                .metadata
+                .get("tenant")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        }
+    }
+
+    pub(crate) fn tenant(&self) -> Option<&str> {
+        self.tenant.as_deref()
+    }
+}
+
 /// The result of advancing an approval through its SLA lifecycle (V5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleChange {
@@ -956,6 +993,12 @@ pub struct ApprovalRequest {
     /// production refuses them at resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     gate_rule_authority: Option<GateRuleAuthorityClass>,
+    /// Exact credential record revision used at approval-open.  Alias equality
+    /// alone is insufficient because aliases can be deleted/recreated and an
+    /// existing record's tenant/routing metadata can change.  Older records
+    /// deserialize as `None` and are refused at resume in every posture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_authority: Option<CredentialAuthority>,
     /// Trusted spend facts from the policy extractor at open (D3 grant caps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_spend_amount_minor: Option<i64>,
@@ -1084,6 +1127,7 @@ impl ApprovalRequest {
             trusted_irreversible: params.trusted_irreversible.unwrap_or(false),
             capability_authority: None,
             gate_rule_authority: None,
+            credential_authority: None,
             trusted_spend_amount_minor: None,
             trusted_spend_asset: None,
             delegate_veto_until: None,
@@ -1144,6 +1188,20 @@ impl ApprovalRequest {
     /// Recipe-authority class to compare with a fresh Govder answer at resume.
     pub(crate) fn gate_rule_authority(&self) -> Option<GateRuleAuthorityClass> {
         self.gate_rule_authority
+    }
+
+    /// Bind the exact credential revision that existed when this request was
+    /// shown to the approver.  Crate-only so a downstream caller cannot rewrite
+    /// the premise checked immediately before permit issuance.
+    pub(crate) fn bind_credential_authority(&mut self, authority: CredentialAuthority) {
+        self.credential_authority = Some(authority);
+    }
+
+    /// Credential revision frozen at approval-open. `None` identifies an older
+    /// persisted approval, which cannot safely execute because alias continuity
+    /// alone does not identify the credential the human reviewed.
+    pub(crate) fn credential_authority(&self) -> Option<&CredentialAuthority> {
+        self.credential_authority.as_ref()
     }
 
     /// Re-establish the persisted approval invariants after decryption and

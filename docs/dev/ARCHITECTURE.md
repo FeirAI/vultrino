@@ -107,7 +107,10 @@ The authoritative path is `VultrinoServer::execute_gated` → `run_action` in
    dispatch. The same exact-request catalog snapshot that forced gating stamps
    authority on the approval. Resume reloads the catalog and requires the same
    authority class before permit issuance, so replacement/deletion invalidates the
-   old approval. Approval previews preserve the same exact-label boundary and fall
+   old approval. It separately freezes the concrete credential id/type/revision/
+   tenant resolved at open; alias replacement, metadata/tenant mutation, and
+   missing legacy snapshots refuse before any later authority or permit check.
+   Approval previews preserve the same exact-label boundary and fall
    back to the generic summary rather than selecting a canonical sibling or
    duplicate declaration.
 8. **Run the action** (`run_action`), if not gated:
@@ -129,8 +132,10 @@ The authoritative path is `VultrinoServer::execute_gated` → `run_action` in
 
 Approval-gated actions run later via the **deferred path** (`resume_approved`),
 triggered when the requester polls the approval after a human decides. The resume
-first re-resolves the exact credential+action catalog authority and refuses if it
-differs from approval-open. It then re-fetches the exact tenant/agent/business-action
+first re-resolves the credential alias and requires the exact id/type/revision/
+tenant frozen at open plus current tenant authorization. It then re-resolves the
+exact credential+action catalog authority and refuses if it differs from
+approval-open. Finally it re-fetches the exact tenant/agent/business-action
 Govder answer and requires the same authority class, normalized recipe, risk tier,
 and irreversibility facts that were frozen at open. An outage, strengthened rule,
 removed rule, or other change invalidates the approval before permit issuance.
