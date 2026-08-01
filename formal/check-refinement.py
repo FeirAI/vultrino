@@ -42,6 +42,7 @@ tenant_assert = (ROOT / "src/govder/tenant_assert.rs").read_text()
 authority_lean = (ROOT / "formal/lean/Vultrino/Approval/Authority.lean").read_text()
 approval_model_lean = (ROOT / "formal/lean/Vultrino/Approval/Model.lean").read_text()
 action_authority_lean = (ROOT / "formal/lean/Vultrino/Approval/ActionAuthority.lean").read_text()
+criticality_lean = (ROOT / "formal/lean/Vultrino/Approval/Criticality.lean").read_text()
 method_authority_lean = (ROOT / "formal/lean/Vultrino/Action/MethodAuthority.lean").read_text()
 confinement_lean = (ROOT / "formal/lean/Vultrino/Credentials/Confinement.lean").read_text()
 startup_lean = (ROOT / "formal/lean/Vultrino/Configuration/Startup.lean").read_text()
@@ -52,6 +53,8 @@ workload_exchange = (ROOT / "src/web/workload_exchange.rs").read_text()
 web_mod = (ROOT / "src/web/mod.rs").read_text()
 web_server = (ROOT / "src/web/server.rs").read_text()
 startup_security_tests = (ROOT / "tests/startup_security_integration.rs").read_text()
+approval_integration_tests = (ROOT / "tests/approval_token_integration.rs").read_text()
+web_smoke_tests = (ROOT / "tests/web_smoke.rs").read_text()
 
 if not lib.startswith("#![forbid(unsafe_code)]") or not main.startswith("#![forbid(unsafe_code)]"):
     fail("the library and production CLI must both forbid unsafe Rust")
@@ -200,6 +203,56 @@ if "async fn verifier_is_snapshotted_before_requests" not in (
 ).read_text():
     fail("workload verifier snapshot regression test missing")
 
+for hook in (
+    "enum IrreversibilityResolution",
+    "fn automatically_requires_approval(self) -> bool",
+    "Self::HumanFloor | Self::Unavailable",
+    "async fn resolve_irreversibility_for_action(",
+    'return IrreversibilityResolution::Unavailable;',
+):
+    if hook not in server:
+        fail(f"criticality-to-approval refinement hook missing: {hook!r}")
+if '!matches!(reversibility.trim(), "reversible")' not in approval:
+    fail("unknown stored reversibility no longer fails to the human floor")
+if "fn reversibility_wire_values_fail_closed_to_human_floor" not in approval:
+    fail("reversibility parser no longer has unknown/blank fail-closed controls")
+criticality_snapshot = server.find("let irreversibility = self")
+criticality_force = server.find(
+    "if irreversibility.automatically_requires_approval()", criticality_snapshot
+)
+approval_branch = server.find("if needs_approval {", criticality_force)
+if min(criticality_snapshot, criticality_force, approval_branch) < 0 or not (
+    criticality_snapshot < criticality_force < approval_branch
+):
+    fail("trusted criticality snapshot must force approval before the shared approval branch")
+if "let trusted_irreversible = irreversibility.trusted_human_floor();" not in server:
+    fail("approval stamp no longer consumes the same criticality snapshot that forced gating")
+for theorem in (
+    "declared_human_floor_never_direct",
+    "unavailable_catalog_never_direct",
+    "direct_excludes_human_floor_and_unavailable",
+):
+    if f"theorem {theorem}" not in criticality_lean:
+        fail(f"Lean criticality-gating theorem missing: {theorem}")
+for test in (
+    "declared_irreversible_capability_cannot_take_the_direct_path",
+    "disabled_approvals_refuse_declared_irreversible_capability",
+):
+    if f"async fn {test}" not in approval_integration_tests:
+        fail(f"criticality direct-path negative control missing: {test}")
+money_helper_start = web_smoke_tests.find("async fn execute_labelled_money_action(")
+money_helper_end = web_smoke_tests.find(
+    "\n}\n\n/// THE ACTION-CLASS AXIS", money_helper_start
+)
+if money_helper_start < 0 or money_helper_end < 0:
+    fail("could not isolate labeled-money approval fixture")
+if 'with_metadata("require_approval", "true")' in web_smoke_tests[
+    money_helper_start:money_helper_end
+]:
+    fail("positive money fixture regained a second approval signal and no longer proves criticality forces gating")
+if "async fn the_gate_is_found_when_it_is_keyed_by_the_govder_action_label" not in web_smoke_tests:
+    fail("automatic human-floor gating lacks the authoritative-recipe positive control")
+
 if server.count("confine_plugin_execution_error(error, &secret_material)") != 2:
     fail("both post-dispatch error paths must classify connector diagnostics")
 if "diagnostic_may_contain_secret(&error.to_string(), secrets)" not in server:
@@ -344,4 +397,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; fail-closed canonical action aliases; operator-pinned internal HTTP method; startup-validated policy/workload secrets; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; declared human-floor capabilities cannot dispatch directly; fail-closed canonical action aliases; operator-pinned internal HTTP method; startup-validated policy/workload secrets; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

@@ -53,6 +53,28 @@ enum StreamStep {
     TotalTimeout,
 }
 
+/// Trusted capability-catalog answer used to decide whether an action may take
+/// the direct execution path. `Undeclared` preserves legacy/local plugin calls;
+/// an unavailable catalog fails closed because it may be hiding a declared
+/// irreversible capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IrreversibilityResolution {
+    Reversible,
+    HumanFloor,
+    Undeclared,
+    Unavailable,
+}
+
+impl IrreversibilityResolution {
+    fn automatically_requires_approval(self) -> bool {
+        matches!(self, Self::HumanFloor | Self::Unavailable)
+    }
+
+    fn trusted_human_floor(self) -> bool {
+        !matches!(self, Self::Reversible)
+    }
+}
+
 /// While a serving process executes an approved action, it refreshes the
 /// approval's execution claim this often so a slow-but-alive worker is never
 /// mistaken for a crashed one. Must be comfortably smaller than the storage
@@ -1003,7 +1025,9 @@ impl VultrinoServer {
     /// Approval is required when **any** of these hold:
     /// - the credential is flagged with metadata `require_approval = "true"`,
     /// - a matching policy returns `Prompt`,
-    /// - the auth context forces it (e.g. a use token with `require_approval`).
+    /// - the auth context forces it (e.g. a use token with `require_approval`),
+    /// - the trusted capability catalog declares a human-floor reversibility
+    ///   class, or the catalog is unavailable and cannot prove otherwise.
     ///
     /// When gated, the action does **not** run: an [`ApprovalRequest`] is created,
     /// persisted, and announced to notifiers, and [`PreparedAction::Pending`] is
@@ -1222,6 +1246,18 @@ impl VultrinoServer {
             needs_approval = true;
         }
 
+        // Capability reversibility is an independent authority source, not a
+        // decoration consulted only after some other branch happens to gate.
+        // Snapshot it once and use the same answer both to force approval and to
+        // stamp the approval floor. This closes the policy-Allow/unflagged-token
+        // bypass for declared irreversible and partially-reversible actions.
+        let irreversibility = self
+            .resolve_irreversibility_for_action(&full_action, action_label.as_deref())
+            .await;
+        if irreversibility.automatically_requires_approval() {
+            needs_approval = true;
+        }
+
         if needs_approval {
             if !self.approval_config.enabled {
                 return Err(VultrinoError::PolicyDenied(
@@ -1299,9 +1335,7 @@ impl VultrinoServer {
             if requester.owner.is_none() {
                 requester.owner = principal.as_ref().and_then(|p| p.owner.clone());
             }
-            let trusted_irreversible = self
-                .trusted_irreversible_for_action(&full_action, action_label.as_deref())
-                .await;
+            let trusted_irreversible = irreversibility.trusted_human_floor();
             // Extract the capability's declared approval-preview fields from the
             // SAME params that will execute (never a separate/mutable copy), so
             // the approver sees exactly what will run. None when the backing
@@ -3147,19 +3181,34 @@ impl VultrinoServer {
 
     /// Trusted irreversibility for D3 floors: resolve from stored capability metadata
     /// (not requester-authored params). Matches canonical action or govder label.
-    async fn trusted_irreversible_for_action(
+    async fn resolve_irreversibility_for_action(
         &self,
         canonical_action: &str,
         action_label: Option<&str>,
-    ) -> bool {
-        let _ = self.storage.reload().await;
+    ) -> IrreversibilityResolution {
+        if let Err(error) = self.storage.reload().await {
+            tracing::error!(%error, "capability catalog reload failed while deriving trusted irreversibility");
+            return IrreversibilityResolution::Unavailable;
+        }
         let caps = match self.storage.list_capabilities().await {
             Ok(caps) => caps,
             Err(error) => {
                 // This stamp decides whether a machine may replace a human. An
                 // unavailable catalog must therefore fail to the human floor.
                 tracing::error!(%error, "capability lookup failed while deriving trusted irreversibility");
-                return true;
+                return IrreversibilityResolution::Unavailable;
+            }
+        };
+
+        let classify = |matching: Vec<&crate::capability::Capability>| {
+            if matching.is_empty() {
+                IrreversibilityResolution::Undeclared
+            } else if matching.iter().any(|cap| {
+                crate::approval::reversibility_requires_human_floor(&cap.reversibility)
+            }) {
+                IrreversibilityResolution::HumanFloor
+            } else {
+                IrreversibilityResolution::Reversible
             }
         };
 
@@ -3177,9 +3226,7 @@ impl VultrinoServer {
                 })
                 .collect();
             if !exact.is_empty() {
-                return exact.iter().any(|cap| {
-                    crate::approval::reversibility_requires_human_floor(&cap.reversibility)
-                });
+                return classify(exact);
             }
         }
 
@@ -3189,17 +3236,15 @@ impl VultrinoServer {
             .collect();
         if canonical.is_empty() {
             tracing::warn!(%canonical_action, ?action_label,
-                "no capability metadata matched approval action; requiring human floor");
-            return true;
+                "no capability metadata matched approval action; no automatic criticality classification is available");
+            return IrreversibilityResolution::Undeclared;
         }
-        canonical
-            .iter()
-            .any(|cap| crate::approval::reversibility_requires_human_floor(&cap.reversibility))
+        classify(canonical)
     }
 
     /// Extract the approval-preview VALUES for an action being gated, if its
     /// backing capability declares an `approval_preview` spec. Looks up the
-    /// capability the SAME way [`Self::trusted_irreversible_for_action`] does
+    /// capability the SAME way [`Self::resolve_irreversibility_for_action`] does
     /// (prefer an exact `action_label` match, else the first capability whose
     /// resolved canonical action matches). Returns `None` when no matching
     /// capability is found, or it has no `approval_preview` spec — the caller
@@ -4753,7 +4798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trusted_irreversibility_uses_strictest_canonical_match_and_fails_unknown_closed() {
+    async fn trusted_irreversibility_uses_strictest_canonical_match_and_distinguishes_undeclared() {
         use crate::capability::{Capability, CapabilityTarget};
         let (server, storage) = irreversibility_test_server().await;
         for (id, reversibility) in [
@@ -4778,14 +4823,12 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            server
-                .trusted_irreversible_for_action("http.request", None)
-                .await
+            server.resolve_irreversibility_for_action("http.request", None).await
+                == IrreversibilityResolution::HumanFloor
         );
         assert!(
-            server
-                .trusted_irreversible_for_action("unknown.action", None)
-                .await
+            server.resolve_irreversibility_for_action("unknown.action", None).await
+                == IrreversibilityResolution::Undeclared
         );
     }
 }

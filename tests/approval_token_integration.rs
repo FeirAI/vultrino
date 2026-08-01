@@ -165,10 +165,11 @@ async fn setup_deny_mode(
 /// actually are.
 ///
 /// WHY THIS IS NEEDED, and why it is a statement of fact rather than a green-run
-/// convenience. `VultrinoServer::trusted_irreversible_for_action` resolves
+/// convenience. `VultrinoServer::resolve_irreversibility_for_action` resolves
 /// irreversibility from stored capability metadata (never requester-authored params)
-/// and fails CLOSED: an action that matches NO capability is assumed to need the human
-/// floor, i.e. treated as irreversible. Separately, these fixtures wire no govder
+/// and, once another authority signal gates an undeclared action, stamps the unknown
+/// declaration with the human floor. (An undeclared action alone does not auto-gate;
+/// see `docs/dev/LIMITATIONS.md`.) Separately, these fixtures wire no govder
 /// (`Config::default().govder == None`), so no approval recipe can be CONFIRMED for
 /// anything they gate. An assumed-irreversible action whose recipe is unconfirmable is
 /// refused at approval-open rather than opened on the weaker single-approver numeric
@@ -250,12 +251,86 @@ async fn store_credential(storage: &Arc<dyn StorageBackend>, alias: &str, requir
     storage.store(&cred).await.unwrap();
 }
 
+async fn set_count_capability_reversibility(
+    storage: &Arc<dyn StorageBackend>,
+    reversibility: &str,
+) {
+    storage
+        .store_capability(&vultrino::capability::Capability {
+            id: "cap-fixture-count-run".to_string(),
+            tool_name: "count_run".to_string(),
+            description: "counting criticality fixture".to_string(),
+            action: "count.run".to_string(),
+            plugin: None,
+            target: vultrino::capability::CapabilityTarget::default(),
+            credential_ref: "*".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            reversibility: reversibility.to_string(),
+            llm: None,
+            approval_preview: None,
+        })
+        .await
+        .unwrap();
+}
+
 fn echo_request(credential: &str) -> ExecuteRequest {
     ExecuteRequest {
         credential: credential.to_string(),
         action: "mock.echo".to_string(),
         params: serde_json::json!({"hello": "world"}),
     }
+}
+
+/// A stored human-floor declaration is itself approval authority. Policy Allow,
+/// an unflagged credential, and an unflagged auth context cannot reach dispatch;
+/// with no Govder recipe authority wired, the only valid outcome is refusal.
+#[tokio::test]
+async fn declared_irreversible_capability_cannot_take_the_direct_path() {
+    let (server, storage) = setup().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    set_count_capability_reversibility(&storage, "irreversible").await;
+    store_credential(&storage, "critical-cred", false).await;
+
+    let error = server
+        .execute_gated(count_request("critical-cred"), ExecAuth::default())
+        .await
+        .expect_err("an irreversible action without recipe authority must refuse");
+    assert!(matches!(error, vultrino::VultrinoError::PolicyUnavailable(_)));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(storage.list_approvals().await.unwrap().is_empty());
+}
+
+/// Disabling the approval subsystem is an availability posture, never a bypass:
+/// a declared human-floor action is denied before recipe lookup or dispatch.
+#[tokio::test]
+async fn disabled_approvals_refuse_declared_irreversible_capability() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("pw");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    set_count_capability_reversibility(&storage, "irreversible").await;
+    store_credential(&storage, "critical-cred", false).await;
+
+    let error = server
+        .execute_gated(count_request("critical-cred"), ExecAuth::default())
+        .await
+        .expect_err("disabled approvals must not become direct authority");
+    assert!(matches!(error, vultrino::VultrinoError::PolicyDenied(_)));
+    assert!(error.to_string().contains("approvals are not enabled"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 // ==================== Use tokens ====================

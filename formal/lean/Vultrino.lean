@@ -1,6 +1,7 @@
 import Vultrino.Approval.ExecutionSafety
 import Vultrino.Approval.Authority
 import Vultrino.Approval.ActionAuthority
+import Vultrino.Approval.Criticality
 import Vultrino.Credentials.Confinement
 import Vultrino.Action.MethodAuthority
 import Vultrino.Configuration.Startup
@@ -27,6 +28,8 @@ The machine-checked entry point for Vultrino's critical-boundary model.
   to weaker numeric approval when no exact canonical rule is found.
 * a named internal-HTTP capability executes only its unique operator-pinned
   method; any caller-supplied method is rejected before composition.
+* a declared human-floor capability or unavailable capability catalog can never
+  produce direct execution authority; disabled approvals refuse rather than bypass.
 * a started production web process has a configured policy-hash key, and an
   enabled workload exchange has a valid startup-snapshotted verifier.
 

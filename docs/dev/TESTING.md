@@ -42,7 +42,7 @@ The integration suites and their focus:
 |-------|--------|
 | `tests/auth_integration.rs` | API-key / use-token auth, role scoping, permission checks. |
 | `tests/outbox_integration.rs` | Signed outbox: ordering, gap-free replay, dead-letter, delivery. |
-| `tests/approval_token_integration.rs` | Use-token lifecycle, approval gating/lifecycle/dual-control, and the **V13a/V13b `meter.observed` emit** (`test_v13a_*`, `test_v13b_*`). |
+| `tests/approval_token_integration.rs` | Use-token lifecycle, approval gating/lifecycle/dual-control, declared-irreversibility direct-path refusal (including approvals disabled), and the **V13a/V13b `meter.observed` emit** (`test_v13a_*`, `test_v13b_*`). |
 | `tests/web_smoke.rs` | The `vultrino web` JSON API + admin surface end-to-end (in-process axum router). |
 | `tests/llm_proxy_integration.rs` | The metered LLM proxy: provider gate, model allowlist, output-token clamp, buffered + streaming enforcement. |
 | `tests/workload_exchange_integration.rs` | HTTP-level deny paths for `POST /api/v1/workload/exchange`: forged HMAC → `401`, replayed `jti` → `409`, identity-binding mismatch → `403`, expired assertion → `401`, feature disabled → `404`; also pins that an embedded server snapshots its verifier and does not reread the environment per request. The permissive embedded constructor's invalid state returns `503`. |

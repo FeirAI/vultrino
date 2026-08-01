@@ -59,6 +59,11 @@ production web process cannot have the policy-drift oracle disabled.
 with workload exchange enabled has a configured, valid verifier snapshot; the
 invalid state is a startup refusal before vault access or listener bind.
 
+`Approval.declared_human_floor_never_direct` proves that a capability snapshot
+classified as irreversible or partially reversible cannot take the direct path;
+`unavailable_catalog_never_direct` gives a catalog outage the same fail-closed
+result. If approvals are disabled, the decision is refusal rather than bypass.
+
 `Credentials.reachable_credentials_are_confined` proves, by induction over
 every reachable credential-flow trace, that raw credential material reaches
 only the encrypted vault, the private injector, or the specifically authorized
@@ -109,6 +114,9 @@ the model:
 - the production web entrypoint validates the policy-hash secret and any enabled
   workload verifier before touching the vault, spawning workers, or binding; the
   verifier list is then held in `AppState` rather than reread per request;
+- the trusted capability catalog is resolved once per admitted request before a
+  direct permit can be minted; a declared human-floor class or catalog outage
+  independently forces approval, and that same snapshot stamps the approval;
 - WASM ABI v2 serializes only an alias/type credential handle. ABI v1 modules,
   including the archived PGP fixture, fail installation and loading;
 - plaintext `Secret` serialization requires a crate-private, dynamically scoped
@@ -189,6 +197,7 @@ declared-transform assumptions.
 | `Authority.AssertionEvidence.validFor` | inbound HMAC verifier over raw body plus actual tenant/method/path/query/Host, bounded to five minutes |
 | `ActionAuthority.decideAuthority` | label-first exact Govder lookup plus canonical-label ambiguity refusal before numeric fallback |
 | `Action.MethodAuthority.composeMethod` | registration-time method-source validation plus caller-method rejection and final operator pin in `build_internal_http_params` |
+| `Approval.decideCriticalGate` | `resolve_irreversibility_for_action` snapshot plus `automatically_requires_approval` before the shared prepared-action branch |
 | `Configuration.decideWebStartup` | first operation in production `run_web_server` plus startup-snapshotted `WorkloadVerifier` in `AppState` |
 | `Approval.Step.execute` | the single buffered/streaming dispatch seam |
 | `Credentials.Operation` | built-ins are trusted declassification points; untrusted WASM receives only a handle |

@@ -4573,8 +4573,8 @@ async fn test_v10_inbound_oidc_resolves_subject_and_binds_owner() {
     storage.store(&cred).await.unwrap();
     // This test is about OIDC subject/owner resolution, and it needs an approval to OPEN so
     // it can read those two fields off it. Say out loud what it executes: a GET, which is
-    // reversible. Without a capability declaring that, `trusted_irreversible_for_action`
-    // fails closed to "assume irreversible" — and since this fixture wires no govder, the
+    // reversible. Without a capability declaring that, the trusted resolution stamps an
+    // already-gated request as human-floor — and since this fixture wires no govder, the
     // recipe is unconfirmable, so an irreversible action is refused and no approval opens.
     // Both of those are correct; what was wrong was the fixture never stating which kind of
     // action it was, and quietly relying on an unwired govder answering "no recipe".
@@ -6025,9 +6025,9 @@ async fn execute_against_require_approval_credential(
 }
 
 /// As above, but optionally register a stored capability for the action so vultrino's
-/// TRUSTED irreversibility (`trusted_irreversible_for_action`) resolves to a known
-/// value instead of the fail-closed "no capability metadata matched → assume the human
-/// floor" default. Pass `Some("reversible")` to exercise the reversible arm of the
+/// TRUSTED irreversibility (`resolve_irreversibility_for_action`) resolves to a known
+/// value instead of `Undeclared` (which an already-gated request stamps with the human
+/// floor). Pass `Some("reversible")` to exercise the reversible arm of the
 /// inconclusive-gate decision, `Some("irreversible")` for the money arm, and `None` to
 /// keep the historical fixture (no catalog at all → irreversible by fail-closed
 /// default).
@@ -6427,13 +6427,13 @@ async fn execute_labelled_money_action(
             header_name: "Authorization".to_string(),
             header_prefix: "Bearer ".to_string(),
         },
-    )
-    .with_metadata("require_approval", "true");
+    );
     storage.store(&cred).await.unwrap();
 
     // The capability declares the LABEL as its action, exactly as a pack does, and is
-    // irreversible — so `trusted_irreversible_for_action` resolves to the money floor
-    // from stored metadata rather than the fail-closed default.
+    // irreversible — so the trusted catalog classification ITSELF forces the
+    // approval path. Neither the credential nor token carries require_approval;
+    // this is the regression control for the former policy-Allow bypass.
     storage
         .store_capability(&Capability {
             id: "cap-payments-refund".to_string(),
@@ -6912,8 +6912,9 @@ async fn execute_open_numeric_path_parity_when_gate_has_rule_false() {
 /// not reserved for a requirement vultrino never confirmed.
 ///
 /// The fixture deliberately registers NO capability catalog, which is the exact fixture
-/// the deleted test used: `trusted_irreversible_for_action` fails closed to `true` when
-/// nothing matches, so this is precisely the shape that test asserted a 202 for.
+/// the deleted test used: when nothing matches, trusted irreversibility stamps an
+/// already-gated undeclared action with the human floor, so this is precisely the
+/// shape that test asserted a 202 for.
 #[tokio::test]
 async fn execute_refuses_an_irreversible_action_when_no_govder_is_wired() {
     let mut config = Config::default();

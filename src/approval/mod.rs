@@ -226,10 +226,11 @@ pub fn execution_state_at_decision(
 
 /// Map a capability/policy reversibility label to the D3 irreversible floor.
 pub fn reversibility_requires_human_floor(reversibility: &str) -> bool {
-    matches!(
-        reversibility.trim(),
-        "irreversible" | "partially-reversible" | "partially_reversible"
-    )
+    // Only the one fully reversible spelling may bypass the human floor. Stored
+    // values normally pass Capability::validate first, but a corrupted/legacy
+    // value at this authority boundary must fail closed rather than becoming
+    // equivalent to `reversible`.
+    !matches!(reversibility.trim(), "reversible")
 }
 
 /// The result of advancing an approval through its SLA lifecycle (V5).
@@ -3056,6 +3057,23 @@ mod stage1_proofs;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reversibility_wire_values_fail_closed_to_human_floor() {
+        assert!(!reversibility_requires_human_floor("reversible"));
+        for value in [
+            "partially-reversible",
+            "partially_reversible",
+            "irreversible",
+            "",
+            "unknown",
+        ] {
+            assert!(
+                reversibility_requires_human_floor(value),
+                "{value:?} must not acquire reversible authority"
+            );
+        }
+    }
 
     fn new_approval() -> (ApprovalRequest, String) {
         ApprovalRequest::open(NewApproval {

@@ -1346,7 +1346,7 @@ async fn start_mock_govder_confirming_no_recipe(
 /// The fixture now states both facts it was leaning on without declaring:
 ///   1. `money.refund` is IRREVERSIBLE. It moves money out; nothing here can undo it.
 ///      Declared in the capability catalog, which is the only source
-///      `trusted_irreversible_for_action` trusts (never requester params).
+///      `resolve_irreversibility_for_action` trusts (never requester params).
 ///   2. A recipe authority IS wired, and it ANSWERS: govder confirms it holds no
 ///      recipe for this (agent, action class). That confirmed absence — not an unset
 ///      env var — is what licenses the numeric path and its single approver.

@@ -213,6 +213,10 @@ every turn with `[llm_proxy] streaming_enabled = false`. See
 - Engine default `deny`; SpendCap unparseable → deny; cross-tenant + untenanted
   principal → enforce; a malformed egress/policy/identity glob is a hard config
   error (no silent degrade to never-matching).
+- A declared partially-reversible/irreversible capability independently forces
+  the shared approval path even under policy `Allow` and unflagged credentials or
+  tokens. An unavailable catalog does the same; disabled approvals refuse. Only
+  the exact `reversible` spelling can establish a reversible stored declaration.
 - An outbox push with no URL or no signing secret is a hard config error
   (an unsigned/undeliverable outbox is rejected).
 - A halt label must be a literal id (no glob), so a halt can't deny a fleet.

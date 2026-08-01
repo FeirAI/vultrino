@@ -312,6 +312,12 @@ returned until someone signs off.
 - A credential flagged with `vultrino meta set <alias> require_approval true`
 - A use token created with `--require-approval`
 - A matching policy rule with `action = "prompt"`
+- A stored capability whose trusted `reversibility` is `partially-reversible` or
+  `irreversible`. This signal is independent of policy/token flags; an unavailable
+  capability catalog also fails to approval/refusal rather than direct execution.
+
+If approvals are disabled, a triggered action is refused; disabling the approval
+subsystem never converts a human-floor action into a direct action.
 
 **How it works (and what the agent sees):**
 

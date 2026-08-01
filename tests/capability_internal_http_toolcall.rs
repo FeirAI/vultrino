@@ -187,6 +187,7 @@ struct PackCap {
     url_glob: &'static str,
     methods: &'static [&'static str],
     credential_ref: &'static str,
+    reversibility: &'static str,
     input_schema: serde_json::Value,
     plugin_params: serde_json::Map<String, serde_json::Value>,
 }
@@ -200,6 +201,7 @@ fn refund_cap() -> PackCap {
         url_glob: "/v1/refunds",
         methods: &["POST"],
         credential_ref: "finsandbox-refund",
+        reversibility: "irreversible",
         input_schema: pack_refund_input_schema(),
         plugin_params: serde_json::Map::new(),
     }
@@ -214,6 +216,7 @@ fn ledger_cap() -> PackCap {
         url_glob: "/v1/ledger*",
         methods: &["GET"],
         credential_ref: "finsandbox-read",
+        reversibility: "reversible",
         input_schema: pack_ledger_input_schema(),
         plugin_params: serde_json::Map::new(),
     }
@@ -236,7 +239,7 @@ async fn register_pack_capability(storage: &Arc<dyn StorageBackend>, c: PackCap)
         },
         credential_ref: c.credential_ref.to_string(),
         input_schema: c.input_schema,
-        reversibility: "irreversible".to_string(),
+        reversibility: c.reversibility.to_string(),
         llm: None,
         approval_preview: None,
     };
@@ -245,7 +248,34 @@ async fn register_pack_capability(storage: &Arc<dyn StorageBackend>, c: PackCap)
     cap
 }
 
-async fn build_stack(config: Config) -> (Arc<dyn StorageBackend>, McpServer) {
+/// A test policy authority that definitively confirms that no per-action recipe
+/// is stored. This licenses the ordinary one-human approval path; an absent or
+/// unreachable authority would correctly refuse an irreversible capability.
+async fn start_mock_govder_confirming_no_recipe() -> vultrino::govder::GovderConfig {
+    async fn handler() -> impl IntoResponse {
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "has_rule": false })),
+        )
+    }
+
+    let app = Router::new().route("/v1/oversight/gates/rule", axum::routing::get(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    vultrino::govder::GovderConfig {
+        base_url: format!("http://{addr}"),
+        assertion_secret: "test-govder-assertion-secret".to_string(),
+        assertion_ttl: std::time::Duration::from_secs(90),
+        http_timeout: std::time::Duration::from_secs(5),
+    }
+}
+
+async fn build_stack(
+    mut config: Config,
+) -> (Arc<dyn StorageBackend>, Arc<VultrinoServer>, McpServer) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
     std::mem::forget(dir); // keep the scratch vault alive for the test process
@@ -258,12 +288,17 @@ async fn build_stack(config: Config) -> (Arc<dyn StorageBackend>, McpServer) {
         storage.list_roles().await.unwrap(),
         storage.list_api_keys().await.unwrap(),
     )));
+    // The shipped refund is irreversible. Give the fixture a real approval
+    // subsystem and a reachable recipe authority so its happy path proves an
+    // approved resume, never an inline dispatch or an unwired-policy fallback.
+    config.approval.enabled = true;
+    config.govder = Some(start_mock_govder_confirming_no_recipe().await);
     let resolver = CredentialResolver::new(storage.clone());
-    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    let server = Arc::new(VultrinoServer::new(config, storage.clone(), resolver));
     server.load_plugins().await.unwrap();
     server.reload_policies().await.unwrap();
-    let mcp = McpServer::new(Arc::new(server), auth_manager);
-    (storage, mcp)
+    let mcp = McpServer::new(server.clone(), auth_manager);
+    (storage, server, mcp)
 }
 
 /// Seed the sandbox credential (with its operator-pinned destination metadata)
@@ -286,7 +321,7 @@ async fn seed(
         .insert(META_DESTINATION.to_string(), destination.to_string());
     storage.store(&cred).await.unwrap();
 
-    let (full, token) = UseToken::create(NewUseToken {
+    let (full, mut token) = UseToken::create(NewUseToken {
         name: format!("{alias}-token"),
         credential_scope: alias.to_string(),
         action_scope: Some(action_scope.to_string()),
@@ -294,6 +329,8 @@ async fn seed(
         require_approval: false,
         expires_in: None,
     });
+    token.tenant = Some("acme".to_string());
+    token.agent_label = Some(format!("{alias}-agent"));
     storage.store_use_token(&token).await.unwrap();
     full
 }
@@ -390,17 +427,57 @@ fn refund_body() -> serde_json::Value {
     })
 }
 
+/// Apply one valid human decision to the only pending request and drive the
+/// trusted local resume path. The destination must remain untouched until this
+/// helper is called.
+async fn approve_only_pending_and_resume(
+    storage: &Arc<dyn StorageBackend>,
+    server: &Arc<VultrinoServer>,
+) -> vultrino::approval::ApprovalRequest {
+    let mut approvals = storage.list_approvals().await.unwrap();
+    assert_eq!(
+        approvals.len(),
+        1,
+        "the MCP call must open exactly one approval"
+    );
+    let mut approval = approvals.pop().unwrap();
+    assert!(
+        approval.trusted_irreversible,
+        "the stored catalog classification must be stamped on the gate"
+    );
+    assert_eq!(
+        approval.required_approvals, 1,
+        "the mock policy authority explicitly confirmed the ordinary one-human path"
+    );
+    approval
+        .approve(vultrino::approval::Decision::new("admin panel", "dana"))
+        .unwrap();
+    storage.update_approval(&approval).await.unwrap();
+
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .expect("an approved request must resume");
+    assert!(
+        resumed.executed,
+        "the approved action must reach a terminal execution result: {:?}",
+        resumed.result_error
+    );
+    resumed
+}
+
 // ===========================================================================
 // (1) The money path an agent actually uses.
 // ===========================================================================
 
 /// THE REGRESSION TEST FOR §10g FIX 1. An L3 sender is offered `issue_refund`,
-/// fills the schema it was handed, and the refund LANDS in the sandbox with the
-/// vault credential injected — through `tools/call`, not `/api/v1/execute`.
+/// fills the schema it was handed, and receives a pending approval through
+/// `tools/call`, not `/api/v1/execute`. The refund reaches the sandbox only after
+/// a valid human decision and the approved-resume path injects the credential.
 #[tokio::test]
-async fn agent_executes_a_refund_through_tools_call_using_only_the_advertised_schema() {
+async fn agent_refund_from_advertised_schema_executes_only_after_approval() {
     let (port, rec) = start_sandbox().await;
-    let (storage, mut mcp) = build_stack(operator_config(port)).await;
+    let (storage, server, mut mcp) = build_stack(operator_config(port)).await;
     let token = seed(&storage, "finsandbox-refund", "finsandbox", "money.refund").await;
     register_pack_capability(&storage, refund_cap()).await;
 
@@ -414,12 +491,27 @@ async fn agent_executes_a_refund_through_tools_call_using_only_the_advertised_sc
         ],
     );
 
-    let out = tools_call(&mut mcp, "issue_refund", args)
+    let pending = tools_call(&mut mcp, "issue_refund", args)
         .await
-        .expect("a refund called with the schema the agent was given must execute");
+        .expect("a refund called with the advertised schema must open its approval");
     assert!(
-        out.contains("rf_1"),
-        "the sandbox response must reach the agent: {out}"
+        pending.contains("APPROVAL REQUIRED") && pending.contains("status: pending"),
+        "the agent must receive a pending-approval result: {pending}"
+    );
+    assert!(
+        rec.hits.lock().unwrap().is_empty(),
+        "the irreversible action must not dispatch before approval"
+    );
+
+    let resumed = approve_only_pending_and_resume(&storage, &server).await;
+    assert!(
+        resumed
+            .result_body
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rf_1"),
+        "the sandbox response must reach the approved resume: {:?}",
+        resumed.result_body
     );
 
     let hits = rec.hits.lock().unwrap().clone();
@@ -442,7 +534,7 @@ async fn agent_executes_a_refund_through_tools_call_using_only_the_advertised_sc
 #[tokio::test]
 async fn agent_reads_the_ledger_through_tools_call_using_only_the_advertised_schema() {
     let (port, rec) = start_sandbox().await;
-    let (storage, mut mcp) = build_stack(operator_config(port)).await;
+    let (storage, _server, mut mcp) = build_stack(operator_config(port)).await;
     let token = seed(&storage, "finsandbox-read", "finsandbox", "data.read").await;
     register_pack_capability(&storage, ledger_cap()).await;
 
@@ -475,7 +567,7 @@ async fn agent_reads_the_ledger_through_tools_call_using_only_the_advertised_sch
 #[tokio::test]
 async fn a_caller_supplied_method_is_refused_and_never_widens_the_verb() {
     let (port, rec) = start_sandbox().await;
-    let (storage, mut mcp) = build_stack(operator_config(port)).await;
+    let (storage, _server, mut mcp) = build_stack(operator_config(port)).await;
     // A READ capability: GET /v1/ledger*. The classic escalation is turning it
     // into a POST.
     let token = seed(&storage, "finsandbox-read", "finsandbox", "data.read").await;
@@ -509,7 +601,7 @@ async fn a_caller_supplied_method_is_refused_and_never_widens_the_verb() {
 #[tokio::test]
 async fn a_caller_supplied_method_is_refused_even_when_it_matches_the_pin() {
     let (port, rec) = start_sandbox().await;
-    let (storage, mut mcp) = build_stack(operator_config(port)).await;
+    let (storage, _server, mut mcp) = build_stack(operator_config(port)).await;
     let token = seed(&storage, "finsandbox-refund", "finsandbox", "money.refund").await;
     register_pack_capability(&storage, refund_cap()).await;
 
@@ -533,12 +625,12 @@ async fn a_caller_supplied_method_is_refused_even_when_it_matches_the_pin() {
 }
 
 /// An operator-pinned `plugin_params.method` (what govder's `ToCapUpsert` now
-/// writes) is honoured and wins: the capability executes with the pinned verb
-/// even though the target's `methods` list is what derived it.
+/// writes) is honoured and wins: after approval, the capability executes with
+/// the pinned verb even though the target's `methods` list is empty.
 #[tokio::test]
 async fn an_operator_pinned_plugin_param_method_is_what_executes() {
     let (port, rec) = start_sandbox().await;
-    let (storage, mut mcp) = build_stack(operator_config(port)).await;
+    let (storage, server, mut mcp) = build_stack(operator_config(port)).await;
     let token = seed(&storage, "finsandbox-refund", "finsandbox", "money.refund").await;
     let mut pinned = serde_json::Map::new();
     pinned.insert("method".to_string(), serde_json::json!("POST"));
@@ -558,9 +650,18 @@ async fn an_operator_pinned_plugin_param_method_is_what_executes() {
             ("body", refund_body()),
         ],
     );
-    tools_call(&mut mcp, "issue_refund", args)
+    let pending = tools_call(&mut mcp, "issue_refund", args)
         .await
-        .expect("the operator-pinned method executes");
+        .expect("the operator-pinned request opens its approval");
+    assert!(
+        pending.contains("APPROVAL REQUIRED") && pending.contains("status: pending"),
+        "{pending}"
+    );
+    assert!(
+        rec.hits.lock().unwrap().is_empty(),
+        "the method pin must not bypass the critical-action gate"
+    );
+    approve_only_pending_and_resume(&storage, &server).await;
 
     let hits = rec.hits.lock().unwrap().clone();
     assert_eq!(hits.len(), 1, "exactly one sandbox request: {hits:?}");
