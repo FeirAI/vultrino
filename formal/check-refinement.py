@@ -42,7 +42,10 @@ tenant_assert = (ROOT / "src/govder/tenant_assert.rs").read_text()
 authority_lean = (ROOT / "formal/lean/Vultrino/Approval/Authority.lean").read_text()
 approval_model_lean = (ROOT / "formal/lean/Vultrino/Approval/Model.lean").read_text()
 action_authority_lean = (ROOT / "formal/lean/Vultrino/Approval/ActionAuthority.lean").read_text()
+method_authority_lean = (ROOT / "formal/lean/Vultrino/Action/MethodAuthority.lean").read_text()
 config = (ROOT / "src/config/mod.rs").read_text()
+capability = (ROOT / "src/capability/mod.rs").read_text()
+internal_http_capability_tests = (ROOT / "tests/capability_internal_http_toolcall.rs").read_text()
 
 if not lib.startswith("#![forbid(unsafe_code)]") or not main.startswith("#![forbid(unsafe_code)]"):
     fail("the library and production CLI must both forbid unsafe Rust")
@@ -173,6 +176,38 @@ for theorem in (
 ):
     if f"theorem {theorem}" not in action_authority_lean:
         fail(f"Lean action-authority theorem missing: {theorem}")
+for hook in (
+    "self.resolve_pinned_http_method()?",
+    'if args_obj.contains_key("method")',
+    "let method = capability.resolve_pinned_http_method()?",
+    'params.insert("method".to_string(), serde_json::json!(method))',
+):
+    if hook not in capability:
+        fail(f"internal HTTP method-authority refinement hook missing: {hook!r}")
+caller_method_rejection = capability.find('if args_obj.contains_key("method")')
+operator_resolution = capability.find(
+    "let method = capability.resolve_pinned_http_method()?", caller_method_rejection
+)
+plugin_params_merge = capability.find("for (k, v) in &capability.target.plugin_params", operator_resolution)
+final_method_pin = capability.find(
+    'params.insert("method".to_string(), serde_json::json!(method))', plugin_params_merge
+)
+if min(caller_method_rejection, operator_resolution, plugin_params_merge, final_method_pin) < 0 or not (
+    caller_method_rejection < operator_resolution < plugin_params_merge < final_method_pin
+):
+    fail("caller method rejection and final operator method pin ordering drifted")
+for theorem in (
+    "successful_method_is_operator_method",
+    "caller_method_is_rejected",
+):
+    if f"theorem {theorem}" not in method_authority_lean:
+        fail(f"Lean method-authority theorem missing: {theorem}")
+for test in (
+    "a_caller_supplied_method_is_refused_and_never_widens_the_verb",
+    "a_caller_supplied_method_is_refused_even_when_it_matches_the_pin",
+):
+    if f"async fn {test}" not in internal_http_capability_tests:
+        fail(f"internal HTTP method-authority integration test missing: {test}")
 
 abi_validation = installer.find("WasmPlugin::from_directory(staging_path.clone())")
 plugin_copy = installer.find("self.copy_plugin(&staging_path, &target_dir)")
@@ -211,4 +246,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; fail-closed canonical action aliases; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; fail-closed canonical action aliases; operator-pinned internal HTTP method; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

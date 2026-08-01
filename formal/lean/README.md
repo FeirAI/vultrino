@@ -48,6 +48,11 @@ configured business label by presenting its shared canonical plugin verb, a
 missing exact canonical rule cannot open the weaker numeric-approval path. An
 exact rule filed under the canonical key remains authoritative.
 
+`Action.MethodAuthority.successful_method_is_operator_method` proves that every
+successfully composed named internal-HTTP capability request uses its unique
+operator method source, while `caller_method_is_rejected` proves an agent-supplied
+method never yields an executable plugin request.
+
 `Credentials.reachable_credentials_are_confined` proves, by induction over
 every reachable credential-flow trace, that raw credential material reaches
 only the encrypted vault, the private injector, or the specifically authorized
@@ -84,6 +89,9 @@ the model:
   canonical verb; a canonical presentation whose verb is targeted by configured
   labels may use an exact canonical rule, but otherwise fails closed before the
   numeric-approval fallback;
+- internal-HTTP capability registration requires one unambiguous method source;
+  named tool calls reject a caller `method` before resolving and finally
+  overwriting the plugin request with the operator method;
 - WASM ABI v2 serializes only an alias/type credential handle. ABI v1 modules,
   including the archived PGP fixture, fail installation and loading;
 - plaintext `Secret` serialization requires a crate-private, dynamically scoped
@@ -155,6 +163,7 @@ declared-transform assumptions.
 | `Evidence.validFor` | one pure function run under the storage claim lock |
 | `Authority.AssertionEvidence.validFor` | inbound HMAC verifier over raw body plus actual tenant/method/path/query/Host, bounded to five minutes |
 | `ActionAuthority.decideAuthority` | label-first exact Govder lookup plus canonical-label ambiguity refusal before numeric fallback |
+| `Action.MethodAuthority.composeMethod` | registration-time method-source validation plus caller-method rejection and final operator pin in `build_internal_http_params` |
 | `Approval.Step.execute` | the single buffered/streaming dispatch seam |
 | `Credentials.Operation` | built-ins are trusted declassification points; untrusted WASM receives only a handle |
 | `PublicPayload` | fail-closed egress result whose constructor checks every declared form |

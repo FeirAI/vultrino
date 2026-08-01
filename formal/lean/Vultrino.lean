@@ -2,6 +2,7 @@ import Vultrino.Approval.ExecutionSafety
 import Vultrino.Approval.Authority
 import Vultrino.Approval.ActionAuthority
 import Vultrino.Credentials.Confinement
+import Vultrino.Action.MethodAuthority
 
 /-!
 The machine-checked entry point for Vultrino's critical-boundary model.
@@ -19,6 +20,8 @@ The machine-checked entry point for Vultrino's critical-boundary model.
   independent-identity witness.
 * a canonical plugin verb shared by configured business labels cannot fall back
   to weaker numeric approval when no exact canonical rule is found.
+* a named internal-HTTP capability executes only its unique operator-pinned
+  method; any caller-supplied method is rejected before composition.
 
 The Rust implementation must refine this model. The proof/refinement boundary
 and the deliberately explicit trusted-computing-base assumptions are documented
