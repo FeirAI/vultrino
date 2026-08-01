@@ -4,8 +4,9 @@
 //! Vultrino using API keys instead of session-based authentication.
 
 use axum::{
-    extract::{FromRequestParts, Json, Path, Query, State},
-    http::{header, request::Parts, StatusCode},
+    body::Bytes,
+    extract::{FromRequestParts, Json, OriginalUri, Path, Query, State},
+    http::{header, request::Parts, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -672,6 +673,17 @@ const MAX_APPROVALS_LIST: usize = 500;
 /// identity in the self-approval SoD check.
 const NO_OPERATOR_SENTINEL: &str = "-";
 
+/// Existing cross-plane assertion wire, reused for broker-authenticated approval
+/// identity. The assertion binds the exact decision route and raw JSON bytes, so
+/// Vultrino may distinguish two verified subjects behind one broker key without
+/// weakening the legacy same-key anti-fabrication guard.
+const BROKER_ASSERTION_HEADER: &str = "X-Govder-Tenant-Assertion";
+
+/// Independent verifier cap, matching Govder's public assertion contract. An
+/// operator-configured signer TTL may be shorter, but can never lengthen this
+/// approval identity/replay window beyond five minutes.
+const MAX_BROKER_ASSERTION_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// Require the acting admin key to be tenant-scoped on the product-aggregator
 /// approvals surface, returning its tenant. A `None`-tenant key is a global
 /// admin — a deliberately SEPARATE surface (the HTML console), not this one — so
@@ -895,7 +907,10 @@ pub async fn api_decide_approval(
     admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(body): Json<DecideReq>,
+    OriginalUri(original_uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body_bytes: Bytes,
 ) -> Response {
     // SECURITY: this is the per-tenant aggregator surface — a global (untenanted)
     // admin key has no business deciding here (it would be able to decide ANY
@@ -904,6 +919,94 @@ pub async fn api_decide_approval(
     let acting_tenant = match require_tenant_scoped(&admin).await {
         Ok(t) => t,
         Err(resp) => return resp,
+    };
+
+    // A PRESENT broker assertion is an explicit attempt to cross the stronger
+    // identity boundary: it must verify or the request fails closed. We never
+    // fall back to an aggregator-asserted identity after a bad/misconfigured
+    // assertion. The MAC is checked against the raw bytes BEFORE JSON decoding,
+    // and against the actual method/path/query/Host received by Axum.
+    let mut assertion_values = headers.get_all(BROKER_ASSERTION_HEADER).iter();
+    let assertion_value = assertion_values.next();
+    if assertion_values.next().is_some() {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_tenant_assertion",
+            "Invalid broker tenant assertion",
+        );
+    }
+    let verified_broker_assertion = if let Some(raw_assertion) = assertion_value {
+        let assertion = match raw_assertion.to_str() {
+            Ok(v) => v,
+            Err(_) => {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_tenant_assertion",
+                    "Invalid broker tenant assertion",
+                )
+            }
+        };
+        let govder = match state.config.govder.as_ref() {
+            Some(cfg) if cfg.is_configured() => cfg,
+            _ => {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_tenant_assertion",
+                    "Invalid broker tenant assertion",
+                )
+            }
+        };
+        let host = match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_tenant_assertion",
+                    "Invalid broker tenant assertion",
+                )
+            }
+        };
+        if let Err(error) = crate::govder::verify_tenant_assertion(
+            assertion,
+            &govder.assertion_secret,
+            acting_tenant,
+            method.as_str(),
+            original_uri.path(),
+            original_uri.query().unwrap_or(""),
+            host,
+            &body_bytes,
+            chrono::Utc::now(),
+            govder.assertion_ttl.min(MAX_BROKER_ASSERTION_TTL),
+        ) {
+            tracing::warn!(
+                error = %error,
+                tenant = %acting_tenant,
+                approval_id = %id,
+                "rejected request-bound broker approval assertion"
+            );
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_tenant_assertion",
+                "Invalid broker tenant assertion",
+            );
+        }
+        true
+    } else {
+        false
+    };
+
+    // Preserve the old Json-extractor boundary while retaining the exact raw
+    // bytes required by the assertion verifier. Invalid JSON is rejected before
+    // any lookup or state transition.
+    let body: DecideReq = match serde_json::from_slice(&body_bytes) {
+        Ok(body) => body,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "Invalid decision request",
+            )
+        }
     };
 
     // Reload so the existence/visibility check sees the authoritative state.
@@ -934,15 +1037,12 @@ pub async fn api_decide_approval(
         }
     };
 
-    // Attribute the decision to the human operator the aggregator passed, but
-    // record it as an AGGREGATOR-ASSERTED identity — vultrino must not present a
-    // caller-supplied string as a verified identity. The recorded approver is
-    // ALWAYS `agg:<acting-api-key-id>:<operator>`, which (a) keeps the human-
-    // readable operator for audit, and (b) makes the asserting key explicit. The
-    // operator part is a CLAIM the aggregator (feir-os) makes — vultrino trusts
-    // feir-os to pass the real authenticated operator, but the namespace records
-    // WHICH key made that claim, so a decision is never mistaken for a first-party
-    // identity.
+    // Unsigned legacy calls remain AGGREGATOR-ASSERTED identities and retain the
+    // hard one-positive-slot-per-key guard. A valid request-bound assertion
+    // upgrades only a non-empty operator to `verified:<subject>`: its tenant,
+    // approval id, outcome, subject, and class are all covered by the MAC. This is
+    // what lets a single broker transport two independently authenticated humans
+    // without letting its bearer API key fabricate two caller-supplied strings.
     //
     // SECURITY: the namespace MUST be applied unconditionally. When no operator is
     // supplied we use a sentinel (`agg:<key-id>:-`) rather than the bare key id —
@@ -957,7 +1057,11 @@ pub async fn api_decide_approval(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(NO_OPERATOR_SENTINEL);
-    let approver = format!("agg:{}:{}", admin.0.api_key.id, operator);
+    let approver = if verified_broker_assertion && operator != NO_OPERATOR_SENTINEL {
+        format!("{}{}", crate::approval::VERIFIED_IDENTITY_PREFIX, operator)
+    } else {
+        format!("agg:{}:{}", admin.0.api_key.id, operator)
+    };
 
     let enforce_sod = state.config.approval.enforce_separation_of_duty;
 

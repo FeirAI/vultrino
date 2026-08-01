@@ -37,6 +37,9 @@ installer = (ROOT / "src/plugins/installer.rs").read_text()
 main = (ROOT / "src/main.rs").read_text()
 kani_runner = (ROOT / "formal/run-kani.sh").read_text()
 policy = (ROOT / "src/policy/mod.rs").read_text()
+api = (ROOT / "src/web/api.rs").read_text()
+tenant_assert = (ROOT / "src/govder/tenant_assert.rs").read_text()
+authority_lean = (ROOT / "formal/lean/Vultrino/Approval/Authority.lean").read_text()
 
 if not lib.startswith("#![forbid(unsafe_code)]") or not main.startswith("#![forbid(unsafe_code)]"):
     fail("the library and production CLI must both forbid unsafe Rust")
@@ -105,6 +108,33 @@ if "approval.validate_vault_shape()" not in storage:
 if "self.approval_rule.is_some() || self.effective_required_approvals() > 1" not in approval:
     fail("multi-principal controller separation no longer covers every recipe")
 
+for hook in (
+    "verify_tenant_assertion(",
+    "original_uri.path()",
+    "original_uri.query().unwrap_or(\"\")",
+    "&body_bytes",
+    "govder.assertion_ttl.min(MAX_BROKER_ASSERTION_TTL)",
+    "verified_broker_assertion && operator != NO_OPERATOR_SENTINEL",
+    "VERIFIED_IDENTITY_PREFIX",
+):
+    if hook not in api and hook not in approval:
+        fail(f"broker approval assertion refinement hook missing: {hook!r}")
+for hook in (
+    "tenant.as_slice() != expected_tenant.as_bytes()",
+    "remaining < 0",
+    "max_ttl.as_secs()",
+    "mac.verify_slice(&supplied_mac)",
+):
+    if hook not in tenant_assert:
+        fail(f"inbound tenant assertion verifier hook missing: {hook!r}")
+for theorem in (
+    "verified_broker_identity_is_exact",
+    "changed_binding_rejected",
+    "aggregator_claim_is_not_independent",
+):
+    if f"theorem {theorem}" not in authority_lean:
+        fail(f"Lean approval authority theorem missing: {theorem}")
+
 abi_validation = installer.find("WasmPlugin::from_directory(staging_path.clone())")
 plugin_copy = installer.find("self.copy_plugin(&staging_path, &target_dir)")
 if abi_validation < 0 or plugin_copy < 0 or abi_validation > plugin_copy:
@@ -142,4 +172,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: PASS (8 binding fields; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: PASS (8 execution binding fields; exact-bound broker approval authority; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

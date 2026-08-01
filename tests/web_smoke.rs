@@ -421,6 +421,43 @@ fn admin_req(method: &str, uri: &str, key: &str, body: serde_json::Value) -> Req
         .unwrap()
 }
 
+const TEST_BROKER_ASSERTION_SECRET: &str = "test-broker-approval-assertion-secret";
+const TEST_VULTRINO_HOST: &str = "vultrino.test";
+
+/// Build the exact request shape feir-os sends for a broker-verified approval.
+/// `signed_body` is separate from `sent_body` so negative tests can prove any
+/// post-signing change fails before a sign-off is recorded.
+fn signed_admin_decision_req(
+    uri: &str,
+    key: &str,
+    tenant: &str,
+    signed_body: serde_json::Value,
+    sent_body: serde_json::Value,
+) -> Request<Body> {
+    let signed_bytes = serde_json::to_vec(&signed_body).unwrap();
+    let sent_bytes = serde_json::to_vec(&sent_body).unwrap();
+    let parsed: axum::http::Uri = uri.parse().unwrap();
+    let assertion = vultrino::govder::sign_tenant_assertion(
+        TEST_BROKER_ASSERTION_SECRET,
+        tenant,
+        "POST",
+        parsed.path(),
+        parsed.query().unwrap_or(""),
+        TEST_VULTRINO_HOST,
+        &signed_bytes,
+        chrono::Utc::now() + chrono::Duration::seconds(60),
+    );
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("host", TEST_VULTRINO_HOST)
+        .header("authorization", format!("Bearer {}", key))
+        .header("content-type", "application/json")
+        .header("x-govder-tenant-assertion", assertion)
+        .body(Body::from(sent_bytes))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn test_health_endpoint() {
     let (router, _) = build_router().await;
@@ -3470,6 +3507,12 @@ async fn build_hard_sod_recipe_fixture(
 
     let mut sod_config = Config::default();
     sod_config.approval.enforce_separation_of_duty = true;
+    sod_config.govder = Some(GovderConfig {
+        base_url: "http://govder.invalid".to_string(),
+        assertion_secret: TEST_BROKER_ASSERTION_SECRET.to_string(),
+        assertion_ttl: Duration::from_secs(90),
+        http_timeout: Duration::from_secs(1),
+    });
 
     let admin = AdminAuth::new("admin", "password123").unwrap();
     let resolver = vultrino::router::CredentialResolver::new(storage.clone());
@@ -3574,6 +3617,105 @@ async fn test_json_decision_recipe_hard_sod_senior_pair_one_key_409() {
         1,
         "the second same-key sign-off was not recorded"
     );
+}
+
+#[tokio::test]
+async fn test_verified_broker_assertion_allows_two_bound_subjects_on_one_key() {
+    let rule = ApprovalRule {
+        recipes: vec![Recipe {
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Teammate,
+                count: 2,
+            }],
+        }],
+        decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+    };
+    let (router, storage, key, id) =
+        build_hard_sod_recipe_fixture("team-a", rule, "High").await;
+    let uri = format!("/api/v1/approvals/{id}/decision");
+
+    let alice = serde_json::json!({
+        "approve": true,
+        "approver": "sub-alice",
+        "approver_class": "teammate",
+    });
+    let response = router
+        .clone()
+        .oneshot(signed_admin_decision_req(
+            &uri,
+            &key,
+            "team-a",
+            alice.clone(),
+            alice,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let after_one = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(after_one.status(), vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(after_one.signoffs().len(), 1);
+    assert_eq!(after_one.signoffs()[0].approver_identity, "verified:sub-alice");
+
+    let bob = serde_json::json!({
+        "approve": true,
+        "approver": "sub-bob",
+        "approver_class": "teammate",
+    });
+    let response = router
+        .oneshot(signed_admin_decision_req(
+            &uri,
+            &key,
+            "team-a",
+            bob.clone(),
+            bob,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let after_two = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(after_two.status(), vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(after_two.signoffs().len(), 2);
+    assert_eq!(after_two.signoffs()[1].approver_identity, "verified:sub-bob");
+}
+
+#[tokio::test]
+async fn test_invalid_present_broker_assertion_fails_closed_without_signoff() {
+    let rule = ApprovalRule {
+        recipes: vec![Recipe {
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Senior,
+                count: 1,
+            }],
+        }],
+        decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+    };
+    let (router, storage, key, id) =
+        build_hard_sod_recipe_fixture("team-a", rule, "High").await;
+    let uri = format!("/api/v1/approvals/{id}/decision");
+    let signed = serde_json::json!({
+        "approve": true,
+        "approver": "sub-alice",
+        "approver_class": "senior",
+    });
+    let tampered = serde_json::json!({
+        "approve": true,
+        "approver": "sub-mallory",
+        "approver_class": "senior",
+    });
+    let response = router
+        .oneshot(signed_admin_decision_req(
+            &uri,
+            &key,
+            "team-a",
+            signed,
+            tampered,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
+    assert!(stored.signoffs().is_empty(), "tampered request recorded a sign-off");
 }
 
 #[tokio::test]

@@ -388,6 +388,17 @@ Mints keep at-most-once because their plaintext is shown exactly once.
 The JSON counterpart to the HTML console decision (A4), for the per-tenant product
 aggregator. Authenticate with an admin `vk_` key. Body: `{ "approve": true|false, "note": "…" }`.
 
+The feir-os broker additionally sends `approver` (its immutable authenticated
+ticket subject) and `approver_class`, plus an `X-Govder-Tenant-Assertion` signed
+over the exact tenant, method, path, query, Host, and raw JSON body. When that
+header is present Vultrino requires a valid, unexpired assertion (server-capped
+at five minutes) before recording `verified:<subject>`; any mismatch fails `401`
+and records nothing. Without the header the identity remains
+`agg:<acting-key-id>:<claimed-operator>`, and one key may contribute at most one
+positive slot to a multi-person recipe. A bearer key alone therefore cannot
+manufacture two approvers, while one verified broker can transport two distinct
+authenticated subjects.
+
 It is **tenant-partitioned**: the approval must be `visible_to_tenant` for the acting
 key's tenant or the route returns `404` (never revealing a cross-tenant approval's
 existence), and a **global (untenanted) admin key is rejected `403`** before any lookup —

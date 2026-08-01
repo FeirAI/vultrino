@@ -2479,6 +2479,13 @@ pub enum ApprovalError {
 /// detect two sign-offs from the same key under hard M-of-N SoD.
 pub const AGG_IDENTITY_PREFIX: &str = "agg:";
 
+/// Prefix for an approver identity whose immutable subject and class arrived in
+/// an exact-request-bound assertion verified under the configured broker/Govder
+/// HMAC key. Unlike `agg:`, this provenance permits distinct verified subjects
+/// behind one broker API key to fill distinct recipe slots; the bearer key alone
+/// still cannot manufacture them.
+pub const VERIFIED_IDENTITY_PREFIX: &str = "verified:";
+
 /// If `identity` is an aggregator-asserted identity (`agg:<key-id>:<operator>`),
 /// return the un-namespaced operator (everything after the second colon) for SoD
 /// comparison; otherwise return it unchanged. A malformed `agg:`-prefixed value
@@ -2489,6 +2496,9 @@ pub const AGG_IDENTITY_PREFIX: &str = "agg:";
 /// distinctness on the immutable subject, not vultrino's per-key `agg:` wrapper
 /// (Codex P2 RE-REVIEW RE-BLOCKER 1 / payload item).
 pub fn bare_approver_identity(identity: &str) -> &str {
+    if let Some(subject) = identity.strip_prefix(VERIFIED_IDENTITY_PREFIX) {
+        return subject;
+    }
     let Some(rest) = identity.strip_prefix(AGG_IDENTITY_PREFIX) else {
         return identity;
     };
@@ -3323,6 +3333,13 @@ mod tests {
             "alice@example.com"
         );
         assert_eq!(aggregator_key_prefix("alice@example.com"), None);
+        // A cryptographically request-bound broker subject strips only its
+        // provenance marker and is never classified as a bearer-key claim.
+        assert_eq!(
+            bare_approver_identity("verified:sub-alice"),
+            "sub-alice"
+        );
+        assert_eq!(aggregator_key_prefix("verified:sub-alice"), None);
         // agg:<key-id>:<operator> → bare operator + key prefix.
         let id = "agg:11111111-2222-3333-4444-555555555555:alice@example.com";
         assert_eq!(bare_approver_identity(id), "alice@example.com");

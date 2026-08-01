@@ -192,6 +192,12 @@ lifecycle: a **lazy** advance on each agent poll, and a **background sweep**
 (`APPROVAL_SWEEP_SECS = 15`) so requests nobody is polling still escalate/expire.
 Dual-control (V12) requires *M* distinct approvers (default 2). Decisions are made
 in the admin panel, via a signed out-of-band link (Telegram/webhook), or the CLI.
+The feir-os JSON decision path may carry a short-lived request-bound HMAC
+assertion over the authenticated subject and class. Valid assertions enter the
+`verified:` namespace; unsigned subjects remain `agg:<key>:` claims subject to
+the one-positive-slot-per-key guard. A present invalid assertion never falls
+back. Correct human authentication before the broker signs remains a
+cross-plane/IdP premise, not something Vultrino can establish locally.
 A delegate agent can also decide via a `vap_` token at
 `POST /api/v1/approvals/{id}/delegate-decision`, gated by govder-evaluated D3
 floors (irreversible => human-only, Medium risk => veto window); the sign-off

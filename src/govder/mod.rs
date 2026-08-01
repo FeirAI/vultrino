@@ -13,7 +13,9 @@ use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
-pub use tenant_assert::sign_tenant_assertion;
+pub use tenant_assert::{
+    sign_tenant_assertion, verify_tenant_assertion, TenantAssertionError,
+};
 
 /// Configuration for outbound govder delegation calls.
 #[derive(Clone)]

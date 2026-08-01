@@ -28,6 +28,15 @@ evidence that is:
   `reachable_approval_consumption_is_one_shot` theorem proves that consumed
   exact-request bindings never repeat in any reachable trace.
 
+`Approval.Authority.verified_broker_identity_is_exact` proves that a broker
+identity accepted through the stronger JSON-decision path has the exact tenant,
+approval id, outcome, subject, approver class, method, path, query, host, and
+body digest covered by its evidence. `changed_binding_rejected` proves that the
+same evidence cannot validate any changed tuple. The model deliberately gives
+plain bearer-key identity claims no independent-authentication witness, matching
+the Rust rule that unsigned `agg:<key>:` identities can contribute at most one
+positive recipe slot per key.
+
 `Credentials.reachable_credentials_are_confined` proves, by induction over
 every reachable credential-flow trace, that raw credential material reaches
 only the encrypted vault, the private injector, or the specifically authorized
@@ -53,6 +62,10 @@ the model:
   `Authorized<ActionPayload>` accepted by the only two dispatch variants;
 - approval claims derive the epoch-bound grant while holding the vault lock and
   refuse epoch overflow;
+- the approval JSON handler verifies any present broker assertion over the raw
+  received bytes and actual route/Host before decoding authority-bearing fields;
+  bad, expired, cross-tenant, over-five-minute, or request-mismatched assertions
+  fail closed, while unsigned callers remain in the guarded `agg:<key>:` namespace;
 - WASM ABI v2 serializes only an alias/type credential handle. ABI v1 modules,
   including the archived PGP fixture, fail installation and loading;
 - plaintext `Secret` serialization requires a crate-private, dynamically scoped
@@ -93,6 +106,10 @@ The proof also makes these assumptions explicit:
   hashing, or other transformations;
 - cryptographic primitives, the OS/process boundary, allocator behavior,
   zeroization, and hardware side channels are in the trusted computing base;
+- a `verified:` approval identity means the holder of the configured shared
+  broker/Govder assertion key signed the exact request. Correct authentication of
+  the human ticket and immutable subject/group resolution inside that signer is a
+  composition premise; the Lean theorem does not prove the IdP or HMAC primitive;
 - digest equality is exact in the model, but SHA-256 collision resistance and
   the producer's authentication of the rule digest are cryptographic/composition
   assumptions rather than theorems about the hash implementation;
@@ -118,6 +135,7 @@ declared-transform assumptions.
 | `RequestBinding` | private `ExecutionBinding` containing the same eight fields |
 | `ExecutionPermit` | non-cloneable, private-constructor `ExecutionPermit` consumed at the side-effect call |
 | `Evidence.validFor` | one pure function run under the storage claim lock |
+| `Authority.AssertionEvidence.validFor` | inbound HMAC verifier over raw body plus actual tenant/method/path/query/Host, bounded to five minutes |
 | `Approval.Step.execute` | the single buffered/streaming dispatch seam |
 | `Credentials.Operation` | built-ins are trusted declassification points; untrusted WASM receives only a handle |
 | `PublicPayload` | fail-closed egress result whose constructor checks every declared form |
