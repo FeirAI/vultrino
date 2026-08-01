@@ -21,6 +21,16 @@ at Govder authoring and permanently unsatisfiable at Vultrino consumption. -/
 def Recipe.supported (recipe : Recipe) : Prop :=
   recipe.wellFormed ∧ recipe.agentReviewer = 0
 
+/-- The consumer accepts exactly the same human-only domain as Govder's current
+floor. Risk, autonomy, and irreversibility are universally quantified so this
+proof must change if any non-human recipe class is enabled later. -/
+theorem supported_recipe_satisfies_every_floor {recipe : Recipe}
+    (supported : recipe.supported) :
+    ∀ (_riskTier _autonomy : String) (_irreversible : Bool),
+      recipe.agentReviewer = 0 ∧ 0 < recipe.senior + recipe.teammate := by
+  intro _riskTier _autonomy _irreversible
+  exact ⟨supported.2, by simpa [supported.2] using supported.1.1⟩
+
 /-- An authoritative rule is a disjunction of whole recipes. -/
 structure Rule where
   recipes : List Recipe

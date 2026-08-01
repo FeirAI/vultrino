@@ -152,6 +152,8 @@ if "if need_agent_reviewer > 0" not in approval:
     fail("agent-reviewer recipes are no longer hard-rejected by the runtime evaluator")
 if "theorem agent_reviewer_recipe_is_unsatisfiable" not in approval_model_lean:
     fail("Lean model no longer proves agent-reviewer recipes unsatisfiable")
+if "theorem supported_recipe_satisfies_every_floor" not in approval_model_lean:
+    fail("Lean model no longer proves supported recipes satisfy every authority floor")
 
 abi_validation = installer.find("WasmPlugin::from_directory(staging_path.clone())")
 plugin_copy = installer.find("self.copy_plugin(&staging_path, &target_dir)")

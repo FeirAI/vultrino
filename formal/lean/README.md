@@ -26,6 +26,9 @@ evidence that is:
   controller separation; and
 - unable to satisfy any recipe containing a disabled agent-reviewer term, so
   Govder-only D4(c)/(d)/(e) reviewer checks cannot be bypassed at this consumer; and
+- restricted to a non-empty human-only recipe domain that
+  `supported_recipe_satisfies_every_floor` proves remains valid for every current
+  risk/autonomy/irreversibility floor; and
 - issued no later than execution, unexpired, and unconsumed. The separate
   `reachable_approval_consumption_is_one_shot` theorem proves that consumed
   exact-request bindings never repeat in any reachable trace.
