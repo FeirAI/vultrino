@@ -82,6 +82,9 @@ pub struct AppState {
     pub server: Arc<crate::server::VultrinoServer>,
     /// Govder decide-plane client for delegation grant/evaluate (plan 031).
     pub govder: Option<Arc<crate::govder::GovderClient>>,
+    /// Workload assertion verifier snapshotted once when the router is built.
+    /// The exchange handler never rereads environment or secret files.
+    pub(crate) workload_verifier: super::workload_exchange::WorkloadVerifier,
     /// In-flight MCP requests keyed by a hash of the authenticated principal and
     /// JSON-RPC request id. Cancellation notifications remove and abort exactly
     /// the referenced request without retaining bearer secrets in memory.
@@ -129,6 +132,50 @@ impl WebServer {
         admin_auth: AdminAuth,
         server: Arc<crate::server::VultrinoServer>,
     ) -> Self {
+        let workload_verifier = super::workload_exchange::WorkloadVerifier::from_env();
+        Self::new_with_workload_verifier(
+            config,
+            vultrino_config,
+            storage,
+            auth_manager,
+            admin_auth,
+            server,
+            workload_verifier,
+        )
+    }
+
+    /// Create the production web server from the exact security snapshot that
+    /// passed [`super::validate_security_startup`].
+    pub fn new_with_security_startup(
+        config: WebConfig,
+        security_startup: super::WebSecurityStartup,
+        storage: Arc<dyn StorageBackend>,
+        auth_manager: AuthManager,
+        admin_auth: AdminAuth,
+        server: Arc<crate::server::VultrinoServer>,
+    ) -> Self {
+        let (vultrino_config, workload_verifier) = security_startup.into_parts();
+        Self::new_with_workload_verifier(
+            config,
+            vultrino_config,
+            storage,
+            auth_manager,
+            admin_auth,
+            server,
+            workload_verifier,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_workload_verifier(
+        config: WebConfig,
+        vultrino_config: Config,
+        storage: Arc<dyn StorageBackend>,
+        auth_manager: AuthManager,
+        admin_auth: AdminAuth,
+        server: Arc<crate::server::VultrinoServer>,
+        workload_verifier: super::workload_exchange::WorkloadVerifier,
+    ) -> Self {
         // Trust X-Forwarded-For only when explicitly declared behind a trusted proxy.
         let trust_forwarded_for = std::env::var("VULTRINO_TRUST_FORWARDED_FOR")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -169,6 +216,7 @@ impl WebServer {
             trust_forwarded_for,
             server,
             govder,
+            workload_verifier,
             mcp_requests: Arc::new(RwLock::new(std::collections::HashMap::new())),
             config_loaded_at: chrono::Utc::now(),
         };

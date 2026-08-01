@@ -8,12 +8,10 @@
 //! must REFUSE: forged signature, replay, identity-binding mismatch, expiry, and
 //! the feature being disabled / unconfigured.
 //!
-//! `exchange_workload_token` reads two PROCESS-GLOBAL env vars
-//! (`VULTRINO_WORKLOAD_EXCHANGE_ENABLED`, `VULTRINO_WORKLOAD_ASSERTION_SECRET`).
-//! cargo runs the tests in this binary on parallel threads, so a static mutex
-//! (`ENV_LOCK`) serializes them: each test takes the lock, sets the exact env
-//! state it needs, and holds the guard across its request so no sibling test can
-//! observe a half-configured environment.
+//! `WebServer::new` snapshots the process-global workload-exchange environment;
+//! the request handler never rereads it. Cargo runs the tests in this binary on
+//! parallel threads, so a static mutex (`ENV_LOCK`) serializes router creation:
+//! each test takes the lock and sets the exact startup state it needs.
 
 use std::sync::{Arc, Mutex};
 
@@ -355,6 +353,29 @@ async fn enabled_without_secret_is_503() {
     let assertion = mint_assertion(VERIFIER_SECRET, valid_claims("jti-unconfigured"));
     let resp = router.oneshot(exchange_req(&assertion)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// The verifier authority is frozen when the router is built. A later process
+/// environment mutation cannot replace the key used by an already-healthy
+/// server; production additionally refuses an invalid snapshot at startup.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn verifier_is_snapshotted_before_requests() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    enable_exchange();
+    let (router, _storage, admin_key) = build_router().await;
+    author_grant(&router, &admin_key).await;
+
+    unsafe {
+        std::env::set_var(
+            "VULTRINO_WORKLOAD_ASSERTION_SECRET",
+            String::from_utf8_lossy(WRONG_SECRET).to_string(),
+        );
+    }
+
+    let assertion = mint_assertion(VERIFIER_SECRET, valid_claims("jti-snapshot"));
+    let resp = router.oneshot(exchange_req(&assertion)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ---------------------------------------------------------------------------

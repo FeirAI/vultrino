@@ -90,6 +90,9 @@ assertion rather than a pre-minted token, enable the exchange
 `POST /api/v1/workload/exchange` with its `vwa_` assertion to mint the short-lived
 MCP + model tokens. The runtime can hold a non-consuming liveness lease via
 `GET /api/v1/runtime/control` so a revoke/expiry/halt tears its work down.
+The production `web` command validates and snapshots the verifier before opening
+the vault; deployment must still keep that verifier aligned with the trusted
+identity-edge signer.
 
 ## Cross-plane composition (optional)
 

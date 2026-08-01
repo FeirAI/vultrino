@@ -144,20 +144,21 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   stated per-agent isolation as the intent. It is now keyed on `agent_label` with an id
   fallback, so a rotating workload shares one window. The **per-process, per-replica** bound
   below still applies on top of it.
-- **`VULTRINO_WORKLOAD_ASSERTION_SECRET` is read PER REQUEST, not at startup, and vultrino
-  has no startup validation of it.** A missing, blank or too-short value yields
-  `503 exchange_unconfigured` at exchange time; a wrong value yields
-  `401 invalid_workload_identity`. Neither is visible until an agent actually runs, and the
-  process starts and reports healthy either way. A comma-separated list is accepted as a
-  rotation overlap (every entry trimmed and ≥32 bytes, element 0 primary, a match against
-  any entry verifies). The counterpart signer refuses a short secret at *its* startup, which
-  is the only loud case in the relationship.
-- **`VULTRINO_POLICY_HASH_SECRET` is env-only and its absence is silent.** Unset or blank,
-  every policy `content_hash` is emitted **EMPTY** — it never falls back to a bare unkeyed
-  digest — so every consumer that compares a stored hash against a re-read one degrades to no
-  check at all. It is not parsed from `config.toml`, and because the TOML loader ignores
-  unknown keys, putting it there *looks right and does nothing*. It must also be stable across
-  restarts: rotating it makes every previously-authored hash mismatch, i.e. false drift.
+- **Workload-verifier shape is checked at startup, but signer alignment is still an operator
+  obligation.** When workload exchange is enabled, `vultrino web` refuses an absent, blank,
+  unreadable, or <32-byte verifier before vault access or listener bind. A comma-separated
+  overlap list is accepted (every entry trimmed and ≥32 bytes; a match against any entry
+  verifies), validated once, and frozen in `AppState`. This proves the running process has a
+  stable verifier snapshot; it cannot prove that the external identity-edge signer holds the
+  matching key. A validly shaped but mismatched key therefore starts successfully and rejects
+  every assertion with `401 invalid_workload_identity`.
+- **Policy-hash presence is checked at startup, but stability across restarts is still an
+  operator obligation.** `VULTRINO_POLICY_HASH_SECRET` remains env-only; putting it in
+  `config.toml` looks plausible but does nothing because unknown TOML keys are ignored.
+  Production `vultrino web` refuses an unset/blank value before touching the vault. It cannot
+  prove cross-process key continuity: rotating the value makes every previously authored hash
+  mismatch, i.e. false drift. The reusable embedded/test constructor remains permissive and
+  emits an empty hash when no key is supplied; it never falls back to a bare digest.
 - **There is no per-policy rules read-back.** `GET /api/v1/policies/{id}` does not exist and
   the collection GET returns a reduced DTO with no rules, so an external verifier cannot
   read back what a policy actually enforces. It can only compare `content_hash` (see above)

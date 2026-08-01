@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::fs;
+use std::sync::Arc;
+use zeroize::Zeroizing;
 
 use super::{api::AdminApiAuth, server::AppState};
 use crate::auth::{NewUseToken, UseToken, UseTokenMetadata};
@@ -294,7 +296,10 @@ pub async fn delete_workload_grant(
         .into_response()
 }
 
-fn verify_assertion(raw: &str, secrets: &[Vec<u8>]) -> Result<WorkloadAssertion, String> {
+fn verify_assertion(
+    raw: &str,
+    secrets: &[Zeroizing<Vec<u8>>],
+) -> Result<WorkloadAssertion, String> {
     let raw = raw
         .strip_prefix("vwa_")
         .ok_or("expected a vwa_ verified-workload assertion")?;
@@ -344,22 +349,22 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .map(str::trim)
 }
 
-fn verifier_secrets() -> Result<Vec<Vec<u8>>, &'static str> {
-    let value = match std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET_FILE") {
+fn verifier_secrets() -> Result<Vec<Zeroizing<Vec<u8>>>, &'static str> {
+    let value = Zeroizing::new(match std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET_FILE") {
         Ok(path) if !path.trim().is_empty() => fs::read_to_string(path)
             .map_err(|_| "workload assertion verifier file cannot be read")?,
         _ => std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET")
             .map_err(|_| "workload assertion verifier is not configured")?,
-    };
+    });
     // A comma-separated LIST of verifier secrets (dual-secret overlap for rotation); a single value is a
     // 1-element list = the pre-rotation behavior. Each non-blank entry is trimmed and must be >= 32
     // bytes. An all-blank/empty configuration yields no secrets → fail closed (never verify against no
     // key). Element 0 is the primary; verify accepts a match against ANY listed secret.
-    let secrets: Vec<Vec<u8>> = value
+    let secrets: Vec<Zeroizing<Vec<u8>>> = value
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.as_bytes().to_vec())
+        .map(|s| Zeroizing::new(s.as_bytes().to_vec()))
         .collect();
     if secrets.is_empty() {
         return Err("workload assertion verifier is not configured");
@@ -370,32 +375,61 @@ fn verifier_secrets() -> Result<Vec<Vec<u8>>, &'static str> {
     Ok(secrets)
 }
 
+/// Startup-snapshotted workload-verifier posture. The request path never rereads
+/// process environment or a secret file, so authority cannot change between
+/// health and the first exchange (or halfway through a rotation window).
+#[derive(Clone)]
+pub(crate) enum WorkloadVerifier {
+    Disabled,
+    Configured(Arc<Vec<Zeroizing<Vec<u8>>>>),
+    Invalid(&'static str),
+}
+
+impl WorkloadVerifier {
+    pub(crate) fn from_env() -> Self {
+        let enabled = std::env::var("VULTRINO_WORKLOAD_EXCHANGE_ENABLED")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        if !enabled {
+            return Self::Disabled;
+        }
+        match verifier_secrets() {
+            Ok(secrets) => Self::Configured(Arc::new(secrets)),
+            Err(message) => Self::Invalid(message),
+        }
+    }
+
+    pub(crate) fn startup_result(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Disabled | Self::Configured(_) => Ok(()),
+            Self::Invalid(message) => Err(message),
+        }
+    }
+}
+
 pub async fn exchange_workload_token(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    let enabled = std::env::var("VULTRINO_WORKLOAD_EXCHANGE_ENABLED")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    if !enabled {
-        return error(
-            StatusCode::NOT_FOUND,
-            "feature_disabled",
-            "workload exchange is disabled",
-        );
-    }
-    let secrets = match verifier_secrets() {
-        Ok(v) => v,
-        Err(message) => {
+    let secrets = match &state.workload_verifier {
+        WorkloadVerifier::Disabled => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "feature_disabled",
+                "workload exchange is disabled",
+            )
+        }
+        WorkloadVerifier::Invalid(message) => {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "exchange_unconfigured",
-                message,
+                *message,
             )
         }
+        WorkloadVerifier::Configured(secrets) => secrets,
     };
     let assertion = match bearer(&headers)
         .ok_or_else(|| "missing Bearer assertion".to_string())
-        .and_then(|v| verify_assertion(v, &secrets))
+        .and_then(|v| verify_assertion(v, secrets))
     {
         Ok(v) => v,
         Err(e) => return error(StatusCode::UNAUTHORIZED, "invalid_workload_identity", e),
@@ -719,23 +753,29 @@ mod tests {
         );
         // A one-element list is the pre-rotation behavior: the matching secret verifies, a wrong one
         // does not.
-        assert!(verify_assertion(&token, &[secret.to_vec()]).is_ok());
-        assert!(verify_assertion(&token, &[b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_vec()]).is_err());
+        assert!(verify_assertion(&token, &[Zeroizing::new(secret.to_vec())]).is_ok());
+        assert!(verify_assertion(
+            &token,
+            &[Zeroizing::new(
+                b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_vec()
+            )]
+        )
+        .is_err());
         // Dual-secret overlap: the token verifies as long as its signing secret is ANYWHERE in the
         // list (here the second, rotated-in secret), while a list of only wrong secrets still fails.
         assert!(verify_assertion(
             &token,
             &[
-                b"wrongwrongwrongwrongwrongwrongww".to_vec(),
-                secret.to_vec()
+                Zeroizing::new(b"wrongwrongwrongwrongwrongwrongww".to_vec()),
+                Zeroizing::new(secret.to_vec())
             ]
         )
         .is_ok());
         assert!(verify_assertion(
             &token,
             &[
-                b"wrongwrongwrongwrongwrongwrongww".to_vec(),
-                b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_vec()
+                Zeroizing::new(b"wrongwrongwrongwrongwrongwrongww".to_vec()),
+                Zeroizing::new(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_vec())
             ]
         )
         .is_err());

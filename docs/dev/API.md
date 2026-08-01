@@ -460,7 +460,9 @@ an out-of-bounds veto window — fail-closed).
 A framework-native runtime (e.g. a LangChain agent) exchanges a signed workload
 assertion for the short-lived use tokens it then presents to `/mcp` and `/llm`.
 The endpoint is **gated off** unless `VULTRINO_WORKLOAD_EXCHANGE_ENABLED` is set,
-and needs a ≥32-byte `VULTRINO_WORKLOAD_ASSERTION_SECRET` configured.
+and needs a ≥32-byte `VULTRINO_WORKLOAD_ASSERTION_SECRET` configured. The shipped
+`vultrino web` command validates and snapshots that verifier before vault access
+or listener bind; it refuses to start when the enabled exchange is misconfigured.
 
 ### `POST /api/v1/workload/exchange` — mint runtime tokens (`vwa_` assertion)
 
@@ -486,7 +488,7 @@ mint failure revokes every token already minted.
 | Status | Code | When |
 |--------|------|------|
 | `404` | `feature_disabled` | `VULTRINO_WORKLOAD_EXCHANGE_ENABLED` is not set. |
-| `503` | `exchange_unconfigured` | Verifier secret absent or < 32 bytes. |
+| `503` | `exchange_unconfigured` | An embedded server was constructed with an enabled but invalid verifier snapshot. The production `vultrino web` command refuses this state at startup. |
 | `401` | `invalid_workload_identity` | Missing Bearer, forged/tampered signature, expired/overlong `exp`, bad `kind`, or empty `jti`. |
 | `403` | `grant_not_found` | No template authored for `(tenant, agent_label)`. |
 | `403` | `identity_binding_mismatch` | `iss`/`sub`/`aud`/`tenant`/`agent_label` do not match the stored template. |

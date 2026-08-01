@@ -255,7 +255,9 @@ is served buffered).
 `POST /api/v1/workload/exchange` (`src/web/workload_exchange.rs`, gated by
 `VULTRINO_WORKLOAD_EXCHANGE_ENABLED`) lets a framework-native runtime trade a signed
 `vwa_` assertion — HMAC-SHA256-verified against `VULTRINO_WORKLOAD_ASSERTION_SECRET`
-(≥32 bytes) — for short-lived MCP + per-channel model use tokens. It fails closed on
+(≥32 bytes per verifier) — for short-lived MCP + per-channel model use tokens. The
+production entrypoint validates and snapshots that verifier before vault access or
+listener bind, and the handler never rereads environment or secret files. It fails closed on
 a forged/expired assertion (`401`), a cross-process fd-locked `jti` replay (`409`),
 or an identity-binding mismatch against the admin-authored grant template (`403`);
 a partial mint failure revokes every token already minted. A runtime then holds a

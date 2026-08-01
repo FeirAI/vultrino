@@ -129,7 +129,9 @@ upstream.
   (`POST /api/v1/workload/exchange`, gated off by default behind
   `VULTRINO_WORKLOAD_EXCHANGE_ENABLED`) authenticates a framework runtime by an
   HMAC-SHA256 assertion signed with `VULTRINO_WORKLOAD_ASSERTION_SECRET` (≥32
-  bytes, else the endpoint fails closed with `503 exchange_unconfigured`). A
+  bytes per verifier). When enabled, the production `web` command validates the
+  verifier before vault access or listener bind and carries that exact snapshot
+  into request state; it does not reread the environment or file per request. A
   forged/tampered or expired assertion is rejected (`401 invalid_workload_identity`);
   a replayed `jti` is rejected (`409 assertion_replay`, durable + fd-locked so the
   guard holds across processes); the assertion's issuer/subject/audience/tenant/agent
@@ -137,6 +139,8 @@ upstream.
   (`403 identity_binding_mismatch`). A successful exchange mints only short-lived
   (TTL ≤ 3600s) MCP + per-channel model **use tokens** — never an admin credential —
   and a partial mint failure revokes every token already minted for that exchange.
+  Startup establishes presence and shape, not that the external signer has the
+  matching key; deployment alignment remains an operator responsibility.
 
 ## Trust boundaries
 

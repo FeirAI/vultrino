@@ -53,6 +53,12 @@ successfully composed named internal-HTTP capability request uses its unique
 operator method source, while `caller_method_is_rejected` proves an agent-supplied
 method never yields an executable plugin request.
 
+`Configuration.web_start_implies_policy_hash_configured` proves that a started
+production web process cannot have the policy-drift oracle disabled.
+`enabled_exchange_start_implies_valid_verifier` proves that a started process
+with workload exchange enabled has a configured, valid verifier snapshot; the
+invalid state is a startup refusal before vault access or listener bind.
+
 `Credentials.reachable_credentials_are_confined` proves, by induction over
 every reachable credential-flow trace, that raw credential material reaches
 only the encrypted vault, the private injector, or the specifically authorized
@@ -100,6 +106,9 @@ the model:
 - internal-HTTP capability registration requires one unambiguous method source;
   named tool calls reject a caller `method` before resolving and finally
   overwriting the plugin request with the operator method;
+- the production web entrypoint validates the policy-hash secret and any enabled
+  workload verifier before touching the vault, spawning workers, or binding; the
+  verifier list is then held in `AppState` rather than reread per request;
 - WASM ABI v2 serializes only an alias/type credential handle. ABI v1 modules,
   including the archived PGP fixture, fail installation and loading;
 - plaintext `Secret` serialization requires a crate-private, dynamically scoped
@@ -142,6 +151,10 @@ The proof also makes these assumptions explicit:
   hashing, or other transformations;
 - cryptographic primitives, the OS/process boundary, allocator behavior,
   zeroization, and hardware side channels are in the trusted computing base;
+- the policy-hash secret remains stable across restarts and the workload verifier
+  matches the trusted signer. Startup proves presence/shape and freezes one
+  process snapshot; cross-process key ownership/alignment remains an operator
+  obligation;
 - a `verified:` approval identity means the holder of the configured shared
   broker/Govder assertion key signed the exact request. Correct authentication of
   the human ticket and immutable subject/group resolution inside that signer is a
@@ -176,6 +189,7 @@ declared-transform assumptions.
 | `Authority.AssertionEvidence.validFor` | inbound HMAC verifier over raw body plus actual tenant/method/path/query/Host, bounded to five minutes |
 | `ActionAuthority.decideAuthority` | label-first exact Govder lookup plus canonical-label ambiguity refusal before numeric fallback |
 | `Action.MethodAuthority.composeMethod` | registration-time method-source validation plus caller-method rejection and final operator pin in `build_internal_http_params` |
+| `Configuration.decideWebStartup` | first operation in production `run_web_server` plus startup-snapshotted `WorkloadVerifier` in `AppState` |
 | `Approval.Step.execute` | the single buffered/streaming dispatch seam |
 | `Credentials.Operation` | built-ins are trusted declassification points; untrusted WASM receives only a handle |
 | `PublicPayload` / `StreamState` | fail-closed buffered result and compositional streaming output gate checking every declared form |

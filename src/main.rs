@@ -1155,10 +1155,16 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
 
 /// Run the web UI server
 async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std::error::Error>> {
-    // Load admin credentials
-    let admin_auth = load_admin_auth(&config).await?;
+    // Security-critical configuration is a startup precondition, not a warning
+    // or a first-request surprise. This runs before vault access, background
+    // workers, health, or listener bind.
+    let security_startup = vultrino::web::validate_security_startup(config)?;
+    let config = security_startup.config();
 
-    let storage = init_storage(&config).await?;
+    // Load admin credentials
+    let admin_auth = load_admin_auth(config).await?;
+
+    let storage = init_storage(config).await?;
 
     // Load existing roles and keys for auth manager
     let stored_roles = storage.list_roles().await?;
@@ -1232,9 +1238,9 @@ async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std:
     // web server below.
     let auth_refresh_storage = storage.clone();
 
-    let web_server = WebServer::new(
+    let web_server = WebServer::new_with_security_startup(
         web_config,
-        config,
+        security_startup,
         storage,
         auth_manager,
         admin_auth,

@@ -44,9 +44,14 @@ approval_model_lean = (ROOT / "formal/lean/Vultrino/Approval/Model.lean").read_t
 action_authority_lean = (ROOT / "formal/lean/Vultrino/Approval/ActionAuthority.lean").read_text()
 method_authority_lean = (ROOT / "formal/lean/Vultrino/Action/MethodAuthority.lean").read_text()
 confinement_lean = (ROOT / "formal/lean/Vultrino/Credentials/Confinement.lean").read_text()
+startup_lean = (ROOT / "formal/lean/Vultrino/Configuration/Startup.lean").read_text()
 config = (ROOT / "src/config/mod.rs").read_text()
 capability = (ROOT / "src/capability/mod.rs").read_text()
 internal_http_capability_tests = (ROOT / "tests/capability_internal_http_toolcall.rs").read_text()
+workload_exchange = (ROOT / "src/web/workload_exchange.rs").read_text()
+web_mod = (ROOT / "src/web/mod.rs").read_text()
+web_server = (ROOT / "src/web/server.rs").read_text()
+startup_security_tests = (ROOT / "tests/startup_security_integration.rs").read_text()
 
 if not lib.startswith("#![forbid(unsafe_code)]") or not main.startswith("#![forbid(unsafe_code)]"):
     fail("the library and production CLI must both forbid unsafe Rust")
@@ -133,6 +138,67 @@ for test in (
 ):
     if f"fn {test}" not in (ROOT / "src/egress.rs").read_text():
         fail(f"egress postcondition regression test missing: {test}")
+
+startup_validation = main.find(
+    "let security_startup = vultrino::web::validate_security_startup(config)?"
+)
+vault_access = main.find("let admin_auth = load_admin_auth(config).await?", startup_validation)
+if startup_validation < 0 or vault_access < 0 or startup_validation > vault_access:
+    fail("web security validation must precede vault/admin-auth access")
+if "WebServer::new_with_security_startup(" not in main or "security_startup," not in main:
+    fail("production web server no longer consumes the validated security snapshot")
+for ownership_hook in (
+    "vultrino_config: crate::config::Config",
+    "pub fn config(&self) -> &crate::config::Config",
+    "(self.vultrino_config, self.workload_verifier)",
+):
+    if ownership_hook not in web_mod:
+        fail(f"opaque startup witness no longer owns exact validated inputs: {ownership_hook!r}")
+for hook in (
+    "pub(crate) enum WorkloadVerifier",
+    "Configured(Arc<Vec<Zeroizing<Vec<u8>>>>)",
+    "pub(crate) fn from_env()",
+    "pub(crate) fn startup_result(&self)",
+):
+    if hook not in workload_exchange:
+        fail(f"startup-snapshotted workload verifier hook missing: {hook!r}")
+if "workload_verifier: super::workload_exchange::WorkloadVerifier" not in web_server:
+    fail("web AppState no longer stores the workload verifier snapshot")
+if "security_startup.into_parts()" not in web_server:
+    fail("validated config and workload verifier are not consumed together")
+validated_constructor_start = web_server.find("pub fn new_with_security_startup(")
+validated_constructor_end = web_server.find(
+    "fn new_with_workload_verifier(", validated_constructor_start
+)
+if validated_constructor_start < 0 or validated_constructor_end < 0:
+    fail("could not isolate validated production web constructor")
+if "WorkloadVerifier::from_env()" in web_server[
+    validated_constructor_start:validated_constructor_end
+]:
+    fail("validated production constructor rereads workload verifier authority")
+exchange_start = workload_exchange.find("pub async fn exchange_workload_token(")
+exchange_end = workload_exchange.find("pub async fn runtime_control(", exchange_start)
+if exchange_start < 0 or exchange_end < 0:
+    fail("could not isolate workload exchange handler")
+if "std::env::" in workload_exchange[exchange_start:exchange_end]:
+    fail("workload exchange handler rereads process environment per request")
+for theorem in (
+    "web_start_implies_policy_hash_configured",
+    "enabled_exchange_start_implies_valid_verifier",
+    "invalid_security_config_refuses_before_listen",
+):
+    if f"theorem {theorem}" not in startup_lean:
+        fail(f"Lean startup-security theorem missing: {theorem}")
+for test in (
+    "web_refuses_to_start_without_policy_hash_secret",
+    "enabled_exchange_refuses_to_start_without_valid_verifier",
+):
+    if f"fn {test}" not in startup_security_tests:
+        fail(f"production startup negative control missing: {test}")
+if "async fn verifier_is_snapshotted_before_requests" not in (
+    ROOT / "tests/workload_exchange_integration.rs"
+).read_text():
+    fail("workload verifier snapshot regression test missing")
 
 if server.count("confine_plugin_execution_error(error, &secret_material)") != 2:
     fail("both post-dispatch error paths must classify connector diagnostics")
@@ -278,4 +344,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; fail-closed canonical action aliases; operator-pinned internal HTTP method; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; fail-closed canonical action aliases; operator-pinned internal HTTP method; startup-validated policy/workload secrets; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
