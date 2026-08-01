@@ -1,5 +1,6 @@
 import Vultrino.Approval.ExecutionSafety
 import Vultrino.Approval.Authority
+import Vultrino.Approval.ActionAuthority
 import Vultrino.Credentials.Confinement
 
 /-!
@@ -16,6 +17,8 @@ The machine-checked entry point for Vultrino's critical-boundary model.
 * broker-verified approval identity is exact-bound to tenant, approval, outcome,
   subject, class, route, host, and body digest; legacy bearer-key claims carry no
   independent-identity witness.
+* a canonical plugin verb shared by configured business labels cannot fall back
+  to weaker numeric approval when no exact canonical rule is found.
 
 The Rust implementation must refine this model. The proof/refinement boundary
 and the deliberately explicit trusted-computing-base assumptions are documented

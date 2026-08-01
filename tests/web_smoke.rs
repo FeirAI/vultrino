@@ -6550,6 +6550,100 @@ async fn the_gate_is_found_when_it_is_keyed_by_the_govder_action_label() {
     );
 }
 
+/// V-A7 canonical-alias ambiguity: several governed business labels may route to
+/// one plugin verb. Presenting only that verb erases which label/gate was meant.
+/// A definitive miss under the canonical key therefore cannot authorize the
+/// weaker numeric fallback, even for a reversible action.
+#[tokio::test]
+async fn canonical_action_with_configured_labels_cannot_fall_back_to_numeric_approval() {
+    let (govder, asked) = start_mock_govder_keyed_gate(
+        "agent-x",
+        "money.refund",
+        serde_json::json!({
+            "gate_id": "gate-money-refund",
+            "agent_id": "agent-x",
+            "action_class": "money.refund",
+            "has_rule": true,
+            "risk_tier": "Medium",
+            "irreversible": false,
+            "approval_rule": {"recipes": [{"terms": [
+                {"class": "teammate", "count": 2}
+            ]}]},
+        }),
+    )
+    .await;
+    let mut config = approval_open_test_config(govder);
+    config
+        .action_labels
+        .insert("money.refund".to_string(), "http.request".to_string());
+    let (router, storage) = build_router_with_config(config).await;
+
+    // The helper presents canonical `http.request` and registers it reversible.
+    // Govder holds only the label rule, so the exact canonical lookup misses.
+    let resp = execute_against_require_approval_credential_with_reversibility(
+        router,
+        &storage,
+        Some("reversible"),
+    )
+    .await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "an ambiguous canonical spelling must not open a weaker numeric approval"
+    );
+    assert!(
+        storage.list_approvals().await.unwrap().is_empty(),
+        "fail-closed alias handling must persist no numeric approval"
+    );
+    assert_eq!(
+        asked.lock().unwrap().as_slice(),
+        &["http.request".to_string()],
+        "the canonical presentation must not guess one of several possible labels"
+    );
+}
+
+/// The ambiguity guard is not a blanket canonical-action ban. When Govder holds
+/// an exact authoritative rule under the canonical key, that rule is stamped.
+#[tokio::test]
+async fn canonical_action_with_exact_rule_keeps_authoritative_recipe() {
+    let (govder, asked) = start_mock_govder_keyed_gate(
+        "agent-x",
+        "http.request",
+        serde_json::json!({
+            "gate_id": "gate-http-request",
+            "agent_id": "agent-x",
+            "action_class": "http.request",
+            "has_rule": true,
+            "risk_tier": "Medium",
+            "irreversible": false,
+            "approval_rule": {"recipes": [{"terms": [
+                {"class": "teammate", "count": 2}
+            ]}]},
+        }),
+    )
+    .await;
+    let mut config = approval_open_test_config(govder);
+    config
+        .action_labels
+        .insert("money.refund".to_string(), "http.request".to_string());
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential_with_reversibility(
+        router,
+        &storage,
+        Some("reversible"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let approvals = storage.list_approvals().await.unwrap();
+    assert_eq!(approvals.len(), 1);
+    assert!(approvals[0].approval_rule.is_some());
+    assert_eq!(
+        asked.lock().unwrap().as_slice(),
+        &["http.request".to_string()]
+    );
+}
+
 /// THE CONTRACT TEST: how many DISTINCT humans a two-key money recipe actually requires.
 ///
 /// WHY IT IS WRITTEN THIS WAY. Every earlier approval proof in plan 103 asserted that the

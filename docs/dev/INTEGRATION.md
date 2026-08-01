@@ -107,7 +107,10 @@ mints/revokes use tokens, and halts agents. Two contract details:
 
 - **Action labels (V8):** a decision plane may present a business verb (e.g.
   `payments.refund`); map it to a canonical `plugin.action` via
-  `[[action_labels]]` so policy/audit see both forms.
+  `[[action_labels]]` so policy/audit see both forms. Approval lookup tries that
+  exact label before the canonical form. Presenting only a canonical verb shared
+  by configured labels requires a rule filed under the canonical key; without
+  one, Vultrino refuses rather than choosing a label or falling back numerically.
 - **Principal targeting (V4):** bind an `agent_label` to a use token (or set it on
   a kill policy's `principal_pattern`) so a policy targets one agent.
 - **Propagation timing:** an admin policy push is synchronous on the web process

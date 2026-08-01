@@ -41,6 +41,8 @@ api = (ROOT / "src/web/api.rs").read_text()
 tenant_assert = (ROOT / "src/govder/tenant_assert.rs").read_text()
 authority_lean = (ROOT / "formal/lean/Vultrino/Approval/Authority.lean").read_text()
 approval_model_lean = (ROOT / "formal/lean/Vultrino/Approval/Model.lean").read_text()
+action_authority_lean = (ROOT / "formal/lean/Vultrino/Approval/ActionAuthority.lean").read_text()
+config = (ROOT / "src/config/mod.rs").read_text()
 
 if not lib.startswith("#![forbid(unsafe_code)]") or not main.startswith("#![forbid(unsafe_code)]"):
     fail("the library and production CLI must both forbid unsafe Rust")
@@ -154,6 +156,23 @@ if "theorem agent_reviewer_recipe_is_unsatisfiable" not in approval_model_lean:
     fail("Lean model no longer proves agent-reviewer recipes unsatisfiable")
 if "theorem supported_recipe_satisfies_every_floor" not in approval_model_lean:
     fail("Lean model no longer proves supported recipes satisfy every authority floor")
+if "pub fn canonical_action_has_labels" not in config:
+    fail("canonical action-label ambiguity detector is missing")
+alias_ambiguity = server.find("let canonical_label_ambiguous =")
+exact_rule_return = server.find("GateRuleAnswer::Rule(_) => return Ok(answer)", alias_ambiguity)
+alias_refusal = server.find("if canonical_label_ambiguous {", exact_rule_return)
+numeric_fallback = server.find("Ok(match first_inconclusive", alias_refusal)
+if min(alias_ambiguity, exact_rule_return, alias_refusal, numeric_fallback) < 0 or not (
+    alias_ambiguity < exact_rule_return < alias_refusal < numeric_fallback
+):
+    fail("canonical alias ambiguity must allow an exact rule then refuse before numeric fallback")
+for theorem in (
+    "canonical_alias_without_rule_is_refused",
+    "canonical_alias_inconclusive_is_refused",
+    "exact_canonical_rule_remains_authoritative",
+):
+    if f"theorem {theorem}" not in action_authority_lean:
+        fail(f"Lean action-authority theorem missing: {theorem}")
 
 abi_validation = installer.find("WasmPlugin::from_directory(staging_path.clone())")
 plugin_copy = installer.find("self.copy_plugin(&staging_path, &target_dir)")
@@ -192,4 +211,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; fail-closed canonical action aliases; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

@@ -42,6 +42,12 @@ plain bearer-key identity claims no independent-authentication witness, matching
 the Rust rule that unsigned `agg:<key>:` identities can contribute at most one
 positive recipe slot per key.
 
+`Approval.ActionAuthority.canonical_alias_without_rule_is_refused` and its
+inconclusive twin prove the V-A7 namespace partition: when a caller erases a
+configured business label by presenting its shared canonical plugin verb, a
+missing exact canonical rule cannot open the weaker numeric-approval path. An
+exact rule filed under the canonical key remains authoritative.
+
 `Credentials.reachable_credentials_are_confined` proves, by induction over
 every reachable credential-flow trace, that raw credential material reaches
 only the encrypted vault, the private injector, or the specifically authorized
@@ -49,7 +55,7 @@ upstream. Agent, MCP, HTTP, log, error, audit, metrics, and untrusted-plugin
 sinks accept only a `PublicPayload` carrying evidence that every declared
 secret byte-form is absent.
 
-Both theorems are universal over traces; they are not bounded test sweeps.
+The trace theorems are universal over traces; they are not bounded test sweeps.
 The second command exports the complete environment and rechecks it with the
 independently implemented nanoda kernel. Its exporter and checker revisions are
 full-commit pinned, and `sorryAx` is deliberately not permitted.
@@ -74,6 +80,10 @@ the model:
 - the production recipe evaluator hard-rejects every agent-reviewer term, matching
   `agent_reviewer_recipe_is_unsatisfiable` in the Lean model and the shared
   exhaustive Govder/Vultrino recipe vectors;
+- action-label presentations query Govder under that exact label before the
+  canonical verb; a canonical presentation whose verb is targeted by configured
+  labels may use an exact canonical rule, but otherwise fails closed before the
+  numeric-approval fallback;
 - WASM ABI v2 serializes only an alias/type credential handle. ABI v1 modules,
   including the archived PGP fixture, fail installation and loading;
 - plaintext `Secret` serialization requires a crate-private, dynamically scoped
@@ -144,6 +154,7 @@ declared-transform assumptions.
 | `ExecutionPermit` | non-cloneable, private-constructor `ExecutionPermit` consumed at the side-effect call |
 | `Evidence.validFor` | one pure function run under the storage claim lock |
 | `Authority.AssertionEvidence.validFor` | inbound HMAC verifier over raw body plus actual tenant/method/path/query/Host, bounded to five minutes |
+| `ActionAuthority.decideAuthority` | label-first exact Govder lookup plus canonical-label ambiguity refusal before numeric fallback |
 | `Approval.Step.execute` | the single buffered/streaming dispatch seam |
 | `Credentials.Operation` | built-ins are trusted declassification points; untrusted WASM receives only a handle |
 | `PublicPayload` | fail-closed egress result whose constructor checks every declared form |

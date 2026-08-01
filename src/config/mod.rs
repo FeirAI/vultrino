@@ -422,6 +422,17 @@ impl Config {
             None => (presented.to_string(), None),
         }
     }
+
+    /// Whether at least one configured business label dispatches to this exact
+    /// canonical plugin action. A caller that presents the canonical spelling
+    /// directly has discarded which label (and therefore which Govder gate key)
+    /// it meant whenever this is true. Approval lookup must not interpret that
+    /// ambiguity as permission to use the weaker numeric fallback.
+    pub fn canonical_action_has_labels(&self, canonical: &str) -> bool {
+        self.action_labels
+            .values()
+            .any(|configured| configured == canonical)
+    }
 }
 
 /// Whether `s` is a well-formed canonical `plugin.action` — a non-empty plugin

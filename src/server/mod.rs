@@ -3025,9 +3025,27 @@ impl VultrinoServer {
         action_class: &str,
         action_label: Option<&str>,
     ) -> Result<crate::govder::GateRuleAnswer, VultrinoError> {
+        // A canonical plugin verb can be the target of several business labels
+        // carrying different approval recipes (for example money.refund and
+        // money.payout both route to internal_http.request). When the caller
+        // presents only that canonical spelling, a missing exact canonical rule
+        // is NOT proof that none of those label gates applies. Keep this flag
+        // through the lookup so an exact canonical Rule remains usable, while a
+        // no-rule/inconclusive result refuses instead of taking the weaker
+        // numeric-approval path. This is the V-A7 fail-closed partition.
+        let canonical_label_ambiguous = action_label.is_none()
+            && self.config.canonical_action_has_labels(action_class);
         let govder = match self.govder.as_ref() {
             Some(g) => g,
             None => {
+                if canonical_label_ambiguous {
+                    return Err(VultrinoError::PolicyUnavailable(
+                        "the canonical action is shared by configured business labels, but no \
+                         policy engine is available to prove an exact canonical approval rule; \
+                         present the governed business label (fail-closed)"
+                            .to_string(),
+                    ));
+                }
                 return Ok(crate::govder::GateRuleAnswer::Inconclusive {
                     reason: "this vultrino has no policy engine wired \
                              (GOVDER_BASE_URL/GOVDER_TENANT_ASSERTION_SECRET are unset), so no \
@@ -3084,6 +3102,13 @@ impl VultrinoServer {
                     }
                 }
             }
+        }
+        if canonical_label_ambiguous {
+            return Err(VultrinoError::PolicyUnavailable(
+                "the canonical action is shared by configured business labels and has no exact \
+                 authoritative rule; present the governed business label (fail-closed)"
+                    .to_string(),
+            ));
         }
         Ok(match first_inconclusive {
             Some(reason) => crate::govder::GateRuleAnswer::Inconclusive { reason },

@@ -57,6 +57,9 @@ upstream.
    under the lock and fenced by a monotonic `execution_epoch`, and a worker that
    crashes mid-flight is finalized terminally as `outcome unknown` (re-approve to
    retry) rather than re-run — the crash cannot cause a duplicate side effect.
+   A canonical plugin verb shared by configured business labels also cannot erase
+   which Govder recipe applies: without an exact canonical rule, approval open
+   fails closed before the numeric fallback.
 6. **Security/financial boundaries hold even in observe mode.** Cross-tenant
    isolation, halts, and SpendCap/RateLimit resource guards always enforce; only
    ordinary policy denials are observable-away.

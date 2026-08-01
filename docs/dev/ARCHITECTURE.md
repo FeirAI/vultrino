@@ -92,6 +92,10 @@ The authoritative path is `VultrinoServer::execute_gated` → `run_action` in
    does not run**: an `ApprovalRequest` is opened, persisted, announced to
    notifiers, a `approval.requested` event is emitted, and `202`/Pending is
    returned. The use token is **not** consumed yet (reserved for the eventual run).
+   Govder recipe lookup uses the presented business label first, then the resolved
+   canonical verb. If a caller presents only a canonical verb that is targeted by
+   configured labels, Vultrino accepts an exact canonical rule but otherwise
+   refuses before numeric fallback; it never guesses which label's recipe applies.
 8. **Run the action** (`run_action`), if not gated:
    - **Preflight (no side effects):** resolve the plugin, validate params. A
      not-loaded plugin is *retryable*; bad params are *terminal*.
