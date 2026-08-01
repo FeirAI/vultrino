@@ -50,6 +50,12 @@ impl WebSecurityStartup {
 pub fn validate_security_startup(
     config: crate::config::Config,
 ) -> Result<WebSecurityStartup, String> {
+    if !config.enforcement.require_declared_capabilities {
+        return Err(
+            "production web startup requires strict declared-capability enforcement; refusing to expose a network execution surface that can dispatch undeclared actions"
+                .to_string(),
+        );
+    }
     if config
         .policy_hash_secret
         .as_deref()
@@ -82,11 +88,25 @@ mod security_startup_tests {
 
     #[test]
     fn policy_hash_secret_is_a_web_startup_precondition() {
-        let config = crate::config::Config::default();
+        let mut config = crate::config::Config::default();
+        config.enforcement.require_declared_capabilities = true;
         let error = match validate_security_startup(config) {
             Err(error) => error,
             Ok(_) => panic!("missing policy-hash secret unexpectedly passed validation"),
         };
         assert!(error.contains("VULTRINO_POLICY_HASH_SECRET is required"));
+    }
+
+    #[test]
+    fn strict_declared_capabilities_are_a_web_startup_precondition() {
+        let config = crate::config::Config {
+            policy_hash_secret: Some("configured-policy-hash-secret".to_string()),
+            ..crate::config::Config::default()
+        };
+        let error = match validate_security_startup(config) {
+            Err(error) => error,
+            Ok(_) => panic!("non-strict network execution unexpectedly passed validation"),
+        };
+        assert!(error.contains("strict declared-capability enforcement"));
     }
 }

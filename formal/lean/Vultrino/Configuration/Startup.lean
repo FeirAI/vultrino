@@ -18,6 +18,7 @@ def WorkloadVerifier.valid : WorkloadVerifier → Bool
   | .disabled | .invalid => false
 
 structure WebSecurityInputs where
+  strictCatalog : Bool
   policyHashConfigured : Bool
   workloadVerifier : WorkloadVerifier
 deriving DecidableEq, Repr
@@ -29,7 +30,9 @@ deriving DecidableEq, Repr
 
 /-- The production `vultrino web` startup decision, before vault or listener. -/
 def decideWebStartup (inputs : WebSecurityInputs) : StartupDecision :=
-  if inputs.policyHashConfigured = false then
+  if inputs.strictCatalog = false then
+    .refuse
+  else if inputs.policyHashConfigured = false then
     .refuse
   else if inputs.workloadVerifier = .invalid then
     .refuse
@@ -40,27 +43,42 @@ theorem web_start_implies_policy_hash_configured
     {inputs : WebSecurityInputs}
     (started : decideWebStartup inputs = .start) :
     inputs.policyHashConfigured = true := by
-  cases policy : inputs.policyHashConfigured <;>
-    simp [decideWebStartup, policy] at started ⊢
+  cases strict : inputs.strictCatalog <;>
+    cases policy : inputs.policyHashConfigured <;>
+    simp [decideWebStartup, strict, policy] at started ⊢
+
+/-- The network execution surface never starts in standalone compatibility
+posture: every direct execution requires an exact reversible declaration. -/
+theorem web_start_implies_strict_catalog
+    {inputs : WebSecurityInputs}
+    (started : decideWebStartup inputs = .start) :
+    inputs.strictCatalog = true := by
+  cases strict : inputs.strictCatalog <;>
+    simp [decideWebStartup, strict] at started ⊢
 
 theorem enabled_exchange_start_implies_valid_verifier
     {inputs : WebSecurityInputs}
     (started : decideWebStartup inputs = .start)
     (enabled : inputs.workloadVerifier.enabled = true) :
     inputs.workloadVerifier.valid = true := by
-  cases verifier : inputs.workloadVerifier with
-  | disabled => simp [WorkloadVerifier.enabled, verifier] at enabled
-  | configured => rfl
-  | invalid => simp [decideWebStartup, verifier] at started
+  cases strict : inputs.strictCatalog <;>
+    cases verifier : inputs.workloadVerifier with
+    | disabled => simp [WorkloadVerifier.enabled, verifier] at enabled
+    | configured => rfl
+    | invalid => simp [decideWebStartup, strict, verifier] at started
 
 theorem invalid_security_config_refuses_before_listen
     {inputs : WebSecurityInputs}
-    (invalid : inputs.policyHashConfigured = false ∨
+    (invalid : inputs.strictCatalog = false ∨
+      inputs.policyHashConfigured = false ∨
       inputs.workloadVerifier = .invalid) :
     decideWebStartup inputs = .refuse := by
-  rcases invalid with missingPolicy | invalidVerifier
-  · simp [decideWebStartup, missingPolicy]
-  · cases policy : inputs.policyHashConfigured <;>
-      simp [decideWebStartup, policy, invalidVerifier]
+  rcases invalid with nonStrict | missingPolicy | invalidVerifier
+  · simp [decideWebStartup, nonStrict]
+  · cases strict : inputs.strictCatalog <;>
+      simp [decideWebStartup, strict, missingPolicy]
+  · cases strict : inputs.strictCatalog <;>
+      cases policy : inputs.policyHashConfigured <;>
+      simp [decideWebStartup, strict, policy, invalidVerifier]
 
 end Vultrino.Configuration

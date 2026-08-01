@@ -215,8 +215,13 @@ every turn with `[llm_proxy] streaming_enabled = false`. See
   error (no silent degrade to never-matching).
 - A declared partially-reversible/irreversible capability independently forces
   the shared approval path even under policy `Allow` and unflagged credentials or
-  tokens. An unavailable catalog does the same; disabled approvals refuse. Only
-  the exact `reversible` spelling can establish a reversible stored declaration.
+  tokens. An unavailable catalog refuses before approval-open or dispatch;
+  disabled approvals refuse a human-floor or ambiguous action. Production
+  `vultrino web` refuses undeclared actions, exact label misses never borrow a
+  canonical sibling, and a shared bare canonical verb can never run directly.
+  Therefore only an exact trusted `reversible` declaration can reach the direct
+  path. This proves enforcement of the stored declaration, not that an operator's
+  declaration is semantically truthful about the real-world side effect.
 - An outbox push with no URL or no signing secret is a hard config error
   (an unsigned/undeliverable outbox is rejected).
 - A halt label must be a literal id (no glob), so a halt can't deny a fleet.

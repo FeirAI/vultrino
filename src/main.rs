@@ -1154,10 +1154,19 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
 }
 
 /// Run the web UI server
-async fn run_web_server(config: Config, bind: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_web_server(
+    mut config: Config,
+    bind: String,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Security-critical configuration is a startup precondition, not a warning
     // or a first-request surprise. This runs before vault access, background
     // workers, health, or listener bind.
+    //
+    // The network execution surface is strict by construction: an operator
+    // cannot turn a missing capability declaration into direct authority by
+    // omitting a config key. Embedded and stdio users retain an explicit
+    // compatibility posture, but `vultrino web` never does.
+    config.enforcement.require_declared_capabilities = true;
     let security_startup = vultrino::web::validate_security_startup(config)?;
     let config = security_startup.config();
 
@@ -1809,6 +1818,9 @@ level = "info"
 # removed, the built-in default is still "deny".
 [enforcement]
 default_action = "deny"
+# New configurations make stdio/embedded execution strict too. `vultrino web`
+# forces this posture even when an older config omits the key.
+require_declared_capabilities = true
 
 [mcp]
 enabled = true

@@ -28,10 +28,13 @@ The machine-checked entry point for Vultrino's critical-boundary model.
   to weaker numeric approval when no exact canonical rule is found.
 * a named internal-HTTP capability executes only its unique operator-pinned
   method; any caller-supplied method is rejected before composition.
-* a declared human-floor capability or unavailable capability catalog can never
-  produce direct execution authority; disabled approvals refuse rather than bypass.
-* a started production web process has a configured policy-hash key, and an
-  enabled workload exchange has a valid startup-snapshotted verifier.
+* a declared human-floor capability, unavailable catalog, shared canonical verb,
+  or (in production strict posture) undeclared action can never produce direct
+  execution authority; production direct authority implies an exact reversible
+  declaration, and disabled approvals refuse rather than bypass.
+* a started production web process has strict catalog enforcement and a configured
+  policy-hash key, and an enabled workload exchange has a valid startup-snapshotted
+  verifier.
 
 The Rust implementation must refine this model. The proof/refinement boundary
 and the deliberately explicit trusted-computing-base assumptions are documented

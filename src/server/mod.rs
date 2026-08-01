@@ -54,20 +54,21 @@ enum StreamStep {
 }
 
 /// Trusted capability-catalog answer used to decide whether an action may take
-/// the direct execution path. `Undeclared` preserves legacy/local plugin calls;
-/// an unavailable catalog fails closed because it may be hiding a declared
-/// irreversible capability.
+/// the direct execution path. `Undeclared` preserves legacy/local plugin calls
+/// only outside strict mode; an unavailable catalog always refuses because it
+/// may be hiding a declared irreversible capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IrreversibilityResolution {
     Reversible,
     HumanFloor,
     Undeclared,
+    AmbiguousCanonical,
     Unavailable,
 }
 
 impl IrreversibilityResolution {
     fn automatically_requires_approval(self) -> bool {
-        matches!(self, Self::HumanFloor | Self::Unavailable)
+        matches!(self, Self::HumanFloor | Self::AmbiguousCanonical)
     }
 
     fn trusted_human_floor(self) -> bool {
@@ -1254,6 +1255,22 @@ impl VultrinoServer {
         let irreversibility = self
             .resolve_irreversibility_for_action(&full_action, action_label.as_deref())
             .await;
+        if matches!(irreversibility, IrreversibilityResolution::Unavailable) {
+            return Err(VultrinoError::PolicyUnavailable(
+                "the capability catalog is unavailable, so Vultrino cannot establish this \
+                 action's approval requirement; nothing was executed"
+                    .to_string(),
+            ));
+        }
+        if self.config.enforcement.require_declared_capabilities
+            && matches!(irreversibility, IrreversibilityResolution::Undeclared)
+        {
+            return Err(VultrinoError::PolicyDenied(
+                "strict capability enforcement requires an exact stored declaration for this \
+                 action; nothing was executed"
+                    .to_string(),
+            ));
+        }
         if irreversibility.automatically_requires_approval() {
             needs_approval = true;
         }
@@ -3194,7 +3211,8 @@ impl VultrinoServer {
             Ok(caps) => caps,
             Err(error) => {
                 // This stamp decides whether a machine may replace a human. An
-                // unavailable catalog must therefore fail to the human floor.
+                // unavailable catalog cannot establish any safe classification,
+                // so the caller refuses before approval-open or dispatch.
                 tracing::error!(%error, "capability lookup failed while deriving trusted irreversibility");
                 return IrreversibilityResolution::Unavailable;
             }
@@ -3214,9 +3232,10 @@ impl VultrinoServer {
 
         // Prefer the exact govder action label. Several capabilities commonly
         // resolve to the same canonical plugin verb (for example http.request),
-        // so returning the first canonical match can pick a reversible sibling
-        // for an irreversible capability. When only the canonical form is known,
-        // use the strictest matching value; no match also fails to the human floor.
+        // so falling back to a canonical sibling after an exact miss would let an
+        // undeclared money label borrow a reversible read label's classification.
+        // A presented label therefore either matches its own declaration or is
+        // `Undeclared`; it never borrows.
         if let Some(label) = action_label.map(str::trim).filter(|s| !s.is_empty()) {
             let exact: Vec<_> = caps
                 .iter()
@@ -3228,8 +3247,22 @@ impl VultrinoServer {
             if !exact.is_empty() {
                 return classify(exact);
             }
+            tracing::warn!(%canonical_action, %label,
+                "no exact capability metadata matched the governed action label");
+            return IrreversibilityResolution::Undeclared;
         }
 
+        // A bare canonical verb that is shared by governed business labels has
+        // erased which capability (and therefore which reversibility and recipe)
+        // the caller intends. It may enter the approval-authority path, where an
+        // exact canonical rule can still govern it, but it can never dispatch
+        // directly by borrowing a sibling capability's classification.
+        if self.config.canonical_action_has_labels(canonical_action) {
+            return IrreversibilityResolution::AmbiguousCanonical;
+        }
+
+        // No configured business-label ambiguity: use the strictest matching
+        // canonical declaration.
         let canonical: Vec<_> = caps
             .iter()
             .filter(|cap| self.config.resolve_action(&cap.action).0 == canonical_action)
@@ -3243,12 +3276,13 @@ impl VultrinoServer {
     }
 
     /// Extract the approval-preview VALUES for an action being gated, if its
-    /// backing capability declares an `approval_preview` spec. Looks up the
-    /// capability the SAME way [`Self::resolve_irreversibility_for_action`] does
-    /// (prefer an exact `action_label` match, else the first capability whose
-    /// resolved canonical action matches). Returns `None` when no matching
-    /// capability is found, or it has no `approval_preview` spec — the caller
-    /// then falls back to the existing `summary` line, unchanged.
+    /// backing capability declares an `approval_preview` spec. The lookup
+    /// preserves the SAME exact-label boundary as
+    /// [`Self::resolve_irreversibility_for_action`]: a presented label never
+    /// borrows a canonical sibling's preview, and a shared canonical verb never
+    /// chooses one label nondeterministically. Returns `None` unless exactly one
+    /// unambiguous capability is found, or when that capability has no preview
+    /// spec; the caller then falls back to the existing `summary` line.
     ///
     /// SECURITY: `params` must be the SAME params that will execute (not a
     /// separate/mutable copy) — the approver must see what will actually run.
@@ -3268,21 +3302,35 @@ impl VultrinoServer {
         };
 
         if let Some(label) = action_label.map(str::trim).filter(|s| !s.is_empty()) {
-            let exact = caps.iter().find(|cap| {
+            let mut exact = caps.iter().filter(|cap| {
                 let (_, configured_label) = self.config.resolve_action(&cap.action);
                 cap.action.trim() == label || configured_label.as_deref() == Some(label)
             });
-            if let Some(cap) = exact {
-                return cap
-                    .approval_preview
-                    .as_ref()
-                    .map(|spec| crate::capability::extract_preview(spec, params));
+            let cap = exact.next()?;
+            if exact.next().is_some() {
+                tracing::warn!(%canonical_action, %label,
+                    "multiple exact capabilities matched approval preview; using summary only");
+                return None;
             }
+            return cap
+                .approval_preview
+                .as_ref()
+                .map(|spec| crate::capability::extract_preview(spec, params));
         }
 
-        let cap = caps
+        if self.config.canonical_action_has_labels(canonical_action) {
+            return None;
+        }
+
+        let mut canonical = caps
             .iter()
-            .find(|cap| self.config.resolve_action(&cap.action).0 == canonical_action)?;
+            .filter(|cap| self.config.resolve_action(&cap.action).0 == canonical_action);
+        let cap = canonical.next()?;
+        if canonical.next().is_some() {
+            tracing::warn!(%canonical_action,
+                "multiple canonical capabilities matched approval preview; using summary only");
+            return None;
+        }
         cap.approval_preview
             .as_ref()
             .map(|spec| crate::capability::extract_preview(spec, params))
@@ -4829,6 +4877,111 @@ mod tests {
         assert!(
             server.resolve_irreversibility_for_action("unknown.action", None).await
                 == IrreversibilityResolution::Undeclared
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_labels_and_previews_never_borrow_canonical_siblings() {
+        use crate::capability::{
+            ApprovalPreviewSpec, Capability, CapabilityTarget, PreviewFieldSpec,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        std::mem::forget(dir);
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::FileStorage::new(
+                &path,
+                &secrecy::SecretString::from("test-password"),
+            )
+            .await
+            .unwrap(),
+        );
+        let config = Config {
+            action_labels: std::collections::HashMap::from([
+                ("data.read".to_string(), "http.request".to_string()),
+                ("money.refund".to_string(), "http.request".to_string()),
+            ]),
+            ..Config::default()
+        };
+        let server = VultrinoServer::new(
+            config,
+            storage.clone(),
+            CredentialResolver::new(storage.clone()),
+        );
+        storage
+            .store_capability(&Capability {
+                id: "data-read".to_string(),
+                tool_name: "data_read".to_string(),
+                description: "reversible sibling".to_string(),
+                action: "data.read".to_string(),
+                plugin: Some("http".to_string()),
+                target: CapabilityTarget::default(),
+                credential_ref: "cred".to_string(),
+                input_schema: serde_json::json!({}),
+                reversibility: "reversible".to_string(),
+                llm: None,
+                approval_preview: Some(ApprovalPreviewSpec {
+                    title: Some("Data read".to_string()),
+                    fields: vec![PreviewFieldSpec {
+                        label: "Record".to_string(),
+                        path: "record".to_string(),
+                        format: None,
+                    }],
+                }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server
+                .resolve_irreversibility_for_action("http.request", Some("data.read"))
+                .await,
+            IrreversibilityResolution::Reversible
+        );
+        let exact_preview = server
+            .approval_preview_for_action(
+                "http.request",
+                Some("data.read"),
+                &serde_json::json!({"record": "customer-7"}),
+            )
+            .await
+            .expect("the exact label owns its preview");
+        assert_eq!(exact_preview.title.as_deref(), Some("Data read"));
+
+        assert_eq!(
+            server
+                .resolve_irreversibility_for_action("http.request", Some("money.refund"))
+                .await,
+            IrreversibilityResolution::Undeclared
+        );
+        assert!(
+            server
+                .approval_preview_for_action(
+                    "http.request",
+                    Some("money.refund"),
+                    &serde_json::json!({"record": "refund-9"}),
+                )
+                .await
+                .is_none(),
+            "an undeclared label must not display its sibling's preview"
+        );
+
+        assert_eq!(
+            server
+                .resolve_irreversibility_for_action("http.request", None)
+                .await,
+            IrreversibilityResolution::AmbiguousCanonical
+        );
+        assert!(
+            server
+                .approval_preview_for_action(
+                    "http.request",
+                    None,
+                    &serde_json::json!({"record": "ambiguous"}),
+                )
+                .await
+                .is_none(),
+            "a shared canonical verb must not select one label's preview"
         );
     }
 }

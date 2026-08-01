@@ -448,6 +448,13 @@ pub struct EnforcementConfig {
     /// What the policy engine decides for a credential that matches **no**
     /// policy. Defaults to [`EnforcementDefault::Deny`] (fail-closed).
     pub default_action: EnforcementDefault,
+    /// Refuse an execution unless its presented governed label (or an
+    /// unambiguous canonical action) has a matching stored capability.
+    ///
+    /// Embedded/stdio callers default this to `false` for standalone
+    /// compatibility. The production `vultrino web` entrypoint forces it to
+    /// `true` before constructing its validated startup witness.
+    pub require_declared_capabilities: bool,
 }
 
 impl Default for EnforcementConfig {
@@ -458,6 +465,7 @@ impl Default for EnforcementConfig {
         // `[enforcement] default_action = "allow"`.
         Self {
             default_action: EnforcementDefault::Deny,
+            require_declared_capabilities: false,
         }
     }
 }

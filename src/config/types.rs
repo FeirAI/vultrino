@@ -247,6 +247,10 @@ pub struct RawEnforcementConfig {
     /// Engine decision for a credential that matches no policy: `deny`
     /// (fail-closed, default) or `allow` (fail-open, legacy).
     pub default_action: Option<String>,
+    /// Opt into exact stored-capability enforcement outside the production web
+    /// entrypoint (which forces this posture unconditionally).
+    #[serde(default)]
+    pub require_declared_capabilities: bool,
 }
 
 impl TryFrom<RawEnforcementConfig> for EnforcementConfig {
@@ -263,7 +267,10 @@ impl TryFrom<RawEnforcementConfig> for EnforcementConfig {
                 )))
             }
         };
-        Ok(Self { default_action })
+        Ok(Self {
+            default_action,
+            require_declared_capabilities: raw.require_declared_capabilities,
+        })
     }
 }
 
@@ -974,6 +981,7 @@ action = "deny"
         // Fail-closed is the built-in default when no [enforcement] section.
         let config = Config::parse("").unwrap();
         assert_eq!(config.enforcement.default_action, EnforcementDefault::Deny);
+        assert!(!config.enforcement.require_declared_capabilities);
     }
 
     #[test]
@@ -985,6 +993,12 @@ action = "deny"
         // Section present but key omitted → deny.
         let bare = Config::parse("[enforcement]").unwrap();
         assert_eq!(bare.enforcement.default_action, EnforcementDefault::Deny);
+
+        let strict = Config::parse(
+            "[enforcement]\nrequire_declared_capabilities = true",
+        )
+        .unwrap();
+        assert!(strict.enforcement.require_declared_capabilities);
     }
 
     #[test]

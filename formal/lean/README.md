@@ -53,16 +53,22 @@ successfully composed named internal-HTTP capability request uses its unique
 operator method source, while `caller_method_is_rejected` proves an agent-supplied
 method never yields an executable plugin request.
 
-`Configuration.web_start_implies_policy_hash_configured` proves that a started
-production web process cannot have the policy-drift oracle disabled.
+`Configuration.web_start_implies_strict_catalog` proves that a started production
+web process uses strict declared-capability enforcement;
+`web_start_implies_policy_hash_configured` proves that it cannot have the
+policy-drift oracle disabled.
 `enabled_exchange_start_implies_valid_verifier` proves that a started process
 with workload exchange enabled has a configured, valid verifier snapshot; the
 invalid state is a startup refusal before vault access or listener bind.
 
 `Approval.declared_human_floor_never_direct` proves that a capability snapshot
 classified as irreversible or partially reversible cannot take the direct path;
-`unavailable_catalog_never_direct` gives a catalog outage the same fail-closed
-result. If approvals are disabled, the decision is refusal rather than bypass.
+`unavailable_catalog_never_direct` and `ambiguous_canonical_never_direct` cover
+catalog failure and erased business labels. In strict production posture,
+`strict_catalog_undeclared_never_direct` refuses exact misses and
+`strict_catalog_direct_implies_reversible` proves that direct criticality
+authority implies an exact reversible declaration. If approvals are disabled,
+the decision is refusal rather than bypass.
 
 `Credentials.reachable_credentials_are_confined` proves, by induction over
 every reachable credential-flow trace, that raw credential material reaches
@@ -115,8 +121,12 @@ the model:
   workload verifier before touching the vault, spawning workers, or binding; the
   verifier list is then held in `AppState` rather than reread per request;
 - the trusted capability catalog is resolved once per admitted request before a
-  direct permit can be minted; a declared human-floor class or catalog outage
+  direct permit can be minted; catalog failure and undeclared production actions
+  refuse, while a declared human-floor class or erased shared-canonical label
   independently forces approval, and that same snapshot stamps the approval;
+- exact action labels never borrow a canonical sibling's classification or
+  approval preview; ambiguous or duplicate previews fall back to the generic
+  summary rather than selecting one declaration nondeterministically;
 - WASM ABI v2 serializes only an alias/type credential handle. ABI v1 modules,
   including the archived PGP fixture, fail installation and loading;
 - plaintext `Secret` serialization requires a crate-private, dynamically scoped
@@ -197,8 +207,8 @@ declared-transform assumptions.
 | `Authority.AssertionEvidence.validFor` | inbound HMAC verifier over raw body plus actual tenant/method/path/query/Host, bounded to five minutes |
 | `ActionAuthority.decideAuthority` | label-first exact Govder lookup plus canonical-label ambiguity refusal before numeric fallback |
 | `Action.MethodAuthority.composeMethod` | registration-time method-source validation plus caller-method rejection and final operator pin in `build_internal_http_params` |
-| `Approval.decideCriticalGate` | `resolve_irreversibility_for_action` snapshot plus `automatically_requires_approval` before the shared prepared-action branch |
-| `Configuration.decideWebStartup` | first operation in production `run_web_server` plus startup-snapshotted `WorkloadVerifier` in `AppState` |
+| `Approval.decideCriticalGate` | one exact-label catalog snapshot; unavailable/strict-undeclared refusal and human-floor/ambiguous approval forcing before the shared prepared-action branch |
+| `Configuration.decideWebStartup` | production `run_web_server` forces strict catalog posture before validated startup; policy hash and workload verifier are then snapshotted in `AppState` |
 | `Approval.Step.execute` | the single buffered/streaming dispatch seam |
 | `Credentials.Operation` | built-ins are trusted declassification points; untrusted WASM receives only a handle |
 | `PublicPayload` / `StreamState` | fail-closed buffered result and compositional streaming output gate checking every declared form |

@@ -253,6 +253,7 @@ async fn store_credential(storage: &Arc<dyn StorageBackend>, alias: &str, requir
 
 async fn set_count_capability_reversibility(
     storage: &Arc<dyn StorageBackend>,
+    action: &str,
     reversibility: &str,
 ) {
     storage
@@ -260,7 +261,7 @@ async fn set_count_capability_reversibility(
             id: "cap-fixture-count-run".to_string(),
             tool_name: "count_run".to_string(),
             description: "counting criticality fixture".to_string(),
-            action: "count.run".to_string(),
+            action: action.to_string(),
             plugin: None,
             target: vultrino::capability::CapabilityTarget::default(),
             credential_ref: "*".to_string(),
@@ -281,6 +282,14 @@ fn echo_request(credential: &str) -> ExecuteRequest {
     }
 }
 
+fn count_request_for_action(credential: &str, action: &str) -> ExecuteRequest {
+    ExecuteRequest {
+        credential: credential.to_string(),
+        action: action.to_string(),
+        params: serde_json::json!({}),
+    }
+}
+
 /// A stored human-floor declaration is itself approval authority. Policy Allow,
 /// an unflagged credential, and an unflagged auth context cannot reach dispatch;
 /// with no Govder recipe authority wired, the only valid outcome is refusal.
@@ -291,7 +300,7 @@ async fn declared_irreversible_capability_cannot_take_the_direct_path() {
     server.plugins().register(Arc::new(CountingPlugin {
         calls: calls.clone(),
     }));
-    set_count_capability_reversibility(&storage, "irreversible").await;
+    set_count_capability_reversibility(&storage, "count.run", "irreversible").await;
     store_credential(&storage, "critical-cred", false).await;
 
     let error = server
@@ -321,13 +330,122 @@ async fn disabled_approvals_refuse_declared_irreversible_capability() {
     server.plugins().register(Arc::new(CountingPlugin {
         calls: calls.clone(),
     }));
-    set_count_capability_reversibility(&storage, "irreversible").await;
+    set_count_capability_reversibility(&storage, "count.run", "irreversible").await;
     store_credential(&storage, "critical-cred", false).await;
 
     let error = server
         .execute_gated(count_request("critical-cred"), ExecAuth::default())
         .await
         .expect_err("disabled approvals must not become direct authority");
+    assert!(matches!(error, vultrino::VultrinoError::PolicyDenied(_)));
+    assert!(error.to_string().contains("approvals are not enabled"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Production strictness turns a missing declaration into a pre-dispatch
+/// refusal. Policy Allow is not declaration authority.
+#[tokio::test]
+async fn strict_catalog_refuses_undeclared_action_before_dispatch() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let storage: Arc<dyn StorageBackend> = Arc::new(
+        FileStorage::new(&path, &SecretString::from("pw"))
+            .await
+            .unwrap(),
+    );
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.enforcement.require_declared_capabilities = true;
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    store_credential(&storage, "undeclared-cred", false).await;
+
+    let error = server
+        .execute_gated(count_request("undeclared-cred"), ExecAuth::default())
+        .await
+        .expect_err("strict catalog mode must refuse an undeclared action");
+    assert!(matches!(error, vultrino::VultrinoError::PolicyDenied(_)));
+    assert!(error.to_string().contains("exact stored declaration"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// A missing exact label must not borrow the classification of a reversible
+/// sibling merely because both labels resolve to the same plugin verb.
+#[tokio::test]
+async fn strict_catalog_refuses_label_that_only_matches_a_canonical_sibling() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let storage: Arc<dyn StorageBackend> = Arc::new(
+        FileStorage::new(&path, &SecretString::from("pw"))
+            .await
+            .unwrap(),
+    );
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.enforcement.require_declared_capabilities = true;
+    config.action_labels = std::collections::HashMap::from([
+        ("data.read".to_string(), "count.run".to_string()),
+        ("money.refund".to_string(), "count.run".to_string()),
+    ]);
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    set_count_capability_reversibility(&storage, "data.read", "reversible").await;
+    store_credential(&storage, "label-cred", false).await;
+
+    let error = server
+        .execute_gated(
+            count_request_for_action("label-cred", "money.refund"),
+            ExecAuth::default(),
+        )
+        .await
+        .expect_err("an undeclared label must not borrow its sibling's classification");
+    assert!(matches!(error, vultrino::VultrinoError::PolicyDenied(_)));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Presenting only a shared canonical verb erases which governed label and
+/// recipe applies. Even a reversible sibling cannot turn that ambiguity into a
+/// direct dispatch.
+#[tokio::test]
+async fn shared_canonical_alias_cannot_take_the_direct_path() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let storage: Arc<dyn StorageBackend> = Arc::new(
+        FileStorage::new(&path, &SecretString::from("pw"))
+            .await
+            .unwrap(),
+    );
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.enforcement.require_declared_capabilities = true;
+    config.action_labels = std::collections::HashMap::from([(
+        "data.read".to_string(),
+        "count.run".to_string(),
+    )]);
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    set_count_capability_reversibility(&storage, "data.read", "reversible").await;
+    store_credential(&storage, "canonical-cred", false).await;
+
+    let error = server
+        .execute_gated(count_request("canonical-cred"), ExecAuth::default())
+        .await
+        .expect_err("a shared canonical alias must enter approval or refuse");
     assert!(matches!(error, vultrino::VultrinoError::PolicyDenied(_)));
     assert!(error.to_string().contains("approvals are not enabled"));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -2264,6 +2382,10 @@ async fn test_action_label_token_scope_and_approval_summary() {
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     server.plugins().register(Arc::new(MockPlugin));
     declare_reversible_fixture_capabilities(&storage).await;
+    // The governed label is arbitrary test data routed to an in-process echo;
+    // declare THAT exact label reversible rather than borrowing `mock.echo`'s
+    // classification through the shared canonical verb.
+    set_count_capability_reversibility(&storage, "payments.refund", "reversible").await;
     store_credential(&storage, "pay-cred", true).await; // require_approval → gates
 
     let (_f, token) = UseToken::create(NewUseToken {

@@ -313,8 +313,16 @@ returned until someone signs off.
 - A use token created with `--require-approval`
 - A matching policy rule with `action = "prompt"`
 - A stored capability whose trusted `reversibility` is `partially-reversible` or
-  `irreversible`. This signal is independent of policy/token flags; an unavailable
-  capability catalog also fails to approval/refusal rather than direct execution.
+  `irreversible`. This signal is independent of policy/token flags.
+
+On the production `vultrino web` surface, every action must have an exact stored
+declaration. A presented business label cannot borrow a canonical sibling's
+classification, a shared bare canonical verb cannot run directly, and a missing
+declaration or unavailable catalog is refused before dispatch. Consequently the
+only catalog classification that can reach the direct path is an exact trusted
+`reversible` declaration. New `vultrino init` configurations enable the same
+posture for stdio; older stdio/embedded configurations can opt in with
+`[enforcement] require_declared_capabilities = true`.
 
 If approvals are disabled, a triggered action is refused; disabling the approval
 subsystem never converts a human-floor action into a direct action.

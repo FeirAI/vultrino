@@ -167,15 +167,17 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 
 ## Documented-not-enforced / posture notes
 
-- **Automatic reversibility gating is bounded to the trusted stored capability
-  catalog.** A matched `partially-reversible`/`irreversible` declaration (or a
-  catalog outage) can never take the direct path, and invalid stored spellings
-  fail to the human floor. A healthy catalog with no matching declaration is
-  classified `undeclared` to preserve standalone/local plugin calls; such a call
-  still depends on policy, credential metadata, or token flags to request
-  approval. Production critical actions therefore need stored capability entries;
-  Lean and the refinement gate prove the declared-capability boundary, not that an
-  operator classified every possible ad-hoc plugin call.
+- **Reversibility truth remains operator authority.** Production `vultrino web`
+  forces strict catalog posture: a catalog outage or missing exact declaration is
+  refused, a presented label cannot borrow a canonical sibling, and a shared bare
+  canonical verb cannot dispatch directly. Thus every production-web direct path
+  has an exact stored `reversible` declaration. The parser/library default remains
+  non-strict for compatibility with older stdio/embedded callers (new `vultrino
+  init` files opt in); those callers must set
+  `require_declared_capabilities = true` for the same guarantee. Lean and the
+  refinement gate prove that the declared class is enforced. They cannot establish
+  that an operator truthfully labeled the real-world side effect reversible; that
+  semantic classification remains an explicit operational assumption.
 - **Observe mode is a deliberate downgrade.** A tenant in `observe` mode lets
   ordinary policy denials through (logged + emitted as `policy.observed_denial`).
   Security/financial boundaries (halt, cross-tenant isolation, SpendCap/RateLimit)

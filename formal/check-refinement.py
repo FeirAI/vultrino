@@ -47,6 +47,7 @@ method_authority_lean = (ROOT / "formal/lean/Vultrino/Action/MethodAuthority.lea
 confinement_lean = (ROOT / "formal/lean/Vultrino/Credentials/Confinement.lean").read_text()
 startup_lean = (ROOT / "formal/lean/Vultrino/Configuration/Startup.lean").read_text()
 config = (ROOT / "src/config/mod.rs").read_text()
+config_types = (ROOT / "src/config/types.rs").read_text()
 capability = (ROOT / "src/capability/mod.rs").read_text()
 internal_http_capability_tests = (ROOT / "tests/capability_internal_http_toolcall.rs").read_text()
 workload_exchange = (ROOT / "src/web/workload_exchange.rs").read_text()
@@ -145,9 +146,20 @@ for test in (
 startup_validation = main.find(
     "let security_startup = vultrino::web::validate_security_startup(config)?"
 )
+strict_web_assignment = main.find(
+    "config.enforcement.require_declared_capabilities = true;"
+)
 vault_access = main.find("let admin_auth = load_admin_auth(config).await?", startup_validation)
-if startup_validation < 0 or vault_access < 0 or startup_validation > vault_access:
-    fail("web security validation must precede vault/admin-auth access")
+if min(strict_web_assignment, startup_validation, vault_access) < 0 or not (
+    strict_web_assignment < startup_validation < vault_access
+):
+    fail("web strictness and security validation must precede vault/admin-auth access")
+if "if !config.enforcement.require_declared_capabilities" not in web_mod:
+    fail("validated production web startup no longer requires strict capability declarations")
+if "pub require_declared_capabilities: bool" not in config:
+    fail("runtime enforcement config lost the strict catalog posture")
+if "require_declared_capabilities: raw.require_declared_capabilities" not in config_types:
+    fail("parsed strict catalog posture no longer reaches runtime configuration")
 if "WebServer::new_with_security_startup(" not in main or "security_startup," not in main:
     fail("production web server no longer consumes the validated security snapshot")
 for ownership_hook in (
@@ -186,6 +198,7 @@ if exchange_start < 0 or exchange_end < 0:
 if "std::env::" in workload_exchange[exchange_start:exchange_end]:
     fail("workload exchange handler rereads process environment per request")
 for theorem in (
+    "web_start_implies_strict_catalog",
     "web_start_implies_policy_hash_configured",
     "enabled_exchange_start_implies_valid_verifier",
     "invalid_security_config_refuses_before_listen",
@@ -205,8 +218,9 @@ if "async fn verifier_is_snapshotted_before_requests" not in (
 
 for hook in (
     "enum IrreversibilityResolution",
+    "AmbiguousCanonical",
     "fn automatically_requires_approval(self) -> bool",
-    "Self::HumanFloor | Self::Unavailable",
+    "Self::HumanFloor | Self::AmbiguousCanonical",
     "async fn resolve_irreversibility_for_action(",
     'return IrreversibilityResolution::Unavailable;',
 ):
@@ -217,28 +231,87 @@ if '!matches!(reversibility.trim(), "reversible")' not in approval:
 if "fn reversibility_wire_values_fail_closed_to_human_floor" not in approval:
     fail("reversibility parser no longer has unknown/blank fail-closed controls")
 criticality_snapshot = server.find("let irreversibility = self")
+unavailable_refusal = server.find(
+    "matches!(irreversibility, IrreversibilityResolution::Unavailable)",
+    criticality_snapshot,
+)
+strict_undeclared_refusal = server.find(
+    "self.config.enforcement.require_declared_capabilities",
+    unavailable_refusal,
+)
 criticality_force = server.find(
-    "if irreversibility.automatically_requires_approval()", criticality_snapshot
+    "if irreversibility.automatically_requires_approval()", strict_undeclared_refusal
 )
 approval_branch = server.find("if needs_approval {", criticality_force)
-if min(criticality_snapshot, criticality_force, approval_branch) < 0 or not (
-    criticality_snapshot < criticality_force < approval_branch
+if min(
+    criticality_snapshot,
+    unavailable_refusal,
+    strict_undeclared_refusal,
+    criticality_force,
+    approval_branch,
+) < 0 or not (
+    criticality_snapshot
+    < unavailable_refusal
+    < strict_undeclared_refusal
+    < criticality_force
+    < approval_branch
 ):
-    fail("trusted criticality snapshot must force approval before the shared approval branch")
+    fail("trusted criticality snapshot must refuse or force approval before the shared branch")
 if "let trusted_irreversible = irreversibility.trusted_human_floor();" not in server:
     fail("approval stamp no longer consumes the same criticality snapshot that forced gating")
+label_lookup = server.find("async fn resolve_irreversibility_for_action(")
+label_miss = server.find("return IrreversibilityResolution::Undeclared;", label_lookup)
+canonical_ambiguity = server.find(
+    "return IrreversibilityResolution::AmbiguousCanonical;", label_miss
+)
+canonical_collection = server.find("let canonical: Vec<_>", canonical_ambiguity)
+if min(label_lookup, label_miss, canonical_ambiguity, canonical_collection) < 0 or not (
+    label_lookup < label_miss < canonical_ambiguity < canonical_collection
+):
+    fail("exact-label miss or shared canonical ambiguity can borrow a sibling declaration")
+preview_lookup = server.find("async fn approval_preview_for_action(")
+preview_label = server.find("if let Some(label)", preview_lookup)
+preview_exact_only = server.find("let cap = exact.next()?;", preview_label)
+preview_canonical_guard = server.find(
+    "if self.config.canonical_action_has_labels(canonical_action)", preview_exact_only
+)
+preview_canonical = server.find("let mut canonical = caps", preview_canonical_guard)
+if min(
+    preview_lookup,
+    preview_label,
+    preview_exact_only,
+    preview_canonical_guard,
+    preview_canonical,
+) < 0 or not (
+    preview_lookup
+    < preview_label
+    < preview_exact_only
+    < preview_canonical_guard
+    < preview_canonical
+):
+    fail("approval preview no longer preserves the exact-label/ambiguity boundary")
 for theorem in (
     "declared_human_floor_never_direct",
     "unavailable_catalog_never_direct",
+    "ambiguous_canonical_never_direct",
+    "strict_catalog_undeclared_never_direct",
     "direct_excludes_human_floor_and_unavailable",
+    "strict_catalog_direct_implies_reversible",
 ):
     if f"theorem {theorem}" not in criticality_lean:
         fail(f"Lean criticality-gating theorem missing: {theorem}")
 for test in (
     "declared_irreversible_capability_cannot_take_the_direct_path",
     "disabled_approvals_refuse_declared_irreversible_capability",
+    "strict_catalog_refuses_undeclared_action_before_dispatch",
+    "strict_catalog_refuses_label_that_only_matches_a_canonical_sibling",
+    "shared_canonical_alias_cannot_take_the_direct_path",
+    "exact_labels_and_previews_never_borrow_canonical_siblings",
 ):
-    if f"async fn {test}" not in approval_integration_tests:
+    test_source = approval_integration_tests if test != (
+        "exact_labels_and_previews_never_borrow_canonical_siblings"
+    ) else server
+    if f"async fn {test}" not in test_source:
         fail(f"criticality direct-path negative control missing: {test}")
 money_helper_start = web_smoke_tests.find("async fn execute_labelled_money_action(")
 money_helper_end = web_smoke_tests.find(

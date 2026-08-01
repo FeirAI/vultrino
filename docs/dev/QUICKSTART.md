@@ -83,6 +83,7 @@ Config/vault locations (`Config::default_path` / `default_storage_path`):
 >
 > [enforcement]
 > default_action = "deny"   # fail-closed (also the built-in default)
+> require_declared_capabilities = true
 >
 > [mcp]
 > enabled = false

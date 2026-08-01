@@ -84,11 +84,20 @@ path = "~/.local/share/vultrino/credentials.enc"   # ~ expands to home
 ```toml
 [enforcement]
 default_action = "deny"   # "deny" (default, fail-closed) | "allow" (legacy fail-open)
+require_declared_capabilities = true
 ```
 
 | Key | Default | Behavior |
 |-----|---------|----------|
 | `default_action` | `deny` | Decision for a credential matching **no** policy. `deny` (the built-in default, even if the whole section is omitted) is fail-closed. `allow` is legacy fail-open. **An unknown value (or wrong case, e.g. `"Deny"`) is a hard load error.** |
+| `require_declared_capabilities` | `false` in the library/parser; `true` in newly generated configs | Refuse unless the presented business label, or an unambiguous canonical action, has an exact stored capability declaration. The production `vultrino web` entrypoint forces this to `true` before validated startup, even when an older config omits it or sets it false. Stdio/embedded callers retain the parsed value for compatibility. |
+
+Strict declaration enforcement is separate from `default_action`: policy `Allow`
+cannot authorize an undeclared action. An unavailable capability catalog always
+refuses. With configured business labels, callers must present the label; the
+shared canonical target cannot borrow one sibling's `reversible` classification.
+The exact spelling `reversible` is operator authority, so operators remain
+responsible for classifying the real side effect truthfully.
 
 > Two zero-policy postures are warned about loudly at startup: `deny` + no policies
 > ("ALL credential use will be denied") and `allow` + no policies ("FAIL-OPEN").

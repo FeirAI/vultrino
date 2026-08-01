@@ -209,6 +209,7 @@ fn config_with_policies(policies: Vec<Policy>) -> Config {
     Config {
         enforcement: EnforcementConfig {
             default_action: EnforcementDefault::Deny,
+            require_declared_capabilities: false,
         },
         policies,
         ..Config::default()
@@ -1182,6 +1183,7 @@ async fn llm_streamed_block_egress_rule_falls_back_to_buffered_withhold() {
     let config = Config {
         enforcement: EnforcementConfig {
             default_action: EnforcementDefault::Deny,
+            require_declared_capabilities: false,
         },
         policies: vec![allow_policy("cred-*")],
         egress: vec![vultrino::egress::EgressRule {

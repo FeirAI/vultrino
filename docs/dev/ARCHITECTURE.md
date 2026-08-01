@@ -90,8 +90,12 @@ The authoritative path is `VultrinoServer::execute_gated` → `run_action` in
    flagged `require_approval=true`, policy returned `Prompt`, the use token forces
    it (`require_approval`), the token is dual-control, or the trusted stored
    capability snapshot declares a partially-reversible/irreversible class. A
-   catalog outage also forces this path; unknown/invalid stored reversibility is
-   human-floor, not reversible. When gated, **the action
+   catalog outage is an immediate refusal; unknown/invalid stored reversibility is
+   human-floor, not reversible. Production `vultrino web` additionally requires
+   an exact declaration for the presented business label (or an unambiguous
+   canonical action). An exact label miss is refused and never borrows a canonical
+   sibling. A bare canonical verb targeted by configured labels is ambiguous and
+   cannot run directly. When gated, **the action
    does not run**: an `ApprovalRequest` is opened, persisted, announced to
    notifiers, a `approval.requested` event is emitted, and `202`/Pending is
    returned. The use token is **not** consumed yet (reserved for the eventual run).
@@ -101,7 +105,9 @@ The authoritative path is `VultrinoServer::execute_gated` → `run_action` in
    refuses before numeric fallback; it never guesses which label's recipe applies.
    If approvals are disabled, the request is refused before recipe lookup or
    dispatch. The same catalog snapshot that forced gating stamps irreversibility
-   on the approval, avoiding a classification check/use window.
+   on the approval, avoiding a classification check/use window. Approval previews
+   preserve the same exact-label boundary and fall back to the generic summary
+   rather than selecting a canonical sibling or duplicate declaration.
 8. **Run the action** (`run_action`), if not gated:
    - **Preflight (no side effects):** resolve the plugin, validate params. A
      not-loaded plugin is *retryable*; bad params are *terminal*.
