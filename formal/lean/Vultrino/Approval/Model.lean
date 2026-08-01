@@ -16,6 +16,11 @@ def Recipe.wellFormed (recipe : Recipe) : Prop :=
   0 < recipe.senior + recipe.teammate + recipe.agentReviewer ∧
   recipe.senior + recipe.teammate + recipe.agentReviewer ≤ maxRecipeTermCount
 
+/-- The cross-plane supported recipe domain. Agent-reviewer terms are disabled
+at Govder authoring and permanently unsatisfiable at Vultrino consumption. -/
+def Recipe.supported (recipe : Recipe) : Prop :=
+  recipe.wellFormed ∧ recipe.agentReviewer = 0
+
 /-- An authoritative rule is a disjunction of whole recipes. -/
 structure Rule where
   recipes : List Recipe
@@ -24,7 +29,7 @@ structure Rule where
 deriving DecidableEq, Repr
 
 def Rule.wellFormed (rule : Rule) : Prop :=
-  rule.recipes ≠ [] ∧ ∀ recipe ∈ rule.recipes, recipe.wellFormed
+  rule.recipes ≠ [] ∧ ∀ recipe ∈ rule.recipes, recipe.supported
 
 /--
 The normalized sign-off set after identity and authority validation. The four
@@ -55,9 +60,10 @@ def Requirement.wellFormed : Requirement → Prop
 
 /--
 Senior reviewers may fill otherwise-unfilled teammate slots, but one senior may
-not fill both slots. Agent-reviewer slots are a separate authority domain.
+not fill both slots. Agent-reviewer slots are disabled by the cross-plane contract.
 -/
 def Recipe.satisfied (recipe : Recipe) (signoffs : SignoffSet) : Prop :=
+  recipe.agentReviewer = 0 ∧
   signoffs.allNamed = true ∧
   signoffs.allDistinct = true ∧
   signoffs.allAuthoritiesResolved = true ∧
@@ -65,6 +71,16 @@ def Recipe.satisfied (recipe : Recipe) (signoffs : SignoffSet) : Prop :=
   recipe.senior ≤ signoffs.senior ∧
   recipe.teammate ≤ signoffs.teammate + (signoffs.senior - recipe.senior) ∧
   recipe.agentReviewer ≤ signoffs.agentReviewer
+
+/-- D4(c)/(d)/(e) concern only agent-reviewer authority. The supported runtime
+contract makes every recipe requiring such a reviewer unsatisfiable, regardless
+of the collected sign-offs. -/
+theorem agent_reviewer_recipe_is_unsatisfiable
+    {recipe : Recipe} {signoffs : SignoffSet}
+    (requiresReviewer : 0 < recipe.agentReviewer) :
+    ¬ recipe.satisfied signoffs := by
+  intro satisfied
+  exact (Nat.ne_of_gt requiresReviewer) satisfied.1
 
 /-- At least one complete authoritative recipe holds. Slots never mix recipes. -/
 def Rule.satisfied (rule : Rule) (signoffs : SignoffSet) : Prop :=

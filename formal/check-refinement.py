@@ -40,6 +40,7 @@ policy = (ROOT / "src/policy/mod.rs").read_text()
 api = (ROOT / "src/web/api.rs").read_text()
 tenant_assert = (ROOT / "src/govder/tenant_assert.rs").read_text()
 authority_lean = (ROOT / "formal/lean/Vultrino/Approval/Authority.lean").read_text()
+approval_model_lean = (ROOT / "formal/lean/Vultrino/Approval/Model.lean").read_text()
 
 if not lib.startswith("#![forbid(unsafe_code)]") or not main.startswith("#![forbid(unsafe_code)]"):
     fail("the library and production CLI must both forbid unsafe Rust")
@@ -147,6 +148,10 @@ for theorem in (
 ):
     if f"theorem {theorem}" not in authority_lean:
         fail(f"Lean approval authority theorem missing: {theorem}")
+if "if need_agent_reviewer > 0" not in approval:
+    fail("agent-reviewer recipes are no longer hard-rejected by the runtime evaluator")
+if "theorem agent_reviewer_recipe_is_unsatisfiable" not in approval_model_lean:
+    fail("Lean model no longer proves agent-reviewer recipes unsatisfiable")
 
 abi_validation = installer.find("WasmPlugin::from_directory(staging_path.clone())")
 plugin_copy = installer.find("self.copy_plugin(&staging_path, &target_dir)")
@@ -185,4 +190,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

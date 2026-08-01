@@ -24,6 +24,8 @@ evidence that is:
 - satisfied by one complete recipe rather than slots mixed across recipes;
 - based only on named, distinct, authority-resolved sign-offs with the required
   controller separation; and
+- unable to satisfy any recipe containing a disabled agent-reviewer term, so
+  Govder-only D4(c)/(d)/(e) reviewer checks cannot be bypassed at this consumer; and
 - issued no later than execution, unexpired, and unconsumed. The separate
   `reachable_approval_consumption_is_one_shot` theorem proves that consumed
   exact-request bindings never repeat in any reachable trace.
@@ -66,6 +68,9 @@ the model:
   received bytes and actual route/Host before decoding authority-bearing fields;
   bad, expired, cross-tenant, over-five-minute, or request-mismatched assertions
   fail closed, while unsigned callers remain in the guarded `agg:<key>:` namespace;
+- the production recipe evaluator hard-rejects every agent-reviewer term, matching
+  `agent_reviewer_recipe_is_unsatisfiable` in the Lean model and the shared
+  exhaustive Govder/Vultrino recipe vectors;
 - WASM ABI v2 serializes only an alias/type credential handle. ABI v1 modules,
   including the archived PGP fixture, fail installation and loading;
 - plaintext `Secret` serialization requires a crate-private, dynamically scoped
