@@ -59,6 +59,14 @@ only the encrypted vault, the private injector, or the specifically authorized
 upstream. Agent, MCP, HTTP, log, error, audit, metrics, and untrusted-plugin
 sinks accept only a `PublicPayload` carrying evidence that every declared
 secret byte-form is absent.
+`Credentials.reachable_public_stream_excludes_every_declared_form` separately
+proves that this postcondition is preserved over the concatenation of arbitrary
+accepted streaming chunks; checking chunks independently is intentionally not
+enough because a forbidden form can cross a transport boundary.
+`suffix_gate_preserves_stream_confinement` proves the bounded implementation
+rule: retaining the last `max_form_len - 1` released bytes is sufficient to catch
+every newly completed occurrence when that suffix is checked with the next
+candidate.
 
 The trace theorems are universal over traces; they are not bounded test sweeps.
 The second command exports the complete environment and rechecks it with the
@@ -97,10 +105,12 @@ the model:
 - plaintext `Secret` serialization requires a crate-private, dynamically scoped
   vault capability; refreshed credentials are neither public fields nor
   serializable response fields;
-- buffered responses require a private `PublicResponse` confinement result,
-  short secrets force whole-response withholding, streaming errors are generic,
-  and post-dispatch connector diagnostics are either proven free of every
-  declared credential form or discarded; and
+- buffered responses require a private `PublicResponse` confinement result and
+  use a content-free fallback when no non-empty fixed diagnostic can satisfy the
+  postcondition; short secrets force whole-response withholding; streamed
+  headers, redaction output, and terminal frames receive a final declared-form
+  check across output-chunk boundaries; and post-dispatch connector diagnostics
+  are either proven free of every declared credential form or discarded; and
 - the library security core forbids unsafe Rust.
 
 The separate fixed-window limiter seam is extracted to the pure
@@ -142,10 +152,12 @@ The proof also makes these assumptions explicit:
 - the async adapter linearizes claim/consume/finalize correctly. The pure Rust
   kernel, structural gate, and race tests constrain this seam, but do not prove
   Tokio/storage behavior refines the Lean transition relation;
-- the incremental streaming scrubber implements the abstract public-payload
-  predicate for all unbounded byte streams. It is supported by adversarial and
-  property tests, while short or whole-body-policy cases fall back to the
-  buffered confinement constructor.
+- that the Rust `StreamScrubber` refines the proved suffix-gate transition. The
+  implementation retains the exact `max_form_len - 1` bound and rechecks that
+  suffix plus every candidate; the structural gate and adversarial/property tests
+  constrain this adapter seam, while short or whole-body-policy cases fall back
+  to the buffered confinement constructor. This is not a full Rust
+  operational-semantics proof.
 
 No production claim should use an assumption-free “credentials can never
 leak.” The precise claim being implemented and checked is: raw credential
@@ -166,7 +178,7 @@ declared-transform assumptions.
 | `Action.MethodAuthority.composeMethod` | registration-time method-source validation plus caller-method rejection and final operator pin in `build_internal_http_params` |
 | `Approval.Step.execute` | the single buffered/streaming dispatch seam |
 | `Credentials.Operation` | built-ins are trusted declassification points; untrusted WASM receives only a handle |
-| `PublicPayload` | fail-closed egress result whose constructor checks every declared form |
+| `PublicPayload` / `StreamState` | fail-closed buffered result and compositional streaming output gate checking every declared form |
 | `Credentials.Step.apply` | the only module allowed to expose raw secret bytes |
 
 Aeneas evaluation is now isolated to the pure, safe Rust kernel. Tokio lock

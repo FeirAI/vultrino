@@ -414,11 +414,13 @@ impl PublicResponse {
 }
 
 fn withhold_unredactable(resp: &mut ExecuteResponse) {
-    resp.body =
-        b"[vultrino: response withheld - credential material could not be proven absent]".to_vec();
+    // The fallback itself must satisfy the exact byte-absence postcondition for
+    // *every* non-empty credential. No fixed diagnostic can do that: an operator
+    // may legitimately store a credential equal to a word in the diagnostic
+    // (for example `response` or `credential`). An empty body and empty headers
+    // are the only constant low-sink value that excludes every non-empty form.
+    resp.body.clear();
     resp.headers.clear();
-    resp.headers
-        .insert("content-type".to_string(), "text/plain".to_string());
 }
 
 fn response_contains_form(resp: &ExecuteResponse, form: &str) -> bool {
@@ -535,6 +537,30 @@ pub fn scrub_headers(
     scrub_header_values(headers, forms, &marker)
 }
 
+/// Confine streamed response headers before the response head commits.
+///
+/// Replacement text can itself equal (or contain) an unusual credential form.
+/// Buffered responses catch that with their final whole-response postcheck; this
+/// is the corresponding streaming-head gate. If any declared form remains after
+/// scrubbing, every upstream-controlled header is withheld.
+pub fn confine_stream_headers(
+    headers: &mut std::collections::HashMap<String, String>,
+    forms: &[String],
+) -> bool {
+    let mut modified = scrub_headers(headers, forms, "");
+    let unsafe_after_scrub = forms.iter().any(|form| {
+        !form.is_empty()
+            && headers
+                .values()
+                .any(|value| find_bytes(value.as_bytes(), form.as_bytes()))
+    });
+    if unsafe_after_scrub {
+        headers.clear();
+        modified = true;
+    }
+    modified
+}
+
 /// Replace every occurrence of any secret `form` with `marker` across all header VALUES. The SINGLE
 /// implementation shared by the buffered path ([`redact_secret_material`]) and the streaming-config path
 /// ([`scrub_headers`]) — so a future change to header redaction (e.g. case-folding, multi-form handling)
@@ -594,6 +620,10 @@ pub enum ScrubError {
     /// The working buffer (retained carry + a single chunk) exceeded the configured
     /// hard cap — a delimiter-less giant payload that could OOM. Fail closed.
     BufferOverflow,
+    /// Redaction produced bytes that still contain a declared form (for
+    /// example because the constant marker occurs inside an unusual secret).
+    /// The candidate bytes are withheld before they reach the caller.
+    UnsafeOutput,
 }
 
 impl std::fmt::Display for ScrubError {
@@ -601,6 +631,12 @@ impl std::fmt::Display for ScrubError {
         match self {
             ScrubError::BufferOverflow => {
                 write!(f, "stream scrub buffer exceeded the configured cap")
+            }
+            ScrubError::UnsafeOutput => {
+                write!(
+                    f,
+                    "stream scrub output failed the credential confinement postcondition"
+                )
             }
         }
     }
@@ -631,6 +667,13 @@ impl std::error::Error for ScrubError {}
 /// includes this one if nothing longer matched) *does* match; the only way an
 /// occurrence is "missed" is if an earlier overlapping match already consumed its
 /// start byte, which destroys the secret anyway.
+///
+/// Replacement is not trusted merely because the input match was removed. A
+/// fixed marker can occur inside an unusual credential, and bytes on either side
+/// of a replacement or transport chunk can reconstruct a forbidden form. Every
+/// candidate output therefore passes a second postcondition check together with
+/// the last `max_form_len - 1` already-released bytes. A collision terminates the
+/// stream before the candidate is returned.
 pub struct StreamScrubber {
     /// Secret byte-forms, longest-first, each ≥ [`MIN_REDACT_LEN`]. Zeroized on drop.
     forms: Vec<Zeroizing<Vec<u8>>>,
@@ -641,8 +684,16 @@ pub struct StreamScrubber {
     carry: Zeroizing<Vec<u8>>,
     /// `max_form_len - 1`: how many trailing bytes to hold back (0 when no forms).
     keep: usize,
+    /// Copy of the last `keep` bytes already released. Checking this suffix plus
+    /// each candidate chunk catches a declared form created across output-chunk
+    /// boundaries without retaining the complete response.
+    released_tail: Zeroizing<Vec<u8>>,
     /// Hard cap on the working buffer (carry + chunk); over it, fail closed.
     max_buffer: usize,
+    /// Once a raw-buffer or output-postcondition failure occurs, ordinary pushes
+    /// and finish calls remain closed. `terminate_with` may still emit a checked,
+    /// secret-independent terminal frame.
+    failed: bool,
 }
 
 impl StreamScrubber {
@@ -659,7 +710,9 @@ impl StreamScrubber {
             marker: b"[REDACTED]".to_vec(),
             carry: Zeroizing::new(Vec::new()),
             keep: max_form_len.saturating_sub(1),
+            released_tail: Zeroizing::new(Vec::new()),
             max_buffer,
+            failed: false,
         }
     }
 
@@ -674,6 +727,9 @@ impl StreamScrubber {
     /// Feed one upstream chunk; returns the bytes safe to forward to the agent now
     /// (the rest is retained as carry until the next chunk or [`Self::finish`]).
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, ScrubError> {
+        if self.failed {
+            return Err(ScrubError::UnsafeOutput);
+        }
         if self.forms.is_empty() {
             return Ok(chunk.to_vec());
         }
@@ -685,6 +741,8 @@ impl StreamScrubber {
             // paths. The overflow early-return previously skipped this, leaving secret
             // material in freed heap until reuse.
             working.iter_mut().for_each(|b| *b = 0);
+            self.carry.zeroize();
+            self.failed = true;
             return Err(ScrubError::BufferOverflow);
         }
         let safe_end = working.len().saturating_sub(self.keep);
@@ -692,11 +750,14 @@ impl StreamScrubber {
         *self.carry = working[consumed..].to_vec();
         // Wipe the transient working buffer (it held raw, pre-scrub bytes).
         working.iter_mut().for_each(|b| *b = 0);
-        Ok(out)
+        self.admit_output(out)
     }
 
     /// Flush the residual carry at end-of-stream (everything is now final).
     pub fn finish(&mut self) -> Result<Vec<u8>, ScrubError> {
+        if self.failed {
+            return Err(ScrubError::UnsafeOutput);
+        }
         if self.forms.is_empty() || self.carry.is_empty() {
             return Ok(Vec::new());
         }
@@ -705,7 +766,57 @@ impl StreamScrubber {
         // Wipe the transient buffer (it held raw, pre-scrub secret-bearing bytes),
         // symmetric with `push`.
         working.iter_mut().for_each(|b| *b = 0);
-        Ok(out)
+        self.admit_output(out)
+    }
+
+    /// End a failed/truncated stream with a public constant only when that
+    /// constant is safe both internally and across the boundary with bytes
+    /// already released. Raw carry is discarded, never flushed on an error.
+    /// An unsafe terminal frame becomes an empty suffix.
+    pub fn terminate_with(&mut self, frame: &[u8]) -> Vec<u8> {
+        self.carry.zeroize();
+        self.failed = true;
+        if self.forms.is_empty() {
+            return frame.to_vec();
+        }
+        let mut boundary = Vec::with_capacity(self.released_tail.len() + frame.len());
+        boundary.extend_from_slice(&self.released_tail);
+        boundary.extend_from_slice(frame);
+        let unsafe_output = self
+            .forms
+            .iter()
+            .any(|form| find_bytes(&boundary, form.as_slice()));
+        boundary.zeroize();
+        if unsafe_output {
+            Vec::new()
+        } else {
+            frame.to_vec()
+        }
+    }
+
+    /// Final byte-level postcondition for each candidate emitted by the raw
+    /// scrubber. The suffix copy makes the check compositional across arbitrary
+    /// transport chunking: every forbidden form has length at most `keep + 1`,
+    /// so a newly completed cross-boundary occurrence must start in this tail.
+    fn admit_output(&mut self, mut candidate: Vec<u8>) -> Result<Vec<u8>, ScrubError> {
+        let mut boundary = Vec::with_capacity(self.released_tail.len() + candidate.len());
+        boundary.extend_from_slice(&self.released_tail);
+        boundary.extend_from_slice(&candidate);
+        if self
+            .forms
+            .iter()
+            .any(|form| find_bytes(&boundary, form.as_slice()))
+        {
+            boundary.zeroize();
+            candidate.zeroize();
+            self.carry.zeroize();
+            self.failed = true;
+            return Err(ScrubError::UnsafeOutput);
+        }
+        let tail_start = boundary.len().saturating_sub(self.keep);
+        *self.released_tail = boundary[tail_start..].to_vec();
+        boundary.zeroize();
+        Ok(candidate)
     }
 
     /// Scrub `buf`, emitting final output and returning `(output, consumed)`. Bytes
@@ -939,17 +1050,31 @@ mod tests {
     #[test]
     fn confined_response_withholds_for_a_short_secret() {
         let public = confine_response(
-            resp("the pin is 1234"),
-            &secrets(&["1234"]),
+            // `resp` is itself a substring of the old fixed fallback sentence.
+            // A content-free fallback is required for the exact postcondition.
+            resp("the pin is resp"),
+            &secrets(&["resp"]),
             "pin",
             &[],
             "http.request",
         )
         .into_inner();
-        assert_eq!(
-            String::from_utf8(public.body).unwrap(),
-            "[vultrino: response withheld - credential material could not be proven absent]"
-        );
+        assert!(public.body.is_empty());
+        assert!(public.headers.is_empty());
+    }
+
+    #[test]
+    fn confined_response_fallback_cannot_repeat_a_secret_from_its_own_diagnostic() {
+        let public = confine_response(
+            resp("ordinary upstream bytes"),
+            &secrets(&["response"]),
+            "x",
+            &[rule("*", "*", true, &[])],
+            "http.request",
+        )
+        .into_inner();
+        assert!(public.body.is_empty());
+        assert!(public.headers.is_empty());
     }
 
     #[test]
@@ -1427,6 +1552,41 @@ mod tests {
         let mut sc = StreamScrubber::new(&secs, "x", 8);
         let err = sc.push(b"way more than eight bytes").unwrap_err();
         assert_eq!(err, ScrubError::BufferOverflow);
+    }
+
+    #[test]
+    fn stream_scrubber_rejects_a_marker_that_reconstructs_the_secret() {
+        let secret = "ab[REDACTED]cd";
+        let secs = secrets(&[secret]);
+        let mut sc = StreamScrubber::new(&secs, "x", 1 << 20);
+
+        // Scrubbing the middle credential from this body would produce exactly
+        // the credential again: `ab` + marker + `cd`.
+        let body = format!("ab{secret}cd");
+        let mut released = sc.push(body.as_bytes()).unwrap_or_default();
+        let finish = sc.finish();
+        if let Ok(tail) = &finish {
+            released.extend_from_slice(tail);
+        }
+        assert!(!contains_subslice(&released, secret.as_bytes()));
+        assert_eq!(finish.unwrap_err(), ScrubError::UnsafeOutput);
+    }
+
+    #[test]
+    fn stream_terminal_frame_is_withheld_when_it_contains_a_secret() {
+        let secs = secrets(&["api_error"]);
+        let mut sc = StreamScrubber::new(&secs, "x", 1 << 20);
+        assert!(sc
+            .terminate_with(b"event: error\ndata: {\"type\":\"api_error\"}\n\n")
+            .is_empty());
+    }
+
+    #[test]
+    fn streamed_headers_are_cleared_when_the_marker_contains_a_secret() {
+        let forms = vec!["REDACTED".to_string()];
+        let mut headers = HashMap::from([("x-reflected".to_string(), "REDACTED".to_string())]);
+        assert!(confine_stream_headers(&mut headers, &forms));
+        assert!(headers.is_empty());
     }
 
     #[test]

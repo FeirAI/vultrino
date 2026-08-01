@@ -60,6 +60,10 @@ Unit tests also live alongside the code — notably `src/outbox.rs`
 `test_meter_tokens_payload_*`), `src/policy/mod.rs` (engine evaluation, kill
 switch, spend caps), `src/egress.rs` (secret scrubbing), `src/config/types.rs`
 (config validation), and `src/plugins/http.rs` (SSRF guard).
+The egress unit set includes negative controls where the fixed redaction marker
+reconstructs the credential, a terminal SSE frame contains a credential form,
+a scrubbed header still contains the form, and a buffered fallback diagnostic
+would repeat the credential. Each must withhold before the low sink.
 
 > Tests run against the encrypted file vault using temp dirs; they do not need
 > network except where a suite explicitly exercises an outbound call.

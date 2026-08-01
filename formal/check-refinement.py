@@ -43,6 +43,7 @@ authority_lean = (ROOT / "formal/lean/Vultrino/Approval/Authority.lean").read_te
 approval_model_lean = (ROOT / "formal/lean/Vultrino/Approval/Model.lean").read_text()
 action_authority_lean = (ROOT / "formal/lean/Vultrino/Approval/ActionAuthority.lean").read_text()
 method_authority_lean = (ROOT / "formal/lean/Vultrino/Action/MethodAuthority.lean").read_text()
+confinement_lean = (ROOT / "formal/lean/Vultrino/Credentials/Confinement.lean").read_text()
 config = (ROOT / "src/config/mod.rs").read_text()
 capability = (ROOT / "src/capability/mod.rs").read_text()
 internal_http_capability_tests = (ROOT / "tests/capability_internal_http_toolcall.rs").read_text()
@@ -101,6 +102,37 @@ if "confine_response(" not in server:
     fail("buffered low sink no longer requires PublicResponse confinement")
 if "has_unredactable_secret(" not in server:
     fail("streaming path no longer falls back to whole-response confinement for short secrets")
+for hook in (
+    "resp.body.clear();",
+    "pub fn confine_stream_headers(",
+    "released_tail: Zeroizing<Vec<u8>>",
+    "self.admit_output(out)",
+    "fn admit_output(&mut self",
+    "pub fn terminate_with(&mut self",
+):
+    if hook not in server and hook not in (ROOT / "src/egress.rs").read_text():
+        fail(f"final egress postcondition hook missing: {hook!r}")
+if "crate::egress::confine_stream_headers(&mut headers, &forms)" not in server:
+    fail("streamed headers no longer pass the final declared-form postcondition")
+if server.count("scrubber.terminate_with(SSE_ERROR_FRAME)") < 4:
+    fail("stream terminal frames no longer pass the compositional output gate")
+for theorem in (
+    "retained_tail_covers_every_possible_crossing_start",
+    "suffix_gate_preserves_stream_confinement",
+    "admitted_chunk_extends_stream_safely",
+    "unsafe_chunk_is_rejected",
+    "reachable_public_stream_excludes_every_declared_form",
+):
+    if f"theorem {theorem}" not in confinement_lean:
+        fail(f"Lean stream-confinement theorem missing: {theorem}")
+for test in (
+    "confined_response_fallback_cannot_repeat_a_secret_from_its_own_diagnostic",
+    "stream_scrubber_rejects_a_marker_that_reconstructs_the_secret",
+    "stream_terminal_frame_is_withheld_when_it_contains_a_secret",
+    "streamed_headers_are_cleared_when_the_marker_contains_a_secret",
+):
+    if f"fn {test}" not in (ROOT / "src/egress.rs").read_text():
+        fail(f"egress postcondition regression test missing: {test}")
 
 if server.count("confine_plugin_execution_error(error, &secret_material)") != 2:
     fail("both post-dispatch error paths must classify connector diagnostics")
@@ -246,4 +278,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; fail-closed canonical action aliases; operator-pinned internal HTTP method; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; fail-closed canonical action aliases; operator-pinned internal HTTP method; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

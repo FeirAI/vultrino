@@ -11,9 +11,10 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 - **Streamed metering has honest residuals.** A `{"stream": true}` LLM call is now
   forwarded as incremental SSE with a streamed token meter (V13b), but: a capability
   whose `(credential, action)` matches an operator `block`/`redact_patterns` egress
-  rule, or whose response is compressed, is served **buffered** (the incremental
-  scrubber runs only the always-on literal credential-secret scrub, not arbitrary
-  whole-body regex/block); a client that sets `stream_options.include_usage:false`,
+  rule is served **buffered** (the incremental scrubber runs only the always-on
+  literal credential-secret scrub, not arbitrary whole-body regex/block); a
+  residual-compressed response is withheld at the streamed head before any body
+  byte is released; a client that sets `stream_options.include_usage:false`,
   or a truncated/halted stream, meters the V13a `api-calls=1` event only (no V13b
   token counts). See [METERING.md](METERING.md).
 - **The meter emit is fail-open / out-of-band.** A swallowed `append_event`
@@ -60,7 +61,10 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   real protections there are that vultrino never trusts the upstream beyond the injected
   credential, the **buffered-block fallback** for unparseable/compressed bodies, and an
   operator `block`/`redact_patterns` rule. Secrets shorter than `MIN_REDACT_LEN = 5`
-  force buffered execution and whole-response withholding. A structural fix
+  force buffered execution and content-free whole-response withholding. Buffered
+  and streamed output receive a final exact-form check after replacement; the
+  streamed check includes the preceding released suffix, so neither the redaction
+  marker nor a chunk boundary can reconstruct a declared form. A structural fix
   (decode-then-match normalization) is a deferred follow-up.
 - **Halt abort callbacks are per-process.** The in-flight session registry is
   in-memory per process, so leg 3 of a halt (firing abort callbacks) only preempts

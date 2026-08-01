@@ -2162,9 +2162,10 @@ async fn test_egress_block_withholds_response_end_to_end() {
     let body = String::from_utf8_lossy(&resp.body);
     assert!(!body.contains("abc123"), "blocked body leaked: {body}");
     assert!(
-        body.contains("response withheld"),
-        "the exact diagnostic may itself contain a credential form and is then replaced by the generic confinement message: {body}"
+        body.is_empty(),
+        "the egress diagnostic contains the credential form `secret`, so exact confinement must return a content-free body: {body}"
     );
+    assert!(resp.headers.is_empty());
 }
 
 #[tokio::test]

@@ -37,8 +37,10 @@ upstream.
    endpoints. A credential's declared raw/derived forms are scrubbed from response
    bodies and headers; responses that cannot be safely scrubbed (including a
    still-compressed body or a secret shorter than five bytes) are **withheld
-   entirely**. Connector-provided post-dispatch error detail is also withheld from
-   live and persisted approval responses.
+   entirely**. The fail-closed buffered value has no body or headers, because no
+   fixed diagnostic can exclude every possible non-empty credential string.
+   Connector-provided post-dispatch error detail is also withheld from live and
+   persisted approval responses.
 2. **Default-deny.** A credential matching no policy is denied (`no_policy`
    reason). Fail-open is opt-in (`[enforcement] default_action = "allow"`) and
    warned about loudly at startup.
@@ -191,6 +193,11 @@ A still-compressed body is also withheld entirely (fail-closed).
 **incrementally** — each raw SSE chunk is passed through the always-on
 credential-secret scrub before it reaches the caller, with a carry-buffer sized off
 the longest secret form so a secret split across chunk boundaries is still caught.
+Each scrubbed output candidate, response header set, and terminal frame then passes
+a second declared-form postcondition. That check includes the last
+`max_form_len - 1` released bytes, so neither a replacement marker nor a transport
+boundary can reconstruct a credential form after the raw input was scrubbed; an
+unsafe candidate is withheld before release.
 The stricter whole-body controls (an operator `block`/`redact_patterns` rule, or a
 compressed body) cannot be honored at a chunk boundary, so a capability that needs
 them is served **buffered** instead. An operator can force buffered service for

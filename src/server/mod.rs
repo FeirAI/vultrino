@@ -2184,21 +2184,26 @@ impl VultrinoServer {
                 "streamed response is compressed and cannot be scrubbed — withholding"
             );
             emit_meter(&Arc::clone(&self.storage), &attribution, None, None).await;
-            let placeholder = Bytes::from_static(
+            let mut terminal_scrubber = crate::egress::StreamScrubber::new(
+                &secret_material,
+                &credential_alias,
+                self.config.llm_proxy.stream_max_line_bytes,
+            );
+            let placeholder = terminal_scrubber.terminate_with(
                 b"[vultrino: streamed response withheld - a compressed body could not be scrubbed for secrets]",
             );
             return Ok(StreamingExecution {
                 status,
-                headers: std::collections::HashMap::from([(
-                    "content-type".to_string(),
-                    "text/plain".to_string(),
-                )]),
+                // Upstream-controlled headers are opaque under residual
+                // compression. A fixed Content-Type could itself equal an
+                // unusual credential form, so the confined head is empty.
+                headers: std::collections::HashMap::new(),
                 // Move the V6 guard into the (single-chunk) body so the in-flight
                 // session deregisters when the placeholder is drained, not at this
                 // early return — symmetric with the main streaming path.
                 body: Box::pin(futures::stream::once(async move {
                     let _guard = session_guard;
-                    Ok::<Bytes, std::io::Error>(placeholder)
+                    Ok::<Bytes, std::io::Error>(Bytes::from(placeholder))
                 })),
             });
         }
@@ -2235,7 +2240,7 @@ impl VultrinoServer {
         // redacted body would invalidate (axum frames from the emitted bytes).
         let mut headers = streaming.headers;
         let forms = crate::egress::derive_secret_forms(&secret_material);
-        crate::egress::scrub_headers(&mut headers, &forms, &credential_alias);
+        crate::egress::confine_stream_headers(&mut headers, &forms);
         headers.retain(|k, _| {
             !k.eq_ignore_ascii_case("content-length")
                 && !k.eq_ignore_ascii_case("transfer-encoding")
@@ -2311,7 +2316,10 @@ impl VultrinoServer {
                 match step {
                     StreamStep::CleanEof => break,
                     StreamStep::Halted => {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(SSE_HALT_FRAME));
+                        let terminal = scrubber.terminate_with(SSE_HALT_FRAME);
+                        if !terminal.is_empty() {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(terminal));
+                        }
                         clean = false;
                         break;
                     }
@@ -2319,15 +2327,23 @@ impl VultrinoServer {
                     | StreamStep::TotalTimeout
                     | StreamStep::UpstreamError => {
                         // Generic in-band SSE error, never the detail (the buffered path
-                        // withholds upstream Err detail too).
-                        yield Ok(Bytes::from_static(SSE_ERROR_FRAME));
+                        // withholds upstream Err detail too). The terminal frame
+                        // itself passes the output-boundary postcondition; if it
+                        // collides with a credential form, the safe suffix is empty.
+                        let terminal = scrubber.terminate_with(SSE_ERROR_FRAME);
+                        if !terminal.is_empty() {
+                            yield Ok(Bytes::from(terminal));
+                        }
                         clean = false;
                         break;
                     }
                     StreamStep::Chunk(chunk) => {
                         total_bytes = total_bytes.saturating_add(chunk.len() as u64);
                         if max_bytes > 0 && total_bytes > max_bytes {
-                            yield Ok(Bytes::from_static(SSE_ERROR_FRAME));
+                            let terminal = scrubber.terminate_with(SSE_ERROR_FRAME);
+                            if !terminal.is_empty() {
+                                yield Ok(Bytes::from(terminal));
+                            }
                             clean = false;
                             break;
                         }
@@ -2347,8 +2363,13 @@ impl VultrinoServer {
                                 }
                             }
                             Err(_) => {
-                                // Scrub fail-closed (e.g. buffer cap).
-                                yield Ok(Bytes::from_static(SSE_ERROR_FRAME));
+                                // Scrub fail-closed (buffer cap or final-output
+                                // collision). The generic frame is also checked
+                                // against the already-released suffix.
+                                let terminal = scrubber.terminate_with(SSE_ERROR_FRAME);
+                                if !terminal.is_empty() {
+                                    yield Ok(Bytes::from(terminal));
+                                }
                                 clean = false;
                                 break;
                             }
@@ -2358,9 +2379,17 @@ impl VultrinoServer {
             }
 
             if clean {
-                if let Ok(out) = scrubber.finish() {
-                    if !out.is_empty() {
-                        yield Ok(Bytes::from(out));
+                match scrubber.finish() {
+                    Ok(out) => {
+                        if !out.is_empty() {
+                            yield Ok(Bytes::from(out));
+                        }
+                    }
+                    Err(_) => {
+                        let terminal = scrubber.terminate_with(SSE_ERROR_FRAME);
+                        if !terminal.is_empty() {
+                            yield Ok(Bytes::from(terminal));
+                        }
                     }
                 }
                 // Clean EOF: emit V13a + (when a usage split was parsed) the V13b
