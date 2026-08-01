@@ -259,6 +259,22 @@ if min(
     fail("trusted criticality snapshot must refuse or force approval before the shared branch")
 if "let trusted_irreversible = irreversibility.trusted_human_floor();" not in server:
     fail("approval stamp no longer consumes the same criticality snapshot that forced gating")
+if "async fn resolve_irreversibility_for_action(\n        &self,\n        credential_alias: &str," not in server:
+    fail("criticality lookup is no longer bound to the executing credential")
+if "cap.credential_ref.trim() == credential_alias.trim()" not in server:
+    fail("strict catalog lookup can borrow a declaration from another credential")
+if "approval.bind_capability_authority(" not in server:
+    fail("approval-open no longer freezes its catalog authority class")
+if "capability_authority: Option<CapabilityAuthorityClass>" not in approval:
+    fail("persisted approvals lost the private catalog authority snapshot")
+resume = server.find("async fn resume_approved(")
+resume_catalog = server.find("let current_capability_authority = self", resume)
+resume_policy = server.find("evaluate_readonly_full", resume_catalog)
+resume_permit = server.find("ExecutionPermit::approved", resume_policy)
+if min(resume, resume_catalog, resume_policy, resume_permit) < 0 or not (
+    resume < resume_catalog < resume_policy < resume_permit
+):
+    fail("approval resume must revalidate catalog authority before policy and permit issuance")
 label_lookup = server.find("async fn resolve_irreversibility_for_action(")
 label_miss = server.find("return IrreversibilityResolution::Undeclared;", label_lookup)
 canonical_ambiguity = server.find(
@@ -297,6 +313,9 @@ for theorem in (
     "strict_catalog_undeclared_never_direct",
     "direct_excludes_human_floor_and_unavailable",
     "strict_catalog_direct_implies_reversible",
+    "changed_catalog_authority_refuses_resume",
+    "approval_resume_implies_same_catalog_authority",
+    "unavailable_catalog_refuses_approval_resume",
 ):
     if f"theorem {theorem}" not in criticality_lean:
         fail(f"Lean criticality-gating theorem missing: {theorem}")
@@ -305,6 +324,8 @@ for test in (
     "disabled_approvals_refuse_declared_irreversible_capability",
     "strict_catalog_refuses_undeclared_action_before_dispatch",
     "strict_catalog_refuses_label_that_only_matches_a_canonical_sibling",
+    "strict_catalog_refuses_declaration_for_different_credential",
+    "approval_resume_refuses_changed_capability_authority",
     "shared_canonical_alias_cannot_take_the_direct_path",
     "exact_labels_and_previews_never_borrow_canonical_siblings",
 ):
@@ -470,4 +491,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; declared human-floor capabilities cannot dispatch directly; fail-closed canonical action aliases; operator-pinned internal HTTP method; startup-validated policy/workload secrets; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; credential-bound criticality with open-to-resume catalog continuity; declared human-floor capabilities cannot dispatch directly; fail-closed canonical action aliases; operator-pinned internal HTTP method; startup-validated policy/workload secrets; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

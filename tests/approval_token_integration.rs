@@ -256,6 +256,21 @@ async fn set_count_capability_reversibility(
     action: &str,
     reversibility: &str,
 ) {
+    set_count_capability_reversibility_for_credential(
+        storage,
+        action,
+        "*",
+        reversibility,
+    )
+    .await;
+}
+
+async fn set_count_capability_reversibility_for_credential(
+    storage: &Arc<dyn StorageBackend>,
+    action: &str,
+    credential_ref: &str,
+    reversibility: &str,
+) {
     storage
         .store_capability(&vultrino::capability::Capability {
             id: "cap-fixture-count-run".to_string(),
@@ -264,7 +279,7 @@ async fn set_count_capability_reversibility(
             action: action.to_string(),
             plugin: None,
             target: vultrino::capability::CapabilityTarget::default(),
-            credential_ref: "*".to_string(),
+            credential_ref: credential_ref.to_string(),
             input_schema: serde_json::json!({"type": "object"}),
             reversibility: reversibility.to_string(),
             llm: None,
@@ -374,6 +389,114 @@ async fn strict_catalog_refuses_undeclared_action_before_dispatch() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
+/// A declaration is authority only for the credential it actually injects.
+/// Production strictness must not let a request using another credential borrow
+/// a reversible action declaration and dispatch directly.
+#[tokio::test]
+async fn strict_catalog_refuses_declaration_for_different_credential() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let storage: Arc<dyn StorageBackend> = Arc::new(
+        FileStorage::new(&path, &SecretString::from("pw"))
+            .await
+            .unwrap(),
+    );
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.enforcement.require_declared_capabilities = true;
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    set_count_capability_reversibility_for_credential(
+        &storage,
+        "count.run",
+        "safe-cred",
+        "reversible",
+    )
+    .await;
+    store_credential(&storage, "different-cred", false).await;
+
+    let error = server
+        .execute_gated(count_request("different-cred"), ExecAuth::default())
+        .await
+        .expect_err("a different credential must not borrow the declaration");
+    assert!(matches!(error, vultrino::VultrinoError::PolicyDenied(_)));
+    assert!(error.to_string().contains("exact stored declaration"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// A capability PUT between decision and execution invalidates the approval's
+/// catalog snapshot. The action must be re-opened under the new human floor; an
+/// already-recorded single approval is not authority for the changed catalog.
+#[tokio::test]
+async fn approval_resume_refuses_changed_capability_authority() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let storage: Arc<dyn StorageBackend> = Arc::new(
+        FileStorage::new(&path, &SecretString::from("pw"))
+            .await
+            .unwrap(),
+    );
+    let mut config = Config::default();
+    config.approval.enabled = true;
+    config.approval.ttl_secs = 3600;
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.enforcement.require_declared_capabilities = true;
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    store_credential(&storage, "mutable-cred", true).await;
+    set_count_capability_reversibility_for_credential(
+        &storage,
+        "count.run",
+        "mutable-cred",
+        "reversible",
+    )
+    .await;
+
+    let approval = match server
+        .execute_gated(count_request("mutable-cred"), ExecAuth::default())
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(approval) => approval,
+        ExecutionOutcome::Completed(_) => panic!("expected pending approval"),
+    };
+    let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    stored
+        .approve(Decision::new("admin panel", "secops"))
+        .unwrap();
+    storage.update_approval(&stored).await.unwrap();
+
+    set_count_capability_reversibility_for_credential(
+        &storage,
+        "count.run",
+        "mutable-cred",
+        "irreversible",
+    )
+    .await;
+
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed, "the stale grant is terminal, not retryable");
+    assert!(resumed
+        .result_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("capability declaration governing this approval"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
 /// A missing exact label must not borrow the classification of a reversible
 /// sibling merely because both labels resolve to the same plugin verb.
 #[tokio::test]
@@ -399,7 +522,13 @@ async fn strict_catalog_refuses_label_that_only_matches_a_canonical_sibling() {
     server.plugins().register(Arc::new(CountingPlugin {
         calls: calls.clone(),
     }));
-    set_count_capability_reversibility(&storage, "data.read", "reversible").await;
+    set_count_capability_reversibility_for_credential(
+        &storage,
+        "data.read",
+        "label-cred",
+        "reversible",
+    )
+    .await;
     store_credential(&storage, "label-cred", false).await;
 
     let error = server

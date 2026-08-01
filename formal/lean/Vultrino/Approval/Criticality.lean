@@ -84,4 +84,35 @@ theorem strict_catalog_direct_implies_reversible
   cases approvalsEnabled <;> cases resolution <;>
     simp [decideCriticalGate] at direct ⊢
 
+/-- An approval may resume only when a fresh exact credential+action catalog
+resolution matches the authority class frozen at approval-open. An unavailable
+catalog is never continuity evidence. -/
+def approvalCatalogStillAuthorizes
+    (opened current : IrreversibilityResolution) : Bool :=
+  current != .unavailable && opened == current
+
+/-- A catalog replacement that changes the authority class invalidates the old
+approval. This includes reversible-to-human-floor escalation. -/
+theorem changed_catalog_authority_refuses_resume
+    {opened current : IrreversibilityResolution}
+    (changed : opened ≠ current) :
+    approvalCatalogStillAuthorizes opened current = false := by
+  simp [approvalCatalogStillAuthorizes, changed]
+
+/-- A successful approval resume proves continuity of the exact request's
+catalog authority from approval-open to permit issuance. -/
+theorem approval_resume_implies_same_catalog_authority
+    {opened current : IrreversibilityResolution}
+    (authorized : approvalCatalogStillAuthorizes opened current = true) :
+    opened = current := by
+  simp [approvalCatalogStillAuthorizes] at authorized
+  exact authorized.2
+
+/-- Catalog unavailability at resume is fail-closed regardless of the stamped
+open-time authority. -/
+theorem unavailable_catalog_refuses_approval_resume
+    (opened : IrreversibilityResolution) :
+    approvalCatalogStillAuthorizes opened .unavailable = false := by
+  simp [approvalCatalogStillAuthorizes]
+
 end Vultrino.Approval

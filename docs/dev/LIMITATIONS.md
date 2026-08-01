@@ -169,15 +169,19 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 
 - **Reversibility truth remains operator authority.** Production `vultrino web`
   forces strict catalog posture: a catalog outage or missing exact declaration is
-  refused, a presented label cannot borrow a canonical sibling, and a shared bare
-  canonical verb cannot dispatch directly. Thus every production-web direct path
-  has an exact stored `reversible` declaration. The parser/library default remains
+  refused, a presented label cannot borrow a canonical sibling, a request cannot
+  borrow another credential's declaration, and a shared bare canonical verb cannot
+  dispatch directly. Thus every production-web direct path has an exact stored
+  `reversible` declaration for the executing credential and action. Approval resume
+  also refuses if that catalog authority class changed since open. The parser/library default remains
   non-strict for compatibility with older stdio/embedded callers (new `vultrino
   init` files opt in); those callers must set
   `require_declared_capabilities = true` for the same guarantee. Lean and the
-  refinement gate prove that the declared class is enforced. They cannot establish
-  that an operator truthfully labeled the real-world side effect reversible; that
-  semantic classification remains an explicit operational assumption.
+  refinement gate prove that the declared class and its open-to-resume continuity
+  are enforced. They cannot establish that an operator truthfully labeled the
+  real-world side effect reversible, or detect an external semantic change that
+  the operator did not reflect in the catalog; that classification remains an
+  explicit operational assumption.
 - **Observe mode is a deliberate downgrade.** A tenant in `observe` mode lets
   ordinary policy denials through (logged + emitted as `policy.observed_denial`).
   Security/financial boundaries (halt, cross-tenant isolation, SpendCap/RateLimit)

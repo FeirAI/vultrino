@@ -31,7 +31,9 @@ The machine-checked entry point for Vultrino's critical-boundary model.
 * a declared human-floor capability, unavailable catalog, shared canonical verb,
   or (in production strict posture) undeclared action can never produce direct
   execution authority; production direct authority implies an exact reversible
-  declaration, and disabled approvals refuse rather than bypass.
+  declaration for the executing credential and action, and an approval can resume
+  only while that catalog authority class remains unchanged. Disabled approvals
+  refuse rather than bypass.
 * a started production web process has strict catalog enforcement and a configured
   policy-hash key, and an enabled workload exchange has a valid startup-snapshotted
   verifier.

@@ -3,7 +3,8 @@
 //! Provides JSON API mode for execute requests.
 
 use crate::approval::{
-    ApprovalLinks, ApprovalNotifier, ApprovalRequest, ApprovalStatus, NewApproval, RequesterInfo,
+    ApprovalLinks, ApprovalNotifier, ApprovalRequest, ApprovalStatus, CapabilityAuthorityClass,
+    NewApproval, RequesterInfo,
 };
 use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
 use crate::config::Config;
@@ -73,6 +74,16 @@ impl IrreversibilityResolution {
 
     fn trusted_human_floor(self) -> bool {
         !matches!(self, Self::Reversible)
+    }
+
+    fn authority_class(self) -> Option<CapabilityAuthorityClass> {
+        match self {
+            Self::Reversible => Some(CapabilityAuthorityClass::Reversible),
+            Self::HumanFloor => Some(CapabilityAuthorityClass::HumanFloor),
+            Self::Undeclared => Some(CapabilityAuthorityClass::Undeclared),
+            Self::AmbiguousCanonical => Some(CapabilityAuthorityClass::AmbiguousCanonical),
+            Self::Unavailable => None,
+        }
     }
 }
 
@@ -1253,7 +1264,11 @@ impl VultrinoServer {
         // stamp the approval floor. This closes the policy-Allow/unflagged-token
         // bypass for declared irreversible and partially-reversible actions.
         let irreversibility = self
-            .resolve_irreversibility_for_action(&full_action, action_label.as_deref())
+            .resolve_irreversibility_for_action(
+                &credential.alias,
+                &full_action,
+                action_label.as_deref(),
+            )
             .await;
         if matches!(irreversibility, IrreversibilityResolution::Unavailable) {
             return Err(VultrinoError::PolicyUnavailable(
@@ -1456,6 +1471,15 @@ impl VultrinoServer {
                 },
                 approval_rule,
             });
+            // Freeze the exact request's catalog authority alongside the approval.
+            // `Unavailable` returned above, so every request that can reach open
+            // has a concrete class. Resume compares this class with a fresh
+            // credential+action resolution before minting the execution permit.
+            approval.bind_capability_authority(
+                irreversibility
+                    .authority_class()
+                    .expect("available catalog resolution has an authority class"),
+            );
             // Spend is extracted by the trusted policy layer above. Stamp it only
             // after opening so requester-authored params can never supply these
             // grant-cap facts.
@@ -2513,6 +2537,36 @@ impl VultrinoServer {
             parse_action(&approval.action).map_err(RunError::terminal)?;
         let mut context = RequestContext::new();
 
+        // Revalidate the exact credential+action catalog authority immediately
+        // before execution. Capability PUT/DELETE is live operator authority: an
+        // approval opened under one classification must not survive a replacement
+        // or deletion and execute under a stale, weaker snapshot. The catalog read
+        // is the authorization linearization point; a concurrent later mutation
+        // applies to the next execution, as with the policy read below.
+        let current_capability_authority = self
+            .resolve_irreversibility_for_action(
+                &approval.credential,
+                &approval.action,
+                approval.action_label.as_deref(),
+            )
+            .await
+            .authority_class();
+        let opened_capability_authority = approval.capability_authority();
+        let catalog_authority_changed = match opened_capability_authority {
+            Some(opened) => current_capability_authority != Some(opened),
+            // Older persisted approvals have no snapshot. Preserve them only for
+            // explicitly non-strict embedded/stdio posture; production web forces
+            // strict mode and therefore requires a bound snapshot.
+            None => self.config.enforcement.require_declared_capabilities,
+        };
+        if current_capability_authority.is_none() || catalog_authority_changed {
+            return Err(RunError::terminal(VultrinoError::PolicyDenied(
+                "the capability declaration governing this approval is unavailable or changed; \
+                 nothing ran — open a new approval against the current catalog"
+                    .to_string(),
+            )));
+        }
+
         // Re-evaluate policy at execution time so the deferred path still
         // enforces hard *deny* gates — a human approval is not a policy bypass.
         // NOTE (policy-change interaction): policy is re-evaluated read-only at
@@ -3197,9 +3251,11 @@ impl VultrinoServer {
     }
 
     /// Trusted irreversibility for D3 floors: resolve from stored capability metadata
-    /// (not requester-authored params). Matches canonical action or govder label.
+    /// (not requester-authored params). Production strict mode binds the executing
+    /// credential as well as the canonical action or Govder label.
     async fn resolve_irreversibility_for_action(
         &self,
+        credential_alias: &str,
         canonical_action: &str,
         action_label: Option<&str>,
     ) -> IrreversibilityResolution {
@@ -3218,7 +3274,19 @@ impl VultrinoServer {
             }
         };
 
+        let exact_request_credential = |cap: &&crate::capability::Capability| {
+            // Production strictness binds a declaration to the credential it
+            // actually injects. Legacy/non-web callers retain the historical
+            // action-only lookup so existing embedded/stdio deployments do not
+            // silently change posture.
+            !self.config.enforcement.require_declared_capabilities
+                || cap.credential_ref.trim() == credential_alias.trim()
+        };
         let classify = |matching: Vec<&crate::capability::Capability>| {
+            let matching: Vec<_> = matching
+                .into_iter()
+                .filter(exact_request_credential)
+                .collect();
             if matching.is_empty() {
                 IrreversibilityResolution::Undeclared
             } else if matching.iter().any(|cap| {
@@ -3247,8 +3315,8 @@ impl VultrinoServer {
             if !exact.is_empty() {
                 return classify(exact);
             }
-            tracing::warn!(%canonical_action, %label,
-                "no exact capability metadata matched the governed action label");
+            tracing::warn!(%credential_alias, %canonical_action, %label,
+                "no exact capability metadata matched the governed credential/action label");
             return IrreversibilityResolution::Undeclared;
         }
 
@@ -3268,8 +3336,8 @@ impl VultrinoServer {
             .filter(|cap| self.config.resolve_action(&cap.action).0 == canonical_action)
             .collect();
         if canonical.is_empty() {
-            tracing::warn!(%canonical_action, ?action_label,
-                "no capability metadata matched approval action; no automatic criticality classification is available");
+            tracing::warn!(%credential_alias, %canonical_action, ?action_label,
+                "no capability metadata matched the governed credential/action; no automatic criticality classification is available");
             return IrreversibilityResolution::Undeclared;
         }
         classify(canonical)
@@ -4871,11 +4939,15 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            server.resolve_irreversibility_for_action("http.request", None).await
+            server
+                .resolve_irreversibility_for_action("cred", "http.request", None)
+                .await
                 == IrreversibilityResolution::HumanFloor
         );
         assert!(
-            server.resolve_irreversibility_for_action("unknown.action", None).await
+            server
+                .resolve_irreversibility_for_action("cred", "unknown.action", None)
+                .await
                 == IrreversibilityResolution::Undeclared
         );
     }
@@ -4934,7 +5006,7 @@ mod tests {
 
         assert_eq!(
             server
-                .resolve_irreversibility_for_action("http.request", Some("data.read"))
+                .resolve_irreversibility_for_action("cred", "http.request", Some("data.read"))
                 .await,
             IrreversibilityResolution::Reversible
         );
@@ -4950,7 +5022,7 @@ mod tests {
 
         assert_eq!(
             server
-                .resolve_irreversibility_for_action("http.request", Some("money.refund"))
+                .resolve_irreversibility_for_action("cred", "http.request", Some("money.refund"))
                 .await,
             IrreversibilityResolution::Undeclared
         );
@@ -4968,7 +5040,7 @@ mod tests {
 
         assert_eq!(
             server
-                .resolve_irreversibility_for_action("http.request", None)
+                .resolve_irreversibility_for_action("cred", "http.request", None)
                 .await,
             IrreversibilityResolution::AmbiguousCanonical
         );

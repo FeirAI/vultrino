@@ -67,8 +67,12 @@ classified as irreversible or partially reversible cannot take the direct path;
 catalog failure and erased business labels. In strict production posture,
 `strict_catalog_undeclared_never_direct` refuses exact misses and
 `strict_catalog_direct_implies_reversible` proves that direct criticality
-authority implies an exact reversible declaration. If approvals are disabled,
-the decision is refusal rather than bypass.
+authority implies an exact reversible declaration. The runtime refinement binds
+that resolution to the executing credential. `changed_catalog_authority_refuses_resume`,
+`approval_resume_implies_same_catalog_authority`, and
+`unavailable_catalog_refuses_approval_resume` prove that an approval cannot
+resume after its exact-request authority class changes or becomes unavailable.
+If approvals are disabled, the decision is refusal rather than bypass.
 
 `Credentials.reachable_credentials_are_confined` proves, by induction over
 every reachable credential-flow trace, that raw credential material reaches
@@ -120,10 +124,11 @@ the model:
 - the production web entrypoint validates the policy-hash secret and any enabled
   workload verifier before touching the vault, spawning workers, or binding; the
   verifier list is then held in `AppState` rather than reread per request;
-- the trusted capability catalog is resolved once per admitted request before a
-  direct permit can be minted; catalog failure and undeclared production actions
+- the trusted capability catalog is resolved for the exact executing credential
+  and action before a direct permit can be minted; catalog failure and undeclared production actions
   refuse, while a declared human-floor class or erased shared-canonical label
-  independently forces approval, and that same snapshot stamps the approval;
+  independently forces approval; that same class stamps the approval and a fresh
+  resolution must match it before the approved permit is minted;
 - exact action labels never borrow a canonical sibling's classification or
   approval preview; ambiguous or duplicate previews fall back to the generic
   summary rather than selecting one declaration nondeterministically;
@@ -207,7 +212,7 @@ declared-transform assumptions.
 | `Authority.AssertionEvidence.validFor` | inbound HMAC verifier over raw body plus actual tenant/method/path/query/Host, bounded to five minutes |
 | `ActionAuthority.decideAuthority` | label-first exact Govder lookup plus canonical-label ambiguity refusal before numeric fallback |
 | `Action.MethodAuthority.composeMethod` | registration-time method-source validation plus caller-method rejection and final operator pin in `build_internal_http_params` |
-| `Approval.decideCriticalGate` | one exact-label catalog snapshot; unavailable/strict-undeclared refusal and human-floor/ambiguous approval forcing before the shared prepared-action branch |
+| `Approval.decideCriticalGate` / `approvalCatalogStillAuthorizes` | exact credential+action catalog authority; unavailable/strict-undeclared refusal, human-floor/ambiguous approval forcing, and open-to-resume class continuity before permit issuance |
 | `Configuration.decideWebStartup` | production `run_web_server` forces strict catalog posture before validated startup; policy hash and workload verifier are then snapshotted in `AppState` |
 | `Approval.Step.execute` | the single buffered/streaming dispatch seam |
 | `Credentials.Operation` | built-ins are trusted declassification points; untrusted WASM receives only a handle |

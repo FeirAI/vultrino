@@ -218,10 +218,14 @@ every turn with `[llm_proxy] streaming_enabled = false`. See
   tokens. An unavailable catalog refuses before approval-open or dispatch;
   disabled approvals refuse a human-floor or ambiguous action. Production
   `vultrino web` refuses undeclared actions, exact label misses never borrow a
-  canonical sibling, and a shared bare canonical verb can never run directly.
-  Therefore only an exact trusted `reversible` declaration can reach the direct
-  path. This proves enforcement of the stored declaration, not that an operator's
-  declaration is semantically truthful about the real-world side effect.
+  canonical sibling, a declaration for another credential cannot be borrowed,
+  and a shared bare canonical verb can never run directly. Therefore only an
+  exact trusted `reversible` declaration for the executing credential and action
+  can reach the direct path. Approval-open freezes that authority class and
+  resume re-resolves it before permit issuance; replacement or deletion refuses
+  the stale approval. This proves enforcement and continuity of the stored
+  declaration, not that an operator's declaration is semantically truthful about
+  the real-world side effect.
 - An outbox push with no URL or no signing secret is a hard config error
   (an unsigned/undeliverable outbox is rejected).
 - A halt label must be a literal id (no glob), so a halt can't deny a fleet.

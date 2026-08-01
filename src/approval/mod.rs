@@ -233,6 +233,20 @@ pub fn reversibility_requires_human_floor(reversibility: &str) -> bool {
     !matches!(reversibility.trim(), "reversible")
 }
 
+/// The authority-relevant result of resolving one exact execution request
+/// against the capability catalog. This is snapshotted when an approval opens
+/// and compared with a fresh resolution immediately before its permit is
+/// minted. A catalog replacement or deletion therefore invalidates the old
+/// approval instead of letting it execute under stale criticality authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CapabilityAuthorityClass {
+    Reversible,
+    HumanFloor,
+    Undeclared,
+    AmbiguousCanonical,
+}
+
 /// The result of advancing an approval through its SLA lifecycle (V5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleChange {
@@ -918,6 +932,12 @@ pub struct ApprovalRequest {
     /// Trusted irreversibility from capability/policy at open (D3); not requester params.
     #[serde(default)]
     pub trusted_irreversible: bool,
+    /// Exact request/capability authority class at approval-open. Kept private:
+    /// server code may bind it once through `bind_capability_authority`, while
+    /// execution reads it only through `capability_authority`. Older records
+    /// deserialize as `None` and production strict mode refuses them at resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capability_authority: Option<CapabilityAuthorityClass>,
     /// Trusted spend facts from the policy extractor at open (D3 grant caps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_spend_amount_minor: Option<i64>,
@@ -1044,6 +1064,7 @@ impl ApprovalRequest {
             authoritative_irreversible: false,
             criticality: params.criticality,
             trusted_irreversible: params.trusted_irreversible.unwrap_or(false),
+            capability_authority: None,
             trusted_spend_amount_minor: None,
             trusted_spend_asset: None,
             delegate_veto_until: None,
@@ -1081,6 +1102,19 @@ impl ApprovalRequest {
     /// for the sealed [`Self::signoffs`] field (Stage 1 V2).
     pub fn signoffs(&self) -> &[Signoff] {
         &self.signoffs
+    }
+
+    /// Bind the catalog snapshot that governed approval-open. This is crate-only
+    /// so downstream callers cannot rewrite the premise an approved execution
+    /// revalidates.
+    pub(crate) fn bind_capability_authority(&mut self, authority: CapabilityAuthorityClass) {
+        self.capability_authority = Some(authority);
+    }
+
+    /// Catalog snapshot to compare with the live exact-request resolution at
+    /// resume. `None` identifies an older persisted approval.
+    pub(crate) fn capability_authority(&self) -> Option<CapabilityAuthorityClass> {
+        self.capability_authority
     }
 
     /// Re-establish the persisted approval invariants after decryption and

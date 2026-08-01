@@ -315,13 +315,17 @@ returned until someone signs off.
 - A stored capability whose trusted `reversibility` is `partially-reversible` or
   `irreversible`. This signal is independent of policy/token flags.
 
-On the production `vultrino web` surface, every action must have an exact stored
-declaration. A presented business label cannot borrow a canonical sibling's
-classification, a shared bare canonical verb cannot run directly, and a missing
-declaration or unavailable catalog is refused before dispatch. Consequently the
-only catalog classification that can reach the direct path is an exact trusted
-`reversible` declaration. New `vultrino init` configurations enable the same
-posture for stdio; older stdio/embedded configurations can opt in with
+On the production `vultrino web` surface, a directly executed action must have an
+exact stored declaration for the credential it actually injects. A presented
+business label cannot borrow a canonical sibling's classification, a request
+cannot borrow a declaration for another credential, and a shared bare canonical
+verb cannot run directly (it may proceed only through authoritative approval).
+A missing exact label declaration or unavailable catalog is refused before
+dispatch. Consequently the only catalog classification that can reach the direct
+path is an exact trusted `reversible` declaration for that credential and action.
+An approval also freezes its authority class and revalidates it at resume, so a
+catalog reclassification/deletion requires a new approval. New `vultrino init`
+configurations enable the same posture for stdio; older stdio/embedded configurations can opt in with
 `[enforcement] require_declared_capabilities = true`.
 
 If approvals are disabled, a triggered action is refused; disabling the approval

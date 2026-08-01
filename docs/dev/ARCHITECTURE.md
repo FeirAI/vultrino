@@ -92,10 +92,10 @@ The authoritative path is `VultrinoServer::execute_gated` → `run_action` in
    capability snapshot declares a partially-reversible/irreversible class. A
    catalog outage is an immediate refusal; unknown/invalid stored reversibility is
    human-floor, not reversible. Production `vultrino web` additionally requires
-   an exact declaration for the presented business label (or an unambiguous
-   canonical action). An exact label miss is refused and never borrows a canonical
-   sibling. A bare canonical verb targeted by configured labels is ambiguous and
-   cannot run directly. When gated, **the action
+   an exact declaration for the executing credential and presented business label
+   (or an unambiguous canonical action). An exact label or credential miss is
+   refused and never borrows a canonical or credential sibling. A bare canonical
+   verb targeted by configured labels is ambiguous and cannot run directly. When gated, **the action
    does not run**: an `ApprovalRequest` is opened, persisted, announced to
    notifiers, a `approval.requested` event is emitted, and `202`/Pending is
    returned. The use token is **not** consumed yet (reserved for the eventual run).
@@ -104,10 +104,12 @@ The authoritative path is `VultrinoServer::execute_gated` → `run_action` in
    configured labels, Vultrino accepts an exact canonical rule but otherwise
    refuses before numeric fallback; it never guesses which label's recipe applies.
    If approvals are disabled, the request is refused before recipe lookup or
-   dispatch. The same catalog snapshot that forced gating stamps irreversibility
-   on the approval, avoiding a classification check/use window. Approval previews
-   preserve the same exact-label boundary and fall back to the generic summary
-   rather than selecting a canonical sibling or duplicate declaration.
+   dispatch. The same exact-request catalog snapshot that forced gating stamps
+   authority on the approval. Resume reloads the catalog and requires the same
+   authority class before permit issuance, so replacement/deletion invalidates the
+   old approval. Approval previews preserve the same exact-label boundary and fall
+   back to the generic summary rather than selecting a canonical sibling or
+   duplicate declaration.
 8. **Run the action** (`run_action`), if not gated:
    - **Preflight (no side effects):** resolve the plugin, validate params. A
      not-loaded plugin is *retryable*; bad params are *terminal*.
@@ -127,7 +129,8 @@ The authoritative path is `VultrinoServer::execute_gated` → `run_action` in
 
 Approval-gated actions run later via the **deferred path** (`resume_approved`),
 triggered when the requester polls the approval after a human decides. The resume
-re-evaluates policy **read-only** (it re-enforces hard `Deny`/kill gates — a
+first re-resolves the exact credential+action catalog authority and refuses if it
+differs from approval-open, then re-evaluates policy **read-only** (it re-enforces hard `Deny`/kill gates — a
 policy revoked or a kill pushed mid-flight stops the action — but does not
 re-charge the rate limiter or re-prompt). Execution is claimed under the storage
 lock and fenced by a monotonic `execution_epoch`, so the action runs **at most
