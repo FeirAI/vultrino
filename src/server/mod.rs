@@ -4,7 +4,7 @@
 
 use crate::approval::{
     ApprovalLinks, ApprovalNotifier, ApprovalRequest, ApprovalStatus, CapabilityAuthorityClass,
-    NewApproval, RequesterInfo,
+    GateRuleAuthorityClass, NewApproval, RequesterInfo,
 };
 use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
 use crate::config::Config;
@@ -580,15 +580,17 @@ pub struct VultrinoServer {
     /// Default-off: `None`, and both hooks are no-ops — `/execute` and mint stay
     /// byte-identical to today. See `docs/dev/averin-sealing.md`.
     averin: Option<Arc<crate::averin::AverinClient>>,
-    /// Govder decide-plane client (plan 100 P2 Phase D), used ONLY to fetch the
-    /// stamped `ApprovalRule` (if any) at approval-open — see
+    /// Govder decide-plane client (plan 100 P2 Phase D), used to fetch the
+    /// stamped `ApprovalRule` at approval-open and revalidate that exact authority
+    /// before permit issuance — see
     /// [`Self::fetch_gate_rule_for_action`]. `None` when govder isn't configured
     /// (`GOVDER_BASE_URL`/`GOVDER_TENANT_ASSERTION_SECRET` unset) or failed to
     /// construct. That is NOT read as "no rule": it is read as "no recipe authority was
-    /// consulted", i.e. `GateRuleAnswer::Inconclusive` — which refuses IRREVERSIBLE
-    /// actions at approval-open and leaves reversible ones on the numeric path. So this
-    /// is still never a hard STARTUP dependency (the process boots and serves), but it
-    /// IS a hard dependency for running an action that cannot be undone. Both `None`
+    /// consulted", i.e. `GateRuleAnswer::Inconclusive`. Production strict posture
+    /// refuses that answer for every gated action; compatibility posture retains the
+    /// reversible-action numeric fallback while always refusing the human-floor class.
+    /// So this is still never a hard STARTUP dependency (the process boots and serves),
+    /// but it IS a runtime dependency for production approval execution. Both `None`
     /// paths warn at startup, by name. A SEPARATE `GovderClient` instance
     /// from the one `web/server.rs` builds for `AppState` (that one backs the
     /// delegate-decide consult) — both are built from the SAME `Config::govder`
@@ -713,8 +715,9 @@ impl VultrinoServer {
 
         // Govder gate-rule client (plan 100 P2 Phase D). `None` when unconfigured or
         // invalid — approval RECIPES are then unenforceable, so every approval-open
-        // treats the gate answer as INCONCLUSIVE: irreversible actions refuse,
-        // reversible ones keep the numeric path (see `fetch_gate_rule_for_action`).
+        // treats the gate answer as INCONCLUSIVE. Production strict mode refuses all
+        // such opens; compatibility mode keeps only the historical reversible-action
+        // numeric path (see `fetch_gate_rule_for_action`).
         //
         // BOTH no-client paths are logged, at the same volume. The absent-config path
         // used to be the silent one: an operator who never set the two env vars got a
@@ -728,8 +731,8 @@ impl VultrinoServer {
                 Err(e) => {
                     warn!(error = %e,
                         "govder gate-rule client disabled: config invalid — approval RECIPES are \
-                         NOT in force; irreversible actions will be REFUSED at approval-open and \
-                         reversible ones fall back to the numeric approver-count path");
+                         NOT in force; production-strict and human-floor approval opens will be \
+                         REFUSED (compatibility posture alone retains reversible numeric fallback)");
                     None
                 }
             },
@@ -737,11 +740,11 @@ impl VultrinoServer {
                 warn!(
                     "no govder policy engine configured (GOVDER_BASE_URL and/or \
                      GOVDER_TENANT_ASSERTION_SECRET unset) — approval RECIPES are NOT in force on \
-                     this deployment; irreversible actions will be REFUSED at approval-open and \
-                     reversible ones fall back to the numeric approver-count path. Set both vars \
-                     to point at your decide plane, or declare each gated action's \
-                     `reversibility` in the capability catalog so vultrino stops having to \
-                     assume the worst about actions it cannot look up"
+                     this deployment; production-strict and human-floor approval opens will be \
+                     REFUSED (compatibility posture alone retains reversible numeric fallback). Set both vars \
+                     to point at your decide plane. Compatibility-only deployments may declare a \
+                     gated action `reversible` to use the numeric fallback; production strict \
+                     approval execution still requires recipe authority"
                 );
                 None
             }
@@ -1379,8 +1382,9 @@ impl VultrinoServer {
             // Plan 100 P2 Phase D: fetch the govder-authored ApprovalRule (if any)
             // for this (agent, action_class) and stamp it onto the approval at open
             // — vultrino evaluates recipe satisfaction IN-LOCK against this SAME
-            // stamped copy on every subsequent sign-off (never re-fetched, never
-            // re-derived — see approval-recipes.md §6 D5).
+            // stamped copy on every subsequent sign-off. It does not switch rules
+            // mid-approval; instead resume re-fetches and requires exact equality
+            // before the execution permit is minted (see approval-recipes.md §6 D5).
             let agent_id_for_rule = principal.as_ref().and_then(|p| p.agent_label.clone());
             // A genuine govder fetch failure here `?`-propagates: vultrino could
             // not confirm the gate's oversight requirement, so it must fail this
@@ -1389,7 +1393,12 @@ impl VultrinoServer {
             // fetched shape into the rule itself plus govder's AUTHORITATIVE risk
             // facts (BLOCKER 5): the recipe deny-wins force reads THESE, never
             // vultrino's LOCAL criticality. No rule → no facts (numeric path).
-            let (approval_rule, authoritative_risk_tier, authoritative_irreversible) = match self
+            let (
+                approval_rule,
+                authoritative_risk_tier,
+                authoritative_irreversible,
+                gate_rule_authority,
+            ) = match self
                 .fetch_gate_rule_for_action(
                     principal_tenant.as_deref(),
                     agent_id_for_rule.as_deref(),
@@ -1402,41 +1411,53 @@ impl VultrinoServer {
                     Some(fetched.rule),
                     fetched.risk_tier,
                     fetched.irreversible,
+                    GateRuleAuthorityClass::Rule,
                 ),
-                crate::govder::GateRuleAnswer::NoRule => (None, String::new(), false),
+                crate::govder::GateRuleAnswer::NoRule => (
+                    None,
+                    String::new(),
+                    false,
+                    GateRuleAuthorityClass::NoRule,
+                ),
                 // INCONCLUSIVE (plan 103 §10h FINDING 1/2): govder answered, but did
                 // not confirm whether a recipe exists. The numeric-threshold fallback
                 // is not a neutral default — it is a WEAKER oversight requirement (one
                 // approver), and this exact silent downgrade let ONE human clear an
                 // irreversible refund the operator had gated at two.
                 //
-                // The decision keys on `trusted_irreversible`, which is derived above
-                // from vultrino's OWN stored capability metadata (never requester
-                // params) and already fails to `true` when that catalog is unreadable.
-                // For an irreversible action, refuse: no approval is opened, so no
-                // notification is sent, no use is reserved, and the use token is NOT
-                // consumed — the caller can retry once the recipe is confirmable. For a
-                // reversible action the numeric path stays exactly as it was (this is
-                // the whole non-money world, and an unconfirmed recipe there costs a
-                // reviewer, not a payment), with the reason logged.
+                // Production strict posture refuses every inconclusive answer: a
+                // reversible declaration says nothing about whether Govder requires
+                // two people or a senior. Compatibility posture retains the prior
+                // reversible numeric path. The human-floor class always refuses,
+                // derived from vultrino's OWN stored metadata (never requester params).
+                // Refusal persists no approval, sends no notification, reserves no use,
+                // and consumes no token; the caller can retry when authority is available.
                 crate::govder::GateRuleAnswer::Inconclusive { reason } => {
-                    if trusted_irreversible {
+                    if self.config.enforcement.require_declared_capabilities
+                        || trusted_irreversible
+                    {
                         tracing::error!(%reason, %full_action,
                             agent_id = agent_id_for_rule.as_deref().unwrap_or("<none>"),
-                            "REFUSING an irreversible action: the approval recipe could not be \
-                             confirmed, and falling back to a single approver would enforce \
-                             weaker oversight than is declared");
+                            "REFUSING an action whose approval recipe could not be confirmed: \
+                             production strict posture (or the human-floor class) forbids \
+                             falling back to weaker numeric oversight");
                         return Err(VultrinoError::PolicyUnavailable(format!(
-                            "this action cannot be undone, so it may only run under a confirmed \
-                             approval requirement: {reason}. Nothing was executed and no \
-                             approval was opened."
+                            "this action may only open under a confirmed approval requirement: \
+                             {reason}. Production strict posture requires confirmation for every \
+                             gated action, and human-floor actions always require it. Nothing was \
+                             executed and no approval was opened."
                         )));
                     }
                     tracing::warn!(%reason, %full_action,
                         agent_id = agent_id_for_rule.as_deref().unwrap_or("<none>"),
                         "the approval recipe could not be confirmed; this action is reversible, \
                          so it opens under the ordinary approver-count path");
-                    (None, String::new(), false)
+                    (
+                        None,
+                        String::new(),
+                        false,
+                        GateRuleAuthorityClass::Inconclusive,
+                    )
                 }
             };
             let (mut approval, decision_token) = ApprovalRequest::open(NewApproval {
@@ -1480,6 +1501,7 @@ impl VultrinoServer {
                     .authority_class()
                     .expect("available catalog resolution has an authority class"),
             );
+            approval.bind_gate_rule_authority(gate_rule_authority);
             // Spend is extracted by the trusted policy layer above. Stamp it only
             // after opening so requester-authored params can never supply these
             // grant-cap facts.
@@ -2567,6 +2589,56 @@ impl VultrinoServer {
             )));
         }
 
+        // Govder recipe authority is live configuration too. Re-fetch the exact
+        // tenant/agent/business-action answer and require it to match the class,
+        // recipe, and authoritative risk facts frozen at approval-open. A newly
+        // strengthened rule, a removed rule, or an inconclusive authority outage
+        // cannot inherit an already-recorded weaker approval.
+        let current_gate_rule = self
+            .fetch_gate_rule_for_action(
+                approval.tenant.as_deref(),
+                approval.agent_label.as_deref(),
+                &approval.action,
+                approval.action_label.as_deref(),
+            )
+            .await
+            .map_err(|error| {
+                RunError::terminal(VultrinoError::PolicyUnavailable(format!(
+                    "the approval recipe authority could not be revalidated; nothing ran: {error}"
+                )))
+            })?;
+        let gate_rule_authority_current = match current_gate_rule {
+            crate::govder::GateRuleAnswer::Rule(fetched) => {
+                approval.gate_rule_authority() == Some(GateRuleAuthorityClass::Rule)
+                    && approval.approval_rule.as_ref() == Some(&fetched.rule)
+                    && approval.authoritative_risk_tier == fetched.risk_tier
+                    && approval.authoritative_irreversible == fetched.irreversible
+            }
+            crate::govder::GateRuleAnswer::NoRule => {
+                approval.gate_rule_authority() == Some(GateRuleAuthorityClass::NoRule)
+                    && approval.approval_rule.is_none()
+                    && approval.authoritative_risk_tier.is_empty()
+                    && !approval.authoritative_irreversible
+            }
+            crate::govder::GateRuleAnswer::Inconclusive { reason } => {
+                tracing::error!(%reason, approval_id = %approval.id,
+                    "approval recipe authority is inconclusive at resume");
+                !self.config.enforcement.require_declared_capabilities
+                    && approval.gate_rule_authority()
+                        == Some(GateRuleAuthorityClass::Inconclusive)
+                    && approval.approval_rule.is_none()
+            }
+        };
+        let legacy_unbound_recipe = approval.gate_rule_authority().is_none()
+            && !self.config.enforcement.require_declared_capabilities;
+        if !legacy_unbound_recipe && !gate_rule_authority_current {
+            return Err(RunError::terminal(VultrinoError::PolicyDenied(
+                "the authoritative approval recipe is unavailable or changed since this request \
+                 opened; nothing ran — open a new approval against the current rule"
+                    .to_string(),
+            )));
+        }
+
         // Re-evaluate policy at execution time so the deferred path still
         // enforces hard *deny* gates — a human approval is not a policy bypass.
         // NOTE (policy-change interaction): policy is re-evaluated read-only at
@@ -3137,19 +3209,17 @@ impl VultrinoServer {
     /// `GOVDER_BASE_URL` on the box that enforces it — but the old short-circuit read
     /// exactly that consent into an unset env var, and one approver cleared the refund.
     ///
-    /// The caller's `trusted_irreversible` seam then does the scoping, unchanged and
-    /// deliberately: an IRREVERSIBLE action refuses (nothing runs, no approval opens),
-    /// a REVERSIBLE one still opens on the numeric path. So a standalone vultrino with
-    /// no decide plane keeps working for the entire non-money world, and only loses the
-    /// ability to silently under-approve the actions that cannot be undone. That is the
-    /// correct trade: a deployment that runs irreversible money actions with no recipe
-    /// authority reachable is not a supported configuration, it is an unenforced one.
+    /// The caller combines this answer with posture and trusted criticality. Production
+    /// strict mode refuses every inconclusive answer because reversibility is not proof
+    /// of recipe absence. Compatibility mode retains the historic reversible numeric
+    /// path; an irreversible/human-floor action refuses in every posture. Refusal means
+    /// nothing runs and no approval opens.
     ///
     /// A wired govder that cannot be REACHED, or answers malformed, is still `Err` —
     /// the caller fails the approval-open closed. But a wired govder that answers "no
     /// gate" WITHOUT confirming it (plan 103 §10h FINDING 1/2) is neither of those: it
-    /// is `GateRuleAnswer::Inconclusive`, and the caller decides on the action's
-    /// irreversibility. A missing tenant or agent label is folded into the same
+    /// is `GateRuleAnswer::Inconclusive`, and the caller applies the strict-posture and
+    /// human-floor rules above. A missing tenant or agent label is folded into the same
     /// inconclusive answer inside `fetch_gate_rule`, because with a govder wired the
     /// inability to NAME the agent to it is a failure to confirm, not a confirmation.
     async fn fetch_gate_rule_for_action(

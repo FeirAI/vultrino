@@ -239,9 +239,10 @@ pub enum GateRuleAnswer {
     /// 404, which is precisely the ambiguity the reason code removes), or this deployment
     /// wires no govder at all, so nothing was ever asked.
     ///
-    /// This is NOT an error: govder answered, and for a REVERSIBLE action the numeric
-    /// path remains the right, unchanged behaviour. For an irreversible/money action the
-    /// caller must fail closed — see `ServerState::execute`.
+    /// This remains a data result rather than a transport error so the caller can apply
+    /// deployment posture. Production strict mode fails closed for every action;
+    /// compatibility posture retains the historical reversible numeric fallback, while
+    /// an irreversible/human-floor action always refuses — see `VultrinoServer::execute_gated`.
     Inconclusive { reason: String },
 }
 
@@ -601,8 +602,9 @@ fn interpret_2xx_gate_rule_body(body: &str) -> Result<GateRuleAnswer, GovderErro
 /// Everything else is inconclusive, INCLUDING an unparseable or reason-less body. That
 /// last case is the old behaviour's entire failure: an unqualified 404 was read as a
 /// confirmation. It is deliberately NOT a `GovderError` — govder answered the call, and
-/// for a reversible action the numeric path is still correct; the caller decides, using
-/// the irreversibility of the action, whether "unconfirmed" is survivable.
+/// the caller must apply the deployment posture: production strict refuses it for every
+/// action; compatibility posture may retain the reversible numeric path but never the
+/// human-floor path.
 fn interpret_404_gate_rule_body(body: &str, agent_id: &str, action_class: &str) -> GateRuleAnswer {
     let parsed: GateApprovalRuleAbsence = serde_json::from_str(body).unwrap_or_default();
     let reason = parsed.reason.unwrap_or_default();

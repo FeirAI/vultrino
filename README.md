@@ -323,9 +323,13 @@ verb cannot run directly (it may proceed only through authoritative approval).
 A missing exact label declaration or unavailable catalog is refused before
 dispatch. Consequently the only catalog classification that can reach the direct
 path is an exact trusted `reversible` declaration for that credential and action.
-An approval also freezes its authority class and revalidates it at resume, so a
-catalog reclassification/deletion requires a new approval. New `vultrino init`
-configurations enable the same posture for stdio; older stdio/embedded configurations can opt in with
+An approval freezes both its catalog class and its authoritative Govder recipe
+(including risk/irreversibility facts). Resume re-fetches both before minting an
+execution permit; catalog reclassification/deletion or recipe replacement/removal
+requires a new approval. Production strict posture also refuses an inconclusive
+recipe lookup for reversible actions instead of inferring the weaker one-person
+numeric fallback. New `vultrino init` configurations enable the same posture for
+stdio; older stdio/embedded configurations can opt in with
 `[enforcement] require_declared_capabilities = true`.
 
 If approvals are disabled, a triggered action is refused; disabling the approval
@@ -383,6 +387,8 @@ required to approve from Telegram/email.
   Telegram/webhook notifier) with requests it could never run.
 - Policy is **re-evaluated when the action finally runs**, so an explicit deny
   rule (URL / method / time-window) still blocks even a human-approved action.
+  The exact Govder recipe and risk facts are also re-fetched; an unavailable or
+  changed authority invalidates the old approval and nothing executes.
   Rate limits are charged **once, at request time** — a human approval is never
   re-charged against, nor re-denied by, the rate limiter at execution time. When
   a deny does fire on resume, the use token is left unconsumed.

@@ -61,7 +61,9 @@ upstream.
    retry) rather than re-run — the crash cannot cause a duplicate side effect.
    A canonical plugin verb shared by configured business labels also cannot erase
    which Govder recipe applies: without an exact canonical rule, approval open
-   fails closed before the numeric fallback.
+   fails closed before the numeric fallback. Production strict mode refuses every
+   inconclusive recipe lookup, and resume requires the exact recipe/risk authority
+   frozen at open before it can mint an execution permit.
 6. **Security/financial boundaries hold even in observe mode.** Cross-tenant
    isolation, halts, and SpendCap/RateLimit resource guards always enforce; only
    ordinary policy denials are observable-away.
@@ -223,9 +225,12 @@ every turn with `[llm_proxy] streaming_enabled = false`. See
   exact trusted `reversible` declaration for the executing credential and action
   can reach the direct path. Approval-open freezes that authority class and
   resume re-resolves it before permit issuance; replacement or deletion refuses
-  the stale approval. This proves enforcement and continuity of the stored
-  declaration, not that an operator's declaration is semantically truthful about
-  the real-world side effect.
+  the stale approval. Production strict approval-open also requires a conclusive
+  Govder answer, and resume requires the same normalized recipe plus authoritative
+  risk/irreversibility facts; uncertainty or change refuses before permit issuance.
+  This proves enforcement and continuity of the stored declaration and received
+  Govder authority, not that an operator's declaration is semantically truthful
+  about the real-world side effect.
 - An outbox push with no URL or no signing secret is a hard config error
   (an unsigned/undeliverable outbox is rejected).
 - A halt label must be a literal id (no glob), so a halt can't deny a fleet.

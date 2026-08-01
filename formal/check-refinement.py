@@ -267,14 +267,44 @@ if "approval.bind_capability_authority(" not in server:
     fail("approval-open no longer freezes its catalog authority class")
 if "capability_authority: Option<CapabilityAuthorityClass>" not in approval:
     fail("persisted approvals lost the private catalog authority snapshot")
+if "gate_rule_authority: Option<GateRuleAuthorityClass>" not in approval:
+    fail("persisted approvals lost the private recipe authority snapshot")
+if "approval.bind_gate_rule_authority(gate_rule_authority);" not in server:
+    fail("approval-open no longer freezes Govder recipe authority")
+strict_recipe_refusal = server.find(
+    "self.config.enforcement.require_declared_capabilities\n                        || trusted_irreversible"
+)
+recipe_authority_bind = server.find(
+    "approval.bind_gate_rule_authority(gate_rule_authority);", strict_recipe_refusal
+)
+if min(strict_recipe_refusal, recipe_authority_bind) < 0 or not (
+    strict_recipe_refusal < recipe_authority_bind
+):
+    fail("strict inconclusive-recipe refusal must precede approval persistence")
 resume = server.find("async fn resume_approved(")
 resume_catalog = server.find("let current_capability_authority = self", resume)
-resume_policy = server.find("evaluate_readonly_full", resume_catalog)
+resume_recipe = server.find("let current_gate_rule = self", resume_catalog)
+resume_recipe_guard = server.find(
+    "if !legacy_unbound_recipe && !gate_rule_authority_current", resume_recipe
+)
+resume_policy = server.find("evaluate_readonly_full", resume_recipe_guard)
 resume_permit = server.find("ExecutionPermit::approved", resume_policy)
-if min(resume, resume_catalog, resume_policy, resume_permit) < 0 or not (
-    resume < resume_catalog < resume_policy < resume_permit
+if min(
+    resume,
+    resume_catalog,
+    resume_recipe,
+    resume_recipe_guard,
+    resume_policy,
+    resume_permit,
+) < 0 or not (
+    resume
+    < resume_catalog
+    < resume_recipe
+    < resume_recipe_guard
+    < resume_policy
+    < resume_permit
 ):
-    fail("approval resume must revalidate catalog authority before policy and permit issuance")
+    fail("approval resume must revalidate catalog and recipe authority before policy and permit issuance")
 label_lookup = server.find("async fn resolve_irreversibility_for_action(")
 label_miss = server.find("return IrreversibilityResolution::Undeclared;", label_lookup)
 canonical_ambiguity = server.find(
@@ -418,9 +448,29 @@ for theorem in (
     "canonical_alias_without_rule_is_refused",
     "canonical_alias_inconclusive_is_refused",
     "exact_canonical_rule_remains_authoritative",
+    "strict_inconclusive_recipe_refuses_open",
+    "changed_recipe_authority_refuses_resume",
+    "recipe_resume_implies_same_authority",
+    "strict_recipe_resume_implies_conclusive_authority",
 ):
     if f"theorem {theorem}" not in action_authority_lean:
         fail(f"Lean action-authority theorem missing: {theorem}")
+for test, source in (
+    (
+        "strict_catalog_refuses_reversible_action_when_recipe_authority_is_inconclusive",
+        web_smoke_tests,
+    ),
+    (
+        "approval_resume_refuses_changed_authoritative_recipe",
+        approval_integration_tests,
+    ),
+    (
+        "approval_resume_accepts_unchanged_authoritative_recipe",
+        approval_integration_tests,
+    ),
+):
+    if f"async fn {test}" not in source:
+        fail(f"recipe-authority regression control missing: {test}")
 for hook in (
     "self.resolve_pinned_http_method()?",
     'if args_obj.contains_key("method")',
@@ -491,4 +541,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; credential-bound criticality with open-to-resume catalog continuity; declared human-floor capabilities cannot dispatch directly; fail-closed canonical action aliases; operator-pinned internal HTTP method; startup-validated policy/workload secrets; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: PASS (8 execution binding fields; exact-bound named broker approval authority; credential-bound criticality with open-to-resume catalog continuity; conclusive production recipe authority with exact open-to-resume continuity; declared human-floor capabilities cannot dispatch directly; fail-closed canonical action aliases; operator-pinned internal HTTP method; startup-validated policy/workload secrets; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

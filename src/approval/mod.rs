@@ -247,6 +247,18 @@ pub(crate) enum CapabilityAuthorityClass {
     AmbiguousCanonical,
 }
 
+/// Whether Govder authoritatively supplied a recipe, authoritatively confirmed
+/// its absence, or confirmed neither. The class is frozen at approval-open; the
+/// rule and risk facts themselves already live on `ApprovalRequest` and are
+/// compared structurally with a fresh Govder answer before permit issuance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GateRuleAuthorityClass {
+    Rule,
+    NoRule,
+    Inconclusive,
+}
+
 /// The result of advancing an approval through its SLA lifecycle (V5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleChange {
@@ -938,6 +950,12 @@ pub struct ApprovalRequest {
     /// deserialize as `None` and production strict mode refuses them at resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     capability_authority: Option<CapabilityAuthorityClass>,
+    /// Govder recipe-authority result at approval-open. Private for the same
+    /// reason as `capability_authority`: execution, not downstream mutation,
+    /// owns its revalidation. Older records deserialize as `None` and strict
+    /// production refuses them at resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gate_rule_authority: Option<GateRuleAuthorityClass>,
     /// Trusted spend facts from the policy extractor at open (D3 grant caps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_spend_amount_minor: Option<i64>,
@@ -1065,6 +1083,7 @@ impl ApprovalRequest {
             criticality: params.criticality,
             trusted_irreversible: params.trusted_irreversible.unwrap_or(false),
             capability_authority: None,
+            gate_rule_authority: None,
             trusted_spend_amount_minor: None,
             trusted_spend_asset: None,
             delegate_veto_until: None,
@@ -1115,6 +1134,16 @@ impl ApprovalRequest {
     /// resume. `None` identifies an older persisted approval.
     pub(crate) fn capability_authority(&self) -> Option<CapabilityAuthorityClass> {
         self.capability_authority
+    }
+
+    /// Bind the authoritative recipe lookup result used at approval-open.
+    pub(crate) fn bind_gate_rule_authority(&mut self, authority: GateRuleAuthorityClass) {
+        self.gate_rule_authority = Some(authority);
+    }
+
+    /// Recipe-authority class to compare with a fresh Govder answer at resume.
+    pub(crate) fn gate_rule_authority(&self) -> Option<GateRuleAuthorityClass> {
+        self.gate_rule_authority
     }
 
     /// Re-establish the persisted approval invariants after decryption and

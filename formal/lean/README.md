@@ -47,6 +47,13 @@ inconclusive twin prove the V-A7 namespace partition: when a caller erases a
 configured business label by presenting its shared canonical plugin verb, a
 missing exact canonical rule cannot open the weaker numeric-approval path. An
 exact rule filed under the canonical key remains authoritative.
+`strict_inconclusive_recipe_refuses_open` proves that production strict posture
+cannot infer a numeric recipe from an inconclusive Govder answer.
+`changed_recipe_authority_refuses_resume`,
+`recipe_resume_implies_same_authority`, and
+`strict_recipe_resume_implies_conclusive_authority` prove that permit issuance
+requires the same normalized recipe/risk snapshot frozen at approval-open and a
+conclusive current answer.
 
 `Action.MethodAuthority.successful_method_is_operator_method` proves that every
 successfully composed named internal-HTTP capability request uses its unique
@@ -118,6 +125,10 @@ the model:
   canonical verb; a canonical presentation whose verb is targeted by configured
   labels may use an exact canonical rule, but otherwise fails closed before the
   numeric-approval fallback;
+- production strict approval-open refuses an inconclusive recipe result, and
+  approval resume re-fetches the exact tenant/agent/action authority before policy
+  evaluation and permit issuance, requiring equality of the rule and authoritative
+  risk/irreversibility facts frozen at open;
 - internal-HTTP capability registration requires one unambiguous method source;
   named tool calls reject a caller `method` before resolving and finally
   overwriting the plugin request with the operator method;
@@ -210,7 +221,7 @@ declared-transform assumptions.
 | `ExecutionPermit` | non-cloneable, private-constructor `ExecutionPermit` consumed at the side-effect call |
 | `Evidence.validFor` | one pure function run under the storage claim lock |
 | `Authority.AssertionEvidence.validFor` | inbound HMAC verifier over raw body plus actual tenant/method/path/query/Host, bounded to five minutes |
-| `ActionAuthority.decideAuthority` | label-first exact Govder lookup plus canonical-label ambiguity refusal before numeric fallback |
+| `ActionAuthority.decideAuthority` / `approvalRecipeStillAuthorizes` | label-first exact Govder lookup, canonical-label ambiguity refusal, production-strict conclusive-open requirement, and exact recipe/risk continuity at resume before permit issuance |
 | `Action.MethodAuthority.composeMethod` | registration-time method-source validation plus caller-method rejection and final operator pin in `build_internal_http_params` |
 | `Approval.decideCriticalGate` / `approvalCatalogStillAuthorizes` | exact credential+action catalog authority; unavailable/strict-undeclared refusal, human-floor/ambiguous approval forcing, and open-to-resume class continuity before permit issuance |
 | `Configuration.decideWebStartup` | production `run_web_server` forces strict catalog posture before validated startup; policy hash and workload verifier are then snapshotted in `AppState` |

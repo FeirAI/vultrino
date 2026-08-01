@@ -25,7 +25,9 @@ The machine-checked entry point for Vultrino's critical-boundary model.
   subject, class, route, host, and body digest; legacy bearer-key claims carry no
   independent-identity witness.
 * a canonical plugin verb shared by configured business labels cannot fall back
-  to weaker numeric approval when no exact canonical rule is found.
+  to weaker numeric approval when no exact canonical rule is found; production
+  strict posture also refuses every inconclusive recipe answer, and approval
+  resume requires the same conclusive recipe/risk authority frozen at open.
 * a named internal-HTTP capability executes only its unique operator-pinned
   method; any caller-supplied method is rejected before composition.
 * a declared human-floor capability, unavailable catalog, shared canonical verb,

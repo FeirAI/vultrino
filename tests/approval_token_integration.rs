@@ -11,9 +11,12 @@ use chrono::Duration;
 use secrecy::SecretString;
 use tempfile::tempdir;
 
-use vultrino::approval::{ApprovalRequest, ApprovalStatus, Decision, NewApproval, RequesterInfo};
+use vultrino::approval::{
+    ApprovalRequest, ApprovalStatus, ApproverClass, Decision, NewApproval, RequesterInfo,
+};
 use vultrino::auth::{AuthResult, NewUseToken, UseToken};
 use vultrino::config::Config;
+use vultrino::govder::GovderConfig;
 use vultrino::plugins::{Plugin, PluginError, PluginRequest};
 use vultrino::router::CredentialResolver;
 use vultrino::server::{ExecAuth, VultrinoServer};
@@ -289,6 +292,142 @@ async fn set_count_capability_reversibility_for_credential(
         .unwrap();
 }
 
+/// A recipe authority whose exact response can be changed after an approval
+/// opens. This models a real Govder gate update without replacing the client or
+/// server, so the resume test crosses the same HTTP/authentication boundary as
+/// production.
+async fn start_mutable_gate_rule(
+    initial: serde_json::Value,
+) -> (GovderConfig, Arc<tokio::sync::RwLock<serde_json::Value>>) {
+    async fn handler(
+        axum::extract::State(body): axum::extract::State<
+            Arc<tokio::sync::RwLock<serde_json::Value>>,
+        >,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let current = body.read().await.clone();
+        (axum::http::StatusCode::OK, axum::Json(current)).into_response()
+    }
+
+    let body = Arc::new(tokio::sync::RwLock::new(initial));
+    let app = axum::Router::new()
+        .route(
+            "/v1/oversight/gates/rule",
+            axum::routing::get(handler),
+        )
+        .with_state(body.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (
+        GovderConfig {
+            base_url: format!("http://{address}"),
+            assertion_secret: "test-govder-assertion-secret".to_string(),
+            assertion_ttl: std::time::Duration::from_secs(90),
+            http_timeout: std::time::Duration::from_secs(5),
+        },
+        body,
+    )
+}
+
+struct MutableRecipeApprovalFixture {
+    server: VultrinoServer,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    current_rule: Arc<tokio::sync::RwLock<serde_json::Value>>,
+    approval_id: String,
+}
+
+/// Open and satisfy one strict, exact-request approval under a one-teammate
+/// Govder rule. Paired positive/negative resume tests then differ only in
+/// whether the authority is mutated, preventing an always-refuse check from
+/// making the negative control pass vacuously.
+async fn open_approved_mutable_recipe_fixture() -> MutableRecipeApprovalFixture {
+    let one_teammate = serde_json::json!({
+        "has_rule": true,
+        "risk_tier": "High",
+        "irreversible": false,
+        "approval_rule": {
+            "recipes": [{"terms": [{"class": "teammate", "count": 1}]}],
+            "decision_mode": "deny-on-any-deny"
+        }
+    });
+    let (govder, current_rule) = start_mutable_gate_rule(one_teammate).await;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let storage: Arc<dyn StorageBackend> = Arc::new(
+        FileStorage::new(&path, &SecretString::from("pw"))
+            .await
+            .unwrap(),
+    );
+    let mut config = Config::default();
+    config.approval.enabled = true;
+    config.approval.ttl_secs = 3600;
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    config.enforcement.require_declared_capabilities = true;
+    config.govder = Some(govder);
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = VultrinoServer::new(config, storage.clone(), resolver);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    store_credential(&storage, "mutable-recipe-cred", false).await;
+    set_count_capability_reversibility_for_credential(
+        &storage,
+        "count.run",
+        "mutable-recipe-cred",
+        "reversible",
+    )
+    .await;
+
+    let (_plaintext, mut token) = UseToken::create(NewUseToken {
+        name: "recipe-bound-executor".to_string(),
+        credential_scope: "mutable-recipe-cred".to_string(),
+        action_scope: Some("count.run".to_string()),
+        max_uses: Some(1),
+        require_approval: true,
+        expires_in: None,
+    });
+    token.tenant = Some("acme".to_string());
+    token.agent_label = Some("agent-x".to_string());
+    storage.store_use_token(&token).await.unwrap();
+
+    let approval = match server
+        .execute_gated(
+            count_request("mutable-recipe-cred"),
+            ExecAuth::from_use_token(token),
+        )
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(approval) => approval,
+        ExecutionOutcome::Completed(_) => panic!("expected recipe-gated approval"),
+    };
+    let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    stored
+        .approve(
+            Decision::new("admin panel", "secops")
+                .with_resolved_class(ApproverClass::Teammate),
+        )
+        .unwrap();
+    assert_eq!(stored.status(), ApprovalStatus::Approved);
+    storage.update_approval(&stored).await.unwrap();
+
+    MutableRecipeApprovalFixture {
+        server,
+        calls,
+        current_rule,
+        approval_id: approval.id,
+    }
+}
+
 fn echo_request(credential: &str) -> ExecuteRequest {
     ExecuteRequest {
         credential: credential.to_string(),
@@ -446,7 +585,6 @@ async fn approval_resume_refuses_changed_capability_authority() {
     config.approval.enabled = true;
     config.approval.ttl_secs = 3600;
     config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
-    config.enforcement.require_declared_capabilities = true;
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -495,6 +633,70 @@ async fn approval_resume_refuses_changed_capability_authority() {
         .unwrap_or_default()
         .contains("capability declaration governing this approval"));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Approval is authority for the exact Govder recipe that was satisfied, not
+/// for whatever recipe happens to govern the action later. Strengthening the
+/// rule after open invalidates the old grant before the execution permit is
+/// minted.
+#[tokio::test]
+async fn approval_resume_refuses_changed_authoritative_recipe() {
+    let fixture = open_approved_mutable_recipe_fixture().await;
+
+    *fixture.current_rule.write().await = serde_json::json!({
+        "has_rule": true,
+        "risk_tier": "High",
+        "irreversible": false,
+        "approval_rule": {
+            "recipes": [{"terms": [{"class": "teammate", "count": 2}]}],
+            "decision_mode": "deny-on-any-deny"
+        }
+    });
+
+    let resumed = fixture
+        .server
+        .check_and_resume_approval(&fixture.approval_id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed, "the stale grant is terminal, not retryable");
+    assert!(resumed
+        .result_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("authoritative approval recipe"));
+    assert_eq!(
+        fixture
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+/// Positive control for the continuity check: the exact same authoritative
+/// recipe and risk facts still authorize the already-satisfied approval. This
+/// prevents an accidental always-refuse implementation from satisfying only
+/// the changed-authority negative test.
+#[tokio::test]
+async fn approval_resume_accepts_unchanged_authoritative_recipe() {
+    let fixture = open_approved_mutable_recipe_fixture().await;
+
+    let resumed = fixture
+        .server
+        .check_and_resume_approval(&fixture.approval_id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed);
+    assert!(
+        resumed.result_error.is_none(),
+        "unchanged authority must execute, got {:?}",
+        resumed.result_error
+    );
+    assert_eq!(
+        fixture
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 }
 
 /// A missing exact label must not borrow the classification of a reversible

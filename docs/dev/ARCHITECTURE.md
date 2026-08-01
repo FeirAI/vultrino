@@ -130,7 +130,11 @@ The authoritative path is `VultrinoServer::execute_gated` → `run_action` in
 Approval-gated actions run later via the **deferred path** (`resume_approved`),
 triggered when the requester polls the approval after a human decides. The resume
 first re-resolves the exact credential+action catalog authority and refuses if it
-differs from approval-open, then re-evaluates policy **read-only** (it re-enforces hard `Deny`/kill gates — a
+differs from approval-open. It then re-fetches the exact tenant/agent/business-action
+Govder answer and requires the same authority class, normalized recipe, risk tier,
+and irreversibility facts that were frozen at open. An outage, strengthened rule,
+removed rule, or other change invalidates the approval before permit issuance.
+Only then does it re-evaluate policy **read-only** (it re-enforces hard `Deny`/kill gates — a
 policy revoked or a kill pushed mid-flight stops the action — but does not
 re-charge the rate limiter or re-prompt). Execution is claimed under the storage
 lock and fenced by a monotonic `execution_epoch`, so the action runs **at most

@@ -6313,9 +6313,9 @@ async fn execute_open_numeric_path_parity_when_gate_absence_is_confirmed() {
 // the numeric threshold, and required ONE approver for a refund the operator had gated
 // at two distinct humans.
 //
-// The refusal is scoped to IRREVERSIBLE actions on purpose: for a reversible action an
-// unconfirmed recipe costs a reviewer, not a payment, so the numeric path stays exactly
-// as it was and the whole non-money world is unaffected.
+// Compatibility deployments retain the earlier reversible-action fallback. Production
+// strict mode refuses every inconclusive recipe result: "reversible" is criticality,
+// not evidence that no stronger approval recipe exists.
 
 /// An UNQUALIFIED 404 (the shape every govder before this fix returned, and the shape a
 /// future build that drops the reason field would return) must NOT run an irreversible
@@ -6828,9 +6828,9 @@ async fn a_two_key_money_recipe_requires_two_distinct_humans_not_one() {
     );
 }
 
-/// The other side of the scoping, and the reason this change is not a flag day: a
+/// Compatibility posture remains available for standalone/embedded deployments: a
 /// REVERSIBLE action with the same unconfirmable gate answer still opens on the numeric
-/// path, exactly as before. Only irreversible actions are refused.
+/// path. This test deliberately leaves production strictness disabled.
 #[tokio::test]
 async fn execute_still_opens_a_reversible_action_when_the_gate_answer_is_inconclusive() {
     let govder = start_mock_govder_gate_rule(
@@ -6856,6 +6856,40 @@ async fn execute_still_opens_a_reversible_action_when_the_gate_answer_is_inconcl
     let approvals = storage.list_approvals().await.unwrap();
     assert_eq!(approvals.len(), 1);
     assert_eq!(approvals[0].required_approvals, 1);
+}
+
+/// Production strict posture never treats an inconclusive recipe lookup as
+/// authority for the weaker numeric path, even when the capability itself is
+/// declared reversible. Reversibility bounds side-effect severity; it does not
+/// prove that Govder has no two-person (or senior) oversight rule for the action.
+#[tokio::test]
+async fn strict_catalog_refuses_reversible_action_when_recipe_authority_is_inconclusive() {
+    let govder = start_mock_govder_gate_rule(
+        StatusCode::NOT_FOUND,
+        serde_json::json!({ "error": "no gate configured" }),
+    )
+    .await;
+    let mut config = approval_open_test_config(govder);
+    config.enforcement.require_declared_capabilities = true;
+    let (router, storage) = build_router_with_config(config).await;
+
+    let resp = execute_against_require_approval_credential_with_reversibility(
+        router,
+        &storage,
+        Some("reversible"),
+    )
+    .await;
+    let status = resp.status();
+    let body = body_string(resp).await;
+    assert_ne!(
+        status,
+        StatusCode::ACCEPTED,
+        "strict production must not infer a numeric recipe from an inconclusive answer: {body}"
+    );
+    assert!(
+        storage.list_approvals().await.unwrap().is_empty(),
+        "strict recipe uncertainty must persist no approval and reserve no use"
+    );
 }
 
 /// PARITY (unchanged behavior): a 2xx body with `has_rule:false` — a gate
@@ -6937,7 +6971,8 @@ async fn execute_refuses_an_irreversible_action_when_no_govder_is_wired() {
          body: {body}"
     );
     assert!(
-        body.contains("cannot be undone"),
+        body.contains("confirmed approval requirement")
+            && body.contains("Nothing was executed and no approval was opened"),
         "the refusal must tell the caller WHY it was refused and that nothing ran; got: {body}"
     );
     assert!(
