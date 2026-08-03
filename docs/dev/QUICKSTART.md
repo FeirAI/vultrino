@@ -8,10 +8,13 @@ authoritative record of how the binary is actually built, configured, and run.
 
 ## Prerequisites
 
-- **Rust** (edition 2021; pinned in `rust-toolchain.toml`). Stable Rust with
-  `cargo` is sufficient.
+- **Rust 1.94.0** (edition 2021; pinned in `rust-toolchain.toml` — `rustup`
+  installs it). Matches the CI / wasmtime-47 MSRV floor.
 - **TLS:** reqwest is built with `rustls-tls` — no system OpenSSL development
   packages are required for a normal build.
+- Default build features include **`wasm-plugins`** (wasmtime 47). Production
+  binaries keep that default; Kani proofs deliberately build with
+  `--no-default-features` (see [LIMITATIONS.md](LIMITATIONS.md)).
 - For the **web UI login record** (`admin.json`), the `init` flow prompts
   interactively; the e2e harness seeds it non-interactively with `htpasswd`
   (bcrypt). Either works — the JSON API itself uses `vk_` keys, not this record.

@@ -34,7 +34,19 @@ cargo test test_v13a_
 cd formal/lean
 lake build --wfail
 bash check-nanoda.sh       # slower, independent Rust checker; pinned + cached
+
+# Source-shape / choke-point refinement gate (no Lean/Kani install needed):
+bash formal/check-refinement.sh
+
+# Kani pure-kernel proofs (optional locally; CI runs this as its own job).
+# Requires Kani 0.67.0. Always use the wrapper — bare `cargo kani` under
+# default features pulls wasmtime and fails Kani's rustc-1.93 MSRV check:
+bash formal/run-kani.sh    # → cargo kani --no-default-features --harness …
 ```
+
+Default Cargo features include `wasm-plugins` (wasmtime 47). Production
+`cargo test` / `cargo build` keep that default. Formal Kani jobs deliberately
+disable it; see [LIMITATIONS.md](LIMITATIONS.md) for the honest proof scope.
 
 The integration suites and their focus:
 
@@ -102,18 +114,19 @@ run the same PEP path locally (no server) and are handy for testing a policy.
 ## Contributing
 
 - **Build/lint before sending changes:** run `./ci-local.sh` from the repo root. It is
-  `.github/workflows/ci.yml`'s job, step for step, with every exit code captured into a
-  variable rather than read through a pipe: `cargo build`, `cargo test`, `cargo test
-  --features mock-govder` (both test invocations are required — see above), and the
-  zero-warning clippy gate **twice** — `cargo clippy --all-targets -- -D warnings` and
-  `cargo clippy --all-targets --all-features -- -D warnings`. The second is not optional:
-  the first does not compile the `mock-govder`-only test target, so it cannot lint it, and
-  on 2026-07-27 a `clippy::type_complexity` error was sitting in that target while the gate
-  read green. Add `cargo fmt` yourself; `ci-local.sh` deliberately runs nothing that
-  rewrites files. It also runs `lake build --wfail` over `formal/lean`; CI repeats that
-  proof check, then exports and checks all declarations with the independently
-  implemented nanoda kernel. Both exporter and checker are full-commit pinned;
-  `sorryAx` is not on nanoda's permitted-axiom list.
+  the local parity loop for the Rust + Lean + refinement half of
+  `.github/workflows/ci.yml`, with every exit code captured into a variable rather than
+  read through a pipe: `cargo build --locked`, refinement check, `cargo test --locked`,
+  `cargo test --locked --features mock-govder` (both test invocations are required —
+  see above), the zero-warning clippy gate **twice** (`cargo clippy --all-targets -- -D
+  warnings` and `cargo clippy --all-targets --all-features -- -D warnings`), `cargo
+  audit`, Lean `lake build --wfail`, and nanoda. The second clippy is not optional: the
+  first does not compile the `mock-govder`-only test target, so it cannot lint it, and
+  on 2026-07-27 a `clippy::type_complexity` error was sitting in that target while the
+  gate read green. Add `cargo fmt` yourself; `ci-local.sh` deliberately runs nothing
+  that rewrites files. **Kani is intentionally not in `ci-local.sh`** (separate CI job /
+  `formal/run-kani.sh`) — do not treat a green local script as having run the Kani
+  harnesses.
   Why the script exists at all: that same day the zero-warning gate was found RED with 11
   errors, of unknown age, because the documented loop was build+test and clippy lived only
   in a workflow no runner executes on the branches the work happens on.

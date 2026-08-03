@@ -165,6 +165,39 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   and assert on the grant set the decide plane reports. Any claim of the form "we verified
   the compiled rules" is really "we verified the hash and the grant set".
 
+## Formal verification bounds (what the gates prove — and do not)
+
+Stage-1 artefacts under `formal/` are CI-gated on `main` (Lean + nanoda, Kani,
+refinement check). They prove **finite modeled invariants under stated TCB
+assumptions**, not the whole product and not information-theoretic
+noninterference. Honest scope:
+
+- **Lean (`formal/lean/`)** models critical approval / credential-confinement /
+  startup / method-authority boundaries and rechecks declarations with the
+  independent nanoda kernel (`sorryAx` forbidden). Theorems are universal over
+  modeled traces; they are **not** a complete semantic refinement of the async
+  Rust server (see `formal/lean/README.md`).
+- **Kani (`formal/run-kani.sh`)** runs pure-kernel harnesses with
+  `--no-default-features` (no `wasm-plugins` / wasmtime). Kani 0.67 ships rustc
+  **1.93** nightly; the production default feature set pulls wasmtime **47**,
+  which declares rust-version **1.94**. So Kani does **not** verify the WASM
+  plugin host, and a default-features build is outside that proof job.
+- **Refinement (`formal/check-refinement.sh`)** is a source-shape / choke-point
+  gate (execution-binding fields, permit mint sites, WASM ABI-before-copy
+  install order, pinned harness inventory, etc.). It catches drift of the
+  modeled seams; it does not prove the surrounding I/O, networking, or plugin
+  implementations correct.
+- **Operator-authored truth stays outside the model.** A truthful
+  reversible/irreversible label, a correct Govder recipe, and a matching
+  workload-assertion signing key are operational assumptions — the gates prove
+  enforcement continuity of what the stores and verifiers report, not that the
+  external world matches those labels.
+
+`./ci-local.sh` runs Lean + refinement + the Rust gates; it does **not** run
+Kani (install + toolchain cost). CI's separate `kani` job is the authoritative
+Kani gate — run `bash formal/run-kani.sh` locally when touching the harnessed
+kernels.
+
 ## Documented-not-enforced / posture notes
 
 - **Reversibility truth remains operator authority.** Production `vultrino web`
@@ -256,6 +289,12 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 - Keychain and HashiCorp Vault storage backends.
 - Outbox push fan-out (today a single push subscriber; additional consumers poll).
 - A transactional storage layer for exactly-once idempotency.
+- A Kani toolchain that can verify the default `wasm-plugins` feature set (today
+  Kani 0.67’s rustc 1.93 cannot compile wasmtime 47’s rustc-1.94 MSRV — proofs
+  stay on `--no-default-features`).
+- Migrating the Askama axum integration off `askama_axum = "0.4"` — crates.io’s
+  `0.5.0+deprecated` is an empty hard-`compile_error!` stub; stay on 0.4 until a
+  supported replacement lands.
 
 ## Rate-limit windows are per-process and per-replica (vultrino#6)
 

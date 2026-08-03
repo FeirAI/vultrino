@@ -50,8 +50,8 @@ credential broker:
 | [METERING.md](METERING.md) | The `meter.observed` emit (V13a/V13b): when it fires, the exact payload shapes, the poll/replay contract, and the honest bounds of the guarantee. |
 | [SECURITY.md](SECURITY.md) | Threat model, invariants, authn/authz, trust boundaries, and what Vultrino deliberately does **not** do. |
 | [INTEGRATION.md](INTEGRATION.md) | Standalone integration (the client-facing API), then the optional cross-plane composition contracts. |
-| [TESTING.md](TESTING.md) | Running the tests, the four-plane e2e harness, and a contributing note. |
-| [LIMITATIONS.md](LIMITATIONS.md) | The honest v1 limits, non-goals, and deferred/documented-not-enforced items. |
+| [TESTING.md](TESTING.md) | Running the tests, formal gates (Lean / Kani / refinement), the four-plane e2e harness, and a contributing note. |
+| [LIMITATIONS.md](LIMITATIONS.md) | The honest v1 limits, formal-verification bounds, non-goals, and deferred/documented-not-enforced items. |
 
 ## Project layout (Rust crate)
 
@@ -67,7 +67,7 @@ src/
   egress.rs        Response secret scrubbing + egress classification (V7)
   outbox.rs        Signed event outbox: event types, MeterEvent payloads, HMAC signing
   storage/         Encrypted file vault (storage/file.rs) behind the StorageBackend trait
-  crypto/          AES-256-GCM + Argon2 key derivation
+  crypto/          AES-256-GCM + Argon2 key derivation (OS CSPRNG: rand SysRng)
   plugins/         Built-in plugins (http, hmac, ecdsa, ssh, postgres) + WASM plugin loader
   web/             axum web server: admin panel (HTML) + JSON API (web/api.rs) + routes
   mcp/             MCP (Model Context Protocol) stdio server for LLM tool integration
@@ -75,4 +75,9 @@ src/
   revocation.rs    Downstream OAuth2/STS revoke propagation on credential delete
   session.rs       In-flight execution registry + halt callbacks
 tests/             Integration tests (auth, outbox, approvals/tokens, web smoke)
+formal/            Stage-1 gates: Lean model, Kani harnesses, refinement checker
+Cargo.lock         Committed; CI and Docker build with --locked
 ```
+
+Default Cargo features: `wasm-plugins` (wasmtime 47). See [LIMITATIONS.md](LIMITATIONS.md)
+for why Kani runs with `--no-default-features`.

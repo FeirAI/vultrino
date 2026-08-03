@@ -48,8 +48,9 @@ Critical-boundary models live under [`formal/`](formal/). If you change approval
 1. Update the Rust choke points.
 2. Keep `formal/check-refinement.sh` green.
 3. Keep `cd formal/lean && lake build --wfail` green when Lean models are affected.
+4. Keep `bash formal/run-kani.sh` green when harnessed kernels change (CI’s `kani` job; not part of `./ci-local.sh`).
 
-These gates prove finite modeled invariants under stated TCB assumptions — not information-theoretic noninterference. See [`formal/lean/README.md`](formal/lean/README.md) and LIMITATIONS.
+These gates prove finite modeled invariants under stated TCB assumptions — not information-theoretic noninterference. See [`formal/lean/README.md`](formal/lean/README.md) and [`docs/dev/LIMITATIONS.md`](docs/dev/LIMITATIONS.md) §"Formal verification bounds".
 
 ## Pull requests
 

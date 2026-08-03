@@ -313,11 +313,12 @@ events past `retention_secs`. Event types include `approval.*`, `agent.halted`,
 
 The default backend is an **encrypted file vault**:
 
-- **Cipher:** AES-256-GCM (`crypto/encrypt.rs`), 32-byte key, 12-byte random nonce
-  per encryption, nonce stored alongside the ciphertext.
+- **Cipher:** AES-256-GCM (`crypto/encrypt.rs`; `aes-gcm` 0.11), 32-byte key,
+  12-byte nonce per encryption drawn from `rand::rngs::SysRng`, nonce stored
+  alongside the ciphertext.
 - **Key derivation:** Argon2 (`Argon2::default()`) over the storage password and a
-  random 16-byte salt; the salt is stored in the file header (cleartext), the key
-  is never stored.
+  16-byte salt from the same OS CSPRNG; the salt is stored in the file header
+  (cleartext), the key is never stored.
 - **On-disk shape:** a JSON file with `version`, `salt`, and an encrypted blob
   holding the cache (credentials, roles, API keys, use tokens, approvals, stored
   policies, and idempotency records; since v7 the signed outbox lives OUTSIDE the

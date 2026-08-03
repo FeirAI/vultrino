@@ -118,13 +118,13 @@ upstream.
   mint a fresh bucket per request. In server mode without that flag, all logins
   behind a proxy share one bucket (a startup warning is emitted).
 - **Out-of-band approval links:** authorized by a high-entropy **random capability
-  token** in the link (`OsRng`-generated). The server stores only the token's
-  **hash** and verifies a presented token by hashing it and **constant-time
-  comparing** the hashes (`subtle::ConstantTimeEq`) — it is a hashed bearer
-  capability, *not* an HMAC. A link prefetch only renders a confirmation page —
-  the decision requires a POST. The verdict is attributed to the configured
-  `oob_approver_identity` (required when a notifier is set, else config load
-  fails).
+  token** in the link (`rand::rngs::SysRng`-generated; OS CSPRNG via rand 0.10).
+  The server stores only the token's **hash** and verifies a presented token by
+  hashing it and **constant-time comparing** the hashes (`subtle::ConstantTimeEq`)
+  — it is a hashed bearer capability, *not* an HMAC. A link prefetch only renders
+  a confirmation page — the decision requires a POST. The verdict is attributed
+  to the configured `oob_approver_identity` (required when a notifier is set,
+  else config load fails).
 - **Inbound workload identity (V10/R6):** optional SPIFFE/OIDC resolution of a
   header the deployment has *already verified* at the edge. It **refines** the
   principal (adds a `workload_id` policy match dimension and binds the owner for
