@@ -54,7 +54,7 @@ jobs:
           # Flat archive: extracting yields ./vultrino (+ license/readme).
           cp "target/${{ matrix.target }}/release/vultrino" ./vultrino
           tar -czf "vultrino-${{ matrix.target }}.tar.gz" vultrino LICENSE README.md
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: vultrino-${{ matrix.target }}.tar.gz
           generate_release_notes: true
