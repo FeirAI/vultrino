@@ -2014,7 +2014,7 @@ fn policy_content_hash(policy: &Policy, secret: Option<&str>) -> String {
     // hashed field changes the bytes and thus the digest.
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
     // `new_from_slice` accepts any key length for HMAC, so this never errors.
-    let mut mac = <PolicyHmac as hmac::Mac>::new_from_slice(secret.as_bytes())
+    let mut mac = <PolicyHmac as hmac::KeyInit>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts any key length");
     hmac::Mac::update(&mut mac, &bytes);
     format!(

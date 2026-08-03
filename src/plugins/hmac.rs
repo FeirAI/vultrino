@@ -12,7 +12,7 @@
 use super::{Plugin, PluginError, PluginRequest};
 use crate::{CredentialData, CredentialType, ExecuteResponse};
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;

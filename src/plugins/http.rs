@@ -12,7 +12,7 @@ use crate::{CredentialData, CredentialType, ExecuteResponse, Secret};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Duration, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
