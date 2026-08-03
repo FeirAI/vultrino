@@ -170,14 +170,14 @@ pub fn encrypt(plaintext: &[u8], key: &MasterKey) -> Result<EncryptedData, Crypt
     // Generate random nonce
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     // Create cipher and encrypt
     let cipher = Aes256Gcm::new_from_slice(key.as_bytes())
         .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
 
     Ok(EncryptedData {
@@ -201,7 +201,8 @@ pub fn decrypt(encrypted: &EncryptedData, key: &MasterKey) -> Result<Vec<u8>, Cr
         )));
     }
 
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes.as_slice())
+        .map_err(|_| CryptoError::DecryptionFailed("Invalid nonce".into()))?;
 
     // Decode ciphertext
     let ciphertext = STANDARD
@@ -212,7 +213,7 @@ pub fn decrypt(encrypted: &EncryptedData, key: &MasterKey) -> Result<Vec<u8>, Cr
     let cipher = Aes256Gcm::new_from_slice(key.as_bytes())
         .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
 
-    let plaintext = cipher.decrypt(nonce, ciphertext.as_slice()).map_err(|_| {
+    let plaintext = cipher.decrypt(&nonce, ciphertext.as_slice()).map_err(|_| {
         CryptoError::DecryptionFailed(
             "Decryption failed - invalid key or corrupted data".to_string(),
         )
