@@ -4,10 +4,8 @@
 **/*.rs.bk
 *.pdb
 
-# Cargo
-Cargo.lock
-
 # IDE
+
 .idea/
 .vscode/
 *.swp

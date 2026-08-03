@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "A credential proxy for the AI era - enabling AI agents to use credentials without seeing them"
 license = "MIT"
-repository = "https://github.com/zachyking/vultrino"
+repository = "https://github.com/feir-ai/vultrino"
+homepage = "https://github.com/feir-ai/vultrino"
+readme = "README.md"
 keywords = ["proxy", "credentials", "security", "ai", "llm"]
 categories = ["authentication", "network-programming"]
 
@@ -53,8 +55,8 @@ k256 = { version = "0.13", features = ["ecdsa", "ecdsa-core", "schnorr"] }  # EC
 sha3 = "0.10"  # Keccak256 for Ethereum
 
 # WASM runtime for plugins
-wasmtime = "44"
-wasmtime-wasi = "44"
+wasmtime = "47"
+wasmtime-wasi = "47"
 
 # OS integration (for future keychain support)
 # keyring = "3"

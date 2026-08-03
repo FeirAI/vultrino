@@ -10,7 +10,7 @@ docker run -d \
   -p 7879:7879 \
   -e VULTRINO_PASSWORD=your-secure-password \
   -v vultrino-data:/data \
-  ghcr.io/vultrino/vultrino:latest web
+  ghcr.io/feir-ai/vultrino:latest web
 ```
 
 ## Dockerfile
@@ -50,7 +50,7 @@ version: '3.8'
 
 services:
   vultrino-web:
-    image: ghcr.io/vultrino/vultrino:latest
+    image: ghcr.io/feir-ai/vultrino:latest
     command: web --bind 0.0.0.0:7879
     ports:
       - "7879:7879"
@@ -107,7 +107,7 @@ services:
       - letsencrypt:/letsencrypt
 
   vultrino:
-    image: ghcr.io/vultrino/vultrino:latest
+    image: ghcr.io/feir-ai/vultrino:latest
     command: web --bind 0.0.0.0:7879
     environment:
       - VULTRINO_PASSWORD=${VULTRINO_PASSWORD}
@@ -146,7 +146,7 @@ spec:
     spec:
       containers:
         - name: vultrino-web
-          image: ghcr.io/vultrino/vultrino:latest
+          image: ghcr.io/feir-ai/vultrino:latest
           args: ["web", "--bind", "0.0.0.0:7879"]
           ports:
             - containerPort: 7879
@@ -188,7 +188,7 @@ stringData:
 
 ```bash
 # Clone repository
-git clone https://github.com/vultrino/vultrino.git
+git clone https://github.com/feir-ai/vultrino.git
 cd vultrino
 
 # Build image
@@ -224,14 +224,14 @@ docker run -d \
 # Initialize (creates admin credentials)
 docker run -it --rm \
   -v vultrino-data:/data \
-  ghcr.io/vultrino/vultrino:latest \
+  ghcr.io/feir-ai/vultrino:latest \
   init
 
 # Add a credential
 docker run -it --rm \
   -e VULTRINO_PASSWORD=your-password \
   -v vultrino-data:/data \
-  ghcr.io/vultrino/vultrino:latest \
+  ghcr.io/feir-ai/vultrino:latest \
   add --alias github-api --key ghp_xxx
 ```
 

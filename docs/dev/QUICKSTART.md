@@ -8,10 +8,10 @@ authoritative record of how the binary is actually built, configured, and run.
 
 ## Prerequisites
 
-- **Rust** (edition 2021; built/verified with the toolchain in this repo). Stable
-  Rust with `cargo` is sufficient.
-- **OpenSSL development libraries** (per the README's requirements; the HTTP
-  client uses rustls, but the build pulls system crypto in places).
+- **Rust** (edition 2021; pinned in `rust-toolchain.toml`). Stable Rust with
+  `cargo` is sufficient.
+- **TLS:** reqwest is built with `rustls-tls` — no system OpenSSL development
+  packages are required for a normal build.
 - For the **web UI login record** (`admin.json`), the `init` flow prompts
   interactively; the e2e harness seeds it non-interactively with `htpasswd`
   (bcrypt). Either works — the JSON API itself uses `vk_` keys, not this record.
@@ -22,7 +22,7 @@ authoritative record of how the binary is actually built, configured, and run.
 ## 1. Build from source
 
 ```bash
-git clone https://github.com/zachyking/vultrino.git
+git clone https://github.com/feir-ai/vultrino.git
 cd vultrino
 
 # Debug build (what the e2e harness uses — faster to build):

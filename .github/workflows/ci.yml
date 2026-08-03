@@ -40,30 +40,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The Rust version is pinned in rust-toolchain.toml (1.92.0 + clippy/rustfmt). cargo honors that file
+      # The Rust version is pinned in rust-toolchain.toml (1.94.0 + clippy/rustfmt). cargo honors that file
       # regardless of which toolchain this action installs, so local builds and CI share ONE source of truth.
-      # The zero-warning clippy gate below therefore always runs under 1.92.0. Bump it there, not here
+      # The zero-warning clippy gate below therefore always runs under 1.94.0. Bump it there, not here
       # (mirrors averin/.github/workflows/ci.yml). components: is a belt-and-suspenders pre-install.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build
+      - run: cargo build --locked
       - run: bash formal/check-refinement.sh
-      - run: cargo test
+      - run: cargo test --locked
       # `delegate_approval_integration` (tenant-equality, D3 PEP floors,
       # approver_kind outbox, signed webhook) requires `mock-govder` and is
       # invisible to a plain `cargo test` (default features are empty, and the
       # feature is deliberately NOT default — the src-side mock evaluator must
       # stay out of production builds, see src/delegation/mod.rs). Both
       # invocations are required; this is the only gate that runs the second one.
-      - run: cargo test --features mock-govder
+      - run: cargo test --locked --features mock-govder
       # Zero clippy warnings is a repo convention; -D warnings makes it a hard gate.
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
       # ...and the same gate over the feature-gated targets, which the line above does NOT
       # compile. `tests/delegate_approval_integration.rs` only exists under `mock-govder`, so
       # a lint regression in it was invisible to the "zero-warning gate" — measured
       # 2026-07-27: the default invocation was clean while --all-features still had a
       # clippy::type_complexity error. A gate that skips a third of the test tree is the
       # inert-gate class this repo keeps finding.
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit

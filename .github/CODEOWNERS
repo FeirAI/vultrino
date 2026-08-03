@@ -1,0 +1,15 @@
+# Default reviewers for the feir-ai org cut.
+# After the org exists, create a "maintainers" team (or edit this file to match).
+* @feir-ai/maintainers
+
+/.github/ @feir-ai/maintainers
+/formal/ @feir-ai/maintainers
+/src/approval/ @feir-ai/maintainers
+/src/averin/ @feir-ai/maintainers
+/src/egress.rs @feir-ai/maintainers
+/src/formal_kernel.rs @feir-ai/maintainers
+/src/plugins/ @feir-ai/maintainers
+/src/server/ @feir-ai/maintainers
+/docs/dev/SECURITY.md @feir-ai/maintainers
+/docs/dev/LIMITATIONS.md @feir-ai/maintainers
+/SECURITY.md @feir-ai/maintainers

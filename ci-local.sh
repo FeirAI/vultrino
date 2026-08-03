@@ -46,15 +46,17 @@ step() { # step <name> <cmd...>
   fi
 }
 
-step "cargo build"                    cargo build
-step "cargo test"                     cargo test
+step "cargo build --locked"             cargo build --locked
+step "formal refinement check"          bash formal/check-refinement.sh
+step "cargo test --locked"              cargo test --locked
 # Feature-gated: tests/delegate_approval_integration.rs exists ONLY under mock-govder.
-step "cargo test --features mock-govder" cargo test --features mock-govder
+step "cargo test --locked --features mock-govder" cargo test --locked --features mock-govder
 # The zero-warning gate, both ways. The default invocation does not compile the
 # mock-govder-only test target, so it cannot lint it — that gap is what let a
 # clippy::type_complexity error sit in the tree while the gate read green.
-step "cargo clippy (default features)"  cargo clippy --all-targets -- -D warnings
-step "cargo clippy (--all-features)"    cargo clippy --all-targets --all-features -- -D warnings
+step "cargo clippy (default features)"  cargo clippy --locked --all-targets -- -D warnings
+step "cargo clippy (--all-features)"    cargo clippy --locked --all-targets --all-features -- -D warnings
+step "cargo audit"                      bash -c 'command -v cargo-audit >/dev/null || cargo install cargo-audit --locked; cargo audit'
 # Universal, unbounded critical-boundary theorems. `--wfail` makes any
 # placeholder/sorry warning fatal locally; CI additionally checks the produced
 # declarations with the independent nanoda kernel.

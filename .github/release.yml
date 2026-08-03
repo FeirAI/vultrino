@@ -1,0 +1,24 @@
+# GitHub automatically-generated release notes categories.
+changelog:
+  exclude:
+    labels:
+      - dependencies
+  categories:
+    - title: Security
+      labels:
+        - security
+    - title: Breaking changes
+      labels:
+        - breaking-change
+    - title: Features
+      labels:
+        - enhancement
+    - title: Bug fixes
+      labels:
+        - bug
+    - title: Formal verification
+      labels:
+        - formal
+    - title: Other changes
+      labels:
+        - "*"

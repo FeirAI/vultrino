@@ -37,24 +37,34 @@ Vultrino is a credential proxy that keeps raw credential fields out of the agent
 
 ## Installation
 
+### Requirements
+
+- Rust **1.94.0** (pinned in [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` installs it)
+- No system OpenSSL packages — TLS uses **rustls**
+
 ### From Source
 
 ```bash
-# Clone the repository
-git clone https://github.com/zachyking/vultrino.git
+git clone https://github.com/feir-ai/vultrino.git
 cd vultrino
-
-# Build release binary
-cargo build --release
-
-# Install to path (optional)
+cargo build --release --locked
 cp target/release/vultrino ~/.local/bin/
 ```
 
-### Requirements
+### Release binaries / Docker
 
-- Rust 1.75+
-- OpenSSL development libraries
+Tagged releases (`v*`) publish platform archives and a container image:
+
+```bash
+# Binary (example: Apple Silicon)
+curl -L https://github.com/feir-ai/vultrino/releases/latest/download/vultrino-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv vultrino /usr/local/bin/
+
+# Container
+docker pull ghcr.io/feir-ai/vultrino:latest
+```
+
+See [Installation](docs/src/getting-started/installation.md) for Linux/macOS variants.
 
 ## Quick Start
 
@@ -552,10 +562,20 @@ security model, the usage-metering emit, and the honest v1 limits — see
 **[`docs/dev/`](docs/dev/README.md)**. (Where the dev set and the guides differ,
 the dev set describes what the shipped code does today.)
 
+## Formal verification (Stage-1)
+
+Critical-boundary models and CI gates live under [`formal/`](formal/). They prove
+finite modeled invariants under an explicit TCB — not information-theoretic
+noninterference. Bounded claims and known holes are in
+[`docs/dev/LIMITATIONS.md`](docs/dev/LIMITATIONS.md).
+
+## Community
+
+- [Contributing](CONTRIBUTING.md) — setup, norms, PR expectations
+- [Security policy](SECURITY.md) — private vulnerability reporting (`security@feir.ai`)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Changelog](CHANGELOG.md)
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
-
-## Contributing
-
-Contributions welcome! Please read the contributing guidelines before submitting PRs.

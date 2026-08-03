@@ -1,9 +1,10 @@
 # Pin the EXACT Rust toolchain so local builds and CI read ONE source of truth. CI's dtolnay/rust-toolchain
-# step installs stable, but cargo honors THIS file, so the zero-warning clippy gate always runs under 1.92.0
+# step installs stable, but cargo honors THIS file, so the zero-warning clippy gate always runs under 1.94.0
 # — the version the convention was verified clean under. A floating stable could add lints and turn
 # `-D warnings` red. Bump this deliberately (mirrors averin/rust-toolchain.toml).
+# 1.94.0 is required by wasmtime ≥46 (RUSTSEC-2026-0188 / RUSTSEC-2026-0222 remediation).
 [toolchain]
-channel = "1.92.0"
+channel = "1.94.0"
 # clippy: CI runs `cargo clippy --all-targets -- -D warnings` under THIS pin. rustfmt: mirrors averin and costs
 # nothing (rustup installs it with the toolchain). No `targets`: vultrino builds for the host only — wasmtime
 # here is a host-side WASM *runtime* for plugins, not a wasm/i686 compile target (unlike averin's cross-builds).
