@@ -2667,9 +2667,9 @@ pub fn summarize(credential: &str, action: &str, params: &serde_json::Value) -> 
 // ==================== Decision token helpers ====================
 
 fn generate_decision_token() -> (String, String) {
-    use rand::RngCore;
+    use rand::TryRng;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng.try_fill_bytes(&mut bytes).expect("SysRng failure");
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     let hash = hash_decision_token(&token);
     (token, hash)

@@ -6,7 +6,7 @@ use aes_gcm::{
 };
 use argon2::{password_hash::SaltString, Algorithm, Argon2, Params, PasswordHasher, Version};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::SysRng, TryRng};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -161,7 +161,7 @@ pub fn derive_key(
 /// Generate a random salt for key derivation
 pub fn generate_salt() -> Vec<u8> {
     let mut salt = vec![0u8; 16];
-    OsRng.fill_bytes(&mut salt);
+    SysRng.try_fill_bytes(&mut salt).expect("SysRng failure");
     salt
 }
 
@@ -169,7 +169,7 @@ pub fn generate_salt() -> Vec<u8> {
 pub fn encrypt(plaintext: &[u8], key: &MasterKey) -> Result<EncryptedData, CryptoError> {
     // Generate random nonce
     let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    SysRng.try_fill_bytes(&mut nonce_bytes).expect("SysRng failure");
     let nonce = Nonce::from(nonce_bytes);
 
     // Create cipher and encrypt

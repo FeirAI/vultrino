@@ -37,8 +37,13 @@ pub struct PopKeypair {
 impl PopKeypair {
     /// Generate a fresh keypair from the OS CSPRNG.
     pub fn generate() -> Self {
-        // rand 0.8 OsRng implements the rand_core 0.6 traits ed25519-dalek v2 uses.
-        let signing = SigningKey::generate(&mut rand::rngs::OsRng);
+        // ed25519-dalek v2 pins rand_core 0.6; fill via rand 0.10 SysRng then from_bytes.
+        use rand::TryRng;
+        let mut secret = [0u8; 32];
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut secret)
+            .expect("SysRng failure");
+        let signing = SigningKey::from_bytes(&secret);
         Self { signing }
     }
 
@@ -169,9 +174,9 @@ pub fn credential_binding(capability: &str) -> Result<String, PopError> {
 
 /// A 64-lowercase-hex random `params_nonce` for the hiding commitment.
 pub fn random_params_nonce_hex() -> String {
-    use rand::RngCore;
+    use rand::TryRng;
     let mut b = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut b);
+    rand::rngs::SysRng.try_fill_bytes(&mut b).expect("SysRng failure");
     hex::encode(b)
 }
 

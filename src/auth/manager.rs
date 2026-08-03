@@ -9,7 +9,7 @@ use super::types::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{Duration, Utc};
 use parking_lot::RwLock;
-use rand::RngCore;
+use rand::TryRng;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -207,7 +207,7 @@ impl AuthManager {
     /// Generate a new API key
     fn generate_key() -> (String, String) {
         let mut random_bytes = [0u8; KEY_RANDOM_LENGTH];
-        rand::rngs::OsRng.fill_bytes(&mut random_bytes);
+        rand::rngs::SysRng.try_fill_bytes(&mut random_bytes).expect("SysRng failure");
 
         // Use URL-safe base64 encoding, trimmed to desired length
         let random_part: String = STANDARD

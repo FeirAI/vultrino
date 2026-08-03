@@ -8,7 +8,7 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Duration, Utc};
-use rand::RngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -199,7 +199,7 @@ impl From<&ApprovalToken> for ApprovalTokenMetadata {
 
 fn generate_token() -> (String, String) {
     let mut random_bytes = [0u8; TOKEN_RANDOM_LENGTH];
-    rand::rngs::OsRng.fill_bytes(&mut random_bytes);
+    rand::rngs::SysRng.try_fill_bytes(&mut random_bytes).expect("SysRng failure");
 
     let random_part: String = STANDARD
         .encode(random_bytes)
