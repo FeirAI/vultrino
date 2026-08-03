@@ -259,6 +259,20 @@ if min(
     fail("trusted criticality snapshot must refuse or force approval before the shared branch")
 if "let trusted_irreversible = irreversibility.trusted_human_floor();" not in server:
     fail("approval stamp no longer consumes the same criticality snapshot that forced gating")
+if "let evidence_required = irreversibility.requires_committed_evidence();" not in server:
+    fail("direct dispatch no longer derives Averin evidence from the catalog snapshot")
+if "fn requires_committed_evidence(self) -> bool" not in server:
+    fail("committed-evidence selection is no longer a closed catalog classification")
+if "Some(CapabilityAuthorityClass::HumanFloor)" not in server or "Some(CapabilityAuthorityClass::AmbiguousCanonical)" not in server:
+    fail("approval resume no longer selects Averin evidence from the frozen catalog class")
+if "async fn validate_required_evidence_preflight(" not in server:
+    fail("trusted human-floor evidence preflight is missing from the execute path")
+if server.count("self.validate_required_evidence_preflight(") < 2:
+    fail("both buffered and streaming dispatch must run the evidence preflight")
+if "seal_use_required(token_id, params_bytes)" not in server:
+    fail("trusted human-floor path no longer awaits a committed Averin use seal")
+if 'unknown [averin] mode' not in (ROOT / "src/config/types.rs").read_text():
+    fail("Averin mode typos can again fail open into Observe")
 if "async fn resolve_irreversibility_for_action(\n        &self,\n        credential_alias: &str," not in server:
     fail("criticality lookup is no longer bound to the executing credential")
 if "cap.credential_ref.trim() == credential_alias.trim()" not in server:

@@ -72,8 +72,20 @@ impl IrreversibilityResolution {
         matches!(self, Self::HumanFloor | Self::AmbiguousCanonical)
     }
 
+    /// Anything not proven reversible. Used for inconclusive-recipe refusal and
+    /// approval stamps: undeclared/ambiguous/unavailable cannot inherit the
+    /// weaker numeric oversight path.
     fn trusted_human_floor(self) -> bool {
         !matches!(self, Self::Reversible)
+    }
+
+    /// Averin evidence is selected by trusted catalog authority, not by the
+    /// broader "not proven reversible" stamp. Undeclared actions in non-strict
+    /// posture keep the historical availability knobs (including Observe
+    /// fail-open); only a declared human floor or an erased shared-canonical
+    /// verb forces a committed use seal before dispatch.
+    fn requires_committed_evidence(self) -> bool {
+        matches!(self, Self::HumanFloor | Self::AmbiguousCanonical)
     }
 
     fn authority_class(self) -> Option<CapabilityAuthorityClass> {
@@ -259,6 +271,10 @@ struct ActionPayload {
     params: serde_json::Value,
     context: RequestContext,
     use_token_id: Option<String>,
+    /// Trusted capability-catalog human floor carried through the exact permit
+    /// binding. When true, a committed Averin use receipt is a precondition of
+    /// plugin dispatch, independent of the ordinary Observe posture.
+    evidence_required: bool,
 }
 
 /// Metering attribution captured before `context`/`credential` move into the
@@ -1292,6 +1308,12 @@ impl VultrinoServer {
         if irreversibility.automatically_requires_approval() {
             needs_approval = true;
         }
+        // Recipe-refusal / approval stamps use the broader "not proven
+        // reversible" answer. The Averin evidence floor is narrower: only a
+        // declared human-floor capability or an ambiguous shared canonical verb
+        // forces a committed use seal. Both answers come from this one snapshot.
+        let trusted_irreversible = irreversibility.trusted_human_floor();
+        let evidence_required = irreversibility.requires_committed_evidence();
 
         if needs_approval {
             if !self.approval_config.enabled {
@@ -1370,7 +1392,6 @@ impl VultrinoServer {
             if requester.owner.is_none() {
                 requester.owner = principal.as_ref().and_then(|p| p.owner.clone());
             }
-            let trusted_irreversible = irreversibility.trusted_human_floor();
             // Extract the capability's declared approval-preview fields from the
             // SAME params that will execute (never a separate/mutable copy), so
             // the approver sees exactly what will run. None when the backing
@@ -1613,6 +1634,7 @@ impl VultrinoServer {
             params: request.params.clone(),
             context,
             use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
+            evidence_required,
         };
         let authorized = permit.authorize(&binding, payload).map_err(|_| {
             VultrinoError::PolicyDenied(
@@ -1641,25 +1663,102 @@ impl VultrinoServer {
         }
     }
 
+    /// Validate the evidence prerequisites selected by trusted capability
+    /// authority before a use token is consumed. A human-floor action may reach
+    /// dispatch only with a concrete token, a live Averin client, bounded params,
+    /// and the grant material needed to build its use receipt.
+    async fn validate_required_evidence_preflight(
+        &self,
+        evidence_required: bool,
+        use_token_id: Option<&str>,
+        params_len: usize,
+    ) -> Result<(), RunError> {
+        if !evidence_required {
+            return Ok(());
+        }
+        let av = self.averin.as_ref().ok_or_else(|| {
+            RunError::terminal(VultrinoError::PolicyDenied(
+                "trusted human-floor action requires Averin evidence, but the seal client is not \
+                 available; nothing ran"
+                    .to_string(),
+            ))
+        })?;
+        let token_id = use_token_id.ok_or_else(|| {
+            RunError::terminal(VultrinoError::PolicyDenied(
+                "trusted human-floor action requires a use token bound to an Averin grant; \
+                 nothing ran"
+                    .to_string(),
+            ))
+        })?;
+        if params_len > av.config().max_seal_params_bytes {
+            return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
+                "trusted human-floor action requires an Averin evidence seal, but its parameters \
+                 exceed the configured {} byte evidence bound; nothing ran",
+                av.config().max_seal_params_bytes
+            ))));
+        }
+
+        // A queue-owning durable process stores the grant material on disk. Its
+        // worker may still be resolving a freshly minted grant; report that as a
+        // retryable preflight refusal before consuming the token. Missing state is
+        // terminal: this token was never durably bound and cannot produce evidence.
+        if av.config().durable {
+            if let Some(popkeys) = self.storage.averin_durable_popkeys() {
+                return match popkeys.get(token_id).await.map_err(|error| {
+                    RunError::retryable(VultrinoError::PolicyUnavailable(format!(
+                        "trusted human-floor evidence grant could not be read: {error}; nothing ran"
+                    )))
+                })? {
+                    Some(entry) if entry.grant_id.is_some() && entry.capability.is_some() => Ok(()),
+                    Some(_) => Err(RunError::retryable(VultrinoError::PolicyUnavailable(
+                        "trusted human-floor evidence grant is not sealed yet; nothing ran — retry \
+                         after the Averin delivery worker resolves it"
+                            .to_string(),
+                    ))),
+                    None => Err(RunError::terminal(VultrinoError::PolicyDenied(
+                        "trusted human-floor action has no durable Averin grant binding; nothing ran"
+                            .to_string(),
+                    ))),
+                };
+            }
+        }
+
+        if av.has_in_memory_grant(token_id) {
+            Ok(())
+        } else {
+            Err(RunError::terminal(VultrinoError::PolicyDenied(
+                "trusted human-floor action has no live Averin grant binding; nothing ran"
+                    .to_string(),
+            )))
+        }
+    }
+
     /// Plan 087 FIX 1 — the SHARED averin use-seal hook for BOTH the buffered
     /// ([`Self::run_action`]) and streaming ([`Self::run_action_streaming`]) execute
     /// paths. Called AFTER the use token is consumed (the point of no return) and
     /// BEFORE `plugin.execute*`, so a `stream: true` request gets exactly the seal a
     /// buffered one does — the two paths cannot drift.
     ///
-    /// - `Observe` (default): fire-and-forget off the hot path via `spawn_use_seal`
-    ///   (bounded fan-out, dropped fail-open on saturation). Returns `Ok(())` ALWAYS,
-    ///   so the action always proceeds — an averin outage never stalls or fails it.
-    /// - `RequireEvidence` (opt-in, per-resource): AWAIT the seal; on failure return
-    ///   `Err` so the caller DENIES the action before any side effect (buffered:
-    ///   returns the error; streaming: denies BEFORE the SSE body opens). This closes
-    ///   the strict-mode fail-OPEN hole the streaming path previously had.
+    /// - `evidence_required` (trusted human-floor catalog authority): AWAIT a
+    ///   committed use seal regardless of the ordinary `[averin] mode`. Failure
+    ///   denies before `plugin.execute*`. Preflight
+    ///   ([`Self::validate_required_evidence_preflight`]) must already have refused
+    ///   missing client/token/grant before the token was consumed.
+    /// - `Observe` (default, when evidence is not required): fire-and-forget off the
+    ///   hot path via `spawn_use_seal` (bounded fan-out, dropped fail-open on
+    ///   saturation). Returns `Ok(())` ALWAYS, so reversible work is not stalled by
+    ///   an averin outage.
+    /// - `RequireEvidence` (opt-in, per-resource, when evidence is not already
+    ///   required by catalog authority): AWAIT the seal; on failure return `Err` so
+    ///   the caller DENIES before any side effect (buffered: returns the error;
+    ///   streaming: denies BEFORE the SSE body opens).
     ///
-    /// Callers reach this only inside `if let (Some(av), Some(tid)) = (&self.averin,
-    /// use_token_id)`, so `[averin] enabled = false` (the default) skips it — and the
-    /// `params_bytes` serialization — entirely, keeping the default-off path
-    /// byte-identical. Takes OWNED `params_bytes` (FIX 3b): the buffer moves into the
-    /// seal instead of being copied again.
+    /// Callers serialize `params_bytes` before token consume when Averin is in play
+    /// or evidence is required, then reach this hook only with that bound buffer.
+    /// `[averin] enabled = false` still skips the reversible path entirely; a
+    /// trusted human-floor action refuses earlier in preflight instead. Takes OWNED
+    /// `params_bytes` (FIX 3b): the buffer moves into the seal instead of being
+    /// copied again.
     ///
     /// Plan 088 D5c — `use_sequence_number` (the `consume_use_token` post-increment `uses`,
     /// 1-based) and `request_id` are threaded through here from both call sites so they are
@@ -1694,7 +1793,36 @@ impl VultrinoServer {
         params_bytes: Vec<u8>,
         use_sequence_number: u32,
         request_id: &str,
+        evidence_required: bool,
     ) -> Result<(), RunError> {
+        if evidence_required {
+            if av.config().durable {
+                if let (Some(queue), Some(popkeys)) = (
+                    self.storage.averin_durable_queue(),
+                    self.storage.averin_durable_popkeys(),
+                ) {
+                    return Self::seal_durable_use_required(
+                        av,
+                        &queue,
+                        &popkeys,
+                        token_id,
+                        params_bytes,
+                        use_sequence_number,
+                        request_id,
+                    )
+                    .await;
+                }
+            }
+            return av
+                .seal_use_required(token_id, params_bytes)
+                .await
+                .map_err(|error| {
+                    RunError::terminal(VultrinoError::PolicyDenied(format!(
+                        "trusted human-floor Averin evidence seal failed: {error}; nothing ran"
+                    )))
+                });
+        }
+
         match av.mode() {
             crate::averin::AverinMode::Observe => {
                 if av.config().durable {
@@ -1751,6 +1879,92 @@ impl VultrinoServer {
                         "averin evidence seal required but failed (require_evidence): {e}"
                     )))
                 })
+            }
+        }
+    }
+
+    /// Strict counterpart of the durable Observe enqueue. The exact use event is
+    /// committed to the encrypted queue first, then synchronously delivered and
+    /// confirmed before plugin dispatch. A background worker racing this call can
+    /// only duplicate the same deterministic request; Averin idempotency makes
+    /// that safe, and a worker-confirmed `Delivered` state is accepted.
+    async fn seal_durable_use_required(
+        av: &crate::averin::AverinClient,
+        queue: &crate::storage::AverinQueue,
+        popkeys: &crate::storage::PopKeyStore,
+        token_id: &str,
+        params_bytes: Vec<u8>,
+        use_sequence_number: u32,
+        request_id: &str,
+    ) -> Result<(), RunError> {
+        let payload = serde_json::json!({
+            "params": String::from_utf8_lossy(&params_bytes),
+            "nonce": crate::averin::pop::random_params_nonce_hex(),
+            "params_nonce": crate::averin::pop::random_params_nonce_hex(),
+            "request_id": request_id,
+            "use_sequence_number": use_sequence_number,
+            "project_id": av.config().project_id,
+            "session_id": av.config().session_id,
+            "resource_id": av.config().resource_id,
+        });
+        let sequence = run_averin_queue_blocking(|| queue.append(token_id, "averin.use", payload))
+            .map_err(|error| {
+                av.record_enqueue_failed();
+                RunError::terminal(VultrinoError::PolicyDenied(format!(
+                    "trusted human-floor evidence could not be durably queued: {error}; nothing ran"
+                )))
+            })?;
+        let event = queue.get(sequence).ok_or_else(|| {
+            av.record_required_failed();
+            RunError::terminal(VultrinoError::PolicyDenied(
+                "trusted human-floor evidence event disappeared before delivery; nothing ran"
+                    .to_string(),
+            ))
+        })?;
+
+        match deliver_averin_use(&event, popkeys, av).await {
+            Ok(()) => {
+                if let Err(error) = run_averin_queue_blocking(|| {
+                    queue.record_delivery(sequence, true, None, AVERIN_MAX_ATTEMPTS)
+                }) {
+                    // The remote record already committed. Retain the queue event
+                    // for an idempotent worker retry rather than denying a proven
+                    // action solely because local acknowledgement persistence failed.
+                    warn!(
+                        target: "averin_seal",
+                        token_id,
+                        sequence,
+                        error = %error,
+                        "strict Averin use sealed but local delivery acknowledgement failed; \
+                         worker will retry idempotently"
+                    );
+                }
+                av.record_required_sealed();
+                Ok(())
+            }
+            Err(error) => {
+                // A racing worker may have completed the exact same idempotent
+                // event while this request lost its response. Accept only the
+                // queue's durable Delivered state; otherwise nothing dispatches.
+                if queue
+                    .get(sequence)
+                    .is_some_and(|event| event.delivery == crate::outbox::DeliveryState::Delivered)
+                {
+                    av.record_required_sealed();
+                    return Ok(());
+                }
+                let _ = run_averin_queue_blocking(|| {
+                    queue.record_delivery(
+                        sequence,
+                        false,
+                        Some(error.clone()),
+                        AVERIN_MAX_ATTEMPTS,
+                    )
+                });
+                av.record_required_failed();
+                Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
+                    "trusted human-floor Averin evidence seal failed: {error}; nothing ran"
+                ))))
             }
         }
     }
@@ -1815,6 +2029,7 @@ impl VultrinoServer {
             params,
             context,
             use_token_id,
+            evidence_required,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
         let action_name = action_name.as_str();
@@ -1830,6 +2045,27 @@ impl VultrinoServer {
         plugin
             .validate_params(action_name, &params)
             .map_err(|e| RunError::terminal(e.into()))?;
+
+        // Serialize once before token consumption. Trusted human-floor actions
+        // fail closed here if no evidence path/grant exists; reversible actions
+        // preserve the default-off and Observe behavior.
+        let evidence_params = if evidence_required
+            || (self.averin.is_some() && use_token_id.is_some())
+        {
+            Some(serde_json::to_vec(&params).map_err(|_| {
+                RunError::terminal(VultrinoError::PolicyDenied(
+                    "execution parameters could not be bound to evidence; nothing ran".to_string(),
+                ))
+            })?)
+        } else {
+            None
+        };
+        self.validate_required_evidence_preflight(
+            evidence_required,
+            use_token_id,
+            evidence_params.as_ref().map_or(0, Vec::len),
+        )
+        .await?;
 
         // Reserve the use token atomically, fail-closed, just before the side
         // effect. A failure here (exhausted/expired/revoked) means nothing ran
@@ -1938,15 +2174,23 @@ impl VultrinoServer {
         //     consumed above, so a strict block here burns it; fixing that ordering
         //     is a separate change. This caveat is UNREACHABLE in the default
         //     (Observe) posture because the async path never blocks.
-        if let (Some(av), Some(tid)) = (&self.averin, use_token_id) {
-            let params_bytes = serde_json::to_vec(&params).unwrap_or_default();
+        if let (Some(av), Some(tid), Some(params_bytes)) =
+            (&self.averin, use_token_id, evidence_params)
+        {
             // Plan 087 FIX 1 — the mode-dependent seal hook now lives in ONE shared
             // helper so the buffered and streaming execute paths cannot drift. In
             // RequireEvidence a seal failure returns Err and DENIES the action here
             // (before `plugin.execute` — the point of no return). Plan 088 D5c threads
             // this execute's `use_sequence_number` + `request_id` through too.
-            self.seal_after_consume(av, tid, params_bytes, use_sequence_number, &request_id)
-                .await?;
+            self.seal_after_consume(
+                av,
+                tid,
+                params_bytes,
+                use_sequence_number,
+                &request_id,
+                evidence_required,
+            )
+            .await?;
         }
 
         let plugin_request = crate::plugins::PluginRequest {
@@ -2143,6 +2387,7 @@ impl VultrinoServer {
             params,
             context,
             use_token_id,
+            evidence_required,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
         let action_name = action_name.as_str();
@@ -2156,6 +2401,27 @@ impl VultrinoServer {
         plugin
             .validate_params(action_name, &params)
             .map_err(|e| RunError::terminal(e.into()))?;
+
+        // The streaming path shares the exact same pre-consume evidence
+        // preflight as buffered execution. A strict failure occurs before the
+        // upstream stream is opened and before the token is reserved.
+        let evidence_params = if evidence_required
+            || (self.averin.is_some() && use_token_id.is_some())
+        {
+            Some(serde_json::to_vec(&params).map_err(|_| {
+                RunError::terminal(VultrinoError::PolicyDenied(
+                    "execution parameters could not be bound to evidence; nothing ran".to_string(),
+                ))
+            })?)
+        } else {
+            None
+        };
+        self.validate_required_evidence_preflight(
+            evidence_required,
+            use_token_id,
+            evidence_params.as_ref().map_or(0, Vec::len),
+        )
+        .await?;
 
         // Reserve the use token atomically, fail-closed, BEFORE the first byte —
         // the point of no return, identical to the buffered path.
@@ -2249,12 +2515,20 @@ impl VultrinoServer {
         // `plugin.execute_streaming` (the point of no return) opens the upstream
         // stream, so strict mode now fails CLOSED on streams too. Must precede the
         // `params` move into `plugin_request` below.
-        if let (Some(av), Some(tid)) = (&self.averin, use_token_id) {
-            let params_bytes = serde_json::to_vec(&params).unwrap_or_default();
+        if let (Some(av), Some(tid), Some(params_bytes)) =
+            (&self.averin, use_token_id, evidence_params)
+        {
             // Plan 088 D5c — threads this execute's `use_sequence_number` + `request_id`
             // through too, identical to the buffered path.
-            self.seal_after_consume(av, tid, params_bytes, use_sequence_number, &request_id)
-                .await?;
+            self.seal_after_consume(
+                av,
+                tid,
+                params_bytes,
+                use_sequence_number,
+                &request_id,
+                evidence_required,
+            )
+            .await?;
         }
 
         let plugin_request = crate::plugins::PluginRequest {
@@ -2790,6 +3064,15 @@ impl VultrinoServer {
                 "approved execution permit refused ({reason:?}); nothing ran"
             )))
         })?;
+        // Prefer the frozen catalog class: undeclared approvals may carry the
+        // broader trusted_irreversible stamp for recipe refusal without forcing
+        // Averin evidence. Legacy rows without a class keep the stamp fail-closed.
+        let evidence_required = match approval.capability_authority() {
+            Some(CapabilityAuthorityClass::HumanFloor)
+            | Some(CapabilityAuthorityClass::AmbiguousCanonical) => true,
+            Some(_) => false,
+            None => approval.trusted_irreversible,
+        };
         let payload = ActionPayload {
             credential,
             plugin_name: plugin_name.to_string(),
@@ -2797,6 +3080,7 @@ impl VultrinoServer {
             params: approval.params.clone(),
             context,
             use_token_id: approval.use_token_id.clone(),
+            evidence_required,
         };
         let authorized = permit.authorize(&binding, payload).map_err(|reason| {
             RunError::terminal(VultrinoError::PolicyDenied(format!(
@@ -6419,7 +6703,7 @@ mod averin_worker_tests {
 
             server.seal_mint(&token).await;
             let result = server
-                .seal_after_consume(&av, &token.id, br#"{"q":1}"#.to_vec(), 1, "req-rekey-1")
+                .seal_after_consume(&av, &token.id, br#"{"q":1}"#.to_vec(), 1, "req-rekey-1", false)
                 .await;
             assert!(result.is_ok(), "Observe must never return Err");
 
@@ -6604,7 +6888,7 @@ mod averin_worker_tests {
             // network round-trip — then "crash" before either ever reaches averin.
             server.seal_mint(&token).await;
             let result = server
-                .seal_after_consume(&av, &token.id, br#"{"q":1}"#.to_vec(), 1, "req-restart-1")
+                .seal_after_consume(&av, &token.id, br#"{"q":1}"#.to_vec(), 1, "req-restart-1", false)
                 .await;
             assert!(result.is_ok(), "Observe must never return Err");
 
@@ -6835,7 +7119,7 @@ mod durable_enqueue_tests {
         .await;
 
         let result = server
-            .seal_after_consume(&av, "vut_no_grant", b"{}".to_vec(), 1, "req-1")
+            .seal_after_consume(&av, "vut_no_grant", b"{}".to_vec(), 1, "req-1", false)
             .await;
         assert!(result.is_ok(), "Observe must never return Err");
 
@@ -6899,7 +7183,7 @@ mod durable_enqueue_tests {
 
         let t0 = Instant::now();
         let result = server
-            .seal_after_consume(&av, "tok-durable", br#"{"q":1}"#.to_vec(), 2, "req-42")
+            .seal_after_consume(&av, "tok-durable", br#"{"q":1}"#.to_vec(), 2, "req-42", false)
             .await;
         let elapsed = t0.elapsed();
         assert!(result.is_ok(), "Observe must never return Err");
@@ -6958,7 +7242,7 @@ mod durable_enqueue_tests {
         assert_eq!(av.metrics().dropped, 0);
 
         let result = server
-            .seal_after_consume(&av, "tok-oversize", oversize_params, 1, "req-oversize")
+            .seal_after_consume(&av, "tok-oversize", oversize_params, 1, "req-oversize", false)
             .await;
         assert!(
             result.is_ok(),

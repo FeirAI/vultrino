@@ -518,9 +518,14 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
     fn try_from(raw: RawAverinConfig) -> Result<Self, Self::Error> {
         let d = crate::averin::AverinConfig::default();
         let mode = match raw.mode.as_deref() {
+            None | Some("observe") => crate::averin::AverinMode::Observe,
             Some("require_evidence") => crate::averin::AverinMode::RequireEvidence,
-            // Any other value (incl. "observe" and typos) is the safe fail-open default.
-            _ => crate::averin::AverinMode::Observe,
+            Some(other) => {
+                return Err(ConfigError::Invalid(format!(
+                    "unknown [averin] mode {other:?}; expected \"observe\" or \
+                     \"require_evidence\" (refusing to turn a typo into fail-open evidence)"
+                )))
+            }
         };
         let durable = raw.durable.unwrap_or(d.durable);
         // Plan 088 D6 — durable at-least-once delivery is Observe-only: durable mint enqueues the
@@ -1284,6 +1289,33 @@ action = "deny"
                 }
             }
         }
+    }
+
+    #[test]
+    fn averin_mode_is_closed_and_typos_fail_config_load() {
+        for mode in ["Observe", "require-evidnce", "best_effort", ""] {
+            let input = format!("[averin]\nmode = {mode:?}");
+            let error = Config::parse(&input).expect_err("unknown Averin mode must refuse");
+            let message = error.to_string();
+            assert!(message.contains("unknown [averin] mode"), "{message}");
+            assert!(message.contains("observe"), "{message}");
+            assert!(message.contains("require_evidence"), "{message}");
+        }
+
+        assert_eq!(
+            Config::parse("[averin]\nmode = \"observe\"")
+                .unwrap()
+                .averin
+                .mode,
+            crate::averin::AverinMode::Observe
+        );
+        assert_eq!(
+            Config::parse("[averin]\nmode = \"require_evidence\"")
+                .unwrap()
+                .averin
+                .mode,
+            crate::averin::AverinMode::RequireEvidence
+        );
     }
 
     #[test]

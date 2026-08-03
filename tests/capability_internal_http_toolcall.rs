@@ -38,6 +38,7 @@ use tempfile::tempdir;
 use tokio::sync::RwLock;
 
 use vultrino::auth::{AuthManager, NewUseToken, UseToken};
+use vultrino::averin::{AverinConfig, AverinMode};
 use vultrino::capability::{Capability, CapabilityTarget};
 use vultrino::config::Config;
 use vultrino::mcp::McpServer;
@@ -273,6 +274,30 @@ async fn start_mock_govder_confirming_no_recipe() -> vultrino::govder::GovderCon
     }
 }
 
+/// Minimal Averin stub so irreversible happy paths can satisfy the committed
+/// evidence floor without a real Averin deployment.
+async fn spawn_stub_averin() -> String {
+    use axum::routing::post;
+    use axum::Json;
+
+    async fn grants() -> Json<serde_json::Value> {
+        Json(serde_json::json!({"grant_id": "g-stub-1", "capability": "AAAABBBB.sig"}))
+    }
+    async fn use_seal() -> Json<serde_json::Value> {
+        Json(serde_json::json!({"record": {"record_id": "use-stub-1"}}))
+    }
+
+    let app = Router::new()
+        .route("/v2/grants", post(grants))
+        .route("/v2/use", post(use_seal));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 async fn build_stack(
     mut config: Config,
 ) -> (Arc<dyn StorageBackend>, Arc<VultrinoServer>, McpServer) {
@@ -291,8 +316,17 @@ async fn build_stack(
     // The shipped refund is irreversible. Give the fixture a real approval
     // subsystem and a reachable recipe authority so its happy path proves an
     // approved resume, never an inline dispatch or an unwired-policy fallback.
+    // Averin is also required: a declared human-floor resume must commit a use
+    // receipt before plugin dispatch, independent of Observe posture.
     config.approval.enabled = true;
     config.govder = Some(start_mock_govder_confirming_no_recipe().await);
+    config.averin = AverinConfig {
+        enabled: true,
+        base_url: spawn_stub_averin().await,
+        resource_id: "finsandbox".to_string(),
+        mode: AverinMode::Observe,
+        ..AverinConfig::default()
+    };
     let resolver = CredentialResolver::new(storage.clone());
     let server = Arc::new(VultrinoServer::new(config, storage.clone(), resolver));
     server.load_plugins().await.unwrap();
@@ -305,6 +339,7 @@ async fn build_stack(
 /// and mint the agent's use token, returning the plaintext `vut_…`.
 async fn seed(
     storage: &Arc<dyn StorageBackend>,
+    server: &VultrinoServer,
     alias: &str,
     destination: &str,
     action_scope: &str,
@@ -332,6 +367,14 @@ async fn seed(
     token.tenant = Some("acme".to_string());
     token.agent_label = Some(format!("{alias}-agent"));
     storage.store_use_token(&token).await.unwrap();
+    // Direct storage mint skips the server mint hook, so seal the grant here
+    // for the human-floor evidence preflight.
+    server
+        .averin()
+        .expect("build_stack enables Averin")
+        .seal_grant(&token.id, alias, action_scope, None)
+        .await
+        .expect("stub Averin must seal the fixture grant");
     full
 }
 
@@ -478,7 +521,14 @@ async fn approve_only_pending_and_resume(
 async fn agent_refund_from_advertised_schema_executes_only_after_approval() {
     let (port, rec) = start_sandbox().await;
     let (storage, server, mut mcp) = build_stack(operator_config(port)).await;
-    let token = seed(&storage, "finsandbox-refund", "finsandbox", "money.refund").await;
+    let token = seed(
+        &storage,
+        &server,
+        "finsandbox-refund",
+        "finsandbox",
+        "money.refund",
+    )
+    .await;
     register_pack_capability(&storage, refund_cap()).await;
 
     let schema = advertised_schema(&mut mcp, &token, "issue_refund").await;
@@ -534,8 +584,15 @@ async fn agent_refund_from_advertised_schema_executes_only_after_approval() {
 #[tokio::test]
 async fn agent_reads_the_ledger_through_tools_call_using_only_the_advertised_schema() {
     let (port, rec) = start_sandbox().await;
-    let (storage, _server, mut mcp) = build_stack(operator_config(port)).await;
-    let token = seed(&storage, "finsandbox-read", "finsandbox", "data.read").await;
+    let (storage, server, mut mcp) = build_stack(operator_config(port)).await;
+    let token = seed(
+        &storage,
+        &server,
+        "finsandbox-read",
+        "finsandbox",
+        "data.read",
+    )
+    .await;
     register_pack_capability(&storage, ledger_cap()).await;
 
     let schema = advertised_schema(&mut mcp, &token, "ledger_read").await;
@@ -567,10 +624,17 @@ async fn agent_reads_the_ledger_through_tools_call_using_only_the_advertised_sch
 #[tokio::test]
 async fn a_caller_supplied_method_is_refused_and_never_widens_the_verb() {
     let (port, rec) = start_sandbox().await;
-    let (storage, _server, mut mcp) = build_stack(operator_config(port)).await;
+    let (storage, server, mut mcp) = build_stack(operator_config(port)).await;
     // A READ capability: GET /v1/ledger*. The classic escalation is turning it
     // into a POST.
-    let token = seed(&storage, "finsandbox-read", "finsandbox", "data.read").await;
+    let token = seed(
+        &storage,
+        &server,
+        "finsandbox-read",
+        "finsandbox",
+        "data.read",
+    )
+    .await;
     register_pack_capability(&storage, ledger_cap()).await;
 
     let err = tools_call(
@@ -601,8 +665,15 @@ async fn a_caller_supplied_method_is_refused_and_never_widens_the_verb() {
 #[tokio::test]
 async fn a_caller_supplied_method_is_refused_even_when_it_matches_the_pin() {
     let (port, rec) = start_sandbox().await;
-    let (storage, _server, mut mcp) = build_stack(operator_config(port)).await;
-    let token = seed(&storage, "finsandbox-refund", "finsandbox", "money.refund").await;
+    let (storage, server, mut mcp) = build_stack(operator_config(port)).await;
+    let token = seed(
+        &storage,
+        &server,
+        "finsandbox-refund",
+        "finsandbox",
+        "money.refund",
+    )
+    .await;
     register_pack_capability(&storage, refund_cap()).await;
 
     let err = tools_call(
@@ -631,7 +702,14 @@ async fn a_caller_supplied_method_is_refused_even_when_it_matches_the_pin() {
 async fn an_operator_pinned_plugin_param_method_is_what_executes() {
     let (port, rec) = start_sandbox().await;
     let (storage, server, mut mcp) = build_stack(operator_config(port)).await;
-    let token = seed(&storage, "finsandbox-refund", "finsandbox", "money.refund").await;
+    let token = seed(
+        &storage,
+        &server,
+        "finsandbox-refund",
+        "finsandbox",
+        "money.refund",
+    )
+    .await;
     let mut pinned = serde_json::Map::new();
     pinned.insert("method".to_string(), serde_json::json!("POST"));
     let mut cap = refund_cap();

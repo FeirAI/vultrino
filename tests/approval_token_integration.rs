@@ -14,6 +14,7 @@ use tempfile::tempdir;
 use vultrino::approval::{
     ApprovalRequest, ApprovalStatus, ApproverClass, Decision, NewApproval, RequesterInfo,
 };
+use vultrino::averin::{AverinConfig, AverinMode};
 use vultrino::auth::{AuthResult, NewUseToken, UseToken};
 use vultrino::config::Config;
 use vultrino::govder::GovderConfig;
@@ -347,10 +348,21 @@ struct MutableRecipeApprovalFixture {
 /// whether the authority is mutated, preventing an always-refuse check from
 /// making the negative control pass vacuously.
 async fn open_approved_mutable_recipe_fixture() -> MutableRecipeApprovalFixture {
+    open_approved_mutable_recipe_fixture_with_authority("reversible", false, None).await
+}
+
+/// Variant used by the evidence-floor controls. The catalog and Govder answer
+/// agree on whether this is human-floor; an optional Averin client can be wired
+/// in Observe mode without a grant, reproducing the historical fail-open seam.
+async fn open_approved_mutable_recipe_fixture_with_authority(
+    catalog_reversibility: &str,
+    authoritative_irreversible: bool,
+    averin_mode: Option<AverinMode>,
+) -> MutableRecipeApprovalFixture {
     let one_teammate = serde_json::json!({
         "has_rule": true,
         "risk_tier": "High",
-        "irreversible": false,
+        "irreversible": authoritative_irreversible,
         "approval_rule": {
             "recipes": [{"terms": [{"class": "teammate", "count": 1}]}],
             "decision_mode": "deny-on-any-deny"
@@ -372,6 +384,15 @@ async fn open_approved_mutable_recipe_fixture() -> MutableRecipeApprovalFixture 
     config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
     config.enforcement.require_declared_capabilities = true;
     config.govder = Some(govder);
+    if let Some(mode) = averin_mode {
+        config.averin = AverinConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:9".to_string(),
+            resource_id: "orders-db".to_string(),
+            mode,
+            ..AverinConfig::default()
+        };
+    }
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -383,7 +404,7 @@ async fn open_approved_mutable_recipe_fixture() -> MutableRecipeApprovalFixture 
         &storage,
         "count.run",
         "mutable-recipe-cred",
-        "reversible",
+        catalog_reversibility,
     )
     .await;
 
@@ -920,6 +941,96 @@ async fn approval_resume_accepts_unchanged_authoritative_recipe() {
         "unchanged authority must execute, got {:?}",
         resumed.result_error
     );
+    assert_eq!(
+        fixture
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+/// Plan 105 T6 / V-A19: trusted human-floor authority selects a strict evidence
+/// contract. Disabling the Averin client is refusal before the plugin seam, not
+/// an availability setting that can silently erase an irreversible record.
+#[tokio::test]
+async fn irreversible_approval_resume_refuses_when_averin_is_disabled() {
+    let fixture = open_approved_mutable_recipe_fixture_with_authority(
+        "irreversible",
+        true,
+        None,
+    )
+    .await;
+
+    let resumed = fixture
+        .server
+        .check_and_resume_approval(&fixture.approval_id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed, "missing evidence authority is terminal");
+    assert!(resumed
+        .result_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("requires Averin evidence"));
+    assert_eq!(
+        fixture
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the irreversible plugin must remain behind the evidence boundary"
+    );
+}
+
+/// Observe remains fail-open for reversible work, but it cannot weaken a
+/// trusted human-floor action. An enabled Observe client with no sealed grant
+/// refuses synchronously before consuming or dispatching.
+#[tokio::test]
+async fn irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode() {
+    let fixture = open_approved_mutable_recipe_fixture_with_authority(
+        "irreversible",
+        true,
+        Some(AverinMode::Observe),
+    )
+    .await;
+
+    let resumed = fixture
+        .server
+        .check_and_resume_approval(&fixture.approval_id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed, "missing sealed grant is terminal");
+    assert!(resumed
+        .result_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("no live Averin grant binding"));
+    assert_eq!(
+        fixture
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+/// Paired availability control: the same missing Observe grant does not block a
+/// catalog-proven reversible action. This rules out implementing T6 as a global
+/// Averin dependency or an always-refuse gate.
+#[tokio::test]
+async fn reversible_approval_resume_remains_fail_open_when_observe_seal_is_missing() {
+    let fixture = open_approved_mutable_recipe_fixture_with_authority(
+        "reversible",
+        false,
+        Some(AverinMode::Observe),
+    )
+    .await;
+
+    let resumed = fixture
+        .server
+        .check_and_resume_approval(&fixture.approval_id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed);
+    assert!(resumed.result_error.is_none());
     assert_eq!(
         fixture
             .calls

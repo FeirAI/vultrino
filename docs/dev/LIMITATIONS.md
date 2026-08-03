@@ -189,7 +189,16 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   ordinary policy denials through (logged + emitted as `policy.observed_denial`).
   Security/financial boundaries (halt, cross-tenant isolation, SpendCap/RateLimit)
   still enforce — but operators must understand observe mode is non-blocking for
-  ordinary denials.
+  ordinary denials. Separately, `[averin] mode = "observe"` remains fail-open for
+  reversible and undeclared work (missing/failed use seals do not block dispatch).
+  A declared human-floor capability, or a bare canonical verb shared by configured
+  business labels, does **not** inherit that availability knob: buffered and
+  streaming dispatch require a live Averin client, a bound use token, grant
+  material, and a committed use seal before `plugin.execute*`, independent of the
+  ordinary Observe/RequireEvidence posture. Unknown `[averin] mode` values are
+  refused at config load rather than coerced into Observe. Undeclared actions in
+  non-strict posture, reversible declarations, and deployments with Averin
+  disabled still have no record-existence guarantee.
 - **An `internal_http` capability's HTTP verb is operator authority, and the agent
   may not send one.** The transport requires `method`, so a capability registered
   through the admin API must make it decidable: exactly one `target.methods` entry,

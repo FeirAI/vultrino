@@ -30,12 +30,37 @@ use secrecy::SecretString;
 use tempfile::tempdir;
 
 use vultrino::auth::{NewUseToken, UseToken};
+use vultrino::averin::{AverinConfig, AverinMode};
 use vultrino::config::Config;
 use vultrino::plugins::META_DESTINATION;
 use vultrino::router::CredentialResolver;
 use vultrino::server::{ExecAuth, VultrinoServer};
 use vultrino::storage::{FileStorage, StorageBackend};
 use vultrino::{Credential, CredentialData, ExecuteRequest, ExecutionOutcome, Secret};
+
+/// Minimal Averin stub for irreversible resume happy paths that must commit a
+/// use receipt before plugin dispatch.
+async fn spawn_stub_averin() -> String {
+    use axum::routing::post;
+    use axum::Json;
+
+    async fn grants() -> Json<serde_json::Value> {
+        Json(serde_json::json!({"grant_id": "g-stub-1", "capability": "AAAABBBB.sig"}))
+    }
+    async fn use_seal() -> Json<serde_json::Value> {
+        Json(serde_json::json!({"record": {"record_id": "use-stub-1"}}))
+    }
+
+    let app = Router::new()
+        .route("/v2/grants", post(grants))
+        .route("/v2/use", post(use_seal));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
 
 /// The sandbox API key that exists ONLY in the vault.
 const SANDBOX_KEY: &str = "sbx-vault-only-KEY-4a3b2c1d0e9f8a7b6c5d";
@@ -1360,6 +1385,15 @@ async fn a_gated_internal_http_action_runs_when_the_approval_is_granted() {
     let mut config = operator_config(port, "");
     config.approval.enabled = true;
     config.govder = Some(govder);
+    // Declared human-floor resume requires a committed Averin use seal before
+    // dispatch, even when the ordinary Averin posture is Observe.
+    config.averin = AverinConfig {
+        enabled: true,
+        base_url: spawn_stub_averin().await,
+        resource_id: "finsandbox".to_string(),
+        mode: AverinMode::Observe,
+        ..AverinConfig::default()
+    };
     let (server, storage) = build_server(config).await;
 
     // The credential is pinned to the destination and to the refund path, exactly as
@@ -1418,6 +1452,12 @@ async fn a_gated_internal_http_action_runs_when_the_approval_is_granted() {
     token.tenant = Some("acme".to_string());
     token.agent_label = Some("refund-processor".to_string());
     storage.store_use_token(&token).await.unwrap();
+    server
+        .averin()
+        .expect("this fixture enables Averin")
+        .seal_grant(&token.id, "finsandbox-refund", "money.refund", Some(5))
+        .await
+        .expect("stub Averin must seal the fixture grant");
 
     let params = serde_json::json!({
         "url": "/v1/refunds",

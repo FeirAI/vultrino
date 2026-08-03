@@ -442,6 +442,14 @@ impl AverinClient {
         self.cfg.mode
     }
 
+    /// Whether this process holds the successfully sealed grant needed to build
+    /// a synchronous use receipt.  Crate-only: execution uses this as a
+    /// pre-consume availability check for trusted human-floor actions, so a
+    /// missing/restart-lost grant refuses before burning the use token.
+    pub(crate) fn has_in_memory_grant(&self, token_id: &str) -> bool {
+        self.pop.lock().contains_key(token_id)
+    }
+
     /// The client's config — `pub(crate)` so the plan 088 Step 3b durable delivery worker
     /// (`src/server/mod.rs`, a SIBLING transport, never a branch of `seal_grant`/`seal_use`, D1)
     /// can read `project_id`/`session_id`/`resource_id`/`grant_ttl_secs` when it rebuilds a
@@ -660,6 +668,65 @@ impl AverinClient {
                 }
             },
         }
+    }
+
+    /// Seal one use synchronously with fail-closed semantics regardless of the
+    /// deployment's ordinary Observe/RequireEvidence posture. Trusted
+    /// human-floor actions call this immediately before dispatch: their safety
+    /// contract is selected by action authority, not by an availability knob.
+    pub(crate) async fn seal_use_required(
+        &self,
+        token_id: &str,
+        params: Vec<u8>,
+    ) -> Result<(), AverinError> {
+        if params.len() > self.cfg.max_seal_params_bytes {
+            self.metrics.record_failed();
+            let error = AverinError::ParamsTooLarge {
+                len: params.len(),
+                cap: self.cfg.max_seal_params_bytes,
+            };
+            tracing::error!(
+                target: "averin_seal",
+                token_id,
+                project_id = %self.cfg.project_id,
+                error = %error,
+                "AVERIN-SEAL-FAILED oversize params (trusted human-floor evidence required) \
+                 — BLOCKING action"
+            );
+            return Err(error);
+        }
+
+        match self.seal_use(token_id, &params).await {
+            Ok(record_id) => {
+                self.metrics.record_sealed();
+                tracing::debug!(
+                    target: "averin_seal",
+                    token_id,
+                    record_id = %record_id,
+                    "averin use sealed (trusted human-floor evidence required)"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.metrics.record_failed();
+                tracing::error!(
+                    target: "averin_seal",
+                    token_id,
+                    project_id = %self.cfg.project_id,
+                    error = %error,
+                    "AVERIN-SEAL-FAILED trusted human-floor evidence required — BLOCKING action"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn record_required_sealed(&self) {
+        self.metrics.record_sealed();
+    }
+
+    pub(crate) fn record_required_failed(&self) {
+        self.metrics.record_failed();
     }
 
     /// Plan 087 — the PRODUCTION Observe (fail-open) execute seal: fire-and-forget
