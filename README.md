@@ -45,7 +45,7 @@ Vultrino is a credential proxy that keeps raw credential fields out of the agent
 ### From Source
 
 ```bash
-git clone https://github.com/feir-ai/vultrino.git
+git clone https://github.com/FeirAI/vultrino.git
 cd vultrino
 cargo build --release --locked
 cp target/release/vultrino ~/.local/bin/
@@ -57,11 +57,11 @@ Tagged releases (`v*`) publish platform archives and a container image:
 
 ```bash
 # Binary (example: Apple Silicon)
-curl -L https://github.com/feir-ai/vultrino/releases/latest/download/vultrino-aarch64-apple-darwin.tar.gz | tar xz
+curl -L https://github.com/FeirAI/vultrino/releases/latest/download/vultrino-aarch64-apple-darwin.tar.gz | tar xz
 sudo mv vultrino /usr/local/bin/
 
 # Container
-docker pull ghcr.io/feir-ai/vultrino:latest
+docker pull ghcr.io/feirai/vultrino:latest
 ```
 
 See [Installation](docs/src/getting-started/installation.md) for Linux/macOS variants.

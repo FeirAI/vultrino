@@ -12,7 +12,7 @@ Deploy Vultrino on a VPS or dedicated server for team access and production use.
 
 ```bash
 # Download latest release
-curl -L https://github.com/feir-ai/vultrino/releases/latest/download/vultrino-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -L https://github.com/FeirAI/vultrino/releases/latest/download/vultrino-x86_64-unknown-linux-gnu.tar.gz | tar xz
 sudo mv vultrino /usr/local/bin/
 
 # Create vultrino user

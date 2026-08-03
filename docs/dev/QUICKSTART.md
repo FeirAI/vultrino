@@ -22,7 +22,7 @@ authoritative record of how the binary is actually built, configured, and run.
 ## 1. Build from source
 
 ```bash
-git clone https://github.com/feir-ai/vultrino.git
+git clone https://github.com/FeirAI/vultrino.git
 cd vultrino
 
 # Debug build (what the e2e harness uses — faster to build):

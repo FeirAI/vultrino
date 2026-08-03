@@ -10,7 +10,7 @@ Requirements:
 - Optional for formal gates: [Lean 4.30.0](https://lean-lang.org/) via `elan`, and [Kani](https://model-checking.github.io/kani/) 0.67.0
 
 ```bash
-git clone https://github.com/feir-ai/vultrino.git
+git clone https://github.com/FeirAI/vultrino.git
 cd vultrino
 cargo build
 cargo test

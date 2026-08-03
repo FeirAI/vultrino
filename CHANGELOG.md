@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Repository identity targets the `feir-ai` GitHub organization (`https://github.com/feir-ai/vultrino`).
+- Repository identity targets the `FeirAI` GitHub organization (`https://github.com/FeirAI/vultrino`).
 - Documentation install paths and clone URLs updated for the org cut; TLS requirements clarify rustls (no OpenSSL toolchain dependency).
 - Bump Rust toolchain pin to **1.94.0** and wasmtime/wasmtime-wasi to **47** (RUSTSEC-2026-0188, RUSTSEC-2026-0222).
 
@@ -26,5 +26,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Credential proxy with encrypted vault, RBAC, policies, MCP server, web admin UI, use tokens, and action approvals.
 - WASM plugin runtime, metered LLM proxy with streaming egress scrubbing, and optional Averin sealing / Govder integration surfaces.
 
-[Unreleased]: https://github.com/feir-ai/vultrino/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/feir-ai/vultrino/releases/tag/v0.1.0
+[Unreleased]: https://github.com/FeirAI/vultrino/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/FeirAI/vultrino/releases/tag/v0.1.0
