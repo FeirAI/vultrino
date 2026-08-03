@@ -1,1320 +1,314 @@
 <!DOCTYPE html>
 <html lang="en">
-<!-- Vultrino Landing Page - Auto-deployed via Cloudflare Pages -->
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vultrino - Credential Proxy for the AI Era</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-
-        :root {
-            --blood-darkest: #340000;
-            --blood-dark: #410000;
-            --blood: #4d0000;
-            --blood-mid: #5a0000;
-            --blood-light: #670000;
-            --blood-glow: rgba(103, 0, 0, 0.6);
-            --blood-accent: #8b0000;
-            --blood-highlight: #a52a2a;
-            --dark: #0a0000;
-            --dark-card: #1a0505;
-            --dark-elevated: #200808;
-            --text: #fafafa;
-            --text-muted: #b8a8a8;
-        }
-
-        html { scroll-behavior: smooth; }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: var(--dark);
-            color: var(--text);
-            overflow-x: hidden;
-        }
-
-        /* Ambient glow */
-        .ambient-glow {
-            position: fixed;
-            top: -50%;
-            left: -50%;
-            width: 200%;
-            height: 200%;
-            background: radial-gradient(circle at 30% 30%, rgba(103, 0, 0, 0.15) 0%, transparent 50%),
-                        radial-gradient(circle at 70% 70%, rgba(90, 0, 0, 0.1) 0%, transparent 50%);
-            pointer-events: none;
-            z-index: 0;
-        }
-
-        /* Navigation */
-        nav {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            padding: 1rem 2rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            z-index: 100;
-            background: rgba(10, 0, 0, 0.95);
-            backdrop-filter: blur(20px);
-            border-bottom: 1px solid var(--blood-darkest);
-        }
-
-        .logo {
-            display: flex;
-            align-items: center;
-            gap: 0.6rem;
-            font-weight: 700;
-            font-size: 1.35rem;
-        }
-
-        .logo-icon {
-            width: 36px;
-            height: 36px;
-            background: linear-gradient(135deg, var(--blood-mid), var(--blood-light));
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            box-shadow: 0 0 25px var(--blood-glow);
-        }
-
-        .nav-links {
-            display: flex;
-            gap: 2rem;
-            list-style: none;
-        }
-
-        .nav-links a {
-            color: var(--text-muted);
-            text-decoration: none;
-            font-size: 0.9rem;
-            font-weight: 500;
-            transition: color 0.2s;
-        }
-
-        .nav-links a:hover { color: var(--blood-highlight); }
-
-        .nav-cta {
-            padding: 0.5rem 1.25rem;
-            background: linear-gradient(135deg, var(--blood-mid), var(--blood-light));
-            color: white;
-            border-radius: 8px;
-            font-weight: 600;
-            font-size: 0.9rem;
-            text-decoration: none;
-            transition: all 0.3s;
-        }
-
-        .nav-cta:hover {
-            box-shadow: 0 0 40px var(--blood-glow);
-        }
-
-        /* Mobile Menu Button */
-        .menu-toggle {
-            display: none;
-            flex-direction: column;
-            gap: 5px;
-            background: none;
-            border: none;
-            cursor: pointer;
-            padding: 5px;
-            z-index: 101;
-        }
-
-        .menu-toggle span {
-            display: block;
-            width: 24px;
-            height: 2px;
-            background: var(--text);
-            transition: all 0.3s;
-        }
-
-        .menu-toggle.active span:nth-child(1) {
-            transform: rotate(45deg) translate(5px, 5px);
-        }
-
-        .menu-toggle.active span:nth-child(2) {
-            opacity: 0;
-        }
-
-        .menu-toggle.active span:nth-child(3) {
-            transform: rotate(-45deg) translate(5px, -5px);
-        }
-
-        /* Mobile Navigation */
-        .mobile-nav {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(10, 0, 0, 0.98);
-            z-index: 99;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            gap: 2rem;
-            opacity: 0;
-            visibility: hidden;
-            transition: all 0.3s;
-        }
-
-        .mobile-nav.active {
-            opacity: 1;
-            visibility: visible;
-        }
-
-        .mobile-nav a {
-            color: var(--text);
-            text-decoration: none;
-            font-size: 1.5rem;
-            font-weight: 600;
-            transition: color 0.2s;
-        }
-
-        .mobile-nav a:hover {
-            color: var(--blood-highlight);
-        }
-
-        .mobile-nav .nav-cta {
-            padding: 1rem 2rem;
-            font-size: 1.1rem;
-        }
-
-        /* Hero */
-        .hero {
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            position: relative;
-            padding: 7rem 2rem 4rem;
-            z-index: 1;
-        }
-
-        .hero-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 4rem;
-            max-width: 1400px;
-            margin: 0 auto;
-            align-items: center;
-        }
-
-        .hero-content {
-            z-index: 10;
-        }
-
-        .hero-eyebrow {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.4rem 1rem;
-            background: rgba(103, 0, 0, 0.2);
-            border: 1px solid var(--blood);
-            border-radius: 50px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            color: var(--blood-highlight);
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            margin-bottom: 1.5rem;
-        }
-
-        .hero h1 {
-            font-size: clamp(2rem, 5vw, 4rem);
-            font-weight: 800;
-            line-height: 1.15;
-            margin-bottom: 1.5rem;
-        }
-
-        .hero h1 .highlight {
-            background: linear-gradient(135deg, var(--blood-accent), var(--blood-highlight));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        .hero p {
-            font-size: 1.1rem;
-            color: var(--text-muted);
-            margin-bottom: 2rem;
-            line-height: 1.7;
-        }
-
-        .hero-buttons {
-            display: flex;
-            gap: 1rem;
-            flex-wrap: wrap;
-        }
-
-        .btn {
-            padding: 0.875rem 1.75rem;
-            border-radius: 10px;
-            font-size: 0.95rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s;
-            text-decoration: none;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 0.5rem;
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, var(--blood-mid), var(--blood-light));
-            color: white;
-            border: none;
-        }
-
-        .btn-primary:hover {
-            box-shadow: 0 0 60px var(--blood-glow);
-            transform: translateY(-3px);
-        }
-
-        .btn-outline {
-            background: transparent;
-            color: var(--text);
-            border: 2px solid var(--blood);
-        }
-
-        .btn-outline:hover {
-            border-color: var(--blood-light);
-            color: var(--blood-highlight);
-            background: rgba(103, 0, 0, 0.1);
-        }
-
-        /* Shield Graphic */
-        .hero-graphic {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            position: relative;
-        }
-
-        .shield-container {
-            position: relative;
-            width: 350px;
-            height: 400px;
-        }
-
-        .shield {
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            width: 240px;
-            height: 280px;
-        }
-
-        .shield-shape {
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(180deg, var(--dark-card) 0%, rgba(26, 5, 5, 0.5) 100%);
-            border: 3px solid var(--blood-light);
-            border-radius: 50% 50% 50% 50% / 20% 20% 60% 60%;
-            box-shadow:
-                0 0 100px var(--blood-glow),
-                inset 0 0 80px rgba(103, 0, 0, 0.2);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            animation: shield-float 4s ease-in-out infinite;
-        }
-
-        @keyframes shield-float {
-            0%, 100% { transform: translateY(0) rotate(0deg); }
-            50% { transform: translateY(-20px) rotate(2deg); }
-        }
-
-        .shield-icon {
-            font-size: 3.5rem;
-            margin-bottom: 0.75rem;
-            filter: drop-shadow(0 0 30px var(--blood-glow));
-        }
-
-        .shield-text {
-            font-weight: 700;
-            font-size: 1.25rem;
-            color: var(--blood-highlight);
-            text-shadow: 0 0 40px var(--blood-glow);
-        }
-
-        .floating-shape {
-            position: absolute;
-            border: 2px solid var(--blood-mid);
-            opacity: 0.4;
-            animation: orbit 12s linear infinite;
-        }
-
-        .shape-1 {
-            width: 50px;
-            height: 50px;
-            top: 10%;
-            left: 10%;
-            border-radius: 12px;
-            transform: rotate(45deg);
-        }
-
-        .shape-2 {
-            width: 35px;
-            height: 35px;
-            top: 20%;
-            right: 15%;
-            border-radius: 50%;
-            animation-delay: -3s;
-        }
-
-        .shape-3 {
-            width: 40px;
-            height: 40px;
-            bottom: 20%;
-            left: 5%;
-            clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
-            animation-delay: -6s;
-        }
-
-        .shape-4 {
-            width: 30px;
-            height: 30px;
-            bottom: 15%;
-            right: 10%;
-            border-radius: 6px;
-            animation-delay: -9s;
-        }
-
-        @keyframes orbit {
-            0% { transform: rotate(0deg) translateX(20px) rotate(0deg); opacity: 0.2; }
-            50% { opacity: 0.5; }
-            100% { transform: rotate(360deg) translateX(20px) rotate(-360deg); opacity: 0.2; }
-        }
-
-        /* Features Section */
-        .features {
-            padding: 6rem 2rem;
-            position: relative;
-            z-index: 1;
-            overflow: hidden;
-        }
-
-        .features::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: linear-gradient(180deg, transparent, rgba(103, 0, 0, 0.05), transparent);
-            pointer-events: none;
-        }
-
-        .section-header {
-            text-align: center;
-            max-width: 600px;
-            margin: 0 auto 4rem;
-            padding: 0 1rem;
-            opacity: 0;
-            transform: translateY(30px);
-            transition: all 0.8s cubic-bezier(0.16, 1, 0.3, 1);
-        }
-
-        .section-header.visible {
-            opacity: 1;
-            transform: translateY(0);
-        }
-
-        .section-header h2 {
-            font-size: clamp(1.75rem, 5vw, 2.75rem);
-            font-weight: 800;
-            margin-bottom: 1rem;
-        }
-
-        .section-header p {
-            color: var(--text-muted);
-            font-size: 1rem;
-        }
-
-        .features-list {
-            max-width: 1100px;
-            margin: 0 auto;
-        }
-
-        .feature-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 3rem;
-            align-items: center;
-            padding: 3rem 0;
-            border-bottom: 1px solid rgba(103, 0, 0, 0.2);
-            opacity: 0;
-            transform: translateX(-60px);
-            transition: all 0.8s cubic-bezier(0.16, 1, 0.3, 1);
-        }
-
-        .feature-row.visible {
-            opacity: 1;
-            transform: translateX(0);
-        }
-
-        .feature-row:nth-child(even) {
-            direction: rtl;
-            transform: translateX(60px);
-        }
-
-        .feature-row:nth-child(even).visible {
-            transform: translateX(0);
-        }
-
-        .feature-row:nth-child(even) > * {
-            direction: ltr;
-        }
-
-        .feature-row:last-child {
-            border-bottom: none;
-        }
-
-        .feature-visual {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            perspective: 1000px;
-        }
-
-        .feature-box {
-            width: 180px;
-            height: 180px;
-            background: var(--dark-card);
-            border: 2px solid var(--blood-dark);
-            border-radius: 20px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.5s cubic-bezier(0.16, 1, 0.3, 1);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .feature-box::before {
-            content: '';
-            position: absolute;
-            top: -50%;
-            left: -50%;
-            width: 200%;
-            height: 200%;
-            background: conic-gradient(from 0deg, transparent, var(--blood-mid), transparent 30%);
-            opacity: 0;
-            transition: opacity 0.5s;
-            animation: rotate-glow 4s linear infinite paused;
-        }
-
-        .feature-box:hover::before {
-            opacity: 0.4;
-            animation-play-state: running;
-        }
-
-        @keyframes rotate-glow {
-            100% { transform: rotate(360deg); }
-        }
-
-        .feature-box::after {
-            content: '';
-            position: absolute;
-            inset: 2px;
-            background: var(--dark-card);
-            border-radius: 18px;
-            z-index: 0;
-        }
-
-        .feature-box:hover {
-            border-color: var(--blood-light);
-            transform: translateY(-8px);
-            box-shadow:
-                0 25px 50px rgba(0,0,0,0.5),
-                0 0 60px var(--blood-glow);
-        }
-
-        .feature-box-icon {
-            font-size: 3rem;
-            margin-bottom: 0.5rem;
-            position: relative;
-            z-index: 1;
-            transition: transform 0.5s;
-        }
-
-        .feature-box:hover .feature-box-icon {
-            transform: scale(1.1);
-            filter: drop-shadow(0 0 20px var(--blood-glow));
-        }
-
-        .feature-box-label {
-            font-size: 0.85rem;
-            color: var(--text-muted);
-            position: relative;
-            z-index: 1;
-            font-weight: 500;
-        }
-
-        .feature-content {
-            opacity: 0;
-            transform: translateY(20px);
-            transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.2s;
-        }
-
-        .feature-row.visible .feature-content {
-            opacity: 1;
-            transform: translateY(0);
-        }
-
-        .feature-content h3 {
-            font-size: 1.5rem;
-            font-weight: 700;
-            margin-bottom: 0.75rem;
-            background: linear-gradient(135deg, var(--blood-accent), var(--blood-highlight));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        .feature-content p {
-            color: var(--text-muted);
-            line-height: 1.7;
-            font-size: 0.95rem;
-        }
-
-        /* Use Cases */
-        .use-cases {
-            padding: 5rem 2rem;
-            position: relative;
-            z-index: 1;
-        }
-
-        .use-cases-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-            gap: 1.25rem;
-            max-width: 1100px;
-            margin: 0 auto;
-        }
-
-        .use-case-card {
-            background: var(--dark-card);
-            border: 1px solid var(--blood-darkest);
-            border-radius: 16px;
-            padding: 1.5rem;
-            transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-            opacity: 0;
-            transform: translateY(40px) scale(0.95);
-        }
-
-        .use-case-card.visible {
-            opacity: 1;
-            transform: translateY(0) scale(1);
-        }
-
-        .use-case-card:hover {
-            border-color: var(--blood-mid);
-            transform: translateY(-6px);
-            box-shadow: 0 20px 40px rgba(0,0,0,0.4), 0 0 40px rgba(103, 0, 0, 0.12);
-        }
-
-        .use-case-icon {
-            font-size: 2rem;
-            margin-bottom: 0.75rem;
-            transition: transform 0.3s;
-        }
-
-        .use-case-card:hover .use-case-icon {
-            transform: scale(1.1);
-        }
-
-        .use-case-card h3 {
-            font-size: 1.05rem;
-            font-weight: 600;
-            margin-bottom: 0.4rem;
-        }
-
-        .use-case-card p {
-            font-size: 0.85rem;
-            color: var(--text-muted);
-            line-height: 1.5;
-        }
-
-        /* Code Block */
-        .code-section {
-            padding: 5rem 2rem;
-            position: relative;
-            z-index: 1;
-        }
-
-        .code-block {
-            max-width: 750px;
-            margin: 0 auto;
-            background: var(--dark-card);
-            border: 1px solid var(--blood-dark);
-            border-radius: 14px;
-            overflow: hidden;
-            opacity: 0;
-            transform: translateY(30px);
-            transition: all 0.8s cubic-bezier(0.16, 1, 0.3, 1);
-        }
-
-        .code-block.visible {
-            opacity: 1;
-            transform: translateY(0);
-        }
-
-        .code-tabs {
-            display: flex;
-            background: var(--blood-darkest);
-            border-bottom: 1px solid var(--blood-dark);
-        }
-
-        .code-tab {
-            padding: 0.875rem 1.25rem;
-            font-size: 0.8rem;
-            color: var(--text-muted);
-            cursor: pointer;
-            border-bottom: 2px solid transparent;
-            transition: all 0.2s;
-        }
-
-        .code-tab.active {
-            color: var(--blood-highlight);
-            border-bottom-color: var(--blood-mid);
-        }
-
-        .code-content {
-            padding: 1.5rem;
-            font-family: "SF Mono", Monaco, monospace;
-            font-size: 0.8rem;
-            line-height: 1.9;
-            overflow-x: auto;
-        }
-
-        .code-line {
-            opacity: 0;
-            transform: translateX(-20px);
-            transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-            white-space: nowrap;
-        }
-
-        .code-block.visible .code-line {
-            opacity: 1;
-            transform: translateX(0);
-        }
-
-        .code-block.visible .code-line:nth-child(1) { transition-delay: 0.1s; }
-        .code-block.visible .code-line:nth-child(2) { transition-delay: 0.15s; }
-        .code-block.visible .code-line:nth-child(3) { transition-delay: 0.2s; }
-        .code-block.visible .code-line:nth-child(4) { transition-delay: 0.25s; }
-        .code-block.visible .code-line:nth-child(5) { transition-delay: 0.3s; }
-        .code-block.visible .code-line:nth-child(6) { transition-delay: 0.35s; }
-        .code-block.visible .code-line:nth-child(7) { transition-delay: 0.4s; }
-        .code-block.visible .code-line:nth-child(8) { transition-delay: 0.45s; }
-        .code-block.visible .code-line:nth-child(9) { transition-delay: 0.5s; }
-        .code-block.visible .code-line:nth-child(10) { transition-delay: 0.55s; }
-
-        .code-comment { color: #5c4a4a; }
-        .code-cmd { color: var(--blood-highlight); }
-        .code-arg { color: #c97a7a; }
-        .code-string { color: #d9a8a8; }
-
-        /* CTA */
-        .cta {
-            padding: 6rem 2rem;
-            text-align: center;
-            position: relative;
-            z-index: 1;
-        }
-
-        .cta-box {
-            max-width: 700px;
-            margin: 0 auto;
-            padding: 3rem 2rem;
-            background: linear-gradient(135deg, rgba(103, 0, 0, 0.15), rgba(90, 0, 0, 0.08));
-            border: 1px solid var(--blood);
-            border-radius: 24px;
-            position: relative;
-            overflow: hidden;
-            opacity: 0;
-            transform: scale(0.95);
-            transition: all 0.8s cubic-bezier(0.16, 1, 0.3, 1);
-        }
-
-        .cta-box.visible {
-            opacity: 1;
-            transform: scale(1);
-        }
-
-        .cta-box::before {
-            content: '';
-            position: absolute;
-            top: -100%;
-            left: -100%;
-            width: 300%;
-            height: 300%;
-            background: conic-gradient(from 0deg, transparent, rgba(103, 0, 0, 0.15), transparent 30%);
-            animation: cta-rotate 10s linear infinite;
-        }
-
-        @keyframes cta-rotate {
-            100% { transform: rotate(360deg); }
-        }
-
-        .cta-content {
-            position: relative;
-            z-index: 1;
-        }
-
-        .cta h2 {
-            font-size: clamp(1.5rem, 5vw, 2.25rem);
-            font-weight: 700;
-            margin-bottom: 0.75rem;
-        }
-
-        .cta p {
-            color: var(--text-muted);
-            font-size: 1rem;
-            margin-bottom: 1.5rem;
-        }
-
-        /* Footer */
-        footer {
-            padding: 2rem;
-            border-top: 1px solid var(--blood-darkest);
-            text-align: center;
-            color: var(--text-muted);
-            position: relative;
-            z-index: 1;
-        }
-
-        footer a {
-            color: var(--blood-highlight);
-            text-decoration: none;
-            transition: color 0.2s;
-        }
-
-        footer a:hover {
-            color: var(--text);
-        }
-
-        /* Scroll Progress Bar */
-        .scroll-progress {
-            position: fixed;
-            top: 0;
-            left: 0;
-            height: 3px;
-            background: linear-gradient(90deg, var(--blood-mid), var(--blood-light));
-            z-index: 1000;
-            transform-origin: left;
-            transform: scaleX(0);
-        }
-
-        /* ============== MOBILE STYLES ============== */
-        @media (max-width: 900px) {
-            /* Navigation */
-            nav {
-                padding: 1rem 1.5rem;
-            }
-
-            .nav-links,
-            .nav-cta {
-                display: none;
-            }
-
-            .menu-toggle {
-                display: flex;
-            }
-
-            .mobile-nav {
-                display: flex;
-            }
-
-            /* Hero */
-            .hero {
-                padding: 6rem 1.5rem 3rem;
-                min-height: auto;
-            }
-
-            .hero-grid {
-                grid-template-columns: 1fr;
-                gap: 2rem;
-                text-align: center;
-            }
-
-            .hero-content {
-                order: 1;
-            }
-
-            .hero-graphic {
-                order: 2;
-            }
-
-            .hero-eyebrow {
-                font-size: 0.7rem;
-            }
-
-            .hero h1 {
-                font-size: 2rem;
-            }
-
-            .hero p {
-                font-size: 1rem;
-            }
-
-            .hero-buttons {
-                justify-content: center;
-                flex-direction: column;
-                align-items: center;
-            }
-
-            .hero-buttons .btn {
-                width: 100%;
-                max-width: 280px;
-            }
-
-            /* Shield */
-            .shield-container {
-                width: 280px;
-                height: 320px;
-            }
-
-            .shield {
-                width: 180px;
-                height: 210px;
-            }
-
-            .shield-icon {
-                font-size: 2.5rem;
-            }
-
-            .shield-text {
-                font-size: 1rem;
-            }
-
-            .floating-shape {
-                display: none;
-            }
-
-            /* Features */
-            .features {
-                padding: 4rem 1.5rem;
-            }
-
-            .section-header {
-                margin-bottom: 3rem;
-            }
-
-            .feature-row,
-            .feature-row:nth-child(even) {
-                grid-template-columns: 1fr;
-                text-align: center;
-                direction: ltr;
-                transform: translateY(30px);
-                gap: 1.5rem;
-                padding: 2rem 0;
-            }
-
-            .feature-row.visible,
-            .feature-row:nth-child(even).visible {
-                transform: translateY(0);
-            }
-
-            .feature-box {
-                width: 140px;
-                height: 140px;
-            }
-
-            .feature-box-icon {
-                font-size: 2.5rem;
-            }
-
-            .feature-box-label {
-                font-size: 0.75rem;
-            }
-
-            .feature-content h3 {
-                font-size: 1.25rem;
-            }
-
-            .feature-content p {
-                font-size: 0.9rem;
-            }
-
-            /* Use Cases */
-            .use-cases {
-                padding: 4rem 1.5rem;
-            }
-
-            .use-cases-grid {
-                grid-template-columns: 1fr;
-                gap: 1rem;
-            }
-
-            .use-case-card {
-                padding: 1.25rem;
-            }
-
-            /* Code */
-            .code-section {
-                padding: 4rem 1.5rem;
-            }
-
-            .code-content {
-                padding: 1rem;
-                font-size: 0.7rem;
-            }
-
-            /* CTA */
-            .cta {
-                padding: 4rem 1.5rem;
-            }
-
-            .cta-box {
-                padding: 2rem 1.5rem;
-            }
-        }
-
-        @media (max-width: 480px) {
-            nav {
-                padding: 0.875rem 1rem;
-            }
-
-            .logo {
-                font-size: 1.2rem;
-            }
-
-            .logo-icon {
-                width: 32px;
-                height: 32px;
-            }
-
-            .hero {
-                padding: 5rem 1rem 2rem;
-            }
-
-            .hero h1 {
-                font-size: 1.75rem;
-            }
-
-            .hero p {
-                font-size: 0.95rem;
-            }
-
-            .btn {
-                padding: 0.75rem 1.5rem;
-                font-size: 0.9rem;
-            }
-
-            .section-header h2 {
-                font-size: 1.5rem;
-            }
-
-            .shield-container {
-                width: 240px;
-                height: 280px;
-            }
-
-            .shield {
-                width: 160px;
-                height: 185px;
-            }
-        }
-    </style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a09" />
+  <meta name="color-scheme" content="dark" />
+  <title>Vultrino — Credential Proxy for the AI Era</title>
+  <meta name="description" content="Vultrino is a credential proxy that lets AI agents perform authenticated actions without ever exposing your secrets. From API keys to crypto wallets — extensible via plugins." />
+  <link rel="canonical" href="https://vultrino.com/" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="Vultrino" />
+  <meta property="og:title" content="Vultrino — Credential Proxy for the AI Era" />
+  <meta property="og:description" content="AI agents use credentials without seeing them. Default-deny policy, encrypted vault, WASM plugins, MCP." />
+  <meta property="og:url" content="https://vultrino.com/" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="Vultrino — Credential Proxy for the AI Era" />
+  <meta name="twitter:description" content="AI agents use credentials without seeing them. Default-deny policy, encrypted vault, WASM plugins, MCP." />
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+  <link rel="preload" href="assets/fonts/instrument-sans-var.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="assets/fonts/ibm-plex-mono-400.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="stylesheet" href="assets/styles.css" />
 </head>
 <body>
-    <div class="ambient-glow"></div>
-    <div class="scroll-progress" id="scrollProgress"></div>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="page-progress" aria-hidden="true"><span id="pageProgress"></span></div>
 
-    <nav>
-        <div class="logo">
-            <div class="logo-icon">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" fill="rgba(103,0,0,0.3)"/>
-                </svg>
-            </div>
-            <span>Vultrino</span>
-        </div>
-        <ul class="nav-links">
-            <li><a href="#features">Features</a></li>
-            <li><a href="#use-cases">Use Cases</a></li>
-            <li><a href="#quickstart">Quick Start</a></li>
-            <li><a href="https://github.com/FeirAI/vultrino">GitHub</a></li>
-        </ul>
-        <a href="https://docs.vultrino.com" class="nav-cta">Documentation</a>
-        <button class="menu-toggle" id="menuToggle" aria-label="Toggle menu">
-            <span></span>
-            <span></span>
-            <span></span>
+  <nav class="site-nav" id="siteNav" aria-label="Primary">
+    <div class="site-nav__inner wrap">
+      <a class="site-nav__brand" href="#top" aria-label="Vultrino home">
+        <img src="assets/feirai-wordmark-light.svg" alt="FeirAI" width="154" height="48" />
+        <span class="site-nav__product">Vultrino</span>
+      </a>
+
+      <ul class="nav-links">
+        <li><a href="#features">Features</a></li>
+        <li><a href="#use-cases">Use Cases</a></li>
+        <li><a href="#quickstart">Quick Start</a></li>
+        <li><a href="https://github.com/FeirAI/vultrino">GitHub</a></li>
+      </ul>
+
+      <div class="site-nav__actions">
+        <a class="button button--light" href="https://docs.vultrino.com">Documentation <span aria-hidden="true">↗</span></a>
+        <button class="nav-toggle" id="navToggle" type="button" aria-expanded="false" aria-controls="mobileNav">
+          <span class="sr-only">Open menu</span>
+          <span aria-hidden="true"></span>
+          <span aria-hidden="true"></span>
+          <span aria-hidden="true"></span>
         </button>
-    </nav>
-
-    <div class="mobile-nav" id="mobileNav">
-        <a href="#features" class="mobile-nav-link">Features</a>
-        <a href="#use-cases" class="mobile-nav-link">Use Cases</a>
-        <a href="#quickstart" class="mobile-nav-link">Quick Start</a>
-        <a href="https://github.com/FeirAI/vultrino" class="mobile-nav-link">GitHub</a>
-        <a href="https://docs.vultrino.com" class="nav-cta">Documentation</a>
+      </div>
     </div>
+  </nav>
 
-    <section class="hero">
-        <div class="hero-grid">
-            <div class="hero-content">
-                <span class="hero-eyebrow">Credential Security</span>
-                <h1>Secure Credentials.<br/><span class="highlight">Powerful AI.</span></h1>
-                <p>Vultrino is a credential proxy that lets AI agents perform authenticated actions without ever exposing your secrets. From API keys to PGP signing to crypto wallets — extensible via plugins.</p>
-                <div class="hero-buttons">
-                    <a href="https://docs.vultrino.com" class="btn btn-primary">Read Documentation</a>
-                    <a href="https://github.com/FeirAI/vultrino" class="btn btn-outline">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
-                        </svg>
-                        GitHub
-                    </a>
-                </div>
-            </div>
-            <div class="hero-graphic">
-                <div class="shield-container">
-                    <div class="floating-shape shape-1"></div>
-                    <div class="floating-shape shape-2"></div>
-                    <div class="floating-shape shape-3"></div>
-                    <div class="floating-shape shape-4"></div>
-                    <div class="shield">
-                        <div class="shield-shape">
-                            <div class="shield-icon">🔐</div>
-                            <div class="shield-text">SECURE</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
+  <div class="mobile-nav" id="mobileNav" hidden>
+    <a href="#features">Features</a>
+    <a href="#use-cases">Use Cases</a>
+    <a href="#quickstart">Quick Start</a>
+    <a href="https://github.com/FeirAI/vultrino">GitHub</a>
+    <a href="https://docs.vultrino.com">Documentation</a>
+  </div>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="hero__inner wrap">
+        <div>
+          <p class="eyebrow" data-reveal>Credential Security</p>
+          <p class="hero__brand" data-reveal>Vultrino</p>
+          <h1 data-reveal>Secure Credentials.<br /><span>Powerful AI.</span></h1>
+          <p class="hero__lead" data-reveal>
+            Vultrino is a credential proxy that lets AI agents perform authenticated actions
+            without ever exposing your secrets. From API keys to PGP signing to crypto wallets —
+            extensible via plugins.
+          </p>
+          <div class="hero__actions" data-reveal>
+            <a class="button button--light" href="https://docs.vultrino.com">Read Documentation <span aria-hidden="true">→</span></a>
+            <a class="button button--outline" href="https://github.com/FeirAI/vultrino">GitHub <span aria-hidden="true">↗</span></a>
+          </div>
+          <div class="hero__meta" data-reveal>
+            <span>Open source · MIT</span>
+            <span>Self-hosted</span>
+            <span>Enforce plane · FeirAI</span>
+          </div>
         </div>
+
+        <aside class="console" data-reveal aria-label="Credential isolation console">
+          <div class="console__bar">
+            <span>ENFORCE / PROXY</span>
+            <span class="console__tag">DEFAULT DENY</span>
+          </div>
+          <div class="console__body">
+            <div class="console__row"><span>Agent sees</span><strong>alias <em>github</em></strong></div>
+            <div class="console__row"><span>Vault holds</span><strong>ghp_… (encrypted)</strong></div>
+            <div class="console__row"><span>Policy</span><strong>allow GET api.github.com/*</strong></div>
+            <div class="console__row"><span>Injection</span><strong>server-side · never returned</strong></div>
+            <div class="console__row"><span>Egress</span><strong>secret forms scrubbed</strong></div>
+          </div>
+        </aside>
+      </div>
     </section>
 
-    <section class="features" id="features">
-        <div class="section-header">
-            <h2>Defense in Depth</h2>
-            <p>Multiple layers of security for all your credentials</p>
+    <section class="section section--ink" id="features">
+      <div class="wrap">
+        <div class="section-rule"><span>01 / Defense in depth</span><span>Features</span></div>
+        <div class="section__head" data-reveal>
+          <p class="eyebrow">Layers</p>
+          <h2>Defense in Depth</h2>
+          <p>Multiple layers of security for all your credentials</p>
         </div>
-        <div class="features-list">
-            <div class="feature-row">
-                <div class="feature-visual">
-                    <div class="feature-box">
-                        <div class="feature-box-icon">🔐</div>
-                        <div class="feature-box-label">Zero Exposure</div>
-                    </div>
-                </div>
-                <div class="feature-content">
-                    <h3>Credential Isolation</h3>
-                    <p>AI agents never see your actual secrets. They reference aliases, and Vultrino handles the sensitive operations server-side. Your keys, tokens, and private data never leave your secure environment.</p>
-                </div>
+
+        <div class="features">
+          <article class="feature" data-reveal>
+            <div class="feature__label">Zero Exposure</div>
+            <div>
+              <h3>Credential Isolation</h3>
+              <p>AI agents never see your actual secrets. They reference aliases, and Vultrino handles the sensitive operations server-side. Your keys, tokens, and private data never leave your secure environment.</p>
             </div>
-            <div class="feature-row">
-                <div class="feature-visual">
-                    <div class="feature-box">
-                        <div class="feature-box-icon">🧩</div>
-                        <div class="feature-box-label">WASM Plugins</div>
-                    </div>
-                </div>
-                <div class="feature-content">
-                    <h3>Infinitely Extensible</h3>
-                    <p>Add any credential type via WebAssembly plugins. PGP signing, cryptocurrency wallets, SSH keys, OAuth tokens — if you can build it, Vultrino can secure it. Plugins run in sandboxed isolation.</p>
-                </div>
+          </article>
+          <article class="feature" data-reveal>
+            <div class="feature__label">WASM Plugins</div>
+            <div>
+              <h3>Infinitely Extensible</h3>
+              <p>Add any credential type via WebAssembly plugins. PGP signing, cryptocurrency wallets, SSH keys, OAuth tokens — if you can build it, Vultrino can secure it. Plugins run in sandboxed isolation.</p>
             </div>
-            <div class="feature-row">
-                <div class="feature-visual">
-                    <div class="feature-box">
-                        <div class="feature-box-icon">🛡️</div>
-                        <div class="feature-box-label">AES-256-GCM</div>
-                    </div>
-                </div>
-                <div class="feature-content">
-                    <h3>Encrypted at Rest</h3>
-                    <p>All credentials are encrypted using AES-256-GCM with Argon2 key derivation. Even if someone gets your storage file, they can't read your secrets without the master password.</p>
-                </div>
+          </article>
+          <article class="feature" data-reveal>
+            <div class="feature__label">AES-256-GCM</div>
+            <div>
+              <h3>Encrypted at Rest</h3>
+              <p>All credentials are encrypted using AES-256-GCM with Argon2 key derivation. Even if someone gets your storage file, they can't read your secrets without the master password.</p>
             </div>
-            <div class="feature-row">
-                <div class="feature-visual">
-                    <div class="feature-box">
-                        <div class="feature-box-icon">⚙️</div>
-                        <div class="feature-box-label">Policy Engine</div>
-                    </div>
-                </div>
-                <div class="feature-content">
-                    <h3>Fine-Grained Control</h3>
-                    <p>Define URL patterns, method restrictions, and rate limits. Role-based access control lets you scope which credentials and actions each agent or application can access.</p>
-                </div>
+          </article>
+          <article class="feature" data-reveal>
+            <div class="feature__label">Policy Engine</div>
+            <div>
+              <h3>Fine-Grained Control</h3>
+              <p>Define URL patterns, method restrictions, and rate limits. Role-based access control lets you scope which credentials and actions each agent or application can access.</p>
             </div>
+          </article>
         </div>
+      </div>
     </section>
 
-    <section class="use-cases" id="use-cases">
-        <div class="section-header">
-            <h2>Built for Any Credential</h2>
-            <p>From API keys to cryptographic signing — secure it all</p>
+    <section class="section section--paper" id="use-cases">
+      <div class="wrap">
+        <div class="section-rule"><span>02 / Coverage</span><span>Use Cases</span></div>
+        <div class="section__head" data-reveal>
+          <p class="eyebrow">Credentials</p>
+          <h2>Built for Any Credential</h2>
+          <p>From API keys to cryptographic signing — secure it all</p>
         </div>
-        <div class="use-cases-grid">
-            <div class="use-case-card">
-                <div class="use-case-icon">🔑</div>
-                <h3>API Keys & Tokens</h3>
-                <p>GitHub, OpenAI, Stripe, AWS — let AI agents call APIs without exposing your keys.</p>
-            </div>
-            <div class="use-case-card">
-                <div class="use-case-icon">✍️</div>
-                <h3>PGP Signing</h3>
-                <p>Sign commits, documents, and messages. Your private key stays private.</p>
-            </div>
-            <div class="use-case-card">
-                <div class="use-case-icon">💰</div>
-                <h3>Crypto Wallets</h3>
-                <p>Sign transactions without exposing seed phrases or private keys to agents.</p>
-            </div>
-            <div class="use-case-card">
-                <div class="use-case-icon">🔒</div>
-                <h3>SSH Keys</h3>
-                <p>Authenticate to servers and services without sharing private keys.</p>
-            </div>
-            <div class="use-case-card">
-                <div class="use-case-icon">🤖</div>
-                <h3>MCP Integration</h3>
-                <p>Native Model Context Protocol support for Claude, GPT, and other LLMs.</p>
-            </div>
-            <div class="use-case-card">
-                <div class="use-case-icon">🖥️</div>
-                <h3>Web Dashboard</h3>
-                <p>Manage credentials, roles, and permissions from a clean admin interface.</p>
-            </div>
+
+        <div class="cases">
+          <article class="case" data-reveal>
+            <div class="case__id">01</div>
+            <h3>API Keys &amp; Tokens</h3>
+            <p>GitHub, OpenAI, Stripe, AWS — let AI agents call APIs without exposing your keys.</p>
+          </article>
+          <article class="case" data-reveal>
+            <div class="case__id">02</div>
+            <h3>PGP Signing</h3>
+            <p>Sign commits, documents, and messages. Your private key stays private.</p>
+          </article>
+          <article class="case" data-reveal>
+            <div class="case__id">03</div>
+            <h3>Crypto Wallets</h3>
+            <p>Sign transactions without exposing seed phrases or private keys to agents.</p>
+          </article>
+          <article class="case" data-reveal>
+            <div class="case__id">04</div>
+            <h3>SSH Keys</h3>
+            <p>Authenticate to servers and services without sharing private keys.</p>
+          </article>
+          <article class="case" data-reveal>
+            <div class="case__id">05</div>
+            <h3>MCP Integration</h3>
+            <p>Native Model Context Protocol support for Claude, GPT, and other LLMs.</p>
+          </article>
+          <article class="case" data-reveal>
+            <div class="case__id">06</div>
+            <h3>Web Dashboard</h3>
+            <p>Manage credentials, roles, and permissions from a clean admin interface.</p>
+          </article>
         </div>
+      </div>
     </section>
 
-    <section class="code-section" id="quickstart">
-        <div class="section-header">
-            <h2>Quick Start</h2>
-            <p>Up and running in seconds</p>
+    <section class="section section--ink" id="quickstart">
+      <div class="wrap">
+        <div class="section-rule"><span>03 / Terminal</span><span>Quick Start</span></div>
+        <div class="section__head" data-reveal>
+          <p class="eyebrow">Get running</p>
+          <h2>Quick Start</h2>
+          <p>Up and running in seconds</p>
         </div>
-        <div class="code-block">
-            <div class="code-tabs">
-                <div class="code-tab active">Terminal</div>
-            </div>
-            <div class="code-content">
-                <div class="code-line"><span class="code-comment"># Initialize and store a credential</span></div>
-                <div class="code-line"><span class="code-cmd">vultrino</span> <span class="code-arg">init</span></div>
-                <div class="code-line"><span class="code-cmd">vultrino</span> <span class="code-arg">add</span> --alias github --key <span class="code-string">ghp_xxx</span></div>
-                <div class="code-line">&nbsp;</div>
-                <div class="code-line"><span class="code-comment"># Start server and create a scoped API key</span></div>
-                <div class="code-line"><span class="code-cmd">vultrino</span> <span class="code-arg">web</span> &</div>
-                <div class="code-line"><span class="code-cmd">vultrino</span> <span class="code-arg">key create</span> my-agent --role executor</div>
-                <div class="code-line"><span class="code-comment"># → vk_a1b2c3...</span></div>
-                <div class="code-line">&nbsp;</div>
-                <div class="code-line"><span class="code-comment"># Use API key (no password needed!)</span></div>
-                <div class="code-line"><span class="code-cmd">vultrino</span> --key <span class="code-string">vk_a1b2c3...</span> <span class="code-arg">request</span> github <span class="code-string">https://api.github.com/user</span></div>
-                <div class="code-line">&nbsp;</div>
-                <div class="code-line"><span class="code-comment"># Or connect AI agents via MCP</span></div>
-                <div class="code-line"><span class="code-cmd">vultrino</span> <span class="code-arg">mcp</span></div>
-            </div>
+
+        <div class="code-panel" data-reveal>
+          <div class="code-tab">Terminal</div>
+          <div class="code-content">
+            <div class="code-line"><span class="code-comment"># Initialize and store a credential</span></div>
+            <div class="code-line"><span class="code-cmd">vultrino</span> <span class="code-arg">init</span></div>
+            <div class="code-line"><span class="code-cmd">vultrino</span> <span class="code-arg">add</span> --alias github --key <span class="code-string">ghp_xxx</span></div>
+            <div class="code-line">&nbsp;</div>
+            <div class="code-line"><span class="code-comment"># Start server and create a scoped API key</span></div>
+            <div class="code-line"><span class="code-cmd">vultrino</span> <span class="code-arg">web</span> &amp;</div>
+            <div class="code-line"><span class="code-cmd">vultrino</span> <span class="code-arg">key create</span> my-agent --role executor</div>
+            <div class="code-line"><span class="code-comment"># → vk_a1b2c3...</span></div>
+            <div class="code-line">&nbsp;</div>
+            <div class="code-line"><span class="code-comment"># Use API key (no password needed!)</span></div>
+            <div class="code-line"><span class="code-cmd">vultrino</span> --key <span class="code-string">vk_a1b2c3...</span> <span class="code-arg">request</span> github <span class="code-string">https://api.github.com/user</span></div>
+            <div class="code-line">&nbsp;</div>
+            <div class="code-line"><span class="code-comment"># Or connect AI agents via MCP</span></div>
+            <div class="code-line"><span class="code-cmd">vultrino</span> <span class="code-arg">mcp</span></div>
+          </div>
         </div>
+      </div>
     </section>
 
-    <section class="cta">
-        <div class="cta-box">
-            <div class="cta-content">
-                <h2>Secure Your AI Stack</h2>
-                <p>Self-hosted and extensible to any credential type.</p>
-                <a href="https://docs.vultrino.com" class="btn btn-primary">Get Started</a>
-            </div>
+    <section class="section section--ink cta">
+      <div class="wrap">
+        <div class="cta__box" data-reveal>
+          <p class="eyebrow" style="justify-content: center;">Next step</p>
+          <h2>Secure Your AI Stack</h2>
+          <p>Self-hosted and extensible to any credential type.</p>
+          <a class="button button--light" href="https://docs.vultrino.com">Get Started <span aria-hidden="true">→</span></a>
         </div>
+      </div>
     </section>
+  </main>
 
-    <footer>
-        <p>By <a href="https://dzcodes.dev">dzcodes.dev</a></p>
-    </footer>
+  <footer class="footer">
+    <div class="footer__top wrap">
+      <a class="footer__brand" href="https://feir.ai" aria-label="FeirAI">
+        <img src="assets/feirai-wordmark-light.svg" alt="FeirAI" width="184" height="57" />
+        <p>Vultrino is the open-source enforce plane from FeirAI — credentials agents can use, never see.</p>
+      </a>
+      <div class="footer__links">
+        <div>
+          <span>Product</span>
+          <a href="#features">Features</a>
+          <a href="#quickstart">Quick Start</a>
+          <a href="https://docs.vultrino.com">Documentation</a>
+          <a href="https://github.com/FeirAI/vultrino">GitHub</a>
+        </div>
+        <div>
+          <span>Company</span>
+          <a href="https://feir.ai">feir.ai</a>
+          <a href="https://demo.feir.ai">FeirOS demo</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer__bottom wrap">
+      <span>© <span id="year">2026</span> FeirAI · Vultrino</span>
+      <a href="https://feir.ai">A FeirAI project → feir.ai</a>
+    </div>
+  </footer>
 
-    <script>
-        // Mobile menu toggle
-        const menuToggle = document.getElementById('menuToggle');
-        const mobileNav = document.getElementById('mobileNav');
-        const mobileNavLinks = document.querySelectorAll('.mobile-nav a');
+  <script>
+    (function () {
+      const nav = document.getElementById("siteNav");
+      const toggle = document.getElementById("navToggle");
+      const mobile = document.getElementById("mobileNav");
+      const progress = document.getElementById("pageProgress");
+      const year = document.getElementById("year");
+      if (year) year.textContent = String(new Date().getFullYear());
 
-        menuToggle.addEventListener('click', () => {
-            menuToggle.classList.toggle('active');
-            mobileNav.classList.toggle('active');
-            document.body.style.overflow = mobileNav.classList.contains('active') ? 'hidden' : '';
+      const setMenu = (open) => {
+        document.body.classList.toggle("menu-open", open);
+        toggle.setAttribute("aria-expanded", open ? "true" : "false");
+        mobile.classList.toggle("is-open", open);
+        mobile.hidden = !open;
+      };
+
+      toggle.addEventListener("click", () => {
+        setMenu(toggle.getAttribute("aria-expanded") !== "true");
+      });
+
+      mobile.querySelectorAll("a").forEach((a) => {
+        a.addEventListener("click", () => setMenu(false));
+      });
+
+      const onScroll = () => {
+        nav.classList.toggle("is-scrolled", window.scrollY > 8);
+        const max = document.documentElement.scrollHeight - window.innerHeight;
+        const t = max > 0 ? window.scrollY / max : 0;
+        progress.style.transform = "scaleX(" + Math.min(1, Math.max(0, t)) + ")";
+      };
+      window.addEventListener("scroll", onScroll, { passive: true });
+      onScroll();
+
+      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      if (reduce) {
+        document.querySelectorAll("[data-reveal], .console, .code-panel").forEach((el) => {
+          el.classList.add("is-in");
         });
+        return;
+      }
 
-        mobileNavLinks.forEach(link => {
-            link.addEventListener('click', () => {
-                menuToggle.classList.remove('active');
-                mobileNav.classList.remove('active');
-                document.body.style.overflow = '';
-            });
-        });
+      const io = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (entry.isIntersecting) {
+              entry.target.classList.add("is-in");
+              io.unobserve(entry.target);
+            }
+          });
+        },
+        { threshold: 0.12, rootMargin: "0px 0px -8% 0px" }
+      );
 
-        // Scroll progress bar
-        const scrollProgress = document.getElementById('scrollProgress');
-        window.addEventListener('scroll', () => {
-            const scrollTop = window.scrollY;
-            const docHeight = document.documentElement.scrollHeight - window.innerHeight;
-            const progress = scrollTop / docHeight;
-            scrollProgress.style.transform = `scaleX(${progress})`;
-        });
-
-        // Intersection Observer for scroll animations
-        const observerOptions = {
-            threshold: 0.1,
-            rootMargin: '0px 0px -30px 0px'
-        };
-
-        const observer = new IntersectionObserver((entries) => {
-            entries.forEach((entry) => {
-                if (entry.isIntersecting) {
-                    entry.target.classList.add('visible');
-                }
-            });
-        }, observerOptions);
-
-        // Observe all animated elements
-        document.querySelectorAll('.section-header, .feature-row, .use-case-card, .code-block, .cta-box').forEach(el => {
-            observer.observe(el);
-        });
-
-        // Staggered animation for use case cards
-        const useCaseCards = document.querySelectorAll('.use-case-card');
-        const useCaseObserver = new IntersectionObserver((entries) => {
-            entries.forEach((entry) => {
-                if (entry.isIntersecting) {
-                    const cards = entry.target.parentElement.querySelectorAll('.use-case-card');
-                    cards.forEach((card, i) => {
-                        setTimeout(() => {
-                            card.classList.add('visible');
-                        }, i * 80);
-                    });
-                    useCaseObserver.unobserve(entry.target);
-                }
-            });
-        }, { threshold: 0.1 });
-
-        if (useCaseCards.length > 0) {
-            useCaseObserver.observe(useCaseCards[0]);
-        }
-
-        // Parallax effect on hero shapes (desktop only)
-        if (window.innerWidth > 900) {
-            document.addEventListener('mousemove', (e) => {
-                const shapes = document.querySelectorAll('.floating-shape');
-                const x = (e.clientX / window.innerWidth - 0.5) * 20;
-                const y = (e.clientY / window.innerHeight - 0.5) * 20;
-
-                shapes.forEach((shape, i) => {
-                    const factor = (i + 1) * 0.5;
-                    shape.style.transform = `translate(${x * factor}px, ${y * factor}px)`;
-                });
-            });
-        }
-    </script>
+      document.querySelectorAll("[data-reveal]").forEach((el) => io.observe(el));
+    })();
+  </script>
 </body>
 </html>
