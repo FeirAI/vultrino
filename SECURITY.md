@@ -16,7 +16,7 @@ Please **do not** file a public GitHub issue for security bugs.
 Prefer one of:
 
 1. GitHub **Private vulnerability reporting** on this repository (Security → Report a vulnerability), once enabled on the org, or
-2. Email **security@feir.ai** with:
+2. Email **contact@feir.ai** with:
    - a short description of the impact
    - reproduction steps or a minimal PoC
    - affected commit / release if known
