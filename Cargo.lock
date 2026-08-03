@@ -186,14 +186,9 @@ dependencies = [
 
 [[package]]
 name = "askama_axum"
-version = "0.4.0"
+version = "0.5.0+deprecated"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a41603f7cdbf5ac4af60760f17253eb6adf6ec5b6f14a7ed830cf687d375f163"
-dependencies = [
- "askama",
- "axum-core 0.4.5",
- "http",
-]
+checksum = "78ebeda8ac47efa9ea6c5947c911a2db48a9d92cba6fff15ceb2ccbb1ee0f21e"
 
 [[package]]
 name = "askama_derive"
@@ -289,7 +284,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
- "axum-core 0.5.6",
+ "axum-core",
  "axum-macros",
  "bytes",
  "form_urlencoded",
@@ -315,26 +310,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "axum-core"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09f2bd6146b97ae3359fa0cc6d6b376d9539582c7b4220f041a33ec24c226199"
-dependencies = [
- "async-trait",
- "bytes",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "mime",
- "pin-project-lite",
- "rustversion",
- "sync_wrapper",
- "tower-layer",
- "tower-service",
 ]
 
 [[package]]
@@ -3315,7 +3290,7 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "151b5a3e3c45df17466454bb74e9ecedecc955269bdedbf4d150dfa393b55a36"
 dependencies = [
- "axum-core 0.5.6",
+ "axum-core",
  "cookie",
  "futures-util",
  "http",
@@ -3391,7 +3366,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce8cce604865576b7751b7a6bc3058f754569a60d689328bb74c52b1d87e355b"
 dependencies = [
  "async-trait",
- "axum-core 0.5.6",
+ "axum-core",
  "base64",
  "futures",
  "http",

@@ -32,7 +32,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs", "trace", "cors", "set-header"] }
 tower-sessions = "0.14"
 askama = { version = "0.12", features = ["with-axum"] }
-askama_axum = "0.4"
+askama_axum = "0.5"
 bcrypt = "0.16"
 cookie = "0.18"
 
