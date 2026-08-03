@@ -169,53 +169,47 @@ impl PluginInstaller {
         // carried plaintext credential data into the guest and is intentionally
         // rejected by ABI v2; an obsolete module must fail at install time rather
         // than appear installed and only fail on the next server restart.
-        self.validate_wasm_module(&staging_path)?;
-
-        // Copy to plugins directory
-        self.copy_plugin(&staging_path, &target_dir).await?;
-
-        // Create installed info
-        let installed_info = InstalledPluginInfo::new(
-            manifest,
-            match &source {
-                PluginSource::LocalPath(p) => p.display().to_string(),
-                PluginSource::Git { url, git_ref } => {
-                    if let Some(r) = git_ref {
-                        format!("{}#{}", url, r)
-                    } else {
-                        url.clone()
-                    }
-                }
-                PluginSource::Archive(url) => url.clone(),
-            },
-            target_dir.clone(),
-        );
-
-        // Save installed info
-        let info_path = target_dir.join(".installed.json");
-        let info_json = serde_json::to_string_pretty(&installed_info)
-            .map_err(|e| PluginError::Installation(format!("Failed to serialize info: {}", e)))?;
-        tokio::fs::write(&info_path, info_json).await?;
-
-        info!("Plugin '{}' installed successfully", plugin_name);
-        Ok(installed_info)
-    }
-
-    /// Fail closed if the staged WASM module is missing/incompatible, or if this
-    /// binary was built without the wasm-plugins feature.
-    fn validate_wasm_module(&self, staging_path: &Path) -> Result<(), PluginError> {
         #[cfg(feature = "wasm-plugins")]
         {
-            WasmPlugin::from_directory(staging_path.to_path_buf()).map_err(|e| {
+            WasmPlugin::from_directory(staging_path.clone()).map_err(|e| {
                 PluginError::Installation(format!(
                     "WASM module is incompatible with the active security ABI: {e}"
                 ))
             })?;
-            Ok(())
+
+            // Copy to plugins directory
+            self.copy_plugin(&staging_path, &target_dir).await?;
+
+            // Create installed info
+            let installed_info = InstalledPluginInfo::new(
+                manifest,
+                match &source {
+                    PluginSource::LocalPath(p) => p.display().to_string(),
+                    PluginSource::Git { url, git_ref } => {
+                        if let Some(r) = git_ref {
+                            format!("{}#{}", url, r)
+                        } else {
+                            url.clone()
+                        }
+                    }
+                    PluginSource::Archive(url) => url.clone(),
+                },
+                target_dir.clone(),
+            );
+
+            // Save installed info
+            let info_path = target_dir.join(".installed.json");
+            let info_json = serde_json::to_string_pretty(&installed_info).map_err(|e| {
+                PluginError::Installation(format!("Failed to serialize info: {}", e))
+            })?;
+            tokio::fs::write(&info_path, info_json).await?;
+
+            info!("Plugin '{}' installed successfully", plugin_name);
+            Ok(installed_info)
         }
         #[cfg(not(feature = "wasm-plugins"))]
         {
-            let _ = staging_path;
+            let _ = (manifest, source, staging_path, target_dir, plugin_name);
             Err(PluginError::Installation(
                 "this build was compiled without the wasm-plugins feature; cannot install WASM plugins"
                     .into(),
@@ -402,6 +396,7 @@ impl PluginInstaller {
     }
 
     /// Copy plugin files to target directory
+    #[cfg(feature = "wasm-plugins")]
     async fn copy_plugin(&self, source: &Path, target: &Path) -> Result<(), PluginError> {
         self.copy_dir_recursive(source, target).await
     }
