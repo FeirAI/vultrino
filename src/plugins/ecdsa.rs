@@ -90,7 +90,7 @@ impl EcdsaPlugin {
     /// Get Ethereum address from public key
     fn public_key_to_address(verifying_key: &VerifyingKey) -> String {
         // Get uncompressed public key (65 bytes, 04 prefix + 64 bytes)
-        let public_key = verifying_key.to_encoded_point(false);
+        let public_key = verifying_key.to_sec1_point(false);
         let public_key_bytes = public_key.as_bytes();
 
         // Skip the 0x04 prefix, hash the remaining 64 bytes
@@ -247,7 +247,7 @@ impl EcdsaPlugin {
         let verifying_key = signing_key.verifying_key();
 
         let wallet_address = Self::public_key_to_address(verifying_key);
-        let public_key = verifying_key.to_encoded_point(false);
+        let public_key = verifying_key.to_sec1_point(false);
         let public_key_hex = format!("0x{}", hex::encode(public_key.as_bytes()));
 
         let response = AddressResponse {
