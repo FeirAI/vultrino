@@ -7,7 +7,7 @@ Thanks for helping improve Vultrino. This document is the short path from clone 
 Requirements:
 
 - Rust **1.94.0** (pinned in [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` installs it automatically)
-- Optional for formal gates: [Lean 4.30.0](https://lean-lang.org/) via `elan`, and [Kani](https://model-checking.github.io/kani/) 0.67.0
+- Optional for formal gates: [Lean 4.30.0](https://lean-lang.org/) via `elan`, and [Kani](https://model-checking.github.io/kani/) 0.67.0 (`formal/run-kani.sh` uses `--no-default-features` so proofs stay off wasmtime’s rustc-1.94 MSRV)
 
 ```bash
 git clone https://github.com/FeirAI/vultrino.git

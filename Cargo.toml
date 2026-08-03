@@ -54,9 +54,10 @@ subtle = "2"  # Constant-time comparison for security
 k256 = { version = "0.13", features = ["ecdsa", "ecdsa-core", "schnorr"] }  # ECDSA secp256k1
 sha3 = "0.10"  # Keccak256 for Ethereum
 
-# WASM runtime for plugins
-wasmtime = "47"
-wasmtime-wasi = "47"
+# WASM runtime for plugins (optional so Kani 0.67's rustc 1.93 can verify
+# pure-kernel harnesses without pulling wasmtime's rustc-1.94 MSRV).
+wasmtime = { version = "47", optional = true }
+wasmtime-wasi = { version = "47", optional = true }
 
 # OS integration (for future keychain support)
 # keyring = "3"
@@ -106,7 +107,11 @@ proptest = "1"
 glob = "0.3"
 
 [features]
-default = []
+default = ["wasm-plugins"]
+# Host-side WASM plugin runtime (wasmtime 47). Default-on for production builds;
+# Kani pure-kernel proofs run with `--no-default-features` because Kani 0.67
+# ships rustc 1.93.0-nightly and wasmtime 47 declares rust-version = 1.94.
+wasm-plugins = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # Gate for the local delegation evaluator (`evaluate_delegate_decision`). Off by
 # default so a production build cannot call the local evaluator; the external
 # integration test `delegate_approval_integration` requires this feature (see

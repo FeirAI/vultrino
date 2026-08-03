@@ -18,6 +18,7 @@ pub mod loader;
 mod postgres;
 mod ssh;
 pub mod types;
+#[cfg(feature = "wasm-plugins")]
 pub mod wasm;
 
 pub use ecdsa::EcdsaPlugin;

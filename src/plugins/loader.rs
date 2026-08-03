@@ -3,6 +3,7 @@
 //! This module handles loading installed plugins into the plugin registry.
 
 use super::installer::PluginInstaller;
+#[cfg(feature = "wasm-plugins")]
 use super::wasm::WasmPlugin;
 use super::{Plugin, PluginError, PluginRegistry};
 use std::sync::Arc;
@@ -56,8 +57,18 @@ impl PluginLoader {
         &self,
         directory: &std::path::Path,
     ) -> Result<Arc<dyn Plugin>, PluginError> {
-        let plugin = WasmPlugin::from_directory(directory.to_path_buf())?;
-        Ok(Arc::new(plugin))
+        #[cfg(feature = "wasm-plugins")]
+        {
+            let plugin = WasmPlugin::from_directory(directory.to_path_buf())?;
+            Ok(Arc::new(plugin))
+        }
+        #[cfg(not(feature = "wasm-plugins"))]
+        {
+            let _ = directory;
+            Err(PluginError::Wasm(
+                "this build was compiled without the wasm-plugins feature".into(),
+            ))
+        }
     }
 
     /// Reload a specific plugin by name

@@ -6,6 +6,7 @@
 //! - URLs (tar.gz archives)
 
 use super::types::{InstalledPluginInfo, PluginManifest};
+#[cfg(feature = "wasm-plugins")]
 use super::wasm::WasmPlugin;
 use super::PluginError;
 use std::path::{Path, PathBuf};
@@ -168,11 +169,7 @@ impl PluginInstaller {
         // carried plaintext credential data into the guest and is intentionally
         // rejected by ABI v2; an obsolete module must fail at install time rather
         // than appear installed and only fail on the next server restart.
-        WasmPlugin::from_directory(staging_path.clone()).map_err(|e| {
-            PluginError::Installation(format!(
-                "WASM module is incompatible with the active security ABI: {e}"
-            ))
-        })?;
+        self.validate_wasm_module(&staging_path)?;
 
         // Copy to plugins directory
         self.copy_plugin(&staging_path, &target_dir).await?;
@@ -202,6 +199,28 @@ impl PluginInstaller {
 
         info!("Plugin '{}' installed successfully", plugin_name);
         Ok(installed_info)
+    }
+
+    /// Fail closed if the staged WASM module is missing/incompatible, or if this
+    /// binary was built without the wasm-plugins feature.
+    fn validate_wasm_module(&self, staging_path: &Path) -> Result<(), PluginError> {
+        #[cfg(feature = "wasm-plugins")]
+        {
+            WasmPlugin::from_directory(staging_path.to_path_buf()).map_err(|e| {
+                PluginError::Installation(format!(
+                    "WASM module is incompatible with the active security ABI: {e}"
+                ))
+            })?;
+            Ok(())
+        }
+        #[cfg(not(feature = "wasm-plugins"))]
+        {
+            let _ = staging_path;
+            Err(PluginError::Installation(
+                "this build was compiled without the wasm-plugins feature; cannot install WASM plugins"
+                    .into(),
+            ))
+        }
     }
 
     /// Stage plugin from a local path
