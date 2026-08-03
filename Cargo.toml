@@ -51,7 +51,7 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 subtle = "2"  # Constant-time comparison for security
-k256 = { version = "0.13", features = ["ecdsa", "ecdsa-core", "schnorr"] }  # ECDSA secp256k1
+k256 = { version = "0.14", features = ["ecdsa", "ecdsa-core", "schnorr"] }  # ECDSA secp256k1
 sha3 = "0.12"  # Keccak256 for Ethereum
 
 # WASM runtime for plugins (optional so Kani 0.67's rustc 1.93 can verify
