@@ -10,7 +10,7 @@ jobs:
     name: Kani pure-kernel proofs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Install only — do not run bare `cargo-kani` (the action default), which
       # would try to verify the whole crate including wasmtime and fail Kani
       # 0.67's rustc-1.93 MSRV check. formal/run-kani.sh drives the harnesses
@@ -26,7 +26,7 @@ jobs:
     name: Lean critical-boundary proofs (no sorry)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: leanprover/lean-action@v1
         with:
           lake-package-directory: formal/lean
@@ -45,7 +45,7 @@ jobs:
     name: build + test + clippy (zero-warning gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The Rust version is pinned in rust-toolchain.toml (1.94.0 + clippy/rustfmt). cargo honors that file
       # regardless of which toolchain this action installs, so local builds and CI share ONE source of truth.
       # The zero-warning clippy gate below therefore always runs under 1.94.0. Bump it there, not here
@@ -78,7 +78,7 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
