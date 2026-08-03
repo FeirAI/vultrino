@@ -13,8 +13,8 @@ use crate::{CredentialData, CredentialType, ExecuteResponse};
 use async_trait::async_trait;
 use k256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use sha3::Keccak256;
+use sha2::{Digest as Sha2Digest, Sha256};
+use sha3::{Digest as Sha3Digest, Keccak256};
 use std::collections::HashMap;
 
 /// ECDSA plugin for Ethereum-style signing
@@ -94,7 +94,7 @@ impl EcdsaPlugin {
         let public_key_bytes = public_key.as_bytes();
 
         // Skip the 0x04 prefix, hash the remaining 64 bytes
-        let hash = Keccak256::digest(&public_key_bytes[1..]);
+        let hash = <Keccak256 as Sha3Digest>::digest(&public_key_bytes[1..]);
 
         // Take last 20 bytes as address
         let address_bytes = &hash[12..];
@@ -107,7 +107,7 @@ impl EcdsaPlugin {
     /// Apply EIP-55 checksum to address
     fn checksum_address(address_hex: &str) -> String {
         let address_lower = address_hex.to_lowercase();
-        let hash = Keccak256::digest(address_lower.as_bytes());
+        let hash = <Keccak256 as Sha3Digest>::digest(address_lower.as_bytes());
         let hash_hex = hex::encode(hash);
 
         let mut checksummed = String::with_capacity(42);
@@ -152,8 +152,8 @@ impl EcdsaPlugin {
     /// Hash data based on algorithm
     fn hash_data(data: &[u8], algorithm: &str) -> Result<Vec<u8>, PluginError> {
         match algorithm {
-            "keccak256" => Ok(Keccak256::digest(data).to_vec()),
-            "sha256" => Ok(Sha256::digest(data).to_vec()),
+            "keccak256" => Ok(<Keccak256 as Sha3Digest>::digest(data).to_vec()),
+            "sha256" => Ok(<Sha256 as Sha2Digest>::digest(data).to_vec()),
             "none" => {
                 if data.len() != 32 {
                     return Err(PluginError::InvalidParams(
