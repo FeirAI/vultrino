@@ -237,6 +237,13 @@ pub struct AverinConfig {
     /// in-memory `pop` map durable mint never populates, so the combination would deny every
     /// execute). Never flip this default; enabling it is a deliberate per-deployment choice.
     pub durable: bool,
+    /// D8 evidence mode. When enabled, each admitted invocation receives its own
+    /// exact-action, exact-credential, single-operation grant and a synchronous
+    /// use-intent before dispatch; a use-outcome is appended after dispatch. The
+    /// broad outer use token remains the authorization envelope but is never used
+    /// as the D8 grant. Default false; enabling it is an explicit availability
+    /// trade-off because the before-act evidence write is fail-closed.
+    pub d8_complete_evidence: bool,
 }
 
 impl Default for AverinConfig {
@@ -267,6 +274,25 @@ impl Default for AverinConfig {
             // on the exact 087 async path; enabling durable at-least-once delivery is an explicit
             // per-deployment opt-in, never a default flip.
             durable: false,
+            d8_complete_evidence: false,
+        }
+    }
+}
+
+/// State returned after the D8 before-act grant + use-intent are committed.
+/// It is intentionally small and contains no credential or parameter material.
+#[derive(Clone, Debug)]
+pub(crate) struct ExactUseEvidence {
+    intent_record_id: String,
+    outcome_idempotency_key: String,
+}
+
+#[cfg(test)]
+impl ExactUseEvidence {
+    pub(crate) fn for_test(intent_record_id: &str, outcome_idempotency_key: &str) -> Self {
+        Self {
+            intent_record_id: intent_record_id.to_string(),
+            outcome_idempotency_key: outcome_idempotency_key.to_string(),
         }
     }
 }
@@ -339,6 +365,27 @@ pub(crate) struct UsePop {
     #[allow(dead_code)]
     pub params_commitment: String,
     pub use_sig: String,
+}
+
+/// Classify the Vultrino token honestly for Averin's grant taxonomy.
+///
+/// A token is `single_operation` only when both its credential and action scopes
+/// name an exact pair and Vultrino caps it at one use. Exact N-use tokens can be
+/// `bounded_reuse`. Wildcard or unlimited tokens are session grants: Vultrino may
+/// still enforce its own use cap, but the evidence must not overclaim a tight
+/// action/resource binding.
+pub(crate) fn grant_shape(
+    scope: &str,
+    action: &str,
+    max_uses: Option<u32>,
+) -> (Option<&'static str>, u32) {
+    if scope.contains('*') || action.contains('*') || max_uses.is_none() {
+        return (Some("session_grant"), 0);
+    }
+    match max_uses {
+        Some(n) if n > 1 => (Some("bounded_reuse"), n),
+        _ => (None, 0),
+    }
 }
 
 /// Plan 088 D5 — the use-PoP "core" build, shared by [`AverinClient::seal_use`] (the
@@ -563,11 +610,10 @@ impl AverinClient {
         let agent_id = self.agent_id(token_id);
         let resource = self.cfg.resource_id.clone();
 
-        let challenge =
-            pop::grant_challenge(action, &agent_id, &agent_pubkey, &resource, scope);
+        let challenge = pop::grant_challenge(action, &agent_id, &agent_pubkey, &resource, scope);
         let agent_sig = keypair.sign_b64(&challenge);
 
-        let scope_class = use_limit.filter(|n| *n > 1).map(|_| "bounded_reuse");
+        let (scope_class, averin_use_limit) = grant_shape(scope, action, use_limit);
         let body = serde_json::json!({
             "idempotency_key": token_id,
             "project_id": self.cfg.project_id,
@@ -577,7 +623,7 @@ impl AverinClient {
             "resource": resource,
             "scope": scope,
             "scope_class": scope_class,
-            "use_limit": use_limit.filter(|n| *n > 1).unwrap_or(0),
+            "use_limit": averin_use_limit,
             "agent_pubkey": agent_pubkey,
             "agent_sig": agent_sig,
             "ttl_seconds": self.cfg.grant_ttl_secs,
@@ -624,7 +670,13 @@ impl AverinClient {
     /// (seal-before-consume, or a consume rollback) is a separate change — plan 087
     /// only moves the *fail-open* path async, where nothing ever blocks, so this
     /// caveat is unreachable in the default (Observe) posture.
-    pub async fn on_execute(&self, token_id: &str, params: Vec<u8>) -> Result<(), AverinError> {
+    pub async fn on_execute(
+        &self,
+        token_id: &str,
+        params: Vec<u8>,
+        use_sequence_number: u32,
+        request_id: &str,
+    ) -> Result<(), AverinError> {
         // FIX 3 — never transmit an oversize body. averin recomputes the commitment
         // from the raw bytes (§5a), so we cannot seal a fixed-size commitment WITHOUT
         // the body; oversize therefore deny (require_evidence) or drop (observe),
@@ -647,7 +699,10 @@ impl AverinClient {
                 }
             };
         }
-        match self.seal_use(token_id, &params).await {
+        match self
+            .seal_use(token_id, &params, use_sequence_number, request_id)
+            .await
+        {
             Ok(rid) => {
                 self.metrics.record_sealed();
                 tracing::debug!(target: "averin_seal", token_id, record_id = %rid, "averin use sealed (sync)");
@@ -678,6 +733,8 @@ impl AverinClient {
         &self,
         token_id: &str,
         params: Vec<u8>,
+        use_sequence_number: u32,
+        request_id: &str,
     ) -> Result<(), AverinError> {
         if params.len() > self.cfg.max_seal_params_bytes {
             self.metrics.record_failed();
@@ -696,7 +753,10 @@ impl AverinClient {
             return Err(error);
         }
 
-        match self.seal_use(token_id, &params).await {
+        match self
+            .seal_use(token_id, &params, use_sequence_number, request_id)
+            .await
+        {
             Ok(record_id) => {
                 self.metrics.record_sealed();
                 tracing::debug!(
@@ -749,7 +809,13 @@ impl AverinClient {
     /// params (> `max_seal_params_bytes`) are dropped BEFORE claiming a permit (FIX 3),
     /// and the saturation/oversize drop LOG is rate-limited (FIX 5) though the counter
     /// always increments. The in-flight gauge is RAII-guarded (FIX 6).
-    pub fn spawn_use_seal(&self, token_id: &str, params: Vec<u8>) {
+    pub fn spawn_use_seal(
+        &self,
+        token_id: &str,
+        params: Vec<u8>,
+        use_sequence_number: u32,
+        request_id: &str,
+    ) {
         // FIX 3 — oversize params are never sealed (averin recomputes the commitment
         // from the raw bytes, so there is no fixed-size-commitment-only option). Drop
         // fail-open + count; the action already proceeded (085 detects the gap). Done
@@ -791,6 +857,7 @@ impl AverinClient {
         };
         let this = self.clone();
         let token_id = token_id.to_string();
+        let request_id = request_id.to_string();
         tokio::spawn(async move {
             // Held for the seal's whole lifetime; releasing it frees a fan-out slot.
             let _permit = permit;
@@ -798,7 +865,9 @@ impl AverinClient {
             // this task panics or is cancelled mid-await. `complete()` on the normal
             // arms stops `Drop` from double-counting a failure.
             let mut guard = InflightGuard::enter(this.metrics.clone());
-            let outcome = this.seal_use(&token_id, &params).await;
+            let outcome = this
+                .seal_use(&token_id, &params, use_sequence_number, &request_id)
+                .await;
             match outcome {
                 Ok(rid) => {
                     this.metrics.record_sealed();
@@ -826,14 +895,21 @@ impl AverinClient {
     /// real `Result`); [`Self::on_execute`] wraps it with the configured fail-mode.
     /// Public so the spike's integration test can assert + time it against a real averin.
     ///
-    /// Plan 088 D5 — generates a FRESH `nonce`/`params_nonce` on every call, exactly as before
-    /// this refactor: this is the synchronous 087 path, and its wire body must stay
-    /// byte-identical to today (durable = false, the default). The body-build itself is now
+    /// Generates a FRESH `nonce`/`params_nonce` on every logical call. The caller supplies the
+    /// post-consume 1-based use sequence and request id so bounded-reuse grants satisfy Averin's
+    /// proof contract and distinct executions never reuse an idempotency key with a different
+    /// body. The body-build itself is
     /// [`build_use_pop`] — the SAME helper the durable delivery worker
     /// (`deliver_averin_use`, `src/server/mod.rs`) calls with STORED `(nonce, params_nonce)`
     /// instead of fresh ones, so a durable retry rebuilds byte-for-byte (D5's determinism
     /// contract) while this synchronous path's behavior does not change at all.
-    pub async fn seal_use(&self, token_id: &str, params: &[u8]) -> Result<String, AverinError> {
+    pub async fn seal_use(
+        &self,
+        token_id: &str,
+        params: &[u8],
+        use_sequence_number: u32,
+        request_id: &str,
+    ) -> Result<String, AverinError> {
         let params_nonce = pop::random_params_nonce_hex();
         let nonce = pop::random_params_nonce_hex(); // any non-empty freshness string
 
@@ -853,11 +929,15 @@ impl AverinClient {
                 &nonce,
                 &params_nonce,
             )?;
-            (entry.capability.clone(), entry.action.clone(), use_pop.use_sig)
+            (
+                entry.capability.clone(),
+                entry.action.clone(),
+                use_pop.use_sig,
+            )
         };
 
         let body = serde_json::json!({
-            "idempotency_key": format!("{token_id}:use"),
+            "idempotency_key": format!("{token_id}:use:{request_id}"),
             "project_id": self.cfg.project_id,
             "session_id": self.cfg.session_id,
             "capability": capability,
@@ -866,6 +946,7 @@ impl AverinClient {
             "params": String::from_utf8_lossy(params),
             "nonce": nonce,
             "params_nonce": params_nonce,
+            "use_sequence_number": use_sequence_number,
         });
 
         let resp = self.post("/v2/use", &body).await?;
@@ -876,6 +957,133 @@ impl AverinClient {
             .unwrap_or("<unknown>")
             .to_string();
         Ok(rid)
+    }
+
+    /// Commit the D8 before-act evidence for one exact governed invocation.
+    /// A fresh PoP key + single-operation grant is minted for this request, then
+    /// consumed by `/v2/use-intent`. Broad session-token scope is deliberately not
+    /// copied into the evidence grant: the exact credential alias and business
+    /// action are supplied by the already-authorized execution permit.
+    pub(crate) async fn begin_exact_use(
+        &self,
+        token_id: &str,
+        credential_scope: &str,
+        action: &str,
+        params: &[u8],
+        request_id: &str,
+    ) -> Result<ExactUseEvidence, AverinError> {
+        if credential_scope.trim().is_empty()
+            || action.trim().is_empty()
+            || credential_scope.contains('*')
+            || action.contains('*')
+        {
+            return Err(AverinError::BadResponse(
+                "D8 exact evidence requires non-wildcard credential and action scope".into(),
+            ));
+        }
+        if params.len() > self.cfg.max_seal_params_bytes {
+            return Err(AverinError::BadResponse(format!(
+                "D8 exact evidence params exceed {} byte bound",
+                self.cfg.max_seal_params_bytes
+            )));
+        }
+
+        let keypair = PopKeypair::generate();
+        let agent_pubkey = keypair.agent_pubkey_b64();
+        let agent_id = format!("vultrino:{token_id}:{request_id}");
+        let challenge = pop::grant_challenge(
+            action,
+            &agent_id,
+            &agent_pubkey,
+            &self.cfg.resource_id,
+            credential_scope,
+        );
+        let agent_sig = keypair.sign_b64(&challenge);
+        let grant_idem = format!("{token_id}:d8-grant:{request_id}");
+        let grant_body = serde_json::json!({
+            "idempotency_key": grant_idem,
+            "project_id": self.cfg.project_id,
+            "session_id": self.cfg.session_id,
+            "agent_id": agent_id,
+            "action": action,
+            "resource": self.cfg.resource_id,
+            "scope": credential_scope,
+            // Empty/null is the protocol's authoritative default: single_operation.
+            "scope_class": serde_json::Value::Null,
+            "use_limit": 0,
+            "agent_pubkey": agent_pubkey,
+            "agent_sig": agent_sig,
+            "ttl_seconds": self.cfg.grant_ttl_secs,
+        });
+        let grant = self.post("/v2/grants", &grant_body).await?;
+        let grant_id = grant
+            .get("grant_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AverinError::BadResponse("missing D8 grant_id".into()))?;
+        let capability = grant
+            .get("capability")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AverinError::BadResponse("missing D8 capability".into()))?;
+
+        let nonce = pop::random_params_nonce_hex();
+        let params_nonce = pop::random_params_nonce_hex();
+        let use_pop = build_use_pop(
+            &keypair,
+            capability,
+            grant_id,
+            &self.cfg.resource_id,
+            action,
+            params,
+            &nonce,
+            &params_nonce,
+        )?;
+        let intent_idem = format!("{token_id}:d8-intent:{request_id}");
+        let intent_body = serde_json::json!({
+            "idempotency_key": intent_idem,
+            "project_id": self.cfg.project_id,
+            "session_id": self.cfg.session_id,
+            "capability": capability,
+            "use_sig": use_pop.use_sig,
+            "action": action,
+            "params": String::from_utf8_lossy(params),
+            "nonce": nonce,
+            "params_nonce": params_nonce,
+            "use_sequence_number": 0,
+        });
+        let intent = self.post("/v2/use-intent", &intent_body).await?;
+        let intent_record_id = intent
+            .get("record")
+            .and_then(|v| v.get("record_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AverinError::BadResponse("missing D8 intent record_id".into()))?
+            .to_string();
+        Ok(ExactUseEvidence {
+            intent_record_id,
+            outcome_idempotency_key: format!("{token_id}:d8-outcome:{request_id}"),
+        })
+    }
+
+    /// Append the after-act half of a D8 invocation. The intent already consumed
+    /// the single-use capability; this binds completion (or a surfaced failure)
+    /// to that exact before-act record.
+    pub(crate) async fn complete_exact_use(
+        &self,
+        evidence: &ExactUseEvidence,
+        status: &str,
+    ) -> Result<String, AverinError> {
+        let body = serde_json::json!({
+            "idempotency_key": evidence.outcome_idempotency_key,
+            "project_id": self.cfg.project_id,
+            "session_id": self.cfg.session_id,
+            "intent_record_id": evidence.intent_record_id,
+            "status": status,
+        });
+        let outcome = self.post("/v2/use-outcome", &body).await?;
+        outcome
+            .get("outcome_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| AverinError::BadResponse("missing D8 outcome_id".into()))
     }
 
     // ---- transport -------------------------------------------------------
@@ -989,7 +1197,9 @@ mod tests {
         // The default-off guarantee: a disabled config yields no client, so both
         // hooks are unreachable and mint/execute stay byte-identical to today.
         assert!(!AverinConfig::default().enabled);
-        assert!(AverinClient::new(AverinConfig::default()).unwrap().is_none());
+        assert!(AverinClient::new(AverinConfig::default())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1024,6 +1234,26 @@ mod tests {
         // out of the box; a zero cap (which would drop every seal) is impossible —
         // `new` floors it at 1.
         assert_eq!(AverinConfig::default().max_inflight_seals, 256);
+    }
+
+    #[test]
+    fn grant_shape_never_overclaims_broad_or_unlimited_tokens() {
+        assert_eq!(
+            grant_shape("cred-*", "content.*", Some(1)),
+            (Some("session_grant"), 0)
+        );
+        assert_eq!(
+            grant_shape("cred-notion", "content.brand_write", None),
+            (Some("session_grant"), 0)
+        );
+        assert_eq!(
+            grant_shape("cred-notion", "content.brand_write", Some(3)),
+            (Some("bounded_reuse"), 3)
+        );
+        assert_eq!(
+            grant_shape("cred-notion", "content.brand_write", Some(1)),
+            (None, 0)
+        );
     }
 
     // ---- plan 087 async fail-open behaviour --------------------------------
@@ -1067,7 +1297,7 @@ mod tests {
         client.insert_test_grant("vut_slow", "AAAA.sig");
 
         let t0 = Instant::now();
-        client.spawn_use_seal("vut_slow", br#"{"q":1}"#.to_vec());
+        client.spawn_use_seal("vut_slow", br#"{"q":1}"#.to_vec(), 1, "req-slow");
         let elapsed = t0.elapsed();
         assert!(
             elapsed < Duration::from_millis(100),
@@ -1096,7 +1326,7 @@ mod tests {
 
         let t0 = Instant::now();
         for i in 0..total {
-            client.spawn_use_seal(&format!("vut_{i}"), b"{}".to_vec());
+            client.spawn_use_seal(&format!("vut_{i}"), b"{}".to_vec(), 1, &format!("req-{i}"));
         }
         let fire_elapsed = t0.elapsed();
         // (a) /execute never blocks: firing `total` bounded spawns is ~instant.
@@ -1138,7 +1368,7 @@ mod tests {
         let client = client_with("http://127.0.0.1:9", 256, Duration::from_secs(5));
         client.insert_test_grant("vut_bad", "nodothere"); // no '.' → MalformedCapability
 
-        client.spawn_use_seal("vut_bad", b"{}".to_vec());
+        client.spawn_use_seal("vut_bad", b"{}".to_vec(), 1, "req-bad");
         // Wait for the spawned task to run.
         for _ in 0..100 {
             if client.metrics().failed >= 1 {
@@ -1178,7 +1408,7 @@ mod tests {
     async fn observe_oversize_params_dropped_before_spawn() {
         let client = client_capped(AverinMode::Observe, 8);
         client.insert_test_grant("vut_big", "AAAA.sig");
-        client.spawn_use_seal("vut_big", vec![b'x'; 64]); // 64 > 8-byte cap
+        client.spawn_use_seal("vut_big", vec![b'x'; 64], 1, "req-big"); // 64 > 8-byte cap
         let m = client.metrics();
         assert_eq!(m.dropped, 1, "oversize params must be dropped");
         assert_eq!(m.in_flight, 0, "no task is spawned for oversize params");
@@ -1187,8 +1417,12 @@ mod tests {
         // A within-cap seal is NOT dropped (it spawns and — NoGrant-free here, but the
         // dead port means it will fail later; we only assert it wasn't oversize-dropped).
         client.insert_test_grant("vut_small", "AAAA.sig");
-        client.spawn_use_seal("vut_small", vec![b'x'; 4]);
-        assert_eq!(client.metrics().dropped, 1, "a within-cap seal must not be dropped");
+        client.spawn_use_seal("vut_small", vec![b'x'; 4], 1, "req-small");
+        assert_eq!(
+            client.metrics().dropped,
+            1,
+            "a within-cap seal must not be dropped"
+        );
     }
 
     /// FIX 3 — in RequireEvidence, oversize params DENY with a bounded `ParamsTooLarge`
@@ -1198,7 +1432,7 @@ mod tests {
         let client = client_capped(AverinMode::RequireEvidence, 8);
         client.insert_test_grant("vut_big", "AAAA.sig");
         let err = client
-            .on_execute("vut_big", vec![b'x'; 64])
+            .on_execute("vut_big", vec![b'x'; 64], 1, "req-big")
             .await
             .expect_err("oversize params must DENY in require_evidence");
         assert!(matches!(err, AverinError::ParamsTooLarge { .. }));
@@ -1229,7 +1463,10 @@ mod tests {
     #[test]
     fn drop_log_is_rate_limited_after_the_first() {
         let client = client_with("http://127.0.0.1:9", 256, Duration::from_secs(5));
-        assert!(client.claim_drop_log().is_some(), "the first drop always logs");
+        assert!(
+            client.claim_drop_log().is_some(),
+            "the first drop always logs"
+        );
         for _ in 0..10_000 {
             assert!(
                 client.claim_drop_log().is_none(),
@@ -1248,8 +1485,14 @@ mod tests {
             assert_eq!(metrics.snapshot().in_flight, 1);
         } // dropped WITHOUT complete() → abnormal (panic/cancel) path
         let m = metrics.snapshot();
-        assert_eq!(m.in_flight, 0, "guard must release in_flight even on panic/cancel");
-        assert_eq!(m.failed, 1, "an abnormal drop must count the lost seal as failed");
+        assert_eq!(
+            m.in_flight, 0,
+            "guard must release in_flight even on panic/cancel"
+        );
+        assert_eq!(
+            m.failed, 1,
+            "an abnormal drop must count the lost seal as failed"
+        );
         assert_eq!(m.max_in_flight, 1);
     }
 
@@ -1340,8 +1583,7 @@ mod tests {
     /// A minimal RESPONDING fake `/v2/use` that just captures the request body it received —
     /// enough to prove the synchronous 087 path's WIRE SHAPE is unchanged by the D5 refactor
     /// (this test's whole point), without needing a real averin.
-    async fn responding_use_capture() -> (String, Arc<parking_lot::Mutex<Vec<serde_json::Value>>>)
-    {
+    async fn responding_use_capture() -> (String, Arc<parking_lot::Mutex<Vec<serde_json::Value>>>) {
         use axum::{extract::State, routing::post, Json, Router};
         let bodies: Arc<parking_lot::Mutex<Vec<serde_json::Value>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -1363,36 +1605,37 @@ mod tests {
         (format!("http://{addr}"), bodies)
     }
 
-    /// Plan 088 Step 4 — the DEFAULT-OFF / `durable = false` constraint: `seal_use`'s refactored
-    /// body-build must be byte-for-byte the same WIRE SHAPE as before the refactor. Asserts (a)
-    /// the idempotency key is still the bare `"{token_id}:use"` (the D5b `:request_id` suffix is
-    /// a DURABLE-worker-only change, never the synchronous path's), (b) there is no
-    /// `use_sequence_number` field (that is a durable-worker-only addition too), and (c) two
-    /// calls still generate FRESH, DIFFERENT nonces each time (the synchronous path's existing
-    /// fresh-per-call behavior, unchanged by extracting `build_use_pop`).
+    /// The synchronous path carries the same per-execution identity as the durable path:
+    /// a request-scoped idempotency key plus the post-consume use sequence. Two different
+    /// logical calls still generate fresh nonces and cannot conflict at Averin.
     #[tokio::test]
-    async fn seal_use_wire_shape_is_byte_identical_to_before_the_d5_refactor() {
+    async fn synchronous_seal_use_carries_distinct_request_and_sequence_identity() {
         let (base_url, bodies) = responding_use_capture().await;
         let client = client_with(&base_url, 256, Duration::from_secs(5));
         client.insert_test_grant("vut_shape", "AAAA.sig");
 
         client
-            .seal_use("vut_shape", br#"{"q":1}"#)
+            .seal_use("vut_shape", br#"{"q":1}"#, 1, "req-1")
             .await
             .expect("seal against the responding fake succeeds");
         client
-            .seal_use("vut_shape", br#"{"q":1}"#)
+            .seal_use("vut_shape", br#"{"q":1}"#, 2, "req-2")
             .await
             .expect("seal against the responding fake succeeds");
 
         let seen = bodies.lock().clone();
         assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[0]["idempotency_key"],
+            serde_json::json!("vut_shape:use:req-1")
+        );
+        assert_eq!(
+            seen[1]["idempotency_key"],
+            serde_json::json!("vut_shape:use:req-2")
+        );
+        assert_eq!(seen[0]["use_sequence_number"], serde_json::json!(1));
+        assert_eq!(seen[1]["use_sequence_number"], serde_json::json!(2));
         for body in &seen {
-            assert_eq!(body["idempotency_key"], serde_json::json!("vut_shape:use"));
-            assert!(
-                body.get("use_sequence_number").is_none(),
-                "the synchronous 087 path must NOT carry use_sequence_number (durable-worker-only): {body:?}"
-            );
             let expected_keys: std::collections::BTreeSet<&str> = [
                 "idempotency_key",
                 "project_id",
@@ -1403,12 +1646,20 @@ mod tests {
                 "params",
                 "nonce",
                 "params_nonce",
+                "use_sequence_number",
             ]
             .into_iter()
             .collect();
-            let actual_keys: std::collections::BTreeSet<&str> =
-                body.as_object().unwrap().keys().map(String::as_str).collect();
-            assert_eq!(actual_keys, expected_keys, "seal_use's body key set must be unchanged");
+            let actual_keys: std::collections::BTreeSet<&str> = body
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                actual_keys, expected_keys,
+                "seal_use's body key set must be complete"
+            );
         }
         assert_ne!(
             seen[0]["nonce"], seen[1]["nonce"],

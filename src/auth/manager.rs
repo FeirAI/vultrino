@@ -207,7 +207,9 @@ impl AuthManager {
     /// Generate a new API key
     fn generate_key() -> (String, String) {
         let mut random_bytes = [0u8; KEY_RANDOM_LENGTH];
-        rand::rngs::SysRng.try_fill_bytes(&mut random_bytes).expect("SysRng failure");
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut random_bytes)
+            .expect("SysRng failure");
 
         // Use URL-safe base64 encoding, trimmed to desired length
         let random_part: String = STANDARD

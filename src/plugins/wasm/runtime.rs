@@ -190,10 +190,8 @@ impl WasmtimeRuntime {
     /// Create a linker with WASI imports
     fn create_linker(&self) -> Result<Linker<WasmState>, PluginError> {
         let mut linker = Linker::new(&self.engine);
-        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut WasmState| {
-            &mut state.wasi
-        })
-        .map_err(|e| PluginError::Wasm(format!("Failed to add WASI to linker: {}", e)))?;
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut WasmState| &mut state.wasi)
+            .map_err(|e| PluginError::Wasm(format!("Failed to add WASI to linker: {}", e)))?;
         Ok(linker)
     }
 

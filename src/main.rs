@@ -8,7 +8,7 @@ use chrono::Duration;
 use clap::{Parser, Subcommand};
 use secrecy::SecretString;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn, Level};
@@ -519,8 +519,30 @@ enum PluginCommands {
     },
 }
 
+fn validate_plugin_dir_value(value: &std::ffi::OsStr) -> Result<(), String> {
+    let path = Path::new(value);
+    if value.is_empty() || value.to_string_lossy().trim().is_empty() {
+        return Err("VULTRINO_PLUGIN_DIR must be nonblank".to_string());
+    }
+    if !path.is_absolute() {
+        return Err(format!(
+            "VULTRINO_PLUGIN_DIR must be absolute (got {})",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plugin_dir_env() -> Result<(), String> {
+    if let Some(value) = std::env::var_os("VULTRINO_PLUGIN_DIR") {
+        validate_plugin_dir_value(&value)?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    validate_plugin_dir_env()?;
     let cli = Cli::parse();
 
     // Setup logging
@@ -800,6 +822,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(test)]
+mod plugin_dir_validation_tests {
+    use super::validate_plugin_dir_value;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn accepts_nonblank_absolute_plugin_dir() {
+        assert!(validate_plugin_dir_value(OsStr::new("/var/lib/feir-os/plugins")).is_ok());
+    }
+
+    #[test]
+    fn rejects_blank_and_relative_plugin_dirs() {
+        for value in ["", "   ", "relative/plugins"] {
+            assert!(
+                validate_plugin_dir_value(OsStr::new(value)).is_err(),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+}
+
 /// Get the storage password.
 ///
 /// Source precedence, so agents and CI can run non-interactively:
@@ -1055,13 +1098,15 @@ fn spawn_averin_worker_if_enabled(
     let popkeys = storage.averin_durable_popkeys()?;
     let deadletter = storage.averin_durable_deadletter()?;
     let averin_client = server.averin()?;
-    Some(tokio::spawn(vultrino::server::deliver_averin_outbox_periodically(
-        queue,
-        popkeys,
-        deadletter,
-        averin_client,
-        std::time::Duration::from_secs(vultrino::server::AVERIN_OUTBOX_DELIVERY_SECS),
-    )))
+    Some(tokio::spawn(
+        vultrino::server::deliver_averin_outbox_periodically(
+            queue,
+            popkeys,
+            deadletter,
+            averin_client,
+            std::time::Duration::from_secs(vultrino::server::AVERIN_OUTBOX_DELIVERY_SECS),
+        ),
+    ))
 }
 
 /// Run the MCP server for LLM integration
@@ -1231,7 +1276,8 @@ async fn run_web_server(
     // worker just above, never a branch of it. Spawns nothing unless `[averin] enabled && durable`
     // AND this process actually owns the durable queue (Step 3a's single-writer-process lock) —
     // default OFF, byte-identical to every build before this plan.
-    let _ = spawn_averin_worker_if_enabled(&exec_server, config.averin.enabled, config.averin.durable);
+    let _ =
+        spawn_averin_worker_if_enabled(&exec_server, config.averin.enabled, config.averin.durable);
     // Reconcile any intent-staged events an inline drain left behind (D1 safety net).
     tokio::spawn(vultrino::server::drain_pending_events_periodically(
         exec_server.storage().clone(),
@@ -3148,10 +3194,7 @@ mod averin_worker_spawn_gate_tests {
         }
     }
 
-    async fn server_over(
-        storage: Arc<dyn StorageBackend>,
-        cfg: AverinConfig,
-    ) -> VultrinoServer {
+    async fn server_over(storage: Arc<dyn StorageBackend>, cfg: AverinConfig) -> VultrinoServer {
         let config = Config {
             averin: cfg,
             ..Default::default()
@@ -3187,7 +3230,10 @@ mod averin_worker_spawn_gate_tests {
                 .await
                 .unwrap(),
         );
-        assert!(storage.averin_durable_queue().is_some(), "this process owns the queue");
+        assert!(
+            storage.averin_durable_queue().is_some(),
+            "this process owns the queue"
+        );
         let server = server_over(storage, averin_cfg(true, false)).await;
         assert!(
             spawn_averin_worker_if_enabled(&server, true, false).is_none(),
@@ -3222,16 +3268,23 @@ mod averin_worker_spawn_gate_tests {
         // The FIRST opener wins the durable queue's exclusive owner lock (Step 3a) and is kept alive
         // for the rest of this test — its `_owner_lock` is what makes the second open lose the race.
         let storage1: Arc<dyn StorageBackend> = Arc::new(
-            FileStorage::new_with_averin(&path, &password, true).await.unwrap(),
+            FileStorage::new_with_averin(&path, &password, true)
+                .await
+                .unwrap(),
         );
-        assert!(storage1.averin_durable_queue().is_some(), "the first opener owns the queue");
+        assert!(
+            storage1.averin_durable_queue().is_some(),
+            "the first opener owns the queue"
+        );
 
         // A SECOND live `FileStorage` on the SAME vault path (the "another live process already owns
         // it" case Step 3a's `AverinQueue::open` degrades gracefully, exercised here in-process via
         // two open `FileStorage` handles) must construct fine but WITHOUT the durable averin stores —
         // `averin_durable_queue()` is `None` even though `[averin] enabled` is `true`.
         let storage2: Arc<dyn StorageBackend> = Arc::new(
-            FileStorage::new_with_averin(&path, &password, true).await.unwrap(),
+            FileStorage::new_with_averin(&path, &password, true)
+                .await
+                .unwrap(),
         );
         assert!(
             storage2.averin_durable_queue().is_none(),
@@ -3263,7 +3316,9 @@ mod averin_worker_spawn_gate_tests {
         let mut config = Config::default();
         config.storage.file_path = Some(path.clone());
         config.averin = averin_cfg(true, false);
-        let storage = init_storage_with_password(&config, &password).await.unwrap();
+        let storage = init_storage_with_password(&config, &password)
+            .await
+            .unwrap();
         assert!(
             storage.averin_durable_queue().is_none(),
             "enabled=true, durable=false must NOT construct the durable averin queue"
@@ -3284,7 +3339,9 @@ mod averin_worker_spawn_gate_tests {
         let mut config2 = Config::default();
         config2.storage.file_path = Some(path.clone());
         config2.averin = averin_cfg(true, true);
-        let storage2 = init_storage_with_password(&config2, &password).await.unwrap();
+        let storage2 = init_storage_with_password(&config2, &password)
+            .await
+            .unwrap();
         assert!(
             storage2.averin_durable_queue().is_some(),
             "enabled=true, durable=true must construct the durable averin queue"

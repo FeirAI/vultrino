@@ -390,9 +390,7 @@ impl CredentialData {
                 key_pem,
                 passphrase,
             } => secret(key_pem) && optional_secret(passphrase),
-            CredentialData::Certificate { cert_pem, key_pem } => {
-                text(cert_pem) && secret(key_pem)
-            }
+            CredentialData::Certificate { cert_pem, key_pem } => text(cert_pem) && secret(key_pem),
             CredentialData::HmacApiKey {
                 api_key,
                 api_secret,
@@ -426,13 +424,7 @@ impl CredentialData {
                 password,
                 sslmode,
                 ..
-            } => {
-                text(host)
-                    && text(database)
-                    && text(user)
-                    && secret(password)
-                    && text(sslmode)
-            }
+            } => text(host) && text(database) && text(user) && secret(password) && text(sslmode),
             CredentialData::UrlToken { token } => secret(token),
             CredentialData::Custom(values) => {
                 !values.is_empty()
@@ -981,13 +973,12 @@ mod tests {
 
     #[test]
     fn execution_response_never_serializes_refresh_credentials() {
-        let response = ExecuteResponse::success("ok").with_updated_credential(
-            CredentialData::ApiKey {
+        let response =
+            ExecuteResponse::success("ok").with_updated_credential(CredentialData::ApiKey {
                 key: Secret::new("fresh-secret-token"),
                 header_name: "Authorization".to_string(),
                 header_prefix: "Bearer ".to_string(),
-            },
-        );
+            });
         let wire = serde_json::to_string(&response).unwrap();
         assert!(!wire.contains("updated_credential"));
         assert!(!wire.contains("fresh-secret-token"));

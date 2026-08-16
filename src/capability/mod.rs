@@ -202,16 +202,22 @@ fn default_preview_format() -> String {
     "inline".to_string()
 }
 
-/// Walk a dot path (e.g. `"body.chat_id"`) into a JSON object, returning the leaf
-/// value if every segment resolves to an object key. Never descends into arrays
-/// or any structure not named by the path.
+/// Walk a dot path (e.g. `"body.chat_id"` or `"body.content_updates.0.new_str"`)
+/// into JSON, returning the leaf value if every segment resolves to an object key
+/// or a nonnegative array index. Missing keys, invalid/out-of-range indexes, and
+/// paths through any other structure return `None`. Only segments named by the
+/// path are ever traversed, so undeclared data is not exposed.
 fn dot_path_get<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut current = value;
     for segment in path.split('.') {
         if segment.is_empty() {
             return None;
         }
-        current = current.as_object()?.get(segment)?;
+        current = match current {
+            serde_json::Value::Object(object) => object.get(segment)?,
+            serde_json::Value::Array(array) => array.get(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
     }
     Some(current)
 }
@@ -731,8 +737,49 @@ pub fn build_action_params(
         if let Some(url) = url {
             params.insert("url".to_string(), serde_json::json!(url));
         }
-        if let Some(headers) = args_obj.get("headers") {
-            params.insert("headers".to_string(), headers.clone());
+        // Merge headers: agent-supplied first, then capability-pinned plugin_params
+        // (operator pins win). Notion's API requires Notion-Version on every call —
+        // default it when the target is api.notion.com and nothing set one.
+        let mut headers = serde_json::Map::new();
+        if let Some(h) = args_obj.get("headers").and_then(|v| v.as_object()) {
+            for (k, v) in h {
+                headers.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(h) = capability
+            .target
+            .plugin_params
+            .get("headers")
+            .and_then(|v| v.as_object())
+        {
+            let caller_keys_to_remove: Vec<String> = headers
+                .keys()
+                .filter(|caller| h.keys().any(|pinned| caller.eq_ignore_ascii_case(pinned)))
+                .cloned()
+                .collect();
+            for key in caller_keys_to_remove {
+                headers.remove(&key);
+            }
+            for (k, v) in h {
+                headers.insert(k.clone(), v.clone());
+            }
+        }
+        let notion_url = params
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("api.notion.com");
+        let has_notion_version = headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("Notion-Version"));
+        if notion_url && !has_notion_version {
+            headers.insert(
+                "Notion-Version".to_string(),
+                serde_json::json!("2022-06-28"),
+            );
+        }
+        if !headers.is_empty() {
+            params.insert("headers".to_string(), serde_json::Value::Object(headers));
         }
         if let Some(body) = args_obj.get("body") {
             params.insert("body".to_string(), body.clone());
@@ -935,6 +982,27 @@ mod tests {
         // Method upper-cased; url is the LLM's (policy then enforces the glob).
         assert_eq!(params["method"], "GET");
         assert_eq!(params["url"], "https://api.sendgrid.com/v3/x");
+    }
+
+    #[test]
+    fn test_build_http_params_pinned_headers_override_case_insensitively() {
+        let mut c = cap("notion_read");
+        c.target.plugin_params = serde_json::json!({
+            "headers": { "Notion-Version": "2026-03-11", "X-Operator": "pinned" }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let args = serde_json::json!({
+            "headers": { "notion-version": "caller", "x-operator": "caller", "X-Other": "kept" }
+        });
+        let params = build_action_params(&c, "http", &args).unwrap();
+        let headers = params["headers"].as_object().unwrap();
+        assert_eq!(headers["Notion-Version"], "2026-03-11");
+        assert_eq!(headers["X-Operator"], "pinned");
+        assert_eq!(headers["X-Other"], "kept");
+        assert!(!headers.contains_key("notion-version"));
+        assert!(!headers.contains_key("x-operator"));
     }
 
     fn llm_cap(provider_base: &str) -> Capability {
@@ -1219,6 +1287,41 @@ mod tests {
         assert_eq!(preview.fields[1].label, "Message");
         assert_eq!(preview.fields[1].value, "hello there");
         assert_eq!(preview.fields[1].format, "text");
+    }
+
+    #[test]
+    fn test_dot_path_get_walks_declared_array_indexes_and_rejects_invalid_paths() {
+        let params = serde_json::json!({
+            "body": {
+                "content_updates": [
+                    { "old_str": "audience", "new_str": "Who it is for" },
+                    { "old_str": "alternative", "new_str": "What it replaces" },
+                    { "old_str": "rules", "new_str": "Non-negotiables" }
+                ],
+                "secret": "must not be exposed"
+            }
+        });
+
+        assert_eq!(
+            dot_path_get(&params, "body.content_updates.0.new_str"),
+            Some(&serde_json::json!("Who it is for"))
+        );
+        assert_eq!(
+            dot_path_get(&params, "body.content_updates.1.new_str"),
+            Some(&serde_json::json!("What it replaces"))
+        );
+        assert_eq!(
+            dot_path_get(&params, "body.content_updates.2.new_str"),
+            Some(&serde_json::json!("Non-negotiables"))
+        );
+        assert!(dot_path_get(&params, "body.content_updates.3.new_str").is_none());
+        assert!(dot_path_get(&params, "body.content_updates.first.new_str").is_none());
+        assert!(dot_path_get(&params, "body.content_updates.-1.new_str").is_none());
+        assert!(dot_path_get(&params, "body.secret").is_some());
+        assert_eq!(
+            dot_path_get(&params, "body.content_updates.0.missing"),
+            None
+        );
     }
 
     #[test]

@@ -95,10 +95,16 @@ impl PluginInstaller {
 
     /// Get the default plugins directory
     pub fn default_plugins_dir() -> PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("vultrino")
-            .join("plugins")
+        Self::default_plugins_dir_for(std::env::var_os("VULTRINO_PLUGIN_DIR").as_deref())
+    }
+
+    fn default_plugins_dir_for(override_dir: Option<&std::ffi::OsStr>) -> PathBuf {
+        override_dir.map(PathBuf::from).unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("vultrino")
+                .join("plugins")
+        })
     }
 
     /// Ensure the plugins directory exists
@@ -573,6 +579,24 @@ mod tests {
 
         let source = PluginSource::parse("https://example.com/plugin.tgz").unwrap();
         assert!(matches!(source, PluginSource::Archive(_)));
+    }
+
+    #[test]
+    fn plugin_dir_override_is_used_without_mutating_process_environment() {
+        let override_dir = std::ffi::OsStr::new("/var/lib/feir-os/vultrino/plugins");
+        assert_eq!(
+            PluginInstaller::default_plugins_dir_for(Some(override_dir)),
+            PathBuf::from(override_dir)
+        );
+    }
+
+    #[test]
+    fn absent_plugin_dir_override_preserves_platform_default() {
+        let expected = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("vultrino")
+            .join("plugins");
+        assert_eq!(PluginInstaller::default_plugins_dir_for(None), expected);
     }
 
     #[tokio::test]

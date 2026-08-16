@@ -14,8 +14,8 @@ use tempfile::tempdir;
 use vultrino::approval::{
     ApprovalRequest, ApprovalStatus, ApproverClass, Decision, NewApproval, RequesterInfo,
 };
-use vultrino::averin::{AverinConfig, AverinMode};
 use vultrino::auth::{AuthResult, NewUseToken, UseToken};
+use vultrino::averin::{AverinConfig, AverinMode};
 use vultrino::config::Config;
 use vultrino::govder::GovderConfig;
 use vultrino::plugins::{Plugin, PluginError, PluginRequest};
@@ -260,13 +260,7 @@ async fn set_count_capability_reversibility(
     action: &str,
     reversibility: &str,
 ) {
-    set_count_capability_reversibility_for_credential(
-        storage,
-        action,
-        "*",
-        reversibility,
-    )
-    .await;
+    set_count_capability_reversibility_for_credential(storage, action, "*", reversibility).await;
 }
 
 async fn set_count_capability_reversibility_for_credential(
@@ -312,14 +306,9 @@ async fn start_mutable_gate_rule(
 
     let body = Arc::new(tokio::sync::RwLock::new(initial));
     let app = axum::Router::new()
-        .route(
-            "/v1/oversight/gates/rule",
-            axum::routing::get(handler),
-        )
+        .route("/v1/oversight/gates/rule", axum::routing::get(handler))
         .with_state(body.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -434,8 +423,7 @@ async fn open_approved_mutable_recipe_fixture_with_authority(
     let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
     stored
         .approve(
-            Decision::new("admin panel", "secops")
-                .with_resolved_class(ApproverClass::Teammate),
+            Decision::new("admin panel", "secops").with_resolved_class(ApproverClass::Teammate),
         )
         .unwrap();
     assert_eq!(stored.status(), ApprovalStatus::Approved);
@@ -482,7 +470,10 @@ async fn declared_irreversible_capability_cannot_take_the_direct_path() {
         .execute_gated(count_request("critical-cred"), ExecAuth::default())
         .await
         .expect_err("an irreversible action without recipe authority must refuse");
-    assert!(matches!(error, vultrino::VultrinoError::PolicyUnavailable(_)));
+    assert!(matches!(
+        error,
+        vultrino::VultrinoError::PolicyUnavailable(_)
+    ));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(storage.list_approvals().await.unwrap().is_empty());
 }
@@ -647,7 +638,10 @@ async fn approval_resume_refuses_changed_capability_authority() {
         .check_and_resume_approval(&approval.id, None)
         .await
         .unwrap();
-    assert!(resumed.executed, "the stale grant is terminal, not retryable");
+    assert!(
+        resumed.executed,
+        "the stale grant is terminal, not retryable"
+    );
     assert!(resumed
         .result_error
         .as_deref()
@@ -908,18 +902,16 @@ async fn approval_resume_refuses_changed_authoritative_recipe() {
         .check_and_resume_approval(&fixture.approval_id, None)
         .await
         .unwrap();
-    assert!(resumed.executed, "the stale grant is terminal, not retryable");
+    assert!(
+        resumed.executed,
+        "the stale grant is terminal, not retryable"
+    );
     assert!(resumed
         .result_error
         .as_deref()
         .unwrap_or_default()
         .contains("authoritative approval recipe"));
-    assert_eq!(
-        fixture
-            .calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
+    assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 /// Positive control for the continuity check: the exact same authoritative
@@ -941,12 +933,7 @@ async fn approval_resume_accepts_unchanged_authoritative_recipe() {
         "unchanged authority must execute, got {:?}",
         resumed.result_error
     );
-    assert_eq!(
-        fixture
-            .calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
+    assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 /// Plan 105 T6 / V-A19: trusted human-floor authority selects a strict evidence
@@ -954,12 +941,8 @@ async fn approval_resume_accepts_unchanged_authoritative_recipe() {
 /// an availability setting that can silently erase an irreversible record.
 #[tokio::test]
 async fn irreversible_approval_resume_refuses_when_averin_is_disabled() {
-    let fixture = open_approved_mutable_recipe_fixture_with_authority(
-        "irreversible",
-        true,
-        None,
-    )
-    .await;
+    let fixture =
+        open_approved_mutable_recipe_fixture_with_authority("irreversible", true, None).await;
 
     let resumed = fixture
         .server
@@ -973,9 +956,7 @@ async fn irreversible_approval_resume_refuses_when_averin_is_disabled() {
         .unwrap_or_default()
         .contains("requires Averin evidence"));
     assert_eq!(
-        fixture
-            .calls
-            .load(std::sync::atomic::Ordering::SeqCst),
+        fixture.calls.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "the irreversible plugin must remain behind the evidence boundary"
     );
@@ -1004,12 +985,7 @@ async fn irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode()
         .as_deref()
         .unwrap_or_default()
         .contains("no live Averin grant binding"));
-    assert_eq!(
-        fixture
-            .calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
+    assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 /// Paired availability control: the same missing Observe grant does not block a
@@ -1031,12 +1007,7 @@ async fn reversible_approval_resume_remains_fail_open_when_observe_seal_is_missi
         .unwrap();
     assert!(resumed.executed);
     assert!(resumed.result_error.is_none());
-    assert_eq!(
-        fixture
-            .calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
+    assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 /// A missing exact label must not borrow the classification of a reversible
@@ -1100,10 +1071,8 @@ async fn shared_canonical_alias_cannot_take_the_direct_path() {
     let mut config = Config::default();
     config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
     config.enforcement.require_declared_capabilities = true;
-    config.action_labels = std::collections::HashMap::from([(
-        "data.read".to_string(),
-        "count.run".to_string(),
-    )]);
+    config.action_labels =
+        std::collections::HashMap::from([("data.read".to_string(), "count.run".to_string())]);
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4418,7 +4387,11 @@ async fn test_v12_dual_control_requires_two_distinct_approvers_e2e() {
         .await
         .unwrap();
     let a = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(a.status(), ApprovalStatus::Pending, "1 of 2 → still pending");
+    assert_eq!(
+        a.status(),
+        ApprovalStatus::Pending,
+        "1 of 2 → still pending"
+    );
     assert_eq!(a.signoffs().len(), 1);
 
     // The same approver can't satisfy the second sign-off.

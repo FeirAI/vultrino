@@ -424,6 +424,27 @@ touch action latency; it remains fail-open (a token never depends on averin).
 - **Unchanged:** the production default is `enabled = false`. Plan 087 makes
   enabling SAFE and READY; it does not flip the switch on any deployment.
 
+### D8 exact-operation evidence
+
+`[averin] d8_complete_evidence = true` replaces the legacy one-phase use seal
+for each admitted invocation with an exact credential/action,
+`single_operation` grant, a synchronous `/v2/use-intent` before plugin
+dispatch, and a matching `/v2/use-outcome` after dispatch. The outer Vultrino
+use token remains the authorization envelope; it is not reused as the D8 grant.
+
+This mode is deliberately default-off and availability-coupled to Averin. A
+failed grant or intent write denies before the plugin can act. If a plugin
+returns an error, Vultrino records an `error` outcome; if an action completes
+but its outcome cannot be recorded, the client receives a committed error and
+verification retains the incomplete intent rather than overstating closure.
+Streaming invocations close the outcome only at their terminal state, so a
+dropped stream is likewise visible as incomplete evidence.
+
+The flag supplies only the broker-side exact-operation records. A deployment
+may claim D8 only when Averin also pins a signed action taxonomy, verifies an
+attested checkpoint chain, receives a coverage manifest whose side-effect
+closure is closed, and all remaining D8 verifier conjuncts pass.
+
 ## 11. Plan 087 hardening — the six adversarial-review fixes
 
 An adversarial review of the §10 landing found six issues (all verified against

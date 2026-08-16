@@ -344,9 +344,9 @@ impl AverinDeadLetterStore {
     pub async fn has_replayable_for_subject(&self, subject: &str) -> Result<bool, StorageError> {
         self.reload().await?;
         let c = self.cache.read();
-        Ok(c.entries
-            .values()
-            .any(|r| r.event.subject == subject && r.status == QuarantineStatus::Open && !r.params_purged))
+        Ok(c.entries.values().any(|r| {
+            r.event.subject == subject && r.status == QuarantineStatus::Open && !r.params_purged
+        }))
     }
 
     // ---- internal persistence (mirrors PopKeyStore's locked_mutate / reload on its own file) ----
@@ -485,7 +485,10 @@ impl AverinDeadLetterStore {
     /// quarantine file exists yet (nothing to re-encrypt). [`DEADLETTER_FILE_VERSION`] is PRESERVED
     /// — a re-key rotates the key, never the format. On any error the live file is left untouched
     /// (fail-closed). Mirrors `OutboxStore::rekey_prepare` exactly.
-    pub(super) fn rekey_prepare(&self, new_key: &MasterKey) -> Result<Option<PathBuf>, StorageError> {
+    pub(super) fn rekey_prepare(
+        &self,
+        new_key: &MasterKey,
+    ) -> Result<Option<PathBuf>, StorageError> {
         let mut flock = self.lock_file_exclusive()?;
         let _guard = flock.write().map_err(StorageError::Io)?;
         if !self.path.exists() {
@@ -619,8 +622,14 @@ mod tests {
             !dbg.contains("SUPER_SECRET_PARAMS"),
             "Debug output must not print raw params: {dbg}"
         );
-        assert!(dbg.contains("tok-a"), "non-sensitive fields must still print: {dbg}");
-        assert!(dbg.contains("redacted"), "must show the redaction marker: {dbg}");
+        assert!(
+            dbg.contains("tok-a"),
+            "non-sensitive fields must still print: {dbg}"
+        );
+        assert!(
+            dbg.contains("redacted"),
+            "must show the redaction marker: {dbg}"
+        );
     }
 
     #[tokio::test]
@@ -630,10 +639,16 @@ mod tests {
             .await
             .unwrap();
         assert!(s.ack(1).await.unwrap());
-        assert_eq!(s.list().await.unwrap()[0].status, QuarantineStatus::Acknowledged);
+        assert_eq!(
+            s.list().await.unwrap()[0].status,
+            QuarantineStatus::Acknowledged
+        );
         // Idempotent: already-acknowledged re-ack is a no-op, still returns true (found).
         assert!(s.ack(1).await.unwrap());
-        assert!(!s.ack(999).await.unwrap(), "unknown sequence is false, not an error");
+        assert!(
+            !s.ack(999).await.unwrap(),
+            "unknown sequence is false, not an error"
+        );
     }
 
     #[tokio::test]
@@ -651,7 +666,10 @@ mod tests {
         s.ack(2).await.unwrap(); // already acknowledged -> abandon must not touch it
 
         let changed = s.abandon("tok-a").await.unwrap();
-        assert_eq!(changed, 1, "only the still-Open tok-a record is newly abandoned");
+        assert_eq!(
+            changed, 1,
+            "only the still-Open tok-a record is newly abandoned"
+        );
 
         let by_seq: std::collections::HashMap<u64, QuarantineStatus> = s
             .list()
@@ -661,8 +679,16 @@ mod tests {
             .map(|r| (r.event.sequence, r.status))
             .collect();
         assert_eq!(by_seq[&1], QuarantineStatus::Abandoned);
-        assert_eq!(by_seq[&2], QuarantineStatus::Acknowledged, "untouched by abandon");
-        assert_eq!(by_seq[&3], QuarantineStatus::Open, "different subject, untouched");
+        assert_eq!(
+            by_seq[&2],
+            QuarantineStatus::Acknowledged,
+            "untouched by abandon"
+        );
+        assert_eq!(
+            by_seq[&3],
+            QuarantineStatus::Open,
+            "different subject, untouched"
+        );
     }
 
     #[tokio::test]
@@ -673,7 +699,10 @@ mod tests {
             .unwrap();
         assert!(s.purge(1).await.unwrap());
         assert_eq!(s.entry_count().await.unwrap(), 0);
-        assert!(!s.purge(1).await.unwrap(), "already gone -- false, not an error");
+        assert!(
+            !s.purge(1).await.unwrap(),
+            "already gone -- false, not an error"
+        );
     }
 
     #[tokio::test]
@@ -692,10 +721,7 @@ mod tests {
     #[tokio::test]
     async fn replay_fails_closed_on_unknown_abandoned_acknowledged_or_purged() {
         let (s, _d) = store();
-        assert!(matches!(
-            s.replay(1).await,
-            Err(StorageError::NotFound(_))
-        ));
+        assert!(matches!(s.replay(1).await, Err(StorageError::NotFound(_))));
 
         s.quarantine(use_event(2, "tok-a", "p"), Utc::now())
             .await
@@ -740,7 +766,10 @@ mod tests {
             .await
             .unwrap();
         let event = s.replay(11).await.unwrap();
-        assert_eq!(event.sequence, 11, "an averin.use in the same Open/unpurged state still replays");
+        assert_eq!(
+            event.sequence, 11,
+            "an averin.use in the same Open/unpurged state still replays"
+        );
     }
 
     #[tokio::test]
@@ -757,7 +786,10 @@ mod tests {
 
         let cutoff = Utc::now() - chrono::Duration::days(7);
         let purged = s.purge_expired_params(cutoff).await.unwrap();
-        assert_eq!(purged, 1, "only the record dead-lettered before the cutoff is redacted");
+        assert_eq!(
+            purged, 1,
+            "only the record dead-lettered before the cutoff is redacted"
+        );
 
         let by_seq: std::collections::HashMap<u64, QuarantineRecord> = s
             .list()
@@ -781,10 +813,15 @@ mod tests {
     async fn contains_reflects_presence_regardless_of_status() {
         let (s, _d) = store();
         assert!(!s.contains(1).await.unwrap());
-        s.quarantine(use_event(1, "tok-a", "p"), Utc::now()).await.unwrap();
+        s.quarantine(use_event(1, "tok-a", "p"), Utc::now())
+            .await
+            .unwrap();
         assert!(s.contains(1).await.unwrap());
         s.ack(1).await.unwrap();
-        assert!(s.contains(1).await.unwrap(), "Acknowledged is still present, not gone");
+        assert!(
+            s.contains(1).await.unwrap(),
+            "Acknowledged is still present, not gone"
+        );
         assert!(s.purge(1).await.unwrap());
         assert!(!s.contains(1).await.unwrap(), "purge actually removes it");
     }
@@ -799,7 +836,9 @@ mod tests {
             "no quarantined record at all -> not replayable"
         );
 
-        s.quarantine(use_event(1, "tok-a", "p"), Utc::now()).await.unwrap();
+        s.quarantine(use_event(1, "tok-a", "p"), Utc::now())
+            .await
+            .unwrap();
         assert!(
             s.has_replayable_for_subject("tok-a").await.unwrap(),
             "a fresh Open, unpurged record IS replayable"
@@ -814,12 +853,16 @@ mod tests {
         assert!(!s.has_replayable_for_subject("tok-a").await.unwrap());
 
         // Abandoned -> no longer replayable either.
-        s.quarantine(use_event(2, "tok-c", "p"), Utc::now()).await.unwrap();
+        s.quarantine(use_event(2, "tok-c", "p"), Utc::now())
+            .await
+            .unwrap();
         s.abandon("tok-c").await.unwrap();
         assert!(!s.has_replayable_for_subject("tok-c").await.unwrap());
 
         // Open but past its params-purge window -> no longer replayable (mirrors `replay`'s own gate).
-        s.quarantine(use_event(3, "tok-d", "p"), Utc::now()).await.unwrap();
+        s.quarantine(use_event(3, "tok-d", "p"), Utc::now())
+            .await
+            .unwrap();
         let cutoff = Utc::now() + chrono::Duration::seconds(1);
         s.purge_expired_params(cutoff).await.unwrap();
         assert!(!s.has_replayable_for_subject("tok-d").await.unwrap());

@@ -2669,7 +2669,9 @@ pub fn summarize(credential: &str, action: &str, params: &serde_json::Value) -> 
 fn generate_decision_token() -> (String, String) {
     use rand::TryRng;
     let mut bytes = [0u8; 32];
-    rand::rngs::SysRng.try_fill_bytes(&mut bytes).expect("SysRng failure");
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("SysRng failure");
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     let hash = hash_decision_token(&token);
     (token, hash)
@@ -3474,10 +3476,7 @@ mod tests {
         assert_eq!(aggregator_key_prefix("alice@example.com"), None);
         // A cryptographically request-bound broker subject strips only its
         // provenance marker and is never classified as a bearer-key claim.
-        assert_eq!(
-            bare_approver_identity("verified:sub-alice"),
-            "sub-alice"
-        );
+        assert_eq!(bare_approver_identity("verified:sub-alice"), "sub-alice");
         assert_eq!(aggregator_key_prefix("verified:sub-alice"), None);
         // agg:<key-id>:<operator> → bare operator + key prefix.
         let id = "agg:11111111-2222-3333-4444-555555555555:alice@example.com";
@@ -4074,7 +4073,11 @@ mod tests {
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "Extreme".to_string();
-        assert_eq!(a.criticality, CriticalityClass::Medium, "local criticality is not the authority");
+        assert_eq!(
+            a.criticality,
+            CriticalityClass::Medium,
+            "local criticality is not the authority"
+        );
         approve_as(&mut a, "alice@corp", ApproverClass::Teammate, None, None).unwrap();
         a.deny(Decision::new("admin panel", "carol@corp")).unwrap();
         assert_eq!(
@@ -4099,7 +4102,10 @@ mod tests {
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
         };
         let mut a = new_approval_with_rule(rule);
-        assert_eq!(a.authoritative_risk_tier, "", "default is the unresolved worst case");
+        assert_eq!(
+            a.authoritative_risk_tier, "",
+            "default is the unresolved worst case"
+        );
         approve_as(&mut a, "alice@corp", ApproverClass::Teammate, None, None).unwrap();
         a.deny(Decision::new("admin panel", "carol@corp")).unwrap();
         assert_eq!(
@@ -4188,7 +4194,14 @@ mod tests {
         // Same bare subject `alice@corp` via two DIFFERENT aggregator keys. The
         // second is rejected at decision time: waiting until grant re-derivation
         // would leave a misleading stored Approved/Pending history.
-        approve_as(&mut a, "agg:key-a:alice@corp", ApproverClass::Teammate, None, None).unwrap();
+        approve_as(
+            &mut a,
+            "agg:key-a:alice@corp",
+            ApproverClass::Teammate,
+            None,
+            None,
+        )
+        .unwrap();
         let duplicate = approve_as(
             &mut a,
             "agg:key-b:alice@corp",
@@ -4209,7 +4222,14 @@ mod tests {
             "one bare subject via two aggregator keys fills only ONE of the two teammate slots"
         );
         // A GENUINELY distinct bare subject fills the second slot and clears the recipe.
-        approve_as(&mut a, "agg:key-b:bob@corp", ApproverClass::Teammate, None, None).unwrap();
+        approve_as(
+            &mut a,
+            "agg:key-b:bob@corp",
+            ApproverClass::Teammate,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             a.status,
             ApprovalStatus::Approved,
@@ -4317,7 +4337,10 @@ mod tests {
         // Ordinary token: no dual_control, numeric threshold is 1 — the guard would be
         // skipped if it keyed on effective_required_approvals() alone.
         assert_eq!(a.effective_required_approvals(), 1);
-        assert!(a.same_aggregator_key_guard_active(true), "recipe activates the guard");
+        assert!(
+            a.same_aggregator_key_guard_active(true),
+            "recipe activates the guard"
+        );
         // First teammate via aggregator key A, under HARD SoD.
         let mut d1 = Decision::new("json-api", "agg:keyA:fake-alice@corp")
             .with_resolved_class(ApproverClass::Teammate)
@@ -4333,7 +4356,11 @@ mod tests {
         d2.approver_kind = "human".to_string();
         let err = a.approve(d2).unwrap_err();
         assert!(matches!(err, ApprovalError::SameAggregatorKey));
-        assert_eq!(a.signoffs.len(), 1, "the same-key second sign-off was not recorded");
+        assert_eq!(
+            a.signoffs.len(),
+            1,
+            "the same-key second sign-off was not recorded"
+        );
         assert_eq!(
             a.status,
             ApprovalStatus::Pending,
@@ -4368,7 +4395,7 @@ mod tests {
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "High".to_string(); // majority honored: dissent non-terminal
-        // Carol DISSENTS through tenant aggregator key K.
+                                                        // Carol DISSENTS through tenant aggregator key K.
         let carol = Decision::new("json-api", "agg:keyK:carol@corp")
             .with_resolved_class(ApproverClass::Teammate);
         a.deny(carol).unwrap();
@@ -4415,7 +4442,11 @@ mod tests {
             .enforcing_sod(true);
         bob.approver_kind = "human".to_string();
         a.approve(bob).unwrap();
-        assert_eq!(a.status, ApprovalStatus::Pending, "a teammate does not satisfy {{senior:1}}");
+        assert_eq!(
+            a.status,
+            ApprovalStatus::Pending,
+            "a teammate does not satisfy {{senior:1}}"
+        );
         // A senior approves through the SAME key K — the first CONTRIBUTING positive.
         let mut alice = Decision::new("json-api", "agg:keyK:alice@corp")
             .with_resolved_class(ApproverClass::Senior)
@@ -4579,8 +4610,8 @@ mod tests {
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "Medium".to_string();
         // A sign-off with a RESOLVED Teammate class but a BLANK Kind (corrupt/legacy).
-        let mut decision = Decision::new("admin panel", "alice@corp")
-            .with_resolved_class(ApproverClass::Teammate);
+        let mut decision =
+            Decision::new("admin panel", "alice@corp").with_resolved_class(ApproverClass::Teammate);
         decision.approver_kind = "  ".to_string(); // blank/whitespace
         a.approve(decision).unwrap();
         assert_eq!(a.signoffs.len(), 1, "the sign-off is still recorded");

@@ -63,7 +63,8 @@ fn scrub_plaintext_secrets(input: &str) -> String {
             lower.find("vwa_").map(|i| (i, 4)),
             lower.find("bearer ").map(|i| (i, 7)),
         ];
-        let Some((idx, prefix_len)) = candidates.into_iter().flatten().min_by_key(|(i, _)| *i) else {
+        let Some((idx, prefix_len)) = candidates.into_iter().flatten().min_by_key(|(i, _)| *i)
+        else {
             out.push_str(rest);
             break;
         };
@@ -71,7 +72,9 @@ fn scrub_plaintext_secrets(input: &str) -> String {
         out.push_str(REDACTED);
         rest = &rest[idx + prefix_len..];
         let end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '=')))
+            .find(|c: char| {
+                !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '='))
+            })
             .unwrap_or(rest.len());
         rest = &rest[end..];
     }
@@ -1430,13 +1433,28 @@ mod tests {
             }
         }"#;
         let out = sanitize_log_str(raw);
-        assert!(!out.contains("vk_live_secret"), "api_key must be redacted: {out}");
-        assert!(!out.contains("upstream-secret"), "Authorization header must be redacted: {out}");
-        assert!(!out.contains("vut_abc123"), "body secret prefix must be scrubbed: {out}");
+        assert!(
+            !out.contains("vk_live_secret"),
+            "api_key must be redacted: {out}"
+        );
+        assert!(
+            !out.contains("upstream-secret"),
+            "Authorization header must be redacted: {out}"
+        );
+        assert!(
+            !out.contains("vut_abc123"),
+            "body secret prefix must be scrubbed: {out}"
+        );
         assert!(out.contains(REDACTED), "redaction marker expected: {out}");
-        assert!(out.contains("https://example.com"), "non-secret fields must survive: {out}");
+        assert!(
+            out.contains("https://example.com"),
+            "non-secret fields must survive: {out}"
+        );
         // Header values are redacted; keys remain so logs stay diagnosable.
-        assert!(out.contains("Authorization"), "header names should remain: {out}");
+        assert!(
+            out.contains("Authorization"),
+            "header names should remain: {out}"
+        );
     }
 
     #[test]

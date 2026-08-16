@@ -269,7 +269,9 @@ async fn require_evidence_streaming_denies_when_seal_fails() {
         .execute_gated_streaming(echo_request(), exec_auth_for(&token))
         .await;
     let err = match result {
-        Ok(_) => panic!("RequireEvidence streaming must DENY when the seal fails — no stream may open"),
+        Ok(_) => {
+            panic!("RequireEvidence streaming must DENY when the seal fails — no stream may open")
+        }
         Err(e) => e,
     };
 

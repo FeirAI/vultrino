@@ -201,7 +201,12 @@ async fn http_rejects_unsupported_protocol_version_and_cross_origin_requests() {
         .headers_mut()
         .insert("mcp-protocol-version", "2099-01-01".parse().unwrap());
     assert_ne!(
-        router.clone().oneshot(newer_version).await.unwrap().status(),
+        router
+            .clone()
+            .oneshot(newer_version)
+            .await
+            .unwrap()
+            .status(),
         StatusCode::BAD_REQUEST
     );
 

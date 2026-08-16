@@ -706,7 +706,11 @@ impl Config {
             govder: None,
             // Plan 088 D6 — `TryInto` (was `Into`): the `[averin] durable = true` +
             // `mode = "require_evidence"` combination is rejected here at config load.
-            averin: raw.averin.map(TryInto::try_into).transpose()?.unwrap_or_default(),
+            averin: raw
+                .averin
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
             internal_destinations,
         })
     }

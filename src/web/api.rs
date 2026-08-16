@@ -3521,7 +3521,10 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
         *by_status.entry(a.status().to_string()).or_default() += 1;
         // Decision latency for decided requests (approved or denied).
         if let Some(decided) = a.decided_at {
-            if matches!(a.status(), ApprovalStatus::Approved | ApprovalStatus::Denied) {
+            if matches!(
+                a.status(),
+                ApprovalStatus::Approved | ApprovalStatus::Denied
+            ) {
                 latencies_secs.push((decided - a.created_at).num_seconds().max(0));
             }
         }

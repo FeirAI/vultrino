@@ -126,13 +126,21 @@ fn load() -> Doc {
         "vector file cap != MAX_RECIPE_TERM_COUNT — the cap moved, so the exhaustive domain and \
          every sweep digest below is stated over the OLD cap and no longer proves anything"
     );
-    assert_eq!(doc.u32_max, u32::MAX, "u32_max in the vector file is not u32::MAX");
+    assert_eq!(
+        doc.u32_max,
+        u32::MAX,
+        "u32_max in the vector file is not u32::MAX"
+    );
     assert!(
         doc.vectors.len() >= 40,
         "vector file has only {} explicit vectors — it was truncated, not extended",
         doc.vectors.len()
     );
-    assert_eq!(doc.sweeps.len(), 4, "a sweep was dropped from the vector file");
+    assert_eq!(
+        doc.sweeps.len(),
+        4,
+        "a sweep was dropped from the vector file"
+    );
     doc
 }
 
@@ -160,7 +168,12 @@ struct Acc {
 
 impl Acc {
     fn new() -> Self {
-        Self { h: Sha256::new(), buf: Vec::with_capacity(1 << 20), n: 0, n_sat: 0 }
+        Self {
+            h: Sha256::new(),
+            buf: Vec::with_capacity(1 << 20),
+            n: 0,
+            n_sat: 0,
+        }
     }
 
     fn emit(&mut self, v: bool) {
@@ -248,14 +261,24 @@ fn vectors_satisfied_matches_the_shared_contract() {
         );
         let got = recipe_satisfied(&r, v.avail.senior, v.avail.teammate, v.avail.agent_reviewer);
         assert_eq!(
-            got, v.satisfied,
+            got,
+            v.satisfied,
             "[{}] recipe_satisfied({:?}, s={} t={} a={}) = {}, want {}  ({})",
-            v.id, r.terms, v.avail.senior, v.avail.teammate, v.avail.agent_reviewer, got,
-            v.satisfied, v.note
+            v.id,
+            r.terms,
+            v.avail.senior,
+            v.avail.teammate,
+            v.avail.agent_reviewer,
+            got,
+            v.satisfied,
+            v.note
         );
         checked += 1;
     }
-    assert!(checked >= 40, "only {checked} representable vectors were checked");
+    assert!(
+        checked >= 40,
+        "only {checked} representable vectors were checked"
+    );
 }
 
 /// The rows the Go half exercises but this side structurally cannot: a negative
@@ -284,7 +307,10 @@ fn vectors_unrepresentable_rows_really_are_unrepresentable() {
         );
         checked += 1;
     }
-    assert!(checked >= 2, "only {checked} unrepresentable rows — the claim is barely exercised");
+    assert!(
+        checked >= 2,
+        "only {checked} unrepresentable rows — the claim is barely exercised"
+    );
 }
 
 /// The item-7 hard guard as a standalone property over the explicit rows: no
@@ -299,11 +325,19 @@ fn vectors_agent_reviewer_terms_are_unsatisfiable() {
             continue;
         }
         let r: Recipe = serde_json::from_value(v.recipe.clone()).unwrap();
-        if !r.terms.iter().any(|t| t.class == ApproverClass::AgentReviewer) {
+        if !r
+            .terms
+            .iter()
+            .any(|t| t.class == ApproverClass::AgentReviewer)
+        {
             continue;
         }
         checked += 1;
-        assert!(!v.satisfied, "[{}] the vector file claims an agent-reviewer recipe is satisfiable", v.id);
+        assert!(
+            !v.satisfied,
+            "[{}] the vector file claims an agent-reviewer recipe is satisfiable",
+            v.id
+        );
         for avail in [0u32, 1, super::MAX_RECIPE_TERM_COUNT, u32::MAX] {
             assert!(
                 !recipe_satisfied(&r, avail, avail, avail),
@@ -313,7 +347,10 @@ fn vectors_agent_reviewer_terms_are_unsatisfiable() {
             );
         }
     }
-    assert!(checked >= 3, "only {checked} agent-reviewer vectors — the guard is barely exercised");
+    assert!(
+        checked >= 3,
+        "only {checked} agent-reviewer vectors — the guard is barely exercised"
+    );
 }
 
 // --- exhaustive sweeps ------------------------------------------------------
@@ -382,19 +419,32 @@ fn sweep_cap_cliff_exhaustive() {
     let s = sweep_by_id(&doc, "cap-cliff");
     let mut acc = Acc::new();
     let mut recipes: Vec<Recipe> = Vec::with_capacity(s.recipes);
-    for class in [ApproverClass::Senior, ApproverClass::Teammate, ApproverClass::AgentReviewer] {
+    for class in [
+        ApproverClass::Senior,
+        ApproverClass::Teammate,
+        ApproverClass::AgentReviewer,
+    ] {
         for c in 0..=(super::MAX_RECIPE_TERM_COUNT + 2) {
-            recipes.push(Recipe { terms: vec![term(class, c)] });
+            recipes.push(Recipe {
+                terms: vec![term(class, c)],
+            });
         }
     }
     for c1 in 0..=(super::MAX_RECIPE_TERM_COUNT + 2) {
         for c2 in 0..=(super::MAX_RECIPE_TERM_COUNT + 2) {
             recipes.push(Recipe {
-                terms: vec![term(ApproverClass::Senior, c1), term(ApproverClass::Teammate, c2)],
+                terms: vec![
+                    term(ApproverClass::Senior, c1),
+                    term(ApproverClass::Teammate, c2),
+                ],
             });
         }
     }
-    assert_eq!(recipes.len(), s.recipes, "cap-cliff recipe count moved away from the frozen spec");
+    assert_eq!(
+        recipes.len(),
+        s.recipes,
+        "cap-cliff recipe count moved away from the frozen spec"
+    );
     for r in &recipes {
         for &avs in &s.avail_values {
             for &avt in &s.avail_values {
@@ -532,15 +582,60 @@ fn matching_oracle_is_discriminating() {
     /// `(need_s, need_t, need_a, avail_s, avail_t, avail_a, want, why)`.
     type OracleCase = (u32, u32, u32, u32, u32, u32, bool, &'static str);
     let cases: &[OracleCase] = &[
-        (1, 0, 0, 0, 5, 0, false, "no teammate can ever fill a senior slot"),
+        (
+            1,
+            0,
+            0,
+            0,
+            5,
+            0,
+            false,
+            "no teammate can ever fill a senior slot",
+        ),
         (0, 1, 0, 1, 0, 0, true, "a senior fills a teammate slot"),
-        (1, 1, 0, 1, 0, 0, false, "ONE senior cannot fill BOTH slots (injectivity)"),
+        (
+            1,
+            1,
+            0,
+            1,
+            0,
+            0,
+            false,
+            "ONE senior cannot fill BOTH slots (injectivity)",
+        ),
         (1, 1, 0, 2, 0, 0, true, "two seniors fill senior+teammate"),
         (1, 1, 0, 1, 1, 0, true, "the natural fill"),
-        (0, 0, 1, 0, 9, 0, false, "humans cannot fill an agent-reviewer slot"),
-        (0, 0, 1, 0, 0, 1, true, "an agent-reviewer fills an agent-reviewer slot"),
+        (
+            0,
+            0,
+            1,
+            0,
+            9,
+            0,
+            false,
+            "humans cannot fill an agent-reviewer slot",
+        ),
+        (
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            true,
+            "an agent-reviewer fills an agent-reviewer slot",
+        ),
         (2, 3, 0, 2, 3, 0, true, "exact fill"),
-        (2, 3, 0, 1, 9, 0, false, "seniors are not substitutable downward"),
+        (
+            2,
+            3,
+            0,
+            1,
+            9,
+            0,
+            false,
+            "seniors are not substitutable downward",
+        ),
         (0, 0, 0, 0, 0, 0, true, "zero slots are vacuously matchable"),
     ];
     for &(ns, nt, na, avs, avt, ava, want, why) in cases {

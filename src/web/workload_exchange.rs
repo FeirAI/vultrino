@@ -350,12 +350,14 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn verifier_secrets() -> Result<Vec<Zeroizing<Vec<u8>>>, &'static str> {
-    let value = Zeroizing::new(match std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET_FILE") {
-        Ok(path) if !path.trim().is_empty() => fs::read_to_string(path)
-            .map_err(|_| "workload assertion verifier file cannot be read")?,
-        _ => std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET")
-            .map_err(|_| "workload assertion verifier is not configured")?,
-    });
+    let value = Zeroizing::new(
+        match std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET_FILE") {
+            Ok(path) if !path.trim().is_empty() => fs::read_to_string(path)
+                .map_err(|_| "workload assertion verifier file cannot be read")?,
+            _ => std::env::var("VULTRINO_WORKLOAD_ASSERTION_SECRET")
+                .map_err(|_| "workload assertion verifier is not configured")?,
+        },
+    );
     // A comma-separated LIST of verifier secrets (dual-secret overlap for rotation); a single value is a
     // 1-element list = the pre-rotation behavior. Each non-blank entry is trimmed and must be >= 32
     // bytes. An all-blank/empty configuration yields no secrets → fail closed (never verify against no
@@ -756,9 +758,7 @@ mod tests {
         assert!(verify_assertion(&token, &[Zeroizing::new(secret.to_vec())]).is_ok());
         assert!(verify_assertion(
             &token,
-            &[Zeroizing::new(
-                b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_vec()
-            )]
+            &[Zeroizing::new(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_vec())]
         )
         .is_err());
         // Dual-secret overlap: the token verifies as long as its signing secret is ANYWHERE in the

@@ -326,6 +326,45 @@ async fn test_signed_delivery_end_to_end_and_marks_delivered() {
 }
 
 #[tokio::test]
+async fn test_disabled_outbox_does_not_deliver_or_consume_events() {
+    let storage = storage().await;
+    let seq = storage
+        .append_event(
+            "poll-only",
+            "meter.observed",
+            serde_json::json!({"amount": 1}),
+        )
+        .await
+        .unwrap();
+    let config = OutboxConfig {
+        enabled: false,
+        url: Some("http://127.0.0.1:1/hook".to_string()),
+        hmac_secret: Some("shared-hmac-secret".to_string()),
+        max_attempts: 3,
+        retention_secs: 3600,
+    };
+    let metrics = vultrino::server::OutboxMetrics::default();
+
+    vultrino::server::deliver_outbox_once(&storage, &config, &reqwest::Client::new(), &metrics)
+        .await
+        .unwrap();
+
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    assert_eq!(events.len(), 1, "poll-only events remain in the feed");
+    assert_eq!(events[0].sequence, seq);
+    assert_eq!(events[0].delivery, DeliveryState::Pending);
+    assert!(storage
+        .deliverable_events(100)
+        .await
+        .unwrap()
+        .iter()
+        .any(|e| e.sequence == seq));
+    let snap = metrics.snapshot();
+    assert_eq!(snap.delivered, 0);
+    assert_eq!(snap.failed, 0);
+}
+
+#[tokio::test]
 async fn test_failed_delivery_is_recorded_and_backed_off() {
     let storage = storage().await;
     // Mock consumer that always 500s.

@@ -311,7 +311,9 @@ pub async fn clear_session(session: &Session) -> Result<(), StatusCode> {
 /// Generate a new CSRF token and store it in the session
 pub async fn generate_csrf_token(session: &Session) -> Result<String, StatusCode> {
     let mut bytes = [0u8; 32];
-    rand::rngs::SysRng.try_fill_bytes(&mut bytes).expect("SysRng failure");
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("SysRng failure");
     let token = URL_SAFE_NO_PAD.encode(bytes);
 
     session
@@ -384,7 +386,9 @@ mod tests {
     fn test_csrf_token_generation() {
         // Test that generated tokens are the correct length and format
         let mut bytes = [0u8; 32];
-        rand::rngs::SysRng.try_fill_bytes(&mut bytes).expect("SysRng failure");
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("SysRng failure");
         let token = URL_SAFE_NO_PAD.encode(bytes);
 
         // Base64 URL-safe encoding of 32 bytes = 43 characters

@@ -176,7 +176,9 @@ pub fn credential_binding(capability: &str) -> Result<String, PopError> {
 pub fn random_params_nonce_hex() -> String {
     use rand::TryRng;
     let mut b = [0u8; 32];
-    rand::rngs::SysRng.try_fill_bytes(&mut b).expect("SysRng failure");
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut b)
+        .expect("SysRng failure");
     hex::encode(b)
 }
 
@@ -216,7 +218,13 @@ mod tests {
     #[test]
     fn grant_challenge_is_sorted_key_compact_json() {
         // Exactly what Go's sorted-map json.Marshal emits: alphabetical keys, no spaces.
-        let c = grant_challenge("db.query:orders-ro", "agent-1", "AAAA", "orders-db", "read:orders");
+        let c = grant_challenge(
+            "db.query:orders-ro",
+            "agent-1",
+            "AAAA",
+            "orders-db",
+            "read:orders",
+        );
         assert_eq!(
             String::from_utf8(c).unwrap(),
             r#"{"action":"db.query:orders-ro","agent_id":"agent-1","agent_pubkey":"AAAA","resource":"orders-db","scope":"read:orders","tag":"averin.broker.pop.v1"}"#

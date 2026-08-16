@@ -169,7 +169,9 @@ pub fn generate_salt() -> Vec<u8> {
 pub fn encrypt(plaintext: &[u8], key: &MasterKey) -> Result<EncryptedData, CryptoError> {
     // Generate random nonce
     let mut nonce_bytes = [0u8; NONCE_SIZE];
-    SysRng.try_fill_bytes(&mut nonce_bytes).expect("SysRng failure");
+    SysRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .expect("SysRng failure");
     let nonce = Nonce::from(nonce_bytes);
 
     // Create cipher and encrypt

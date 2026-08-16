@@ -268,7 +268,9 @@ impl PopKeyStore {
                 .entries
                 .iter()
                 .filter(|(_, e)| {
-                    e.abandoned || e.grant_expires_at.is_some_and(|expires_at| expires_at <= now)
+                    e.abandoned
+                        || e.grant_expires_at
+                            .is_some_and(|expires_at| expires_at <= now)
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -435,7 +437,10 @@ impl PopKeyStore {
     /// file exists yet (nothing to re-encrypt). [`POPKEY_FILE_VERSION`] is PRESERVED — a re-key
     /// rotates the key, never the format. On any error the live file is left untouched (fail-closed).
     /// Mirrors `OutboxStore::rekey_prepare` exactly.
-    pub(super) fn rekey_prepare(&self, new_key: &MasterKey) -> Result<Option<PathBuf>, StorageError> {
+    pub(super) fn rekey_prepare(
+        &self,
+        new_key: &MasterKey,
+    ) -> Result<Option<PathBuf>, StorageError> {
         let mut flock = self.lock_file_exclusive()?;
         let _guard = flock.write().map_err(StorageError::Io)?;
         if !self.path.exists() {
@@ -623,7 +628,10 @@ mod tests {
     async fn eviction_skips_an_unresolved_subject_regardless_of_predicates() {
         let (s, _d) = store();
         s.insert("tok-pending", entry([1u8; 32])).await.unwrap(); // grant never delivered, not abandoned
-        let evicted = s.evict_resolved(Utc::now(), |_| false, |_| false).await.unwrap();
+        let evicted = s
+            .evict_resolved(Utc::now(), |_| false, |_| false)
+            .await
+            .unwrap();
         assert_eq!(evicted, 0, "an unresolved subject is never evicted");
         assert_eq!(s.entry_count().await.unwrap(), 1);
     }
@@ -637,9 +645,15 @@ mod tests {
         let now = Utc::now();
         let expires_at = now + chrono::Duration::hours(1); // still valid
         s.insert("tok-1", entry([1u8; 32])).await.unwrap();
-        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, Some(expires_at))
-            .await
-            .unwrap();
+        s.grant_resolved(
+            "tok-1",
+            "cap".into(),
+            "grant-1".into(),
+            now,
+            Some(expires_at),
+        )
+        .await
+        .unwrap();
         // No pending use, no dead letter, but the grant hasn't expired yet → must NOT evict.
         let evicted = s.evict_resolved(now, |_| false, |_| false).await.unwrap();
         assert_eq!(
@@ -668,7 +682,10 @@ mod tests {
         .unwrap();
         // A GC tick running strictly AFTER expiry, still nothing outstanding → evict.
         let after_expiry = expires_at + chrono::Duration::seconds(1);
-        let evicted = s.evict_resolved(after_expiry, |_| false, |_| false).await.unwrap();
+        let evicted = s
+            .evict_resolved(after_expiry, |_| false, |_| false)
+            .await
+            .unwrap();
         assert_eq!(
             evicted, 1,
             "an expired grant with nothing outstanding must be evicted"
@@ -682,9 +699,15 @@ mod tests {
         let now = Utc::now();
         let expires_at = now - chrono::Duration::hours(1); // already expired -> a candidate
         s.insert("tok-1", entry([1u8; 32])).await.unwrap();
-        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, Some(expires_at))
-            .await
-            .unwrap();
+        s.grant_resolved(
+            "tok-1",
+            "cap".into(),
+            "grant-1".into(),
+            now,
+            Some(expires_at),
+        )
+        .await
+        .unwrap();
         // A candidate (expired), but a pending/leased use still exists for the subject → must NOT evict.
         let evicted = s
             .evict_resolved(now, |subj| subj == "tok-1", |_| false)
@@ -700,9 +723,15 @@ mod tests {
         let now = Utc::now();
         let expires_at = now - chrono::Duration::hours(1); // already expired -> a candidate
         s.insert("tok-1", entry([1u8; 32])).await.unwrap();
-        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, Some(expires_at))
-            .await
-            .unwrap();
+        s.grant_resolved(
+            "tok-1",
+            "cap".into(),
+            "grant-1".into(),
+            now,
+            Some(expires_at),
+        )
+        .await
+        .unwrap();
         // A candidate (expired), no live use, but a replayable dead-lettered use still exists → must NOT evict.
         let evicted = s
             .evict_resolved(now, |_| false, |subj| subj == "tok-1")
@@ -721,9 +750,15 @@ mod tests {
         let now = Utc::now();
         let expires_at = now - chrono::Duration::hours(1); // already expired
         s.insert("tok-1", entry([1u8; 32])).await.unwrap();
-        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, Some(expires_at))
-            .await
-            .unwrap();
+        s.grant_resolved(
+            "tok-1",
+            "cap".into(),
+            "grant-1".into(),
+            now,
+            Some(expires_at),
+        )
+        .await
+        .unwrap();
         let evicted = s.evict_resolved(now, |_| false, |_| false).await.unwrap();
         assert_eq!(
             evicted, 1,
@@ -740,13 +775,21 @@ mod tests {
         let (s, _d) = store();
         s.insert("tok-1", entry([1u8; 32])).await.unwrap();
         assert_eq!(
-            s.evict_resolved(Utc::now(), |_| false, |_| false).await.unwrap(),
+            s.evict_resolved(Utc::now(), |_| false, |_| false)
+                .await
+                .unwrap(),
             0,
             "not resolved yet — neither abandoned nor expired (never delivered)"
         );
         assert!(s.mark_abandoned("tok-1").await.unwrap());
-        let evicted = s.evict_resolved(Utc::now(), |_| false, |_| false).await.unwrap();
-        assert_eq!(evicted, 1, "abandoned satisfies rule (a) without a delivered grant");
+        let evicted = s
+            .evict_resolved(Utc::now(), |_| false, |_| false)
+            .await
+            .unwrap();
+        assert_eq!(
+            evicted, 1,
+            "abandoned satisfies rule (a) without a delivered grant"
+        );
     }
 
     /// Task-required case: an abandoned subject is evicted regardless of expiry — even a grant
@@ -757,9 +800,15 @@ mod tests {
         let now = Utc::now();
         let expires_at = now + chrono::Duration::hours(1); // still far from expiry
         s.insert("tok-1", entry([1u8; 32])).await.unwrap();
-        s.grant_resolved("tok-1", "cap".into(), "grant-1".into(), now, Some(expires_at))
-            .await
-            .unwrap();
+        s.grant_resolved(
+            "tok-1",
+            "cap".into(),
+            "grant-1".into(),
+            now,
+            Some(expires_at),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             s.evict_resolved(now, |_| false, |_| false).await.unwrap(),
             0,
@@ -813,6 +862,9 @@ mod tests {
             .evict_resolved(now, unknown_is_blocking, |_| false)
             .await
             .unwrap();
-        assert_eq!(evicted, 0, "an unevaluable predicate must retain, never evict");
+        assert_eq!(
+            evicted, 0,
+            "an unevaluable predicate must retain, never evict"
+        );
     }
 }
