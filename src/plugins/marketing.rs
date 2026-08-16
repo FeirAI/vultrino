@@ -76,7 +76,12 @@ struct BufferReadParams {
 struct BufferDraftParams {
     base_url: String,
     channel_id: String,
+    account_id: String,
     text: String,
+    media_hash: String,
+    content_hash: String,
+    row_version: String,
+    due_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,7 +89,12 @@ struct BufferDraftParams {
 struct BufferScheduleParams {
     base_url: String,
     post_id: String,
+    channel_id: String,
+    account_id: String,
     text: String,
+    media_hash: String,
+    content_hash: String,
+    row_version: String,
     due_at: String,
 }
 
@@ -93,6 +103,87 @@ struct BufferScheduleParams {
 struct BufferPostParams {
     base_url: String,
     post_id: String,
+    channel_id: String,
+    account_id: String,
+    text: String,
+    media_hash: String,
+    content_hash: String,
+    row_version: String,
+    due_at: String,
+}
+
+fn validate_frozen_buffer_fields(
+    channel_id: &str,
+    account_id: &str,
+    text: &str,
+    media_hash: &str,
+    content_hash: &str,
+    row_version: &str,
+    due_at: &str,
+) -> Result<(), PluginError> {
+    for (name, value) in [
+        ("channel_id", channel_id),
+        ("account_id", account_id),
+        ("text", text),
+        ("media_hash", media_hash),
+        ("content_hash", content_hash),
+        ("row_version", row_version),
+        ("due_at", due_at),
+    ] {
+        if value.is_empty() {
+            return Err(PluginError::InvalidParams(format!(
+                "Buffer frozen payload field {name} must be non-empty"
+            )));
+        }
+    }
+    if content_hash.len() != 64 || !content_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(PluginError::InvalidParams(
+            "Buffer frozen payload content_hash must be 64 hexadecimal characters".to_string(),
+        ));
+    }
+    if row_version
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .is_none()
+    {
+        return Err(PluginError::InvalidParams(
+            "Buffer frozen payload row_version must be a positive decimal version".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_content_hash(value: &str, action: &str) -> Result<(), PluginError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(PluginError::InvalidParams(format!(
+            "{action} content_hash must be exactly 64 hexadecimal characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_positive_row_version(value: &str) -> Result<u64, PluginError> {
+    let version = value.parse::<u64>().map_err(|_| {
+        PluginError::InvalidParams(
+            "expected_row_version must be a positive decimal row version".to_string(),
+        )
+    })?;
+    if version == 0 {
+        return Err(PluginError::InvalidParams(
+            "expected_row_version must be a positive decimal row version".to_string(),
+        ));
+    }
+    Ok(version)
+}
+
+fn validate_post_id(value: &str) -> Result<(), PluginError> {
+    if value.is_empty() {
+        return Err(PluginError::InvalidParams(
+            "Buffer mutation post_id must be non-empty".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_base_url(raw: &str, expected: &str) -> Result<reqwest::Url, PluginError> {
@@ -232,9 +323,16 @@ async fn send_buffer_json(
     client: &Client,
     url: reqwest::Url,
     credential: &Credential,
-    body: Value,
+    query: &'static str,
+    variables: Value,
 ) -> Result<ExecuteResponse, PluginError> {
-    let response = send_json(client, url, credential, body).await?;
+    let response = send_json(
+        client,
+        url,
+        credential,
+        json!({"query": query, "variables": variables}),
+    )
+    .await?;
     let document: Value = serde_json::from_slice(&response.body).map_err(|e| {
         PluginError::ExecutionFailed(format!("Buffer upstream returned non-JSON: {e}"))
     })?;
@@ -275,17 +373,34 @@ impl SheetsPlugin {
     }
 
     fn validate_typed(action: &str, params: &Value) -> Result<(), PluginError> {
-        let result = match action {
-            "read" => serde_json::from_value::<SheetsReadParams>(params.clone()).map(|_| ()),
+        match action {
+            "read" => serde_json::from_value::<SheetsReadParams>(params.clone())
+                .map(|_| ())
+                .map_err(|error| PluginError::InvalidParams(error.to_string())),
             "append_draft" => {
-                serde_json::from_value::<SheetsAppendParams>(params.clone()).map(|_| ())
+                let p = serde_json::from_value::<SheetsAppendParams>(params.clone())
+                    .map_err(|error| PluginError::InvalidParams(error.to_string()))?;
+                if p.state != "Draft" || p.row_version != "1" || p.updated_by != "m45ve" {
+                    return Err(PluginError::InvalidParams(
+                        "append_draft only creates Draft rows at row_version 1 by m45ve"
+                            .to_string(),
+                    ));
+                }
+                validate_content_hash(&p.content_hash, "append_draft")
             }
             "revise_draft" => {
-                serde_json::from_value::<SheetsReviseParams>(params.clone()).map(|_| ())
+                let p = serde_json::from_value::<SheetsReviseParams>(params.clone())
+                    .map_err(|error| PluginError::InvalidParams(error.to_string()))?;
+                validate_positive_row_version(&p.expected_row_version)?;
+                if p.state != "Draft" || p.updated_by != "m45ve" {
+                    return Err(PluginError::InvalidParams(
+                        "revise_draft only revises Draft rows by m45ve".to_string(),
+                    ));
+                }
+                validate_content_hash(&p.content_hash, "revise_draft")
             }
-            _ => return Err(PluginError::UnsupportedAction(action.to_string())),
-        };
-        result.map_err(|e| PluginError::InvalidParams(e.to_string()))
+            _ => Err(PluginError::UnsupportedAction(action.to_string())),
+        }
     }
 
     async fn execute_typed(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
@@ -512,67 +627,181 @@ impl BufferPlugin {
     }
 
     fn validate_typed(action: &str, params: &Value) -> Result<(), PluginError> {
-        let result = match action {
+        match action {
             "accounts_read" | "channels_read" => {
-                serde_json::from_value::<BufferReadParams>(params.clone()).map(|_| ())
+                serde_json::from_value::<BufferReadParams>(params.clone())
+                    .map(|_| ())
+                    .map_err(|error| PluginError::InvalidParams(error.to_string()))
             }
-            "draft" => serde_json::from_value::<BufferDraftParams>(params.clone()).map(|_| ()),
+            "draft" => {
+                let p = serde_json::from_value::<BufferDraftParams>(params.clone())
+                    .map_err(|error| PluginError::InvalidParams(error.to_string()))?;
+                validate_frozen_buffer_fields(
+                    &p.channel_id,
+                    &p.account_id,
+                    &p.text,
+                    &p.media_hash,
+                    &p.content_hash,
+                    &p.row_version,
+                    &p.due_at,
+                )
+            }
             "schedule" => {
-                serde_json::from_value::<BufferScheduleParams>(params.clone()).map(|_| ())
+                let p = serde_json::from_value::<BufferScheduleParams>(params.clone())
+                    .map_err(|error| PluginError::InvalidParams(error.to_string()))?;
+                validate_post_id(&p.post_id)?;
+                validate_frozen_buffer_fields(
+                    &p.channel_id,
+                    &p.account_id,
+                    &p.text,
+                    &p.media_hash,
+                    &p.content_hash,
+                    &p.row_version,
+                    &p.due_at,
+                )
             }
             "publish" | "cancel_delete" => {
-                serde_json::from_value::<BufferPostParams>(params.clone()).map(|_| ())
+                let p = serde_json::from_value::<BufferPostParams>(params.clone())
+                    .map_err(|error| PluginError::InvalidParams(error.to_string()))?;
+                validate_post_id(&p.post_id)?;
+                validate_frozen_buffer_fields(
+                    &p.channel_id,
+                    &p.account_id,
+                    &p.text,
+                    &p.media_hash,
+                    &p.content_hash,
+                    &p.row_version,
+                    &p.due_at,
+                )
             }
             _ => return Err(PluginError::UnsupportedAction(action.to_string())),
-        };
-        result.map_err(|e| PluginError::InvalidParams(e.to_string()))
+        }
     }
 
     async fn execute_typed(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
-        let (base_url, query) = match request.action.as_str() {
+        const ACCOUNT_QUERY: &str = "query EveAccount { account { id organizations { id name } } }";
+        const CHANNELS_QUERY: &str =
+            "query EveChannels($input: ChannelsInput!) { channels(input: $input) { id name service organizationId } }";
+        const DRAFT_QUERY: &str =
+            "mutation EveDraft($input: CreatePostInput!) { createPost(input: $input) { ... on PostActionSuccess { post { id text status } } ... on MutationError { message } } }";
+        const SCHEDULE_QUERY: &str =
+            "mutation EveSchedule($input: EditPostInput!) { editPost(input: $input) { ... on PostActionSuccess { post { id text status dueAt } } ... on MutationError { message } } }";
+        const PUBLISH_QUERY: &str =
+            "mutation EvePublish($input: EditPostInput!) { editPost(input: $input) { ... on PostActionSuccess { post { id status } } ... on MutationError { message } } }";
+        const DELETE_QUERY: &str =
+            "mutation EveDelete($input: DeletePostInput!) { deletePost(input: $input) { ... on DeletePostSuccess { id } ... on MutationError { message } } }";
+
+        let (base_url, query, variables) = match request.action.as_str() {
             "accounts_read" => {
                 let p: BufferReadParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
-                (
-                    p.base_url,
-                    "query EveAccount { account { id organizations { id name } } }".to_string(),
-                )
+                (p.base_url, ACCOUNT_QUERY, json!({}))
             }
             "channels_read" => {
                 let p: BufferReadParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
-                (p.base_url, format!("query EveChannels {{ channels(input: {{ organizationId: \"{}\" }}) {{ id name service organizationId }} }}", p.organization_id))
+                (
+                    p.base_url,
+                    CHANNELS_QUERY,
+                    json!({"input": {"organizationId": p.organization_id}}),
+                )
             }
             "draft" => {
                 let p: BufferDraftParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
-                (p.base_url, format!("mutation EveDraft {{ createPost(input: {{ text: \"{}\", channelId: \"{}\", schedulingType: automatic, mode: addToQueue, saveToDraft: true }}) {{ ... on PostActionSuccess {{ post {{ id text status }} }} ... on MutationError {{ message }} }} }}", escape_graphql(&p.text), escape_graphql(&p.channel_id)))
+                validate_frozen_buffer_fields(
+                    &p.channel_id,
+                    &p.account_id,
+                    &p.text,
+                    &p.media_hash,
+                    &p.content_hash,
+                    &p.row_version,
+                    &p.due_at,
+                )?;
+                (
+                    p.base_url,
+                    DRAFT_QUERY,
+                    json!({"input": {
+                        "text": p.text,
+                        "channelId": p.channel_id,
+                        "dueAt": p.due_at,
+                        "schedulingType": "automatic",
+                        "mode": "addToQueue",
+                        "saveToDraft": true
+                    }}),
+                )
             }
             "schedule" => {
                 let p: BufferScheduleParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
-                (p.base_url, format!("mutation EveSchedule {{ editPost(input: {{ id: \"{}\", text: \"{}\", schedulingType: automatic, mode: customScheduled, dueAt: \"{}\" }}) {{ ... on PostActionSuccess {{ post {{ id text status dueAt }} }} ... on MutationError {{ message }} }} }}", escape_graphql(&p.post_id), escape_graphql(&p.text), escape_graphql(&p.due_at)))
+                validate_post_id(&p.post_id)?;
+                validate_frozen_buffer_fields(
+                    &p.channel_id,
+                    &p.account_id,
+                    &p.text,
+                    &p.media_hash,
+                    &p.content_hash,
+                    &p.row_version,
+                    &p.due_at,
+                )?;
+                (
+                    p.base_url,
+                    SCHEDULE_QUERY,
+                    json!({"input": {
+                        "id": p.post_id,
+                        "text": p.text,
+                        "schedulingType": "automatic",
+                        "mode": "customScheduled",
+                        "dueAt": p.due_at
+                    }}),
+                )
             }
             "publish" => {
                 let p: BufferPostParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
-                (p.base_url, format!("mutation EvePublish {{ editPost(input: {{ id: \"{}\", mode: shareNow, schedulingType: automatic }}) {{ ... on PostActionSuccess {{ post {{ id status }} }} ... on MutationError {{ message }} }} }}", escape_graphql(&p.post_id)))
+                validate_post_id(&p.post_id)?;
+                validate_frozen_buffer_fields(
+                    &p.channel_id,
+                    &p.account_id,
+                    &p.text,
+                    &p.media_hash,
+                    &p.content_hash,
+                    &p.row_version,
+                    &p.due_at,
+                )?;
+                (
+                    p.base_url,
+                    PUBLISH_QUERY,
+                    json!({"input": {
+                        "id": p.post_id,
+                        "mode": "shareNow",
+                        "schedulingType": "automatic"
+                    }}),
+                )
             }
             "cancel_delete" => {
                 let p: BufferPostParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
-                (p.base_url, format!("mutation EveDelete {{ deletePost(input: {{ id: \"{}\" }}) {{ ... on DeletePostSuccess {{ id }} ... on MutationError {{ message }} }} }}", escape_graphql(&p.post_id)))
+                validate_post_id(&p.post_id)?;
+                validate_frozen_buffer_fields(
+                    &p.channel_id,
+                    &p.account_id,
+                    &p.text,
+                    &p.media_hash,
+                    &p.content_hash,
+                    &p.row_version,
+                    &p.due_at,
+                )?;
+                (
+                    p.base_url,
+                    DELETE_QUERY,
+                    json!({"input": {"id": p.post_id}}),
+                )
             }
             action => return Err(PluginError::UnsupportedAction(action.to_string())),
         };
         let base = validate_base_url(&base_url, BUFFER_BASE_URL)?;
-        send_buffer_json(
-            &self.client,
-            base,
-            &request.credential,
-            json!({"query": query}),
-        )
-        .await
+        send_buffer_json(&self.client, base, &request.credential, query, variables).await
     }
 }
 
@@ -606,13 +835,6 @@ impl Plugin for BufferPlugin {
     fn validate_params(&self, action: &str, params: &Value) -> Result<(), PluginError> {
         Self::validate_typed(action, params)
     }
-}
-
-fn escape_graphql(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
 }
 
 #[cfg(test)]
@@ -700,13 +922,73 @@ mod tests {
     async fn draft_sends_fixed_mutation_to_fake_upstream() {
         let (base_url, seen) = server().await;
         let plugin = BufferPlugin::with_client(Client::new());
-        let response = plugin.execute(PluginRequest { credential: credential(), action: "draft".into(), params: json!({"base_url": base_url, "channel_id":"pinned-channel", "text":"hello \"world\""}), context: RequestContext::default() }).await.unwrap();
+        let response = plugin.execute(PluginRequest { credential: credential(), action: "draft".into(), params: json!({
+            "base_url": base_url,
+            "channel_id":"pinned-channel",
+            "account_id":"pinned-account",
+            "text":"hello \"world\"",
+            "media_hash":"media-1",
+            "content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "row_version":"2",
+            "due_at":"2026-08-20T09:00:00Z"
+        }), context: RequestContext::default() }).await.unwrap();
         assert_eq!(response.status, 200);
         let query = seen.lock()["query"].as_str().unwrap().to_string();
         assert!(query.contains("mutation EveDraft"));
-        assert!(query.contains("pinned-channel"));
-        assert!(query.contains("saveToDraft: true"));
+        assert!(query.contains("$input: CreatePostInput!"));
+        assert!(!query.contains("pinned-channel"));
+        assert!(!query.contains("hello"));
+        assert!(!query.contains("saveToDraft"));
         assert!(!query.contains("publishNow"));
+        assert_eq!(
+            seen.lock()["variables"]["input"]["channelId"],
+            "pinned-channel"
+        );
+        assert_eq!(seen.lock()["variables"]["input"]["text"], "hello \"world\"");
+    }
+
+    #[test]
+    fn buffer_mutations_require_the_complete_frozen_payload() {
+        let missing = json!({
+            "base_url": BUFFER_BASE_URL,
+            "channel_id": "channel",
+            "text": "copy"
+        });
+        assert!(matches!(
+            BufferPlugin::validate_typed("draft", &missing),
+            Err(PluginError::InvalidParams(_))
+        ));
+
+        let invalid_hash = json!({
+            "base_url": BUFFER_BASE_URL,
+            "channel_id": "channel",
+            "account_id": "account",
+            "text": "copy",
+            "media_hash": "media",
+            "content_hash": "not-a-hash",
+            "row_version": "1",
+            "due_at": "2026-08-20T09:00:00Z"
+        });
+        assert!(matches!(
+            BufferPlugin::validate_typed("draft", &invalid_hash),
+            Err(PluginError::InvalidParams(_))
+        ));
+
+        let missing_post_id = json!({
+            "base_url": BUFFER_BASE_URL,
+            "post_id": "",
+            "channel_id": "channel",
+            "account_id": "account",
+            "text": "copy",
+            "media_hash": "media",
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "row_version": "1",
+            "due_at": "2026-08-20T09:00:00Z"
+        });
+        assert!(matches!(
+            BufferPlugin::validate_typed("publish", &missing_post_id),
+            Err(PluginError::InvalidParams(message)) if message.contains("post_id")
+        ));
     }
 
     #[tokio::test]
