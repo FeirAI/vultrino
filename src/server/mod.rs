@@ -816,6 +816,11 @@ impl VultrinoServer {
         plugins.register(Arc::new(crate::plugins::InternalHttpPlugin::new(
             config.internal_destinations.clone(),
         )));
+        // Typed marketing connectors. Their capability target parameters pin
+        // the upstream endpoint and account/range identifiers; the plugins do
+        // not accept caller-supplied HTTP methods or GraphQL documents.
+        plugins.register(Arc::new(crate::plugins::SheetsPlugin::new()));
+        plugins.register(Arc::new(crate::plugins::BufferPlugin::new()));
         let policy_engine = Arc::new(PolicyEngine::new());
         let auth_manager = Arc::new(AuthManager::new());
 
