@@ -18,6 +18,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+const MAX_INPUT_SCHEMA_DEPTH: usize = 32;
+
 fn default_reversible() -> String {
     "reversible".to_string()
 }
@@ -313,6 +315,7 @@ impl Capability {
         if self.credential_ref.trim().is_empty() {
             return Err("capability credential_ref must not be empty".to_string());
         }
+        validate_input_schema_definition(&self.input_schema)?;
         match self.reversibility.trim() {
             "reversible" | "partially-reversible" | "irreversible" => {}
             other => {
@@ -631,6 +634,266 @@ impl Capability {
         }
         schema
     }
+
+    /// Validate caller arguments against the operator-declared capability schema.
+    ///
+    /// `mcp_input_schema` is an LLM-facing advertisement, not an enforcement
+    /// boundary. This validator is deliberately kept in the capability module so
+    /// every MCP transport reaches the same pre-execution check through
+    /// `build_action_params`. It implements the bounded subset used by Feir
+    /// capability catalogs: object/array/string/number/integer/boolean/null
+    /// types, const, enum, required, additionalProperties, nested properties and
+    /// string/array size limits.
+    fn validate_input(&self, args: &serde_json::Value) -> Result<(), String> {
+        let schema = if self.input_schema.is_object() {
+            &self.input_schema
+        } else {
+            // A missing schema is the legacy spelling for an empty object schema.
+            // Arguments are still required to be an object, matching MCP.
+            return validate_json_schema(
+                &serde_json::json!({"type": "object", "properties": {}}),
+                args,
+                "$",
+                0,
+            );
+        };
+        validate_json_schema(schema, args, "$", 0)
+    }
+}
+
+fn validate_input_schema_definition(schema: &serde_json::Value) -> Result<(), String> {
+    if schema.is_null() {
+        return Ok(());
+    }
+    if !schema.is_object() {
+        return Err("capability input_schema must be a JSON Schema object".to_string());
+    }
+    validate_schema_shape(schema, "$", 0)
+}
+
+fn validate_schema_shape(
+    schema: &serde_json::Value,
+    path: &str,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_INPUT_SCHEMA_DEPTH {
+        return Err(format!(
+            "capability input_schema exceeds maximum nesting depth at {path}"
+        ));
+    }
+    let obj = schema
+        .as_object()
+        .ok_or_else(|| format!("capability input_schema at {path} must be an object"))?;
+
+    if let Some(type_value) = obj.get("type") {
+        validate_schema_type(type_value, path)?;
+    }
+    if let Some(required) = obj.get("required") {
+        let items = required
+            .as_array()
+            .ok_or_else(|| format!("input_schema.required at {path} must be an array"))?;
+        for (index, item) in items.iter().enumerate() {
+            if item.as_str().is_none() {
+                return Err(format!(
+                    "input_schema.required[{index}] at {path} must be a string"
+                ));
+            }
+        }
+    }
+    if let Some(properties) = obj.get("properties") {
+        let properties = properties
+            .as_object()
+            .ok_or_else(|| format!("input_schema.properties at {path} must be an object"))?;
+        for (name, child) in properties {
+            validate_schema_shape(child, &format!("{path}.properties.{name}"), depth + 1)?;
+        }
+    }
+    if let Some(additional) = obj.get("additionalProperties") {
+        match additional {
+            serde_json::Value::Bool(_) => {}
+            serde_json::Value::Object(_) => validate_schema_shape(
+                additional,
+                &format!("{path}.additionalProperties"),
+                depth + 1,
+            )?,
+            _ => {
+                return Err(format!(
+                    "input_schema.additionalProperties at {path} must be a boolean or schema"
+                ))
+            }
+        }
+    }
+    if let Some(items) = obj.get("items") {
+        validate_schema_shape(items, &format!("{path}.items"), depth + 1)?;
+    }
+    if let Some(enum_values) = obj.get("enum") {
+        if !enum_values.is_array() {
+            return Err(format!("input_schema.enum at {path} must be an array"));
+        }
+    }
+    for keyword in ["minLength", "maxLength", "minItems", "maxItems"] {
+        if let Some(value) = obj.get(keyword) {
+            let valid = value.as_u64().is_some();
+            if !valid {
+                return Err(format!(
+                    "input_schema.{keyword} at {path} must be a non-negative integer"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_schema_type(type_value: &serde_json::Value, path: &str) -> Result<(), String> {
+    let valid_type = |value: &str| {
+        matches!(
+            value,
+            "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
+        )
+    };
+    let valid = type_value.as_str().map(valid_type).unwrap_or_else(|| {
+        type_value
+            .as_array()
+            .map(|items| {
+                !items.is_empty()
+                    && items.iter().filter_map(|item| item.as_str()).count() == items.len()
+                    && items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .all(valid_type)
+            })
+            .unwrap_or(false)
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "input_schema.type at {path} must name a supported JSON type"
+        ))
+    }
+}
+
+fn validate_json_schema(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    path: &str,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_INPUT_SCHEMA_DEPTH {
+        return Err(format!("input exceeds maximum nesting depth at {path}"));
+    }
+    let obj = schema
+        .as_object()
+        .ok_or_else(|| format!("input schema at {path} must be an object"))?;
+
+    if let Some(expected) = obj.get("const") {
+        if value != expected {
+            return Err(format!(
+                "input at {path} does not match the required constant"
+            ));
+        }
+    }
+    if let Some(values) = obj.get("enum").and_then(|v| v.as_array()) {
+        if !values.iter().any(|candidate| candidate == value) {
+            return Err(format!("input at {path} is not one of the allowed values"));
+        }
+    }
+
+    if let Some(type_value) = obj.get("type") {
+        let type_matches = type_value
+            .as_str()
+            .map(|kind| json_type_matches(kind, value))
+            .unwrap_or_else(|| {
+                type_value
+                    .as_array()
+                    .map(|types| {
+                        types
+                            .iter()
+                            .filter_map(|kind| kind.as_str())
+                            .any(|kind| json_type_matches(kind, value))
+                    })
+                    .unwrap_or(false)
+            });
+        if !type_matches {
+            return Err(format!("input at {path} has the wrong JSON type"));
+        }
+    }
+
+    if let Some(text) = value.as_str() {
+        if let Some(min) = obj.get("minLength").and_then(|v| v.as_u64()) {
+            if text.chars().count() < min as usize {
+                return Err(format!(
+                    "input at {path} is shorter than the minimum length"
+                ));
+            }
+        }
+        if let Some(max) = obj.get("maxLength").and_then(|v| v.as_u64()) {
+            if text.chars().count() > max as usize {
+                return Err(format!("input at {path} exceeds the maximum length"));
+            }
+        }
+    }
+
+    if let Some(items) = value.as_array() {
+        if let Some(min) = obj.get("minItems").and_then(|v| v.as_u64()) {
+            if items.len() < min as usize {
+                return Err(format!("input at {path} has too few items"));
+            }
+        }
+        if let Some(max) = obj.get("maxItems").and_then(|v| v.as_u64()) {
+            if items.len() > max as usize {
+                return Err(format!("input at {path} has too many items"));
+            }
+        }
+        if let Some(item_schema) = obj.get("items") {
+            for (index, item) in items.iter().enumerate() {
+                validate_json_schema(item_schema, item, &format!("{path}[{index}]"), depth + 1)?;
+            }
+        }
+    }
+
+    if let Some(properties) = value.as_object() {
+        if let Some(required) = obj.get("required").and_then(|v| v.as_array()) {
+            for name in required.iter().filter_map(|v| v.as_str()) {
+                if !properties.contains_key(name) {
+                    return Err(format!(
+                        "input is missing required field '{name}' at {path}"
+                    ));
+                }
+            }
+        }
+        let property_schemas = obj.get("properties").and_then(|v| v.as_object());
+        for (name, child) in properties {
+            if let Some(child_schema) = property_schemas.and_then(|schemas| schemas.get(name)) {
+                validate_json_schema(child_schema, child, &format!("{path}.{name}"), depth + 1)?;
+            } else if obj.get("additionalProperties").and_then(|v| v.as_bool()) == Some(false) {
+                return Err(format!("input contains unknown field '{name}' at {path}"));
+            } else if let Some(additional_schema) =
+                obj.get("additionalProperties").filter(|v| v.is_object())
+            {
+                validate_json_schema(
+                    additional_schema,
+                    child,
+                    &format!("{path}.{name}"),
+                    depth + 1,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn json_type_matches(kind: &str, value: &serde_json::Value) -> bool {
+    match kind {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => false,
+    }
 }
 
 /// The plugin name of the operator-pinned internal transport (F8). Kept here as
@@ -713,6 +976,13 @@ pub fn build_action_params(
     plugin_name: &str,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    if !args.is_object() {
+        return Err("capability arguments must be a JSON object".to_string());
+    }
+    // The schema shown by tools/list is advisory to the model. Enforce the
+    // operator's contract here, before execute_gated can consume a use token or
+    // open an approval. This is the shared seam for every named capability.
+    capability.validate_input(args)?;
     let args_obj = args.as_object().cloned().unwrap_or_default();
 
     if plugin_name == "http" {
@@ -964,6 +1234,81 @@ mod tests {
     }
 
     #[test]
+    fn test_build_action_params_enforces_nested_schema_constraints() {
+        let mut c = cap("brand_context_write");
+        c.input_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "method": { "const": "PATCH" },
+                "body": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "updates": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 2,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "text": { "type": "string", "minLength": 1, "maxLength": 32 }
+                                },
+                                "required": ["text"]
+                            }
+                        }
+                    },
+                    "required": ["updates"]
+                }
+            },
+            "required": ["method", "body"]
+        });
+
+        let valid = serde_json::json!({
+            "method": "PATCH",
+            "body": { "updates": [{ "text": "hello" }] }
+        });
+        assert!(build_action_params(&c, "http", &valid).is_ok());
+
+        for invalid in [
+            serde_json::json!({
+                "method": "POST",
+                "body": { "updates": [{ "text": "hello" }] }
+            }),
+            serde_json::json!({
+                "method": "PATCH",
+                "body": { "updates": [{ "text": "" }] }
+            }),
+            serde_json::json!({
+                "method": "PATCH",
+                "body": { "updates": [{ "text": "hello" }] },
+                "account_id": "attacker-controlled"
+            }),
+            serde_json::json!({ "method": "PATCH" }),
+        ] {
+            assert!(
+                build_action_params(&c, "http", &invalid).is_err(),
+                "invalid capability input must be refused: {invalid}"
+            );
+        }
+        assert!(build_action_params(&c, "http", &serde_json::json!("not an object")).is_err());
+    }
+
+    #[test]
+    fn test_capability_validation_rejects_malformed_schema() {
+        let mut c = cap("send_email");
+        c.input_schema = serde_json::json!({
+            "type": "object",
+            "properties": { "body": { "type": "not-a-json-type" } }
+        });
+        let err = c
+            .validate()
+            .expect_err("malformed schema must fail at registration");
+        assert!(err.contains("supported JSON type"), "{err}");
+    }
+
+    #[test]
     fn test_build_http_params_uses_target_defaults() {
         let c = cap("send_email");
         // LLM supplies only a body; method/url default from the capability target.
@@ -977,7 +1322,11 @@ mod tests {
     #[test]
     fn test_build_http_params_llm_can_override_within_policy() {
         let c = cap("send_email");
-        let args = serde_json::json!({ "method": "get", "url": "https://api.sendgrid.com/v3/x" });
+        let args = serde_json::json!({
+            "method": "get",
+            "url": "https://api.sendgrid.com/v3/x",
+            "body": {}
+        });
         let params = build_action_params(&c, "http", &args).unwrap();
         // Method upper-cased; url is the LLM's (policy then enforces the glob).
         assert_eq!(params["method"], "GET");
@@ -994,7 +1343,8 @@ mod tests {
         .unwrap()
         .clone();
         let args = serde_json::json!({
-            "headers": { "notion-version": "caller", "x-operator": "caller", "X-Other": "kept" }
+            "headers": { "notion-version": "caller", "x-operator": "caller", "X-Other": "kept" },
+            "body": {}
         });
         let params = build_action_params(&c, "http", &args).unwrap();
         let headers = params["headers"].as_object().unwrap();
@@ -1248,7 +1598,7 @@ mod tests {
                 .clone(),
         };
         // The agent tries to override the pinned database; the capability wins.
-        let args = serde_json::json!({ "sql": "SELECT 1", "database": "evil" });
+        let args = serde_json::json!({ "sql": "SELECT 1", "database": "evil", "body": {} });
         let params = build_action_params(&c, "postgres", &args).unwrap();
         assert_eq!(params["sql"], "SELECT 1");
         assert_eq!(params["database"], "prod");

@@ -267,6 +267,60 @@ async fn denied_principal_tools_call_is_rejected_not_bypassed() {
 }
 
 #[tokio::test]
+async fn direct_tools_call_schema_violation_fails_before_token_consumption() {
+    let (_dir, storage) = new_storage().await;
+    store_credential(&storage, "cred-sendgrid").await;
+    let mut cap = register_capability(&storage, "cred-sendgrid").await;
+    cap.input_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "body": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": { "subject": { "type": "string", "minLength": 1 } },
+                "required": ["subject"]
+            }
+        },
+        "required": ["body"]
+    });
+    storage.store_capability(&cap).await.unwrap();
+    let token = mint_token(&storage, "cred-sendgrid", Some("http.request")).await;
+
+    let mut mcp = build_mcp(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        storage.clone(),
+    )
+    .await;
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+        "params": {
+            "name": "send_email",
+            "arguments": {
+                "api_key": token,
+                "body": { "subject": "approved-looking" },
+                "account_id": "attacker-controlled"
+            }
+        }
+    });
+    let resp = mcp.handle_jsonrpc(&call.to_string()).await.unwrap();
+    let value = serde_json::to_value(&resp).unwrap();
+    assert_eq!(value["result"]["isError"], serde_json::json!(true));
+    let text = value["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("unknown field"),
+        "schema refusal was not surfaced: {text}"
+    );
+
+    let tokens = storage.list_use_tokens().await.unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(
+        tokens[0].uses, 0,
+        "schema failure must not consume the use token"
+    );
+}
+
+#[tokio::test]
 async fn no_policy_default_deny_blocks_capability_call() {
     let (_dir, storage) = new_storage().await;
     store_credential(&storage, "cred-sendgrid").await;
