@@ -217,6 +217,7 @@ pub enum CredentialData {
     },
 
     /// OAuth2 credentials
+    #[serde(rename = "oauth2")]
     OAuth2 {
         client_id: String,
         client_secret: Secret,
@@ -1005,6 +1006,19 @@ mod tests {
         assert!(mats.iter().any(|m| m == "atoken"));
         assert!(mats.iter().any(|m| m == "rtoken"));
         assert!(mats.iter().any(|m| m == &STANDARD.encode("cid:csecret")));
+    }
+
+    #[test]
+    fn oauth2_wire_discriminator_matches_public_api_contract() {
+        let data: CredentialData = serde_json::from_str(
+            r#"{"type":"oauth2","client_id":"client","client_secret":"secret","refresh_token":"refresh","token_url":"https://oauth2.googleapis.com/token","scopes":["scope"]}"#,
+        )
+        .expect("the documented oauth2 discriminator must deserialize");
+        assert!(matches!(data, CredentialData::OAuth2 { .. }));
+        assert!(serde_json::from_str::<CredentialData>(
+            r#"{"type":"o_auth2","client_id":"client","client_secret":"secret","token_url":"https://example.com/token"}"#
+        )
+        .is_err());
     }
 
     #[test]
