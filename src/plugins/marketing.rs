@@ -29,6 +29,8 @@ const PIPELINE_CONTENT_HASH: usize = 14;
 const PIPELINE_UPDATED_AT: usize = 20;
 const PIPELINE_UPDATED_BY: usize = 21;
 const PIPELINE_SOURCE_IDS: usize = 22;
+const PENDING_REVIEW_STATE: &str = "Pending Review";
+const FEIR_APPROVAL_ACTOR: &str = "feir_approval";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -715,7 +717,7 @@ impl SheetsPlugin {
                     p.media_brief,
                     p.asset_url,
                     p.asset_hash,
-                    "Draft",
+                    PENDING_REVIEW_STATE,
                     p.lucas_notes,
                     p.publish_at,
                     p.row_version,
@@ -726,7 +728,7 @@ impl SheetsPlugin {
                     "0",
                     "",
                     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-                    "m45ve",
+                    FEIR_APPROVAL_ACTOR,
                     serde_json::to_string(&source_ids)
                         .map_err(|error| PluginError::InvalidParams(error.to_string()))?
                 ]]);
@@ -803,10 +805,17 @@ impl SheetsPlugin {
                         current_cells.len()
                     )));
                 }
-                if current_cells.get(PIPELINE_STATE).and_then(Value::as_str) != Some("Draft") {
+                let current_state = current_cells
+                    .get(PIPELINE_STATE)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !matches!(
+                    current_state,
+                    "Draft" | "Revision Requested" | "Pending Review"
+                ) {
                     return Err(PluginError::InvalidParams(format!(
-                        "variant_id '{}' is not in Draft state and cannot be revised",
-                        p.variant_id
+                        "variant_id '{}' is in state '{}' and cannot receive a governed draft revision",
+                        p.variant_id, current_state
                     )));
                 }
                 let current_version = current_cells
@@ -828,6 +837,7 @@ impl SheetsPlugin {
                 next_row[PIPELINE_DRAFT_COPY] = Value::String(p.draft_copy);
                 next_row[PIPELINE_MEDIA_BRIEF] = Value::String(p.media_brief);
                 next_row[PIPELINE_LUCAS_NOTES] = Value::String(p.lucas_notes);
+                next_row[PIPELINE_STATE] = Value::String(PENDING_REVIEW_STATE.to_string());
                 let next_row_version = expected_row_version.checked_add(1).ok_or_else(|| {
                     PluginError::InvalidParams("row_version overflow".to_string())
                 })?;
@@ -842,7 +852,7 @@ impl SheetsPlugin {
                 next_row[PIPELINE_CONTENT_HASH] = Value::String(p.content_hash);
                 next_row[PIPELINE_UPDATED_AT] =
                     Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
-                next_row[PIPELINE_UPDATED_BY] = Value::String("m45ve".to_string());
+                next_row[PIPELINE_UPDATED_BY] = Value::String(FEIR_APPROVAL_ACTOR.to_string());
                 let url = base
                     .join(&format!(
                         "v4/spreadsheets/{}/values/Pipeline!A{}:W{}?valueInputOption=RAW",
@@ -1175,7 +1185,7 @@ mod tests {
     async fn pipeline_get() -> axum::Json<Value> {
         axum::Json(json!({"values": [
             ["campaign_id", "variant_id", "channel", "account_id", "audience", "content_type", "draft_copy", "media_brief", "asset_url", "asset_hash", "state", "lucas_notes", "publish_at", "row_version", "content_hash", "approval_id", "buffer_post_id", "published_url", "attempt_count", "last_error", "updated_at", "updated_by", "source_ids"],
-            ["camp-1", "var-1", "linkedin", "lucas-linkedin", "builders", "text", "old", "", "", "", "Draft", "", "", "1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "", "", "", "0", "", "2026-08-18T00:00:00Z", "m45ve", "[\"source-1\"]"]
+            ["camp-1", "var-1", "linkedin", "lucas-linkedin", "builders", "text", "old", "", "", "", "Pending Review", "", "", "1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "", "", "", "0", "", "2026-08-18T00:00:00Z", "feir_approval", "[\"source-1\"]"]
         ]}))
     }
 
@@ -1350,7 +1360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sheets_append_writes_only_a_draft_row_to_fake_upstream() {
+    async fn sheets_append_advances_only_to_pending_review_after_the_governed_write() {
         let (base_url, seen) = sheets_server().await;
         let plugin = SheetsPlugin {
             client: Client::new(),
@@ -1388,12 +1398,12 @@ mod tests {
         let seen = seen.lock();
         let row = seen["values"][0].as_array().unwrap();
         assert_eq!(row[1], "var-1");
-        assert_eq!(row[10], "Draft");
+        assert_eq!(row[10], PENDING_REVIEW_STATE);
         assert_eq!(row[13], "1");
         assert_eq!(row.len(), PIPELINE_COLUMN_COUNT);
         assert_eq!(row[15], "");
         assert_eq!(row[18], "0");
-        assert_eq!(row[PIPELINE_UPDATED_BY], "m45ve");
+        assert_eq!(row[PIPELINE_UPDATED_BY], FEIR_APPROVAL_ACTOR);
         assert_eq!(row[PIPELINE_SOURCE_IDS], "[\"source-1\"]");
     }
 
@@ -1455,11 +1465,11 @@ mod tests {
         assert_eq!(result.status, 200);
         let row = &seen.lock()["values"][0];
         assert_eq!(row[6], "revised");
-        assert_eq!(row[10], "Draft");
+        assert_eq!(row[10], PENDING_REVIEW_STATE);
         assert_eq!(row[13], "2");
         assert_eq!(row[14], test_draft_hash("revised", ""));
         assert_eq!(row[15], "");
-        assert_eq!(row[PIPELINE_UPDATED_BY], "m45ve");
+        assert_eq!(row[PIPELINE_UPDATED_BY], FEIR_APPROVAL_ACTOR);
         assert_eq!(row[PIPELINE_SOURCE_IDS], "[\"source-1\"]");
     }
 }
