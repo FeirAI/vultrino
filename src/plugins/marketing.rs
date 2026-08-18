@@ -8,13 +8,27 @@
 use super::{Plugin, PluginError, PluginRequest};
 use crate::{Credential, CredentialData, CredentialType, ExecuteResponse};
 use async_trait::async_trait;
-use reqwest::{Client, StatusCode};
+use chrono::{DateTime, SecondsFormat, Utc};
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, sync::Arc};
 
 const SHEETS_BASE_URL: &str = "https://sheets.googleapis.com";
 const BUFFER_BASE_URL: &str = "https://api.buffer.com";
+const SHEETS_SOURCES_RANGE: &str = "Sources!A1:F100";
+const PIPELINE_COLUMN_COUNT: usize = 23;
+const PIPELINE_VARIANT_ID: usize = 1;
+const PIPELINE_DRAFT_COPY: usize = 6;
+const PIPELINE_MEDIA_BRIEF: usize = 7;
+const PIPELINE_STATE: usize = 10;
+const PIPELINE_LUCAS_NOTES: usize = 11;
+const PIPELINE_ROW_VERSION: usize = 13;
+const PIPELINE_CONTENT_HASH: usize = 14;
+const PIPELINE_UPDATED_AT: usize = 20;
+const PIPELINE_UPDATED_BY: usize = 21;
+const PIPELINE_SOURCE_IDS: usize = 22;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,15 +51,19 @@ struct SheetsAppendParams {
     audience: String,
     content_type: String,
     draft_copy: String,
+    #[serde(default)]
     media_brief: String,
+    #[serde(default)]
     asset_url: String,
+    #[serde(default)]
     asset_hash: String,
-    state: String,
+    #[serde(default)]
     lucas_notes: String,
+    #[serde(default)]
     publish_at: String,
     row_version: String,
     content_hash: String,
-    updated_by: String,
+    source_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,11 +75,11 @@ struct SheetsReviseParams {
     variant_id: String,
     expected_row_version: String,
     draft_copy: String,
+    #[serde(default)]
     media_brief: String,
+    #[serde(default)]
     lucas_notes: String,
-    state: String,
     content_hash: String,
-    updated_by: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +181,191 @@ fn validate_content_hash(value: &str, action: &str) -> Result<(), PluginError> {
     Ok(())
 }
 
+struct DraftHashPayload<'a> {
+    campaign_id: &'a str,
+    variant_id: &'a str,
+    channel: &'a str,
+    account_id: &'a str,
+    audience: &'a str,
+    content_type: &'a str,
+    draft_copy: &'a str,
+    media_brief: &'a str,
+    asset_url: &'a str,
+    asset_hash: &'a str,
+    publish_at: &'a str,
+    source_ids: Vec<String>,
+}
+
+fn normalize_source_ids(source_ids: &[String]) -> Result<Vec<String>, PluginError> {
+    if source_ids.is_empty() || source_ids.len() > 16 {
+        return Err(PluginError::InvalidParams(
+            "source_ids must contain between 1 and 16 pinned source ids".to_string(),
+        ));
+    }
+    let mut normalized = source_ids.to_vec();
+    if normalized
+        .iter()
+        .any(|id| id.is_empty() || id.chars().count() > 128)
+    {
+        return Err(PluginError::InvalidParams(
+            "source_ids entries must be non-empty and at most 128 characters".to_string(),
+        ));
+    }
+    normalized.sort();
+    if normalized.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(PluginError::InvalidParams(
+            "source_ids must not contain duplicates".to_string(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn draft_content_hash(payload: DraftHashPayload<'_>) -> Result<String, PluginError> {
+    let source_ids = normalize_source_ids(&payload.source_ids)?;
+    let mut canonical = BTreeMap::new();
+    canonical.insert("account_id", json!(payload.account_id));
+    canonical.insert("asset_hash", json!(payload.asset_hash));
+    canonical.insert("asset_url", json!(payload.asset_url));
+    canonical.insert("audience", json!(payload.audience));
+    canonical.insert("campaign_id", json!(payload.campaign_id));
+    canonical.insert("channel", json!(payload.channel));
+    canonical.insert("content_type", json!(payload.content_type));
+    canonical.insert("draft_copy", json!(payload.draft_copy));
+    canonical.insert("media_brief", json!(payload.media_brief));
+    canonical.insert("publish_at", json!(payload.publish_at));
+    canonical.insert("source_ids", json!(source_ids));
+    canonical.insert("variant_id", json!(payload.variant_id));
+    let bytes = serde_json::to_vec(&canonical).map_err(|error| {
+        PluginError::InvalidParams(format!("could not canonicalize draft payload: {error}"))
+    })?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn append_payload(params: &SheetsAppendParams) -> DraftHashPayload<'_> {
+    DraftHashPayload {
+        campaign_id: &params.campaign_id,
+        variant_id: &params.variant_id,
+        channel: &params.channel,
+        account_id: &params.account_id,
+        audience: &params.audience,
+        content_type: &params.content_type,
+        draft_copy: &params.draft_copy,
+        media_brief: &params.media_brief,
+        asset_url: &params.asset_url,
+        asset_hash: &params.asset_hash,
+        publish_at: &params.publish_at,
+        source_ids: params.source_ids.clone(),
+    }
+}
+
+fn row_payload(row: &[Value]) -> Result<DraftHashPayload<'_>, PluginError> {
+    if row.len() < PIPELINE_COLUMN_COUNT {
+        return Err(PluginError::ExecutionFailed(format!(
+            "Pipeline row has {} cells, expected at least {PIPELINE_COLUMN_COUNT}",
+            row.len()
+        )));
+    }
+    let cell = |index: usize, name: &str| {
+        row[index].as_str().ok_or_else(|| {
+            PluginError::ExecutionFailed(format!("Pipeline {name} cell is not a string"))
+        })
+    };
+    let source_ids: Vec<String> = serde_json::from_str(cell(PIPELINE_SOURCE_IDS, "source_ids")?)
+        .map_err(|error| {
+            PluginError::ExecutionFailed(format!(
+                "Pipeline source_ids cell is not a JSON string array: {error}"
+            ))
+        })?;
+    Ok(DraftHashPayload {
+        campaign_id: cell(0, "campaign_id")?,
+        variant_id: cell(1, "variant_id")?,
+        channel: cell(2, "channel")?,
+        account_id: cell(3, "account_id")?,
+        audience: cell(4, "audience")?,
+        content_type: cell(5, "content_type")?,
+        draft_copy: cell(6, "draft_copy")?,
+        media_brief: cell(7, "media_brief")?,
+        asset_url: cell(8, "asset_url")?,
+        asset_hash: cell(9, "asset_hash")?,
+        publish_at: cell(12, "publish_at")?,
+        source_ids,
+    })
+}
+
+fn validate_source_rows(
+    document: &Value,
+    requested: &[String],
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, PluginError> {
+    let requested = normalize_source_ids(requested)?;
+    let rows = document["values"].as_array().ok_or_else(|| {
+        PluginError::ExecutionFailed(
+            "Sheets Sources read did not contain a values array".to_string(),
+        )
+    })?;
+    let header = rows.first().and_then(Value::as_array).ok_or_else(|| {
+        PluginError::ExecutionFailed("Sheets Sources range has no header row".to_string())
+    })?;
+    let column = |name: &str| {
+        header
+            .iter()
+            .position(|value| value.as_str() == Some(name))
+            .ok_or_else(|| {
+                PluginError::ExecutionFailed(format!(
+                    "Sheets Sources range is missing required column {name}"
+                ))
+            })
+    };
+    let id_col = column("source_id")?;
+    let fetched_col = column("fetched_at")?;
+    let fresh_col = column("fresh_for_hours")?;
+    for requested_id in &requested {
+        let row = rows
+            .iter()
+            .skip(1)
+            .filter_map(Value::as_array)
+            .find(|row| row.get(id_col).and_then(Value::as_str) == Some(requested_id.as_str()))
+            .ok_or_else(|| {
+                PluginError::InvalidParams(format!(
+                    "source_id '{requested_id}' is not present in the pinned Sources range"
+                ))
+            })?;
+        let fetched_at = row
+            .get(fetched_col)
+            .and_then(Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .ok_or_else(|| {
+                PluginError::ExecutionFailed(format!(
+                    "source_id '{requested_id}' has an invalid fetched_at"
+                ))
+            })?;
+        let fresh_for_hours = row
+            .get(fresh_col)
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .or_else(|| value.as_i64())
+            })
+            .filter(|hours| *hours > 0 && *hours <= 24 * 365)
+            .ok_or_else(|| {
+                PluginError::ExecutionFailed(format!(
+                    "source_id '{requested_id}' has an invalid fresh_for_hours"
+                ))
+            })?;
+        let expires_at = fetched_at
+            .checked_add_signed(chrono::Duration::hours(fresh_for_hours))
+            .ok_or_else(|| PluginError::ExecutionFailed("source freshness overflow".to_string()))?;
+        if expires_at < now {
+            return Err(PluginError::InvalidParams(format!(
+                "source_id '{requested_id}' is stale"
+            )));
+        }
+    }
+    Ok(requested)
+}
+
 fn validate_positive_row_version(value: &str) -> Result<u64, PluginError> {
     let version = value.parse::<u64>().map_err(|_| {
         PluginError::InvalidParams(
@@ -256,10 +459,7 @@ async fn send_json(
         })
         .collect();
     let body = crate::plugins::read_body_capped(response).await?;
-    if status.is_server_error()
-        || status == StatusCode::UNAUTHORIZED
-        || status == StatusCode::FORBIDDEN
-    {
+    if !status.is_success() {
         return Err(PluginError::ExecutionFailed(format!(
             "marketing upstream returned {}: {}",
             status.as_u16(),
@@ -282,10 +482,13 @@ async fn send_json_method(
     body: Value,
 ) -> Result<ExecuteResponse, PluginError> {
     let headers = credential_headers(credential)?;
-    let response = client
-        .request(method, url)
-        .headers(headers)
-        .json(&body)
+    let request = client.request(method.clone(), url).headers(headers);
+    let request = if matches!(method, reqwest::Method::GET | reqwest::Method::HEAD) {
+        request
+    } else {
+        request.json(&body)
+    };
+    let response = request
         .send()
         .await
         .map_err(|e| PluginError::Http(e.to_string()))?;
@@ -301,10 +504,7 @@ async fn send_json_method(
         })
         .collect();
     let body = crate::plugins::read_body_capped(response).await?;
-    if status.is_server_error()
-        || status == StatusCode::UNAUTHORIZED
-        || status == StatusCode::FORBIDDEN
-    {
+    if !status.is_success() {
         return Err(PluginError::ExecutionFailed(format!(
             "marketing upstream returned {}: {}",
             status.as_u16(),
@@ -380,23 +580,25 @@ impl SheetsPlugin {
             "append_draft" => {
                 let p = serde_json::from_value::<SheetsAppendParams>(params.clone())
                     .map_err(|error| PluginError::InvalidParams(error.to_string()))?;
-                if p.state != "Draft" || p.row_version != "1" || p.updated_by != "m45ve" {
+                if p.row_version != "1" {
                     return Err(PluginError::InvalidParams(
-                        "append_draft only creates Draft rows at row_version 1 by m45ve"
+                        "append_draft only creates rows at row_version 1".to_string(),
+                    ));
+                }
+                validate_content_hash(&p.content_hash, "append_draft")?;
+                let expected_hash = draft_content_hash(append_payload(&p))?;
+                if p.content_hash != expected_hash {
+                    return Err(PluginError::InvalidParams(
+                        "append_draft content_hash does not match the canonical draft payload"
                             .to_string(),
                     ));
                 }
-                validate_content_hash(&p.content_hash, "append_draft")
+                Ok(())
             }
             "revise_draft" => {
                 let p = serde_json::from_value::<SheetsReviseParams>(params.clone())
                     .map_err(|error| PluginError::InvalidParams(error.to_string()))?;
                 validate_positive_row_version(&p.expected_row_version)?;
-                if p.state != "Draft" || p.updated_by != "m45ve" {
-                    return Err(PluginError::InvalidParams(
-                        "revise_draft only revises Draft rows by m45ve".to_string(),
-                    ));
-                }
                 validate_content_hash(&p.content_hash, "revise_draft")
             }
             _ => Err(PluginError::UnsupportedAction(action.to_string())),
@@ -428,18 +630,42 @@ impl SheetsPlugin {
             "append_draft" => {
                 let p: SheetsAppendParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
-                if p.state != "Draft" || p.row_version != "1" || p.updated_by != "m45ve" {
+                if p.row_version != "1" {
                     return Err(PluginError::InvalidParams(
-                        "append_draft only creates Draft rows at row_version 1 by m45ve"
+                        "append_draft only creates rows at row_version 1".to_string(),
+                    ));
+                }
+                validate_content_hash(&p.content_hash, "append_draft")?;
+                let expected_hash = draft_content_hash(append_payload(&p))?;
+                if p.content_hash != expected_hash {
+                    return Err(PluginError::InvalidParams(
+                        "append_draft content_hash does not match the canonical draft payload"
                             .to_string(),
                     ));
                 }
-                if p.content_hash.len() != 64 {
-                    return Err(PluginError::InvalidParams(
-                        "append_draft content_hash must be exactly 64 characters".to_string(),
-                    ));
-                }
                 let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
+                let sources_url = base
+                    .join(&format!(
+                        "v4/spreadsheets/{}/values/{}",
+                        urlencoding::encode(&p.spreadsheet_id),
+                        urlencoding::encode(SHEETS_SOURCES_RANGE)
+                    ))
+                    .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+                let sources = send_json_method(
+                    &self.client,
+                    reqwest::Method::GET,
+                    sources_url,
+                    &request.credential,
+                    json!({}),
+                )
+                .await?;
+                let source_document: Value =
+                    serde_json::from_slice(&sources.body).map_err(|e| {
+                        PluginError::ExecutionFailed(format!(
+                            "Sheets Sources read was not JSON: {e}"
+                        ))
+                    })?;
+                let source_ids = validate_source_rows(&source_document, &p.source_ids, Utc::now())?;
                 let url = base
                     .join(&format!(
                         "v4/spreadsheets/{}/values/{}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
@@ -457,12 +683,20 @@ impl SheetsPlugin {
                     p.media_brief,
                     p.asset_url,
                     p.asset_hash,
-                    p.state,
+                    "Draft",
                     p.lucas_notes,
                     p.publish_at,
                     p.row_version,
                     p.content_hash,
-                    p.updated_by
+                    "",
+                    "",
+                    "",
+                    "0",
+                    "",
+                    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                    "m45ve",
+                    serde_json::to_string(&source_ids)
+                        .map_err(|error| PluginError::InvalidParams(error.to_string()))?
                 ]]);
                 send_json(
                     &self.client,
@@ -485,11 +719,7 @@ impl SheetsPlugin {
                         "expected_row_version must be a positive decimal row version".to_string(),
                     ));
                 }
-                if p.state != "Draft" || p.updated_by != "m45ve" || p.content_hash.len() != 64 {
-                    return Err(PluginError::InvalidParams(
-                        "revise_draft only revises Draft rows by m45ve with a 64-character content_hash".to_string(),
-                    ));
-                }
+                validate_content_hash(&p.content_hash, "revise_draft")?;
                 // One Eve agent is the only writer in this pack. The mutex makes
                 // the read/compare/update sequence a process-local CAS, while
                 // the authoritative row_version check below protects a stale
@@ -523,8 +753,9 @@ impl SheetsPlugin {
                     .iter()
                     .enumerate()
                     .find_map(|(index, row)| {
-                        (row.get(1).and_then(Value::as_str) == Some(p.variant_id.as_str()))
-                            .then(|| (index + 1, row))
+                        (row.get(PIPELINE_VARIANT_ID).and_then(Value::as_str)
+                            == Some(p.variant_id.as_str()))
+                        .then(|| (index + 1, row))
                     })
                     .ok_or_else(|| {
                         PluginError::InvalidParams(format!(
@@ -532,8 +763,24 @@ impl SheetsPlugin {
                             p.variant_id
                         ))
                     })?;
-                let current_version = current_row
-                    .get(13)
+                let current_cells = current_row.as_array().ok_or_else(|| {
+                    PluginError::ExecutionFailed("Pipeline row was not an array".to_string())
+                })?;
+                if current_cells.len() < PIPELINE_COLUMN_COUNT {
+                    return Err(PluginError::ExecutionFailed(format!(
+                        "Pipeline row for '{}' has {} cells, expected at least {PIPELINE_COLUMN_COUNT}",
+                        p.variant_id,
+                        current_cells.len()
+                    )));
+                }
+                if current_cells.get(PIPELINE_STATE).and_then(Value::as_str) != Some("Draft") {
+                    return Err(PluginError::InvalidParams(format!(
+                        "variant_id '{}' is not in Draft state and cannot be revised",
+                        p.variant_id
+                    )));
+                }
+                let current_version = current_cells
+                    .get(PIPELINE_ROW_VERSION)
                     .and_then(Value::as_str)
                     .and_then(|value| value.parse::<u64>().ok())
                     .ok_or_else(|| {
@@ -547,25 +794,28 @@ impl SheetsPlugin {
                         p.variant_id, expected_row_version, current_version
                     )));
                 }
-                let mut next_row = current_row.as_array().cloned().ok_or_else(|| {
-                    PluginError::ExecutionFailed("Pipeline row was not an array".to_string())
-                })?;
-                while next_row.len() < 16 {
-                    next_row.push(Value::String(String::new()));
-                }
-                next_row[6] = Value::String(p.draft_copy);
-                next_row[7] = Value::String(p.media_brief);
-                next_row[10] = Value::String(p.state);
-                next_row[11] = Value::String(p.lucas_notes);
+                let mut next_row = current_cells.clone();
+                next_row[PIPELINE_DRAFT_COPY] = Value::String(p.draft_copy);
+                next_row[PIPELINE_MEDIA_BRIEF] = Value::String(p.media_brief);
+                next_row[PIPELINE_LUCAS_NOTES] = Value::String(p.lucas_notes);
                 let next_row_version = expected_row_version.checked_add(1).ok_or_else(|| {
                     PluginError::InvalidParams("row_version overflow".to_string())
                 })?;
-                next_row[13] = Value::String(next_row_version.to_string());
-                next_row[14] = Value::String(p.content_hash);
-                next_row[15] = Value::String(p.updated_by);
+                next_row[PIPELINE_ROW_VERSION] = Value::String(next_row_version.to_string());
+                let expected_hash = draft_content_hash(row_payload(&next_row)?)?;
+                if p.content_hash != expected_hash {
+                    return Err(PluginError::InvalidParams(
+                        "revise_draft content_hash does not match the canonical revised payload"
+                            .to_string(),
+                    ));
+                }
+                next_row[PIPELINE_CONTENT_HASH] = Value::String(p.content_hash);
+                next_row[PIPELINE_UPDATED_AT] =
+                    Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+                next_row[PIPELINE_UPDATED_BY] = Value::String("m45ve".to_string());
                 let url = base
                     .join(&format!(
-                        "v4/spreadsheets/{}/values/Pipeline!A{}:P{}?valueInputOption=RAW",
+                        "v4/spreadsheets/{}/values/Pipeline!A{}:W{}?valueInputOption=RAW",
                         urlencoding::encode(&p.spreadsheet_id),
                         row_number,
                         row_number
@@ -843,7 +1093,7 @@ mod tests {
     use crate::{RequestContext, Secret};
     use axum::{
         extract::State,
-        routing::{any, get, post},
+        routing::{get, post},
         Router,
     };
     use std::net::SocketAddr;
@@ -871,9 +1121,18 @@ mod tests {
         (format!("http://{addr}/"), seen)
     }
 
-    async fn any_server() -> (String, Arc<parking_lot::Mutex<Value>>) {
+    async fn sources_get() -> axum::Json<Value> {
+        axum::Json(json!({"values": [
+            ["source_id", "url", "title", "fetched_at", "fresh_for_hours", "content_hash"],
+            ["source-1", "https://example.com/source", "Source", Utc::now().to_rfc3339(), "168", "source-hash"]
+        ]}))
+    }
+
+    async fn sheets_server() -> (String, Arc<parking_lot::Mutex<Value>>) {
         let seen = Arc::new(parking_lot::Mutex::new(Value::Null));
-        let app = Router::new().fallback(any(fake)).with_state(seen.clone());
+        let app = Router::new()
+            .route("/{*path}", get(sources_get).post(fake))
+            .with_state(seen.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -883,9 +1142,10 @@ mod tests {
     }
 
     async fn pipeline_get() -> axum::Json<Value> {
-        axum::Json(
-            json!({"values": [["camp-1", "var-1", "linkedin", "lucas-linkedin", "builders", "text", "old", "", "", "", "Draft", "", "", "1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "m45ve"]]}),
-        )
+        axum::Json(json!({"values": [
+            ["campaign_id", "variant_id", "channel", "account_id", "audience", "content_type", "draft_copy", "media_brief", "asset_url", "asset_hash", "state", "lucas_notes", "publish_at", "row_version", "content_hash", "approval_id", "buffer_post_id", "published_url", "attempt_count", "last_error", "updated_at", "updated_by", "source_ids"],
+            ["camp-1", "var-1", "linkedin", "lucas-linkedin", "builders", "text", "old", "", "", "", "Draft", "", "", "1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "", "", "", "0", "", "2026-08-18T00:00:00Z", "m45ve", "[\"source-1\"]"]
+        ]}))
     }
 
     async fn revision_server() -> (String, Arc<parking_lot::Mutex<Value>>) {
@@ -910,6 +1170,73 @@ mod tests {
                 header_prefix: "Bearer ".into(),
             },
         )
+    }
+
+    fn test_draft_hash(draft_copy: &str, media_brief: &str) -> String {
+        draft_content_hash(DraftHashPayload {
+            campaign_id: "camp-1",
+            variant_id: "var-1",
+            channel: "linkedin",
+            account_id: "lucas-linkedin",
+            audience: "builders",
+            content_type: "text",
+            draft_copy,
+            media_brief,
+            asset_url: "",
+            asset_hash: "",
+            publish_at: "",
+            source_ids: vec!["source-1".to_string()],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn sheets_source_lineage_requires_present_fresh_unique_sources() {
+        let now = Utc::now();
+        let document = json!({"values": [
+            ["source_id", "url", "title", "fetched_at", "fresh_for_hours", "content_hash"],
+            ["fresh", "https://example.com", "Fresh", now.to_rfc3339(), "24", "hash"],
+            ["stale", "https://example.com/old", "Old", (now - chrono::Duration::hours(48)).to_rfc3339(), "1", "hash"]
+        ]});
+        assert_eq!(
+            validate_source_rows(&document, &["fresh".to_string()], now).unwrap(),
+            vec!["fresh".to_string()]
+        );
+        assert!(matches!(
+            validate_source_rows(&document, &["missing".to_string()], now),
+            Err(PluginError::InvalidParams(message)) if message.contains("not present")
+        ));
+        assert!(matches!(
+            validate_source_rows(&document, &["stale".to_string()], now),
+            Err(PluginError::InvalidParams(message)) if message.contains("stale")
+        ));
+        assert!(matches!(
+            validate_source_rows(&document, &["fresh".to_string(), "fresh".to_string()], now),
+            Err(PluginError::InvalidParams(message)) if message.contains("duplicates")
+        ));
+    }
+
+    #[test]
+    fn sheets_append_rejects_a_hash_not_bound_to_the_draft() {
+        let params = json!({
+            "base_url": SHEETS_BASE_URL,
+            "spreadsheet_id": "solo-marketing-fixture",
+            "range": "Pipeline!A:Z",
+            "campaign_id": "camp-1",
+            "variant_id": "var-1",
+            "channel": "linkedin",
+            "account_id": "lucas-linkedin",
+            "audience": "builders",
+            "content_type": "text",
+            "draft_copy": "A sourced draft",
+            "row_version": "1",
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_ids": ["source-1"]
+        });
+        assert!(matches!(
+            SheetsPlugin::validate_typed("append_draft", &params),
+            Err(PluginError::InvalidParams(message)) if message.contains("canonical draft payload")
+        ));
     }
 
     #[test]
@@ -993,7 +1320,7 @@ mod tests {
 
     #[tokio::test]
     async fn sheets_append_writes_only_a_draft_row_to_fake_upstream() {
-        let (base_url, seen) = any_server().await;
+        let (base_url, seen) = sheets_server().await;
         let plugin = SheetsPlugin {
             client: Client::new(),
             revise_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1012,12 +1339,11 @@ mod tests {
             "media_brief": "",
             "asset_url": "",
             "asset_hash": "",
-            "state": "Draft",
             "lucas_notes": "review",
             "publish_at": "",
             "row_version": "1",
-            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "updated_by": "m45ve"
+            "content_hash": test_draft_hash("A sourced draft", ""),
+            "source_ids": ["source-1"]
         });
         plugin
             .execute(PluginRequest {
@@ -1028,11 +1354,16 @@ mod tests {
             })
             .await
             .unwrap();
-        let row = &seen.lock()["values"][0];
+        let seen = seen.lock();
+        let row = seen["values"][0].as_array().unwrap();
         assert_eq!(row[1], "var-1");
         assert_eq!(row[10], "Draft");
         assert_eq!(row[13], "1");
-        assert_eq!(row[15], "m45ve");
+        assert_eq!(row.len(), PIPELINE_COLUMN_COUNT);
+        assert_eq!(row[15], "");
+        assert_eq!(row[18], "0");
+        assert_eq!(row[PIPELINE_UPDATED_BY], "m45ve");
+        assert_eq!(row[PIPELINE_SOURCE_IDS], "[\"source-1\"]");
     }
 
     #[tokio::test]
@@ -1046,9 +1377,7 @@ mod tests {
             "draft_copy": "new",
             "media_brief": "",
             "lucas_notes": "",
-            "state": "Draft",
             "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "updated_by": "m45ve"
         });
         let result = SheetsPlugin {
             client: Client::new(),
@@ -1086,9 +1415,7 @@ mod tests {
                     "draft_copy": "revised",
                     "media_brief": "",
                     "lucas_notes": "reviewed",
-                    "state": "Draft",
-                    "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "updated_by": "m45ve"
+                    "content_hash": test_draft_hash("revised", ""),
                 }),
                 context: RequestContext::default(),
             })
@@ -1099,9 +1426,9 @@ mod tests {
         assert_eq!(row[6], "revised");
         assert_eq!(row[10], "Draft");
         assert_eq!(row[13], "2");
-        assert_eq!(
-            row[14],
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        );
+        assert_eq!(row[14], test_draft_hash("revised", ""));
+        assert_eq!(row[15], "");
+        assert_eq!(row[PIPELINE_UPDATED_BY], "m45ve");
+        assert_eq!(row[PIPELINE_SOURCE_IDS], "[\"source-1\"]");
     }
 }
