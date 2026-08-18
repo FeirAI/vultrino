@@ -434,6 +434,33 @@ fn credential_headers(credential: &Credential) -> Result<reqwest::header::Header
     Ok(headers)
 }
 
+async fn effective_marketing_credential(
+    credential: &Credential,
+) -> Result<(Credential, Option<CredentialData>), PluginError> {
+    if !matches!(credential.data, CredentialData::OAuth2 { .. }) {
+        return Ok((credential.clone(), None));
+    }
+
+    let oauth = crate::plugins::HttpPlugin::new();
+    let (_, updated) = oauth.ensure_valid_token(&credential.data).await?;
+    let mut effective = credential.clone();
+    if let Some(data) = updated.clone() {
+        effective.data = data;
+        effective.updated_at = Utc::now();
+    }
+    Ok((effective, updated))
+}
+
+fn attach_credential_update(
+    response: ExecuteResponse,
+    updated: Option<CredentialData>,
+) -> ExecuteResponse {
+    match updated {
+        Some(data) => response.with_updated_credential(data),
+        None => response,
+    }
+}
+
 async fn send_json(
     client: &Client,
     url: reqwest::Url,
@@ -610,6 +637,8 @@ impl SheetsPlugin {
             "read" => {
                 let p: SheetsReadParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+                let (credential, updated) =
+                    effective_marketing_credential(&request.credential).await?;
                 let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let url = base
                     .join(&format!(
@@ -618,14 +647,15 @@ impl SheetsPlugin {
                         urlencoding::encode(&p.range)
                     ))
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
-                send_json_method(
+                let response = send_json_method(
                     &self.client,
                     reqwest::Method::GET,
                     url,
-                    &request.credential,
+                    &credential,
                     json!({}),
                 )
-                .await
+                .await?;
+                Ok(attach_credential_update(response, updated))
             }
             "append_draft" => {
                 let p: SheetsAppendParams = serde_json::from_value(request.params)
@@ -643,6 +673,8 @@ impl SheetsPlugin {
                             .to_string(),
                     ));
                 }
+                let (credential, updated) =
+                    effective_marketing_credential(&request.credential).await?;
                 let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let sources_url = base
                     .join(&format!(
@@ -655,7 +687,7 @@ impl SheetsPlugin {
                     &self.client,
                     reqwest::Method::GET,
                     sources_url,
-                    &request.credential,
+                    &credential,
                     json!({}),
                 )
                 .await?;
@@ -698,13 +730,9 @@ impl SheetsPlugin {
                     serde_json::to_string(&source_ids)
                         .map_err(|error| PluginError::InvalidParams(error.to_string()))?
                 ]]);
-                send_json(
-                    &self.client,
-                    url,
-                    &request.credential,
-                    json!({"values": values}),
-                )
-                .await
+                let response =
+                    send_json(&self.client, url, &credential, json!({"values": values})).await?;
+                Ok(attach_credential_update(response, updated))
             }
             "revise_draft" => {
                 let p: SheetsReviseParams = serde_json::from_value(request.params)
@@ -720,6 +748,8 @@ impl SheetsPlugin {
                     ));
                 }
                 validate_content_hash(&p.content_hash, "revise_draft")?;
+                let (credential, updated) =
+                    effective_marketing_credential(&request.credential).await?;
                 // One Eve agent is the only writer in this pack. The mutex makes
                 // the read/compare/update sequence a process-local CAS, while
                 // the authoritative row_version check below protects a stale
@@ -737,7 +767,7 @@ impl SheetsPlugin {
                     &self.client,
                     reqwest::Method::GET,
                     read_url,
-                    &request.credential,
+                    &credential,
                     json!({}),
                 )
                 .await?;
@@ -821,14 +851,15 @@ impl SheetsPlugin {
                         row_number
                     ))
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
-                send_json_method(
+                let response = send_json_method(
                     &self.client,
                     reqwest::Method::PUT,
                     url,
-                    &request.credential,
+                    &credential,
                     json!({"values": [next_row]}),
                 )
-                .await
+                .await?;
+                Ok(attach_credential_update(response, updated))
             }
             action => Err(PluginError::UnsupportedAction(action.to_string())),
         }
