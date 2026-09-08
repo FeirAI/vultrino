@@ -288,6 +288,11 @@ struct RunError {
     /// committed `plugin.execute` failure sets this false — a resumed approval is
     /// then finalized terminally instead of busy-polling forever.
     retryable: bool,
+    /// The plugin had crossed the point of no return. The external effect may
+    /// already exist even though Vultrino could not confirm the final outcome.
+    /// Keep this bit until persistence so every user-facing surface can warn
+    /// against a blind retry.
+    committed: bool,
     error: VultrinoError,
 }
 
@@ -296,6 +301,7 @@ impl RunError {
     fn retryable(error: VultrinoError) -> Self {
         Self {
             retryable: true,
+            committed: false,
             error,
         }
     }
@@ -304,6 +310,7 @@ impl RunError {
     fn terminal(error: VultrinoError) -> Self {
         Self {
             retryable: false,
+            committed: false,
             error,
         }
     }
@@ -312,6 +319,7 @@ impl RunError {
     fn committed(error: VultrinoError) -> Self {
         Self {
             retryable: false,
+            committed: true,
             error,
         }
     }
@@ -358,6 +366,14 @@ struct ActionPayload {
     params: serde_json::Value,
     context: RequestContext,
     use_token_id: Option<String>,
+    /// Stable subject used only for evidence. Direct executions use the presenting
+    /// use-token id. Approved executions use the durable approval id/claim epoch,
+    /// so evidence does not depend on the short-lived bearer remaining usable.
+    evidence_subject_id: Option<String>,
+    /// True only for a payload authorized by a persisted human-approval grant.
+    /// This selects an exact, one-shot Averin grant instead of the opener's broad
+    /// bearer grant.
+    approved_execution: bool,
     /// The exact business capability action that passed policy evaluation
     /// (`content.notion.read`, not the resolved transport verb `http.request`).
     /// D8 evidence binds this value; it must never be reconstructed from plugin
@@ -821,6 +837,10 @@ impl VultrinoServer {
         // not accept caller-supplied HTTP methods or GraphQL documents.
         plugins.register(Arc::new(crate::plugins::SheetsPlugin::new()));
         plugins.register(Arc::new(crate::plugins::BufferPlugin::new()));
+        // Typed Solo-project coordination operations. This keeps learner,
+        // Calendar, and outbound-message destinations inside provider-specific
+        // adapters while the policy layer presents one `solo.*` write domain.
+        plugins.register(Arc::new(crate::plugins::SoloPlugin::new()));
         let policy_engine = Arc::new(PolicyEngine::new());
         let auth_manager = Arc::new(AuthManager::new());
 
@@ -1227,9 +1247,9 @@ impl VultrinoServer {
     ///
     /// When gated, the action does **not** run: an [`ApprovalRequest`] is created,
     /// persisted, and announced to notifiers, and [`PreparedAction::Pending`] is
-    /// returned. Otherwise a [`PreparedAction::Ready`] carries everything the action
-    /// tail needs — the use token is NOT consumed here, the tail reserves it
-    /// fail-closed just before the side effect (identical on both paths).
+    /// returned. A bearer-driven gated request reserves its use while opening the
+    /// frozen approval. Otherwise a [`PreparedAction::Ready`] carries everything
+    /// the action tail needs and reserves the bearer just before the side effect.
     async fn prepare_execution(
         &self,
         request: ExecuteRequest,
@@ -1504,66 +1524,21 @@ impl VultrinoServer {
                 ));
             }
 
-            // Open an approval request. The use token is NOT consumed yet — it is
-            // reserved when the approved action actually runs. The criticality
-            // class (V5) drives the escalation/expiry SLA windows.
+            // Open an approval request. Bearer capacity is converted into the
+            // durable exact-request grant below, before the request is published.
+            // The criticality class (V5) drives the escalation/expiry SLA windows.
             let criticality = self
                 .approval_config
                 .criticality_for(&credential.alias, &full_action);
             let sla = self.approval_config.sla_for(criticality);
-            // FINDING 4 (plan 103 §10h): an approval must never be offerable beyond
-            // the life of the credential that would execute it. The configured SLA
-            // (`approvals.ttl_secs`, 3600s by default) is INDEPENDENT of the use
-            // token's TTL (govder compiles L3·High at 900s), so the two diverged by
-            // 4× and a human decided inside the advertised window on an action that
-            // then failed at resume with `use token has expired`.
-            //
-            // The bound is applied HERE, at open, because this is the only place that
-            // holds both facts at once — the presented token and the class SLA — and
-            // because clamping AT OPEN is the only option that keeps every downstream
-            // surface honest for free: `expires_at` is what the notifier links, the
-            // approver's card copy ("Expires in …") and the agent's poll all read, so
-            // one clamp makes all of them state a deadline the credential can honour.
-            // The alternatives were rejected: RE-MINTING a fresh token on approval
-            // would let a human decision extend a credential past the TTL govder's
-            // decide-path compiled for it (the approval would become a policy bypass,
-            // and vultrino is the enforcement plane, not the issuer); REFUSING every
-            // approval whose token cannot cover the full configured window would
-            // refuse every L3·High money approval on today's shipped config, i.e.
-            // "fail closed" into never governing money at all. Clamp + refuse only
-            // when even the clamped window is dead keeps the fail-closed property
-            // (the window can only ever SHRINK here, never grow) at no availability
-            // cost.
-            let credential_remaining = exec_auth
-                .use_token
-                .as_ref()
-                .and_then(|t| t.expires_at)
-                .map(|exp| exp - chrono::Utc::now());
-            let (escalate_after, escalate_window) =
-                match sla.clamped_to_credential(credential_remaining) {
-                    Some(w) => w,
-                    None => {
-                        // The credential is already dead (or dies within this second).
-                        // Refusing is fail-closed in both directions: nothing executes,
-                        // AND no human is invited to authorize an action that cannot run.
-                        return Err(VultrinoError::PolicyDenied(
-                            "the credential presented for this action expires too soon to hold a \
-                         human approval, so no approval was opened and nothing ran — retry \
-                         with a freshly issued credential"
-                                .to_string(),
-                        ));
-                    }
-                };
-            if escalate_after + escalate_window < sla.escalate_after() + sla.escalate_window() {
-                tracing::info!(
-                    credential = %credential.alias,
-                    action = %full_action,
-                    configured_secs = (sla.escalate_after() + sla.escalate_window()).num_seconds(),
-                    clamped_secs = (escalate_after + escalate_window).num_seconds(),
-                    "approval window clamped to the presenting credential's remaining life \
-                     (the credential, not approvals.ttl_secs, is the binding deadline)"
-                );
-            }
+            // Human review is a durable exact-request grant, not a suspended use
+            // of the presenting bearer. The bearer authenticates/scopes this open
+            // operation and may expire immediately afterwards; the configured SLA
+            // is therefore the honest review deadline. Resume revalidates the live
+            // credential revision, capability catalog, Govder recipe and policy/kill
+            // state before minting a one-shot execution permit.
+            let escalate_after = sla.escalate_after();
+            let escalate_window = sla.escalate_window();
             // V10: record the requester's IdP-resolvable owner (if bound) on the
             // approval so separation-of-duty compares the approver against the
             // directory owner, not just the agent label.
@@ -1673,8 +1648,7 @@ impl VultrinoServer {
                 dual_control,
                 criticality,
                 trusted_irreversible: Some(trusted_irreversible),
-                // Clamped to the presenting credential's remaining life (FINDING 4) —
-                // NEVER the raw class SLA, which can outlive the token 4×.
+                // Independent of the presenting bearer's authentication lifetime.
                 escalate_after,
                 escalate_window,
                 oob_identity: self.approval_config.oob_approver_identity.clone(),
@@ -1717,31 +1691,24 @@ impl VultrinoServer {
             approval.authoritative_risk_tier = authoritative_risk_tier;
             approval.authoritative_irreversible = authoritative_irreversible;
 
-            // Bound the number of *pending* approvals a use token can open: each
-            // open reserves a future use, so outstanding pending approvals plus
-            // already-consumed uses must not exceed max_uses — otherwise a
-            // single-use token could spawn an unbounded approval/notifier flood
-            // (only execution is fail-closed otherwise). The count-and-insert is
-            // atomic under the storage lock, so two concurrent opens (web + MCP)
-            // can't both pass a stale count.
-            let reservation = exec_auth
-                .use_token
-                .as_ref()
-                .and_then(|t| t.max_uses.map(|max| (t.id.clone(), max)));
-            match reservation {
-                Some((token_id, max)) => {
-                    self.storage
-                        .store_approval_reserving(&approval, &token_id, max)
-                        .await
-                        .map_err(|e| match e {
-                            crate::storage::StorageError::Conflict(_) => VultrinoError::PolicyDenied(
-                                "This use token has no remaining capacity for a new pending approval".to_string(),
-                            ),
-                            other => other.into(),
-                        })?;
-                }
-                None => self.storage.store_approval(&approval).await?,
+            // Convert the short-lived bearer authority into this frozen durable
+            // request now. The use is reserved before the approval is published,
+            // so one-use capacity cannot be replayed into a second approval while
+            // a human is reviewing the first. A later denial still spends this
+            // narrow authorization; approved execution must never consume or rely
+            // on the bearer again. If persistence fails after reservation, the use
+            // remains burned (fail-closed: no action can gain authority from it).
+            if let Some(token) = exec_auth.use_token.as_ref() {
+                self.storage
+                    .consume_use_token(&token.id)
+                    .await
+                    .map_err(|error| {
+                        VultrinoError::PolicyDenied(format!(
+                            "Use token could not reserve this approval: {error}"
+                        ))
+                    })?;
             }
+            self.storage.store_approval(&approval).await?;
             self.dispatch_notifications(&approval, &decision_token)
                 .await;
             // V9: emit the requested event to the signed outbox.
@@ -1809,6 +1776,8 @@ impl VultrinoServer {
             params: request.params.clone(),
             context,
             use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
+            evidence_subject_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
+            approved_execution: false,
             evidence_action: request.action.clone(),
             evidence_required,
         };
@@ -1846,7 +1815,8 @@ impl VultrinoServer {
     async fn validate_required_evidence_preflight(
         &self,
         evidence_required: bool,
-        use_token_id: Option<&str>,
+        evidence_subject_id: Option<&str>,
+        approved_execution: bool,
         params_len: usize,
     ) -> Result<(), RunError> {
         if !evidence_required {
@@ -1859,9 +1829,9 @@ impl VultrinoServer {
                     .to_string(),
             ))
         })?;
-        let token_id = use_token_id.ok_or_else(|| {
+        let token_id = evidence_subject_id.ok_or_else(|| {
             RunError::terminal(VultrinoError::PolicyDenied(
-                "trusted human-floor action requires a use token bound to an Averin grant; \
+                "trusted human-floor action requires a stable subject bound to Averin evidence; \
                  nothing ran"
                     .to_string(),
             ))
@@ -1872,6 +1842,14 @@ impl VultrinoServer {
                  exceed the configured {} byte evidence bound; nothing ran",
                 av.config().max_seal_params_bytes
             ))));
+        }
+
+        // An approved execution is authorized by the durable exact-request grant,
+        // not by the opener's short-lived bearer. D8 mints and consumes a fresh
+        // single-operation evidence grant immediately before dispatch, so no broad
+        // token grant is required to remain live while a human reviews the action.
+        if approved_execution || av.config().d8_complete_evidence {
+            return Ok(());
         }
 
         // A queue-owning durable process stores the grant material on disk. Its
@@ -2202,12 +2180,15 @@ impl VultrinoServer {
             params,
             context,
             use_token_id,
+            evidence_subject_id,
+            approved_execution,
             evidence_action,
             evidence_required,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
         let action_name = action_name.as_str();
         let use_token_id = use_token_id.as_deref();
+        let evidence_subject_id = evidence_subject_id.as_deref();
         // Preflight (no side effects yet, no token consumed): resolve + validate.
         // A not-loaded plugin is *transient* (it may load later → retryable);
         // invalid params are *permanent* (a retry can't fix them → terminal).
@@ -2224,7 +2205,7 @@ impl VultrinoServer {
         // fail closed here if no evidence path/grant exists; reversible actions
         // preserve the default-off and Observe behavior.
         let evidence_params = if evidence_required
-            || (self.averin.is_some() && use_token_id.is_some())
+            || (self.averin.is_some() && evidence_subject_id.is_some())
         {
             Some(serde_json::to_vec(&params).map_err(|_| {
                 RunError::terminal(VultrinoError::PolicyDenied(
@@ -2236,7 +2217,8 @@ impl VultrinoServer {
         };
         self.validate_required_evidence_preflight(
             evidence_required,
-            use_token_id,
+            evidence_subject_id,
+            approved_execution,
             evidence_params.as_ref().map_or(0, Vec::len),
         )
         .await?;
@@ -2353,9 +2335,9 @@ impl VultrinoServer {
             crate::averin::ExactUseEvidence,
         )> = None;
         if let (Some(av), Some(tid), Some(params_bytes)) =
-            (&self.averin, use_token_id, evidence_params)
+            (&self.averin, evidence_subject_id, evidence_params)
         {
-            if av.config().d8_complete_evidence {
+            if av.config().d8_complete_evidence || (approved_execution && evidence_required) {
                 let evidence = av
                     .begin_exact_use(
                         tid,
@@ -2603,12 +2585,15 @@ impl VultrinoServer {
             params,
             context,
             use_token_id,
+            evidence_subject_id,
+            approved_execution,
             evidence_action,
             evidence_required,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
         let action_name = action_name.as_str();
         let use_token_id = use_token_id.as_deref();
+        let evidence_subject_id = evidence_subject_id.as_deref();
         // Preflight (no side effects, no token consumed): resolve + validate.
         let plugin = self.plugins.get(plugin_name).ok_or_else(|| {
             RunError::retryable(VultrinoError::Plugin(
@@ -2623,7 +2608,7 @@ impl VultrinoServer {
         // preflight as buffered execution. A strict failure occurs before the
         // upstream stream is opened and before the token is reserved.
         let evidence_params = if evidence_required
-            || (self.averin.is_some() && use_token_id.is_some())
+            || (self.averin.is_some() && evidence_subject_id.is_some())
         {
             Some(serde_json::to_vec(&params).map_err(|_| {
                 RunError::terminal(VultrinoError::PolicyDenied(
@@ -2635,7 +2620,8 @@ impl VultrinoServer {
         };
         self.validate_required_evidence_preflight(
             evidence_required,
-            use_token_id,
+            evidence_subject_id,
+            approved_execution,
             evidence_params.as_ref().map_or(0, Vec::len),
         )
         .await?;
@@ -2737,9 +2723,9 @@ impl VultrinoServer {
             crate::averin::ExactUseEvidence,
         )> = None;
         if let (Some(av), Some(tid), Some(params_bytes)) =
-            (&self.averin, use_token_id, evidence_params)
+            (&self.averin, evidence_subject_id, evidence_params)
         {
-            if av.config().d8_complete_evidence {
+            if av.config().d8_complete_evidence || (approved_execution && evidence_required) {
                 let evidence = av
                     .begin_exact_use(
                         tid,
@@ -3291,6 +3277,7 @@ impl VultrinoServer {
                     "approved execution could not be exactly bound; nothing ran".to_string(),
                 ))
             })?;
+        let execution_epoch = grant.binding().epoch;
         let permit = crate::formal_kernel::ExecutionPermit::approved(
             binding.clone(),
             true,
@@ -3318,7 +3305,12 @@ impl VultrinoServer {
             action_name: action_name.to_string(),
             params: approval.params.clone(),
             context,
-            use_token_id: approval.use_token_id.clone(),
+            // The presenting bearer authenticated and scoped approval-open. Once
+            // the exact request is approved, the persisted one-shot grant is the
+            // execution authority; bearer expiry/rotation cannot invalidate it.
+            use_token_id: None,
+            evidence_subject_id: Some(format!("approval:{}:{}", approval.id, execution_epoch)),
+            approved_execution: true,
             evidence_action: approval
                 .action_label
                 .clone()
@@ -3455,7 +3447,14 @@ impl VultrinoServer {
                         // failure (unusable token, bad params, missing credential).
                         // Finalize terminally so the agent isn't told to poll forever.
                         Err(re) if !re.retryable => {
-                            claimed.result_error = Some(re.error.to_string());
+                            let error = re.error.to_string();
+                            claimed.result_error = Some(if re.committed {
+                                format!(
+                                    "outcome unknown — the action may have completed; check the connected service before retrying: {error}"
+                                )
+                            } else {
+                                error
+                            });
                             claimed.executed = true;
                             claimed.executing = false;
                             claimed.executing_since = None;
@@ -5871,6 +5870,12 @@ mod tests {
             require_approval: true,
             expires_in: None,
         });
+        let token_id = token.id.clone();
+        // Model the production mint path: the token record is persisted before
+        // the bearer can open an approval or execute an action. `from_use_token`
+        // carries the authenticated snapshot, but reservation is authoritative
+        // in storage and must not rely on that snapshot alone.
+        storage.store_use_token(&token).await.unwrap();
 
         // A read (GET) through the force-approval token must run directly —
         // NOT open an approval.
@@ -5908,6 +5913,9 @@ mod tests {
                 panic!("a write action driven by a require_approval token must still be gated")
             }
         }
+
+        let stored = storage.get_use_token(&token_id).await.unwrap().unwrap();
+        assert_eq!(stored.uses, 1, "opening the approval must reserve one use");
     }
 
     #[tokio::test]

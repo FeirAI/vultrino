@@ -965,7 +965,7 @@ impl BufferPlugin {
                     &p.due_at,
                 )
             }
-            _ => return Err(PluginError::UnsupportedAction(action.to_string())),
+            _ => Err(PluginError::UnsupportedAction(action.to_string())),
         }
     }
 
@@ -1092,7 +1092,9 @@ impl BufferPlugin {
             action => return Err(PluginError::UnsupportedAction(action.to_string())),
         };
         let base = validate_base_url(&base_url, BUFFER_BASE_URL)?;
-        send_buffer_json(&self.client, base, &request.credential, query, variables).await
+        let (credential, updated) = effective_marketing_credential(&request.credential).await?;
+        let response = send_buffer_json(&self.client, base, &credential, query, variables).await?;
+        Ok(attach_credential_update(response, updated))
     }
 }
 
@@ -1284,6 +1286,39 @@ mod tests {
     fn direct_graphql_document_and_channel_are_not_accepted_as_input() {
         let params = json!({"base_url": BUFFER_BASE_URL, "organization_id": "org", "query": "mutation publishNow", "channel_id": "attacker"});
         assert!(BufferPlugin::validate_typed("channels_read", &params).is_err());
+    }
+
+    #[tokio::test]
+    async fn buffer_expired_oauth_requires_refresh_before_dispatch() {
+        let (base_url, seen) = server().await;
+        let credential = Credential::new(
+            "buffer-oauth".to_string(),
+            CredentialData::OAuth2 {
+                client_id: "client".into(),
+                client_secret: Secret::new("client-secret"),
+                refresh_token: None,
+                access_token: Some(Secret::new("expired-access")),
+                expires_at: Some(Utc::now() - chrono::Duration::minutes(1)),
+                token_url: "https://oauth2.googleapis.com/token".into(),
+                scopes: vec![],
+            },
+        );
+        let result = BufferPlugin::with_client(Client::new())
+            .execute(PluginRequest {
+                credential,
+                action: "accounts_read".into(),
+                params: json!({"base_url": base_url, "organization_id": "org"}),
+                context: RequestContext::default(),
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "an expired OAuth2 credential must fail refresh before Buffer dispatch"
+        );
+        assert!(
+            seen.lock().is_null(),
+            "Buffer must not receive an expired token"
+        );
     }
 
     #[tokio::test]

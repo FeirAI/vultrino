@@ -963,8 +963,8 @@ async fn irreversible_approval_resume_refuses_when_averin_is_disabled() {
 }
 
 /// Observe remains fail-open for reversible work, but it cannot weaken a
-/// trusted human-floor action. An enabled Observe client with no sealed grant
-/// refuses synchronously before consuming or dispatching.
+/// trusted human-floor action. An approved request mints exact one-shot evidence
+/// immediately before dispatch; if that write fails, the action is refused.
 #[tokio::test]
 async fn irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode() {
     let fixture = open_approved_mutable_recipe_fixture_with_authority(
@@ -979,12 +979,12 @@ async fn irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode()
         .check_and_resume_approval(&fixture.approval_id, None)
         .await
         .unwrap();
-    assert!(resumed.executed, "missing sealed grant is terminal");
+    assert!(resumed.executed, "failed exact evidence is terminal");
     assert!(resumed
         .result_error
         .as_deref()
         .unwrap_or_default()
-        .contains("no live Averin grant binding"));
+        .contains("D8 before-act evidence failed"));
     assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
@@ -1403,7 +1403,7 @@ async fn test_denied_approval_never_executes() {
 }
 
 #[tokio::test]
-async fn test_token_force_approval_consumes_on_resume() {
+async fn test_token_force_approval_reserves_bearer_at_open_not_resume() {
     let (server, storage) = setup().await;
     store_credential(&storage, "api-cred", false).await;
 
@@ -1431,7 +1431,8 @@ async fn test_token_force_approval_consumes_on_resume() {
         },
     };
 
-    // Gated: nothing runs, token NOT yet consumed.
+    // Gated: nothing runs, but the short-lived bearer is converted into this
+    // exact durable request immediately.
     let approval = match server
         .execute_gated(echo_request("api-cred"), exec_auth)
         .await
@@ -1442,12 +1443,11 @@ async fn test_token_force_approval_consumes_on_resume() {
     };
     assert_eq!(approval.use_token_id.as_deref(), Some(token.id.as_str()));
     let mid = storage.get_use_token(&token.id).await.unwrap().unwrap();
-    assert_eq!(
-        mid.uses, 0,
-        "token must not be consumed until the action runs"
-    );
+    assert_eq!(mid.uses, 1, "approval-open must reserve the bearer use");
+    assert!(mid.is_exhausted());
 
-    // Approve, then resume runs the action and consumes the token.
+    // Approve, then resume runs from the one-shot approval grant without
+    // consuming or requiring the bearer again.
     let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
     stored
         .approve(Decision::new("admin panel", "secops"))
@@ -1577,7 +1577,7 @@ async fn test_single_use_token_pending_approval_bounded() {
         .unwrap();
     assert!(matches!(first, ExecutionOutcome::Pending(_)));
 
-    // Second open is refused — no remaining capacity.
+    // Second open is refused — the bearer use was already reserved.
     let err = server
         .execute_gated(
             echo_request("api-cred"),
@@ -1587,7 +1587,7 @@ async fn test_single_use_token_pending_approval_bounded() {
         .unwrap_err();
     assert!(format!("{}", err)
         .to_lowercase()
-        .contains("no remaining capacity"));
+        .contains("no remaining uses"));
 }
 
 /// The bound is `uses + pending < max_uses`, so a `max_uses = 2` token may have
@@ -1629,12 +1629,12 @@ async fn test_pending_bound_allows_up_to_max_uses() {
         .unwrap_err();
     assert!(format!("{}", err)
         .to_lowercase()
-        .contains("no remaining capacity"));
+        .contains("no remaining uses"));
 }
 
 /// Concurrency: two opens racing on a single-use token must not both slip past
-/// a stale pending count. The atomic `store_approval_reserving` guarantees at
-/// most one pending approval is created (the rest get a capacity error).
+/// a stale count. Atomic bearer consumption guarantees at most one pending
+/// approval is created (the rest get a capacity error).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_pending_opens_are_bounded() {
     let (server, storage) = setup().await;
@@ -1893,10 +1893,11 @@ async fn test_ownership_check_blocks_foreign_principal() {
     assert!(resumed.executed);
 }
 
-/// A preflight failure (plugin not loaded) when resuming an approved action must
-/// leave it retryable and must NOT burn the use token.
+/// A preflight failure (plugin not loaded) when resuming an approved action leaves
+/// the durable grant retryable. The bearer use remains reserved at approval-open;
+/// retries never consume it again.
 #[tokio::test]
-async fn test_preflight_failure_is_retryable_and_does_not_burn_token() {
+async fn test_preflight_failure_is_retryable_without_reusing_bearer() {
     let (server, storage) = setup().await;
     store_credential(&storage, "api-cred", true).await; // require_approval
 
@@ -1948,10 +1949,7 @@ async fn test_preflight_failure_is_retryable_and_does_not_burn_token() {
         .unwrap();
     assert!(!resumed.executed, "preflight failure must remain retryable");
     let tok = storage.get_use_token(&token.id).await.unwrap().unwrap();
-    assert_eq!(
-        tok.uses, 0,
-        "a preflight failure must not consume the token"
-    );
+    assert_eq!(tok.uses, 1, "approval-open reserves exactly one bearer use");
 }
 
 /// A stale execution claim (a worker that set `executing` then crashed mid-flight)
@@ -2085,11 +2083,11 @@ async fn test_heartbeat_prevents_stale_reclaim() {
     );
 }
 
-/// A use-token-gated approval whose token has become unusable by the time it is
-/// approved finalizes TERMINALLY (executed, with an error) rather than telling
-/// the agent to poll forever.
+/// A use-token-gated approval remains executable after a multi-day bearer expiry:
+/// the bearer authenticated/scoped approval-open, while the durable frozen grant
+/// authorizes exactly one resume after current policy/credential revalidation.
 #[tokio::test]
-async fn test_resume_with_unusable_token_is_terminal() {
+async fn test_resume_after_two_day_bearer_expiry_uses_durable_approval_grant() {
     let (server, storage) = setup().await;
     store_credential(&storage, "api-cred", false).await;
 
@@ -2114,6 +2112,12 @@ async fn test_resume_with_unusable_token_is_terminal() {
         ExecutionOutcome::Pending(a) => a,
         _ => panic!("expected pending"),
     };
+    // Simulate a human taking two days. The token record is retained for audit,
+    // but its authentication window is long dead.
+    let mut expired = storage.get_use_token(&token.id).await.unwrap().unwrap();
+    expired.expires_at = Some(chrono::Utc::now() - Duration::days(2));
+    storage.store_use_token(&expired).await.unwrap();
+
     storage
         .decide_approval(
             &approval.id,
@@ -2130,20 +2134,15 @@ async fn test_resume_with_unusable_token_is_terminal() {
         .await
         .unwrap();
 
-    // Token is revoked after approval but before the agent polls to execute.
-    storage.set_use_token_revoked(&token.id).await.unwrap();
-
     let resumed = server
         .check_and_resume_approval(&approval.id, None)
         .await
         .unwrap();
-    assert!(
-        resumed.executed,
-        "an unusable-token resume must be terminal, not retryable"
-    );
-    assert!(resumed.result_status.is_none());
-    let err = resumed.result_error.unwrap().to_lowercase();
-    assert!(err.contains("use token") || err.contains("revoked"));
+    assert!(resumed.executed, "the durable approval must execute");
+    assert_eq!(resumed.result_status, Some(200));
+    assert!(resumed.result_error.is_none());
+    let after = storage.get_use_token(&token.id).await.unwrap().unwrap();
+    assert_eq!(after.uses, 1, "resume must not consume the bearer twice");
 }
 
 #[tokio::test]
@@ -5942,23 +5941,13 @@ async fn test_v13b_token_event_decodes_into_leria_wire_shape() {
     );
 }
 
-// ==================== FINDING 4: the approval window vs the credential ====================
-//
-// plan 103 §10h FINDING 4, measured on the live stack: `approvals.ttl_secs` defaults
-// to 3600s while govder's scope table compiles an L3·High use token at **900s**
-// (`internal/enforce/scope.go`). A browser approval ~21 minutes after the request
-// therefore landed inside the advertised window and outside the credential's life:
-// the plane returned "Approved, but the action failed to execute / use token has
-// expired" and the money never moved.
-//
-// These drive the REAL `execute_gated` open path (not the pure helper) so the
-// property proven is the one the product depends on: what `expires_at` an approver's
-// card can ever show.
+// ==================== Durable approval window vs bearer authentication ====================
 
-/// The final deadline of an opened approval is the CREDENTIAL's deadline, never the
-/// (4× longer) configured approval TTL.
+/// The pending human-review deadline is the configured SLA, not the presenting
+/// bearer's authentication deadline. The use is reserved at open and the frozen
+/// request later executes from a separate one-shot approval grant.
 #[tokio::test]
-async fn test_approval_window_never_outlives_the_use_token() {
+async fn test_approval_window_is_independent_of_the_use_token() {
     let (server, storage) = setup().await;
     store_credential(&storage, "api-cred", true).await;
 
@@ -5991,39 +5980,25 @@ async fn test_approval_window_never_outlives_the_use_token() {
         }
     };
 
-    // The property: an approver can never be offered a window the credential cannot
-    // honour. `<=` (not `==`) because the clamp works in whole seconds.
+    // The configured Medium SLA is one hour even though the bearer expires in
+    // fifteen minutes.
     assert!(
-        approval.expires_at <= token_deadline,
-        "the approval deadline {} outlives the credential {} — an approver would sign \
-         an action that cannot run",
+        approval.expires_at > token_deadline,
+        "the approval deadline {} must be independent of bearer deadline {}",
         approval.expires_at,
         token_deadline,
     );
-    // And it is genuinely bound by the CREDENTIAL, not merely inside the config: the
-    // configured window (ttl_secs = 3600 -> Medium 1800+1800) is far longer.
     let held = approval.expires_at - approval.created_at;
-    assert!(
-        held.num_seconds() <= 900,
-        "expected the 900s credential to bind the window, got {}s",
-        held.num_seconds()
-    );
-    assert!(
-        held.num_seconds() >= 890,
-        "the clamp must use the credential's remaining life, not shrink it to nothing \
-         (got {}s)",
-        held.num_seconds()
-    );
-    // The escalate boundary stays strictly inside the deadline, so a clamped request
-    // still escalates before it expires rather than degenerating.
+    assert_eq!(held.num_seconds(), 3600);
     assert!(approval.escalate_at < approval.expires_at);
+    let reserved = storage.get_use_token(&token.id).await.unwrap().unwrap();
+    assert_eq!(reserved.uses, 1);
 }
 
-/// A token whose remaining life is not a decidable window at all: the open is
-/// REFUSED. Nothing executes, and no human is invited to authorize an action that is
-/// already impossible.
+/// A bearer that is usable at the reservation boundary may open a durable review
+/// even when its authentication clock is about to end.
 #[tokio::test]
-async fn test_approval_open_is_refused_when_the_credential_is_about_to_die() {
+async fn test_approval_open_reserves_a_bearer_that_is_about_to_expire() {
     let (server, storage) = setup().await;
     store_credential(&storage, "api-cred", true).await;
 
@@ -6033,8 +6008,8 @@ async fn test_approval_open_is_refused_when_the_credential_is_about_to_die() {
         action_scope: Some("mock.echo".to_string()),
         max_uses: Some(5),
         require_approval: true,
-        // Still VALID (check_usable passes) but under a second of life left.
-        expires_in: Some(Duration::milliseconds(400)),
+        // Still valid at reservation, but far shorter than the one-hour review SLA.
+        expires_in: Some(Duration::seconds(5)),
     });
     storage.store_use_token(&token).await.unwrap();
     assert!(token.check_usable().is_ok(), "the token is not yet expired");
@@ -6045,28 +6020,30 @@ async fn test_approval_open_is_refused_when_the_credential_is_about_to_die() {
         force_approval: false,
         requester: RequesterInfo::default(),
     };
-    let err = server
+    let outcome = server
         .execute_gated(echo_request("api-cred"), exec_auth)
         .await
-        .expect_err("an approval that cannot outlive its credential must be refused");
-    let msg = format!("{}", err).to_lowercase();
-    assert!(
-        msg.contains("expires too soon"),
-        "the refusal must name the credential deadline as the reason, got: {}",
-        msg
+        .expect("a still-usable bearer can reserve the exact approval");
+    let approval = match outcome {
+        ExecutionOutcome::Pending(approval) => approval,
+        ExecutionOutcome::Completed(_) => panic!("expected pending approval"),
+    };
+    assert_eq!(
+        (approval.expires_at - approval.created_at).num_seconds(),
+        3600
     );
-    // Fail-closed: no approval record was created, so no notifier fired and no
-    // approver can be shown a request that could never run.
-    let approvals = storage.list_approvals().await.unwrap();
-    assert!(
-        approvals.is_empty(),
-        "the refused open must not leave an approval behind: {:?}",
-        approvals.iter().map(|a| a.id.clone()).collect::<Vec<_>>()
+    assert_eq!(
+        storage
+            .get_use_token(&token.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .uses,
+        1
     );
 }
 
-/// A token with NO expiry (bounded only by `max_uses`) is unchanged by the clamp —
-/// the configured SLA still governs, so the fix narrows nothing it should not.
+/// A token with no expiry uses the same configured human-review SLA.
 #[tokio::test]
 async fn test_approval_window_is_unchanged_for_a_non_expiring_token() {
     let (server, storage) = setup().await;

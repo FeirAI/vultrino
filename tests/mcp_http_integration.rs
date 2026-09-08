@@ -7,8 +7,8 @@
 //! - an HTTP JSON-RPC `tools/list` with a valid `vut_` Bearer returns ONLY that
 //!   principal's granted named tools + `check_approval` (a scoped use-token agent
 //!   is not offered vultrino's generic built-in tools — the connector model);
-//! - a missing / invalid / revoked / expired token is rejected `401`, never
-//!   bypassed;
+//! - a missing / invalid / revoked token is rejected `401`; expiry is bypassed
+//!   only for the exact read-only `check_approval` operation;
 //! - a `tools/call` over HTTP runs the SAME enforced `execute_gated` path;
 //! - the header Bearer is authoritative — a different token smuggled in the JSON
 //!   body cannot widen scope (the header token both authenticates AND scopes).
@@ -372,6 +372,48 @@ async fn http_expired_token_is_401() {
         .as_str()
         .unwrap()
         .contains("expired"));
+}
+
+#[tokio::test]
+async fn http_expired_token_reaches_only_check_approval() {
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    store_credential(&storage, "cred-sendgrid").await;
+    register_send_email(&storage, "cred-sendgrid").await;
+    let token = mint_token(
+        &storage,
+        "cred-sendgrid",
+        Some("http.request"),
+        Some(chrono::Duration::seconds(-60)),
+        Some(1),
+    )
+    .await;
+
+    let resp = router
+        .oneshot(mcp_req(
+            Some(&token),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                "params": {
+                    "name": "check_approval",
+                    "arguments": { "approval_id": "appr_not_owned_or_missing" }
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an expired approval owner must reach the read-only ownership check"
+    );
+    let value = body_value(resp).await;
+    assert!(
+        value.get("error").is_some()
+            || value["result"]["isError"].as_bool().unwrap_or(false)
+            || value["result"]["is_error"].as_bool().unwrap_or(false),
+        "the missing approval still fails inside the scoped handler: {value:?}"
+    );
 }
 
 #[tokio::test]

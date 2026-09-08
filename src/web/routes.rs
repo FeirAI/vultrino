@@ -1474,7 +1474,15 @@ pub async fn approval_approve(
     // Surface a rejected decision (e.g. a separation-of-duty self-approval, or an
     // already-decided/expired request) rather than silently redirecting (V5).
     match result {
-        Ok(_) => Redirect::to("/approvals").into_response(),
+        Ok(decided) => {
+            if decided.status() == ApprovalStatus::Approved && !decided.executed {
+                if let Err(error) = state.server.check_and_resume_approval(&id, None).await {
+                    tracing::error!(%error, approval_id = %id,
+                        "admin-panel approval committed but immediate durable resume failed; recovery will retry");
+                }
+            }
+            Redirect::to("/approvals").into_response()
+        }
         Err(e) => render_decided(
             "Could not approve",
             &format!("The approval was not recorded: {}", e),
@@ -1652,13 +1660,30 @@ pub async fn approval_decide_submit(
         )
         .await
     {
-        Ok(_) => {
+        Ok(decided) => {
             if approve {
-                render_decided(
-                    "Approved",
-                    "The action has been approved. The agent will run it on its next check and receive the result.",
-                    true,
-                )
+                let resumed = if decided.status() == ApprovalStatus::Approved && !decided.executed {
+                    state.server.check_and_resume_approval(&id, None).await.ok()
+                } else {
+                    Some(decided)
+                };
+                match resumed {
+                    Some(result) if result.executed && result.result_error.is_none() => render_decided(
+                        "Approved and completed",
+                        "The action was approved and completed. The terminal result is available to the agent.",
+                        true,
+                    ),
+                    Some(result) if result.executed => render_decided(
+                        "Approved, action failed",
+                        result.result_error.as_deref().unwrap_or("The approved action failed."),
+                        false,
+                    ),
+                    _ => render_decided(
+                        "Approved",
+                        "The decision was recorded. Durable recovery will claim the action and deliver its terminal result.",
+                        true,
+                    ),
+                }
             } else {
                 render_decided(
                     "Denied",

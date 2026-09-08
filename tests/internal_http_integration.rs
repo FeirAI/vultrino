@@ -50,10 +50,18 @@ async fn spawn_stub_averin() -> String {
     async fn use_seal() -> Json<serde_json::Value> {
         Json(serde_json::json!({"record": {"record_id": "use-stub-1"}}))
     }
+    async fn use_intent() -> Json<serde_json::Value> {
+        Json(serde_json::json!({"record": {"record_id": "intent-stub-1"}}))
+    }
+    async fn use_outcome() -> Json<serde_json::Value> {
+        Json(serde_json::json!({"outcome_id": "outcome-stub-1"}))
+    }
 
     let app = Router::new()
         .route("/v2/grants", post(grants))
-        .route("/v2/use", post(use_seal));
+        .route("/v2/use", post(use_seal))
+        .route("/v2/use-intent", post(use_intent))
+        .route("/v2/use-outcome", post(use_outcome));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

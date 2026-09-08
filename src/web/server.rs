@@ -309,6 +309,11 @@ impl WebServer {
             // Approvals JSON API: agent poll-by-id; admin-key list + decision
             // (A3/A4) for a product aggregator (tenant-partitioned in the handlers).
             .route("/api/v1/approvals", get(api::api_list_approvals))
+            .route("/api/v1/approval-results", get(api::api_approval_results))
+            .route(
+                "/api/v1/approval-notifications",
+                get(api::api_approval_notifications),
+            )
             .route("/api/v1/approvals/{id}", get(api::api_check_approval))
             .route(
                 "/api/v1/approvals/{id}/decision",

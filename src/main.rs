@@ -1878,10 +1878,8 @@ transport = "stdio"
 #   vultrino meta set <alias> require_approval true
 # [approvals]
 # enabled = true
-# ttl_secs = 3600   # a CEILING: the real deadline is min(this, the presenting use
-#                   # token's remaining life). An approval is never offerable past
-#                   # the life of the credential that would execute it, so this can
-#                   # be shortened by the credential but never lengthens it.
+# ttl_secs = 3600   # pending human-review window for the default Medium class;
+#                   # independent of short-lived bearer authentication.
 # public_base_url = "https://vultrino.example.com"  # used in approve/deny links
 # oob_approver_identity = "oncall@example.com"  # REQUIRED when a notifier is set:
 #                                               # the named approver OOB links are
@@ -2687,7 +2685,7 @@ async fn decide_approval(
 
     if approve {
         println!(
-            "Approval '{}' approved. The agent will run the action on its next check.",
+            "Approval '{}' approved. The serving process or agent result check will claim the durable action.",
             id
         );
     } else {

@@ -4,17 +4,17 @@
 //! unsupervised. When an action requires approval, Vultrino does **not** execute
 //! it. Instead it records an [`ApprovalRequest`], hands the agent an
 //! `approval_id`, and waits. A human approves or denies it — in the admin panel,
-//! via a Telegram button, or via a link delivered by webhook/email — and only
-//! then does the action run, with the result delivered back to the agent the
-//! next time it polls.
+//! via a Telegram button, or via a link delivered by webhook/email. A completed
+//! approval actively claims and runs the durable exact request; agent polling is
+//! a result/recovery mechanism, not a requirement for execution.
 //!
 //! ## The flow, from the agent's side
 //! 1. Agent calls a tool (e.g. `http_request`). The response is **not** the API
 //!    result — it's a clearly-labelled "approval required" message with an
 //!    `approval_id` and instructions to poll `check_approval`.
-//! 2. Agent polls `check_approval` with that id. While `pending`, it keeps
-//!    waiting. If `denied`, it stops. If `approved`, the action executes
-//!    (lazily, in the serving process) and the real result is returned.
+//! 2. The decision path executes immediately after a complete approval recipe.
+//!    Agent polling (or the agent-scoped result feed) reports the terminal result
+//!    and safely recovers a process crash between decision commit and execution.
 //!
 //! ## Out-of-band approval (Telegram / webhook / email)
 //! Each request carries a single-**decision** capability token (only its hash is
@@ -153,13 +153,10 @@ pub enum CredentialCheck {
 /// What a caller may TRUTHFULLY claim about EXECUTION at the instant a decision was
 /// recorded (plan 103 §10h FINDING 4, layer 3).
 ///
-/// Recording a decision and running the action are two separate events in this
-/// design: `POST /api/v1/approvals/{id}/decision` only commits the sign-off, and the
-/// requesting agent's next poll is what actually executes. The decision response
-/// therefore carried `executed: false` on EVERY successful grant, which the product
-/// UI collapsed into one green "Approved. Recorded just now." receipt — the same
-/// receipt it painted for an approval whose action had already failed. An approver
-/// signed an irreversible refund, saw success, and nothing ran.
+/// Recording a decision and running the action are separate durable events. The
+/// decision endpoint actively resumes a complete grant, while polling/result-feed
+/// recovery closes the crash window between those events. `execution_state` keeps
+/// the product from collapsing awaiting, completed, and failed outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionState {
     /// This state implies nothing about execution: the request is still open, or was
@@ -2704,64 +2701,6 @@ impl CriticalitySla {
     pub fn escalate_window(&self) -> chrono::Duration {
         chrono::Duration::seconds(self.escalate_window_secs.max(1) as i64)
     }
-
-    /// Clamp the two SLA windows so an approval's FINAL DEADLINE can never outlive
-    /// the credential that would execute it (plan 103 §10h FINDING 4).
-    ///
-    /// The measured defect: `approvals.ttl_secs` defaults to 3600s while govder
-    /// compiles an L3·High use token with a **900s** TTL, so vultrino offered an
-    /// approval for four times as long as the credential could honour it. A human
-    /// who decided inside the advertised window got `Approved` recorded and the
-    /// action refused at resume with `use token has expired` — an approver signing
-    /// an irreversible money action that then never ran.
-    ///
-    /// `credential_remaining` is the time left on the use token driving the request:
-    /// * `None` — the request is not use-token-driven (a local/API-key caller), or
-    ///   the token carries no expiry (`max_uses` alone bounds it). There is no
-    ///   credential deadline to clamp against, so the configured SLA stands.
-    /// * `Some(d)` — the deadline. The returned windows always sum to `min(total, d)`.
-    ///
-    /// Returns `None` when the credential is ALREADY dead (or dies inside the same
-    /// second): the caller must then REFUSE to open the approval rather than create
-    /// one no approver could ever make good on. That is fail-closed in both
-    /// directions — nothing executes, and no human is invited to authorize something
-    /// that cannot run.
-    ///
-    /// Both phases are scaled by `remaining / total` rather than truncating the
-    /// second window, so a clamped request keeps its two-phase escalate-then-expire
-    /// shape (a High request clamped from 900+900 to 900 total escalates at 450s)
-    /// instead of degenerating into "escalates exactly when it expires".
-    pub fn clamped_to_credential(
-        &self,
-        credential_remaining: Option<chrono::Duration>,
-    ) -> Option<(chrono::Duration, chrono::Duration)> {
-        let after = self.escalate_after();
-        let window = self.escalate_window();
-        let remaining = match credential_remaining {
-            None => return Some((after, window)),
-            Some(r) => r,
-        };
-        // Whole seconds only: `open()` stamps `expires_at` from these durations and
-        // a sub-second remainder is not a window any human can decide inside, so it
-        // is treated as "already dead" (refuse) rather than rounded up into one.
-        let rem_secs = remaining.num_seconds();
-        if rem_secs <= 0 {
-            return None;
-        }
-        let total_secs = (after + window).num_seconds().max(1);
-        if total_secs <= rem_secs {
-            return Some((after, window));
-        }
-        // i128 so the product cannot overflow for any credential TTL an operator
-        // can express.
-        let scaled_after =
-            (after.num_seconds() as i128 * rem_secs as i128 / total_secs as i128) as i64;
-        let after_secs = scaled_after.clamp(0, rem_secs);
-        Some((
-            chrono::Duration::seconds(after_secs),
-            chrono::Duration::seconds(rem_secs - after_secs),
-        ))
-    }
 }
 
 /// A rule mapping a `(credential, action)` to a criticality class (V5). The
@@ -3096,6 +3035,11 @@ fn webhook_payload(
             "id": approval.id,
             "status": approval.status.to_string(),
             "summary": approval.summary,
+            // Stable requesting-agent identity for a trusted channel router. A
+            // solo-project lead can therefore tell the owner which specialist
+            // needs approval without receiving that specialist's use token or
+            // any decision authority.
+            "agent_label": approval.agent_label,
             "credential": approval.credential,
             "action": approval.action,
             "criticality": approval.criticality.to_string(),
@@ -3830,6 +3774,7 @@ mod tests {
     #[test]
     fn test_webhook_payload_event_and_links_by_status() {
         let (mut a, token) = new_approval();
+        a.agent_label = Some("agent-1".to_string());
         let links = a.links("https://vault.example.com", &token);
 
         // Pending → approval.requested with real decision links.
@@ -3837,6 +3782,7 @@ mod tests {
         assert_eq!(p["event"], "approval.requested");
         assert!(p["links"]["approve_url"].is_string());
         assert_eq!(p["approval"]["status"], "pending");
+        assert_eq!(p["approval"]["agent_label"], "agent-1");
 
         // Escalated → approval.escalated; a panel-only link set omits approve/deny.
         a.status = ApprovalStatus::Escalated;
@@ -4867,99 +4813,9 @@ mod finding_6a_startup_warning_tests {
     }
 }
 
-// MERGE NOTE (2026-07-27): FIX A's FINDING 6a startup-warning tests above and FIX B's FINDING 4
-// TTL/clamp tests below were appended at the SAME point in this file by two concurrent streams,
-// and this was the only textual conflict in the whole vultrino merge. Both are kept in full: they
-// assert different properties of the same subsystem (whether a DISABLED approval subsystem
-// announces itself at startup, vs whether an approval can outlive the use token that would
-// execute it) and neither is a superset of the other.
 #[cfg(test)]
-mod finding4_tests {
+mod execution_state_tests {
     use super::*;
-
-    fn sla(after: u64, window: u64) -> CriticalitySla {
-        CriticalitySla {
-            escalate_after_secs: after,
-            escalate_window_secs: window,
-        }
-    }
-
-    /// FINDING 4 (plan 103 §10h): the SHIPPED divergence, in numbers. govder's
-    /// scope table compiles an L3·High use token at **900s**
-    /// (`internal/enforce/scope.go`), while the High criticality SLA is 15+15
-    /// minutes (**1800s**) and the legacy `approvals.ttl_secs` default is 3600s. An
-    /// approval offered for 1800s (or 3600s) against a 900s credential is an
-    /// approval a human can sign and nothing can execute.
-    #[test]
-    fn clamp_binds_the_approval_window_to_an_l3_high_use_token() {
-        let high = sla(15 * 60, 15 * 60);
-        let (after, window) = high
-            .clamped_to_credential(Some(chrono::Duration::seconds(900)))
-            .expect("a 900s credential is alive, so the approval must open");
-        assert_eq!(
-            (after + window).num_seconds(),
-            900,
-            "the final deadline must equal the credential's remaining life, not 1800s"
-        );
-        // Both phases survive proportionally: escalate at the halfway point, so a
-        // clamped request still escalates BEFORE it expires.
-        assert_eq!(after.num_seconds(), 450);
-        assert_eq!(window.num_seconds(), 450);
-    }
-
-    /// The clamp only ever SHRINKS the window. A credential with more life left than
-    /// the configured SLA must not extend the approval — the SLA is still a real
-    /// policy bound, and widening it here would be fail-open.
-    #[test]
-    fn clamp_never_extends_the_window_past_the_configured_sla() {
-        let high = sla(15 * 60, 15 * 60);
-        let (after, window) = high
-            .clamped_to_credential(Some(chrono::Duration::seconds(86_400)))
-            .unwrap();
-        assert_eq!(after.num_seconds(), 900);
-        assert_eq!(window.num_seconds(), 900);
-    }
-
-    /// No credential deadline to clamp against (a local/API-key caller, or a token
-    /// bounded only by `max_uses`): the configured SLA stands, byte-identical to the
-    /// pre-fix behavior.
-    #[test]
-    fn clamp_is_a_no_op_without_a_credential_deadline() {
-        let medium = sla(1800, 1800);
-        let (after, window) = medium.clamped_to_credential(None).unwrap();
-        assert_eq!(after.num_seconds(), 1800);
-        assert_eq!(window.num_seconds(), 1800);
-    }
-
-    /// A dead (or sub-second) credential yields `None` — the caller must REFUSE to
-    /// open. Opening a 0-second approval would invite a human to authorize an action
-    /// that is already impossible; refusing executes nothing and says so.
-    #[test]
-    fn clamp_refuses_when_the_credential_is_already_dead() {
-        let high = sla(900, 900);
-        assert!(high
-            .clamped_to_credential(Some(chrono::Duration::seconds(0)))
-            .is_none());
-        assert!(high
-            .clamped_to_credential(Some(chrono::Duration::seconds(-30)))
-            .is_none());
-        assert!(
-            high.clamped_to_credential(Some(chrono::Duration::milliseconds(800)))
-                .is_none(),
-            "a sub-second remainder is not a decidable window"
-        );
-    }
-
-    /// A very short but real window still opens, with both phases inside it.
-    #[test]
-    fn clamp_keeps_a_short_window_inside_the_credential() {
-        let high = sla(900, 900);
-        let (after, window) = high
-            .clamped_to_credential(Some(chrono::Duration::seconds(30)))
-            .unwrap();
-        assert_eq!((after + window).num_seconds(), 30);
-        assert!(after.num_seconds() >= 0 && window.num_seconds() >= 0);
-    }
 
     fn approved_request() -> ApprovalRequest {
         let (mut a, _t) = tests_support::open_minimal();

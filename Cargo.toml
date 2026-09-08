@@ -56,8 +56,8 @@ sha3 = "0.12"  # Keccak256 for Ethereum
 
 # WASM runtime for plugins (optional so Kani 0.67's rustc 1.93 can verify
 # pure-kernel harnesses without pulling wasmtime's rustc-1.94 MSRV).
-wasmtime = { version = "47", optional = true }
-wasmtime-wasi = { version = "47", optional = true }
+wasmtime = { version = "47.0.4", optional = true }
+wasmtime-wasi = { version = "47.0.4", optional = true }
 
 # OS integration (for future keychain support)
 # keyring = "3"

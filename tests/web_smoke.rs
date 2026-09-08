@@ -7341,11 +7341,12 @@ async fn store_token(
     token
 }
 
-/// The measured misreport: the grant is recorded, and the credential that would run
-/// it is dead. The response must say BLOCKED and name the reason — never a state a UI
-/// can paint as a completed action.
+/// The opener's bearer may expire while a human reviews the request. Approval now
+/// resumes from the frozen, exact durable grant, so bearer expiry must not be exposed
+/// as an execution blocker. This deliberately incomplete fixture then fails for its
+/// actual missing execution authority, proving the decision route attempted resume.
 #[tokio::test]
-async fn test_a4_decision_reports_blocked_when_the_credential_expired() {
+async fn test_a4_decision_does_not_treat_opener_expiry_as_an_execution_blocker() {
     let (router, storage, key) = build_tenant_admin_router("team-a").await;
     let token = store_token(&storage, "dead", Some(chrono::Duration::seconds(-60))).await;
     let id = store_approval_bound_to_token(&storage, "team-a", &token.id).await;
@@ -7365,26 +7366,21 @@ async fn test_a4_decision_reports_blocked_when_the_credential_expired() {
 
     // The decision itself IS recorded — that part was never wrong.
     assert_eq!(body["status"], "approved");
-    assert_eq!(body["executed"], false);
-    // ...but the response must not stop there, which is the whole defect.
-    assert_eq!(
-        body["execution_state"], "blocked",
-        "a grant whose credential has expired must be reported as blocked, not as a \
-         plain recorded approval"
-    );
+    assert_eq!(body["executed"], true);
+    assert_eq!(body["execution_state"], "failed");
     let reason = body["execution_error"].as_str().unwrap_or_default();
     assert!(
-        reason.contains("expired"),
-        "the response must carry the reason the action cannot run, got {:?}",
+        !reason.contains("expired"),
+        "the durable approval grant must not inherit opener-token expiry: {:?}",
         reason
     );
 }
 
-/// Same shape for the kill switch: an operator revokes the agent's token while the
-/// approval is pending. Clamping the window (FINDING 4 layer 1) cannot cover this
-/// case, so the state has to.
+/// Revoking the opener's bearer also cannot retroactively revoke a human-approved,
+/// exact request. Resume still revalidates live policy, credential revision, catalog,
+/// and kill state; this assertion is only about the spent opener bearer.
 #[tokio::test]
-async fn test_a4_decision_reports_blocked_when_the_credential_was_revoked() {
+async fn test_a4_decision_does_not_treat_opener_revocation_as_an_execution_blocker() {
     let (router, storage, key) = build_tenant_admin_router("team-a").await;
     let token = store_token(&storage, "killed", Some(chrono::Duration::seconds(3600))).await;
     let id = store_approval_bound_to_token(&storage, "team-a", &token.id).await;
@@ -7403,19 +7399,19 @@ async fn test_a4_decision_reports_blocked_when_the_credential_was_revoked() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
-    assert_eq!(body["execution_state"], "blocked");
-    assert!(body["execution_error"]
+    assert_eq!(body["executed"], true);
+    assert_eq!(body["execution_state"], "failed");
+    assert!(!body["execution_error"]
         .as_str()
         .unwrap_or_default()
         .contains("revoked"));
 }
 
-/// The DISCRIMINATING control. The same recorded grant with a LIVE credential is
-/// `awaiting_execution` with no error — if the route answered "blocked" here the
-/// state would be worthless, and if it answered "executed" it would be the original
-/// lie in a new field.
+/// A decision endpoint actively attempts durable resume. Even this deliberately
+/// incomplete fixture must therefore return a terminal execution result, rather than
+/// the old `awaiting_execution` response that depended on a later agent poll.
 #[tokio::test]
-async fn test_a4_decision_reports_awaiting_execution_for_a_live_credential() {
+async fn test_a4_decision_actively_resumes_instead_of_waiting_for_an_agent_poll() {
     let (router, storage, key) = build_tenant_admin_router("team-a").await;
     let token = store_token(&storage, "live", Some(chrono::Duration::seconds(3600))).await;
     let id = store_approval_bound_to_token(&storage, "team-a", &token.id).await;
@@ -7433,14 +7429,11 @@ async fn test_a4_decision_reports_awaiting_execution_for_a_live_credential() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
-    assert_eq!(body["executed"], false);
-    assert_eq!(
-        body["execution_state"], "awaiting_execution",
-        "a healthy grant must not be flagged as blocked"
-    );
+    assert_eq!(body["executed"], true);
+    assert_eq!(body["execution_state"], "failed");
     assert!(
-        body.get("execution_error").is_none(),
-        "no reason may be invented when there is none: {:?}",
+        body.get("execution_error").is_some(),
+        "the terminal resume failure must be explained: {:?}",
         body.get("execution_error")
     );
 }
