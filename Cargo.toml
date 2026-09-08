@@ -90,7 +90,7 @@ zeroize = "1"
 shellexpand = "3"
 tempfile = "3"
 fd-lock = "4.0.4"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 rustix = { version = "1", features = ["fs"] }
 
 # Future optional features
