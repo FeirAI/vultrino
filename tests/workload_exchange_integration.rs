@@ -405,11 +405,19 @@ async fn second_exchange_retires_its_predecessor() {
     let resp = router.clone().oneshot(exchange_req(&first)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "first exchange must succeed");
     let live_after_first = live_tokens(&storage, "t1", "ep_agent").await;
-    assert_eq!(live_after_first.len(), 1, "one exchange = one live generation");
+    assert_eq!(
+        live_after_first.len(),
+        1,
+        "one exchange = one live generation"
+    );
 
     let second = mint_assertion(VERIFIER_SECRET, valid_claims("jti-retire-2"));
     let resp = router.clone().oneshot(exchange_req(&second)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "second exchange must succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "second exchange must succeed"
+    );
 
     let live = live_tokens(&storage, "t1", "ep_agent").await;
     assert_eq!(
@@ -491,7 +499,11 @@ async fn max_live_generations_refuses_an_over_cap_exchange() {
 
     let a = mint_assertion(VERIFIER_SECRET, valid_claims("jti-cap-1"));
     let resp = router.clone().oneshot(exchange_req(&a)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "the first exchange is under the cap");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the first exchange is under the cap"
+    );
 
     // Leave the predecessor live so the cap is what is being measured, not retire.
     let live = live_tokens(&storage, "t1", "ep_agent").await;

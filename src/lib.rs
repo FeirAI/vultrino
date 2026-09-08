@@ -217,6 +217,7 @@ pub enum CredentialData {
     },
 
     /// OAuth2 credentials
+    #[serde(rename = "oauth2")]
     OAuth2 {
         client_id: String,
         client_secret: Secret,
@@ -390,9 +391,7 @@ impl CredentialData {
                 key_pem,
                 passphrase,
             } => secret(key_pem) && optional_secret(passphrase),
-            CredentialData::Certificate { cert_pem, key_pem } => {
-                text(cert_pem) && secret(key_pem)
-            }
+            CredentialData::Certificate { cert_pem, key_pem } => text(cert_pem) && secret(key_pem),
             CredentialData::HmacApiKey {
                 api_key,
                 api_secret,
@@ -426,13 +425,7 @@ impl CredentialData {
                 password,
                 sslmode,
                 ..
-            } => {
-                text(host)
-                    && text(database)
-                    && text(user)
-                    && secret(password)
-                    && text(sslmode)
-            }
+            } => text(host) && text(database) && text(user) && secret(password) && text(sslmode),
             CredentialData::UrlToken { token } => secret(token),
             CredentialData::Custom(values) => {
                 !values.is_empty()
@@ -981,13 +974,12 @@ mod tests {
 
     #[test]
     fn execution_response_never_serializes_refresh_credentials() {
-        let response = ExecuteResponse::success("ok").with_updated_credential(
-            CredentialData::ApiKey {
+        let response =
+            ExecuteResponse::success("ok").with_updated_credential(CredentialData::ApiKey {
                 key: Secret::new("fresh-secret-token"),
                 header_name: "Authorization".to_string(),
                 header_prefix: "Bearer ".to_string(),
-            },
-        );
+            });
         let wire = serde_json::to_string(&response).unwrap();
         assert!(!wire.contains("updated_credential"));
         assert!(!wire.contains("fresh-secret-token"));
@@ -1014,6 +1006,19 @@ mod tests {
         assert!(mats.iter().any(|m| m == "atoken"));
         assert!(mats.iter().any(|m| m == "rtoken"));
         assert!(mats.iter().any(|m| m == &STANDARD.encode("cid:csecret")));
+    }
+
+    #[test]
+    fn oauth2_wire_discriminator_matches_public_api_contract() {
+        let data: CredentialData = serde_json::from_str(
+            r#"{"type":"oauth2","client_id":"client","client_secret":"secret","refresh_token":"refresh","token_url":"https://oauth2.googleapis.com/token","scopes":["scope"]}"#,
+        )
+        .expect("the documented oauth2 discriminator must deserialize");
+        assert!(matches!(data, CredentialData::OAuth2 { .. }));
+        assert!(serde_json::from_str::<CredentialData>(
+            r#"{"type":"o_auth2","client_id":"client","client_secret":"secret","token_url":"https://example.com/token"}"#
+        )
+        .is_err());
     }
 
     #[test]

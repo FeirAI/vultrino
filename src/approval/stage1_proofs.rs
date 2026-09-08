@@ -129,7 +129,8 @@ fn split_search_oracle_agrees_with_the_unit_matching_oracle() {
         for nt in 0..=(8 - ns) {
             for avs in 0..=9u32 {
                 for avt in 0..=9u32 {
-                    let unit = super::recipe_conformance::max_matching_exists(ns, nt, 0, avs, avt, 0);
+                    let unit =
+                        super::recipe_conformance::max_matching_exists(ns, nt, 0, avs, avt, 0);
                     let split = matchable_by_split_search(ns, nt, avs, avt);
                     assert_eq!(
                         split, unit,
@@ -146,7 +147,10 @@ fn split_search_oracle_agrees_with_the_unit_matching_oracle() {
     // Report the domain size and the discrimination, so a future reduction of the
     // loop bounds changes a NUMBER rather than passing quietly, and so a
     // constant-false oracle (which would make the equality vacuous) is visible.
-    assert_eq!(points, 4500, "the agreement cube moved; the digest below is stated over the old one");
+    assert_eq!(
+        points, 4500,
+        "the agreement cube moved; the digest below is stated over the old one"
+    );
     assert!(
         agreed_true > 0 && agreed_true < points,
         "both oracles agreed on {agreed_true} of {points} points — a constant oracle would agree \
@@ -185,7 +189,10 @@ fn split_search_oracle_agrees_with_the_unit_matching_oracle() {
 #[test]
 fn greedy_is_optimal_at_the_real_cap() {
     const CAP: u32 = MAX_RECIPE_TERM_COUNT;
-    assert_eq!(CAP, 64, "the cap moved; the point count below is stated over the old cap");
+    assert_eq!(
+        CAP, 64,
+        "the cap moved; the point count below is stated over the old cap"
+    );
 
     let avails: Vec<u32> = (0..=65u32).chain(std::iter::once(u32::MAX)).collect();
     let mut points: u64 = 0;
@@ -199,10 +206,16 @@ fn greedy_is_optimal_at_the_real_cap() {
             // are omitted, because a zero count is itself malformed.
             let mut terms = Vec::with_capacity(2);
             if ns > 0 {
-                terms.push(RecipeTerm { class: ApproverClass::Senior, count: ns });
+                terms.push(RecipeTerm {
+                    class: ApproverClass::Senior,
+                    count: ns,
+                });
             }
             if nt > 0 {
-                terms.push(RecipeTerm { class: ApproverClass::Teammate, count: nt });
+                terms.push(RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: nt,
+                });
             }
             let r = Recipe { terms };
             let well_formed = recipe_well_formed(&r);
@@ -318,7 +331,11 @@ fn expected_transition(
     // GUARD 2 — past the final deadline. `expire_if_due` flips an OPEN request to
     // Expired as a side effect; a non-open one is left alone.
     if past_ttl {
-        let after = if from.is_open() { ApprovalStatus::Expired } else { from };
+        let after = if from.is_open() {
+            ApprovalStatus::Expired
+        } else {
+            from
+        };
         return Expect::Err("expired", after);
     }
     // GUARD 3 — a decision is valid only in an open state, with exactly one
@@ -458,7 +475,10 @@ fn lifecycle_table_is_total_and_guard_order_holds() {
         }
     }
 
-    assert_eq!(states, 720, "the lifecycle product moved away from 720 states");
+    assert_eq!(
+        states, 720,
+        "the lifecycle product moved away from 720 states"
+    );
     // The accepted count is asserted, not merely observed: a future widening of
     // the accepted set (a new legal transition, a relaxed guard) must FAIL this
     // test rather than pass it quietly. That is the whole point of pinning it.
@@ -483,7 +503,10 @@ fn blank_identity_guard_runs_before_the_ttl_guard() {
 
     // A blank identity on an ALREADY-EXPIRED open request.
     let err = a
-        .transition(ApprovalStatus::Approved, Decision::new("admin panel", "   "))
+        .transition(
+            ApprovalStatus::Approved,
+            Decision::new("admin panel", "   "),
+        )
         .unwrap_err();
     assert!(
         matches!(err, ApprovalError::MissingApproverIdentity),
@@ -500,7 +523,10 @@ fn blank_identity_guard_runs_before_the_ttl_guard() {
     // The same request, with a real identity, DOES expire — which is what makes
     // the assertion above about ORDER rather than about the TTL guard being dead.
     let err = a
-        .transition(ApprovalStatus::Approved, Decision::new("admin panel", "alice"))
+        .transition(
+            ApprovalStatus::Approved,
+            Decision::new("admin panel", "alice"),
+        )
         .unwrap_err();
     assert!(matches!(err, ApprovalError::Expired), "got {err:?}");
     assert_eq!(a.status(), ApprovalStatus::Expired);
@@ -541,7 +567,10 @@ fn a_recipe_grant_that_no_longer_satisfies_yields_no_witness() {
     // {senior: 2} — satisfiable only by two distinct seniors.
     let rule = ApprovalRule {
         recipes: vec![Recipe {
-            terms: vec![RecipeTerm { class: ApproverClass::Senior, count: 2 }],
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Senior,
+                count: 2,
+            }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
     };
@@ -566,16 +595,24 @@ fn a_recipe_grant_that_no_longer_satisfies_yields_no_witness() {
         sign("alice@corp", ApproverClass::Senior),
         sign("bob@corp", ApproverClass::Senior),
     ]);
-    let w = a.grant_witness().expect("an honestly satisfied recipe must mint a witness");
+    let w = a
+        .grant_witness()
+        .expect("an honestly satisfied recipe must mint a witness");
     assert_eq!(
         w.basis(),
-        &GrantBasis::Recipe { recipes: 1, counted_signoffs: 2 },
+        &GrantBasis::Recipe {
+            recipes: 1,
+            counted_signoffs: 2
+        },
         "the witness must name the predicate it was minted from"
     );
 
     // Now the shapes a vault edit produces, one axis at a time.
     for (label, signoffs) in [
-        ("one senior short", vec![sign("alice@corp", ApproverClass::Senior)]),
+        (
+            "one senior short",
+            vec![sign("alice@corp", ApproverClass::Senior)],
+        ),
         (
             "two sign-offs, one bare human identity duplicated (D4(b) distinctness)",
             vec![
@@ -593,8 +630,14 @@ fn a_recipe_grant_that_no_longer_satisfies_yields_no_witness() {
         (
             "two seniors whose class never resolved",
             vec![
-                Signoff { resolved_class: None, ..sign("alice@corp", ApproverClass::Senior) },
-                Signoff { resolved_class: None, ..sign("bob@corp", ApproverClass::Senior) },
+                Signoff {
+                    resolved_class: None,
+                    ..sign("alice@corp", ApproverClass::Senior)
+                },
+                Signoff {
+                    resolved_class: None,
+                    ..sign("bob@corp", ApproverClass::Senior)
+                },
             ],
         ),
     ] {
@@ -618,13 +661,17 @@ fn a_recipe_grant_that_no_longer_satisfies_yields_no_witness() {
 #[test]
 fn every_honestly_granted_request_re_derives() {
     let (mut a, _t) = fresh();
-    a.approve(Decision::new("admin panel", "alice@corp")).unwrap();
+    a.approve(Decision::new("admin panel", "alice@corp"))
+        .unwrap();
     assert_eq!(a.status(), ApprovalStatus::Approved);
-    let w = a
-        .grant_witness()
-        .expect("a request granted by transition() must re-derive; if it does not, the claim path \
-                 now refuses legitimate work and the two predicates have drifted");
-    assert_eq!(w.basis(), &GrantBasis::NumericThreshold { need: 1, have: 1 });
+    let w = a.grant_witness().expect(
+        "a request granted by transition() must re-derive; if it does not, the claim path \
+                 now refuses legitimate work and the two predicates have drifted",
+    );
+    assert_eq!(
+        w.basis(),
+        &GrantBasis::NumericThreshold { need: 1, have: 1 }
+    );
 
     // A denied or still-open request never mints one, whatever else is true.
     let (mut d, _t) = fresh();
@@ -666,7 +713,10 @@ fn every_honestly_granted_request_re_derives() {
 fn an_unnamed_principal_fills_no_slot() {
     let rule = ApprovalRule {
         recipes: vec![Recipe {
-            terms: vec![RecipeTerm { class: ApproverClass::Teammate, count: 1 }],
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Teammate,
+                count: 1,
+            }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
     };
@@ -710,7 +760,9 @@ fn an_unnamed_principal_fills_no_slot() {
     assert!(
         approval_rule_satisfied(
             &rule,
-            &[unnamed("agg:00000000-0000-0000-0000-000000000000:alice@corp")]
+            &[unnamed(
+                "agg:00000000-0000-0000-0000-000000000000:alice@corp"
+            )]
         ),
         "a NAMED aggregator-asserted teammate must still fill a teammate slot"
     );
@@ -731,8 +783,8 @@ fn the_drop_and_the_distinctness_key_agree_about_what_a_principal_is() {
         "agg:key-a:alice@corp",
         "agg:key-a:",
         "agg:key-a:   ",
-        "agg:key-a",     // malformed: no second colon, treated as opaque
-        "agg:",          // malformed
+        "agg:key-a", // malformed: no second colon, treated as opaque
+        "agg:",      // malformed
         "   ",
         "",
     ];
@@ -770,13 +822,7 @@ fn reachable_approval_vault_roundtrip_preserves_invariants_20k() {
         ".{0,20}",
     ];
     let decisions = proptest::collection::vec((identity, any::<bool>(), 0u8..3), 0..7);
-    let strategy = (
-        any::<bool>(),
-        any::<bool>(),
-        1u32..=3,
-        0u8..2,
-        decisions,
-    );
+    let strategy = (any::<bool>(), any::<bool>(), 1u32..=3, 0u8..2, decisions);
     let mut runner = TestRunner::new(Config {
         cases: 20_000,
         failure_persistence: None,
@@ -902,7 +948,11 @@ fn risk_tier_and_approver_class_wire_tables_fail_closed() {
     ];
     assert_eq!(risk_cases.len(), 10);
     for (wire, expected) in risk_cases {
-        assert_eq!(risk_tier_forces_deny_on_any_deny(wire), expected, "{wire:?}");
+        assert_eq!(
+            risk_tier_forces_deny_on_any_deny(wire),
+            expected,
+            "{wire:?}"
+        );
     }
 
     let class_cases = [

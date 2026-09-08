@@ -89,9 +89,7 @@ pub fn verify_tenant_assertion(
         return Err(TenantAssertionError::Malformed);
     }
     let parts: Vec<_> = assertion.split('.').collect();
-    if parts.len() != 4
-        || parts[2].len() != 16
-        || !parts[2].bytes().all(|b| b.is_ascii_hexdigit())
+    if parts.len() != 4 || parts[2].len() != 16 || !parts[2].bytes().all(|b| b.is_ascii_hexdigit())
     {
         return Err(TenantAssertionError::Malformed);
     }
@@ -134,8 +132,8 @@ pub fn verify_tenant_assertion(
     let supplied_mac = URL_SAFE_NO_PAD
         .decode(parts[3])
         .map_err(|_| TenantAssertionError::Malformed)?;
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| TenantAssertionError::Malformed)?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|_| TenantAssertionError::Malformed)?;
     mac.update(payload.as_bytes());
     mac.verify_slice(&supplied_mac)
         .map_err(|_| TenantAssertionError::BadMac)
@@ -308,9 +306,7 @@ mod tests {
     #[test]
     fn verify_rejects_expired_far_future_malformed_and_bad_mac() {
         let now = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
-        let sign = |exp| {
-            sign_tenant_assertion("s", "acme", "POST", "/p", "", "host", b"{}", exp)
-        };
+        let sign = |exp| sign_tenant_assertion("s", "acme", "POST", "/p", "", "host", b"{}", exp);
         let verify = |assertion: &str| {
             verify_tenant_assertion(
                 assertion,
@@ -333,7 +329,10 @@ mod tests {
             verify(&sign(now + chrono::Duration::seconds(91))),
             Err(TenantAssertionError::ExcessiveTtl)
         );
-        assert_eq!(verify("not-an-assertion"), Err(TenantAssertionError::Malformed));
+        assert_eq!(
+            verify("not-an-assertion"),
+            Err(TenantAssertionError::Malformed)
+        );
 
         let mut bad = sign(now + chrono::Duration::seconds(60));
         let original_last = bad.pop().expect("signed assertion has a MAC");

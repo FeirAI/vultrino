@@ -15,11 +15,11 @@ An action is gated if **any** of these match:
 The flow is designed so the agent clearly understands it is *waiting*, not failing, and knows how to check back:
 
 1. The agent calls a tool. Instead of a result it receives an **"APPROVAL REQUIRED"** message containing an `approval_id`. The action has **not** run.
-2. The agent polls with that id — the `check_approval` MCP tool, `GET /api/v1/approvals/{id}`, or `vultrino approval status <id> --wait`.
+2. The agent may poll with that id — the `check_approval` MCP tool, `GET /api/v1/approvals/{id}`, or `vultrino approval status <id> --wait`.
 3. A human approves or denies it.
-4. On the next poll after approval, Vultrino **runs the action and returns the real result**. If denied or expired, the agent is told to stop.
+4. A complete approval recipe actively makes Vultrino **claim and run the exact action**. Polling or the agent-scoped result feed reports the terminal result. If denied or expired, the agent is told to stop.
 
-Execution happens lazily on that poll, so no background worker is required and the result is delivered the moment the agent next checks.
+The decision and action are separate durable records. If a process dies after committing the decision but before dispatch, the result feed recovers the same at-most-once claim after restart.
 
 ## Action detail — what the approver sees (`approval_preview`)
 
@@ -92,7 +92,7 @@ Every request is assigned a **criticality class** (`low` | `medium` | `high` | `
 
 Higher criticality uses shorter windows (built-in defaults: `critical` 5m+5m, `high` 15m+15m, `low` 4h+4h; `medium` splits the legacy `ttl_secs` across both phases). Override any class with `[[approvals.sla]]`. Lifecycle advancement happens both on each agent poll and via a background sweep, so a request nobody is polling still escalates and expires on time. From the agent's side `escalated` behaves exactly like `pending` — keep polling.
 
-**The credential can shorten the window, and it wins.** Whatever the class SLA says, an approval's final deadline is clamped to the remaining life of the **use token** that will execute the action — an approval must never be offerable past the point where the credential can still honour it. Both phases scale proportionally, so a clamped request still escalates before it expires. If a request arrives with a credential that has under a second left, the approval is **refused** rather than opened (nothing runs, and nobody is asked to authorize an impossible action). So: to give approvers more time, lengthen the credential, not `ttl_secs`.
+**The human-review window is independent of the presenting bearer.** The short-lived use token authenticates and scopes approval-open; it is not retained as the execution authority. After approval, Vultrino revalidates the current credential revision, capability declaration, Govder recipe, tenant, and policy/kill state, then mints a one-shot exact-request permit. Set `ttl_secs` or a per-class SLA to give approvers hours or days without issuing long-lived bearer credentials.
 
 Set `reauth_interval_secs` to require **continuous re-authorization**: an approved grant that has not yet run within that window is treated as lapsed and must be re-approved before it can execute, rather than running on a stale decision.
 
@@ -134,8 +134,8 @@ Telegram/webhook/email links carry a **single-use capability token** and open a 
 
 - **At most once.** An approved action's execution is claimed atomically and fenced by a monotonic execution epoch, so two racing polls can't both run it. A claim left behind by a process that crashed **mid-execution** is recovered after a timeout **fail-closed**: because the crashed attempt's side effect may already have fired, the action is **not** re-run — the approval is finalized terminally with `outcome unknown — original worker lost mid-execution; re-approve to retry`, so retrying is an explicit human decision rather than a silent double-fire. A transient **pre-execution** failure (e.g. a plugin not yet loaded), where nothing ran, is still retried rather than marked done.
 - **Ownership.** An agent may only poll approvals created by the **same principal** (API key or use token) that made the original request — checked before any execution.
-- **Bounded pending approvals.** A use token's `uses + outstanding pending approvals` can never exceed `max_uses`, enforced atomically under the vault lock — so a single-use token can't flood the approval queue (or the notifier) with requests it could never run.
-- **Policy still applies at run time.** Policy is re-evaluated when the action finally executes, so an explicit **deny** rule (URL / method / time-window) blocks even a human-approved action — a human approval is not a policy bypass. Rate limits are charged **once, at request time**; the deferred re-check never re-charges or re-denies an approved action against the rate limiter. When a deny does fire on resume, the use token is left unconsumed.
+- **Bearer capacity is reserved once.** A bearer-driven approval consumes one use when the frozen request opens. Approval, denial, expiry, or later execution never reuses that bearer capacity, so a single-use token cannot create multiple durable grants.
+- **Policy still applies at run time.** Policy is re-evaluated when the action finally executes, so an explicit **deny** rule (URL / method / time-window) blocks even a human-approved action — a human approval is not a policy bypass. Rate limits are charged **once, at request time**; the deferred re-check never re-charges or re-denies an approved action against the rate limiter.
 
 ## Managing approvals
 

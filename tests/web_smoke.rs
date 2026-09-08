@@ -403,12 +403,7 @@ async fn build_tenant_two_admin_router_with_config(
         exec_server,
     )
     .into_router();
-    (
-        router,
-        storage,
-        admin_key_plain,
-        second_admin_key_plain,
-    )
+    (router, storage, admin_key_plain, second_admin_key_plain)
 }
 
 fn admin_req(method: &str, uri: &str, key: &str, body: serde_json::Value) -> Request<Body> {
@@ -2222,7 +2217,10 @@ async fn test_out_of_band_decide_flow() {
     assert!(body_string(submit).await.contains("Approved"));
 
     let stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
-    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(
+        stored.status(),
+        vultrino::approval::ApprovalStatus::Approved
+    );
     assert_eq!(stored.decided_by.as_deref(), Some("out-of-band link"));
 }
 
@@ -2737,7 +2735,10 @@ async fn test_a3_a4_json_approvals_list_and_decision() {
     assert_eq!(body["status"], "approved");
     assert_eq!(body["approvals_received"], 1);
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(
+        stored.status(),
+        vultrino::approval::ApprovalStatus::Approved
+    );
     // The decision is recorded as an AGGREGATOR-ASSERTED identity:
     // `agg:<api-key-id>:<operator>` — the human operator is preserved (and is a
     // CLAIM by the acting key, not a first-party verified identity), namespaced by
@@ -3441,7 +3442,10 @@ async fn test_json_decision_rejects_missing_operator_before_any_slot() {
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["code"], "missing_approver_identity");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert!(stored.signoffs().is_empty(), "missing identity records no slot");
+    assert!(
+        stored.signoffs().is_empty(),
+        "missing identity records no slot"
+    );
 
     // (2) whitespace-only operator is the same invalid identity.
     let resp = router
@@ -3458,7 +3462,10 @@ async fn test_json_decision_rejects_missing_operator_before_any_slot() {
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["code"], "missing_approver_identity");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert!(stored.signoffs().is_empty(), "blank identity records no slot");
+    assert!(
+        stored.signoffs().is_empty(),
+        "blank identity records no slot"
+    );
 
     // (3) a named operator can contribute the first slot normally.
     let resp = router
@@ -3639,8 +3646,7 @@ async fn test_verified_broker_assertion_requires_named_and_allows_two_bound_subj
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
     };
-    let (router, storage, key, id) =
-        build_hard_sod_recipe_fixture("team-a", rule, "High").await;
+    let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
     let uri = format!("/api/v1/approvals/{id}/decision");
 
     // A valid MAC authenticates the exact bytes, but cannot turn an unnamed
@@ -3688,9 +3694,15 @@ async fn test_verified_broker_assertion_requires_named_and_allows_two_bound_subj
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let after_one = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(after_one.status(), vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(
+        after_one.status(),
+        vultrino::approval::ApprovalStatus::Pending
+    );
     assert_eq!(after_one.signoffs().len(), 1);
-    assert_eq!(after_one.signoffs()[0].approver_identity, "verified:sub-alice");
+    assert_eq!(
+        after_one.signoffs()[0].approver_identity,
+        "verified:sub-alice"
+    );
 
     let bob = serde_json::json!({
         "approve": true,
@@ -3709,9 +3721,15 @@ async fn test_verified_broker_assertion_requires_named_and_allows_two_bound_subj
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let after_two = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(after_two.status(), vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(
+        after_two.status(),
+        vultrino::approval::ApprovalStatus::Approved
+    );
     assert_eq!(after_two.signoffs().len(), 2);
-    assert_eq!(after_two.signoffs()[1].approver_identity, "verified:sub-bob");
+    assert_eq!(
+        after_two.signoffs()[1].approver_identity,
+        "verified:sub-bob"
+    );
 }
 
 #[tokio::test]
@@ -3725,8 +3743,7 @@ async fn test_invalid_present_broker_assertion_fails_closed_without_signoff() {
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
     };
-    let (router, storage, key, id) =
-        build_hard_sod_recipe_fixture("team-a", rule, "High").await;
+    let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
     let uri = format!("/api/v1/approvals/{id}/decision");
     let signed = serde_json::json!({
         "approve": true,
@@ -3740,18 +3757,17 @@ async fn test_invalid_present_broker_assertion_fails_closed_without_signoff() {
     });
     let response = router
         .oneshot(signed_admin_decision_req(
-            &uri,
-            &key,
-            "team-a",
-            signed,
-            tampered,
+            &uri, &key, "team-a", signed, tampered,
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
-    assert!(stored.signoffs().is_empty(), "tampered request recorded a sign-off");
+    assert!(
+        stored.signoffs().is_empty(),
+        "tampered request recorded a sign-off"
+    );
 }
 
 #[tokio::test]
@@ -3918,7 +3934,10 @@ async fn test_json_decision_recipe_hard_sod_unsatisfiable_branch_then_senior_all
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(
+        stored.status(),
+        vultrino::approval::ApprovalStatus::Approved
+    );
 }
 
 #[tokio::test]
@@ -3975,7 +3994,10 @@ async fn test_json_decision_recipe_hard_sod_dissent_then_distinct_approve_allowe
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(
+        stored.status(),
+        vultrino::approval::ApprovalStatus::Approved
+    );
 }
 
 #[tokio::test]
@@ -4096,7 +4118,10 @@ async fn test_json_decision_recipe_hard_sod_two_distinct_keys_allowed() {
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(
+        stored.status(),
+        vultrino::approval::ApprovalStatus::Approved
+    );
 }
 
 #[tokio::test]
@@ -4258,7 +4283,10 @@ async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
         "a distinct operator may approve"
     );
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
-    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(
+        stored.status(),
+        vultrino::approval::ApprovalStatus::Approved
+    );
 }
 
 #[tokio::test]
@@ -5841,10 +5869,20 @@ async fn test_would_deny_reports_tenant_filtered_and_redacted() {
     // fabricate it), plus one for team-b carrying its own agent identity that
     // must never leak into team-a's redacted view.
     for (tenant, action, agent_label, principal_id) in [
-        ("team-a", "db.write", Some("checkout-agent"), Some("vk_abc123")),
+        (
+            "team-a",
+            "db.write",
+            Some("checkout-agent"),
+            Some("vk_abc123"),
+        ),
         ("team-a", "email.send", None, Some("vk_xyz789")),
         ("team-a", "report.export", None, None),
-        ("team-b", "money.payout", Some("team-b-secret-agent"), Some("vk_teamb")),
+        (
+            "team-b",
+            "money.payout",
+            Some("team-b-secret-agent"),
+            Some("vk_teamb"),
+        ),
     ] {
         storage
             .append_event(
@@ -6178,10 +6216,7 @@ async fn start_mock_govder_gate_rule(status: StatusCode, body: serde_json::Value
         (status, axum::Json(body)).into_response()
     }
     let app = axum::Router::new()
-        .route(
-            "/v1/oversight/gates/rule",
-            axum::routing::get(handler),
-        )
+        .route("/v1/oversight/gates/rule", axum::routing::get(handler))
         .with_state((status, body));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -6732,7 +6767,10 @@ async fn a_two_key_money_recipe_requires_two_distinct_humans_not_one() {
         "exactly one sign-off should be recorded"
     );
     assert!(
-        !matches!(after_one.status(), vultrino::approval::ApprovalStatus::Approved),
+        !matches!(
+            after_one.status(),
+            vultrino::approval::ApprovalStatus::Approved
+        ),
         "ONE human must NOT be able to clear a two-key money action — status is {:?} after a \
          single sign-off. This is the exact failure the live run measured: the recipe was \
          declared, `orgpack status` reported it MATCHing, and the enforced requirement was one \
@@ -6812,7 +6850,10 @@ async fn a_two_key_money_recipe_requires_two_distinct_humans_not_one() {
         "two sign-offs should be recorded"
     );
     assert!(
-        matches!(after_two.status(), vultrino::approval::ApprovalStatus::Approved),
+        matches!(
+            after_two.status(),
+            vultrino::approval::ApprovalStatus::Approved
+        ),
         "two DISTINCT humans filling the recipe's two slots must grant it; got {:?}",
         after_two.status()
     );
@@ -6896,11 +6937,8 @@ async fn strict_catalog_refuses_reversible_action_when_recipe_authority_is_incon
 /// exists but has no rule stamped — is likewise a CONFIRMED no-rule answer.
 #[tokio::test]
 async fn execute_open_numeric_path_parity_when_gate_has_rule_false() {
-    let govder = start_mock_govder_gate_rule(
-        StatusCode::OK,
-        serde_json::json!({ "has_rule": false }),
-    )
-    .await;
+    let govder =
+        start_mock_govder_gate_rule(StatusCode::OK, serde_json::json!({ "has_rule": false })).await;
     let config = approval_open_test_config(govder);
     let (router, storage) = build_router_with_config(config).await;
 
@@ -7303,11 +7341,12 @@ async fn store_token(
     token
 }
 
-/// The measured misreport: the grant is recorded, and the credential that would run
-/// it is dead. The response must say BLOCKED and name the reason — never a state a UI
-/// can paint as a completed action.
+/// The opener's bearer may expire while a human reviews the request. Approval now
+/// resumes from the frozen, exact durable grant, so bearer expiry must not be exposed
+/// as an execution blocker. This deliberately incomplete fixture then fails for its
+/// actual missing execution authority, proving the decision route attempted resume.
 #[tokio::test]
-async fn test_a4_decision_reports_blocked_when_the_credential_expired() {
+async fn test_a4_decision_does_not_treat_opener_expiry_as_an_execution_blocker() {
     let (router, storage, key) = build_tenant_admin_router("team-a").await;
     let token = store_token(&storage, "dead", Some(chrono::Duration::seconds(-60))).await;
     let id = store_approval_bound_to_token(&storage, "team-a", &token.id).await;
@@ -7327,26 +7366,21 @@ async fn test_a4_decision_reports_blocked_when_the_credential_expired() {
 
     // The decision itself IS recorded — that part was never wrong.
     assert_eq!(body["status"], "approved");
-    assert_eq!(body["executed"], false);
-    // ...but the response must not stop there, which is the whole defect.
-    assert_eq!(
-        body["execution_state"], "blocked",
-        "a grant whose credential has expired must be reported as blocked, not as a \
-         plain recorded approval"
-    );
+    assert_eq!(body["executed"], true);
+    assert_eq!(body["execution_state"], "failed");
     let reason = body["execution_error"].as_str().unwrap_or_default();
     assert!(
-        reason.contains("expired"),
-        "the response must carry the reason the action cannot run, got {:?}",
+        !reason.contains("expired"),
+        "the durable approval grant must not inherit opener-token expiry: {:?}",
         reason
     );
 }
 
-/// Same shape for the kill switch: an operator revokes the agent's token while the
-/// approval is pending. Clamping the window (FINDING 4 layer 1) cannot cover this
-/// case, so the state has to.
+/// Revoking the opener's bearer also cannot retroactively revoke a human-approved,
+/// exact request. Resume still revalidates live policy, credential revision, catalog,
+/// and kill state; this assertion is only about the spent opener bearer.
 #[tokio::test]
-async fn test_a4_decision_reports_blocked_when_the_credential_was_revoked() {
+async fn test_a4_decision_does_not_treat_opener_revocation_as_an_execution_blocker() {
     let (router, storage, key) = build_tenant_admin_router("team-a").await;
     let token = store_token(&storage, "killed", Some(chrono::Duration::seconds(3600))).await;
     let id = store_approval_bound_to_token(&storage, "team-a", &token.id).await;
@@ -7365,19 +7399,19 @@ async fn test_a4_decision_reports_blocked_when_the_credential_was_revoked() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
-    assert_eq!(body["execution_state"], "blocked");
-    assert!(body["execution_error"]
+    assert_eq!(body["executed"], true);
+    assert_eq!(body["execution_state"], "failed");
+    assert!(!body["execution_error"]
         .as_str()
         .unwrap_or_default()
         .contains("revoked"));
 }
 
-/// The DISCRIMINATING control. The same recorded grant with a LIVE credential is
-/// `awaiting_execution` with no error — if the route answered "blocked" here the
-/// state would be worthless, and if it answered "executed" it would be the original
-/// lie in a new field.
+/// A decision endpoint actively attempts durable resume. Even this deliberately
+/// incomplete fixture must therefore return a terminal execution result, rather than
+/// the old `awaiting_execution` response that depended on a later agent poll.
 #[tokio::test]
-async fn test_a4_decision_reports_awaiting_execution_for_a_live_credential() {
+async fn test_a4_decision_actively_resumes_instead_of_waiting_for_an_agent_poll() {
     let (router, storage, key) = build_tenant_admin_router("team-a").await;
     let token = store_token(&storage, "live", Some(chrono::Duration::seconds(3600))).await;
     let id = store_approval_bound_to_token(&storage, "team-a", &token.id).await;
@@ -7395,14 +7429,11 @@ async fn test_a4_decision_reports_awaiting_execution_for_a_live_credential() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["status"], "approved");
-    assert_eq!(body["executed"], false);
-    assert_eq!(
-        body["execution_state"], "awaiting_execution",
-        "a healthy grant must not be flagged as blocked"
-    );
+    assert_eq!(body["executed"], true);
+    assert_eq!(body["execution_state"], "failed");
     assert!(
-        body.get("execution_error").is_none(),
-        "no reason may be invented when there is none: {:?}",
+        body.get("execution_error").is_some(),
+        "the terminal resume failure must be explained: {:?}",
         body.get("execution_error")
     );
 }

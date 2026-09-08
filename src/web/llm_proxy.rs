@@ -42,11 +42,12 @@
 //! (the parsed usage is carried into the finalizer's Drop), not only on a clean EOF.
 //! For OpenAI-chat requests vultrino FORCES `stream_options.include_usage = true`
 //! (gateway-owned — a client cannot opt out by sending `include_usage:false`) so the
-//! provider emits that trailer; Anthropic `/v1/messages` and OpenAI `/v1/responses`
-//! report usage natively. Honest residuals: a capability with an operator `block`/
-//! `redact_patterns` egress rule, or a compressed response, is served BUFFERED
-//! (incremental scrub can't honor those); a stream that is truncated/halted BEFORE the
-//! usage trailer arrives meters V13a only.
+//! provider emits that trailer. NVIDIA rejects that option on a streaming request with
+//! a non-empty OpenAI `tools` array, so for that provider-specific shape vultrino removes
+//! `stream_options` and records V13a only. Anthropic `/v1/messages` and OpenAI
+//! `/v1/responses` report usage natively. Honest residuals: a capability with an operator
+//! `block`/`redact_patterns` egress rule, or a compressed response, is served BUFFERED;
+//! a stream that is truncated/halted BEFORE the usage trailer arrives meters V13a only.
 
 use axum::{
     extract::{Path, Query, State},
@@ -148,6 +149,29 @@ fn is_openai_chat_endpoint(upstream: &str) -> bool {
         .unwrap_or(upstream)
         .trim_end_matches('/');
     path.ends_with("/completions")
+}
+
+/// NVIDIA's OpenAI-compatible streaming endpoint hangs when `stream_options` is present
+/// alongside a non-empty top-level OpenAI `tools` array. Remove the unsupported option
+/// for precisely that provider/request shape, including a client-supplied value. Returns
+/// whether this is the NVIDIA tool-stream compatibility path, so its caller can leave the
+/// request V13a-only instead of re-injecting `include_usage`.
+fn normalize_nvidia_tool_stream_options(provider: &str, body: &mut serde_json::Value) -> bool {
+    if provider != "nvidia" {
+        return false;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+    let has_tools = obj
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    if !has_tools {
+        return false;
+    }
+    obj.remove("stream_options");
+    true
 }
 
 /// A JSON error response shaped like an OpenAI API error so the harness's model
@@ -497,6 +521,15 @@ async fn llm_proxy_impl(
             obj.remove("stream_options");
         }
     }
+    // NVIDIA hangs when `stream_options` accompanies a non-empty OpenAI `tools` array.
+    // Normalize only that known-incompatible provider shape, including a client-supplied
+    // stream_options, and intentionally meter it V13a-only. Other providers' tool
+    // streams (and NVIDIA streams without tools) retain the usage trailer.
+    let nvidia_tool_stream = use_streaming
+        && request_body
+            .as_mut()
+            .is_some_and(|body| normalize_nvidia_tool_stream_options(&provider, body));
+
     // When streaming an OpenAI-chat request, force `stream_options.include_usage = true`
     // so the provider emits a terminal usage chunk and a streamed turn still meters V13b
     // token counts. include_usage is GATEWAY-OWNED — a client cannot opt out of the token
@@ -507,6 +540,7 @@ async fn llm_proxy_impl(
     if use_streaming
         && state.config.llm_proxy.inject_stream_usage
         && is_openai_chat_endpoint(&upstream)
+        && !nvidia_tool_stream
     {
         if let Some(b) = request_body.as_mut() {
             crate::outbox::maybe_inject_stream_usage(b);
@@ -657,7 +691,10 @@ async fn llm_proxy_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_max_output_tokens, is_openai_chat_endpoint, provider_feature_enabled};
+    use super::{
+        clamp_max_output_tokens, is_openai_chat_endpoint, normalize_nvidia_tool_stream_options,
+        provider_feature_enabled,
+    };
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -814,6 +851,47 @@ mod tests {
         assert!(!is_openai_chat_endpoint(
             "https://api.anthropic.com/v1/messages"
         ));
+    }
+
+    #[test]
+    fn nvidia_tool_stream_normalization_is_provider_specific() {
+        let tools = json!([{
+            "type": "function",
+            "function": { "name": "lookup", "parameters": { "type": "object" } }
+        }]);
+
+        // NVIDIA tool streams must not receive stream_options, including a value supplied
+        // by the client: NVIDIA otherwise hangs before emitting any SSE response.
+        let mut nvidia_tools = json!({
+            "stream": true,
+            "tools": tools,
+            "stream_options": { "include_usage": true }
+        });
+        assert!(normalize_nvidia_tool_stream_options(
+            "nvidia",
+            &mut nvidia_tools
+        ));
+        assert!(nvidia_tools.get("stream_options").is_none());
+
+        // NVIDIA streams without tools retain the gateway token trailer.
+        let mut nvidia_no_tools = json!({ "stream": true });
+        assert!(!normalize_nvidia_tool_stream_options(
+            "nvidia",
+            &mut nvidia_no_tools
+        ));
+        assert!(crate::outbox::maybe_inject_stream_usage(
+            &mut nvidia_no_tools
+        ));
+        assert_eq!(nvidia_no_tools["stream_options"]["include_usage"], true);
+
+        // Other OpenAI-compatible providers retain token trailers for tool streams.
+        let mut openai_tools = json!({ "stream": true, "tools": tools });
+        assert!(!normalize_nvidia_tool_stream_options(
+            "openai-chat",
+            &mut openai_tools
+        ));
+        assert!(crate::outbox::maybe_inject_stream_usage(&mut openai_tools));
+        assert_eq!(openai_tools["stream_options"]["include_usage"], true);
     }
 
     #[test]

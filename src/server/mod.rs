@@ -49,9 +49,96 @@ enum StreamStep {
     Chunk(Bytes),
     CleanEof,
     UpstreamError,
+    DownstreamGone,
     Halted,
     IdleTimeout,
     TotalTimeout,
+}
+
+/// A deliberately small hand-off between the eager upstream reader and the HTTP
+/// body consumer. The producer must keep polling even when axum has returned the
+/// response head but the peer has not started reading it yet; this bound is what
+/// keeps an unresponsive downstream from retaining an upstream model stream
+/// forever.
+const STREAM_DOWNSTREAM_BUFFER: usize = 16;
+
+/// Outcome of forwarding one already-scrubbed chunk to the downstream body.
+/// Waiting for capacity is subject to the same halt, idle, and total bounds as
+/// waiting for an upstream chunk. In particular, a body that is never polled
+/// cannot keep the producer alive indefinitely after the channel fills.
+enum StreamDelivery {
+    Delivered,
+    DownstreamGone,
+    Halted,
+    IdleTimeout,
+    TotalTimeout,
+}
+
+async fn deliver_stream_chunk(
+    sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    chunk: Bytes,
+    abort: &tokio::sync::Notify,
+    idle: Option<std::time::Duration>,
+    deadline: Option<tokio::time::Instant>,
+) -> StreamDelivery {
+    let send = sender.send(Ok(chunk));
+    tokio::pin!(send);
+    tokio::select! {
+        biased;
+        _ = abort.notified() => StreamDelivery::Halted,
+        _ = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => StreamDelivery::TotalTimeout,
+        _ = async {
+            match idle {
+                Some(idle) => tokio::time::sleep(idle).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => StreamDelivery::IdleTimeout,
+        result = &mut send => match result {
+            Ok(()) => StreamDelivery::Delivered,
+            Err(_) => StreamDelivery::DownstreamGone,
+        },
+    }
+}
+
+async fn next_upstream_stream_step<S>(
+    upstream: &mut S,
+    sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    abort: &tokio::sync::Notify,
+    idle: Option<std::time::Duration>,
+    deadline: Option<tokio::time::Instant>,
+) -> StreamStep
+where
+    S: Stream<Item = Result<Bytes, crate::plugins::PluginError>> + Unpin,
+{
+    let next = upstream.next();
+    tokio::pin!(next);
+    tokio::select! {
+        biased;
+        _ = abort.notified() => StreamStep::Halted,
+        _ = sender.closed() => StreamStep::DownstreamGone,
+        _ = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => StreamStep::TotalTimeout,
+        _ = async {
+            match idle {
+                Some(idle) => tokio::time::sleep(idle).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => StreamStep::IdleTimeout,
+        result = next => match result {
+            None => StreamStep::CleanEof,
+            Some(Ok(chunk)) => StreamStep::Chunk(chunk),
+            Some(Err(_)) => StreamStep::UpstreamError,
+        },
+    }
 }
 
 /// Trusted capability-catalog answer used to decide whether an action may take
@@ -201,6 +288,11 @@ struct RunError {
     /// committed `plugin.execute` failure sets this false — a resumed approval is
     /// then finalized terminally instead of busy-polling forever.
     retryable: bool,
+    /// The plugin had crossed the point of no return. The external effect may
+    /// already exist even though Vultrino could not confirm the final outcome.
+    /// Keep this bit until persistence so every user-facing surface can warn
+    /// against a blind retry.
+    committed: bool,
     error: VultrinoError,
 }
 
@@ -209,6 +301,7 @@ impl RunError {
     fn retryable(error: VultrinoError) -> Self {
         Self {
             retryable: true,
+            committed: false,
             error,
         }
     }
@@ -217,6 +310,7 @@ impl RunError {
     fn terminal(error: VultrinoError) -> Self {
         Self {
             retryable: false,
+            committed: false,
             error,
         }
     }
@@ -225,6 +319,7 @@ impl RunError {
     fn committed(error: VultrinoError) -> Self {
         Self {
             retryable: false,
+            committed: true,
             error,
         }
     }
@@ -271,6 +366,19 @@ struct ActionPayload {
     params: serde_json::Value,
     context: RequestContext,
     use_token_id: Option<String>,
+    /// Stable subject used only for evidence. Direct executions use the presenting
+    /// use-token id. Approved executions use the durable approval id/claim epoch,
+    /// so evidence does not depend on the short-lived bearer remaining usable.
+    evidence_subject_id: Option<String>,
+    /// True only for a payload authorized by a persisted human-approval grant.
+    /// This selects an exact, one-shot Averin grant instead of the opener's broad
+    /// bearer grant.
+    approved_execution: bool,
+    /// The exact business capability action that passed policy evaluation
+    /// (`content.notion.read`, not the resolved transport verb `http.request`).
+    /// D8 evidence binds this value; it must never be reconstructed from plugin
+    /// dispatch after the permit is issued.
+    evidence_action: String,
     /// Trusted capability-catalog human floor carried through the exact permit
     /// binding. When true, a committed Averin use receipt is a precondition of
     /// plugin dispatch, independent of the ordinary Observe posture.
@@ -414,12 +522,11 @@ fn buffered_as_stream(resp: ExecuteResponse) -> StreamingExecution {
 /// - **clean end / in-band error:** the adaptor calls [`Self::finalize`] with the
 ///   parsed usage (a complete trailer) or `None` (a truncated turn with no trailer →
 ///   V13a only).
-/// - **client disconnect / panic:** the adaptor's generator future is dropped
-///   mid-await so `finalize` never runs; `Drop` then spawns the emit (a sync `Drop`
-///   can't await, hence the detached task). It emits V13b when a complete usage
-///   trailer was already parsed and recorded via [`Self::record_usage`] BEFORE the
-///   disconnect (so a disconnect right after the trailer doesn't under-count),
-///   otherwise V13a-only.
+/// - **client disconnect / panic:** the eager producer observes receiver closure
+///   and calls `finalize` with its carried usage. `Drop` is a fallback for producer
+///   task cancellation before that terminus; it spawns the emit (a sync `Drop` can't
+///   await). It emits V13b when a complete usage trailer was already parsed and
+///   recorded via [`Self::record_usage`] BEFORE cancellation, otherwise V13a-only.
 ///
 /// An `AtomicBool` makes the two paths mutually exclusive, so V13a fires once and
 /// only once for the call.
@@ -445,9 +552,9 @@ impl StreamFinalizer {
     }
 
     /// Record the latest COMPLETE usage trailer (from `UsageAccumulator::snapshot`) so a
-    /// subsequent client disconnect before a terminus still emits V13b in `Drop` rather
-    /// than under-counting to V13a-only. Cheap; called once per chunk that completes the
-    /// split (idempotent thereafter — last value wins).
+    /// subsequent producer cancellation before a terminus still emits V13b in `Drop`
+    /// rather than under-counting to V13a-only. Cheap; called once per chunk that
+    /// completes the split (idempotent thereafter — last value wins).
     fn record_usage(&self, usage: crate::outbox::TokenUsage, model: Option<String>) {
         *self.carried.lock() = Some((usage, model));
     }
@@ -465,9 +572,9 @@ impl StreamFinalizer {
 
 impl Drop for StreamFinalizer {
     fn drop(&mut self) {
-        // Disconnect/panic before a terminus: emit via a detached task (Drop can't
-        // await). No-op if finalize() already emitted. If a complete usage trailer was
-        // recorded before the disconnect, emit V13b (usage); else V13a-only.
+        // Producer cancellation/panic before a terminus: emit via a detached task
+        // (Drop can't await). No-op if finalize() already emitted. If a complete
+        // usage trailer was recorded before cancellation, emit V13b; else V13a-only.
         if !self.emitted.swap(true, std::sync::atomic::Ordering::SeqCst) {
             // Only spawn when a runtime is live: dropping the body during runtime
             // shutdown would make `tokio::spawn` panic. Metering is best-effort
@@ -483,6 +590,75 @@ impl Drop for StreamFinalizer {
                     emit_meter(&storage, &attribution, usage, model.as_deref()).await
                 });
             }
+        }
+    }
+}
+
+/// Completes a D8 exact-use intent once the streamed response has a terminal outcome.
+/// Unlike metering, this records the action's evidence lifecycle: a normal stream terminus
+/// supplies its actual `ok`/`error` result, while receiver closure is observed by the eager
+/// producer and therefore records `error`. Its completion guard is deliberately independent from
+/// [`StreamFinalizer`]'s metering guard.
+struct ExactUseFinalizer {
+    evidence: Option<(
+        Arc<crate::averin::AverinClient>,
+        crate::averin::ExactUseEvidence,
+    )>,
+    completed: std::sync::atomic::AtomicBool,
+}
+
+impl ExactUseFinalizer {
+    fn new(
+        evidence: Option<(
+            Arc<crate::averin::AverinClient>,
+            crate::averin::ExactUseEvidence,
+        )>,
+    ) -> Self {
+        Self {
+            evidence,
+            completed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Complete at a known stream terminus. The atomic guard makes this mutually exclusive with
+    /// the error completion spawned by [`Drop`].
+    async fn finalize(&self, status: &str) {
+        if self
+            .completed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let Some((av, evidence)) = &self.evidence else {
+            return;
+        };
+        if let Err(error) = av.complete_exact_use(evidence, status).await {
+            warn!(error = %error, "stream completed but D8 outcome evidence failed");
+        }
+    }
+}
+
+impl Drop for ExactUseFinalizer {
+    fn drop(&mut self) {
+        // Producer cancellation before it reaches finalize(): complete the admitted D8 intent
+        // with error from a detached task; Drop cannot await. Once finalize() has claimed
+        // completion, its atomic guard makes this a no-op.
+        if self
+            .completed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let Some((av, evidence)) = self.evidence.clone() else {
+            return;
+        };
+        // Match StreamFinalizer: runtime shutdown cannot host a detached completion task.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = av.complete_exact_use(&evidence, "error").await {
+                    warn!(error = %error, "client disconnect D8 outcome evidence failed");
+                }
+            });
         }
     }
 }
@@ -656,6 +832,15 @@ impl VultrinoServer {
         plugins.register(Arc::new(crate::plugins::InternalHttpPlugin::new(
             config.internal_destinations.clone(),
         )));
+        // Typed marketing connectors. Their capability target parameters pin
+        // the upstream endpoint and account/range identifiers; the plugins do
+        // not accept caller-supplied HTTP methods or GraphQL documents.
+        plugins.register(Arc::new(crate::plugins::SheetsPlugin::new()));
+        plugins.register(Arc::new(crate::plugins::BufferPlugin::new()));
+        // Typed Solo-project coordination operations. This keeps learner,
+        // Calendar, and outbound-message destinations inside provider-specific
+        // adapters while the policy layer presents one `solo.*` write domain.
+        plugins.register(Arc::new(crate::plugins::SoloPlugin::new()));
         let policy_engine = Arc::new(PolicyEngine::new());
         let auth_manager = Arc::new(AuthManager::new());
 
@@ -1062,9 +1247,9 @@ impl VultrinoServer {
     ///
     /// When gated, the action does **not** run: an [`ApprovalRequest`] is created,
     /// persisted, and announced to notifiers, and [`PreparedAction::Pending`] is
-    /// returned. Otherwise a [`PreparedAction::Ready`] carries everything the action
-    /// tail needs — the use token is NOT consumed here, the tail reserves it
-    /// fail-closed just before the side effect (identical on both paths).
+    /// returned. A bearer-driven gated request reserves its use while opening the
+    /// frozen approval. Otherwise a [`PreparedAction::Ready`] carries everything
+    /// the action tail needs and reserves the bearer just before the side effect.
     async fn prepare_execution(
         &self,
         request: ExecuteRequest,
@@ -1205,7 +1390,22 @@ impl VultrinoServer {
             .as_ref()
             .map(|t| t.dual_control)
             .unwrap_or(false);
-        let mut needs_approval = exec_auth.force_approval || dual_control;
+        // A token's `require_approval` (govder: "human-confirmed write on every
+        // use") is about WRITES — it must not force a Notion-style read to open
+        // an approval just because the same token is also allowed to write.
+        // `method` (extracted above) is the actual HTTP verb this action will
+        // send: for BOTH the `http` and `internal_http` plugins it is the SAME
+        // resolved verb `build_action_params`/`resolve_pinned_http_method`
+        // wrote into `params.method` before this request ever reached here (see
+        // `capability::build_action_params`), so it cannot be spoofed by the
+        // caller independently of what actually executes. GET/HEAD never
+        // mutate; anything else — an explicit write verb, or a plugin with no
+        // HTTP verb at all (ssh, postgres, …) — keeps gating, since absence of
+        // proof of a read is not proof of a read (fail closed).
+        let is_read_verb = method
+            .map(|m| m.eq_ignore_ascii_case("GET") || m.eq_ignore_ascii_case("HEAD"))
+            .unwrap_or(false);
+        let mut needs_approval = (exec_auth.force_approval && !is_read_verb) || dual_control;
         match decision {
             crate::policy::PolicyDecision::Allow => {}
             crate::policy::PolicyDecision::Deny(reason) => {
@@ -1324,67 +1524,21 @@ impl VultrinoServer {
                 ));
             }
 
-            // Open an approval request. The use token is NOT consumed yet — it is
-            // reserved when the approved action actually runs. The criticality
-            // class (V5) drives the escalation/expiry SLA windows.
+            // Open an approval request. Bearer capacity is converted into the
+            // durable exact-request grant below, before the request is published.
+            // The criticality class (V5) drives the escalation/expiry SLA windows.
             let criticality = self
                 .approval_config
                 .criticality_for(&credential.alias, &full_action);
             let sla = self.approval_config.sla_for(criticality);
-            // FINDING 4 (plan 103 §10h): an approval must never be offerable beyond
-            // the life of the credential that would execute it. The configured SLA
-            // (`approvals.ttl_secs`, 3600s by default) is INDEPENDENT of the use
-            // token's TTL (govder compiles L3·High at 900s), so the two diverged by
-            // 4× and a human decided inside the advertised window on an action that
-            // then failed at resume with `use token has expired`.
-            //
-            // The bound is applied HERE, at open, because this is the only place that
-            // holds both facts at once — the presented token and the class SLA — and
-            // because clamping AT OPEN is the only option that keeps every downstream
-            // surface honest for free: `expires_at` is what the notifier links, the
-            // approver's card copy ("Expires in …") and the agent's poll all read, so
-            // one clamp makes all of them state a deadline the credential can honour.
-            // The alternatives were rejected: RE-MINTING a fresh token on approval
-            // would let a human decision extend a credential past the TTL govder's
-            // decide-path compiled for it (the approval would become a policy bypass,
-            // and vultrino is the enforcement plane, not the issuer); REFUSING every
-            // approval whose token cannot cover the full configured window would
-            // refuse every L3·High money approval on today's shipped config, i.e.
-            // "fail closed" into never governing money at all. Clamp + refuse only
-            // when even the clamped window is dead keeps the fail-closed property
-            // (the window can only ever SHRINK here, never grow) at no availability
-            // cost.
-            let credential_remaining = exec_auth
-                .use_token
-                .as_ref()
-                .and_then(|t| t.expires_at)
-                .map(|exp| exp - chrono::Utc::now());
-            let (escalate_after, escalate_window) = match sla
-                .clamped_to_credential(credential_remaining)
-            {
-                Some(w) => w,
-                None => {
-                    // The credential is already dead (or dies within this second).
-                    // Refusing is fail-closed in both directions: nothing executes,
-                    // AND no human is invited to authorize an action that cannot run.
-                    return Err(VultrinoError::PolicyDenied(
-                        "the credential presented for this action expires too soon to hold a \
-                         human approval, so no approval was opened and nothing ran — retry \
-                         with a freshly issued credential"
-                            .to_string(),
-                    ));
-                }
-            };
-            if escalate_after + escalate_window < sla.escalate_after() + sla.escalate_window() {
-                tracing::info!(
-                    credential = %credential.alias,
-                    action = %full_action,
-                    configured_secs = (sla.escalate_after() + sla.escalate_window()).num_seconds(),
-                    clamped_secs = (escalate_after + escalate_window).num_seconds(),
-                    "approval window clamped to the presenting credential's remaining life \
-                     (the credential, not approvals.ttl_secs, is the binding deadline)"
-                );
-            }
+            // Human review is a durable exact-request grant, not a suspended use
+            // of the presenting bearer. The bearer authenticates/scopes this open
+            // operation and may expire immediately afterwards; the configured SLA
+            // is therefore the honest review deadline. Resume revalidates the live
+            // credential revision, capability catalog, Govder recipe and policy/kill
+            // state before minting a one-shot execution permit.
+            let escalate_after = sla.escalate_after();
+            let escalate_window = sla.escalate_window();
             // V10: record the requester's IdP-resolvable owner (if bound) on the
             // approval so separation-of-duty compares the approver against the
             // directory owner, not just the agent label.
@@ -1434,12 +1588,9 @@ impl VultrinoServer {
                     fetched.irreversible,
                     GateRuleAuthorityClass::Rule,
                 ),
-                crate::govder::GateRuleAnswer::NoRule => (
-                    None,
-                    String::new(),
-                    false,
-                    GateRuleAuthorityClass::NoRule,
-                ),
+                crate::govder::GateRuleAnswer::NoRule => {
+                    (None, String::new(), false, GateRuleAuthorityClass::NoRule)
+                }
                 // INCONCLUSIVE (plan 103 §10h FINDING 1/2): govder answered, but did
                 // not confirm whether a recipe exists. The numeric-threshold fallback
                 // is not a neutral default — it is a WEAKER oversight requirement (one
@@ -1454,8 +1605,7 @@ impl VultrinoServer {
                 // Refusal persists no approval, sends no notification, reserves no use,
                 // and consumes no token; the caller can retry when authority is available.
                 crate::govder::GateRuleAnswer::Inconclusive { reason } => {
-                    if self.config.enforcement.require_declared_capabilities
-                        || trusted_irreversible
+                    if self.config.enforcement.require_declared_capabilities || trusted_irreversible
                     {
                         tracing::error!(%reason, %full_action,
                             agent_id = agent_id_for_rule.as_deref().unwrap_or("<none>"),
@@ -1498,8 +1648,7 @@ impl VultrinoServer {
                 dual_control,
                 criticality,
                 trusted_irreversible: Some(trusted_irreversible),
-                // Clamped to the presenting credential's remaining life (FINDING 4) —
-                // NEVER the raw class SLA, which can outlive the token 4×.
+                // Independent of the presenting bearer's authentication lifetime.
                 escalate_after,
                 escalate_window,
                 oob_identity: self.approval_config.oob_approver_identity.clone(),
@@ -1542,31 +1691,24 @@ impl VultrinoServer {
             approval.authoritative_risk_tier = authoritative_risk_tier;
             approval.authoritative_irreversible = authoritative_irreversible;
 
-            // Bound the number of *pending* approvals a use token can open: each
-            // open reserves a future use, so outstanding pending approvals plus
-            // already-consumed uses must not exceed max_uses — otherwise a
-            // single-use token could spawn an unbounded approval/notifier flood
-            // (only execution is fail-closed otherwise). The count-and-insert is
-            // atomic under the storage lock, so two concurrent opens (web + MCP)
-            // can't both pass a stale count.
-            let reservation = exec_auth
-                .use_token
-                .as_ref()
-                .and_then(|t| t.max_uses.map(|max| (t.id.clone(), max)));
-            match reservation {
-                Some((token_id, max)) => {
-                    self.storage
-                        .store_approval_reserving(&approval, &token_id, max)
-                        .await
-                        .map_err(|e| match e {
-                            crate::storage::StorageError::Conflict(_) => VultrinoError::PolicyDenied(
-                                "This use token has no remaining capacity for a new pending approval".to_string(),
-                            ),
-                            other => other.into(),
-                        })?;
-                }
-                None => self.storage.store_approval(&approval).await?,
+            // Convert the short-lived bearer authority into this frozen durable
+            // request now. The use is reserved before the approval is published,
+            // so one-use capacity cannot be replayed into a second approval while
+            // a human is reviewing the first. A later denial still spends this
+            // narrow authorization; approved execution must never consume or rely
+            // on the bearer again. If persistence fails after reservation, the use
+            // remains burned (fail-closed: no action can gain authority from it).
+            if let Some(token) = exec_auth.use_token.as_ref() {
+                self.storage
+                    .consume_use_token(&token.id)
+                    .await
+                    .map_err(|error| {
+                        VultrinoError::PolicyDenied(format!(
+                            "Use token could not reserve this approval: {error}"
+                        ))
+                    })?;
             }
+            self.storage.store_approval(&approval).await?;
             self.dispatch_notifications(&approval, &decision_token)
                 .await;
             // V9: emit the requested event to the signed outbox.
@@ -1634,6 +1776,9 @@ impl VultrinoServer {
             params: request.params.clone(),
             context,
             use_token_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
+            evidence_subject_id: exec_auth.use_token.as_ref().map(|t| t.id.clone()),
+            approved_execution: false,
+            evidence_action: request.action.clone(),
             evidence_required,
         };
         let authorized = permit.authorize(&binding, payload).map_err(|_| {
@@ -1670,7 +1815,8 @@ impl VultrinoServer {
     async fn validate_required_evidence_preflight(
         &self,
         evidence_required: bool,
-        use_token_id: Option<&str>,
+        evidence_subject_id: Option<&str>,
+        approved_execution: bool,
         params_len: usize,
     ) -> Result<(), RunError> {
         if !evidence_required {
@@ -1683,9 +1829,9 @@ impl VultrinoServer {
                     .to_string(),
             ))
         })?;
-        let token_id = use_token_id.ok_or_else(|| {
+        let token_id = evidence_subject_id.ok_or_else(|| {
             RunError::terminal(VultrinoError::PolicyDenied(
-                "trusted human-floor action requires a use token bound to an Averin grant; \
+                "trusted human-floor action requires a stable subject bound to Averin evidence; \
                  nothing ran"
                     .to_string(),
             ))
@@ -1696,6 +1842,14 @@ impl VultrinoServer {
                  exceed the configured {} byte evidence bound; nothing ran",
                 av.config().max_seal_params_bytes
             ))));
+        }
+
+        // An approved execution is authorized by the durable exact-request grant,
+        // not by the opener's short-lived bearer. D8 mints and consumes a fresh
+        // single-operation evidence grant immediately before dispatch, so no broad
+        // token grant is required to remain live while a human reviews the action.
+        if approved_execution || av.config().d8_complete_evidence {
+            return Ok(());
         }
 
         // A queue-owning durable process stores the grant material on disk. Its
@@ -1814,7 +1968,7 @@ impl VultrinoServer {
                 }
             }
             return av
-                .seal_use_required(token_id, params_bytes)
+                .seal_use_required(token_id, params_bytes, use_sequence_number, request_id)
                 .await
                 .map_err(|error| {
                     RunError::terminal(VultrinoError::PolicyDenied(format!(
@@ -1863,23 +2017,25 @@ impl VultrinoServer {
                             "session_id": av.config().session_id,
                             "resource_id": av.config().resource_id,
                         });
-                        let result =
-                            run_averin_queue_blocking(|| queue.append(token_id, "averin.use", payload));
+                        let result = run_averin_queue_blocking(|| {
+                            queue.append(token_id, "averin.use", payload)
+                        });
                         return Self::handle_durable_use_enqueue_result(av, token_id, result);
                     }
                     // This process does not own the durable queue (Step 3a graceful
                     // degradation) — fall back to the 087 async path for THIS process only.
                 }
-                av.spawn_use_seal(token_id, params_bytes);
+                av.spawn_use_seal(token_id, params_bytes, use_sequence_number, request_id);
                 Ok(())
             }
-            crate::averin::AverinMode::RequireEvidence => {
-                av.on_execute(token_id, params_bytes).await.map_err(|e| {
+            crate::averin::AverinMode::RequireEvidence => av
+                .on_execute(token_id, params_bytes, use_sequence_number, request_id)
+                .await
+                .map_err(|e| {
                     RunError::terminal(VultrinoError::PolicyDenied(format!(
                         "averin evidence seal required but failed (require_evidence): {e}"
                     )))
-                })
-            }
+                }),
         }
     }
 
@@ -1954,12 +2110,7 @@ impl VultrinoServer {
                     return Ok(());
                 }
                 let _ = run_averin_queue_blocking(|| {
-                    queue.record_delivery(
-                        sequence,
-                        false,
-                        Some(error.clone()),
-                        AVERIN_MAX_ATTEMPTS,
-                    )
+                    queue.record_delivery(sequence, false, Some(error.clone()), AVERIN_MAX_ATTEMPTS)
                 });
                 av.record_required_failed();
                 Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
@@ -2029,11 +2180,15 @@ impl VultrinoServer {
             params,
             context,
             use_token_id,
+            evidence_subject_id,
+            approved_execution,
+            evidence_action,
             evidence_required,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
         let action_name = action_name.as_str();
         let use_token_id = use_token_id.as_deref();
+        let evidence_subject_id = evidence_subject_id.as_deref();
         // Preflight (no side effects yet, no token consumed): resolve + validate.
         // A not-loaded plugin is *transient* (it may load later → retryable);
         // invalid params are *permanent* (a retry can't fix them → terminal).
@@ -2050,7 +2205,7 @@ impl VultrinoServer {
         // fail closed here if no evidence path/grant exists; reversible actions
         // preserve the default-off and Observe behavior.
         let evidence_params = if evidence_required
-            || (self.averin.is_some() && use_token_id.is_some())
+            || (self.averin.is_some() && evidence_subject_id.is_some())
         {
             Some(serde_json::to_vec(&params).map_err(|_| {
                 RunError::terminal(VultrinoError::PolicyDenied(
@@ -2062,7 +2217,8 @@ impl VultrinoServer {
         };
         self.validate_required_evidence_preflight(
             evidence_required,
-            use_token_id,
+            evidence_subject_id,
+            approved_execution,
             evidence_params.as_ref().map_or(0, Vec::len),
         )
         .await?;
@@ -2174,23 +2330,42 @@ impl VultrinoServer {
         //     consumed above, so a strict block here burns it; fixing that ordering
         //     is a separate change. This caveat is UNREACHABLE in the default
         //     (Observe) posture because the async path never blocks.
+        let mut exact_evidence: Option<(
+            Arc<crate::averin::AverinClient>,
+            crate::averin::ExactUseEvidence,
+        )> = None;
         if let (Some(av), Some(tid), Some(params_bytes)) =
-            (&self.averin, use_token_id, evidence_params)
+            (&self.averin, evidence_subject_id, evidence_params)
         {
-            // Plan 087 FIX 1 — the mode-dependent seal hook now lives in ONE shared
-            // helper so the buffered and streaming execute paths cannot drift. In
-            // RequireEvidence a seal failure returns Err and DENIES the action here
-            // (before `plugin.execute` — the point of no return). Plan 088 D5c threads
-            // this execute's `use_sequence_number` + `request_id` through too.
-            self.seal_after_consume(
-                av,
-                tid,
-                params_bytes,
-                use_sequence_number,
-                &request_id,
-                evidence_required,
-            )
-            .await?;
+            if av.config().d8_complete_evidence || (approved_execution && evidence_required) {
+                let evidence = av
+                    .begin_exact_use(
+                        tid,
+                        &credential_alias,
+                        &evidence_action,
+                        &params_bytes,
+                        &request_id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        RunError::terminal(VultrinoError::PolicyDenied(format!(
+                            "D8 before-act evidence failed: {error}; nothing ran"
+                        )))
+                    })?;
+                exact_evidence = Some((av.clone(), evidence));
+            } else {
+                // Plan 087 FIX 1 — the mode-dependent seal hook now lives in ONE shared
+                // helper so the buffered and streaming execute paths cannot drift.
+                self.seal_after_consume(
+                    av,
+                    tid,
+                    params_bytes,
+                    use_sequence_number,
+                    &request_id,
+                    evidence_required,
+                )
+                .await?;
+            }
         }
 
         let plugin_request = crate::plugins::PluginRequest {
@@ -2201,12 +2376,35 @@ impl VultrinoServer {
         };
 
         // Point of no return: the action may now have side effects.
-        let response = plugin
-            .execute(plugin_request)
-            .await
-            .map_err(|error| {
-                RunError::committed(confine_plugin_execution_error(error, &secret_material))
-            })?;
+        let response = match plugin.execute(plugin_request).await {
+            Ok(response) => {
+                if let Some((av, evidence)) = &exact_evidence {
+                    av.complete_exact_use(evidence, "ok")
+                        .await
+                        .map_err(|error| {
+                            RunError::committed(VultrinoError::PolicyUnavailable(format!(
+                                "action completed but D8 outcome evidence failed: {error}"
+                            )))
+                        })?;
+                }
+                response
+            }
+            Err(error) => {
+                if let Some((av, evidence)) = &exact_evidence {
+                    if let Err(seal_error) = av.complete_exact_use(evidence, "error").await {
+                        warn!(
+                            request_id = %request_id,
+                            error = %seal_error,
+                            "action failed and D8 failure-outcome evidence also failed"
+                        );
+                    }
+                }
+                return Err(RunError::committed(confine_plugin_execution_error(
+                    error,
+                    &secret_material,
+                )));
+            }
+        };
 
         // V13b (leria metering, token counts): read the provider usage block from
         // the RAW response body NOW — BEFORE `scrub_response` (below) redacts /
@@ -2387,11 +2585,15 @@ impl VultrinoServer {
             params,
             context,
             use_token_id,
+            evidence_subject_id,
+            approved_execution,
+            evidence_action,
             evidence_required,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
         let action_name = action_name.as_str();
         let use_token_id = use_token_id.as_deref();
+        let evidence_subject_id = evidence_subject_id.as_deref();
         // Preflight (no side effects, no token consumed): resolve + validate.
         let plugin = self.plugins.get(plugin_name).ok_or_else(|| {
             RunError::retryable(VultrinoError::Plugin(
@@ -2406,7 +2608,7 @@ impl VultrinoServer {
         // preflight as buffered execution. A strict failure occurs before the
         // upstream stream is opened and before the token is reserved.
         let evidence_params = if evidence_required
-            || (self.averin.is_some() && use_token_id.is_some())
+            || (self.averin.is_some() && evidence_subject_id.is_some())
         {
             Some(serde_json::to_vec(&params).map_err(|_| {
                 RunError::terminal(VultrinoError::PolicyDenied(
@@ -2418,7 +2620,8 @@ impl VultrinoServer {
         };
         self.validate_required_evidence_preflight(
             evidence_required,
-            use_token_id,
+            evidence_subject_id,
+            approved_execution,
             evidence_params.as_ref().map_or(0, Vec::len),
         )
         .await?;
@@ -2515,20 +2718,40 @@ impl VultrinoServer {
         // `plugin.execute_streaming` (the point of no return) opens the upstream
         // stream, so strict mode now fails CLOSED on streams too. Must precede the
         // `params` move into `plugin_request` below.
+        let mut exact_evidence: Option<(
+            Arc<crate::averin::AverinClient>,
+            crate::averin::ExactUseEvidence,
+        )> = None;
         if let (Some(av), Some(tid), Some(params_bytes)) =
-            (&self.averin, use_token_id, evidence_params)
+            (&self.averin, evidence_subject_id, evidence_params)
         {
-            // Plan 088 D5c — threads this execute's `use_sequence_number` + `request_id`
-            // through too, identical to the buffered path.
-            self.seal_after_consume(
-                av,
-                tid,
-                params_bytes,
-                use_sequence_number,
-                &request_id,
-                evidence_required,
-            )
-            .await?;
+            if av.config().d8_complete_evidence || (approved_execution && evidence_required) {
+                let evidence = av
+                    .begin_exact_use(
+                        tid,
+                        &credential_alias,
+                        &evidence_action,
+                        &params_bytes,
+                        &request_id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        RunError::terminal(VultrinoError::PolicyDenied(format!(
+                            "D8 before-act evidence failed: {error}; nothing ran"
+                        )))
+                    })?;
+                exact_evidence = Some((av.clone(), evidence));
+            } else {
+                self.seal_after_consume(
+                    av,
+                    tid,
+                    params_bytes,
+                    use_sequence_number,
+                    &request_id,
+                    evidence_required,
+                )
+                .await?;
+            }
         }
 
         let plugin_request = crate::plugins::PluginRequest {
@@ -2539,12 +2762,24 @@ impl VultrinoServer {
         };
 
         // Point of no return: open the upstream stream.
-        let streaming = plugin
-            .execute_streaming(plugin_request)
-            .await
-            .map_err(|error| {
-                RunError::committed(confine_plugin_execution_error(error, &secret_material))
-            })?;
+        let streaming = match plugin.execute_streaming(plugin_request).await {
+            Ok(streaming) => streaming,
+            Err(error) => {
+                if let Some((av, evidence)) = &exact_evidence {
+                    if let Err(seal_error) = av.complete_exact_use(evidence, "error").await {
+                        warn!(
+                            request_id = %request_id,
+                            error = %seal_error,
+                            "stream open failed and D8 failure-outcome evidence also failed"
+                        );
+                    }
+                }
+                return Err(RunError::committed(confine_plugin_execution_error(
+                    error,
+                    &secret_material,
+                )));
+            }
+        };
 
         let status = streaming.status;
 
@@ -2560,6 +2795,11 @@ impl VultrinoServer {
                 "streamed response is compressed and cannot be scrubbed — withholding"
             );
             emit_meter(&Arc::clone(&self.storage), &attribution, None, None).await;
+            if let Some((av, evidence)) = &exact_evidence {
+                if let Err(error) = av.complete_exact_use(evidence, "error").await {
+                    warn!(request_id = %request_id, error = %error, "compressed stream D8 outcome evidence failed");
+                }
+            }
             let mut terminal_scrubber = crate::egress::StreamScrubber::new(
                 &secret_material,
                 &credential_alias,
@@ -2645,152 +2885,138 @@ impl VultrinoServer {
         let upstream = streaming.body;
         let alias_for_stream = credential_alias.clone();
         let finalizer = StreamFinalizer::new(Arc::clone(&self.storage), attribution);
-        let body = async_stream::stream! {
-            // Held for the stream's whole life → deregisters on completion/drop.
+        let exact_use_finalizer = ExactUseFinalizer::new(exact_evidence);
+        // Start consuming the upstream NOW, rather than when axum first polls the
+        // response body. A lazy `async_stream` left an LLM stream unpolled forever
+        // when the downstream accepted headers but never consumed the body, which
+        // also stranded metering, D8 outcome evidence, and the V6 session guard.
+        let (sender, receiver) = tokio::sync::mpsc::channel(STREAM_DOWNSTREAM_BUFFER);
+        tokio::spawn(async move {
+            // Held for the producer's whole life → deregisters even if the HTTP body
+            // is never polled. Dropping `upstream` below actively cancels reqwest's
+            // response body when the downstream disappears or a bound fires.
             let _guard = session_guard;
-            // `finalizer`'s Drop emits V13a-only if the consumer disconnects before a
-            // terminus (the generator is dropped mid-await and the code below never
-            // reaches `finalize`).
             let finalizer = finalizer;
+            let exact_use_finalizer = exact_use_finalizer;
             let mut scrubber =
                 crate::egress::StreamScrubber::new(&secret_material, &alias_for_stream, max_line);
             let mut usage_acc = crate::outbox::UsageAccumulator::new(max_line);
             let mut upstream = upstream;
-            let mut clean = true;
+            let mut clean = false;
             let mut total_bytes: u64 = 0;
             let deadline = total.map(|d| tokio::time::Instant::now() + d);
 
-            loop {
-                // Race the next upstream chunk against: a mid-stream halt (V6), the
-                // total-duration cap, and the idle cap. `biased` checks halt first.
-                let step = {
-                    let next = upstream.next();
-                    tokio::pin!(next);
-                    tokio::select! {
-                        biased;
-                        _ = abort.notified() => StreamStep::Halted,
-                        _ = async {
-                            match deadline {
-                                Some(d) => tokio::time::sleep_until(d).await,
-                                None => std::future::pending::<()>().await,
-                            }
-                        } => StreamStep::TotalTimeout,
-                        r = async {
-                            match idle {
-                                Some(d) => tokio::time::timeout(d, next.as_mut()).await.map_err(|_| ()),
-                                None => Ok(next.as_mut().await),
-                            }
-                        } => match r {
-                            Err(()) => StreamStep::IdleTimeout,
-                            Ok(None) => StreamStep::CleanEof,
-                            Ok(Some(Ok(chunk))) => StreamStep::Chunk(chunk),
-                            Ok(Some(Err(_))) => StreamStep::UpstreamError,
-                        },
-                    }
-                };
+            'producer: loop {
+                // `Body::from_stream` may be dropped before its first poll. Detect
+                // that case before touching the upstream so it is an error outcome,
+                // not a misleading clean EOF from a response nobody can receive.
+                if sender.is_closed() {
+                    break 'producer;
+                }
+                // Race the next upstream byte against halt, total, and idle. The
+                // producer owns the upstream irrespective of downstream polling.
+                let step =
+                    next_upstream_stream_step(&mut upstream, &sender, &abort, idle, deadline).await;
 
-                match step {
-                    StreamStep::CleanEof => break,
-                    StreamStep::Halted => {
-                        let terminal = scrubber.terminate_with(SSE_HALT_FRAME);
-                        if !terminal.is_empty() {
-                            yield Ok::<Bytes, std::io::Error>(Bytes::from(terminal));
+                let terminal = match step {
+                    StreamStep::CleanEof => match scrubber.finish() {
+                        Ok(out) => {
+                            if !out.is_empty()
+                                && !matches!(
+                                    deliver_stream_chunk(
+                                        &sender,
+                                        Bytes::from(out),
+                                        &abort,
+                                        idle,
+                                        deadline,
+                                    )
+                                    .await,
+                                    StreamDelivery::Delivered
+                                )
+                            {
+                                break 'producer;
+                            }
+                            clean = true;
+                            break 'producer;
                         }
-                        clean = false;
-                        break;
-                    }
+                        Err(_) => scrubber.terminate_with(SSE_ERROR_FRAME),
+                    },
+                    StreamStep::Halted => scrubber.terminate_with(SSE_HALT_FRAME),
+                    StreamStep::DownstreamGone => break 'producer,
                     StreamStep::IdleTimeout
                     | StreamStep::TotalTimeout
-                    | StreamStep::UpstreamError => {
-                        // Generic in-band SSE error, never the detail (the buffered path
-                        // withholds upstream Err detail too). The terminal frame
-                        // itself passes the output-boundary postcondition; if it
-                        // collides with a credential form, the safe suffix is empty.
-                        let terminal = scrubber.terminate_with(SSE_ERROR_FRAME);
-                        if !terminal.is_empty() {
-                            yield Ok(Bytes::from(terminal));
-                        }
-                        clean = false;
-                        break;
-                    }
+                    | StreamStep::UpstreamError => scrubber.terminate_with(SSE_ERROR_FRAME),
                     StreamStep::Chunk(chunk) => {
                         total_bytes = total_bytes.saturating_add(chunk.len() as u64);
                         if max_bytes > 0 && total_bytes > max_bytes {
-                            let terminal = scrubber.terminate_with(SSE_ERROR_FRAME);
-                            if !terminal.is_empty() {
-                                yield Ok(Bytes::from(terminal));
+                            scrubber.terminate_with(SSE_ERROR_FRAME)
+                        } else {
+                            // Tee the raw bytes before scrubbing, preserving the V13b
+                            // usage parser and carrying a complete trailer across a
+                            // downstream disconnect.
+                            usage_acc.push(&chunk);
+                            if let Some((usage, model)) = usage_acc.snapshot() {
+                                finalizer.record_usage(
+                                    usage,
+                                    model.or_else(|| meter_request_model.clone()),
+                                );
                             }
-                            clean = false;
-                            break;
-                        }
-                        // Tee: usage tap reads the RAW chunk (pre-scrub, symmetric with
-                        // the buffered path's pre-scrub usage read); the scrubber emits.
-                        usage_acc.push(&chunk);
-                        // Carry a COMPLETE trailer into the finalizer so a client
-                        // disconnect right after the usage frame still meters V13b
-                        // (Drop reads this) rather than under-counting to V13a-only.
-                        if let Some((u, m)) = usage_acc.snapshot() {
-                            finalizer.record_usage(u, m.or_else(|| meter_request_model.clone()));
-                        }
-                        match scrubber.push(&chunk) {
-                            Ok(out) => {
-                                if !out.is_empty() {
-                                    yield Ok(Bytes::from(out));
+                            match scrubber.push(&chunk) {
+                                Ok(out) if out.is_empty() => continue,
+                                Ok(out) => {
+                                    match deliver_stream_chunk(
+                                        &sender,
+                                        Bytes::from(out),
+                                        &abort,
+                                        idle,
+                                        deadline,
+                                    )
+                                    .await
+                                    {
+                                        StreamDelivery::Delivered => continue,
+                                        StreamDelivery::DownstreamGone => break 'producer,
+                                        StreamDelivery::Halted => {
+                                            scrubber.terminate_with(SSE_HALT_FRAME)
+                                        }
+                                        StreamDelivery::IdleTimeout
+                                        | StreamDelivery::TotalTimeout => {
+                                            scrubber.terminate_with(SSE_ERROR_FRAME)
+                                        }
+                                    }
                                 }
-                            }
-                            Err(_) => {
-                                // Scrub fail-closed (buffer cap or final-output
-                                // collision). The generic frame is also checked
-                                // against the already-released suffix.
-                                let terminal = scrubber.terminate_with(SSE_ERROR_FRAME);
-                                if !terminal.is_empty() {
-                                    yield Ok(Bytes::from(terminal));
-                                }
-                                clean = false;
-                                break;
+                                Err(_) => scrubber.terminate_with(SSE_ERROR_FRAME),
                             }
                         }
                     }
+                };
+
+                // A terminal SSE frame is best effort: `try_send` never lets a full
+                // or abandoned downstream delay the producer's finalizers. If there
+                // is capacity, the client receives the generic in-band error; if it
+                // disconnected, closing the channel is the only deliverable outcome.
+                if !terminal.is_empty() {
+                    let _ = sender.try_send(Ok(Bytes::from(terminal)));
                 }
+                break;
             }
 
-            if clean {
-                match scrubber.finish() {
-                    Ok(out) => {
-                        if !out.is_empty() {
-                            yield Ok(Bytes::from(out));
-                        }
-                    }
-                    Err(_) => {
-                        let terminal = scrubber.terminate_with(SSE_ERROR_FRAME);
-                        if !terminal.is_empty() {
-                            yield Ok(Bytes::from(terminal));
-                        }
-                    }
-                }
-                // Clean EOF: emit V13a + (when a usage split was parsed) the V13b
-                // priced token event — identical shape to the buffered path. Prefer
-                // the model the provider echoed in the stream; fall back to the
-                // request-side model so `dims.model_ref` is present whenever the
-                // buffered path would have had it (no stream-only pricing gap).
-                let (usage, stream_model) = usage_acc.finish();
-                let model = stream_model.or(meter_request_model);
-                finalizer.finalize(usage, model).await;
-            } else {
-                // Truncated/halted/errored turn. A genuinely partial stream has no
-                // trustworthy usage trailer and meters V13a only (emitting partial
-                // counts would under-count, the dangerous direction). BUT if the
-                // provider's usage trailer ALREADY arrived before this terminus (e.g. an
-                // idle/total timeout or upstream error AFTER the usage + [DONE] frames),
-                // `finish` returns the COMPLETE split — trust it and still emit V13b
-                // (a parsed-complete trailer is authoritative regardless of how the
-                // stream ended; dropping it would under-count).
-                let (usage, stream_model) = usage_acc.finish();
-                let model = stream_model.or(meter_request_model);
-                finalizer.finalize(usage, model).await;
-            }
-            // _guard + finalizer drop here (finalizer already emitted → Drop no-op).
-        };
+            // A clean EOF that was fully forwarded is the only successful outcome.
+            // Every timeout, scrub failure, halt, full/non-consuming downstream, and
+            // receiver drop completes both accounting paths as error exactly once.
+            let (usage, stream_model) = usage_acc.finish();
+            let model = stream_model.or(meter_request_model);
+            finalizer.finalize(usage, model).await;
+            exact_use_finalizer
+                .finalize(if clean { "ok" } else { "error" })
+                .await;
+            // `_guard` and both finalizers now drop after their atomic completion.
+        });
+
+        // Keep the public `Body::from_stream` contract unchanged: axum still sees a
+        // fallible byte stream, backed now by the eager bounded producer above.
+        let body = futures::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|item| (item, receiver))
+        });
 
         Ok(StreamingExecution {
             status,
@@ -2919,8 +3145,7 @@ impl VultrinoServer {
                 tracing::error!(%reason, approval_id = %approval.id,
                     "approval recipe authority is inconclusive at resume");
                 !self.config.enforcement.require_declared_capabilities
-                    && approval.gate_rule_authority()
-                        == Some(GateRuleAuthorityClass::Inconclusive)
+                    && approval.gate_rule_authority() == Some(GateRuleAuthorityClass::Inconclusive)
                     && approval.approval_rule.is_none()
             }
         };
@@ -3052,6 +3277,7 @@ impl VultrinoServer {
                     "approved execution could not be exactly bound; nothing ran".to_string(),
                 ))
             })?;
+        let execution_epoch = grant.binding().epoch;
         let permit = crate::formal_kernel::ExecutionPermit::approved(
             binding.clone(),
             true,
@@ -3079,7 +3305,16 @@ impl VultrinoServer {
             action_name: action_name.to_string(),
             params: approval.params.clone(),
             context,
-            use_token_id: approval.use_token_id.clone(),
+            // The presenting bearer authenticated and scoped approval-open. Once
+            // the exact request is approved, the persisted one-shot grant is the
+            // execution authority; bearer expiry/rotation cannot invalidate it.
+            use_token_id: None,
+            evidence_subject_id: Some(format!("approval:{}:{}", approval.id, execution_epoch)),
+            approved_execution: true,
+            evidence_action: approval
+                .action_label
+                .clone()
+                .unwrap_or_else(|| approval.action.clone()),
             evidence_required,
         };
         let authorized = permit.authorize(&binding, payload).map_err(|reason| {
@@ -3212,7 +3447,14 @@ impl VultrinoServer {
                         // failure (unusable token, bad params, missing credential).
                         // Finalize terminally so the agent isn't told to poll forever.
                         Err(re) if !re.retryable => {
-                            claimed.result_error = Some(re.error.to_string());
+                            let error = re.error.to_string();
+                            claimed.result_error = Some(if re.committed {
+                                format!(
+                                    "outcome unknown — the action may have completed; check the connected service before retrying: {error}"
+                                )
+                            } else {
+                                error
+                            });
                             claimed.executed = true;
                             claimed.executing = false;
                             claimed.executing_since = None;
@@ -3542,8 +3784,8 @@ impl VultrinoServer {
         // through the lookup so an exact canonical Rule remains usable, while a
         // no-rule/inconclusive result refuses instead of taking the weaker
         // numeric-approval path. This is the V-A7 fail-closed partition.
-        let canonical_label_ambiguous = action_label.is_none()
-            && self.config.canonical_action_has_labels(action_class);
+        let canonical_label_ambiguous =
+            action_label.is_none() && self.config.canonical_action_has_labels(action_class);
         let govder = match self.govder.as_ref() {
             Some(g) => g,
             None => {
@@ -3561,7 +3803,7 @@ impl VultrinoServer {
                              approval recipe could be confirmed for this action — an unset \
                              address is not a statement that no recipe exists"
                         .to_string(),
-                })
+                });
             }
         };
         let tenant = tenant.map(str::trim).unwrap_or_default();
@@ -3601,8 +3843,7 @@ impl VultrinoServer {
                          (fail-closed)"
                             .to_string(),
                     )
-                })?
-            {
+                })? {
                 answer @ crate::govder::GateRuleAnswer::Rule(_) => return Ok(answer),
                 crate::govder::GateRuleAnswer::NoRule => {}
                 crate::govder::GateRuleAnswer::Inconclusive { reason } => {
@@ -3664,9 +3905,10 @@ impl VultrinoServer {
                 .collect();
             if matching.is_empty() {
                 IrreversibilityResolution::Undeclared
-            } else if matching.iter().any(|cap| {
-                crate::approval::reversibility_requires_human_floor(&cap.reversibility)
-            }) {
+            } else if matching
+                .iter()
+                .any(|cap| crate::approval::reversibility_requires_human_floor(&cap.reversibility))
+            {
                 IrreversibilityResolution::HumanFloor
             } else {
                 IrreversibilityResolution::Reversible
@@ -4103,6 +4345,9 @@ pub async fn deliver_outbox_once(
     client: &reqwest::Client,
     metrics: &OutboxMetrics,
 ) -> Result<(), crate::storage::StorageError> {
+    if !config.enabled {
+        return Ok(());
+    }
     let (Some(url), Some(secret)) = (config.url.as_deref(), config.hmac_secret.as_deref()) else {
         return Ok(());
     };
@@ -4314,7 +4559,9 @@ async fn deliver_averin_grant(
         .get(&token_id)
         .await
         .map_err(|e| format!("popkey lookup failed: {e}"))?
-        .ok_or_else(|| format!("no PoP-key entry for token {token_id} (grant cannot be rebuilt)"))?;
+        .ok_or_else(|| {
+            format!("no PoP-key entry for token {token_id} (grant cannot be rebuilt)")
+        })?;
 
     // Codex re-review #6 — STORED, never live, and FAIL-CLOSED: these are the fields frozen into the
     // event at enqueue (`enqueue_durable_mint_grant`). A missing frozen field must ERROR the delivery
@@ -4380,7 +4627,8 @@ async fn deliver_averin_grant(
     // Mirrors `AverinClient::seal_grant`'s exact body shape (`src/averin/mod.rs`) — same fields,
     // same `scope_class`/`use_limit` derivation — rebuilt here from the entry instead of the
     // in-memory `pop` map `seal_grant` uses (this worker never touches that map; D1).
-    let scope_class = entry.use_limit.filter(|n| *n > 1).map(|_| "bounded_reuse");
+    let (scope_class, averin_use_limit) =
+        crate::averin::grant_shape(&entry.scope, &entry.action, entry.use_limit);
     let body = serde_json::json!({
         "idempotency_key": token_id,
         "project_id": project_id,
@@ -4390,7 +4638,7 @@ async fn deliver_averin_grant(
         "resource": resource,
         "scope": entry.scope,
         "scope_class": scope_class,
-        "use_limit": entry.use_limit.filter(|n| *n > 1).unwrap_or(0),
+        "use_limit": averin_use_limit,
         "agent_pubkey": agent_pubkey,
         "agent_sig": agent_sig,
         "ttl_seconds": grant_ttl_secs,
@@ -4414,8 +4662,7 @@ async fn deliver_averin_grant(
         .to_string();
 
     let delivered_at = chrono::Utc::now();
-    let expires_at =
-        Some(delivered_at + chrono::Duration::seconds(i64::from(grant_ttl_secs)));
+    let expires_at = Some(delivered_at + chrono::Duration::seconds(i64::from(grant_ttl_secs)));
 
     popkeys
         .grant_resolved(
@@ -4814,9 +5061,14 @@ pub async fn deliver_averin_outbox_periodically(
     let mut ticks: u64 = 0;
     loop {
         tokio::time::sleep(interval).await;
-        if let Err(e) =
-            deliver_averin_outbox_once(&queue, &popkeys, &quarantine, &averin_client, AVERIN_MAX_ATTEMPTS)
-                .await
+        if let Err(e) = deliver_averin_outbox_once(
+            &queue,
+            &popkeys,
+            &quarantine,
+            &averin_client,
+            AVERIN_MAX_ATTEMPTS,
+        )
+        .await
         {
             warn!(error = %e, "averin durable delivery pass failed");
         }
@@ -4899,13 +5151,17 @@ async fn run_averin_gc_tick(
     match run_averin_queue_blocking(|| queue.prune_delivered_prefix(AVERIN_QUEUE_RETENTION_SECS)) {
         Ok(0) => {}
         Ok(pruned) => {
-            info!(pruned, "averin durable queue pruned its delivered-prefix past the retention window")
+            info!(
+                pruned,
+                "averin durable queue pruned its delivered-prefix past the retention window"
+            )
         }
         Err(e) => warn!(error = %e, "averin durable queue delivered-prefix prune failed"),
     }
 
     // 4. The bounded-growth alarm (D0), carried over from `OutboxStore::gc`'s alarm contract.
-    let stuck = run_averin_queue_blocking(|| queue.stuck_undelivered_count(AVERIN_QUEUE_RETENTION_SECS));
+    let stuck =
+        run_averin_queue_blocking(|| queue.stuck_undelivered_count(AVERIN_QUEUE_RETENTION_SECS));
     if stuck > 0 {
         warn!(
             count = stuck,
@@ -4917,12 +5173,16 @@ async fn run_averin_gc_tick(
 
     // 5. The quarantine's own bounded sensitive-data retention (D4) — independent of the queue side.
     let now = chrono::Utc::now();
-    if let Some(before) = chrono::Duration::try_seconds(AVERIN_QUARANTINE_PARAMS_RETENTION_SECS as i64)
-        .and_then(|d| now.checked_sub_signed(d))
+    if let Some(before) =
+        chrono::Duration::try_seconds(AVERIN_QUARANTINE_PARAMS_RETENTION_SECS as i64)
+            .and_then(|d| now.checked_sub_signed(d))
     {
         match quarantine.purge_expired_params(before).await {
             Ok(0) => {}
-            Ok(purged) => info!(purged, "averin quarantine redacted raw params past the retention window"),
+            Ok(purged) => info!(
+                purged,
+                "averin quarantine redacted raw params past the retention window"
+            ),
             Err(e) => warn!(error = %e, "averin quarantine params-purge pass failed"),
         }
     }
@@ -4933,7 +5193,10 @@ async fn run_averin_gc_tick(
     // still `replay`-eligible) record; a listing failure skips eviction entirely THIS tick rather than
     // guess — over-retention (a resolved subject's seed lingers one more tick) is always the safe
     // failure mode here, never under-retention.
-    let replayable_subjects: Option<std::collections::HashSet<String>> = match quarantine.list().await {
+    let replayable_subjects: Option<std::collections::HashSet<String>> = match quarantine
+        .list()
+        .await
+    {
         Ok(records) => Some(
             records
                 .into_iter()
@@ -4962,13 +5225,21 @@ async fn run_averin_gc_tick(
     };
     if let Some(replayable_subjects) = replayable_subjects {
         let subject_has_live_use = |subject: &str| queue.has_pending_for_subject(subject);
-        let subject_has_replayable_dead_letter = |subject: &str| replayable_subjects.contains(subject);
+        let subject_has_replayable_dead_letter =
+            |subject: &str| replayable_subjects.contains(subject);
         match popkeys
-            .evict_resolved(now, subject_has_live_use, subject_has_replayable_dead_letter)
+            .evict_resolved(
+                now,
+                subject_has_live_use,
+                subject_has_replayable_dead_letter,
+            )
             .await
         {
             Ok(0) => {}
-            Ok(evicted) => info!(evicted, "averin popkey GC evicted fully-resolved subjects' PoP seeds"),
+            Ok(evicted) => info!(
+                evicted,
+                "averin popkey GC evicted fully-resolved subjects' PoP seeds"
+            ),
             Err(e) => warn!(error = %e, "averin popkey GC eviction pass failed"),
         }
     }
@@ -5222,6 +5493,204 @@ fn parse_action(action: &str) -> Result<(&str, &str), VultrinoError> {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct ExactUseOutcomeState {
+        statuses: parking_lot::Mutex<Vec<String>>,
+    }
+
+    async fn fake_exact_use_outcome(
+        axum::extract::State(state): axum::extract::State<Arc<ExactUseOutcomeState>>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::Json<serde_json::Value> {
+        state.statuses.lock().push(
+            body.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        );
+        axum::Json(serde_json::json!({ "outcome_id": "outcome-test" }))
+    }
+
+    async fn exact_use_outcome_client(
+    ) -> (Arc<crate::averin::AverinClient>, Arc<ExactUseOutcomeState>) {
+        let state = Arc::new(ExactUseOutcomeState::default());
+        let app = axum::Router::new()
+            .route(
+                "/v2/use-outcome",
+                axum::routing::post(fake_exact_use_outcome),
+            )
+            .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = crate::averin::AverinClient::new(crate::averin::AverinConfig {
+            enabled: true,
+            base_url: format!("http://{addr}"),
+            resource_id: "orders-db".to_string(),
+            ..crate::averin::AverinConfig::default()
+        })
+        .unwrap()
+        .unwrap();
+        (Arc::new(client), state)
+    }
+
+    async fn wait_for_outcomes(state: &ExactUseOutcomeState, expected: usize) {
+        for _ in 0..100 {
+            if state.statuses.lock().len() == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for {expected} D8 outcome(s); got {:?}",
+            state.statuses.lock()
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_use_finalizer_completes_disconnect_and_normal_terminus_once() {
+        let (client, outcomes) = exact_use_outcome_client().await;
+
+        // Dropping the body/generator represents a client disconnect: its admitted D8 intent
+        // receives exactly one asynchronous error outcome.
+        drop(ExactUseFinalizer::new(Some((
+            Arc::clone(&client),
+            crate::averin::ExactUseEvidence::for_test("intent-disconnect", "idem-disconnect"),
+        ))));
+        wait_for_outcomes(&outcomes, 1).await;
+        assert_eq!(*outcomes.statuses.lock(), vec!["error"]);
+
+        // A known clean terminus records ok inline. Its subsequent Drop is a no-op, proving the
+        // normal and disconnect paths cannot double-complete the same exact-use intent.
+        let normal = ExactUseFinalizer::new(Some((
+            client,
+            crate::averin::ExactUseEvidence::for_test("intent-clean", "idem-clean"),
+        )));
+        normal.finalize("ok").await;
+        drop(normal);
+        wait_for_outcomes(&outcomes, 2).await;
+        assert_eq!(*outcomes.statuses.lock(), vec!["error", "ok"]);
+    }
+
+    #[tokio::test]
+    async fn eager_stream_bounds_idle_total_and_unread_downstream() {
+        // An upstream that never yields must be released by the idle cap, even
+        // before a downstream body has ever been polled.
+        let abort = tokio::sync::Notify::new();
+        let mut idle_upstream = Box::pin(futures::stream::pending::<
+            Result<Bytes, crate::plugins::PluginError>,
+        >());
+        let (idle_sender, _idle_receiver) = tokio::sync::mpsc::channel(1);
+        assert!(matches!(
+            next_upstream_stream_step(
+                &mut idle_upstream,
+                &idle_sender,
+                &abort,
+                Some(std::time::Duration::from_millis(5)),
+                None,
+            )
+            .await,
+            StreamStep::IdleTimeout
+        ));
+
+        // Endless chunks cannot evade the total cap merely by staying busy.
+        let mut endless = Box::pin(futures::stream::unfold((), |_| async {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Some((Ok(Bytes::from_static(b"x")), ()))
+        }));
+        let (endless_sender, _endless_receiver) = tokio::sync::mpsc::channel(1);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(8);
+        loop {
+            match next_upstream_stream_step(
+                &mut endless,
+                &endless_sender,
+                &abort,
+                Some(std::time::Duration::from_millis(20)),
+                Some(deadline),
+            )
+            .await
+            {
+                StreamStep::Chunk(_) => continue,
+                StreamStep::TotalTimeout => break,
+                _ => panic!("endless upstream escaped the total cap"),
+            }
+        }
+
+        // A bounded channel with a retained but unread receiver reaches its
+        // delivery-idle bound instead of holding the producer indefinitely.
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(Ok(Bytes::from_static(b"first"))).await.unwrap();
+        assert!(matches!(
+            deliver_stream_chunk(
+                &sender,
+                Bytes::from_static(b"second"),
+                &abort,
+                Some(std::time::Duration::from_millis(5)),
+                None,
+            )
+            .await,
+            StreamDelivery::IdleTimeout
+        ));
+
+        // A downstream disconnect is observable immediately, allowing the
+        // producer to drop/abort its upstream and run error finalizers.
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        assert!(matches!(
+            deliver_stream_chunk(&sender, Bytes::from_static(b"ignored"), &abort, None, None,)
+                .await,
+            StreamDelivery::DownstreamGone
+        ));
+    }
+
+    #[tokio::test]
+    async fn eager_producer_receiver_drop_records_one_d8_error_after_upstream_success() {
+        let (client, outcomes) = exact_use_outcome_client().await;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (chunk_read, chunk_read_waiter) = tokio::sync::oneshot::channel();
+        let (continue_delivery, continue_delivery_waiter) = tokio::sync::oneshot::channel();
+
+        // This mirrors the producer's two phases. The upstream succeeds first; only
+        // then does the downstream vanish, so an upstream `Ok` cannot be mistaken
+        // for a delivered response or an exact-use `ok` outcome.
+        let producer = tokio::spawn(async move {
+            let abort = tokio::sync::Notify::new();
+            let mut upstream = Box::pin(futures::stream::once(async {
+                Ok::<Bytes, crate::plugins::PluginError>(Bytes::from_static(b"upstream-ok"))
+            }));
+            let finalizer = ExactUseFinalizer::new(Some((
+                client,
+                crate::averin::ExactUseEvidence::for_test(
+                    "intent-receiver-drop",
+                    "idem-receiver-drop",
+                ),
+            )));
+
+            let chunk =
+                match next_upstream_stream_step(&mut upstream, &sender, &abort, None, None).await {
+                    StreamStep::Chunk(chunk) => chunk,
+                    _ => panic!("ready upstream did not produce its successful chunk"),
+                };
+            chunk_read.send(()).unwrap();
+            continue_delivery_waiter.await.unwrap();
+
+            assert!(matches!(
+                deliver_stream_chunk(&sender, chunk, &abort, None, None).await,
+                StreamDelivery::DownstreamGone
+            ));
+            finalizer.finalize("error").await;
+        });
+
+        chunk_read_waiter.await.unwrap();
+        drop(receiver);
+        continue_delivery.send(()).unwrap();
+        producer.await.unwrap();
+        wait_for_outcomes(&outcomes, 1).await;
+        assert_eq!(*outcomes.statuses.lock(), vec!["error"]);
+    }
+
     async fn irreversibility_test_server() -> (VultrinoServer, Arc<dyn StorageBackend>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.enc");
@@ -5327,6 +5796,128 @@ mod tests {
         );
     }
 
+    /// A use token's `require_approval: true` (govder: "human-confirmed write
+    /// on every use" for L3) must gate WRITES, not reads. Otherwise every read
+    /// through such a token (e.g. a Notion `GET`) opens a Pending approval, and
+    /// an eve-binder poll loop that re-reads the token file each iteration hits
+    /// "requested by a different principal" after remint — the marketing-demo
+    /// bug this test locks in the fix for.
+    #[tokio::test]
+    async fn force_approval_token_gates_writes_not_reads() {
+        use crate::auth::NewUseToken;
+        use crate::capability::{Capability, CapabilityTarget};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        std::mem::forget(dir);
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::FileStorage::new(&path, &secrecy::SecretString::from("test-password"))
+                .await
+                .unwrap(),
+        );
+        storage
+            .store(&crate::Credential::new(
+                "cred".to_string(),
+                crate::CredentialData::ApiKey {
+                    key: crate::Secret::new("secret-key"),
+                    header_name: "Authorization".to_string(),
+                    header_prefix: "Bearer ".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        // Declared `reversible`, so the independent irreversibility-resolution
+        // authority (untouched by this fix) does not itself force approval or
+        // refuse the write for lack of a confirmed recipe — isolating the
+        // assertions below to the force_approval/read-vs-write gate under test.
+        storage
+            .store_capability(&Capability {
+                id: "cap-http".to_string(),
+                tool_name: "http_request_cap".to_string(),
+                description: "test capability".to_string(),
+                action: "http.request".to_string(),
+                plugin: Some("http".to_string()),
+                target: CapabilityTarget::default(),
+                credential_ref: "cred".to_string(),
+                input_schema: serde_json::json!({}),
+                reversibility: "reversible".to_string(),
+                llm: None,
+                approval_preview: None,
+            })
+            .await
+            .unwrap();
+
+        let mut config = Config::default();
+        // Approvals must be enabled for the write case to actually open a
+        // Pending request rather than being refused outright (fail-closed when
+        // approvals are off is a separate behavior, not what this test proves).
+        config.approval.enabled = true;
+        // An explicit Allow policy isolates this test from the engine's
+        // default-deny posture — what's under test is the force-approval/read
+        // gating, not the policy default.
+        config.policies = vec![crate::policy::Policy::allow_all("allow-all", "*")];
+        let server = VultrinoServer::new(
+            config,
+            storage.clone(),
+            CredentialResolver::new(storage.clone()),
+        );
+
+        let (_plaintext, token) = crate::auth::UseToken::create(NewUseToken {
+            name: "force-approval-test".to_string(),
+            credential_scope: "cred".to_string(),
+            action_scope: None,
+            max_uses: None,
+            require_approval: true,
+            expires_in: None,
+        });
+        let token_id = token.id.clone();
+        // Model the production mint path: the token record is persisted before
+        // the bearer can open an approval or execute an action. `from_use_token`
+        // carries the authenticated snapshot, but reservation is authoritative
+        // in storage and must not rely on that snapshot alone.
+        storage.store_use_token(&token).await.unwrap();
+
+        // A read (GET) through the force-approval token must run directly —
+        // NOT open an approval.
+        let read_request = ExecuteRequest {
+            credential: "cred".to_string(),
+            action: "http.request".to_string(),
+            params: serde_json::json!({"url": "https://example.com/x", "method": "GET"}),
+        };
+        match server
+            .prepare_execution(read_request, ExecAuth::from_use_token(token.clone()))
+            .await
+            .expect("a read must not error")
+        {
+            PreparedAction::Ready(_) => {}
+            PreparedAction::Pending(_) => panic!(
+                "a read action must not be gated by a use token's require_approval \
+                 (which governs writes)"
+            ),
+        }
+
+        // A write (POST) through the SAME force-approval token must still open
+        // a Pending approval.
+        let write_request = ExecuteRequest {
+            credential: "cred".to_string(),
+            action: "http.request".to_string(),
+            params: serde_json::json!({"url": "https://example.com/x", "method": "POST"}),
+        };
+        match server
+            .prepare_execution(write_request, ExecAuth::from_use_token(token))
+            .await
+            .expect("preparing a gated write must not error")
+        {
+            PreparedAction::Pending(_) => {}
+            PreparedAction::Ready(_) => {
+                panic!("a write action driven by a require_approval token must still be gated")
+            }
+        }
+
+        let stored = storage.get_use_token(&token_id).await.unwrap().unwrap();
+        assert_eq!(stored.uses, 1, "opening the approval must reserve one use");
+    }
+
     #[tokio::test]
     async fn exact_labels_and_previews_never_borrow_canonical_siblings() {
         use crate::capability::{
@@ -5336,12 +5927,9 @@ mod tests {
         let path = dir.path().join("vault.enc");
         std::mem::forget(dir);
         let storage: Arc<dyn StorageBackend> = Arc::new(
-            crate::storage::FileStorage::new(
-                &path,
-                &secrecy::SecretString::from("test-password"),
-            )
-            .await
-            .unwrap(),
+            crate::storage::FileStorage::new(&path, &secrecy::SecretString::from("test-password"))
+                .await
+                .unwrap(),
         );
         let config = Config {
             action_labels: std::collections::HashMap::from([
@@ -5545,13 +6133,17 @@ mod averin_worker_tests {
                     // return the already-sealed record, mirroring averin's idempotent dedup.
                     return (
                         StatusCode::OK,
-                        Json(serde_json::json!({"record": {"record_id": record_id}, "idempotent": true})),
+                        Json(
+                            serde_json::json!({"record": {"record_id": record_id}, "idempotent": true}),
+                        ),
                     );
                 }
                 // A DIFFERENT operation reusing an already-claimed key — averin's real 409.
                 return (
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({"error": "idempotency key reused with a mismatched request"})),
+                    Json(
+                        serde_json::json!({"error": "idempotency key reused with a mismatched request"}),
+                    ),
                 );
             }
             let capability = body
@@ -5673,7 +6265,11 @@ mod averin_worker_tests {
             .append("tok-1", "averin.grant", grant_payload())
             .unwrap();
         let use_seq = queue
-            .append("tok-1", "averin.use", use_payload("hello-world", "req-1", 1))
+            .append(
+                "tok-1",
+                "averin.use",
+                use_payload("hello-world", "req-1", 1),
+            )
             .unwrap();
         assert!(grant_seq < use_seq);
 
@@ -5714,7 +6310,10 @@ mod averin_worker_tests {
             "exactly one grant + one use reached the fake averin: {log:?}"
         );
         assert!(log[0].starts_with("grant:"), "grant must be first: {log:?}");
-        assert!(log[1].starts_with("use:"), "use must follow its grant: {log:?}");
+        assert!(
+            log[1].starts_with("use:"),
+            "use must follow its grant: {log:?}"
+        );
 
         assert!(deadletter.list().await.unwrap().is_empty());
     }
@@ -5849,7 +6448,10 @@ mod averin_worker_tests {
         let use_count = log.iter().filter(|l| l.starts_with("use:")).count();
         assert_eq!(use_count, 2, "B and C's uses both reached averin: {log:?}");
         let grant_count = log.iter().filter(|l| l.starts_with("grant:")).count();
-        assert_eq!(grant_count, 3, "all three subjects' grants delivered: {log:?}");
+        assert_eq!(
+            grant_count, 3,
+            "all three subjects' grants delivered: {log:?}"
+        );
 
         // Nothing left Pending anywhere: A's grant Delivered + A's use DeadLettered (terminal, so
         // it no longer blocks anything, including this subject's OWN later events, let alone B/C's
@@ -5923,7 +6525,10 @@ mod averin_worker_tests {
         let client = test_client(&base_url);
 
         popkeys
-            .insert("tok-retry", popkey_entry("db.query:orders-ro", "read:orders"))
+            .insert(
+                "tok-retry",
+                popkey_entry("db.query:orders-ro", "read:orders"),
+            )
             .await
             .unwrap();
         popkeys
@@ -6007,7 +6612,10 @@ mod averin_worker_tests {
         let client_a = test_client(&base_url);
 
         popkeys
-            .insert("tok-drift", popkey_entry("db.query:orders-ro", "read:orders"))
+            .insert(
+                "tok-drift",
+                popkey_entry("db.query:orders-ro", "read:orders"),
+            )
             .await
             .unwrap();
         popkeys
@@ -6109,7 +6717,10 @@ mod averin_worker_tests {
         let (base_url, fake) = responding_averin().await;
 
         popkeys
-            .insert("tok-route", popkey_entry("db.query:orders-ro", "read:orders"))
+            .insert(
+                "tok-route",
+                popkey_entry("db.query:orders-ro", "read:orders"),
+            )
             .await
             .unwrap();
         popkeys
@@ -6184,7 +6795,10 @@ mod averin_worker_tests {
         let client = test_client(&base_url);
 
         popkeys
-            .insert("tok-missing", popkey_entry("db.query:orders-ro", "read:orders"))
+            .insert(
+                "tok-missing",
+                popkey_entry("db.query:orders-ro", "read:orders"),
+            )
             .await
             .unwrap();
         popkeys
@@ -6252,7 +6866,10 @@ mod averin_worker_tests {
         let client = test_client(&base_url);
 
         popkeys
-            .insert("tok-multi", popkey_entry("db.query:orders-ro", "read:orders"))
+            .insert(
+                "tok-multi",
+                popkey_entry("db.query:orders-ro", "read:orders"),
+            )
             .await
             .unwrap();
         queue
@@ -6302,12 +6919,15 @@ mod averin_worker_tests {
     /// `<a regular file>/deadletter.enc`: the store's lock-file sidecar can't be created because a
     /// component of its own path is a plain file, not a directory.
     #[tokio::test]
-    async fn averin_worker_deadletter_whose_quarantine_move_fails_is_not_reclaimed_params_preserved() {
+    async fn averin_worker_deadletter_whose_quarantine_move_fails_is_not_reclaimed_params_preserved(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let (queue, popkeys, _unused) = test_stores(dir.path());
         let (base_url, fake) = responding_averin().await;
         let client = test_client(&base_url);
-        fake.fail_use_actions.lock().insert("action-fail".to_string());
+        fake.fail_use_actions
+            .lock()
+            .insert("action-fail".to_string());
 
         let bad_parent = dir.path().join("not-a-directory");
         std::fs::write(&bad_parent, b"occupied").unwrap();
@@ -6318,7 +6938,9 @@ mod averin_worker_tests {
             .insert("tok-fail", popkey_entry("action-fail", "read:orders"))
             .await
             .unwrap();
-        queue.append("tok-fail", "averin.grant", grant_payload()).unwrap();
+        queue
+            .append("tok-fail", "averin.grant", grant_payload())
+            .unwrap();
         let use_seq = queue
             .append(
                 "tok-fail",
@@ -6358,21 +6980,30 @@ mod averin_worker_tests {
         let (queue, popkeys, deadletter) = test_stores(dir.path());
         let (base_url, fake) = responding_averin().await;
         let client = test_client(&base_url);
-        fake.fail_use_actions.lock().insert("action-sweep".to_string());
+        fake.fail_use_actions
+            .lock()
+            .insert("action-sweep".to_string());
 
         popkeys
             .insert("tok-sweep", popkey_entry("action-sweep", "read:orders"))
             .await
             .unwrap();
-        queue.append("tok-sweep", "averin.grant", grant_payload()).unwrap();
+        queue
+            .append("tok-sweep", "averin.grant", grant_payload())
+            .unwrap();
         let use_seq = queue
-            .append("tok-sweep", "averin.use", use_payload("SWEEP_SECRET", "req-sweep", 1))
+            .append(
+                "tok-sweep",
+                "averin.use",
+                use_payload("SWEEP_SECRET", "req-sweep", 1),
+            )
             .unwrap();
 
         let bad_parent = dir.path().join("not-a-directory");
         std::fs::write(&bad_parent, b"occupied").unwrap();
         let broken_key = Arc::new(MasterKey::from_bytes(vec![9u8; 32]).unwrap());
-        let broken_deadletter = AverinDeadLetterStore::new(bad_parent.join("deadletter.enc"), broken_key);
+        let broken_deadletter =
+            AverinDeadLetterStore::new(bad_parent.join("deadletter.enc"), broken_key);
 
         deliver_averin_outbox_once(&queue, &popkeys, &broken_deadletter, &client, 1)
             .await
@@ -6419,7 +7050,10 @@ mod averin_worker_tests {
 
         // A: grant resolved and EXPIRED, no queue entry at all, no quarantine entry -> fully
         // resolved, no blockers -> the tick must evict it.
-        popkeys.insert("A", popkey_entry("action-a", "read:orders")).await.unwrap();
+        popkeys
+            .insert("A", popkey_entry("action-a", "read:orders"))
+            .await
+            .unwrap();
         popkeys
             .grant_resolved("A", "cap-a".into(), "grant-a".into(), now, already_expired)
             .await
@@ -6427,16 +7061,24 @@ mod averin_worker_tests {
 
         // B: grant resolved and EXPIRED, but a Pending use still sits in the queue -> a live use
         // blocks eviction.
-        popkeys.insert("B", popkey_entry("action-b", "read:orders")).await.unwrap();
+        popkeys
+            .insert("B", popkey_entry("action-b", "read:orders"))
+            .await
+            .unwrap();
         popkeys
             .grant_resolved("B", "cap-b".into(), "grant-b".into(), now, already_expired)
             .await
             .unwrap();
-        queue.append("B", "averin.use", use_payload("pb", "req-b", 1)).unwrap();
+        queue
+            .append("B", "averin.use", use_payload("pb", "req-b", 1))
+            .unwrap();
 
         // C: grant resolved and EXPIRED, no live use in the queue, but an OPEN unpurged quarantine
         // record exists for it -> a replayable dead-letter blocks eviction.
-        popkeys.insert("C", popkey_entry("action-c", "read:orders")).await.unwrap();
+        popkeys
+            .insert("C", popkey_entry("action-c", "read:orders"))
+            .await
+            .unwrap();
         popkeys
             .grant_resolved("C", "cap-c".into(), "grant-c".into(), now, already_expired)
             .await
@@ -6462,13 +7104,19 @@ mod averin_worker_tests {
             .unwrap();
 
         // D: the grant never delivered (not resolved, not abandoned) -> never even a candidate.
-        popkeys.insert("D", popkey_entry("action-d", "read:orders")).await.unwrap();
+        popkeys
+            .insert("D", popkey_entry("action-d", "read:orders"))
+            .await
+            .unwrap();
 
         // E (Codex HIGH-4 regression, exercised through the FULL tick, not just the unit-level
         // predicates): grant delivered but NOT yet expired, no live use, no quarantine record ->
         // must NOT be evicted. Before the fix, "delivered + nothing pending" alone was enough to
         // evict this, which would have dead-lettered a delayed/later use of this same token.
-        popkeys.insert("E", popkey_entry("action-e", "read:orders")).await.unwrap();
+        popkeys
+            .insert("E", popkey_entry("action-e", "read:orders"))
+            .await
+            .unwrap();
         popkeys
             .grant_resolved(
                 "E",
@@ -6482,13 +7130,22 @@ mod averin_worker_tests {
 
         run_averin_gc_tick(&queue, &popkeys, &deadletter).await;
 
-        assert!(popkeys.get("A").await.unwrap().is_none(), "A: expired, no blockers -> evicted");
-        assert!(popkeys.get("B").await.unwrap().is_some(), "B: a live use must block eviction");
+        assert!(
+            popkeys.get("A").await.unwrap().is_none(),
+            "A: expired, no blockers -> evicted"
+        );
+        assert!(
+            popkeys.get("B").await.unwrap().is_some(),
+            "B: a live use must block eviction"
+        );
         assert!(
             popkeys.get("C").await.unwrap().is_some(),
             "C: a replayable dead-letter must block eviction"
         );
-        assert!(popkeys.get("D").await.unwrap().is_some(), "D: never resolved -> never evicted");
+        assert!(
+            popkeys.get("D").await.unwrap().is_some(),
+            "D: never resolved -> never evicted"
+        );
         assert!(
             popkeys.get("E").await.unwrap().is_some(),
             "E: delivered but not yet expired, nothing pending -> must be RETAINED (Codex HIGH-4)"
@@ -6528,7 +7185,11 @@ mod averin_worker_tests {
             .await
             .unwrap();
 
-        let after_dl = popkeys.get(token_id).await.unwrap().expect("entry still present pre-GC");
+        let after_dl = popkeys
+            .get(token_id)
+            .await
+            .unwrap()
+            .expect("entry still present pre-GC");
         assert!(
             after_dl.abandoned,
             "a permanently dead-lettered grant must mark its subject abandoned"
@@ -6560,7 +7221,8 @@ mod averin_worker_tests {
     /// `quarantine_and_reclaim_dead_letter` directly (the function under fix) rather than the whole
     /// worker pass, so the assertions land squarely on its contract.
     #[tokio::test]
-    async fn dead_lettered_grant_whose_mark_abandoned_fails_stays_unreclaimed_until_a_retry_succeeds() {
+    async fn dead_lettered_grant_whose_mark_abandoned_fails_stays_unreclaimed_until_a_retry_succeeds(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let (queue, popkeys, deadletter) = test_stores(dir.path());
         let subject = "tok-mark-fail";
@@ -6569,13 +7231,17 @@ mod averin_worker_tests {
             .insert(subject, popkey_entry("action-mark-fail", "read:orders"))
             .await
             .unwrap();
-        let seq = queue.append(subject, "averin.grant", grant_payload()).unwrap();
+        let seq = queue
+            .append(subject, "averin.grant", grant_payload())
+            .unwrap();
         // Dead-letter it in one shot: max_attempts=1 -> the first recorded failure is terminal.
         queue.claim(10, 1).unwrap();
         queue
             .record_delivery(seq, false, Some("forced failure".to_string()), 1)
             .unwrap();
-        let dead_lettered_event = queue.get(seq).expect("still in the queue, now DeadLettered");
+        let dead_lettered_event = queue
+            .get(seq)
+            .expect("still in the queue, now DeadLettered");
         assert_eq!(dead_lettered_event.delivery, DeliveryState::DeadLettered);
 
         // A SEPARATE store instance over the identical path, keyed wrong — decrypting the
@@ -6624,13 +7290,22 @@ mod averin_worker_tests {
 
         // Retry with a WORKING popkeys store (as the GC retry-sweep would do on its next tick): this
         // time mark_abandoned succeeds, so the grant proceeds all the way through quarantine+reclaim.
-        quarantine_and_reclaim_dead_letter(dead_lettered_event, &queue, &popkeys, &deadletter, false)
-            .await;
+        quarantine_and_reclaim_dead_letter(
+            dead_lettered_event,
+            &queue,
+            &popkeys,
+            &deadletter,
+            false,
+        )
+        .await;
         assert!(
             popkeys.get(subject).await.unwrap().unwrap().abandoned,
             "a successful retry must mark the subject abandoned"
         );
-        assert!(queue.get(seq).is_none(), "a successful retry must reclaim the grant from the queue");
+        assert!(
+            queue.get(seq).is_none(),
+            "a successful retry must reclaim the grant from the queue"
+        );
         assert!(
             deadletter.contains(seq).await.unwrap(),
             "a successful retry must quarantine the grant"
@@ -6689,7 +7364,9 @@ mod averin_worker_tests {
                 storage.clone() as Arc<dyn StorageBackend>,
                 CredentialResolver::new(storage.clone() as Arc<dyn StorageBackend>),
             );
-            let av = server.averin().expect("averin client constructed (enabled = true)");
+            let av = server
+                .averin()
+                .expect("averin client constructed (enabled = true)");
 
             let (_plaintext, mut token) = crate::auth::UseToken::create(NewUseToken {
                 name: "test-token".to_string(),
@@ -6703,7 +7380,14 @@ mod averin_worker_tests {
 
             server.seal_mint(&token).await;
             let result = server
-                .seal_after_consume(&av, &token.id, br#"{"q":1}"#.to_vec(), 1, "req-rekey-1", false)
+                .seal_after_consume(
+                    &av,
+                    &token.id,
+                    br#"{"q":1}"#.to_vec(),
+                    1,
+                    "req-rekey-1",
+                    false,
+                )
                 .await;
             assert!(result.is_ok(), "Observe must never return Err");
 
@@ -6872,7 +7556,9 @@ mod averin_worker_tests {
                 storage.clone() as Arc<dyn StorageBackend>,
                 CredentialResolver::new(storage.clone() as Arc<dyn StorageBackend>),
             );
-            let av = server.averin().expect("averin client constructed (enabled = true)");
+            let av = server
+                .averin()
+                .expect("averin client constructed (enabled = true)");
 
             let (_plaintext, mut token) = crate::auth::UseToken::create(NewUseToken {
                 name: "test-token".to_string(),
@@ -6888,7 +7574,14 @@ mod averin_worker_tests {
             // network round-trip — then "crash" before either ever reaches averin.
             server.seal_mint(&token).await;
             let result = server
-                .seal_after_consume(&av, &token.id, br#"{"q":1}"#.to_vec(), 1, "req-restart-1", false)
+                .seal_after_consume(
+                    &av,
+                    &token.id,
+                    br#"{"q":1}"#.to_vec(),
+                    1,
+                    "req-restart-1",
+                    false,
+                )
                 .await;
             assert!(result.is_ok(), "Observe must never return Err");
 
@@ -6946,7 +7639,10 @@ mod averin_worker_tests {
             "exactly one grant + one use reached the fake averin post-restart: {log:?}"
         );
         assert!(log[0].starts_with("grant:"), "grant must be first: {log:?}");
-        assert!(log[1].starts_with("use:"), "use must follow its grant: {log:?}");
+        assert!(
+            log[1].starts_with("use:"),
+            "use must follow its grant: {log:?}"
+        );
 
         // The PoP-key entry (the seed — the whole point of D2) survived the restart.
         let entry = popkeys2
@@ -7183,7 +7879,14 @@ mod durable_enqueue_tests {
 
         let t0 = Instant::now();
         let result = server
-            .seal_after_consume(&av, "tok-durable", br#"{"q":1}"#.to_vec(), 2, "req-42", false)
+            .seal_after_consume(
+                &av,
+                "tok-durable",
+                br#"{"q":1}"#.to_vec(),
+                2,
+                "req-42",
+                false,
+            )
             .await;
         let elapsed = t0.elapsed();
         assert!(result.is_ok(), "Observe must never return Err");
@@ -7242,7 +7945,14 @@ mod durable_enqueue_tests {
         assert_eq!(av.metrics().dropped, 0);
 
         let result = server
-            .seal_after_consume(&av, "tok-oversize", oversize_params, 1, "req-oversize", false)
+            .seal_after_consume(
+                &av,
+                "tok-oversize",
+                oversize_params,
+                1,
+                "req-oversize",
+                false,
+            )
             .await;
         assert!(
             result.is_ok(),

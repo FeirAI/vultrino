@@ -227,6 +227,81 @@ async fn resolve_caller_id(state: &AppState, secret: &str) -> Result<String, Res
     }
 }
 
+#[derive(Debug, Clone)]
+struct ChannelIdentity {
+    tenant: String,
+    agent_label: String,
+}
+
+#[allow(clippy::result_large_err)]
+fn channel_identity(
+    agent_label: Option<String>,
+    tenant: Option<String>,
+) -> Result<ChannelIdentity, Response> {
+    let agent_label = agent_label
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::FORBIDDEN,
+                "agent_identity_required",
+                "The channel caller must be bound to an agent identity",
+            )
+        })?;
+    let tenant = tenant
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::FORBIDDEN,
+                "tenant_required",
+                "The channel caller must be bound to a tenant",
+            )
+        })?;
+    Ok(ChannelIdentity {
+        tenant,
+        agent_label,
+    })
+}
+
+/// Authenticate the narrow approval-result feed and return the caller's explicit
+/// `(tenant, agent_label)` identity. An expired (but not revoked) bearer may read
+/// results for that exact identity, matching approval polling semantics. A fresh
+/// rotated channel token normally performs the request.
+async fn resolve_caller_channel_identity(
+    state: &AppState,
+    secret: &str,
+) -> Result<ChannelIdentity, Response> {
+    if UseToken::looks_like_token(secret) {
+        let _ = state.storage.reload().await;
+        match state
+            .storage
+            .get_use_token_by_hash(&UseToken::hash(secret))
+            .await
+        {
+            Ok(Some(token)) if token.revoked => Err(error_response(
+                StatusCode::FORBIDDEN,
+                "token_revoked",
+                "Use token has been revoked",
+            )),
+            Ok(Some(token)) => channel_identity(token.agent_label, token.tenant),
+            _ => Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "Invalid use token",
+            )),
+        }
+    } else {
+        match validate_api_key(state, secret).await {
+            Ok((key, _)) => channel_identity(key.agent_label, key.tenant),
+            Err(error) => Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_api_key",
+                error,
+            )),
+        }
+    }
+}
+
 /// Execute an authenticated HTTP request
 pub async fn api_execute(
     State(state): State<AppState>,
@@ -448,6 +523,198 @@ pub async fn api_check_approval(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// `GET /api/v1/approval-results` — bounded terminal-result feed for the
+/// authenticated agent. It also recovers the narrow crash window where a human
+/// decision committed but the deciding HTTP worker died before claiming the
+/// action: approved/unexecuted rows are resumed through the same durable CAS
+/// fence before results are returned.
+pub async fn api_approval_results(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let secret = match extract_api_key(&headers) {
+        Some(secret) => secret,
+        None => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "missing_api_key",
+                "Authorization header with Bearer token required",
+            )
+        }
+    };
+    let identity = match resolve_caller_channel_identity(&state, &secret).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    if let Err(error) = state.storage.reload().await {
+        tracing::error!(%error, tenant = %identity.tenant, agent_label = %identity.agent_label,
+            "approval result feed reload failed");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            "Failed to load approval results",
+        );
+    }
+    let mut approvals = match state.storage.list_approvals().await {
+        Ok(values) => values,
+        Err(error) => {
+            tracing::error!(%error, tenant = %identity.tenant, agent_label = %identity.agent_label,
+                "approval result feed read failed");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "Failed to load approval results",
+            );
+        }
+    };
+    approvals.retain(|approval| approval_belongs_to_channel(approval, &identity));
+
+    // Best-effort recovery of decision-committed work. The claim/finalize path is
+    // durable and at-most-once, so concurrent decision/feed requests cannot run
+    // the same action twice.
+    for approval in &mut approvals {
+        if approval.status() == ApprovalStatus::Approved && !approval.executed {
+            match state
+                .server
+                .check_and_resume_approval(&approval.id, None)
+                .await
+            {
+                Ok(current) => *approval = current,
+                Err(error) => tracing::warn!(%error, approval_id = %approval.id,
+                    "approval result feed could not resume approved action; will retry"),
+            }
+        }
+    }
+
+    approvals.retain(|approval| {
+        matches!(
+            approval.status(),
+            ApprovalStatus::Denied | ApprovalStatus::Expired
+        ) || (approval.status() == ApprovalStatus::Approved && approval.executed)
+    });
+    approvals.sort_by(|a, b| {
+        b.decided_at
+            .unwrap_or(b.created_at)
+            .cmp(&a.decided_at.unwrap_or(a.created_at))
+    });
+    approvals.truncate(100);
+    let results: Vec<serde_json::Value> = approvals
+        .into_iter()
+        .map(|approval| {
+            serde_json::json!({
+                "approval_id": approval.id,
+                "tenant": approval.tenant,
+                "agent_label": approval.agent_label,
+                "status": approval.status().to_string(),
+                "summary": approval.summary,
+                "executed": approval.executed,
+                "result_status": approval.result_status,
+                "result_error": approval.result_error,
+                "decided_at": approval.decided_at,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "results": results })),
+    )
+        .into_response()
+}
+
+/// Project only currently-decidable approvals owned by the exact channel identity.
+/// This is the channel-notification view: no raw params, credentials, decision
+/// tokens, or cross-tenant rows are exposed. The product UI remains the
+/// authenticated decision surface; channel adapters receive only enough
+/// information to render a deep link.
+fn pending_approval_notifications(
+    approvals: &[crate::approval::ApprovalRequest],
+    identity: &ChannelIdentity,
+) -> Vec<serde_json::Value> {
+    let mut pending: Vec<&crate::approval::ApprovalRequest> = approvals
+        .iter()
+        .filter(|approval| {
+            approval_belongs_to_channel(approval, identity)
+                && approval.status().is_open()
+                && !approval.is_past_ttl()
+        })
+        .collect();
+    pending.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    pending.truncate(100);
+    pending
+        .into_iter()
+        .map(|approval| {
+            serde_json::json!({
+                "approval_id": approval.id,
+                "status": approval.status().to_string(),
+                "summary": approval.summary,
+                "created_at": approval.created_at,
+                "expires_at": approval.expires_at,
+            })
+        })
+        .collect()
+}
+
+fn approval_belongs_to_channel(
+    approval: &crate::approval::ApprovalRequest,
+    identity: &ChannelIdentity,
+) -> bool {
+    approval.tenant.as_deref() == Some(identity.tenant.as_str())
+        && approval.agent_label.as_deref() == Some(identity.agent_label.as_str())
+}
+
+/// `GET /api/v1/approval-notifications` — bounded pending-approval feed for the
+/// authenticated agent's channel adapter (Telegram, Slack, etc.). A rotated
+/// channel token supplies an explicit `(tenant, agent_label)` identity; rows from
+/// every other tenant or agent are excluded before serialization.
+pub async fn api_approval_notifications(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let secret = match extract_api_key(&headers) {
+        Some(secret) => secret,
+        None => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "missing_api_key",
+                "Authorization header with Bearer token required",
+            )
+        }
+    };
+    let identity = match resolve_caller_channel_identity(&state, &secret).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if let Err(error) = state.storage.reload().await {
+        tracing::error!(%error, tenant = %identity.tenant, agent_label = %identity.agent_label,
+            "approval notification feed reload failed");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            "Failed to load pending approvals",
+        );
+    }
+    let approvals = match state.storage.list_approvals().await {
+        Ok(values) => values,
+        Err(error) => {
+            tracing::error!(%error, tenant = %identity.tenant, agent_label = %identity.agent_label,
+                "approval notification feed read failed");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "Failed to load pending approvals",
+            );
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "approvals": pending_approval_notifications(&approvals, &identity),
+        })),
+    )
+        .into_response()
+}
+
 // ============================================================================
 // Approvals JSON API (A3/A4) — the admin-key surface a product aggregator drives
 // to render the approvals inbox and record human decisions. Distinct from the
@@ -491,6 +758,15 @@ pub struct ApprovalSummary {
     /// Whether the request is still open (pending/escalated) and within its TTL —
     /// i.e. a decision can still be recorded.
     pub is_open: bool,
+    /// Terminal execution outcome. These fields deliberately omit result_body:
+    /// product surfaces need to explain what happened, not receive connector data.
+    pub executed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<String>,
     /// Tenant this approval belongs to (snapshotted at open from the requesting
     /// principal's tenant); `null` = untenanted (shared, visible to every admin).
     /// Always emitted so a downstream aggregator (feir-os) can backstop-filter by
@@ -621,6 +897,10 @@ impl From<&crate::approval::ApprovalRequest> for ApprovalSummary {
             required_approvals: a.effective_required_approvals(),
             approvals_received: a.signoffs().len() as u32,
             is_open: a.status().is_open() && !a.is_past_ttl(),
+            executed: a.executed,
+            result_status: a.result_status,
+            result_error: a.result_error.clone(),
+            decided_at: a.decided_at.map(|time| time.to_rfc3339()),
             tenant: a.tenant.clone(),
             approver_kind: last.map(|s| s.approver_kind.clone()).or_else(|| {
                 if a.status().is_open() {
@@ -696,39 +976,6 @@ async fn require_tenant_scoped(admin: &AdminApiAuth) -> Result<&str, Response> {
              key must use the admin console instead.",
         )
     })
-}
-
-/// Look up the use token that would execute `approval`, so a decision response can
-/// state whether the action can still run at all (plan 103 §10h FINDING 4, layer 3).
-///
-/// Deliberately conservative in three directions:
-/// * no `use_token_id` → `NotApplicable` (a local/API-key caller needs none);
-/// * a named token that no longer EXISTS → `Unusable` (it can never execute);
-/// * a storage error → `Unknown`, never `Usable` — a blip must not manufacture a
-///   "this will run" claim.
-async fn credential_check_for(
-    state: &AppState,
-    approval: &crate::approval::ApprovalRequest,
-) -> crate::approval::CredentialCheck {
-    use crate::approval::CredentialCheck;
-    let token_id = match approval.use_token_id.as_deref() {
-        Some(id) if !id.trim().is_empty() => id,
-        _ => return CredentialCheck::NotApplicable,
-    };
-    match state.storage.get_use_token(token_id).await {
-        Ok(Some(token)) => match token.check_usable() {
-            Ok(()) => CredentialCheck::Usable,
-            Err(reason) => CredentialCheck::Unusable(reason.to_string()),
-        },
-        Ok(None) => CredentialCheck::Unusable(
-            "the credential this action would run with no longer exists".to_string(),
-        ),
-        Err(error) => {
-            tracing::error!(%error, approval_id = %approval.id,
-                "could not read the approval's use token; reporting the execution state as unknown");
-            CredentialCheck::Unknown
-        }
-    }
 }
 
 /// Require the acting admin key to be **global** (operator/root, `tenant == None`)
@@ -1159,17 +1406,30 @@ pub async fn api_decide_approval(
         .await
     {
         Ok(decided) => {
-            // FINDING 4 layer 3 (plan 103 §10h): `executed` alone cannot tell an
-            // aggregator whether it may claim the action happened. On EVERY successful
-            // grant it is false (the requester's next poll is what executes), so a
-            // product UI that keys its receipt on status+executed paints the same
-            // green "Approved. Recorded just now." for a grant that is about to run,
-            // one that will never run, and one that already failed. `execution_state`
-            // is the explicit, non-collapsing answer; `execution_error` carries the
-            // reason whenever one is known.
-            let credential = credential_check_for(&state, &decided).await;
-            let (exec_state, exec_error) =
-                crate::approval::execution_state_at_decision(&decided, &credential);
+            // A completed human grant actively resumes the durable action here.
+            // Execution no longer waits for the original agent request/poll to stay
+            // alive. A crash between decision commit and resume is recovered by the
+            // agent-scoped result feed, which retries the same at-most-once claim.
+            let decided = if decided.status() == ApprovalStatus::Approved && !decided.executed {
+                match state.server.check_and_resume_approval(&id, None).await {
+                    Ok(resumed) => resumed,
+                    Err(error) => {
+                        tracing::error!(%error, approval_id = %id,
+                            "approval committed but immediate durable resume failed; result feed will retry");
+                        decided
+                    }
+                }
+            } else {
+                decided
+            };
+
+            // The durable approval permit, not the opener's bearer, is now the
+            // execution credential. Therefore bearer expiry/rotation is not a
+            // blocked state; the actual persisted execution outcome is authoritative.
+            let (exec_state, exec_error) = crate::approval::execution_state_at_decision(
+                &decided,
+                &crate::approval::CredentialCheck::NotApplicable,
+            );
             let mut out = serde_json::json!({
                 "id": decided.id,
                 "status": decided.status().to_string(),
@@ -3521,7 +3781,10 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
         *by_status.entry(a.status().to_string()).or_default() += 1;
         // Decision latency for decided requests (approved or denied).
         if let Some(decided) = a.decided_at {
-            if matches!(a.status(), ApprovalStatus::Approved | ApprovalStatus::Denied) {
+            if matches!(
+                a.status(),
+                ApprovalStatus::Approved | ApprovalStatus::Denied
+            ) {
                 latencies_secs.push((decided - a.created_at).num_seconds().max(0));
             }
         }
@@ -4200,6 +4463,52 @@ mod tests {
             approval_rule: None,
         });
         approval
+    }
+
+    #[test]
+    fn pending_notification_projection_is_agent_scoped_and_secret_free() {
+        let own = sample_approval(crate::approval::CriticalityClass::Medium, false);
+        let mut foreign_tenant = sample_approval(crate::approval::CriticalityClass::Medium, false);
+        foreign_tenant.agent_label = own.agent_label.clone();
+        foreign_tenant.tenant = Some("other-tenant".to_string());
+        let mut foreign_agent = sample_approval(crate::approval::CriticalityClass::Medium, false);
+        foreign_agent.agent_label = Some("ep_other_agent".to_string());
+        let identity = ChannelIdentity {
+            tenant: "acme".to_string(),
+            agent_label: own.agent_label.clone().unwrap(),
+        };
+        let projected = pending_approval_notifications(
+            &[own.clone(), foreign_tenant, foreign_agent],
+            &identity,
+        );
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0]["approval_id"], own.id);
+        assert_eq!(projected[0]["status"], "pending");
+        let object = projected[0].as_object().unwrap();
+        assert_eq!(
+            object
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "approval_id",
+                "created_at",
+                "expires_at",
+                "status",
+                "summary"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+    }
+
+    #[test]
+    fn channel_identity_requires_both_tenant_and_agent_label() {
+        assert!(channel_identity(Some("agent".into()), Some("tenant".into())).is_ok());
+        assert!(channel_identity(Some("agent".into()), None).is_err());
+        assert!(channel_identity(None, Some("tenant".into())).is_err());
+        assert!(channel_identity(Some(" ".into()), Some("tenant".into())).is_err());
     }
 
     /// Pins `ApprovalSummary`'s JSON field names/values for the decide-time

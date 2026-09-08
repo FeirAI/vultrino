@@ -450,8 +450,7 @@ impl InternalHttpPlugin {
     fn validate_header_value(value: &str) -> Result<(), PluginError> {
         if value.contains('\r') || value.contains('\n') || value.contains('\0') {
             return Err(PluginError::InvalidParams(
-                "internal_http: credential header value contains a control character"
-                    .to_string(),
+                "internal_http: credential header value contains a control character".to_string(),
             ));
         }
         Ok(())
@@ -969,7 +968,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(h.get("Authorization").map(String::as_str), Some("Bearer s3cret"));
+        assert_eq!(
+            h.get("Authorization").map(String::as_str),
+            Some("Bearer s3cret")
+        );
     }
 
     /// The internal-space allowlist is the mirror image of the `http` plugin's
@@ -1000,7 +1002,7 @@ mod tests {
             "192.0.2.1", // documentation
             "224.0.0.1", // multicast
             "255.255.255.255",
-            "172.32.0.1", // just outside RFC1918
+            "172.32.0.1",  // just outside RFC1918
             "100.128.0.1", // just outside CGNAT
             "fe80::1",
             "2001:4860:4860::8888",
@@ -1068,6 +1070,9 @@ mod tests {
              allow_methods=[\"GET\"]\nallow_paths=[\"/\"]",
         )
         .expect_err("a bare '/' must be refused");
-        assert!(format!("{err}").contains("would allow EVERY path"), "got: {err}");
+        assert!(
+            format!("{err}").contains("would allow EVERY path"),
+            "got: {err}"
+        );
     }
 }

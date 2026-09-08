@@ -71,13 +71,30 @@ action did **not** run; poll the approval.
 **Errors:** `401` (bad bearer); `403 token_unusable` (revoked/expired/exhausted
 token); `400 execute_error` (policy denied, credential not found, SSRF block).
 
-### `GET /api/v1/approvals/{id}` — poll & lazily run an approved action
+### `GET /api/v1/approvals/{id}` — poll/recover an approved action
 
 Authenticate with the **same** bearer that opened the approval. On the first poll
-after a human approves, the action runs **at most once** and the result is
-returned. `status` is one of `Pending` / `Escalated` / `Approved` / `Denied` /
+after a human approves, any decision-committed action not already claimed is
+recovered **at most once** and the result is returned. `status` is one of `Pending` / `Escalated` / `Approved` / `Denied` /
 `Expired`. Errors: `401`; `403 not_authorized` / `token_revoked`;
 `404 approval_not_found`.
+
+### `GET /api/v1/approval-notifications` — pending actions for a channel adapter
+
+Authenticate with an agent-bound API key or use token carrying both `tenant` and
+`agent_label`. The response is bounded to that exact pair and contains only
+currently decidable rows: `approval_id`, `status`, `summary`, `created_at`, and
+`expires_at`. It never includes request parameters, credential material, or a
+decision capability. Telegram, Slack, and other adapters use the id to link to
+the authenticated product approval page.
+
+### `GET /api/v1/approval-results` — terminal outcomes for a channel adapter
+
+Authenticate with an agent-bound API key or use token carrying both `tenant` and
+`agent_label`. Returns up to 100 newest denied/expired outcomes and approved
+actions that have a durable execution result. The feed recovers only
+decision-committed actions for that exact pair through the same at-most-once
+claim before projecting them. Rows from other tenants or agents are excluded.
 
 ### `GET /api/v1/credentials` — list (API key, `read`)
 

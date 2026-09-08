@@ -5,9 +5,9 @@
 use super::averin_deadletter::AverinDeadLetterStore;
 use super::averin_queue::AverinQueue;
 use super::outbox_store::OutboxStore;
-use super::popkey_store::PopKeyStore;
 #[cfg(test)]
 use super::popkey_store::PopKeyEntry;
+use super::popkey_store::PopKeyStore;
 use super::{ExecutionClaim, IdempotencyState, StorageBackend, StorageError};
 use crate::approval::{tenant_may_act, ApprovalRequest};
 use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
@@ -352,7 +352,10 @@ impl AverinStores {
         strict: bool,
     ) -> Result<Option<Self>, StorageError> {
         let queue_dir_for_err = averin_queue_dir(vault);
-        let queue = match open_averin_queue_blocking(averin_queue_dir(vault), Arc::clone(master_key)) {
+        let queue = match open_averin_queue_blocking(
+            averin_queue_dir(vault),
+            Arc::clone(master_key),
+        ) {
             Ok(q) => q,
             Err(StorageError::AverinQueueBusy(dir)) if strict => {
                 // Rekey path: NEVER degrade a busy queue to `Ok(None)` — that is exactly the silent
@@ -3234,9 +3237,7 @@ mod tests {
 
         // Recent terminal: decided just now, executed, has a body → NOT prunable (inside window).
         let mut recent = mk_approval("recent");
-        recent
-            .approve(Decision::new("test", "bob@corp"))
-            .unwrap();
+        recent.approve(Decision::new("test", "bob@corp")).unwrap();
         recent.executed = true;
         recent.result_status = Some(200);
         recent.result_body = Some("y".repeat(2000));
@@ -3522,7 +3523,9 @@ mod tests {
             let storage = FileStorage::new_with_averin(&path2, &password, true)
                 .await
                 .unwrap();
-            let queue = storage.averin_queue().expect("queue constructed when enabled");
+            let queue = storage
+                .averin_queue()
+                .expect("queue constructed when enabled");
             let popkeys = storage
                 .averin_popkeys()
                 .expect("popkeys constructed when enabled");
@@ -4031,7 +4034,9 @@ mod tests {
         assert!(!path.with_file_name("averin-popkeys.enc").exists());
         assert!(!path.with_file_name("averin-deadletter.enc").exists());
         assert!(!path.with_file_name("averin-popkeys.enc.rekey.tmp").exists());
-        assert!(!path.with_file_name("averin-deadletter.enc.rekey.tmp").exists());
+        assert!(!path
+            .with_file_name("averin-deadletter.enc.rekey.tmp")
+            .exists());
 
         // The vault + outbox still rotate and reopen normally under the new password.
         let reopened = FileStorage::new(&path, &new_pw).await.unwrap();
@@ -4174,7 +4179,9 @@ mod tests {
 
         // The OLD password no longer opens the durable stores; the NEW password decrypts all three.
         assert!(
-            FileStorage::new_with_averin(&path, &old_pw, true).await.is_err(),
+            FileStorage::new_with_averin(&path, &old_pw, true)
+                .await
+                .is_err(),
             "the old password must fail after a full three-store rekey"
         );
         let reopened = FileStorage::new_with_averin(&path, &new_pw, true)
@@ -4198,7 +4205,13 @@ mod tests {
             "the popkey entry survived the rekey (decryptable under the new key)"
         );
         assert_eq!(
-            reopened.averin_deadletter().unwrap().list().await.unwrap().len(),
+            reopened
+                .averin_deadletter()
+                .unwrap()
+                .list()
+                .await
+                .unwrap()
+                .len(),
             1,
             "the dead-letter quarantine record survived the rekey"
         );
@@ -4300,9 +4313,9 @@ mod tests {
         // under the NEW key), never a silent brick and never a partial open.
         let reopen_result = FileStorage::new_with_averin(&path, &old_pw, true).await;
         match reopen_result {
-            Ok(_) => panic!(
-                "opening averin under a stale key must fail closed, never silently succeed"
-            ),
+            Ok(_) => {
+                panic!("opening averin under a stale key must fail closed, never silently succeed")
+            }
             Err(err @ StorageError::AverinStaleKey(_)) => {
                 let rendered = err.to_string();
                 assert!(
@@ -4310,9 +4323,9 @@ mod tests {
                     "the stale-key error must point the operator at re-running rekey: {rendered}"
                 );
             }
-            Err(other) => panic!(
-                "expected a fail-closed StorageError::AverinStaleKey, got: {other:?}"
-            ),
+            Err(other) => {
+                panic!("expected a fail-closed StorageError::AverinStaleKey, got: {other:?}")
+            }
         }
 
         // Recovery (documented residual, mirrors the pre-088 two-file note): re-running rekey to

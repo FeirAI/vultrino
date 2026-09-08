@@ -107,6 +107,7 @@ fn client(base_url: &str, mode: AverinMode) -> AverinClient {
         max_inflight_seals: 256,
         max_seal_params_bytes: 128 * 1024,
         durable: false,
+        d8_complete_evidence: false,
     })
     .expect("client builds")
     .expect("client is Some when enabled")
@@ -132,7 +133,7 @@ async fn sealed_use_record_appears_in_averin_export() {
         .expect("grant seals (byte-exact grant PoP accepted by real averin)");
     // execute -> POST /v2/use (consume-before-act one-phase receipt)
     let use_record_id = client
-        .seal_use(token_id, br#"{"q":"select 1"}"#)
+        .seal_use(token_id, br#"{"q":"select 1"}"#, 1, "spike-0001")
         .await
         .expect("use seals (byte-exact use PoP + params commitment accepted by real averin)");
     eprintln!("[086] sealed use record_id = {use_record_id}");
@@ -195,17 +196,26 @@ async fn measure_added_execute_latency() {
 
     const N: usize = 50;
     // warm up (first request pays connection setup)
-    client.seal_grant("vut_warm", SCOPE, ACTION, Some(1)).await.unwrap();
-    let _ = client.seal_use("vut_warm", b"{}").await;
+    client
+        .seal_grant("vut_warm", SCOPE, ACTION, Some(1))
+        .await
+        .unwrap();
+    let _ = client.seal_use("vut_warm", b"{}", 1, "warm-0001").await;
 
     let mut samples: Vec<Duration> = Vec::with_capacity(N);
     for i in 0..N {
         let tid = format!("vut_lat_{i:04}");
         // single_operation is single-use, so each measured execute needs a fresh
         // grant (the grant seal is the mint-path cost, excluded from the measure).
-        client.seal_grant(&tid, SCOPE, ACTION, Some(1)).await.unwrap();
+        client
+            .seal_grant(&tid, SCOPE, ACTION, Some(1))
+            .await
+            .unwrap();
         let t0 = Instant::now();
-        client.seal_use(&tid, br#"{"q":"select 1"}"#).await.unwrap();
+        client
+            .seal_use(&tid, br#"{"q":"select 1"}"#, 1, &format!("lat-{i:04}"))
+            .await
+            .unwrap();
         samples.push(t0.elapsed());
     }
     samples.sort();
@@ -224,7 +234,11 @@ async fn measure_added_execute_latency() {
 
     // A generous sanity ceiling so a pathological regression fails the run; the
     // real go/no-go is the recorded numbers + the ingestMu argument, not this bound.
-    assert!(p(0.99) < Duration::from_millis(500), "p99 seal latency unexpectedly high: {:?}", p(0.99));
+    assert!(
+        p(0.99) < Duration::from_millis(500),
+        "p99 seal latency unexpectedly high: {:?}",
+        p(0.99)
+    );
 }
 
 /// Plan 088 Step 4 (D5/D5b/D5c), against a REAL averin: reproduces the EXACT wire contract the
@@ -297,31 +311,32 @@ async fn durable_worker_shape_accepts_bounded_reuse_sequence_and_dedups_retry() 
 
     // Build the use #1 body — mirrors `deliver_averin_use`'s exact rebuild from STORED
     // nonce/params_nonce/request_id/use_sequence_number.
-    let build_use_body = |params: &[u8], nonce: &str, params_nonce: &str, request_id: &str, seq: u32| {
-        let credential_binding = pop::credential_binding(&capability).unwrap();
-        let params_commitment = pop::params_commitment(params, params_nonce).unwrap();
-        let challenge = pop::use_pop_challenge(
-            &grant_id,
-            RESOURCE_ID,
-            ACTION,
-            &params_commitment,
-            &credential_binding,
-            nonce,
-        );
-        let use_sig = keypair.sign_b64(&challenge);
-        serde_json::json!({
-            "idempotency_key": format!("{token_id}:use:{request_id}"),
-            "project_id": PROJECT,
-            "session_id": SESSION,
-            "capability": capability,
-            "use_sig": use_sig,
-            "action": ACTION,
-            "params": String::from_utf8_lossy(params),
-            "nonce": nonce,
-            "params_nonce": params_nonce,
-            "use_sequence_number": seq,
-        })
-    };
+    let build_use_body =
+        |params: &[u8], nonce: &str, params_nonce: &str, request_id: &str, seq: u32| {
+            let credential_binding = pop::credential_binding(&capability).unwrap();
+            let params_commitment = pop::params_commitment(params, params_nonce).unwrap();
+            let challenge = pop::use_pop_challenge(
+                &grant_id,
+                RESOURCE_ID,
+                ACTION,
+                &params_commitment,
+                &credential_binding,
+                nonce,
+            );
+            let use_sig = keypair.sign_b64(&challenge);
+            serde_json::json!({
+                "idempotency_key": format!("{token_id}:use:{request_id}"),
+                "project_id": PROJECT,
+                "session_id": SESSION,
+                "capability": capability,
+                "use_sig": use_sig,
+                "action": ACTION,
+                "params": String::from_utf8_lossy(params),
+                "nonce": nonce,
+                "params_nonce": params_nonce,
+                "use_sequence_number": seq,
+            })
+        };
 
     let params = br#"{"q":"select 1"}"#;
     let params_nonce_1 = pop::random_params_nonce_hex();

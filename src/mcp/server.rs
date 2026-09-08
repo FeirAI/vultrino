@@ -63,7 +63,8 @@ fn scrub_plaintext_secrets(input: &str) -> String {
             lower.find("vwa_").map(|i| (i, 4)),
             lower.find("bearer ").map(|i| (i, 7)),
         ];
-        let Some((idx, prefix_len)) = candidates.into_iter().flatten().min_by_key(|(i, _)| *i) else {
+        let Some((idx, prefix_len)) = candidates.into_iter().flatten().min_by_key(|(i, _)| *i)
+        else {
             out.push_str(rest);
             break;
         };
@@ -71,7 +72,9 @@ fn scrub_plaintext_secrets(input: &str) -> String {
         out.push_str(REDACTED);
         rest = &rest[idx + prefix_len..];
         let end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '=')))
+            .find(|c: char| {
+                !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '='))
+            })
             .unwrap_or(rest.len());
         rest = &rest[end..];
     }
@@ -348,6 +351,17 @@ impl McpServer {
             "approved" => "running",
             _ => "unknown",
         };
+        let action_result = if execution_status == "completed" {
+            text.split_once("\nResult:\n")
+                .and_then(|(_, tail)| {
+                    tail.split_once("\n\napproval_id:")
+                        .map(|(json, _)| json)
+                        .or(Some(tail))
+                })
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json.trim()).ok())
+        } else {
+            None
+        };
         Some(json!({
             "type": "feir.approval.v1",
             "approval_id": approval_id,
@@ -355,6 +369,7 @@ impl McpServer {
             "expires_at": expires_at,
             "progress": { "completed": completed, "required": required },
             "execution_status": execution_status,
+            "result": action_result,
             "proof_reference": null,
             "execute_at_most_once": true
         }))
@@ -1430,13 +1445,28 @@ mod tests {
             }
         }"#;
         let out = sanitize_log_str(raw);
-        assert!(!out.contains("vk_live_secret"), "api_key must be redacted: {out}");
-        assert!(!out.contains("upstream-secret"), "Authorization header must be redacted: {out}");
-        assert!(!out.contains("vut_abc123"), "body secret prefix must be scrubbed: {out}");
+        assert!(
+            !out.contains("vk_live_secret"),
+            "api_key must be redacted: {out}"
+        );
+        assert!(
+            !out.contains("upstream-secret"),
+            "Authorization header must be redacted: {out}"
+        );
+        assert!(
+            !out.contains("vut_abc123"),
+            "body secret prefix must be scrubbed: {out}"
+        );
         assert!(out.contains(REDACTED), "redaction marker expected: {out}");
-        assert!(out.contains("https://example.com"), "non-secret fields must survive: {out}");
+        assert!(
+            out.contains("https://example.com"),
+            "non-secret fields must survive: {out}"
+        );
         // Header values are redacted; keys remain so logs stay diagnosable.
-        assert!(out.contains("Authorization"), "header names should remain: {out}");
+        assert!(
+            out.contains("Authorization"),
+            "header names should remain: {out}"
+        );
     }
 
     #[test]
@@ -1468,6 +1498,28 @@ mod tests {
         assert_eq!(structured["type"], "feir.approval.v1");
         assert_eq!(structured["approval_id"], "appr_123");
         assert_eq!(structured["execute_at_most_once"], true);
+        assert!(structured["result"].is_null());
+    }
+
+    #[test]
+    fn completed_approval_has_sanitized_result_in_structured_content() {
+        let content = vec![ToolContent::Text {
+            text: concat!(
+                "Approved and the action has now run.\n",
+                "Status: 200\n\n",
+                "Result:\n",
+                "{\"event_id\":\"event-canary\",\"etag\":\"etag-canary\"}\n\n",
+                "approval_id: appr_456\n",
+                "status: approved\n",
+                "expires: 2030-01-01T00:00:00Z\n",
+                "progress: 1/1"
+            )
+            .to_string(),
+        }];
+        let structured = McpServer::structured_approval_content(&content).unwrap();
+        assert_eq!(structured["execution_status"], "completed");
+        assert_eq!(structured["result"]["event_id"], "event-canary");
+        assert_eq!(structured["result"]["etag"], "etag-canary");
     }
 
     #[test]

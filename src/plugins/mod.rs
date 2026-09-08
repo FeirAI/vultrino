@@ -15,7 +15,9 @@ mod http;
 pub mod installer;
 mod internal_http;
 pub mod loader;
+mod marketing;
 mod postgres;
+mod solo;
 mod ssh;
 pub mod types;
 #[cfg(feature = "wasm-plugins")]
@@ -31,7 +33,9 @@ pub use internal_http::{
     InternalHttpParams, InternalHttpPlugin, META_ALLOW_METHODS, META_DESTINATION, META_PATH_PREFIX,
 };
 pub use loader::{PluginLoader, PluginRegistryExt};
+pub use marketing::{BufferPlugin, SheetsPlugin};
 pub use postgres::PostgresPlugin;
+pub use solo::SoloPlugin;
 pub use ssh::SshPlugin;
 pub use types::{
     ActionDefinition, ActionParameterDefinition, CredentialFieldDefinition,

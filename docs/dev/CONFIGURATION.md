@@ -275,34 +275,24 @@ action_pattern     = "*"
 class              = "high"
 ```
 
+Webhook approval payloads include the requesting `agent_label`. This lets a trusted
+Slack, Telegram, or email bridge route approvals from several specialist agents into
+one owner-facing lead conversation without holding their use tokens. Treat the webhook
+as sensitive: first-request payloads also carry one-time decision links.
+
 **Validated at load (hard errors):** a Telegram/webhook notifier without a named
 `oob_approver_identity` is rejected (an out-of-band verdict would be
 unattributable — separation of duty requires an attributable approver); an SLA
 with a zero window, a duplicate SLA class, an unknown criticality class, or a
 malformed criticality-rule glob are all rejected.
 
-**`ttl_secs` and the SLA windows are a CEILING, not a promise (plan 103 §10h
-FINDING 4).** The real deadline stamped on a request is
-`min(class SLA total, the presenting use token's remaining life)`. An approval must
-not be offerable beyond the life of the credential that would execute it: govder
-compiles an L3·High use token with a **900s** TTL, so with `ttl_secs = 3600` the
-approval window used to outlive the credential by 4× — a human decided inside the
-advertised window and the action was then refused at resume with `use token has
-expired`, i.e. an approver signed an irreversible money action that never ran.
-
-Consequences an operator should expect:
-- `expires_at` (and therefore every notifier link, approver card and agent poll) may
-  be **shorter** than `ttl_secs` / the class SLA. That is the credential binding, not
-  a misconfiguration; the clamp only ever shrinks the window, never extends it.
-- Both SLA phases are scaled proportionally, so a clamped request still escalates
-  before it expires (a `high` request clamped from 900+900 to 900 total escalates at
-  450s).
-- A request presenting a credential with **under a second** of life left is
-  **refused** rather than opened: nothing executes, and no approver is invited to
-  authorize an action that is already impossible. Retry with a freshly issued
-  credential.
-- To genuinely lengthen an approval window, lengthen the CREDENTIAL (govder's
-  autonomy/risk scope table), not `ttl_secs`.
+**`ttl_secs` and per-class SLA windows govern human review, independently of bearer
+TTL.** The presenting use token authenticates and scopes approval-open, then may
+expire or rotate. A completed human recipe authorizes the frozen request through a
+durable one-shot permit. Immediately before dispatch Vultrino revalidates the live
+credential revision and tenant, capability declaration, Govder approval recipe,
+and current policy/kill state. This lets operators configure multi-day review
+windows without issuing multi-day bearer credentials.
 
 **`reauth_interval_secs` (continuous re-auth / execute-by window):** when set to a
 positive value, an approved action must run within that many seconds of the

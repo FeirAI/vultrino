@@ -25,7 +25,7 @@ Three auth modes across the surface:
 
 | Surface | Auth | Header |
 |---------|------|--------|
-| JSON API: execute, approval poll, list credentials | API key **or** use token | `Authorization: Bearer vk_…` or `Authorization: Bearer vut_…` |
+| JSON API: execute, approval poll, agent channel feeds, list credentials | API key **or** use token | `Authorization: Bearer vk_…` or `Authorization: Bearer vut_…` |
 | JSON API: admin (policies, tokens, roles, credentials write, halt, sessions, metrics, events, workload grants) | API key with `admin` permission only — **use tokens rejected** | `Authorization: Bearer vk_admin…` |
 | Metered LLM proxy (`POST /llm…`) | API key **or** use token (the same bearer used for `/mcp`) | `Authorization: Bearer vk_…` / `vut_…` |
 | Workload token exchange (`POST /api/v1/workload/exchange`) | a signed `vwa_` workload assertion — **not** an API key | `Authorization: Bearer vwa_…` |
@@ -114,12 +114,12 @@ the request carries its header, the resolved subject refines the principal.
 `400 execute_error` (policy denied, credential not found, SSRF block, plugin error
 — the message carries the reason).
 
-### `GET /api/v1/approvals/{id}` — poll & lazily run an approved action
+### `GET /api/v1/approvals/{id}` — poll/recover an approved action
 
 Authenticate with the **same** bearer that opened the approval (a caller may only
-poll its own approvals; ownership is checked before any execution). On the first
-poll after a human approves, the action runs **at most once** and the result is
-returned.
+poll its own approvals; ownership is checked before any execution). A completed
+decision actively runs the action. Polling recovers the narrow decision-committed
+crash window through the same durable **at-most-once** claim and returns the result.
 
 **Response `200`** carries `approval_id`, `status` (`Pending` | `Escalated` |
 `Approved` | `Denied` | `Expired`), `summary`, `executed`, and a per-status
@@ -140,6 +140,38 @@ Dual-control (M-of-N) progress (`required_approvals`, `approvals_received`,
 
 **Errors:** `401` (missing/invalid bearer); `403 not_authorized` (different
 principal); `403 token_revoked`; `404 approval_not_found`.
+
+### `GET /api/v1/approval-notifications` — agent-scoped pending feed
+
+This is the narrow input for Telegram, Slack, and similar channel adapters.
+Authentication must resolve to an explicit `(tenant, agent_label)` pair. The
+channel API key or use token must carry both fields. Only that tenant-agent
+pair's open, non-expired approvals are returned, newest first, with a limit of 100:
+
+```json
+{
+  "approvals": [{
+    "approval_id": "appr_…",
+    "status": "pending",
+    "summary": "Append LinkedIn draft",
+    "created_at": "2026-08-20T10:00:00Z",
+    "expires_at": "2026-08-27T10:00:00Z"
+  }]
+}
+```
+
+The projection deliberately omits request parameters, credential material, and
+decision tokens. A channel adapter should link `approval_id` to the authenticated
+product UI; the channel message itself does not authorize a decision.
+
+### `GET /api/v1/approval-results` — agent-scoped terminal feed
+
+Returns up to 100 newest denied/expired outcomes and approved actions with a
+durable execution result for the authenticated `(tenant, agent_label)` pair.
+Before returning, approved but unexecuted rows belonging to that exact pair are
+recovered through the same durable at-most-once claim used by the decision route.
+This allows a channel adapter to deliver the result after process restarts and
+independently of the original request bearer.
 
 ### `GET /api/v1/credentials` — list (API key, `read`)
 
@@ -599,6 +631,16 @@ The reduced, machine-friendly projection of an approval for the JSON list API
 | `veto_until` | string? | RFC-3339 end of the delegate-decision veto window, when open. |
 | `risk_tier` | string | Govder risk tier (`Low`\|`Medium`\|`High`\|`Extreme`) from the same mapping the delegate-decide D3 floor evaluates against. Always emitted. |
 | `irreversible` | bool | Trusted irreversibility stamp (D3 floor input). Always emitted. |
+
+### Approval notifier webhook
+
+The configured `[approvals.webhook]` receives `approval.requested` and
+`approval.escalated` JSON. Its nested `approval` object includes `id`, `status`,
+`summary`, `agent_label`, `credential`, `action`, `criticality`, `requested_by`,
+timestamps, and `tenant`. `agent_label` is the stable requesting-agent identity a
+trusted channel router uses to attribute a specialist request without receiving that
+specialist's use token. The `links` object contains `panel_url` and, only for the first
+request notification, the one-time approve/deny URLs.
 
 ### Event types (`src/outbox.rs`)
 

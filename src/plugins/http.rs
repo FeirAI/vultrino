@@ -429,7 +429,7 @@ impl HttpPlugin {
     /// Ensure we have a valid access token, refreshing if needed
     ///
     /// Returns the access token to use and optionally updated credential data
-    async fn ensure_valid_token(
+    pub(crate) async fn ensure_valid_token(
         &self,
         cred_data: &CredentialData,
     ) -> Result<(String, Option<CredentialData>), PluginError> {

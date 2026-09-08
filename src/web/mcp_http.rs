@@ -33,8 +33,11 @@
 //! the token that scopes it.
 //!
 //! ## Transport auth gate vs. inner per-method semantics
-//! The transport rejects a **missing / unknown / revoked / expired** token with
-//! `401` before any dispatch (a bad token never reaches the handler). An
+//! The transport rejects a **missing / unknown / revoked** token with `401`
+//! before any dispatch (a bad token never reaches the handler). An expired token
+//! is rejected too, except for the exact read-only `check_approval` call needed
+//! to retrieve the durable result of an approval that may have waited longer
+//! than the token lifetime. An
 //! *exhausted* single-use token is deliberately **not** rejected here: the inner
 //! handler is read-vs-execute aware — `tools/list` (a read) still works with an
 //! exhausted token, while `tools/call` consumes through `execute_gated` and
@@ -63,7 +66,7 @@ enum BearerGate {
     /// single-use token still passes the gate so `tools/list` works; the inner
     /// `tools/call` fails closed on its own).
     Ok,
-    /// Reject with `401` — missing, unknown, revoked, or expired.
+    /// Reject with `401` — missing, unknown, revoked, or disallowed expiry.
     Reject(&'static str),
 }
 
@@ -82,7 +85,11 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
 /// inner handler is read/execute aware); any other secret is validated as an API
 /// key. The token is **not** consumed here — consumption stays in
 /// `execute_gated`, exactly as on stdio.
-async fn gate_bearer(state: &AppState, secret: &str) -> BearerGate {
+async fn gate_bearer(
+    state: &AppState,
+    secret: &str,
+    allow_expired_approval_poll: bool,
+) -> BearerGate {
     if UseToken::looks_like_token(secret) {
         // Reload so a token minted by another process (the admin API mint flow,
         // i.e. govder's provisioner) is visible.
@@ -96,14 +103,15 @@ async fn gate_bearer(state: &AppState, secret: &str) -> BearerGate {
             Ok(None) => return BearerGate::Reject("unknown use token"),
             Err(_) => return BearerGate::Reject("storage error resolving use token"),
         };
-        // Revoked / expired are hard rejects at the boundary (a revoked token is
-        // the W2 kill leg — it must never dispatch). An exhausted single-use
-        // token still authenticates: `tools/list` is a read, and `tools/call`
-        // fails closed inside execute_gated.
+        // Revocation is always a hard reject (the W2 kill leg). Expiry is also a
+        // hard reject except for the exact read-only check_approval operation:
+        // an approval can intentionally outlive the use-token that opened it.
+        // The inner handler still enforces ownership before revealing or
+        // resuming anything. Exhaustion is handled by the same read/execute split.
         if token.revoked {
             return BearerGate::Reject("use token has been revoked");
         }
-        if token.is_expired() {
+        if token.is_expired() && !allow_expired_approval_poll {
             return BearerGate::Reject("use token has expired");
         }
         BearerGate::Ok
@@ -297,6 +305,14 @@ fn request_key(secret: &str, id: &serde_json::Value) -> String {
     format!("{}:{}", UseToken::hash(secret), id)
 }
 
+fn is_approval_status_poll(message: &serde_json::Value) -> bool {
+    message.get("method").and_then(|value| value.as_str()) == Some("tools/call")
+        && message
+            .pointer("/params/name")
+            .and_then(|value| value.as_str())
+            == Some("check_approval")
+}
+
 async fn abort_tracked_request(
     requests: &tokio::sync::RwLock<std::collections::HashMap<String, tokio::task::AbortHandle>>,
     key: &str,
@@ -314,8 +330,9 @@ async fn abort_tracked_request(
 /// Authenticates the caller via the `Authorization: Bearer …` header, scopes the
 /// call to that principal by injecting the header token into the JSON-RPC body,
 /// and dispatches through the SAME MCP handler used by stdio. A missing /
-/// invalid / revoked / expired token is rejected `401` BEFORE any dispatch — it
-/// is never bypassed.
+/// invalid / revoked token is rejected `401` BEFORE any dispatch. Expired
+/// tokens are accepted only for the exact read-only `check_approval` operation,
+/// whose handler rechecks ownership and revocation.
 pub async fn mcp_jsonrpc(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -365,7 +382,10 @@ pub async fn mcp_jsonrpc(
             )
         }
     };
-    if let BearerGate::Reject(reason) = gate_bearer(&state, &secret).await {
+    let allow_expired_approval_poll = is_approval_status_poll(&message);
+    if let BearerGate::Reject(reason) =
+        gate_bearer(&state, &secret, allow_expired_approval_poll).await
+    {
         return unauthorized(id, reason);
     }
 

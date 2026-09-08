@@ -35,12 +35,7 @@ impl WebSecurityStartup {
         &self.vultrino_config
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        crate::config::Config,
-        workload_exchange::WorkloadVerifier,
-    ) {
+    pub(crate) fn into_parts(self) -> (crate::config::Config, workload_exchange::WorkloadVerifier) {
         (self.vultrino_config, self.workload_verifier)
     }
 }
@@ -71,9 +66,7 @@ pub fn validate_security_startup(
 
     let workload_verifier = workload_exchange::WorkloadVerifier::from_env();
     workload_verifier.startup_result().map_err(|message| {
-        format!(
-            "VULTRINO_WORKLOAD_EXCHANGE_ENABLED requires a valid startup verifier: {message}"
-        )
+        format!("VULTRINO_WORKLOAD_EXCHANGE_ENABLED requires a valid startup verifier: {message}")
     })?;
 
     Ok(WebSecurityStartup {

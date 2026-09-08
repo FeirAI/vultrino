@@ -267,7 +267,11 @@ impl SegmentWriter {
 /// `<index>.delta` or `<index>.snapshot` — a fixed-width decimal index so lexical and numeric sort
 /// agree (directory listings, `ls`, come back in replay order).
 fn segment_name(index: u64, is_snapshot: bool) -> String {
-    format!("{:020}.{}", index, if is_snapshot { "snapshot" } else { "delta" })
+    format!(
+        "{:020}.{}",
+        index,
+        if is_snapshot { "snapshot" } else { "delta" }
+    )
 }
 
 /// Parse a segment filename back into `(index, is_snapshot)`; `None` for anything else in the
@@ -450,7 +454,11 @@ fn replay_segment(path: &Path, key: &MasterKey) -> Result<Vec<Delta>, StorageErr
 
 /// Apply one [`Delta`] to the live in-memory state — shared by replay (folding a whole segment) and
 /// live operation (applying exactly one delta right after its commit is confirmed durable).
-fn apply_delta(cache: &mut OutboxCache, resolved: &mut HashMap<String, ResolvedGrant>, delta: Delta) {
+fn apply_delta(
+    cache: &mut OutboxCache,
+    resolved: &mut HashMap<String, ResolvedGrant>,
+    delta: Delta,
+) {
     match delta {
         Delta::Append(event) => {
             cache.outbox_seq = cache.outbox_seq.max(event.sequence);
@@ -499,7 +507,13 @@ fn apply_delta(cache: &mut OutboxCache, resolved: &mut HashMap<String, ResolvedG
             grant_id,
             capability,
         } => {
-            resolved.insert(token_id, ResolvedGrant { grant_id, capability });
+            resolved.insert(
+                token_id,
+                ResolvedGrant {
+                    grant_id,
+                    capability,
+                },
+            );
         }
     }
 }
@@ -634,9 +648,9 @@ impl Writer {
     fn run(shared: Arc<WriterShared>, dir: PathBuf, mut segment: SegmentWriter) {
         loop {
             let mut q = shared.queue.lock();
-            shared
-                .cv
-                .wait_while(&mut q, |q| q.is_empty() && !shared.shutdown.load(Ordering::Acquire));
+            shared.cv.wait_while(&mut q, |q| {
+                q.is_empty() && !shared.shutdown.load(Ordering::Acquire)
+            });
             if q.is_empty() {
                 // Only reachable via shutdown with nothing left queued.
                 return;
@@ -663,12 +677,9 @@ impl Writer {
                 continue;
             }
             let outcome = match &pj.job {
-                WriteJob::Data(frame) => Self::write_and_maybe_roll(
-                    segment,
-                    dir,
-                    frame,
-                    &mut dirty_since_fsync,
-                ),
+                WriteJob::Data(frame) => {
+                    Self::write_and_maybe_roll(segment, dir, frame, &mut dirty_since_fsync)
+                }
                 WriteJob::Roll => Self::force_roll(segment, dir, &mut dirty_since_fsync),
             };
             match outcome {
@@ -915,10 +926,7 @@ fn acquire_owner_lock(dir: &Path) -> Result<std::fs::File, StorageError> {
     // rustix exposes the OS operation through a safe OwnedFd/BorrowedFd API, so
     // the library can enforce `forbid(unsafe_code)` without weakening the
     // process-lifetime advisory-lock semantics.
-    match rustix::fs::flock(
-        &file,
-        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-    ) {
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(file),
         Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
             Err(StorageError::AverinQueueBusy(dir.display().to_string()))
@@ -1221,8 +1229,13 @@ impl AverinQueue {
         if before.delivery != DeliveryState::Pending {
             return Ok(false);
         }
-        let (dead_lettered, dirty) =
-            record_delivery_transition(&mut mem.cache.outbox, sequence, success, error, max_attempts);
+        let (dead_lettered, dirty) = record_delivery_transition(
+            &mut mem.cache.outbox,
+            sequence,
+            success,
+            error,
+            max_attempts,
+        );
         debug_assert!(dirty, "a Pending event always transitions");
 
         let after = mem
@@ -1597,7 +1610,10 @@ impl AverinQueue {
     /// the next time this directory is opened — mirrors the spike's proven "prepare a full new
     /// generation, switch one pointer, GC the old generation after" protocol (plan 088's header,
     /// INCREMENT-3). On any error the live queue is left completely untouched (fail-closed).
-    pub(super) fn rekey_prepare(&self, new_key: &MasterKey) -> Result<QueueRekeyStaged, StorageError> {
+    pub(super) fn rekey_prepare(
+        &self,
+        new_key: &MasterKey,
+    ) -> Result<QueueRekeyStaged, StorageError> {
         let mem = self.mem.lock();
         let snapshot = QueueSnapshot {
             cache: mem.cache.clone(),
@@ -1642,7 +1658,10 @@ impl AverinQueue {
                 .map_err(|e| StorageError::Io(e.into_error()))?
                 .sync_all()?;
         }
-        Ok(QueueRekeyStaged { tmp_path, final_path })
+        Ok(QueueRekeyStaged {
+            tmp_path,
+            final_path,
+        })
     }
 
     /// Commit the queue's half of an offline vault re-key (D8): atomically rename the prepared
@@ -1685,9 +1704,15 @@ mod tests {
     fn append_replay_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let q = queue(dir.path());
-        let s1 = q.append("tok-a", "averin.use", serde_json::json!({"n": 1})).unwrap();
-        let s2 = q.append("tok-b", "averin.use", serde_json::json!({"n": 2})).unwrap();
-        let s3 = q.append("tok-a", "averin.use", serde_json::json!({"n": 3})).unwrap();
+        let s1 = q
+            .append("tok-a", "averin.use", serde_json::json!({"n": 1}))
+            .unwrap();
+        let s2 = q
+            .append("tok-b", "averin.use", serde_json::json!({"n": 2}))
+            .unwrap();
+        let s3 = q
+            .append("tok-a", "averin.use", serde_json::json!({"n": 3}))
+            .unwrap();
         assert_eq!((s1, s2, s3), (1, 2, 3));
         drop(q);
 
@@ -1699,7 +1724,9 @@ mod tests {
         assert_eq!(seen, StdHashSet::from([1, 2]));
 
         // A new append after reopen continues monotonically, no seq reuse.
-        let s4 = q2.append("tok-c", "averin.use", serde_json::json!({})).unwrap();
+        let s4 = q2
+            .append("tok-c", "averin.use", serde_json::json!({}))
+            .unwrap();
         assert_eq!(s4, 4);
     }
 
@@ -1761,13 +1788,25 @@ mod tests {
         // *claim*, not this peek. So both subjects show up, each at the event the crashed process's
         // last durable state implies.
         let deliverable = q2.deliverable(10);
-        assert_eq!(deliverable.len(), 2, "A's 2nd event + B's still-pending (backed off) event");
+        assert_eq!(
+            deliverable.len(),
+            2,
+            "A's 2nd event + B's still-pending (backed off) event"
+        );
         let by_subject: std::collections::HashMap<&str, u64> = deliverable
             .iter()
             .map(|e| (e.subject.as_str(), e.sequence))
             .collect();
-        assert_eq!(by_subject.get("A"), Some(&3), "A's head advanced past the delivered seq 1");
-        assert_eq!(by_subject.get("B"), Some(&2), "B's failed attempt is still Pending, just leased");
+        assert_eq!(
+            by_subject.get("A"),
+            Some(&3),
+            "A's head advanced past the delivered seq 1"
+        );
+        assert_eq!(
+            by_subject.get("B"),
+            Some(&2),
+            "B's failed attempt is still Pending, just leased"
+        );
 
         // The recovered map matches exactly what was committed before the kill: 3 events total, `a`
         // durably Delivered, `b` durably recorded as one failed attempt (Pending, backoff lease set).
@@ -1778,7 +1817,10 @@ mod tests {
         let b_ev = all.iter().find(|e| e.sequence == b).unwrap();
         assert_eq!(b_ev.delivery, DeliveryState::Pending);
         assert_eq!(b_ev.attempts, 1);
-        assert!(b_ev.leased_until.is_some(), "the backoff lease survived the kill+reopen");
+        assert!(
+            b_ev.leased_until.is_some(),
+            "the backoff lease survived the kill+reopen"
+        );
     }
 
     #[test]
@@ -1821,7 +1863,11 @@ mod tests {
 
         drop(q);
         let q2 = reopen(dir.path());
-        assert_eq!(q2.all_events().len(), 20, "all 20 events survive compaction");
+        assert_eq!(
+            q2.all_events().len(),
+            20,
+            "all 20 events survive compaction"
+        );
         assert_eq!(
             q2.resolved_grant("tok-1"),
             Some(("grant-1".to_string(), "cap-1".to_string()))
@@ -1853,7 +1899,10 @@ mod tests {
             q.append("subj", "t", serde_json::json!({"pad": big, "n": n}))
                 .unwrap();
             n += 1;
-            assert!(n < 10_000, "should have rolled well before this many records");
+            assert!(
+                n < 10_000,
+                "should have rolled well before this many records"
+            );
         }
         drop(q);
         let q2 = reopen(dir.path());
@@ -1911,8 +1960,12 @@ mod tests {
             let mut lat = Vec::with_capacity(count);
             for i in 0..count {
                 let t0 = Instant::now();
-                q.append("bench", "t", serde_json::json!({"solo": counter_start + i as u64}))
-                    .unwrap();
+                q.append(
+                    "bench",
+                    "t",
+                    serde_json::json!({"solo": counter_start + i as u64}),
+                )
+                .unwrap();
                 lat.push(t0.elapsed());
             }
             lat
@@ -2005,22 +2058,31 @@ mod tests {
 
         // First open takes exclusive process ownership.
         let q1 = AverinQueue::open(dir.path().to_path_buf(), key()).unwrap();
-        q1.append("s", "averin.use", serde_json::json!({"n": 1})).unwrap();
+        q1.append("s", "averin.use", serde_json::json!({"n": 1}))
+            .unwrap();
 
         // A SECOND live open on the SAME directory must fail-closed with AverinQueueBusy — never hang,
         // never corrupt (Option A: single-writer-PROCESS ownership). `flock` mutually excludes even
         // across two fds within one process, so this holds in-process too.
         match AverinQueue::open(dir.path().to_path_buf(), key()) {
             Err(StorageError::AverinQueueBusy(_)) => {}
-            Err(e) => panic!("expected AverinQueueBusy while the owner is held, got a different error: {e:?}"),
-            Ok(_) => panic!("expected AverinQueueBusy while the owner is held, but a second open SUCCEEDED"),
+            Err(e) => panic!(
+                "expected AverinQueueBusy while the owner is held, got a different error: {e:?}"
+            ),
+            Ok(_) => panic!(
+                "expected AverinQueueBusy while the owner is held, but a second open SUCCEEDED"
+            ),
         }
 
         // Once the owner drops (releasing the flock), a fresh open on the same dir succeeds AND sees the
         // durably-appended record — ownership is transferable, only never SHARED.
         drop(q1);
         let q2 = AverinQueue::open(dir.path().to_path_buf(), key()).unwrap();
-        assert_eq!(q2.all_events().len(), 1, "the reopened owner replays the prior record");
+        assert_eq!(
+            q2.all_events().len(),
+            1,
+            "the reopened owner replays the prior record"
+        );
         drop(q2);
     }
 
@@ -2031,18 +2093,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = queue(dir.path());
         let seq = q
-            .append("tok-a", "averin.use", serde_json::json!({"params": "SECRET_PARAMS"}))
+            .append(
+                "tok-a",
+                "averin.use",
+                serde_json::json!({"params": "SECRET_PARAMS"}),
+            )
             .unwrap();
         q.claim(10, 60).unwrap();
         // max_attempts=1: the first failed attempt dead-letters immediately.
-        let dead_lettered = q.record_delivery(seq, false, Some("boom".into()), 1).unwrap();
+        let dead_lettered = q
+            .record_delivery(seq, false, Some("boom".into()), 1)
+            .unwrap();
         assert!(dead_lettered, "the single allowed attempt must dead-letter");
         assert_eq!(q.get(seq).unwrap().delivery, DeliveryState::DeadLettered);
 
         // Reclaim (simulating the worker's post-quarantine-success MOVE): the record — and its raw
         // params — are GONE from the live map entirely, not merely re-tagged.
         q.reclaim_dead_letter(seq).unwrap();
-        assert!(q.get(seq).is_none(), "the dead-lettered record must leave the live map");
+        assert!(
+            q.get(seq).is_none(),
+            "the dead-lettered record must leave the live map"
+        );
         assert!(
             q.all_events().is_empty(),
             "no trace of the record (or its params) survives in the live map"
@@ -2061,8 +2132,12 @@ mod tests {
     fn reclaim_dead_letter_survives_compaction_the_record_never_reappears_in_a_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let q = queue(dir.path());
-        let a = q.append("A", "averin.use", serde_json::json!({"params": "p"})).unwrap();
-        let b = q.append("B", "averin.use", serde_json::json!({"params": "p"})).unwrap();
+        let a = q
+            .append("A", "averin.use", serde_json::json!({"params": "p"}))
+            .unwrap();
+        let b = q
+            .append("B", "averin.use", serde_json::json!({"params": "p"}))
+            .unwrap();
         q.claim(10, 60).unwrap();
         assert!(q.record_delivery(a, false, Some("boom".into()), 1).unwrap());
         assert!(!q.record_delivery(b, true, None, 1).unwrap());
@@ -2074,7 +2149,11 @@ mod tests {
         drop(q);
         let q2 = reopen(dir.path());
         let remaining = q2.all_events();
-        assert_eq!(remaining.len(), 1, "only B survives compaction: {remaining:?}");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only B survives compaction: {remaining:?}"
+        );
         assert_eq!(remaining[0].sequence, b);
     }
 
@@ -2101,10 +2180,16 @@ mod tests {
     fn has_pending_for_subject_reflects_only_the_pending_delivery_state() {
         let dir = tempfile::tempdir().unwrap();
         let q = queue(dir.path());
-        assert!(!q.has_pending_for_subject("A"), "unknown subject has no live use");
+        assert!(
+            !q.has_pending_for_subject("A"),
+            "unknown subject has no live use"
+        );
 
         let a = q.append("A", "averin.use", serde_json::json!({})).unwrap();
-        assert!(q.has_pending_for_subject("A"), "a fresh Pending event is live");
+        assert!(
+            q.has_pending_for_subject("A"),
+            "a fresh Pending event is live"
+        );
 
         q.claim(10, 60).unwrap();
         assert!(q.record_delivery(a, false, Some("boom".into()), 1).unwrap()); // -> DeadLettered
@@ -2121,7 +2206,10 @@ mod tests {
         );
 
         assert!(!q.record_delivery(b, true, None, 8).unwrap()); // -> Delivered
-        assert!(!q.has_pending_for_subject("B"), "a Delivered record is not a live use");
+        assert!(
+            !q.has_pending_for_subject("B"),
+            "a Delivered record is not a live use"
+        );
     }
 
     // ---- Codex HIGH-2 (append-ordering resurrection) ----
@@ -2150,9 +2238,15 @@ mod tests {
             "an uncommitted (still-committing) reservation must not be deliverable"
         );
         let claimed = q.claim(10, 60).unwrap();
-        assert!(claimed.is_empty(), "an uncommitted reservation must not be claimable");
+        assert!(
+            claimed.is_empty(),
+            "an uncommitted reservation must not be claimable"
+        );
         let delivered = q.record_delivery(seq, true, None, 8).unwrap();
-        assert!(!delivered, "record_delivery on a still-committing sequence must be a no-op");
+        assert!(
+            !delivered,
+            "record_delivery on a still-committing sequence must be a no-op"
+        );
         assert_eq!(
             q.get(seq).unwrap().delivery,
             DeliveryState::Pending,
@@ -2180,7 +2274,9 @@ mod tests {
         // Pending work on replay).
         drop(q);
         let q2 = reopen(dir.path());
-        let ev = q2.get(seq).expect("the committed, delivered append survives replay");
+        let ev = q2
+            .get(seq)
+            .expect("the committed, delivered append survives replay");
         assert_eq!(
             ev.delivery,
             DeliveryState::Delivered,
@@ -2210,7 +2306,10 @@ mod tests {
             while !stop_bg.load(Ordering::Relaxed) {
                 let claimed = q_bg.claim(10, 60).unwrap();
                 for e in claimed {
-                    assert_ne!(e.sequence, seq, "the unpublished reservation must never be claimed");
+                    assert_ne!(
+                        e.sequence, seq,
+                        "the unpublished reservation must never be claimed"
+                    );
                     let _ = q_bg.record_delivery(e.sequence, true, None, 8);
                 }
                 // A small yield keeps this a genuine concurrency probe without a lock-starving spin.
@@ -2288,10 +2387,15 @@ mod tests {
 
         // The snapshot compact produced must include A: nothing is lost even though its Append had
         // already committed durably before compact observed it as safe to snapshot.
-        let q = Arc::try_unwrap(q).unwrap_or_else(|_| panic!("bg thread's Arc clone should be gone"));
+        let q =
+            Arc::try_unwrap(q).unwrap_or_else(|_| panic!("bg thread's Arc clone should be gone"));
         drop(q);
         let q2 = reopen(dir.path());
-        assert_eq!(q2.all_events().len(), 1, "A must survive compaction, not be lost");
+        assert_eq!(
+            q2.all_events().len(),
+            1,
+            "A must survive compaction, not be lost"
+        );
         assert_eq!(q2.get(seq).unwrap().sequence, seq);
     }
 
@@ -2311,7 +2415,11 @@ mod tests {
         // described precisely: "seq 1 is committing-but-unpublished while seq 2 is delivered".
         let seq2 = q.append("B", "averin.use", serde_json::json!({})).unwrap();
         let claimed = q.claim(10, 60).unwrap();
-        assert_eq!(claimed.len(), 1, "seq1 is still committing and must not be claimed alongside seq2");
+        assert_eq!(
+            claimed.len(),
+            1,
+            "seq1 is still committing and must not be claimed alongside seq2"
+        );
         assert_eq!(claimed[0].sequence, seq2);
         assert!(!q.record_delivery(seq2, true, None, 8).unwrap());
 
@@ -2327,7 +2435,10 @@ mod tests {
         });
 
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(!done.load(Ordering::SeqCst), "prune must wait while seq1 is still committing");
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "prune must wait while seq1 is still committing"
+        );
 
         // Now let seq1 actually publish (mirrors `finish_append`'s success tail).
         q.publish_committed(seq1);
@@ -2336,12 +2447,19 @@ mod tests {
         // seq1 is now genuinely Pending (never delivered) — it correctly BLOCKS the whole prefix
         // (mirrors the existing "a still-pending record blocks the prefix" contract), so a committing
         // seq is never pruned, and nothing else is pruned out of sequence order either.
-        assert_eq!(pruned, 0, "a just-published, still-Pending seq1 blocks the prefix entirely");
+        assert_eq!(
+            pruned, 0,
+            "a just-published, still-Pending seq1 blocks the prefix entirely"
+        );
         assert_eq!(q.get(seq1).unwrap().delivery, DeliveryState::Pending);
-        assert!(q.get(seq2).is_some(), "seq2 must not be pruned past the still-Pending seq1");
+        assert!(
+            q.get(seq2).is_some(),
+            "seq2 must not be pruned past the still-Pending seq1"
+        );
 
         // Durability check: replay must agree — seq1 (Pending) and seq2 (Delivered) both survive.
-        let q = Arc::try_unwrap(q).unwrap_or_else(|_| panic!("bg thread's Arc clone should be gone"));
+        let q =
+            Arc::try_unwrap(q).unwrap_or_else(|_| panic!("bg thread's Arc clone should be gone"));
         drop(q);
         let q2 = reopen(dir.path());
         assert_eq!(q2.all_events().len(), 2);
@@ -2367,8 +2485,14 @@ mod tests {
         // N: reserved but deliberately left `committing` (never finished) — nothing durable backs it.
         let (seq_n, event_n) = q.reserve_for_append("S", "averin.use", serde_json::json!({"n": 1}));
         // N+1: same subject, reserved AND fully committed — durable and genuinely Pending.
-        let seq_n1 = q.append("S", "averin.use", serde_json::json!({"n": 2})).unwrap();
-        assert_eq!(seq_n1, seq_n + 1, "N+1 must immediately follow N in sequence order");
+        let seq_n1 = q
+            .append("S", "averin.use", serde_json::json!({"n": 2}))
+            .unwrap();
+        assert_eq!(
+            seq_n1,
+            seq_n + 1,
+            "N+1 must immediately follow N in sequence order"
+        );
 
         // While N is still committing, claim() must return NOTHING for subject S — not N+1 ahead of
         // it. This is the exact interleaving Codex R3 HIGH-2 flagged.
@@ -2390,7 +2514,10 @@ mod tests {
         // N has delivered — S is unblocked, and N+1 is now (and only now) claimable.
         let claimed = q.claim(10, 60).unwrap();
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].sequence, seq_n1, "N+1 claims only after N delivers, still in order");
+        assert_eq!(
+            claimed[0].sequence, seq_n1,
+            "N+1 claims only after N delivers, still in order"
+        );
     }
 
     // ---- Codex R3 MEDIUM-4 (unbounded compact/prune wait on a stuck committing seq — liveness) ----
@@ -2442,7 +2569,10 @@ mod tests {
 
         // Best-effort skip, not a partial pass: nothing pruned, and no snapshot was ever written
         // (compact bailed before touching disk) — the queue is unchanged, ready to retry next tick.
-        assert_eq!(pruned, 0, "prune must skip (not prune) while committing never drains");
+        assert_eq!(
+            pruned, 0,
+            "prune must skip (not prune) while committing never drains"
+        );
         let segs = list_segments(dir.path()).unwrap();
         assert!(
             !segs.iter().any(|(_, _, is_snap)| *is_snap),
@@ -2457,13 +2587,20 @@ mod tests {
     // ---- Codex HIGH-3 (delivered records retained forever / unbounded growth) ----
 
     #[test]
-    fn prune_delivered_prefix_drops_delivered_records_and_their_params_but_never_a_still_pending_one() {
+    fn prune_delivered_prefix_drops_delivered_records_and_their_params_but_never_a_still_pending_one(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let q = queue(dir.path());
 
-        let a = q.append("A", "averin.use", serde_json::json!({"params": "SECRET_A"})).unwrap();
-        let b = q.append("B", "averin.use", serde_json::json!({"params": "SECRET_B"})).unwrap();
-        let c = q.append("C", "averin.use", serde_json::json!({"params": "SECRET_C"})).unwrap(); // stays Pending
+        let a = q
+            .append("A", "averin.use", serde_json::json!({"params": "SECRET_A"}))
+            .unwrap();
+        let b = q
+            .append("B", "averin.use", serde_json::json!({"params": "SECRET_B"}))
+            .unwrap();
+        let c = q
+            .append("C", "averin.use", serde_json::json!({"params": "SECRET_C"}))
+            .unwrap(); // stays Pending
 
         q.claim(10, 60).unwrap();
         assert!(!q.record_delivery(a, true, None, 8).unwrap());
@@ -2475,11 +2612,21 @@ mod tests {
         let pruned = q.prune_delivered_prefix(0).unwrap();
         assert_eq!(pruned, 2, "both delivered records (A, B) are pruned");
 
-        assert!(q.get(a).is_none(), "A's delivered record (and its raw params) must be gone");
-        assert!(q.get(b).is_none(), "B's delivered record (and its raw params) must be gone");
+        assert!(
+            q.get(a).is_none(),
+            "A's delivered record (and its raw params) must be gone"
+        );
+        assert!(
+            q.get(b).is_none(),
+            "B's delivered record (and its raw params) must be gone"
+        );
         let remaining = q.get(c).expect("C, still Pending, must survive the prune");
         assert_eq!(remaining.delivery, DeliveryState::Pending);
-        assert_eq!(q.all_events().len(), 1, "only the still-Pending record C remains live");
+        assert_eq!(
+            q.all_events().len(),
+            1,
+            "only the still-Pending record C remains live"
+        );
 
         // The prune is itself durable: a reopen must not resurrect A or B.
         drop(q);
@@ -2506,13 +2653,20 @@ mod tests {
         // `a` is left Pending (never delivered).
 
         let pruned = q.prune_delivered_prefix(0).unwrap();
-        assert_eq!(pruned, 0, "the still-Pending `a` blocks the prefix even though `b` delivered");
+        assert_eq!(
+            pruned, 0,
+            "the still-Pending `a` blocks the prefix even though `b` delivered"
+        );
         assert!(q.get(a).is_some());
-        assert!(q.get(b).is_some(), "b survives too: the prefix never reaches past the blocker");
+        assert!(
+            q.get(b).is_some(),
+            "b survives too: the prefix never reaches past the blocker"
+        );
     }
 
     #[test]
-    fn prune_delivered_prefix_respects_the_retention_window_a_just_delivered_record_is_not_pruned_instantly() {
+    fn prune_delivered_prefix_respects_the_retention_window_a_just_delivered_record_is_not_pruned_instantly(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let q = queue(dir.path());
         let a = q.append("A", "averin.use", serde_json::json!({})).unwrap();
@@ -2521,7 +2675,10 @@ mod tests {
 
         // A large retention window (well past "just now") must NOT prune a just-delivered record.
         let pruned = q.prune_delivered_prefix(24 * 3600).unwrap();
-        assert_eq!(pruned, 0, "a just-delivered record must survive within the retention window");
+        assert_eq!(
+            pruned, 0,
+            "a just-delivered record must survive within the retention window"
+        );
         assert!(q.get(a).is_some());
 
         // retention_secs = 0 (no window) prunes it immediately, proving the ONLY thing that withheld
@@ -2629,17 +2786,26 @@ mod tests {
             last_frame_start = pos;
             pos += FRAME_HEADER_LEN + len;
         }
-        let last_len =
-            u32::from_be_bytes(full[last_frame_start + 4..last_frame_start + 8].try_into().unwrap())
-                as usize;
-        assert!(last_len > 4, "need a payload with a few bytes to truncate mid-record");
+        let last_len = u32::from_be_bytes(
+            full[last_frame_start + 4..last_frame_start + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert!(
+            last_len > 4,
+            "need a payload with a few bytes to truncate mid-record"
+        );
         let cut_len = last_frame_start + FRAME_HEADER_LEN + (last_len / 2).max(1);
         assert!(cut_len < full.len(), "must actually truncate something");
         std::fs::write(&segment_path, &full[..cut_len]).unwrap();
 
         let q2 = reopen(dir.path());
         let recovered = q2.all_events();
-        assert_eq!(recovered.len(), 4, "the torn 5th record is discarded; the first 4 survive intact");
+        assert_eq!(
+            recovered.len(),
+            4,
+            "the torn 5th record is discarded; the first 4 survive intact"
+        );
         let seqs: StdHashSet<u64> = recovered.iter().map(|e| e.sequence).collect();
         assert_eq!(seqs, StdHashSet::from([1, 2, 3, 4]));
     }

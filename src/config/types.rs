@@ -510,6 +510,9 @@ pub struct RawAverinConfig {
     /// the exact 087 async path). See [`crate::averin::AverinConfig::durable`]. **`true` combined
     /// with `mode = "require_evidence"` is REJECTED at load (D6)** — see this module's `TryFrom`.
     pub durable: Option<bool>,
+    /// Emit exact single-operation, two-phase D8 evidence for every invocation.
+    /// Default false. The before-act intent is synchronous and fail-closed.
+    pub d8_complete_evidence: Option<bool>,
 }
 
 impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
@@ -528,6 +531,7 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
             }
         };
         let durable = raw.durable.unwrap_or(d.durable);
+        let d8_complete_evidence = raw.d8_complete_evidence.unwrap_or(d.d8_complete_evidence);
         // Plan 088 D6 — durable at-least-once delivery is Observe-only: durable mint enqueues the
         // grant instead of synchronously sealing it, so the in-memory `pop` map the SYNCHRONOUS
         // `require_evidence` path reads (`AverinClient::seal_use`) is never populated, and every
@@ -571,6 +575,7 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
                 .filter(|&n| n > 0)
                 .unwrap_or(d.max_seal_params_bytes),
             durable,
+            d8_complete_evidence,
         })
     }
 }
@@ -999,10 +1004,7 @@ action = "deny"
         let bare = Config::parse("[enforcement]").unwrap();
         assert_eq!(bare.enforcement.default_action, EnforcementDefault::Deny);
 
-        let strict = Config::parse(
-            "[enforcement]\nrequire_declared_capabilities = true",
-        )
-        .unwrap();
+        let strict = Config::parse("[enforcement]\nrequire_declared_capabilities = true").unwrap();
         assert!(strict.enforcement.require_declared_capabilities);
     }
 

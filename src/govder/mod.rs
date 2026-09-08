@@ -13,9 +13,7 @@ use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
-pub use tenant_assert::{
-    sign_tenant_assertion, verify_tenant_assertion, TenantAssertionError,
-};
+pub use tenant_assert::{sign_tenant_assertion, verify_tenant_assertion, TenantAssertionError};
 
 /// Configuration for outbound govder delegation calls.
 #[derive(Clone)]
@@ -781,7 +779,9 @@ mod tests {
         // real) AND its gate store is durable (so a gate it once held cannot have
         // vanished). Both halves are required.
         assert!(matches!(
-            absence(r#"{"error":"no gate","reason":"no_gate_for_action_class","gate_store_durable":true}"#),
+            absence(
+                r#"{"error":"no gate","reason":"no_gate_for_action_class","gate_store_durable":true}"#
+            ),
             GateRuleAnswer::NoRule
         ));
     }
