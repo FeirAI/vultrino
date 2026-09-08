@@ -269,7 +269,10 @@ if "async fn validate_required_evidence_preflight(" not in server:
     fail("trusted human-floor evidence preflight is missing from the execute path")
 if server.count("self.validate_required_evidence_preflight(") < 2:
     fail("both buffered and streaming dispatch must run the evidence preflight")
-if "seal_use_required(token_id, params_bytes)" not in server:
+if (
+    "seal_use_required(token_id, params_bytes, use_sequence_number, request_id)"
+    not in server
+):
     fail("trusted human-floor path no longer awaits a committed Averin use seal")
 if 'unknown [averin] mode' not in (ROOT / "src/config/types.rs").read_text():
     fail("Averin mode typos can again fail open into Observe")
@@ -298,8 +301,13 @@ if "approval.bind_gate_rule_authority(gate_rule_authority);" not in server:
     fail("approval-open no longer freezes Govder recipe authority")
 if "approval.bind_credential_authority(CredentialAuthority::from_credential(&credential));" not in server:
     fail("approval-open no longer freezes the exact credential revision")
-strict_recipe_refusal = server.find(
-    "self.config.enforcement.require_declared_capabilities\n                        || trusted_irreversible"
+strict_recipe_refusal_match = re.search(
+    r"if\s+self\.config\.enforcement\.require_declared_capabilities\s*"
+    r"\|\|\s*trusted_irreversible\s*\{",
+    server,
+)
+strict_recipe_refusal = (
+    strict_recipe_refusal_match.start() if strict_recipe_refusal_match else -1
 )
 recipe_authority_bind = server.find(
     "approval.bind_gate_rule_authority(gate_rule_authority);", strict_recipe_refusal
@@ -431,7 +439,15 @@ if 'with_metadata("require_approval", "true")' in web_smoke_tests[
 if "async fn the_gate_is_found_when_it_is_keyed_by_the_govder_action_label" not in web_smoke_tests:
     fail("automatic human-floor gating lacks the authoritative-recipe positive control")
 
-if server.count("confine_plugin_execution_error(error, &secret_material)") != 2:
+if (
+    len(
+        re.findall(
+            r"confine_plugin_execution_error\(\s*error,\s*&secret_material,\s*\)",
+            server,
+        )
+    )
+    != 2
+):
     fail("both post-dispatch error paths must classify connector diagnostics")
 if "diagnostic_may_contain_secret(&error.to_string(), secrets)" not in server:
     fail("connector diagnostics no longer use the finite secret-form classifier")
