@@ -258,6 +258,41 @@ any upstream request, on the preflight (`validate_params`) and again in `execute
 
   Sheet names containing spaces cannot be pinned.
 
+### `[solo_pins]`: learner spreadsheet and Calendar pins for the `solo` plugin
+
+```toml
+[solo_pins]
+learner_spreadsheet_ids = ["solo-learner-fixture"]
+calendar_ids            = ["solo-calendar-fixture"]
+```
+
+The typed `solo` adapter pins its Sheets ranges to compiled constants
+(`Cohorts!A1:K100`, `Learners!A1:L1000`, `Attendance!A1:K1000`,
+`Knowledge!A1:H200`); these pins bound the spreadsheet id and Calendar id a
+request may name. Every check runs before credential refresh and before any
+upstream request, on the preflight (`validate_params`) and again at the start of
+each `execute` path.
+
+| Key | Notes |
+|-----|-------|
+| `learner_spreadsheet_ids` | Spreadsheet ids `solo.learner_read` and `solo.attendance_update` may name. `[A-Za-z0-9_-]`, 1-128 chars, compared byte-for-byte. |
+| `calendar_ids` | Calendar ids `solo.session_list`, `solo.availability_check`, `solo.session_create`, `solo.session_update` and `solo.session_cancel` may name. `[A-Za-z0-9_.@+-]`, 1-512 chars, compared byte-for-byte. |
+
+This section is separate from `[[sheets_pins]]` on purpose. A `[[sheets_pins]]`
+entry never authorizes a solo call and a `[solo_pins]` entry never authorizes a
+`sheets` call, even for the same spreadsheet. Within `[solo_pins]`, a
+spreadsheet pin never authorizes a Calendar id and a Calendar pin never
+authorizes a spreadsheet id.
+
+**Fail closed:**
+- **No `[solo_pins]` (the default), or an empty list:** the plugin is still
+  registered, but it refuses every call of that family (Sheets or Calendar).
+  It never falls back to "any spreadsheet" or "any calendar".
+- **Malformed, duplicate or unknown keys:** load error. Values are not trimmed
+  or case-folded, so a case or whitespace variant of a pinned id is refused.
+- `solo.learner_message_send` names no spreadsheet or Calendar; its recipients
+  stay bound by the credential's own recipient map and are unaffected.
+
 ### `[outbox]` — signed event outbox + meter feed (V9)
 
 ```toml

@@ -3,9 +3,11 @@
 //! Loads configuration from TOML files and environment variables.
 
 mod sheets;
+mod solo;
 mod types;
 
 pub use sheets::{A1Range, SheetsPin, MAX_SHEETS_ROW};
+pub use solo::SoloPins;
 pub use types::*;
 
 use crate::policy::Policy;
@@ -97,6 +99,10 @@ pub struct Config {
     /// (plan 106 G1b). Empty = the plugin is registered but refuses every call:
     /// the adapter never falls back to "any spreadsheet" when unconfigured.
     pub sheets_pins: Vec<SheetsPin>,
+    /// Operator-pinned learner spreadsheet ids and Calendar ids for the typed
+    /// `solo` plugin (`[solo_pins]`). Default = nothing pinned = the plugin
+    /// refuses every Sheets and Calendar call. Never shared with `sheets_pins`.
+    pub solo_pins: SoloPins,
 }
 
 /// One operator-pinned internal destination (plan 103 D8/F8), validated at
@@ -710,6 +716,16 @@ impl Config {
             sheets_pins.push(pin);
         }
 
+        // Operator-pinned solo plugin targets. A malformed or duplicate pin is
+        // a startup failure; an absent section pins nothing (refuse all).
+        let solo_pins = match raw.solo_pins {
+            Some(raw_solo) => {
+                SoloPins::parse(&raw_solo.learner_spreadsheet_ids, &raw_solo.calendar_ids)
+                    .map_err(ConfigError::Invalid)?
+            }
+            None => SoloPins::default(),
+        };
+
         Ok(Self {
             server,
             storage,
@@ -739,6 +755,7 @@ impl Config {
                 .unwrap_or_default(),
             internal_destinations,
             sheets_pins,
+            solo_pins,
         })
     }
 
@@ -764,6 +781,7 @@ impl Config {
             averin: crate::averin::AverinConfig::default(),
             internal_destinations: vec![],
             sheets_pins: vec![],
+            solo_pins: SoloPins::default(),
         }
     }
 
