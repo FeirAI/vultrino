@@ -4,8 +4,15 @@
 //! document tool.  The operator pins the upstream endpoint and identifiers in
 //! `Capability.target.plugin_params`; the caller supplies only the typed
 //! content fields for the selected business operation.
+//!
+//! The Sheets adapter additionally enforces its own spreadsheet and A1 range
+//! pins from operator TOML (`[[sheets_pins]]`, plan 106 G1b). A capability
+//! schema `const` is only one layer: any path that reaches this plugin with a
+//! spreadsheet id or range outside the pins is refused before credential use
+//! or network I/O, and no pins at all refuses every call.
 
 use super::{Plugin, PluginError, PluginRequest};
+use crate::config::{A1Range, SheetsPin};
 use crate::{Credential, CredentialData, CredentialType, ExecuteResponse};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -591,24 +598,91 @@ fn contains_graphql_message(value: &Value) -> bool {
 pub struct SheetsPlugin {
     client: Client,
     revise_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Operator pins from `[[sheets_pins]]`. Empty = every call is refused.
+    pins: Arc<Vec<SheetsPin>>,
+}
+
+fn pin_refusal(message: &str) -> PluginError {
+    PluginError::InvalidParams(format!("sheets pin: {message}"))
 }
 
 impl SheetsPlugin {
-    pub fn new() -> Self {
+    /// Build the adapter over the operator's pins. An empty list is legal and
+    /// means every Sheets call is refused (fail closed, never "allow all").
+    pub fn new(pins: Vec<SheetsPin>) -> Self {
+        Self::with_client(crate::plugins::build_guarded_client(), pins)
+    }
+
+    fn with_client(client: Client, pins: Vec<SheetsPin>) -> Self {
         Self {
-            client: crate::plugins::build_guarded_client(),
+            client,
             revise_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pins: Arc::new(pins),
         }
     }
 
-    fn validate_typed(action: &str, params: &Value) -> Result<(), PluginError> {
+    /// The pin for an exact (byte-for-byte) spreadsheet id.
+    fn pinned_spreadsheet(&self, spreadsheet_id: &str) -> Result<&SheetsPin, PluginError> {
+        if self.pins.is_empty() {
+            return Err(pin_refusal(
+                "no spreadsheet is operator-pinned ([[sheets_pins]] is empty); every Sheets call is refused",
+            ));
+        }
+        self.pins
+            .iter()
+            .find(|pin| pin.spreadsheet_id == spreadsheet_id)
+            .ok_or_else(|| pin_refusal("spreadsheet_id is not operator-pinned"))
+    }
+
+    /// A caller range that EXACTLY equals one of the pinned ranges of `kind`.
+    fn pinned_range(
+        &self,
+        spreadsheet_id: &str,
+        range: &str,
+        write: bool,
+    ) -> Result<(&SheetsPin, A1Range), PluginError> {
+        let pin = self.pinned_spreadsheet(spreadsheet_id)?;
+        let parsed = A1Range::parse_strict(range)
+            .map_err(|error| pin_refusal(&format!("range refused: {error}")))?;
+        let (allowed, kind) = if write {
+            (&pin.write_ranges, "write")
+        } else {
+            (&pin.read_ranges, "read")
+        };
+        if !allowed.contains(&parsed) {
+            return Err(pin_refusal(&format!(
+                "range is not an operator-pinned {kind} range for this spreadsheet"
+            )));
+        }
+        Ok((pin, parsed))
+    }
+
+    /// Append names a pinned write range and also performs the adapter-internal
+    /// Sources lineage read, which must sit inside a pinned read range.
+    fn pinned_append_range(&self, p: &SheetsAppendParams) -> Result<A1Range, PluginError> {
+        let (pin, range) = self.pinned_range(&p.spreadsheet_id, &p.range, true)?;
+        let sources = A1Range::parse_strict(SHEETS_SOURCES_RANGE)
+            .map_err(|error| pin_refusal(&format!("Sources range constant: {error}")))?;
+        if !pin.read_ranges.iter().any(|read| read.contains(&sources)) {
+            return Err(pin_refusal(
+                "append_draft reads Sources lineage, which is outside every operator-pinned read range",
+            ));
+        }
+        Ok(range)
+    }
+
+    fn validate_typed(&self, action: &str, params: &Value) -> Result<(), PluginError> {
         match action {
-            "read" => serde_json::from_value::<SheetsReadParams>(params.clone())
-                .map(|_| ())
-                .map_err(|error| PluginError::InvalidParams(error.to_string())),
+            "read" => {
+                let p = serde_json::from_value::<SheetsReadParams>(params.clone())
+                    .map_err(|error| PluginError::InvalidParams(error.to_string()))?;
+                self.pinned_range(&p.spreadsheet_id, &p.range, false)
+                    .map(|_| ())
+            }
             "append_draft" => {
                 let p = serde_json::from_value::<SheetsAppendParams>(params.clone())
                     .map_err(|error| PluginError::InvalidParams(error.to_string()))?;
+                self.pinned_append_range(&p)?;
                 if p.row_version != "1" {
                     return Err(PluginError::InvalidParams(
                         "append_draft only creates rows at row_version 1".to_string(),
@@ -627,6 +701,7 @@ impl SheetsPlugin {
             "revise_draft" => {
                 let p = serde_json::from_value::<SheetsReviseParams>(params.clone())
                     .map_err(|error| PluginError::InvalidParams(error.to_string()))?;
+                self.pinned_range(&p.spreadsheet_id, &p.range, true)?;
                 validate_positive_row_version(&p.expected_row_version)?;
                 validate_content_hash(&p.content_hash, "revise_draft")
             }
@@ -639,6 +714,8 @@ impl SheetsPlugin {
             "read" => {
                 let p: SheetsReadParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+                // Pin check first: before credential refresh or any request.
+                let (_, range) = self.pinned_range(&p.spreadsheet_id, &p.range, false)?;
                 let (credential, updated) =
                     effective_marketing_credential(&request.credential).await?;
                 let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
@@ -646,7 +723,7 @@ impl SheetsPlugin {
                     .join(&format!(
                         "v4/spreadsheets/{}/values/{}",
                         urlencoding::encode(&p.spreadsheet_id),
-                        urlencoding::encode(&p.range)
+                        urlencoding::encode(&range.to_string())
                     ))
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
                 let response = send_json_method(
@@ -662,6 +739,8 @@ impl SheetsPlugin {
             "append_draft" => {
                 let p: SheetsAppendParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+                // Pin check first: before credential refresh or any request.
+                let append_range = self.pinned_append_range(&p)?;
                 if p.row_version != "1" {
                     return Err(PluginError::InvalidParams(
                         "append_draft only creates rows at row_version 1".to_string(),
@@ -703,7 +782,8 @@ impl SheetsPlugin {
                 let url = base
                     .join(&format!(
                         "v4/spreadsheets/{}/values/{}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
-                        urlencoding::encode(&p.spreadsheet_id), urlencoding::encode(&p.range)
+                        urlencoding::encode(&p.spreadsheet_id),
+                        urlencoding::encode(&append_range.to_string())
                     ))
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
                 let values = json!([[
@@ -739,6 +819,8 @@ impl SheetsPlugin {
             "revise_draft" => {
                 let p: SheetsReviseParams = serde_json::from_value(request.params)
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+                // Pin check first: before credential refresh or any request.
+                let (_, write_range) = self.pinned_range(&p.spreadsheet_id, &p.range, true)?;
                 let expected_row_version = p.expected_row_version.parse::<u64>().map_err(|_| {
                     PluginError::InvalidParams(
                         "expected_row_version must be a positive decimal row version".to_string(),
@@ -762,7 +844,7 @@ impl SheetsPlugin {
                     .join(&format!(
                         "v4/spreadsheets/{}/values/{}",
                         urlencoding::encode(&p.spreadsheet_id),
-                        urlencoding::encode(&p.range)
+                        urlencoding::encode(&write_range.to_string())
                     ))
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
                 let current = send_json_method(
@@ -781,19 +863,44 @@ impl SheetsPlugin {
                         "Sheets pipeline read did not contain a values array".to_string(),
                     )
                 })?;
-                let (row_number, current_row) = rows
+                let (row_index, current_row) = rows
                     .iter()
                     .enumerate()
                     .find_map(|(index, row)| {
                         (row.get(PIPELINE_VARIANT_ID).and_then(Value::as_str)
                             == Some(p.variant_id.as_str()))
-                        .then(|| (index + 1, row))
+                        .then_some((index, row))
                     })
                     .ok_or_else(|| {
                         PluginError::InvalidParams(format!(
                             "variant_id '{}' is not present in the pinned Pipeline range",
                             p.variant_id
                         ))
+                    })?;
+                // The values array starts at the pinned range's first row and
+                // column, so the row write is derived from the pin (never a
+                // hardcoded sheet) and must stay inside the pinned write range.
+                let write_target = u32::try_from(row_index)
+                    .ok()
+                    .and_then(|index| write_range.first_row().checked_add(index))
+                    .zip(
+                        write_range
+                            .first_col()
+                            .checked_add(PIPELINE_COLUMN_COUNT as u32 - 1),
+                    )
+                    .map(|(row, last_col)| {
+                        A1Range::row_span(
+                            write_range.sheet(),
+                            write_range.first_col(),
+                            last_col,
+                            row,
+                        )
+                    })
+                    .filter(|target| write_range.contains(target))
+                    .ok_or_else(|| {
+                        pin_refusal(
+                            "the resolved Pipeline row write falls outside the operator-pinned write range",
+                        )
                     })?;
                 let current_cells = current_row.as_array().ok_or_else(|| {
                     PluginError::ExecutionFailed("Pipeline row was not an array".to_string())
@@ -855,10 +962,9 @@ impl SheetsPlugin {
                 next_row[PIPELINE_UPDATED_BY] = Value::String(FEIR_APPROVAL_ACTOR.to_string());
                 let url = base
                     .join(&format!(
-                        "v4/spreadsheets/{}/values/Pipeline!A{}:W{}?valueInputOption=RAW",
+                        "v4/spreadsheets/{}/values/{}?valueInputOption=RAW",
                         urlencoding::encode(&p.spreadsheet_id),
-                        row_number,
-                        row_number
+                        urlencoding::encode(&write_target.to_string())
                     ))
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
                 let response = send_json_method(
@@ -877,8 +983,9 @@ impl SheetsPlugin {
 }
 
 impl Default for SheetsPlugin {
+    /// No pins: every call is refused.
     fn default() -> Self {
-        Self::new()
+        Self::new(Vec::new())
     }
 }
 
@@ -897,7 +1004,7 @@ impl Plugin for SheetsPlugin {
         self.execute_typed(request).await
     }
     fn validate_params(&self, action: &str, params: &Value) -> Result<(), PluginError> {
-        Self::validate_typed(action, params)
+        self.validate_typed(action, params)
     }
 }
 
@@ -1277,7 +1384,7 @@ mod tests {
             "source_ids": ["source-1"]
         });
         assert!(matches!(
-            SheetsPlugin::validate_typed("append_draft", &params),
+            pinned_plugin().validate_typed("append_draft", &params),
             Err(PluginError::InvalidParams(message)) if message.contains("canonical draft payload")
         ));
     }
@@ -1397,10 +1504,7 @@ mod tests {
     #[tokio::test]
     async fn sheets_append_advances_only_to_pending_review_after_the_governed_write() {
         let (base_url, seen) = sheets_server().await;
-        let plugin = SheetsPlugin {
-            client: Client::new(),
-            revise_lock: Arc::new(tokio::sync::Mutex::new(())),
-        };
+        let plugin = pinned_plugin();
         let params = json!({
             "base_url": base_url,
             "spreadsheet_id": "solo-marketing-fixture",
@@ -1455,17 +1559,14 @@ mod tests {
             "lucas_notes": "",
             "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         });
-        let result = SheetsPlugin {
-            client: Client::new(),
-            revise_lock: Arc::new(tokio::sync::Mutex::new(())),
-        }
-        .execute(PluginRequest {
-            credential: credential(),
-            action: "revise_draft".into(),
-            params,
-            context: RequestContext::default(),
-        })
-        .await;
+        let result = pinned_plugin()
+            .execute(PluginRequest {
+                credential: credential(),
+                action: "revise_draft".into(),
+                params,
+                context: RequestContext::default(),
+            })
+            .await;
         assert!(
             matches!(result, Err(PluginError::InvalidParams(message)) if message.contains("positive decimal"))
         );
@@ -1474,10 +1575,7 @@ mod tests {
     #[tokio::test]
     async fn sheets_revision_performs_row_version_cas_and_targets_the_resolved_row() {
         let (base_url, seen) = revision_server().await;
-        let plugin = SheetsPlugin {
-            client: Client::new(),
-            revise_lock: Arc::new(tokio::sync::Mutex::new(())),
-        };
+        let plugin = pinned_plugin();
         let result = plugin
             .execute(PluginRequest {
                 credential: credential(),
@@ -1506,5 +1604,463 @@ mod tests {
         assert_eq!(row[15], "");
         assert_eq!(row[PIPELINE_UPDATED_BY], FEIR_APPROVAL_ACTOR);
         assert_eq!(row[PIPELINE_SOURCE_IDS], "[\"source-1\"]");
+    }
+
+    // -----------------------------------------------------------------------
+    // G1b: the adapter itself pins spreadsheet id and A1 ranges.
+    // -----------------------------------------------------------------------
+
+    const PINNED_SPREADSHEET: &str = "solo-marketing-fixture";
+
+    type Hits = Arc<parking_lot::Mutex<Vec<(String, String)>>>;
+
+    /// A loopback upstream that records EVERY request (method + path/query) and
+    /// answers GETs with `get_body`. An empty `Hits` after a call proves that no
+    /// outbound request was made.
+    async fn recording_sheets_server(get_body: Value) -> (String, Hits) {
+        let hits: Hits = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = hits.clone();
+        let app =
+            Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri| {
+                let recorded = recorded.clone();
+                let get_body = get_body.clone();
+                async move {
+                    recorded.lock().push((method.to_string(), uri.to_string()));
+                    if method == axum::http::Method::GET {
+                        axum::Json(get_body)
+                    } else {
+                        axum::Json(json!({"ok": true}))
+                    }
+                }
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/"), hits)
+    }
+
+    fn fixture_pins() -> Vec<SheetsPin> {
+        vec![SheetsPin::parse(
+            PINNED_SPREADSHEET,
+            &[
+                "Brand!A1:Z100",
+                "Sources!A1:Z100",
+                "Campaigns!A1:Z100",
+                "Pipeline!A1:Z100",
+            ],
+            &["Pipeline!A:Z"],
+        )
+        .unwrap()]
+    }
+
+    fn pinned_plugin() -> SheetsPlugin {
+        SheetsPlugin::with_client(Client::new(), fixture_pins())
+    }
+
+    fn unpinned_plugin() -> SheetsPlugin {
+        SheetsPlugin::with_client(Client::new(), Vec::new())
+    }
+
+    fn read_params(base_url: &str, spreadsheet_id: &str, range: &str) -> Value {
+        json!({"base_url": base_url, "spreadsheet_id": spreadsheet_id, "range": range})
+    }
+
+    fn append_params(base_url: &str, spreadsheet_id: &str, range: &str) -> Value {
+        json!({
+            "base_url": base_url,
+            "spreadsheet_id": spreadsheet_id,
+            "range": range,
+            "campaign_id": "camp-1",
+            "variant_id": "var-1",
+            "channel": "linkedin",
+            "account_id": "lucas-linkedin",
+            "audience": "builders",
+            "content_type": "text",
+            "draft_copy": "A sourced draft",
+            "row_version": "1",
+            "content_hash": test_draft_hash("A sourced draft", ""),
+            "source_ids": ["source-1"]
+        })
+    }
+
+    fn revise_params(base_url: &str, spreadsheet_id: &str, range: &str) -> Value {
+        json!({
+            "base_url": base_url,
+            "spreadsheet_id": spreadsheet_id,
+            "range": range,
+            "variant_id": "var-1",
+            "expected_row_version": "1",
+            "draft_copy": "revised",
+            "media_brief": "",
+            "lucas_notes": "reviewed",
+            "content_hash": test_draft_hash("revised", ""),
+        })
+    }
+
+    async fn run_sheets(
+        plugin: &SheetsPlugin,
+        action: &str,
+        params: Value,
+    ) -> Result<ExecuteResponse, PluginError> {
+        plugin
+            .execute(PluginRequest {
+                credential: credential(),
+                action: action.into(),
+                params,
+                context: RequestContext::default(),
+            })
+            .await
+    }
+
+    /// Assert both the preflight (`validate_params`) and a DIRECT `execute`
+    /// refuse, and that the upstream saw nothing.
+    async fn assert_refused_without_network(
+        plugin: &SheetsPlugin,
+        hits: &Hits,
+        action: &str,
+        params: Value,
+        why: &str,
+    ) {
+        assert!(
+            plugin.validate_params(action, &params).is_err(),
+            "{action} preflight must refuse {why}"
+        );
+        let result = run_sheets(plugin, action, params).await;
+        assert!(
+            matches!(result, Err(PluginError::InvalidParams(_))),
+            "{action} execute must refuse {why}, got {result:?}"
+        );
+        assert!(
+            hits.lock().is_empty(),
+            "{action} must make no outbound request for {why}: {:?}",
+            hits.lock()
+        );
+    }
+
+    /// Range spellings that are NOT the pinned `Pipeline!A1:Z100` read range:
+    /// case tricks, whitespace, absolute refs, quoting, `!` injection, R1C1,
+    /// whole-sheet and widened ranges, and a different sheet.
+    const SNEAKY_READ_RANGES: &[&str] = &[
+        "Secrets!A1:Z100",
+        "pipeline!A1:Z100",
+        "PIPELINE!A1:Z100",
+        "Pipeline!a1:z100",
+        " Pipeline!A1:Z100",
+        "Pipeline!A1:Z100 ",
+        "Pipeline! A1:Z100",
+        "Pipeline!A1 :Z100",
+        "Pipeline!A1:Z100\n",
+        "Pipeline!$A$1:$Z$100",
+        "'Pipeline'!A1:Z100",
+        "Pipeline!A1:Z100!Secrets",
+        "Pipeline!Secrets!A1:Z100",
+        "Secrets!A1:Z100,Pipeline!A1:Z100",
+        "Pipeline!R1C1:R100C26",
+        "Pipeline",
+        "Pipeline!A:Z",
+        "Pipeline!A:ZZ",
+        "Pipeline!A1:Z1000",
+        "Pipeline!A1:AA100",
+        "Pipeline!A1",
+        "Pipeline!1:100",
+        "Pipeline!A01:Z100",
+        "Pipeline!Z100:A1",
+        "Pipeline!A1:Z100/../Secrets",
+        "Pipeline%21A1%3AZ100",
+        "",
+    ];
+
+    #[tokio::test]
+    async fn sheets_pinned_read_is_the_positive_control() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = pinned_plugin();
+        let params = read_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z100");
+        plugin.validate_params("read", &params).unwrap();
+        let response = run_sheets(&plugin, "read", params).await.unwrap();
+        assert_eq!(response.status, 200);
+        let hits = hits.lock();
+        assert_eq!(hits.len(), 1, "exactly one upstream read: {hits:?}");
+        assert_eq!(hits[0].0, "GET");
+        assert!(
+            hits[0]
+                .1
+                .starts_with("/v4/spreadsheets/solo-marketing-fixture/values/Pipeline"),
+            "{hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sheets_read_refuses_a_foreign_spreadsheet_before_network() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = pinned_plugin();
+        for foreign in [
+            "attacker-spreadsheet",
+            "Solo-marketing-fixture",
+            "solo-marketing-fixture ",
+            "solo-marketing-fixture/values/Secrets!A1:Z9?x=",
+            "solo-marketing-fixture%2F..",
+            "",
+        ] {
+            assert_refused_without_network(
+                &plugin,
+                &hits,
+                "read",
+                read_params(&base_url, foreign, "Pipeline!A1:Z100"),
+                &format!("foreign spreadsheet {foreign:?}"),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sheets_read_refuses_ranges_outside_the_pin_before_network() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = pinned_plugin();
+        for range in SNEAKY_READ_RANGES {
+            assert_refused_without_network(
+                &plugin,
+                &hits,
+                "read",
+                read_params(&base_url, PINNED_SPREADSHEET, range),
+                &format!("range {range:?}"),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sheets_append_refuses_foreign_spreadsheet_and_ranges_before_network() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = pinned_plugin();
+        assert_refused_without_network(
+            &plugin,
+            &hits,
+            "append_draft",
+            append_params(&base_url, "attacker-spreadsheet", "Pipeline!A:Z"),
+            "a foreign spreadsheet",
+        )
+        .await;
+        for range in [
+            "Secrets!A:Z",
+            "pipeline!A:Z",
+            "Pipeline!a:z",
+            "Pipeline!A:ZZ",
+            " Pipeline!A:Z",
+            "Pipeline!A:Z!Secrets",
+            "Pipeline!C1:R9999",
+            "Pipeline",
+            // A READ pin is not a write pin.
+            "Pipeline!A1:Z100",
+        ] {
+            assert_refused_without_network(
+                &plugin,
+                &hits,
+                "append_draft",
+                append_params(&base_url, PINNED_SPREADSHEET, range),
+                &format!("write range {range:?}"),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sheets_revise_refuses_foreign_spreadsheet_and_ranges_before_network() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = pinned_plugin();
+        assert_refused_without_network(
+            &plugin,
+            &hits,
+            "revise_draft",
+            revise_params(&base_url, "attacker-spreadsheet", "Pipeline!A:Z"),
+            "a foreign spreadsheet",
+        )
+        .await;
+        for range in [
+            "Secrets!A:Z",
+            "PIPELINE!A:Z",
+            "Pipeline!A:AA",
+            "Pipeline!A1:Z100",
+        ] {
+            assert_refused_without_network(
+                &plugin,
+                &hits,
+                "revise_draft",
+                revise_params(&base_url, PINNED_SPREADSHEET, range),
+                &format!("write range {range:?}"),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sheets_with_no_pin_config_refuses_every_action_before_network() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = unpinned_plugin();
+        assert_refused_without_network(
+            &plugin,
+            &hits,
+            "read",
+            read_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z100"),
+            "a call with no operator pin configured",
+        )
+        .await;
+        assert_refused_without_network(
+            &plugin,
+            &hits,
+            "append_draft",
+            append_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A:Z"),
+            "a call with no operator pin configured",
+        )
+        .await;
+        assert_refused_without_network(
+            &plugin,
+            &hits,
+            "revise_draft",
+            revise_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A:Z"),
+            "a call with no operator pin configured",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sheets_revise_never_writes_a_row_outside_the_pinned_write_range() {
+        // The pinned write range covers only row 1; the variant resolves to
+        // row 2, so the adapter must refuse before the PUT.
+        let (base_url, hits) = recording_sheets_server(pipeline_get().await.0).await;
+        let plugin = SheetsPlugin::with_client(
+            Client::new(),
+            vec![SheetsPin::parse(PINNED_SPREADSHEET, &[], &["Pipeline!A1:Z2"]).unwrap()],
+        );
+        // Row 2 IS inside A1:Z2: positive control for the derived write range.
+        run_sheets(
+            &plugin,
+            "revise_draft",
+            revise_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z2"),
+        )
+        .await
+        .unwrap();
+        {
+            let hits = hits.lock();
+            assert_eq!(hits.len(), 2, "{hits:?}");
+            assert_eq!(hits[1].0, "PUT");
+            assert!(
+                hits[1].1.starts_with(
+                    "/v4/spreadsheets/solo-marketing-fixture/values/Pipeline%21A2%3AW2?"
+                ),
+                "{hits:?}"
+            );
+            drop(hits);
+        }
+        hits.lock().clear();
+
+        let (base_url, hits) = recording_sheets_server(pipeline_get().await.0).await;
+        let plugin = SheetsPlugin::with_client(
+            Client::new(),
+            vec![SheetsPin::parse(PINNED_SPREADSHEET, &[], &["Pipeline!A1:Z1"]).unwrap()],
+        );
+        let result = run_sheets(
+            &plugin,
+            "revise_draft",
+            revise_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z1"),
+        )
+        .await;
+        assert!(result.is_err(), "row 2 is outside Pipeline!A1:Z1");
+        assert!(
+            hits.lock().iter().all(|(method, _)| method == "GET"),
+            "no write may reach the upstream: {:?}",
+            hits.lock()
+        );
+    }
+
+    /// Through the server's enforced execute path (`VultrinoServer::execute_gated`,
+    /// which `/api/v1/execute` and MCP `tools/call` both reach) under a policy that
+    /// allows every `sheets.*` action: the refusal of a foreign spreadsheet is the
+    /// adapter's own, from operator TOML, and happens before any upstream request.
+    #[tokio::test]
+    async fn server_execute_path_refuses_a_foreign_spreadsheet_from_operator_pins() {
+        use crate::auth::{NewUseToken, UseToken};
+        use crate::server::{ExecAuth, VultrinoServer};
+        use crate::storage::{FileStorage, StorageBackend};
+        use crate::{ExecuteRequest, ExecutionOutcome};
+
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let config = crate::config::Config::parse(
+            r#"
+[[sheets_pins]]
+spreadsheet_id = "solo-marketing-fixture"
+read_ranges = ["Pipeline!A1:Z100"]
+write_ranges = ["Pipeline!A:Z"]
+
+[[policies]]
+name = "permissive-sheets"
+credential_pattern = "sheets-*"
+default_action = "deny"
+
+[[policies.rules]]
+action = "allow"
+condition = { action_match = "sheets.*" }
+"#,
+        )
+        .expect("operator config parses");
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            FileStorage::new(
+                &dir.path().join("store.enc"),
+                &secrecy::SecretString::from("test-password"),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut cred = credential();
+        cred.alias = "sheets-google".to_string();
+        storage.store(&cred).await.unwrap();
+        let (_full, token) = UseToken::create(NewUseToken {
+            name: "sheets-token".to_string(),
+            credential_scope: "sheets-google".to_string(),
+            action_scope: Some("sheets.read".to_string()),
+            max_uses: None,
+            require_approval: false,
+            expires_in: None,
+        });
+        storage.store_use_token(&token).await.unwrap();
+        let resolver = crate::router::CredentialResolver::new(storage.clone());
+        let server = VultrinoServer::new(config, storage, resolver);
+
+        let run = |spreadsheet: &str| ExecuteRequest {
+            credential: "sheets-google".to_string(),
+            action: "sheets.read".to_string(),
+            params: read_params(&base_url, spreadsheet, "Pipeline!A1:Z100"),
+        };
+
+        let refused = server
+            .execute_gated(
+                run("attacker-spreadsheet"),
+                ExecAuth::from_use_token(token.clone()),
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "a foreign spreadsheet must be refused on the execute path"
+        );
+        assert!(
+            hits.lock().is_empty(),
+            "the foreign spreadsheet must never reach the upstream: {:?}",
+            hits.lock()
+        );
+
+        // Positive control: the same token, policy and credential reach the
+        // upstream for the operator-pinned spreadsheet, so the refusal above is
+        // the pin and not an unrelated denial.
+        let allowed = server
+            .execute_gated(run(PINNED_SPREADSHEET), ExecAuth::from_use_token(token))
+            .await;
+        assert!(
+            matches!(allowed, Ok(ExecutionOutcome::Completed(_))),
+            "pinned spreadsheet must execute, got {allowed:?}"
+        );
+        assert_eq!(hits.lock().len(), 1);
     }
 }

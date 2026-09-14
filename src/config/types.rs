@@ -40,6 +40,31 @@ pub struct RawConfig {
     /// (plan 103 D8/F8). Absent/empty → the plugin refuses every call.
     #[serde(default)]
     pub internal_destinations: Vec<RawInternalDestination>,
+    /// Operator-pinned spreadsheets and A1 ranges for the typed `sheets`
+    /// plugin (plan 106 G1b). Absent/empty → the plugin refuses every call.
+    #[serde(default)]
+    pub sheets_pins: Vec<RawSheetsPin>,
+}
+
+/// TOML shape for `[[sheets_pins]]` (plan 106 G1b).
+///
+/// ```toml
+/// [[sheets_pins]]
+/// spreadsheet_id = "solo-marketing-fixture"
+/// read_ranges = ["Brand!A1:Z100", "Sources!A1:Z100"]
+/// write_ranges = ["Pipeline!A:Z"]
+/// ```
+///
+/// Every field is OPERATOR authority; values are validated strictly (no
+/// trimming, no case folding) at config load.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSheetsPin {
+    pub spreadsheet_id: String,
+    #[serde(default)]
+    pub read_ranges: Vec<String>,
+    #[serde(default)]
+    pub write_ranges: Vec<String>,
 }
 
 /// TOML shape for `[[internal_destinations]]` (plan 103 D8/F8).
