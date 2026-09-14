@@ -643,6 +643,193 @@ impl Plugin for WasmPlugin {
 mod tests {
     use super::*;
 
+    // --- Egress-confinement pins (INV-15 / plan 104 G10) ---------------------
+    //
+    // These tests instantiate hand-written hostile WAT guests directly against
+    // the same `Engine`/`Linker`/`Store` construction the production runtime
+    // uses (`WasmtimeRuntime::create_store` / `create_linker`, exercised via
+    // the private methods below since these tests live inside this module),
+    // bypassing the higher-level plugin ABI so the assertions land squarely on
+    // the WASI import-resolution and capability boundary itself: a plugin
+    // that imports a socket or filesystem function, or an arbitrary unknown
+    // host function, and a legitimate plugin that only uses an allowed import.
+    //
+    // WASI preview1 errno numbers below are read off
+    // `wasmtime-wasi-47.0.4/witx/p1/typenames.witx`'s `$errno` enum (a fixed,
+    // 0-indexed list): badf = 8, notsock = 57. Asserting the exact numeric
+    // errno (not just `is_err()`) pins the failure to a specific WASI error
+    // class rather than "something went wrong".
+
+    /// WASI errno `badf` (bad file descriptor) -- returned when a call names an
+    /// fd that has no descriptor at all, which is what happens to every
+    /// `path_open` call here: `create_store` preopens nothing.
+    const ERRNO_BADF: i32 = 8;
+    /// WASI errno `notsock` -- what wasmtime-wasi's p1 socket shims
+    /// unconditionally return; they are stub implementations that never touch
+    /// a real socket regardless of any `WasiCtx` configuration.
+    const ERRNO_NOTSOCK: i32 = 57;
+
+    /// Instantiate `wat` against the production store/linker construction and
+    /// return the typed `() -> i32` probe export named `func_name`.
+    fn probe(rt: &WasmtimeRuntime, wat: &str, func_name: &str) -> i32 {
+        let module = Module::new(&rt.engine, wat).expect("hostile module must parse");
+        let linker = rt.create_linker().expect("linker");
+        let mut store = rt.create_store();
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("module with only WASI imports must link");
+        let f = instance
+            .get_typed_func::<(), i32>(&mut store, func_name)
+            .expect("probe export must exist");
+        f.call(&mut store, ()).expect("probe call must not trap")
+    }
+
+    const HOSTILE_SOCKET_WAT: &str = r#"
+        (module
+          (import "wasi_snapshot_preview1" "sock_accept" (func $sock_accept (param i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "sock_recv" (func $sock_recv (param i32 i32 i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "sock_send" (func $sock_send (param i32 i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "sock_shutdown" (func $sock_shutdown (param i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          ;; fd 1 (stdout) is the only non-empty descriptor `create_store` ever
+          ;; hands out (no `inherit_stdio`), so it is a deterministic, valid,
+          ;; non-socket fd to probe with.
+          (func (export "probe_sock_accept") (result i32)
+            (call $sock_accept (i32.const 1) (i32.const 0) (i32.const 400)))
+          (func (export "probe_sock_recv") (result i32)
+            (call $sock_recv (i32.const 1) (i32.const 100) (i32.const 1) (i32.const 0) (i32.const 200) (i32.const 204)))
+          (func (export "probe_sock_send") (result i32)
+            (call $sock_send (i32.const 1) (i32.const 100) (i32.const 1) (i32.const 0) (i32.const 200)))
+          (func (export "probe_sock_shutdown") (result i32)
+            (call $sock_shutdown (i32.const 1) (i32.const 0))))
+    "#;
+
+    #[test]
+    fn hostile_socket_imports_link_but_never_perform_real_io() {
+        // Case (a): socket imports resolve (wasmtime-wasi registers them), but
+        // calling any of them returns WASI errno `notsock` -- the p1 socket
+        // shims are unconditionally unimplemented stubs, so a hostile guest
+        // can never reach an actual socket through this ABI.
+        let rt = WasmtimeRuntime::new().expect("runtime");
+        for func in [
+            "probe_sock_accept",
+            "probe_sock_recv",
+            "probe_sock_send",
+            "probe_sock_shutdown",
+        ] {
+            let errno = probe(&rt, HOSTILE_SOCKET_WAT, func);
+            assert_eq!(
+                errno, ERRNO_NOTSOCK,
+                "{func} must return errno notsock (57), got {errno}; a value of \
+                 0 would mean the call actually performed socket I/O"
+            );
+        }
+    }
+
+    const HOSTILE_PATH_WAT: &str = r#"
+        (module
+          (import "wasi_snapshot_preview1" "path_open" (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 300) "/etc/hosts")
+          (data (i32.const 320) "../../../etc/passwd")
+          ;; fd 3 is the conventional first preopened-directory slot in WASI
+          ;; tooling; `create_store` preopens nothing, so it names no descriptor
+          ;; at all regardless of the path text that follows it.
+          (func (export "probe_absolute") (result i32)
+            (call $path_open (i32.const 3) (i32.const 0) (i32.const 300) (i32.const 10) (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 500)))
+          (func (export "probe_traversal") (result i32)
+            (call $path_open (i32.const 3) (i32.const 0) (i32.const 320) (i32.const 20) (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 500))))
+    "#;
+
+    #[test]
+    fn path_open_on_absolute_and_traversal_paths_fails_closed() {
+        // Case (b): an absolute path and a `../` traversal both fail with WASI
+        // errno `badf`, because `create_store` preopens zero directories --
+        // there is no directory descriptor to resolve *any* path against, so
+        // the property holds independent of path content or sanitization.
+        for (func, path_desc) in [
+            ("probe_absolute", "/etc/hosts"),
+            ("probe_traversal", "../../../etc/passwd"),
+        ] {
+            let rt = WasmtimeRuntime::new().expect("runtime");
+            let errno = probe(&rt, HOSTILE_PATH_WAT, func);
+            assert_eq!(
+                errno, ERRNO_BADF,
+                "path_open({path_desc:?}) must return errno badf (8), got {errno}; \
+                 a value of 0 would mean the plugin opened a real file"
+            );
+        }
+    }
+
+    const UNKNOWN_IMPORT_WAT: &str = r#"
+        (module
+          (import "env" "steal_credentials" (func $steal (param i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "probe") (result i32)
+            (call $steal (i32.const 0))))
+    "#;
+
+    #[test]
+    fn unknown_host_import_is_rejected_at_link_time() {
+        // Case (c): a module importing a host function the linker never
+        // registered (neither WASI nor a vultrino host capability) must fail
+        // to *link* -- the wasmtime `unknown import` error class, not a runtime
+        // trap and not a generic error swallowed behind `is_err()`.
+        let rt = WasmtimeRuntime::new().expect("runtime");
+        let module = Module::new(&rt.engine, UNKNOWN_IMPORT_WAT).expect("module must parse");
+        let linker = rt.create_linker().expect("linker");
+        let mut store = rt.create_store();
+
+        let err = linker
+            .instantiate(&mut store, &module)
+            .expect_err("a module importing an unregistered host function must not link");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown import"),
+            "expected a wasmtime unknown-import link error, got: {msg}"
+        );
+        assert!(
+            msg.contains("env") && msg.contains("steal_credentials"),
+            "error should name the rejected import, got: {msg}"
+        );
+    }
+
+    const ALLOWED_IMPORT_WAT: &str = r#"
+        (module
+          (import "wasi_snapshot_preview1" "random_get" (func $random_get (param i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "probe") (result i32)
+            (call $random_get (i32.const 0) (i32.const 16))))
+    "#;
+
+    #[test]
+    fn positive_control_plugin_with_only_allowed_imports_loads_and_runs() {
+        // Case (d): a module whose only import is a genuinely allowed WASI
+        // capability (no filesystem/network access needed) links and its
+        // host call succeeds, so cases (a)-(c) are failing because of what
+        // they import, not because this harness rejects every module.
+        let rt = WasmtimeRuntime::new().expect("runtime");
+        let module = Module::new(&rt.engine, ALLOWED_IMPORT_WAT).expect("module must parse");
+        let linker = rt.create_linker().expect("linker");
+        let mut store = rt.create_store();
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("a module using only allowed imports must link");
+        let f = instance
+            .get_typed_func::<(), i32>(&mut store, "probe")
+            .expect("probe export must exist");
+        let errno = f.call(&mut store, ()).expect("probe call must not trap");
+        assert_eq!(errno, 0, "random_get must succeed (errno 0), got {errno}");
+
+        let memory = instance.get_memory(&mut store, "memory").expect("memory");
+        let mut buf = [0u8; 16];
+        memory.read(&store, 0, &mut buf).expect("read memory");
+        assert_ne!(
+            buf, [0u8; 16],
+            "random_get(buf, 16) with errno 0 must have written real bytes"
+        );
+    }
+
     const LOOP_WAT: &str = r#"
         (module
           (memory (export "memory") 1)
