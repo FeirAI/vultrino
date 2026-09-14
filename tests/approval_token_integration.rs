@@ -6082,3 +6082,151 @@ async fn test_approval_window_is_unchanged_for_a_non_expiring_token() {
         "an unbounded credential must leave the configured window intact"
     );
 }
+
+/// Declare `buffer.<action>` reversible so a gated typed Buffer request reaches
+/// approval-open on the ordinary numeric path (no Govder wired in this suite).
+/// The Buffer plugin is registered by `VultrinoServer::new`; no request in these
+/// tests is ever dispatched, so nothing contacts an upstream.
+async fn declare_reversible_buffer_capability(storage: &Arc<dyn StorageBackend>, action: &str) {
+    storage
+        .store_capability(&vultrino::capability::Capability {
+            id: format!("cap-fixture-buffer-{action}"),
+            tool_name: format!("buffer_{action}"),
+            description: "typed Buffer fixture; never dispatched in this suite".to_string(),
+            action: format!("buffer.{action}"),
+            plugin: None,
+            target: vultrino::capability::CapabilityTarget::default(),
+            credential_ref: "*".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            reversibility: "reversible".to_string(),
+            llm: None,
+            approval_preview: None,
+        })
+        .await
+        .unwrap();
+}
+
+fn valid_buffer_draft_params() -> serde_json::Value {
+    serde_json::json!({
+        "base_url": "https://api.buffer.com",
+        "channel_id": "channel-1",
+        "account_id": "account-1",
+        "text": "hello",
+        "media_hash": "media-1",
+        "content_hash": "a".repeat(64),
+        "row_version": "1",
+        "due_at": "2026-10-01T09:00:00Z",
+    })
+}
+
+async fn one_use_approval_token(storage: &Arc<dyn StorageBackend>) -> UseToken {
+    let (_plaintext, token) = UseToken::create(NewUseToken {
+        name: "buffer-drafter".to_string(),
+        credential_scope: "buffer-cred".to_string(),
+        action_scope: Some("buffer.draft".to_string()),
+        max_uses: Some(1),
+        require_approval: true,
+        expires_in: None,
+    });
+    storage.store_use_token(&token).await.unwrap();
+    token
+}
+
+/// Plan 106 B2: typed plugin validation must run before approval-open reserves the
+/// bearer use or persists an approval. A request whose typed params can never
+/// execute must be refused up front with the same invalid-params error the
+/// execution path returns, leaving the one-use token spendable and no approval
+/// in front of a human.
+#[tokio::test]
+async fn typed_validation_failure_opens_no_approval_and_spends_no_use() {
+    for (case, mutate) in [
+        (
+            "bad content_hash",
+            Box::new(|p: &mut serde_json::Value| {
+                p["content_hash"] = serde_json::json!("not-a-hash");
+            }) as Box<dyn Fn(&mut serde_json::Value)>,
+        ),
+        (
+            "unknown field",
+            Box::new(|p: &mut serde_json::Value| {
+                p["graphql"] = serde_json::json!("mutation { deletePost }");
+            }),
+        ),
+        (
+            "empty frozen field",
+            Box::new(|p: &mut serde_json::Value| {
+                p["text"] = serde_json::json!("");
+            }),
+        ),
+    ] {
+        let (server, storage) = setup().await;
+        store_credential(&storage, "buffer-cred", true).await;
+        declare_reversible_buffer_capability(&storage, "draft").await;
+        let token = one_use_approval_token(&storage).await;
+
+        let mut params = valid_buffer_draft_params();
+        mutate(&mut params);
+        let result = server
+            .execute_gated(
+                ExecuteRequest {
+                    credential: "buffer-cred".to_string(),
+                    action: "buffer.draft".to_string(),
+                    params,
+                },
+                ExecAuth::from_use_token(token.clone()),
+            )
+            .await;
+        match result {
+            Err(vultrino::VultrinoError::Plugin(PluginError::InvalidParams(_))) => {}
+            Err(other) => panic!("{case}: expected InvalidParams refusal, got error {other}"),
+            Ok(ExecutionOutcome::Pending(approval)) => panic!(
+                "{case}: invalid typed params opened approval {} instead of being refused",
+                approval.id
+            ),
+            Ok(ExecutionOutcome::Completed(_)) => panic!("{case}: invalid typed params executed"),
+        }
+        assert!(
+            storage.list_approvals().await.unwrap().is_empty(),
+            "{case}: no approval may be stored for params that can never execute"
+        );
+        let after = storage.get_use_token(&token.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.uses, 0,
+            "{case}: refused typed params must not reserve the one-use token"
+        );
+    }
+}
+
+/// Positive control for the test above: the same gated typed request with valid
+/// params still opens exactly one approval and reserves the bearer use.
+#[tokio::test]
+async fn typed_validation_success_still_opens_approval_and_reserves_use() {
+    let (server, storage) = setup().await;
+    store_credential(&storage, "buffer-cred", true).await;
+    declare_reversible_buffer_capability(&storage, "draft").await;
+    let token = one_use_approval_token(&storage).await;
+
+    let outcome = server
+        .execute_gated(
+            ExecuteRequest {
+                credential: "buffer-cred".to_string(),
+                action: "buffer.draft".to_string(),
+                params: valid_buffer_draft_params(),
+            },
+            ExecAuth::from_use_token(token.clone()),
+        )
+        .await
+        .unwrap();
+    let approval = match outcome {
+        ExecutionOutcome::Pending(approval) => approval,
+        ExecutionOutcome::Completed(_) => panic!("expected an approval, the action ran"),
+    };
+    let stored = storage.list_approvals().await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, approval.id);
+    let after = storage.get_use_token(&token.id).await.unwrap().unwrap();
+    assert_eq!(
+        after.uses, 1,
+        "approval-open reserves exactly one bearer use"
+    );
+}
