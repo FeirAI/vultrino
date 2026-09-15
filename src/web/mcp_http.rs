@@ -171,6 +171,47 @@ fn inject_bearer(message: &mut serde_json::Value, secret: &str) {
     }
 }
 
+/// Strip the transport-injected `api_key` advertisement from an HTTP
+/// `tools/list` response.
+///
+/// Over this transport the caller's credential is supplied by the
+/// `Authorization: Bearer` header and spliced into the JSON-RPC body by
+/// [`inject_bearer`] — the agent never holds or passes it. But the shared
+/// stdio handler's `tools/list` schemas still declare `api_key` as a required
+/// `inputSchema` property on every tool, because a genuine *stdio* client
+/// really does pass its secret in the body. Advertising that same
+/// requirement to an HTTP agent is actively harmful: an LLM reading the
+/// schema sees a required field it has no value for and refuses to call the
+/// tool it was already authenticated for. This function edits only the
+/// outgoing RESPONSE for this transport's advertisement — it never touches
+/// `inject_bearer`, the request body, or `execute_gated`, which still
+/// receives (and still requires) the header-injected `api_key` exactly as
+/// before. Enforcement is unchanged; only what the agent is told is required
+/// changes.
+fn hide_api_key_from_tools_list(result: &mut serde_json::Value) {
+    let Some(tools) = result.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return;
+    };
+    for tool in tools {
+        let Some(schema) = tool.get_mut("inputSchema").and_then(|s| s.as_object_mut()) else {
+            continue;
+        };
+        if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            props.remove("api_key");
+        }
+        let required_now_empty = match schema.get_mut("required").and_then(|r| r.as_array_mut()) {
+            Some(arr) => {
+                arr.retain(|v| v.as_str() != Some("api_key"));
+                arr.is_empty()
+            }
+            None => false,
+        };
+        if required_now_empty {
+            schema.remove("required");
+        }
+    }
+}
+
 /// Get (creating if needed) the named object field of `message`, returning a
 /// mutable handle to its map.
 fn ensure_object<'a>(
@@ -414,7 +455,7 @@ pub async fn mcp_jsonrpc(
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     let tracked = id != serde_json::Value::Null && method != "initialize" && method != "ping";
-    let response = if tracked {
+    let mut response = if tracked {
         let key = request_key(&secret, &id);
         let (start_tx, start_rx) = oneshot::channel();
         let requests = Arc::clone(&state.mcp_requests);
@@ -454,6 +495,14 @@ pub async fn mcp_jsonrpc(
         let mut mcp = McpServer::new(Arc::clone(&state.server), Arc::clone(&state.auth_manager));
         mcp.handle_jsonrpc(&message_str).await
     };
+    // Advertisement-only: this transport authenticates via the header Bearer
+    // (see `inject_bearer` above), so an HTTP `tools/list` must not tell the
+    // agent it still needs to supply `api_key` itself.
+    if method == "tools/list" {
+        if let Some(result) = response.as_mut().and_then(|r| r.result.as_mut()) {
+            hide_api_key_from_tools_list(result);
+        }
+    }
     match response {
         // A normal JSON-RPC response (success OR a JSON-RPC error like a denied
         // tools/call) is HTTP 200 with the JSON-RPC body — the transport
