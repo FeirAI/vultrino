@@ -735,6 +735,75 @@ async fn http_tools_call_plugin_tool_name_blocked_for_use_token() {
 }
 
 #[tokio::test]
+async fn http_tools_list_never_advertises_api_key() {
+    // The HTTP transport authenticates via the header Bearer and injects it
+    // server-side (`inject_bearer`) — an agent over this transport must never be
+    // told it needs to supply `api_key` itself, or an LLM reading the schema
+    // refuses to call a tool it is already authenticated for (observed live with
+    // Codex/gpt-5.4-mini). Covers a capability tool (operator-declared schema),
+    // a built-in tool (check_approval), and any plugin tools present.
+    let (router, storage) =
+        build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
+    store_credential(&storage, "cred-sendgrid").await;
+    register_send_email(&storage, "cred-sendgrid").await;
+    let token = mint_token(&storage, "cred-sendgrid", Some("http.request"), None, None).await;
+
+    let resp = router
+        .oneshot(mcp_req(
+            Some(&token),
+            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let value = body_value(resp).await;
+    let tools = value["result"]["tools"].as_array().unwrap();
+    assert!(!tools.is_empty(), "expected at least one tool: {value:?}");
+
+    for tool in tools {
+        let schema = &tool["inputSchema"];
+        assert!(
+            schema["properties"]["api_key"].is_null(),
+            "tool {:?} must not advertise api_key over HTTP: {schema:?}",
+            tool["name"]
+        );
+        let required = schema["required"].as_array();
+        if let Some(required) = required {
+            assert!(
+                !required.iter().any(|v| v.as_str() == Some("api_key")),
+                "tool {:?} must not require api_key over HTTP: {schema:?}",
+                tool["name"]
+            );
+        }
+    }
+
+    // The operator-declared property on the capability schema survives: only
+    // `api_key` is stripped, not the tool's real contract.
+    let send_email = tools.iter().find(|t| t["name"] == "send_email").unwrap();
+    assert!(
+        send_email["inputSchema"]["properties"]["body"].is_object(),
+        "operator-declared properties must survive the api_key strip: {send_email:?}"
+    );
+    let required = send_email["inputSchema"]["required"]
+        .as_array()
+        .expect("required must remain a valid array after stripping api_key");
+    assert!(required.iter().any(|v| v == "body"));
+}
+
+// Note: two related HTTP behaviors are already exercised elsewhere and are not
+// duplicated here:
+//   - `http_tools_call_runs_enforced_path` calls `tools/call` with arguments
+//     that omit `api_key` entirely and still reaches the gated execute path —
+//     proving `inject_bearer` alone is sufficient for enforcement over HTTP.
+//   - `http_header_token_is_authoritative_over_body_token` proves a body
+//     `api_key`/`token` different from the header is still overwritten by the
+//     header secret (list AND call).
+// Stdio's `tools/list` schema keeping `api_key` (unchanged, since this fix is
+// HTTP-transport-only) is proven by
+// `capability_mcp_integration::allowed_principal_sees_capability_in_tools_list`
+// and by `capability::tests::test_mcp_input_schema_injects_api_key`.
+
+#[tokio::test]
 async fn official_client_handshake_shape_negotiates_and_accepts_notification_without_id() {
     let (router, storage) =
         build_router_with(config_with_policies(vec![allow_policy("cred-*")])).await;
