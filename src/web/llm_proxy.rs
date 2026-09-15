@@ -189,12 +189,40 @@ fn llm_error(status: StatusCode, kind: &str, message: &str) -> Response {
         .into_response()
 }
 
+/// Which output-token field to SET when a request names NONE of the known ones, for the
+/// given provider `protocol` / resolved `upstream` URL. OpenAI's **Responses API**
+/// (`/v1/responses`) reads `max_output_tokens`, not `max_tokens` — an injected `max_tokens`
+/// there is an unrecognized field the provider may simply ignore, so the per-call ceiling
+/// would silently NOT apply (the defect this function closes). Keyed primarily on
+/// `protocol` (authoritative: it is the capability's configured provider family, not
+/// agent-controlled), with a path-suffix fallback so a Responses call is still caught
+/// even if `protocol` were ever something other than `"openai-responses"` (e.g. routed
+/// through a generic/observed protocol whose upstream still ends in `/responses`). Every
+/// other routed protocol/path (openai-chat, azure-openai, anthropic-messages, nvidia,
+/// legacy `/v1/completions`) uses `max_tokens`, unchanged from prior behavior.
+fn default_output_token_field(protocol: &str, upstream: &str) -> &'static str {
+    let path = upstream
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(upstream)
+        .trim_end_matches('/');
+    if protocol == "openai-responses" || path.ends_with("/responses") {
+        "max_output_tokens"
+    } else {
+        "max_tokens"
+    }
+}
+
 /// Bound a request's TOTAL output-token cost to the per-call `ceiling`. This is the
 /// enforceable substitute for a SpendCap on the LLM channel (which fails closed on a
 /// request with no request-time spend), so it must bound EVERY way a request can multiply
 /// output: the scalar limit fields, the choice-multiplicity fields, and the legacy
 /// completions prompt-array (one completion per prompt). A non-object body is untouched.
-fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64) {
+/// `default_field` is the field NAME to insert when the request names none of the known
+/// output-token fields (see [`default_output_token_field`]) — it must be one of
+/// `OUTPUT_TOKEN_FIELDS` below so the inserted field is itself recognized as "present" by
+/// any later call.
+fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64, default_field: &str) {
     // Every provider-supported output-token field the proxy routes to, so the per-call
     // ceiling cannot be evaded by naming an alternate field: `max_tokens` (OpenAI chat +
     // legacy + Anthropic), `max_completion_tokens` (newer OpenAI chat models), and
@@ -237,12 +265,13 @@ fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64) {
                 obj.insert((*field).to_string(), serde_json::json!(clamped));
             }
         }
-        // The request named NO output-token field → set the common one so the provider
-        // default can't exceed the bound. Don't inject a second field when the client
-        // already chose one (a newer chat model rejects `max_tokens` if it wanted
-        // `max_completion_tokens`).
+        // The request named NO output-token field → set the one this protocol/upstream
+        // actually reads so the provider default can't exceed the bound. Don't inject a
+        // second field when the client already chose one (a newer chat model rejects
+        // `max_tokens` if it wanted `max_completion_tokens`; the Responses API does not
+        // read `max_tokens` at all).
         if !any_present {
-            obj.insert("max_tokens".to_string(), serde_json::json!(per_unit));
+            obj.insert(default_field.to_string(), serde_json::json!(per_unit));
         }
     }
 }
@@ -497,7 +526,8 @@ async fn llm_proxy_impl(
     //     buffered and streaming paths forward — `stream:true` can NOT evade the cap.
     if let Some(ceiling) = capability.llm_max_output_tokens() {
         if let Some(body) = request_body.as_mut() {
-            clamp_max_output_tokens(body, ceiling);
+            let default_field = default_output_token_field(&llm.protocol, &upstream);
+            clamp_max_output_tokens(body, ceiling, default_field);
         }
     }
 
@@ -692,8 +722,8 @@ async fn llm_proxy_impl(
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_max_output_tokens, is_openai_chat_endpoint, normalize_nvidia_tool_stream_options,
-        provider_feature_enabled,
+        clamp_max_output_tokens, default_output_token_field, is_openai_chat_endpoint,
+        normalize_nvidia_tool_stream_options, provider_feature_enabled,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -750,7 +780,7 @@ mod tests {
     #[test]
     fn clamps_an_over_ceiling_request_down() {
         let mut body = json!({ "model": "gpt-4o", "max_tokens": 5000 });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["max_tokens"], json!(1000));
     }
 
@@ -759,7 +789,7 @@ mod tests {
         // The ceiling must not be evadable by naming an alternate output-token field.
         // max_completion_tokens (newer OpenAI chat):
         let mut body = json!({ "model": "gpt-5", "max_completion_tokens": 9000 });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["max_completion_tokens"], json!(1000));
         assert!(
             body.get("max_tokens").is_none(),
@@ -767,13 +797,13 @@ mod tests {
         );
         // max_output_tokens (OpenAI /v1/responses):
         let mut body = json!({ "model": "o3", "max_output_tokens": 9000 });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["max_output_tokens"], json!(1000));
         assert!(body.get("max_tokens").is_none());
         // All present → all clamped.
         let mut body =
             json!({ "max_tokens": 9000, "max_completion_tokens": 8000, "max_output_tokens": 7000 });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["max_tokens"], json!(1000));
         assert_eq!(body["max_completion_tokens"], json!(1000));
         assert_eq!(body["max_output_tokens"], json!(1000));
@@ -784,21 +814,21 @@ mod tests {
         // n / best_of multiply TOTAL output tokens, so under a configured ceiling they must
         // be pinned to 1 (else max_tokens:1000,n:10 produces ~10x the per-call bound).
         let mut body = json!({ "max_tokens": 1000, "n": 10 });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["n"], json!(1), "n>1 evades the per-call ceiling");
         let mut body = json!({ "max_tokens": 1000, "best_of": 8 });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["best_of"], json!(1));
         // Non-numeric multiplicity fails closed to 1.
         let mut body = json!({ "max_tokens": 1000, "n": "lots" });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["n"], json!(1));
         // n:1 is left as-is; absent n is not injected.
         let mut body = json!({ "max_tokens": 1000, "n": 1 });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["n"], json!(1));
         let mut body = json!({ "max_tokens": 1000 });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert!(
             body.get("n").is_none(),
             "don't inject n when the request didn't ask for choices"
@@ -811,7 +841,7 @@ mod tests {
         // multiplies total output. The per-prompt budget must be divided by the count so
         // count * per_prompt <= ceiling.
         let mut body = json!({ "prompt": ["a", "b", "c", "d"], "max_tokens": 1000 });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(
             body["max_tokens"],
             json!(250),
@@ -819,11 +849,11 @@ mod tests {
         );
         // A scalar prompt is one unit (full ceiling).
         let mut body = json!({ "prompt": "just one", "max_tokens": 5000 });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["max_tokens"], json!(1000));
         // Absent max_tokens with a prompt array → set to the divided per-prompt budget.
         let mut body = json!({ "prompt": ["a", "b"] });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["max_tokens"], json!(500));
     }
 
@@ -897,7 +927,7 @@ mod tests {
     #[test]
     fn leaves_an_under_ceiling_request_unchanged() {
         let mut body = json!({ "model": "gpt-4o", "max_tokens": 200 });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["max_tokens"], json!(200));
     }
 
@@ -906,14 +936,68 @@ mod tests {
         // The dangerous case: an absent max_tokens lets the provider default (often
         // very large) blow the per-call cost bound. We must SET it to the ceiling.
         let mut body = json!({ "model": "gpt-4o", "messages": [] });
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body["max_tokens"], json!(1000));
     }
 
     #[test]
     fn ignores_a_non_object_body() {
         let mut body = json!("not an object");
-        clamp_max_output_tokens(&mut body, 1000);
+        clamp_max_output_tokens(&mut body, 1000, "max_tokens");
         assert_eq!(body, json!("not an object"));
+    }
+
+    #[test]
+    fn responses_traffic_defaults_to_max_output_tokens_field() {
+        // Protocol is authoritative.
+        assert_eq!(
+            default_output_token_field("openai-responses", "https://api.openai.com/v1/responses"),
+            "max_output_tokens"
+        );
+        // Path-suffix fallback catches a Responses upstream even if `protocol` were ever
+        // something other than the exact "openai-responses" string.
+        assert_eq!(
+            default_output_token_field("openai-chat", "https://api.openai.com/v1/responses"),
+            "max_output_tokens"
+        );
+        // Chat/completions and every other routed protocol keep max_tokens.
+        assert_eq!(
+            default_output_token_field("openai-chat", "https://api.openai.com/v1/chat/completions"),
+            "max_tokens"
+        );
+        assert_eq!(
+            default_output_token_field(
+                "anthropic-messages",
+                "https://api.anthropic.com/v1/messages"
+            ),
+            "max_tokens"
+        );
+    }
+
+    #[test]
+    fn sets_max_output_tokens_for_a_responses_body_that_omits_an_output_limit() {
+        // The Codex-harness defect this test locks down: a Responses-shaped request
+        // (no max_tokens/max_completion_tokens/max_output_tokens) routed to /v1/responses
+        // must get `max_output_tokens` set to the ceiling, NOT `max_tokens` (which the
+        // Responses API does not read, so the per-call ceiling would silently not apply).
+        let mut body = json!({ "model": "gpt-5-codex", "input": "hi" });
+        let field =
+            default_output_token_field("openai-responses", "https://api.openai.com/v1/responses");
+        clamp_max_output_tokens(&mut body, 1000, field);
+        assert_eq!(body["max_output_tokens"], json!(1000));
+        assert!(
+            body.get("max_tokens").is_none(),
+            "must not inject max_tokens for Responses traffic"
+        );
+    }
+
+    #[test]
+    fn clamps_a_present_over_ceiling_max_output_tokens_on_responses_traffic() {
+        let mut body = json!({ "model": "gpt-5-codex", "input": "hi", "max_output_tokens": 9000 });
+        let field =
+            default_output_token_field("openai-responses", "https://api.openai.com/v1/responses");
+        clamp_max_output_tokens(&mut body, 1000, field);
+        assert_eq!(body["max_output_tokens"], json!(1000));
+        assert!(body.get("max_tokens").is_none());
     }
 }

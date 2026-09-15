@@ -559,10 +559,16 @@ the buffered-vs-streaming branch, so a `{"stream": true}` request cannot evade i
 - **Model allowlist:** when the capability restricts models, the body's `model` must
   be allowed (an allowlisted channel with no parseable `model` fails closed) — else
   `403 permission_error`.
-- **Output-token clamp:** under a configured per-call ceiling, `max_tokens` /
-  `max_completion_tokens` / `max_output_tokens` are clamped (and set when absent),
-  and `n`/`best_of`/legacy prompt-array multiplicity is pinned so the ceiling can't
-  be multiplied around.
+- **Output-token clamp:** under a configured per-call ceiling, any of `max_tokens` /
+  `max_completion_tokens` / `max_output_tokens` present in the body are clamped, and
+  `n`/`best_of`/legacy prompt-array multiplicity is pinned so the ceiling can't be
+  multiplied around. When the body names NONE of those fields, one is set to the
+  ceiling — `max_output_tokens` for OpenAI Responses traffic (protocol
+  `openai-responses`, or an upstream path ending in `/responses`), `max_tokens` for
+  every other routed protocol (chat/completions, Azure OpenAI, Anthropic, NVIDIA).
+  The Responses API does not read `max_tokens`, so injecting the wrong field would
+  leave the per-call ceiling unenforced on a Responses request that omits its own
+  limit.
 - **Streaming:** `{"stream": true}` is forwarded incrementally as
   `text/event-stream` when `[llm_proxy] streaming_enabled` is on (default); when off,
   the stream flags are stripped and the turn is served buffered. Bounded by stream
