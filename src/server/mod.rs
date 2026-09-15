@@ -834,8 +834,12 @@ impl VultrinoServer {
         )));
         // Typed marketing connectors. Their capability target parameters pin
         // the upstream endpoint and account/range identifiers; the plugins do
-        // not accept caller-supplied HTTP methods or GraphQL documents.
-        plugins.register(Arc::new(crate::plugins::SheetsPlugin::new()));
+        // not accept caller-supplied HTTP methods or GraphQL documents. The
+        // Sheets adapter also enforces the operator's `[[sheets_pins]]` itself
+        // (plan 106 G1b); with none declared it refuses every call.
+        plugins.register(Arc::new(crate::plugins::SheetsPlugin::new(
+            config.sheets_pins.clone(),
+        )));
         plugins.register(Arc::new(crate::plugins::BufferPlugin::new()));
         // Typed Solo-project coordination operations. This keeps learner,
         // Calendar, and outbound-message destinations inside provider-specific

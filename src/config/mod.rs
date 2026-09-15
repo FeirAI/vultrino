@@ -2,8 +2,10 @@
 //!
 //! Loads configuration from TOML files and environment variables.
 
+mod sheets;
 mod types;
 
+pub use sheets::{A1Range, SheetsPin, MAX_SHEETS_ROW};
 pub use types::*;
 
 use crate::policy::Policy;
@@ -91,6 +93,10 @@ pub struct Config {
     /// vultrino with no declared destination fails, it does not fall back to the
     /// `http` plugin.
     pub internal_destinations: Vec<InternalDestination>,
+    /// Operator-pinned spreadsheets and A1 ranges for the typed `sheets` plugin
+    /// (plan 106 G1b). Empty = the plugin is registered but refuses every call:
+    /// the adapter never falls back to "any spreadsheet" when unconfigured.
+    pub sheets_pins: Vec<SheetsPin>,
 }
 
 /// One operator-pinned internal destination (plan 103 D8/F8), validated at
@@ -684,6 +690,26 @@ impl Config {
             internal_destinations.push(dest);
         }
 
+        // Operator-pinned Sheets targets (plan 106 G1b). A malformed pin is a
+        // startup failure; a duplicate spreadsheet id is ambiguous and refused.
+        let mut sheets_pins: Vec<SheetsPin> = Vec::new();
+        for raw_pin in raw.sheets_pins {
+            let read: Vec<&str> = raw_pin.read_ranges.iter().map(String::as_str).collect();
+            let write: Vec<&str> = raw_pin.write_ranges.iter().map(String::as_str).collect();
+            let pin = SheetsPin::parse(&raw_pin.spreadsheet_id, &read, &write)
+                .map_err(ConfigError::Invalid)?;
+            if sheets_pins
+                .iter()
+                .any(|p| p.spreadsheet_id == pin.spreadsheet_id)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "sheets_pins: duplicate spreadsheet_id '{}'",
+                    pin.spreadsheet_id
+                )));
+            }
+            sheets_pins.push(pin);
+        }
+
         Ok(Self {
             server,
             storage,
@@ -712,6 +738,7 @@ impl Config {
                 .transpose()?
                 .unwrap_or_default(),
             internal_destinations,
+            sheets_pins,
         })
     }
 
@@ -736,6 +763,7 @@ impl Config {
             govder: None,
             averin: crate::averin::AverinConfig::default(),
             internal_destinations: vec![],
+            sheets_pins: vec![],
         }
     }
 

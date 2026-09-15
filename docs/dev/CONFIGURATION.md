@@ -222,6 +222,42 @@ action = "http.request"      # the canonical plugin.action it resolves to
 `plugin.action`; a label may not equal its own target, duplicate another label, or
 shadow another mapping's target.
 
+### `[[sheets_pins]]`: spreadsheet and range pins for the `sheets` plugin (plan 106 G1b)
+
+```toml
+[[sheets_pins]]
+spreadsheet_id = "solo-marketing-fixture"
+read_ranges  = ["Brand!A1:Z100", "Sources!A1:Z100", "Campaigns!A1:Z100", "Pipeline!A1:Z100"]
+write_ranges = ["Pipeline!A:Z"]
+```
+
+The typed `sheets` adapter enforces these pins itself, independent of any
+capability schema `const`. Every check runs before credential refresh and before
+any upstream request, on the preflight (`validate_params`) and again in `execute`.
+
+| Key | Notes |
+|-----|-------|
+| `spreadsheet_id` | Exact id, `[A-Za-z0-9_-]`, 1-128 chars, compared byte-for-byte. Duplicate ids are a load error. |
+| `read_ranges` | Ranges `sheets.read` may name, exact match only. `append_draft` also reads `Sources!A1:F100` internally, so that span must lie inside one of these or append is refused. |
+| `write_ranges` | Ranges `append_draft` / `revise_draft` may name, exact match only. A read range is not a write range. A revision's derived row write (`Sheet!A{n}:W{n}`, starting at the range's first row and column) must lie inside the named write range. |
+
+**Fail closed:**
+- **No `[[sheets_pins]]` (the default):** the plugin is still registered, but it
+  refuses every Sheets call. It never falls back to "any spreadsheet".
+- **A pin with no ranges at all:** load error.
+- **Range spelling is strict**, at load time and at request time. Allowed forms
+  are `Sheet!A1:Z100` or `Sheet!A:Z`, with an unquoted `[A-Za-z0-9_-]` sheet
+  name, uppercase column letters and rows without a leading zero. These are
+  refused, not normalized:
+  - lowercase or case-variant sheet names or columns (Sheets matches sheet
+    names case-insensitively)
+  - whitespace, `$` absolute refs, quoted sheet names, a second `!`
+  - R1C1 notation, a bare sheet name, single cells, row-only spans
+  - percent-encoding
+  - a range wider or narrower than the pin
+
+  Sheet names containing spaces cannot be pinned.
+
 ### `[outbox]` — signed event outbox + meter feed (V9)
 
 ```toml
