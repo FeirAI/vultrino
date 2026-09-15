@@ -844,7 +844,11 @@ impl VultrinoServer {
         // Typed Solo-project coordination operations. This keeps learner,
         // Calendar, and outbound-message destinations inside provider-specific
         // adapters while the policy layer presents one `solo.*` write domain.
-        plugins.register(Arc::new(crate::plugins::SoloPlugin::new()));
+        // The adapter enforces the operator's `[solo_pins]` spreadsheet and
+        // Calendar ids itself; with none declared it refuses those calls.
+        plugins.register(Arc::new(crate::plugins::SoloPlugin::new(
+            config.solo_pins.clone(),
+        )));
         let policy_engine = Arc::new(PolicyEngine::new());
         let auth_manager = Arc::new(AuthManager::new());
 

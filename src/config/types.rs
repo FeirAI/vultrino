@@ -44,6 +44,28 @@ pub struct RawConfig {
     /// plugin (plan 106 G1b). Absent/empty → the plugin refuses every call.
     #[serde(default)]
     pub sheets_pins: Vec<RawSheetsPin>,
+    /// Operator-pinned learner spreadsheet ids and Calendar ids for the typed
+    /// `solo` plugin. Absent/empty → every solo Sheets/Calendar call is refused.
+    pub solo_pins: Option<RawSoloPins>,
+}
+
+/// TOML shape for `[solo_pins]`.
+///
+/// ```toml
+/// [solo_pins]
+/// learner_spreadsheet_ids = ["solo-learner-fixture"]
+/// calendar_ids = ["solo-calendar-fixture"]
+/// ```
+///
+/// Separate from `[[sheets_pins]]` on purpose: neither section authorizes the
+/// other plugin. Values are validated strictly (no trimming, no case folding).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSoloPins {
+    #[serde(default)]
+    pub learner_spreadsheet_ids: Vec<String>,
+    #[serde(default)]
+    pub calendar_ids: Vec<String>,
 }
 
 /// TOML shape for `[[sheets_pins]]` (plan 106 G1b).

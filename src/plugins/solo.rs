@@ -5,6 +5,7 @@
 //! capability surface.
 
 use super::{Plugin, PluginError, PluginRequest};
+use crate::config::SoloPins;
 use crate::{Credential, CredentialData, CredentialType, ExecuteResponse, Secret};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -14,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const SHEETS_BASE_URL: &str = "https://sheets.googleapis.com/";
 const CALENDAR_BASE_URL: &str = "https://www.googleapis.com/calendar/v3/";
@@ -208,7 +210,12 @@ fn validate_optional_text(
 }
 
 fn validate_base_url(raw: &str, expected: &str) -> Result<Url, PluginError> {
-    if raw != expected {
+    // Unit tests only: a loopback mock upstream stands in for Google so the
+    // adapter can be exercised end to end without live calls.
+    let test_loopback = cfg!(test)
+        && Url::parse(raw)
+            .is_ok_and(|url| url.scheme() == "http" && url.host_str() == Some("127.0.0.1"));
+    if raw != expected && !test_loopback {
         return Err(invalid(format!("base_url must be exactly {expected}")));
     }
     Url::parse(raw).map_err(|_| invalid("base_url is not a valid HTTPS URL"))
@@ -760,10 +767,43 @@ fn parse_params<T: for<'de> Deserialize<'de>>(params: &Value) -> Result<T, Plugi
     serde_json::from_value(params.clone()).map_err(|error| invalid(error.to_string()))
 }
 
-fn validate_typed(action: &str, params: &Value) -> Result<(), PluginError> {
+fn pin_refusal(message: &str) -> PluginError {
+    PluginError::InvalidParams(format!("solo pin: {message}"))
+}
+
+/// The spreadsheet id must byte-exactly equal an operator `[solo_pins]`
+/// learner spreadsheet id. Runs before format checks, credential use, or I/O.
+fn require_pinned_spreadsheet(pins: &SoloPins, spreadsheet_id: &str) -> Result<(), PluginError> {
+    if pins.learner_spreadsheet_ids.is_empty() {
+        return Err(pin_refusal(
+            "no learner spreadsheet is operator-pinned ([solo_pins] learner_spreadsheet_ids is empty); every solo Sheets call is refused",
+        ));
+    }
+    if !pins.allows_learner_spreadsheet(spreadsheet_id) {
+        return Err(pin_refusal("spreadsheet_id is not operator-pinned"));
+    }
+    Ok(())
+}
+
+/// The Calendar id must byte-exactly equal an operator `[solo_pins]` Calendar
+/// id. Runs before format checks, credential use, or I/O.
+fn require_pinned_calendar(pins: &SoloPins, calendar_id: &str) -> Result<(), PluginError> {
+    if pins.calendar_ids.is_empty() {
+        return Err(pin_refusal(
+            "no calendar is operator-pinned ([solo_pins] calendar_ids is empty); every solo Calendar call is refused",
+        ));
+    }
+    if !pins.allows_calendar(calendar_id) {
+        return Err(pin_refusal("calendar_id is not operator-pinned"));
+    }
+    Ok(())
+}
+
+fn validate_typed(pins: &SoloPins, action: &str, params: &Value) -> Result<(), PluginError> {
     match action {
         "learner_read" => {
             let p: LearnerReadParams = parse_params(params)?;
+            require_pinned_spreadsheet(pins, &p.spreadsheet_id)?;
             validate_sheet_params(&p.base_url, &p.spreadsheet_id)?;
             if !matches!(
                 p.range.as_str(),
@@ -775,21 +815,28 @@ fn validate_typed(action: &str, params: &Value) -> Result<(), PluginError> {
             }
             Ok(())
         }
-        "attendance_update" => validate_attendance_update(&parse_params(params)?),
+        "attendance_update" => {
+            let p: AttendanceUpdateParams = parse_params(params)?;
+            require_pinned_spreadsheet(pins, &p.spreadsheet_id)?;
+            validate_attendance_update(&p)
+        }
         "session_list" => {
             let p: SessionListParams = parse_params(params)?;
+            require_pinned_calendar(pins, &p.calendar_id)?;
             validate_calendar_base(&p.base_url, &p.calendar_id)?;
             validate_text("timezone", &p.timezone, 128)?;
             validate_window(&p.time_min, &p.time_max)
         }
         "availability_check" => {
             let p: AvailabilityCheckParams = parse_params(params)?;
+            require_pinned_calendar(pins, &p.calendar_id)?;
             validate_calendar_base(&p.base_url, &p.calendar_id)?;
             validate_text("timezone", &p.timezone, 128)?;
             validate_window(&p.time_min, &p.time_max)
         }
         "session_create" => {
             let p: SessionCreateParams = parse_params(params)?;
+            require_pinned_calendar(pins, &p.calendar_id)?;
             validate_calendar_base(&p.base_url, &p.calendar_id)?;
             validate_session_fields(
                 &p.session_id,
@@ -804,6 +851,7 @@ fn validate_typed(action: &str, params: &Value) -> Result<(), PluginError> {
         }
         "session_update" => {
             let p: SessionUpdateParams = parse_params(params)?;
+            require_pinned_calendar(pins, &p.calendar_id)?;
             validate_calendar_base(&p.base_url, &p.calendar_id)?;
             validate_id("event_id", &p.event_id)?;
             validate_text("expected_etag", &p.expected_etag, 1024)?;
@@ -820,6 +868,7 @@ fn validate_typed(action: &str, params: &Value) -> Result<(), PluginError> {
         }
         "session_cancel" => {
             let p: SessionCancelParams = parse_params(params)?;
+            require_pinned_calendar(pins, &p.calendar_id)?;
             validate_calendar_base(&p.base_url, &p.calendar_id)?;
             validate_id("event_id", &p.event_id)?;
             validate_text("expected_etag", &p.expected_etag, 1024)?;
@@ -836,20 +885,32 @@ fn validate_typed(action: &str, params: &Value) -> Result<(), PluginError> {
 
 pub struct SoloPlugin {
     client: Client,
+    /// Operator pins from `[solo_pins]`. Empty = every Sheets/Calendar call is refused.
+    pins: Arc<SoloPins>,
 }
 
 impl SoloPlugin {
-    pub fn new() -> Self {
+    /// Build the adapter over the operator's pins. Empty pins are legal and
+    /// mean every Sheets and Calendar call is refused (fail closed).
+    pub fn new(pins: SoloPins) -> Self {
+        Self::with_client(crate::plugins::build_guarded_client(), pins)
+    }
+
+    fn with_client(client: Client, pins: SoloPins) -> Self {
         Self {
-            client: crate::plugins::build_guarded_client(),
+            client,
+            pins: Arc::new(pins),
         }
     }
 
     async fn execute_typed(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
-        validate_typed(&request.action, &request.params)?;
+        validate_typed(&self.pins, &request.action, &request.params)?;
+        // Every Sheets/Calendar arm re-checks its operator pin immediately
+        // after parsing: before credential refresh and before any request.
         match request.action.as_str() {
             "learner_read" => {
                 let p: LearnerReadParams = parse_params(&request.params)?;
+                require_pinned_spreadsheet(&self.pins, &p.spreadsheet_id)?;
                 let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let (_credential, updated, token) =
                     effective_google_credential(&self.client, &request.credential).await?;
@@ -866,6 +927,7 @@ impl SoloPlugin {
             }
             "attendance_update" => {
                 let p: AttendanceUpdateParams = parse_params(&request.params)?;
+                require_pinned_spreadsheet(&self.pins, &p.spreadsheet_id)?;
                 let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let expected = validate_expected_row_version(&p.expected_row_version)?;
                 let (_credential, updated, token) =
@@ -963,6 +1025,7 @@ impl SoloPlugin {
             }
             "session_list" => {
                 let p: SessionListParams = parse_params(&request.params)?;
+                require_pinned_calendar(&self.pins, &p.calendar_id)?;
                 let base = validate_base_url(&p.base_url, CALENDAR_BASE_URL)?;
                 let (_, updated, token) =
                     effective_google_credential(&self.client, &request.credential).await?;
@@ -987,6 +1050,7 @@ impl SoloPlugin {
             }
             "availability_check" => {
                 let p: AvailabilityCheckParams = parse_params(&request.params)?;
+                require_pinned_calendar(&self.pins, &p.calendar_id)?;
                 let base = validate_base_url(&p.base_url, CALENDAR_BASE_URL)?;
                 let (_, updated, token) =
                     effective_google_credential(&self.client, &request.credential).await?;
@@ -1011,6 +1075,7 @@ impl SoloPlugin {
             }
             "session_create" => {
                 let p: SessionCreateParams = parse_params(&request.params)?;
+                require_pinned_calendar(&self.pins, &p.calendar_id)?;
                 let base = validate_base_url(&p.base_url, CALENDAR_BASE_URL)?;
                 let (_, updated, token) =
                     effective_google_credential(&self.client, &request.credential).await?;
@@ -1039,6 +1104,7 @@ impl SoloPlugin {
             }
             "session_update" => {
                 let p: SessionUpdateParams = parse_params(&request.params)?;
+                require_pinned_calendar(&self.pins, &p.calendar_id)?;
                 let base = validate_base_url(&p.base_url, CALENDAR_BASE_URL)?;
                 let (_, updated, token) =
                     effective_google_credential(&self.client, &request.credential).await?;
@@ -1077,6 +1143,7 @@ impl SoloPlugin {
             }
             "session_cancel" => {
                 let p: SessionCancelParams = parse_params(&request.params)?;
+                require_pinned_calendar(&self.pins, &p.calendar_id)?;
                 let base = validate_base_url(&p.base_url, CALENDAR_BASE_URL)?;
                 let (_, updated, token) =
                     effective_google_credential(&self.client, &request.credential).await?;
@@ -1166,8 +1233,9 @@ impl SoloPlugin {
 }
 
 impl Default for SoloPlugin {
+    /// No pins: every Sheets and Calendar call is refused.
     fn default() -> Self {
-        Self::new()
+        Self::new(SoloPins::default())
     }
 }
 
@@ -1199,7 +1267,7 @@ impl Plugin for SoloPlugin {
     }
 
     fn validate_params(&self, action: &str, params: &Value) -> Result<(), PluginError> {
-        validate_typed(action, params)
+        validate_typed(&self.pins, action, params)
     }
 }
 
@@ -1211,6 +1279,17 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
+
+    /// The pre-pin unit tests below target these ids; this shim keeps their
+    /// field-validation meaning while the adapter now requires pins.
+    fn validate_typed(action: &str, params: &Value) -> Result<(), PluginError> {
+        let pins = SoloPins::parse(
+            &["sheet-1".to_string()],
+            &["calendar@example.com".to_string()],
+        )
+        .unwrap();
+        super::validate_typed(&pins, action, params)
+    }
 
     fn valid_session(action: &str) -> Value {
         let common = json!({
@@ -1238,7 +1317,7 @@ mod tests {
 
     #[test]
     fn supported_action_and_credential_sets_are_exact() {
-        let plugin = SoloPlugin::new();
+        let plugin = SoloPlugin::default();
         assert_eq!(
             plugin.supported_actions(),
             vec![
@@ -1575,5 +1654,340 @@ mod tests {
         .unwrap();
         assert_eq!(delete.response.status, 200);
         assert_eq!(&*methods.lock().unwrap(), &["GET", "DELETE"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The adapter itself pins spreadsheet and Calendar ids from `[solo_pins]`.
+    // -----------------------------------------------------------------------
+
+    const PINNED_SHEET: &str = "solo-learner-fixture";
+    const PINNED_CALENDAR: &str = "solo-calendar-fixture";
+    const SHEET_ACTIONS: &[&str] = &["learner_read", "attendance_update"];
+    const CALENDAR_ACTIONS: &[&str] = &[
+        "session_list",
+        "availability_check",
+        "session_create",
+        "session_update",
+        "session_cancel",
+    ];
+
+    type Hits = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// A loopback upstream that records EVERY request. GETs answer with a body
+    /// that satisfies both the Attendance CAS read and the Calendar binding
+    /// read. An empty `Hits` after a call proves no outbound request was made.
+    async fn recording_solo_server() -> (String, Hits) {
+        let hits: Hits = Arc::new(Mutex::new(Vec::new()));
+        let recorded = hits.clone();
+        let app =
+            Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((method.to_string(), uri.to_string()));
+                    if method == axum::http::Method::GET {
+                        Json(json!({
+                            "values": [
+                                ["attendance_id", "learner_id", "session_id", "cohort_id",
+                                 "status", "confirmed_at", "notes", "row_version",
+                                 "updated_at", "updated_by"],
+                                ["attendance-1", "learner-1", "session-1", "cohort-1",
+                                 "Pending", "", "", "1", "", ""]
+                            ],
+                            "etag": "\"etag-1\"",
+                            "extendedProperties": {"private": {
+                                "feir_session_id": "session-1",
+                                "feir_cohort_id": "cohort-1"
+                            }}
+                        }))
+                    } else {
+                        Json(json!({"ok": true}))
+                    }
+                }
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/"), hits)
+    }
+
+    fn fixture_pins() -> SoloPins {
+        SoloPins::parse(&[PINNED_SHEET.to_string()], &[PINNED_CALENDAR.to_string()]).unwrap()
+    }
+
+    fn pinned_plugin() -> SoloPlugin {
+        SoloPlugin::with_client(Client::new(), fixture_pins())
+    }
+
+    fn unpinned_plugin() -> SoloPlugin {
+        SoloPlugin::with_client(Client::new(), SoloPins::default())
+    }
+
+    /// Fresh access token: no OAuth refresh request is ever needed.
+    fn fresh_google_credential() -> Credential {
+        Credential::new(
+            "google".into(),
+            CredentialData::OAuth2 {
+                client_id: "client".into(),
+                client_secret: Secret::new("client-secret"),
+                refresh_token: None,
+                access_token: Some(Secret::new("access")),
+                expires_at: None,
+                token_url: GOOGLE_TOKEN_URL.into(),
+                scopes: vec![],
+            },
+        )
+    }
+
+    /// Valid params for `action` against the mock upstream, targeting `id`
+    /// (a spreadsheet id for Sheets actions, a Calendar id otherwise).
+    fn action_params(action: &str, base_url: &str, id: &str) -> Value {
+        let window = json!({
+            "base_url": base_url,
+            "calendar_id": id,
+            "time_min": "2026-09-07T10:00:00Z",
+            "time_max": "2026-09-07T11:00:00Z",
+            "timezone": "Europe/Lisbon"
+        });
+        match action {
+            "learner_read" => json!({
+                "base_url": base_url,
+                "spreadsheet_id": id,
+                "range": LEARNERS_RANGE
+            }),
+            "attendance_update" => json!({
+                "base_url": base_url,
+                "spreadsheet_id": id,
+                "range": ATTENDANCE_RANGE,
+                "attendance_id": "attendance-1",
+                "learner_id": "learner-1",
+                "session_id": "session-1",
+                "cohort_id": "cohort-1",
+                "expected_row_version": "1",
+                "status": "Confirmed"
+            }),
+            "session_list" | "availability_check" => window,
+            "session_create" | "session_update" => {
+                let mut params = valid_session(action);
+                params["base_url"] = json!(base_url);
+                params["calendar_id"] = json!(id);
+                params
+            }
+            "session_cancel" => json!({
+                "base_url": base_url,
+                "calendar_id": id,
+                "event_id": "event-1",
+                "expected_etag": "\"etag-1\"",
+                "session_id": "session-1",
+                "cohort_id": "cohort-1"
+            }),
+            other => panic!("no fixture params for {other}"),
+        }
+    }
+
+    async fn run_solo(
+        plugin: &SoloPlugin,
+        action: &str,
+        params: Value,
+    ) -> Result<ExecuteResponse, PluginError> {
+        plugin
+            .execute(PluginRequest {
+                credential: fresh_google_credential(),
+                action: action.into(),
+                params,
+                context: crate::RequestContext::default(),
+            })
+            .await
+    }
+
+    /// Both the preflight (`validate_params`) and a DIRECT `execute` refuse,
+    /// and the upstream saw nothing.
+    async fn assert_refused_without_network(
+        plugin: &SoloPlugin,
+        hits: &Hits,
+        action: &str,
+        params: Value,
+        why: &str,
+    ) {
+        let preflight = plugin.validate_params(action, &params);
+        assert!(
+            matches!(&preflight, Err(PluginError::InvalidParams(m)) if m.starts_with("solo pin:")),
+            "{action} preflight must refuse {why} with a pin error, got {preflight:?}"
+        );
+        let result = run_solo(plugin, action, params).await;
+        assert!(
+            matches!(&result, Err(PluginError::InvalidParams(m)) if m.starts_with("solo pin:")),
+            "{action} execute must refuse {why} with a pin error, got {result:?}"
+        );
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "{action} must make no outbound request for {why}: {:?}",
+            hits.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn solo_sheet_actions_refuse_a_foreign_spreadsheet_before_network() {
+        let (base_url, hits) = recording_solo_server().await;
+        let plugin = pinned_plugin();
+        for action in SHEET_ACTIONS {
+            for foreign in [
+                "attacker-spreadsheet",
+                "Solo-learner-fixture",
+                "solo-learner-fixture ",
+                " solo-learner-fixture",
+                "solo-learner-fixture/values/Secrets!A1:Z9?x=",
+                "solo-learner-fixture%2F..",
+                // A pinned CALENDAR id never authorizes a spreadsheet.
+                PINNED_CALENDAR,
+            ] {
+                assert_refused_without_network(
+                    &plugin,
+                    &hits,
+                    action,
+                    action_params(action, &base_url, foreign),
+                    &format!("foreign spreadsheet {foreign:?}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn solo_calendar_actions_refuse_a_foreign_calendar_before_network() {
+        let (base_url, hits) = recording_solo_server().await;
+        let plugin = pinned_plugin();
+        for action in CALENDAR_ACTIONS {
+            for foreign in [
+                "attacker@example.com",
+                "primary",
+                "Solo-calendar-fixture",
+                "solo-calendar-fixture ",
+                "solo-calendar-fixture/events",
+                "solo-calendar-fixture%40x",
+                // A pinned SPREADSHEET id never authorizes a Calendar.
+                PINNED_SHEET,
+            ] {
+                assert_refused_without_network(
+                    &plugin,
+                    &hits,
+                    action,
+                    action_params(action, &base_url, foreign),
+                    &format!("foreign calendar {foreign:?}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn solo_with_no_pin_config_refuses_every_sheet_and_calendar_action_before_network() {
+        let (base_url, hits) = recording_solo_server().await;
+        let plugin = unpinned_plugin();
+        for action in SHEET_ACTIONS {
+            assert_refused_without_network(
+                &plugin,
+                &hits,
+                action,
+                action_params(action, &base_url, PINNED_SHEET),
+                "a call with no operator pin configured",
+            )
+            .await;
+        }
+        for action in CALENDAR_ACTIONS {
+            assert_refused_without_network(
+                &plugin,
+                &hits,
+                action,
+                action_params(action, &base_url, PINNED_CALENDAR),
+                "a call with no operator pin configured",
+            )
+            .await;
+        }
+        // The server wiring default is the same fail-closed posture.
+        let default_plugin = SoloPlugin::default();
+        for action in SHEET_ACTIONS {
+            assert!(default_plugin
+                .validate_params(
+                    action,
+                    &action_params(action, SHEETS_BASE_URL, PINNED_SHEET)
+                )
+                .is_err());
+        }
+        for action in CALENDAR_ACTIONS {
+            assert!(default_plugin
+                .validate_params(
+                    action,
+                    &action_params(action, CALENDAR_BASE_URL, PINNED_CALENDAR)
+                )
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn solo_pinned_ids_still_work_for_every_action_family() {
+        let expected: &[(&str, &str, &[&str], &str)] = &[
+            (
+                "learner_read",
+                PINNED_SHEET,
+                &["GET"],
+                "/v4/spreadsheets/solo-learner-fixture/values/Learners",
+            ),
+            (
+                "attendance_update",
+                PINNED_SHEET,
+                &["GET", "PUT"],
+                "/v4/spreadsheets/solo-learner-fixture/values/Attendance",
+            ),
+            (
+                "session_list",
+                PINNED_CALENDAR,
+                &["GET"],
+                "/calendars/solo-calendar-fixture/events",
+            ),
+            (
+                "availability_check",
+                PINNED_CALENDAR,
+                &["POST"],
+                "/freeBusy",
+            ),
+            (
+                "session_create",
+                PINNED_CALENDAR,
+                &["POST"],
+                "/calendars/solo-calendar-fixture/events",
+            ),
+            (
+                "session_update",
+                PINNED_CALENDAR,
+                &["GET", "PATCH"],
+                "/calendars/solo-calendar-fixture/events/event-1",
+            ),
+            (
+                "session_cancel",
+                PINNED_CALENDAR,
+                &["GET", "DELETE"],
+                "/calendars/solo-calendar-fixture/events/event-1",
+            ),
+        ];
+        for (action, id, methods, path_prefix) in expected {
+            let (base_url, hits) = recording_solo_server().await;
+            let plugin = pinned_plugin();
+            let params = action_params(action, &base_url, id);
+            plugin.validate_params(action, &params).unwrap();
+            let response = run_solo(&plugin, action, params).await.unwrap();
+            assert_eq!(response.status, 200, "{action}");
+            let hits = hits.lock().unwrap();
+            let seen: Vec<&str> = hits.iter().map(|(m, _)| m.as_str()).collect();
+            assert_eq!(&seen, methods, "{action}: {hits:?}");
+            assert!(
+                hits.iter().all(|(_, uri)| uri.starts_with(path_prefix)),
+                "{action}: {hits:?}"
+            );
+        }
     }
 }
