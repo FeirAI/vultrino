@@ -1524,6 +1524,25 @@ impl VultrinoServer {
                 ));
             }
 
+            // Typed plugin validation runs before any approval-open side effect:
+            // before the Govder recipe fetch, the use-token reservation, approval
+            // persistence, notifications, and the outbox event. Params that the
+            // execution path would refuse as permanently invalid can never run,
+            // so they must not burn a one-use bearer or put an approval in front
+            // of a human. The plugin is resolved from the SAME `plugin_name` and
+            // `action_name` that `run_action` / `run_action_streaming` and
+            // approval resume dispatch, and the error is the same permanent
+            // `PluginError::InvalidParams` class. The execution-path check stays
+            // as defense in depth. A plugin that is not loaded right now keeps the
+            // prior semantics (the approval opens and a resume preflight treats
+            // `NotFound` as retryable); nothing can dispatch without passing the
+            // execution-path validation, so this does not open a bypass.
+            if let Some(plugin) = self.plugins.get(plugin_name) {
+                plugin
+                    .validate_params(action_name, &request.params)
+                    .map_err(VultrinoError::from)?;
+            }
+
             // Open an approval request. Bearer capacity is converted into the
             // durable exact-request grant below, before the request is published.
             // The criticality class (V5) drives the escalation/expiry SLA windows.
