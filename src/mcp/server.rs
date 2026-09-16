@@ -303,7 +303,7 @@ impl McpServer {
     /// understand it is blocked and exactly how to retrieve the result later.
     fn format_pending(approval: &crate::approval::ApprovalRequest) -> String {
         format!(
-            "\u{23F3} APPROVAL REQUIRED — this action has NOT run yet.\n\n\
+            "\u{23F3} APPROVAL REQUIRED - this action has NOT run yet.\n\n\
              Your request ({summary}) needs a human to approve it before Vultrino will execute it. \
              No result is available yet, and nothing has changed on the target system.\n\n\
              approval_id: {id}\n\
@@ -311,9 +311,9 @@ impl McpServer {
              expires: {expires}\n\n\
              HOW TO PROCEED:\n\
              1. Call the `check_approval` tool with approval_id \"{id}\", re-presenting the same \
-             credential (API key or use token) you made this request with — only that same \
+             credential (API key or use token) you made this request with. Only that same \
              principal may poll this approval.\n\
-             2. If it returns \"pending\", a human has not decided yet — wait about 10-30 seconds, \
+             2. If it returns \"pending\", a human has not decided yet. Wait about 10-30 seconds, \
              then call `check_approval` again.\n\
              3. Once approved, `check_approval` will run the action and return the real result.\n\
              4. If denied or expired, `check_approval` will tell you, and you should not retry.",

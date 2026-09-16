@@ -2832,7 +2832,7 @@ async fn make_request_via_api(
         let message = result["message"]
             .as_str()
             .unwrap_or("This action requires human approval before it runs.");
-        eprintln!("[~] APPROVAL REQUIRED — the action has NOT run.");
+        eprintln!("[~] APPROVAL REQUIRED - the action has NOT run.");
         eprintln!("    {}", message);
         if !approval_id.is_empty() {
             eprintln!("    approval_id: {}", approval_id);

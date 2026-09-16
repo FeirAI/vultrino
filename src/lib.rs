@@ -868,7 +868,7 @@ impl ExecutionOutcome {
                     "approval_id": approval.id,
                     "message": format!(
                         "This action requires human approval before it runs. It has NOT executed. \
-                         To get the result, poll this approval by its approval_id '{id}' — \
+                         To get the result, poll this approval by its approval_id '{id}', \
                          e.g. `vultrino approval status {id}` (CLI), the `check_approval` tool (MCP), \
                          or GET /api/v1/approvals/{id} (HTTP API). It stays pending until approved \
                          or it expires at {expires}.",
