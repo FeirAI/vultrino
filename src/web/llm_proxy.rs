@@ -641,8 +641,10 @@ async fn llm_proxy_impl(
                 ),
             ),
             // A policy/rate/budget denial is a 403 authorization decision, not an upstream outage.
-            Err(crate::VultrinoError::PolicyDenied(_)) => {
-                tracing::info!("LLM proxy stream request denied by policy");
+            Err(crate::VultrinoError::PolicyDenied(reason)) => {
+                // The reason stays server-side (operator log + the detect event); the agent-facing
+                // body below is deliberately detail-free.
+                tracing::info!(reason = %reason, "LLM proxy stream request denied by policy");
                 llm_error(
                     StatusCode::FORBIDDEN,
                     "permission_error",
@@ -695,8 +697,8 @@ async fn llm_proxy_impl(
         // A policy/rate/budget DENIAL is an authorization decision, not an upstream outage — surface it
         // as 403 (matching the explicit 403s above), detail-free, so operators don't read denials as
         // provider flakiness. The server-side detect-event + counters still fire.
-        Err(crate::VultrinoError::PolicyDenied(_)) => {
-            tracing::info!("LLM proxy request denied by policy");
+        Err(crate::VultrinoError::PolicyDenied(reason)) => {
+            tracing::info!(reason = %reason, "LLM proxy request denied by policy");
             llm_error(
                 StatusCode::FORBIDDEN,
                 "permission_error",
