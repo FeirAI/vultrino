@@ -53,6 +53,11 @@ hex = "0.4"
 subtle = "2"  # Constant-time comparison for security
 k256 = { version = "0.14", features = ["ecdsa", "ecdsa-core", "schnorr"] }  # ECDSA secp256k1
 sha3 = "0.12"  # Keccak256 for Ethereum
+# RSASSA-PKCS1-v1_5 SHA-256 signing of the PKCS#8 service-account key that mints
+# a Google service-account access token (plugins::google_sa). Already in the
+# lockfile as rustls' crypto provider, so promoting it to a direct dependency
+# adds no new crate: the Cargo.lock delta is one line.
+ring = "0.17"
 
 # WASM runtime for plugins (optional so Kani 0.67's rustc 1.93 can verify
 # pure-kernel harnesses without pulling wasmtime's rustc-1.94 MSRV).

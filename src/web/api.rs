@@ -4307,6 +4307,20 @@ pub async fn api_create_credential(
                 serde_json::json!({"code":"invalid_credential","error":"alias must not be empty"}),
             );
         }
+        // Seed-time admission. The blank-field/deep shape checks otherwise only
+        // run at vault OPEN, which is far too late: a credential that cannot be
+        // used would be accepted here, written to the encrypted file, and only
+        // refused on the next restart. For the types that carry deep rules
+        // (today: google_service_account's pinned endpoint, service-account
+        // address, scope allowlist and PKCS#8 RSA key) that refusal belongs at
+        // the seed call, where the operator is still watching. The message is a
+        // fixed string and never quotes the submitted material.
+        if let Err(reason) = req.data.validate_admission() {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"code":"invalid_credential","error":reason}),
+            );
+        }
         let mut cred = Credential::new(req.alias, req.data);
         cred.metadata = req.metadata;
         // Warn if a secret is below the byte-redaction floor. Execution remains
@@ -4888,6 +4902,102 @@ mod tests {
             Some(&"application/json".to_string())
         );
         assert!(request.body.is_some());
+    }
+
+    /// `POST /api/v1/credentials` is the seed-time gate. The request body is
+    /// Google's downloaded key file plus `type` and `scopes`, and the handler
+    /// admits it only if `validate_admission` passes: the same check that runs
+    /// again at vault open and at use time.
+    #[test]
+    fn google_service_account_create_request_is_gated_at_seed_time() {
+        let pem = crate::plugins::google_sa::tests::test_key_pem();
+        let envelope = |token_uri: &str, scope: &str| {
+            serde_json::json!({
+                "alias": "cred-google-sheets",
+                "metadata": {"tenant": "solo"},
+                "data": {
+                    "type": "google_service_account",
+                    "client_email": "solo@feir-demo.iam.gserviceaccount.com",
+                    "private_key": pem,
+                    "private_key_id": "0123456789abcdef0123456789abcdef01234567",
+                    "token_uri": token_uri,
+                    "scopes": [scope],
+                    "project_id": "feir-demo-471212",
+                    "universe_domain": "googleapis.com"
+                }
+            })
+            .to_string()
+        };
+
+        let good: CredentialCreateRequest = serde_json::from_str(&envelope(
+            crate::plugins::google_sa::GOOGLE_TOKEN_URI,
+            "https://www.googleapis.com/auth/spreadsheets",
+        ))
+        .expect("the documented envelope is the create body");
+        assert_eq!(good.alias, "cred-google-sheets");
+        assert!(
+            good.data.validate_admission().is_ok(),
+            "a well-formed service-account envelope is admitted"
+        );
+
+        // Each of these is refused with a 400 before anything reaches storage.
+        for (token_uri, scope) in [
+            (
+                "https://evil.example/token",
+                "https://www.googleapis.com/auth/spreadsheets",
+            ),
+            (
+                crate::plugins::google_sa::GOOGLE_TOKEN_URI,
+                "https://www.googleapis.com/auth/drive",
+            ),
+        ] {
+            let bad: CredentialCreateRequest =
+                serde_json::from_str(&envelope(token_uri, scope)).unwrap();
+            let reason = bad
+                .data
+                .validate_admission()
+                .expect_err("the create gate refuses it");
+            assert!(
+                !reason.contains("BEGIN PRIVATE KEY"),
+                "the 400 body must not echo key material"
+            );
+        }
+    }
+
+    /// The list projection is metadata-only by construction: there is no field
+    /// on `CredentialInfo` that could carry the service-account key.
+    #[test]
+    fn google_service_account_read_back_carries_no_key_material() {
+        let pem = crate::plugins::google_sa::tests::test_key_pem();
+        let body = pem.lines().nth(1).expect("the PEM has a body line");
+        let data = crate::CredentialData::GoogleServiceAccount {
+            client_email: "solo@feir-demo.iam.gserviceaccount.com".into(),
+            private_key: crate::Secret::new(pem),
+            private_key_id: "kid-1".into(),
+            token_uri: crate::plugins::google_sa::GOOGLE_TOKEN_URI.into(),
+            scopes: vec!["https://www.googleapis.com/auth/spreadsheets".into()],
+            access_token: Some(crate::Secret::new("minted-access-token")),
+            expires_at: None,
+        };
+        let cred = Credential::new("cred-google-sheets".into(), data);
+
+        let info = CredentialInfo {
+            internal_binding: InternalBindingInfo::from_metadata(&cred.metadata),
+            id: cred.id.clone(),
+            alias: cred.alias.clone(),
+            credential_type: format!("{:?}", cred.credential_type).to_lowercase(),
+            description: cred.metadata.get("description").cloned(),
+        };
+        let listed = serde_json::to_string(&info).unwrap();
+        let created = serde_json::to_string(&CredentialMetadata::from(&cred)).unwrap();
+        for wire in [&listed, &created] {
+            assert!(!wire.contains(body), "no key body on the wire");
+            assert!(!wire.contains("BEGIN PRIVATE KEY"), "no PEM on the wire");
+            assert!(
+                !wire.contains("minted-access-token"),
+                "no token on the wire"
+            );
+        }
     }
 
     #[test]

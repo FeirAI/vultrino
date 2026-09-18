@@ -704,7 +704,98 @@ async fn refresh_google_token(
     Ok(token)
 }
 
+/// Resolve a Google credential to a usable access token, refreshing or minting
+/// one only when the cached token is within [`token_is_stale`]'s margin.
+///
+/// Two credential shapes reach here and the caller does not care which:
+/// `oauth2` (an installed-app refresh token, whose behaviour is unchanged) and
+/// `google_service_account` (an RSA key that signs its own assertion). Anything
+/// else is refused.
 async fn effective_google_credential(
+    client: &Client,
+    credential: &Credential,
+) -> Result<(Credential, Option<CredentialData>, String), PluginError> {
+    match &credential.data {
+        CredentialData::OAuth2 { .. } => google_oauth_credential(client, credential).await,
+        CredentialData::GoogleServiceAccount { .. } => {
+            google_service_account_credential(client, credential).await
+        }
+        _ => Err(PluginError::UnsupportedCredentialType(
+            "solo Sheets/Calendar actions require oauth2 or google_service_account".into(),
+        )),
+    }
+}
+
+/// Mint a fresh access token from the service-account key, or hand back the
+/// cached one when it is still comfortably in date.
+///
+/// The credential is re-validated here even though the create path already
+/// validated it: use time is the last gate before the private key is exercised,
+/// and the vault is not the only way a record can arrive.
+async fn google_service_account_credential(
+    client: &Client,
+    credential: &Credential,
+) -> Result<(Credential, Option<CredentialData>, String), PluginError> {
+    let CredentialData::GoogleServiceAccount {
+        client_email,
+        private_key,
+        private_key_id,
+        token_uri,
+        scopes,
+        access_token,
+        expires_at,
+    } = &credential.data
+    else {
+        return Err(PluginError::UnsupportedCredentialType(
+            "solo service-account path requires google_service_account".into(),
+        ));
+    };
+    credential
+        .data
+        .validate_admission()
+        .map_err(|reason| invalid(reason.to_string()))?;
+    if !token_is_stale(access_token.as_ref(), *expires_at) {
+        return Ok((
+            credential.clone(),
+            None,
+            access_token.as_ref().unwrap().expose().into(),
+        ));
+    }
+    // validate_admission has already proved this is byte-for-byte the pinned
+    // endpoint, so the parse cannot fail on operator input.
+    let token_url = Url::parse(token_uri)
+        .map_err(|_| invalid("google_service_account token_uri is not a URL"))?;
+    let token = crate::plugins::google_sa::mint_access_token(
+        client,
+        &token_url,
+        client_email,
+        private_key.expose(),
+        private_key_id,
+        scopes,
+    )
+    .await?;
+    let expires_at = token.expires_in.and_then(|seconds| {
+        i64::try_from(seconds)
+            .ok()
+            .and_then(Duration::try_seconds)
+            .and_then(|duration| Utc::now().checked_add_signed(duration))
+    });
+    let updated_data = CredentialData::GoogleServiceAccount {
+        client_email: client_email.clone(),
+        private_key: private_key.clone(),
+        private_key_id: private_key_id.clone(),
+        token_uri: token_uri.clone(),
+        scopes: scopes.clone(),
+        access_token: Some(Secret::new(token.access_token.clone())),
+        expires_at,
+    };
+    let mut effective = credential.clone();
+    effective.data = updated_data.clone();
+    effective.updated_at = Utc::now();
+    Ok((effective, Some(updated_data), token.access_token))
+}
+
+async fn google_oauth_credential(
     client: &Client,
     credential: &Credential,
 ) -> Result<(Credential, Option<CredentialData>, String), PluginError> {
@@ -1246,7 +1337,11 @@ impl Plugin for SoloPlugin {
     }
 
     fn supported_credential_types(&self) -> Vec<CredentialType> {
-        vec![CredentialType::OAuth2, CredentialType::UrlToken]
+        vec![
+            CredentialType::OAuth2,
+            CredentialType::GoogleServiceAccount,
+            CredentialType::UrlToken,
+        ]
     }
 
     fn supported_actions(&self) -> Vec<&str> {
@@ -1334,7 +1429,11 @@ mod tests {
         assert_eq!(plugin.name(), "solo");
         assert_eq!(
             plugin.supported_credential_types(),
-            vec![CredentialType::OAuth2, CredentialType::UrlToken]
+            vec![
+                CredentialType::OAuth2,
+                CredentialType::GoogleServiceAccount,
+                CredentialType::UrlToken
+            ]
         );
     }
 
@@ -1989,5 +2088,349 @@ mod tests {
                 "{action}: {hits:?}"
             );
         }
+    }
+
+    // ---- google_service_account ----------------------------------------
+    //
+    // The mock token endpoint lives on 127.0.0.1, which `build_guarded_client`
+    // deliberately cannot reach (its connect-time resolver keeps public IPs
+    // only). These tests therefore use a client that keeps the one property
+    // under test here (`redirect::Policy::none()`) and drops only the DNS
+    // guard. Production still goes through `build_guarded_client`:
+    // `SoloPlugin::new` is the only constructor the registry calls.
+    fn loopback_client() -> Client {
+        Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test client builds")
+    }
+
+    const SA_EMAIL: &str = "solo@feir-demo.iam.gserviceaccount.com";
+    const SA_KID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn sa_scopes() -> Vec<String> {
+        vec!["https://www.googleapis.com/auth/spreadsheets".to_string()]
+    }
+
+    fn service_account_data(
+        token_uri: &str,
+        access_token: Option<&str>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> CredentialData {
+        CredentialData::GoogleServiceAccount {
+            client_email: SA_EMAIL.into(),
+            private_key: Secret::new(crate::plugins::google_sa::tests::test_key_pem()),
+            private_key_id: SA_KID.into(),
+            token_uri: token_uri.into(),
+            scopes: sa_scopes(),
+            access_token: access_token.map(Secret::new),
+            expires_at,
+        }
+    }
+
+    /// A token endpoint that records every request it receives and answers with
+    /// `reply`. Returns its base URL and the recording.
+    async fn recording_token_server(
+        status: u16,
+        reply: Value,
+    ) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+        let hits: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = hits.clone();
+        let app = Router::new().route(
+            "/{*path}",
+            any(move |request: axum::extract::Request| {
+                let recorder = recorder.clone();
+                let reply = reply.clone();
+                async move {
+                    let uri = request.uri().to_string();
+                    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    recorder
+                        .lock()
+                        .unwrap()
+                        .push((uri, String::from_utf8_lossy(&body).to_string()));
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        Json(reply),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/token"), hits)
+    }
+
+    /// A fresh cached token is handed straight back: no mint, and no credential
+    /// update to persist.
+    #[tokio::test]
+    async fn service_account_reuses_a_cached_token_that_is_not_yet_stale() {
+        let credential = Credential::new(
+            "google".into(),
+            service_account_data(
+                crate::plugins::google_sa::GOOGLE_TOKEN_URI,
+                Some("cached-access-token"),
+                Some(Utc::now() + Duration::seconds(3000)),
+            ),
+        );
+        let (_effective, updated, token) =
+            effective_google_credential(&loopback_client(), &credential)
+                .await
+                .expect("a fresh cached token needs no mint");
+        assert_eq!(token, "cached-access-token");
+        assert!(updated.is_none(), "nothing to persist when nothing changed");
+    }
+
+    /// The refresh margin is the same 300s one the oauth2 path uses, and it is
+    /// evaluated against the credential's own `expires_at` (the clock seam the
+    /// existing tests drive).
+    #[test]
+    fn service_account_cache_uses_the_shared_refresh_margin() {
+        let fresh = Secret::new("cached");
+        assert!(!token_is_stale(
+            Some(&fresh),
+            Some(Utc::now() + Duration::seconds(301))
+        ));
+        assert!(
+            token_is_stale(Some(&fresh), Some(Utc::now() + Duration::seconds(299))),
+            "a token inside the 300s margin is refreshed before it expires"
+        );
+        assert!(token_is_stale(None, Some(Utc::now() + Duration::days(1))));
+    }
+
+    /// Use time re-pins the endpoint: a credential naming any other token_uri is
+    /// refused before the key is touched, and nothing is sent anywhere.
+    #[tokio::test]
+    async fn service_account_use_time_refuses_an_unpinned_token_uri() {
+        let (token_url, hits) = recording_token_server(200, json!({"access_token": "x"})).await;
+        let credential = Credential::new(
+            "google".into(),
+            service_account_data(&token_url, None, None),
+        );
+        let error = effective_google_credential(&loopback_client(), &credential)
+            .await
+            .expect_err("an unpinned token_uri is refused at use time");
+        assert!(
+            error.to_string().contains("token_uri must be exactly"),
+            "{error}"
+        );
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "the mock endpoint must never be contacted"
+        );
+    }
+
+    /// Use time also re-runs the scope allowlist and the service-account address
+    /// check, so a vault record that bypassed the create API still cannot mint.
+    #[tokio::test]
+    async fn service_account_use_time_refuses_a_widened_scope_or_a_human_address() {
+        let pinned = crate::plugins::google_sa::GOOGLE_TOKEN_URI;
+        let mut widened = service_account_data(pinned, None, None);
+        if let CredentialData::GoogleServiceAccount { scopes, .. } = &mut widened {
+            scopes.push("https://www.googleapis.com/auth/drive".into());
+        }
+        let error = effective_google_credential(
+            &loopback_client(),
+            &Credential::new("google".into(), widened),
+        )
+        .await
+        .expect_err("a scope outside the allowlist is refused");
+        assert!(error.to_string().contains("allowlist"), "{error}");
+
+        let mut human = service_account_data(pinned, None, None);
+        if let CredentialData::GoogleServiceAccount { client_email, .. } = &mut human {
+            *client_email = "owner@feir.ai".into();
+        }
+        let error = effective_google_credential(
+            &loopback_client(),
+            &Credential::new("google".into(), human),
+        )
+        .await
+        .expect_err("a non service-account address is refused");
+        assert!(
+            error.to_string().contains("iam.gserviceaccount.com"),
+            "{error}"
+        );
+    }
+
+    /// The mint posts the RFC 7523 grant and a three-part assertion, and nothing
+    /// else, to the endpoint it was given.
+    #[tokio::test]
+    async fn mint_posts_the_jwt_bearer_grant_and_caches_the_result() {
+        let (token_url, hits) = recording_token_server(
+            200,
+            json!({"access_token": "minted-token", "expires_in": 3599, "token_type": "Bearer"}),
+        )
+        .await;
+        let token = crate::plugins::google_sa::mint_access_token(
+            &loopback_client(),
+            &Url::parse(&token_url).unwrap(),
+            SA_EMAIL,
+            crate::plugins::google_sa::tests::test_key_pem(),
+            SA_KID,
+            &sa_scopes(),
+        )
+        .await
+        .expect("the mock endpoint mints a token");
+        assert_eq!(token.access_token, "minted-token");
+        assert_eq!(token.expires_in, Some(3599));
+
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 1, "exactly one token request");
+        let (uri, body) = &hits[0];
+        assert_eq!(uri, "/token");
+        let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("urn:ietf:params:oauth:grant-type:jwt-bearer")
+        );
+        assert_eq!(form.len(), 2, "grant_type and assertion only");
+        let assertion = form.get("assertion").expect("an assertion is posted");
+        assert_eq!(
+            assertion.split('.').count(),
+            3,
+            "the assertion is a compact JWS"
+        );
+    }
+
+    /// A redirect from the token endpoint is a failure, not a second hop: the
+    /// key is never presented to whatever the 302 pointed at.
+    #[tokio::test]
+    async fn mint_does_not_follow_a_redirect_from_the_token_endpoint() {
+        let (elsewhere, elsewhere_hits) =
+            recording_token_server(200, json!({"access_token": "leaked"})).await;
+        let redirector = Router::new().route(
+            "/{*path}",
+            any(move || {
+                let elsewhere = elsewhere.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, elsewhere)],
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, redirector).await.unwrap();
+        });
+
+        let error = crate::plugins::google_sa::mint_access_token(
+            &loopback_client(),
+            &Url::parse(&format!("http://{address}/token")).unwrap(),
+            SA_EMAIL,
+            crate::plugins::google_sa::tests::test_key_pem(),
+            SA_KID,
+            &sa_scopes(),
+        )
+        .await
+        .expect_err("a 3xx from the token endpoint fails the mint");
+        assert!(error.to_string().contains("HTTP 302"), "{error}");
+        assert!(
+            elsewhere_hits.lock().unwrap().is_empty(),
+            "the redirect target must never be contacted"
+        );
+    }
+
+    /// Google's refusal surfaces as a status-only error. The key, the PEM body
+    /// and the assertion are all absent from what the agent can see.
+    #[tokio::test]
+    async fn mint_surfaces_a_google_error_without_key_or_assertion_material() {
+        let (token_url, _hits) = recording_token_server(
+            400,
+            json!({"error": "invalid_grant", "error_description": "Invalid JWT Signature."}),
+        )
+        .await;
+        let pem = crate::plugins::google_sa::tests::test_key_pem();
+        let error = crate::plugins::google_sa::mint_access_token(
+            &loopback_client(),
+            &Url::parse(&token_url).unwrap(),
+            SA_EMAIL,
+            pem,
+            SA_KID,
+            &sa_scopes(),
+        )
+        .await
+        .expect_err("a 400 from the token endpoint fails the mint");
+        let message = error.to_string();
+        assert!(message.contains("HTTP 400"), "{message}");
+        let pem_body = pem.lines().nth(1).expect("the PEM has a body line");
+        assert!(!message.contains(pem_body), "no key material in the error");
+        assert!(!message.contains("BEGIN PRIVATE KEY"));
+        assert!(
+            !message.contains("eyJ"),
+            "no base64url JWT segment in the error"
+        );
+        assert!(
+            !message.contains("Invalid JWT Signature"),
+            "Google's body is for the operator log, not the agent"
+        );
+    }
+
+    /// The pre-existing oauth2 refresh-token path is untouched by the new
+    /// variant: it still refuses a non-Google token_url and still demands a
+    /// refresh token when the cached access token is stale.
+    #[tokio::test]
+    async fn oauth2_refresh_token_path_is_unchanged() {
+        let credential = Credential::new(
+            "google".into(),
+            CredentialData::OAuth2 {
+                client_id: "client".into(),
+                client_secret: Secret::new("client-secret"),
+                refresh_token: None,
+                access_token: None,
+                expires_at: None,
+                token_url: GOOGLE_TOKEN_URL.into(),
+                scopes: vec![],
+            },
+        );
+        let error = effective_google_credential(&loopback_client(), &credential)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("refresh_token is required"));
+
+        let (_effective, updated, token) =
+            effective_google_credential(&loopback_client(), &fresh_google_credential())
+                .await
+                .unwrap();
+        assert_eq!(token, "access");
+        assert!(updated.is_none());
+    }
+
+    /// A credential shape the connector does not know is refused by type, not
+    /// tried.
+    #[tokio::test]
+    async fn an_unrelated_credential_type_is_refused() {
+        let credential = Credential::new(
+            "google".into(),
+            CredentialData::ApiKey {
+                key: Secret::new("k"),
+                header_name: "Authorization".into(),
+                header_prefix: "Bearer ".into(),
+            },
+        );
+        let error = effective_google_credential(&loopback_client(), &credential)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginError::UnsupportedCredentialType(ref m)
+                if m.contains("google_service_account")
+        ));
+    }
+
+    #[test]
+    fn the_connector_accepts_the_service_account_credential_type() {
+        assert!(SoloPlugin::default()
+            .supported_credential_types()
+            .contains(&CredentialType::GoogleServiceAccount));
     }
 }

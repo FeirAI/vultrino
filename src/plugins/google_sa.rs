@@ -1,0 +1,553 @@
+//! Google service-account access tokens (RFC 7523 JWT-bearer grant).
+//!
+//! A service-account key does not expire the way an installed-app refresh token
+//! does, so this is the credential shape a long-running governed deployment can
+//! actually keep. The trade is that the vault now holds an RSA private key, so
+//! every rule here is written to fail closed:
+//!
+//! - The token endpoint is **pinned** to [`GOOGLE_TOKEN_URI`] byte-for-byte.
+//!   Not "an https host", not "a googleapis.com host": that exact string. The
+//!   assertion is signed for that audience and the private key is only ever
+//!   exercised against it, so a tampered `token_uri` cannot walk the key to
+//!   another origin. Redirects are refused by the shared guarded client
+//!   (`build_guarded_client` sets `redirect::Policy::none()`), and a 3xx from
+//!   the token endpoint surfaces as a failure rather than a second hop.
+//! - Scopes must be a non-empty subset of [`ALLOWED_SCOPES`]: the Sheets and
+//!   Calendar scopes the solo connector actually calls, and nothing else. A key
+//!   that a project granted more broadly still cannot mint a broader token here.
+//! - **No domain-wide delegation.** A `sub` claim is never set, so the minted
+//!   token is the service account acting as itself. An operator grants it access
+//!   by sharing the specific spreadsheet or calendar with the service account's
+//!   own address; it cannot impersonate a human in the workspace.
+//! - The assertion lives at most [`ASSERTION_LIFETIME_SECS`], and no caller can
+//!   widen that.
+//!
+//! Nothing in this module returns key material, the assertion, or the token to a
+//! caller-visible error. Google's own `error` / `error_description` strings are
+//! the only upstream text that reaches the operator log, and they reach no
+//! further than the log.
+
+use super::PluginError;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use chrono::Utc;
+use reqwest::{Client, Url};
+use serde::Deserialize;
+use serde_json::json;
+use zeroize::Zeroizing;
+
+/// The one token endpoint a service-account credential may be used against.
+/// Compared byte-for-byte; see the module note on why this is not a host check.
+pub(crate) const GOOGLE_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
+
+/// Every service-account address Google issues ends in this. A credential whose
+/// `client_email` does not is not a service account, and is refused rather than
+/// tried.
+pub(crate) const SERVICE_ACCOUNT_EMAIL_SUFFIX: &str = ".iam.gserviceaccount.com";
+
+/// The complete set of scopes a service-account credential may request. This is
+/// what the solo connector calls, and only that: Sheets values read/append
+/// (`v4/spreadsheets/{id}/values/...`) and Calendar events plus freebusy
+/// (`calendars/{id}/events`, `freeBusy`). Read-only variants are permitted so an
+/// operator can seed a narrower key for a read-only deployment.
+pub(crate) const ALLOWED_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.readonly",
+];
+
+/// Google rejects an assertion longer-lived than an hour; we never ask for one.
+const ASSERTION_LIFETIME_SECS: i64 = 3600;
+
+/// RSA keys below this are refused before `ring` ever sees them, so the refusal
+/// is ours and says why.
+const MIN_RSA_MODULUS_BITS: usize = 2048;
+
+const PKCS8_PEM_BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
+const PKCS8_PEM_END: &str = "-----END PRIVATE KEY-----";
+
+const JWT_BEARER_GRANT: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
+/// The subset of Google's token response this path uses.
+#[derive(Debug, Deserialize)]
+pub(crate) struct MintedToken {
+    pub(crate) access_token: String,
+    #[serde(default)]
+    pub(crate) expires_in: Option<u64>,
+}
+
+/// Google's RFC 6749 §5.2 error body. Parsed only so the operator log can say
+/// *why* a mint failed (`invalid_grant` when a key is disabled, `invalid_scope`
+/// when the project has not enabled an API). Never returned to the agent.
+#[derive(Debug, Deserialize)]
+struct TokenErrorBody {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+/// Admission check for a `google_service_account` credential. Runs at credential
+/// create (seed time) and again immediately before the key is used, so a record
+/// that reached the vault by some other route still cannot mint.
+///
+/// Every message is a fixed string: none of them quotes the key, the email, or
+/// the offending scope back to the caller.
+pub(crate) fn validate(
+    client_email: &str,
+    private_key: &str,
+    private_key_id: &str,
+    token_uri: &str,
+    scopes: &[String],
+) -> Result<(), &'static str> {
+    if token_uri != GOOGLE_TOKEN_URI {
+        return Err(
+            "google_service_account token_uri must be exactly https://oauth2.googleapis.com/token",
+        );
+    }
+    let email = client_email.trim();
+    if email.is_empty() || !email.ends_with(SERVICE_ACCOUNT_EMAIL_SUFFIX) {
+        return Err("google_service_account client_email must end with .iam.gserviceaccount.com");
+    }
+    if private_key_id.trim().is_empty() {
+        return Err("google_service_account private_key_id must not be empty");
+    }
+    if scopes.is_empty() {
+        return Err("google_service_account requires at least one scope");
+    }
+    if !scopes
+        .iter()
+        .all(|scope| ALLOWED_SCOPES.contains(&scope.as_str()))
+    {
+        return Err(
+            "google_service_account scopes must be a subset of the Sheets/Calendar allowlist",
+        );
+    }
+    // Proving the key parses is part of admission: a credential that cannot sign
+    // must be refused at seed, not at the first governed call.
+    signing_key(private_key).map(|_| ())
+}
+
+/// Decode a PKCS#8 PEM private key and hand back a `ring` RSA key pair.
+///
+/// The PKCS#8 label is required. A PKCS#1 (`BEGIN RSA PRIVATE KEY`) or SEC1
+/// (`BEGIN EC PRIVATE KEY`) body is refused here rather than being coerced:
+/// Google emits PKCS#8, so anything else means the operator pasted something
+/// this path was not designed to sign with.
+fn signing_key(private_key: &str) -> Result<ring::signature::RsaKeyPair, &'static str> {
+    let der = decode_pkcs8_pem(private_key)?;
+    let key_pair = ring::signature::RsaKeyPair::from_pkcs8(&der)
+        .map_err(|_| "google_service_account private_key is not a usable PKCS#8 RSA key")?;
+    if key_pair.public().modulus_len() * 8 < MIN_RSA_MODULUS_BITS {
+        return Err("google_service_account private_key must be an RSA key of at least 2048 bits");
+    }
+    Ok(key_pair)
+}
+
+fn decode_pkcs8_pem(private_key: &str) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    let trimmed = private_key.trim();
+    let body = trimmed
+        .strip_prefix(PKCS8_PEM_BEGIN)
+        .and_then(|rest| rest.strip_suffix(PKCS8_PEM_END))
+        .ok_or("google_service_account private_key must be a PKCS#8 PEM block")?;
+    let base64_body: Zeroizing<String> =
+        Zeroizing::new(body.chars().filter(|c| !c.is_whitespace()).collect());
+    STANDARD
+        .decode(base64_body.as_bytes())
+        .map(Zeroizing::new)
+        .map_err(|_| "google_service_account private_key PEM body is not valid base64")
+}
+
+/// Build and sign the RS256 assertion. Public inputs only in the output; the
+/// key never leaves this function.
+fn signed_assertion(
+    client_email: &str,
+    private_key: &str,
+    private_key_id: &str,
+    token_uri: &str,
+    scopes: &[String],
+) -> Result<Zeroizing<String>, &'static str> {
+    let key_pair = signing_key(private_key)?;
+    let issued_at = Utc::now().timestamp();
+
+    // No `sub`: this is the service account acting as itself. Adding one would
+    // be domain-wide delegation, which this deployment does not do.
+    let header = json!({"alg": "RS256", "typ": "JWT", "kid": private_key_id});
+    let claims = json!({
+        "iss": client_email,
+        "scope": scopes.join(" "),
+        "aud": token_uri,
+        "iat": issued_at,
+        "exp": issued_at + ASSERTION_LIFETIME_SECS,
+    });
+
+    let encode = |value: &serde_json::Value| -> Result<String, &'static str> {
+        serde_json::to_vec(value)
+            .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+            .map_err(|_| "google_service_account assertion could not be encoded")
+    };
+    let signing_input = format!("{}.{}", encode(&header)?, encode(&claims)?);
+
+    let mut signature = vec![0u8; key_pair.public().modulus_len()];
+    key_pair
+        .sign(
+            &ring::signature::RSA_PKCS1_SHA256,
+            &ring::rand::SystemRandom::new(),
+            signing_input.as_bytes(),
+            &mut signature,
+        )
+        .map_err(|_| "google_service_account assertion could not be signed")?;
+
+    Ok(Zeroizing::new(format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(&signature)
+    )))
+}
+
+/// Mint an access token from the service-account key.
+///
+/// `token_uri` is taken as a parsed [`Url`] so the caller has already had to
+/// pin it; [`validate`] is what enforces that it is [`GOOGLE_TOKEN_URI`], and
+/// every production caller runs that first. The `aud` claim is signed over the
+/// string form of this same URL, so the assertion is worthless anywhere else.
+pub(crate) async fn mint_access_token(
+    client: &Client,
+    token_uri: &Url,
+    client_email: &str,
+    private_key: &str,
+    private_key_id: &str,
+    scopes: &[String],
+) -> Result<MintedToken, PluginError> {
+    let assertion = signed_assertion(
+        client_email,
+        private_key,
+        private_key_id,
+        token_uri.as_str(),
+        scopes,
+    )
+    .map_err(|reason| PluginError::Validation(reason.to_string()))?;
+
+    let response = client
+        .post(token_uri.clone())
+        .timeout(crate::plugins::REQUEST_TIMEOUT)
+        .form(&[
+            ("grant_type", JWT_BEARER_GRANT),
+            ("assertion", assertion.as_str()),
+        ])
+        .send()
+        .await
+        // `without_url()` keeps the query-free endpoint out of the message; the
+        // assertion was in the body, never the URL, so nothing secret is here.
+        .map_err(|error| PluginError::Http(error.without_url().to_string()))?;
+
+    let status = response.status();
+    let body = crate::plugins::read_body_capped(response).await?;
+    if !status.is_success() {
+        // A 3xx lands here too: the guarded client does not follow redirects, so
+        // a token endpoint that tries to move us is a failure, not a second hop.
+        log_upstream_failure(status.as_u16(), &body);
+        return Err(PluginError::ExecutionFailed(format!(
+            "Google service-account token mint returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+
+    let token: MintedToken = serde_json::from_slice(&body).map_err(|_| {
+        PluginError::ExecutionFailed("Google service-account token response was invalid".into())
+    })?;
+    if token.access_token.is_empty() {
+        return Err(PluginError::ExecutionFailed(
+            "Google service-account token response did not contain an access token".into(),
+        ));
+    }
+    Ok(token)
+}
+
+/// Operator-log only. Google's `error` / `error_description` are the two strings
+/// that make a failed mint diagnosable (`invalid_grant`, `invalid_scope`,
+/// "Invalid JWT Signature."); nothing else from the body is logged, and the
+/// agent-visible error carries only the status code.
+fn log_upstream_failure(status: u16, body: &[u8]) {
+    let parsed: Option<TokenErrorBody> = serde_json::from_slice(body).ok();
+    let (error, description) = parsed
+        .map(|b| (b.error, b.error_description))
+        .unwrap_or((None, None));
+    tracing::warn!(
+        status,
+        error = error.as_deref().unwrap_or("unknown"),
+        error_description = description.as_deref().unwrap_or(""),
+        "Google service-account token mint failed"
+    );
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::sync::OnceLock;
+
+    /// A 2048-bit RSA key generated locally, once, for this test run. It is
+    /// never a real key and never leaves the process image.
+    pub(crate) fn test_key_pem() -> &'static str {
+        static KEY: OnceLock<String> = OnceLock::new();
+        KEY.get_or_init(|| generate_rsa_pem(2048))
+    }
+
+    fn generate_rsa_pem(bits: usize) -> String {
+        let output = Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                &format!("rsa_keygen_bits:{bits}"),
+                "-outform",
+                "PEM",
+            ])
+            .output()
+            .expect("openssl is required to generate the RSA test key");
+        assert!(output.status.success(), "openssl genpkey failed");
+        String::from_utf8(output.stdout).expect("openssl emits utf-8 PEM")
+    }
+
+    fn scopes() -> Vec<String> {
+        vec!["https://www.googleapis.com/auth/spreadsheets".to_string()]
+    }
+
+    const EMAIL: &str = "solo@feir-demo.iam.gserviceaccount.com";
+    const KID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn decode_segment(segment: &str) -> serde_json::Value {
+        serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(segment)
+                .expect("segment is base64url"),
+        )
+        .expect("segment is JSON")
+    }
+
+    #[test]
+    fn assertion_header_and_claims_are_exact_and_carry_no_sub() {
+        let before = Utc::now().timestamp();
+        let jwt = signed_assertion(
+            EMAIL,
+            test_key_pem(),
+            KID,
+            GOOGLE_TOKEN_URI,
+            &[
+                "https://www.googleapis.com/auth/spreadsheets".to_string(),
+                "https://www.googleapis.com/auth/calendar".to_string(),
+            ],
+        )
+        .expect("a valid service-account key signs");
+        let after = Utc::now().timestamp();
+
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "a JWS compact serialization has three parts"
+        );
+
+        let header = decode_segment(parts[0]);
+        assert_eq!(
+            header,
+            json!({"alg": "RS256", "typ": "JWT", "kid": KID}),
+            "the header is exactly alg/typ/kid"
+        );
+
+        let claims = decode_segment(parts[1]);
+        assert_eq!(claims["iss"], json!(EMAIL));
+        assert_eq!(
+            claims["scope"],
+            json!("https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/calendar"),
+            "scopes are space-joined in order"
+        );
+        assert_eq!(claims["aud"], json!(GOOGLE_TOKEN_URI));
+        assert!(
+            claims.get("sub").is_none(),
+            "no domain-wide delegation: a sub claim must never be set"
+        );
+
+        let iat = claims["iat"].as_i64().expect("iat is a number");
+        let exp = claims["exp"].as_i64().expect("exp is a number");
+        assert_eq!(exp - iat, 3600, "the assertion lives exactly one hour");
+        assert!((before..=after).contains(&iat), "iat is minted now");
+
+        // Exactly the five claims above, and nothing the brief did not ask for.
+        let claim_names: Vec<&String> = claims
+            .as_object()
+            .expect("claims are an object")
+            .keys()
+            .collect();
+        assert_eq!(
+            claim_names.len(),
+            5,
+            "claims are iss/scope/aud/iat/exp only"
+        );
+    }
+
+    #[test]
+    fn assertion_signature_verifies_against_the_public_key() {
+        let pem = test_key_pem();
+        let jwt = signed_assertion(EMAIL, pem, KID, GOOGLE_TOKEN_URI, &scopes()).unwrap();
+        let (signing_input, signature_b64) = jwt.rsplit_once('.').expect("jwt has a signature");
+        let signature = URL_SAFE_NO_PAD
+            .decode(signature_b64)
+            .expect("the signature is base64url");
+
+        let key_pair = signing_key(pem).unwrap();
+        let public_key = ring::signature::UnparsedPublicKey::new(
+            &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+            key_pair.public().as_ref(),
+        );
+        public_key
+            .verify(signing_input.as_bytes(), &signature)
+            .expect("RS256 signature verifies against the service-account public key");
+
+        // Tampering with the signed input must break it.
+        let tampered = format!("{signing_input}x");
+        assert!(public_key.verify(tampered.as_bytes(), &signature).is_err());
+    }
+
+    #[test]
+    fn validation_pins_the_token_uri() {
+        let pem = test_key_pem();
+        assert!(validate(EMAIL, pem, KID, GOOGLE_TOKEN_URI, &scopes()).is_ok());
+        for other in [
+            "http://oauth2.googleapis.com/token",
+            "https://oauth2.googleapis.com/token/",
+            "https://oauth2.googleapis.com:443/token",
+            "https://accounts.google.com/o/oauth2/token",
+            "https://evil.example/token",
+            "",
+        ] {
+            assert!(
+                validate(EMAIL, pem, KID, other, &scopes()).is_err(),
+                "token_uri {other:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_enforces_the_service_account_email_suffix() {
+        let pem = test_key_pem();
+        for bad in [
+            "owner@feir.ai",
+            "solo@iam.gserviceaccount.com.evil.example",
+            "solo@feir-demo.iam.gserviceaccount.com.evil",
+            "",
+        ] {
+            assert!(
+                validate(bad, pem, KID, GOOGLE_TOKEN_URI, &scopes()).is_err(),
+                "client_email {bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_enforces_the_scope_allowlist() {
+        let pem = test_key_pem();
+        assert!(
+            validate(EMAIL, pem, KID, GOOGLE_TOKEN_URI, &[]).is_err(),
+            "an empty scope set is refused"
+        );
+        for bad in [
+            "https://www.googleapis.com/auth/drive",
+            "https://mail.google.com/",
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/spreadsheets ",
+            "spreadsheets",
+        ] {
+            assert!(
+                validate(EMAIL, pem, KID, GOOGLE_TOKEN_URI, &[bad.to_string()]).is_err(),
+                "scope {bad:?} must be refused"
+            );
+        }
+        // One allowed scope plus one disallowed scope is still refused.
+        let mixed = vec![
+            "https://www.googleapis.com/auth/spreadsheets".to_string(),
+            "https://www.googleapis.com/auth/drive".to_string(),
+        ];
+        assert!(validate(EMAIL, pem, KID, GOOGLE_TOKEN_URI, &mixed).is_err());
+        // Every allowlisted scope is individually accepted.
+        for allowed in ALLOWED_SCOPES {
+            assert!(validate(EMAIL, pem, KID, GOOGLE_TOKEN_URI, &[allowed.to_string()]).is_ok());
+        }
+    }
+
+    #[test]
+    fn validation_requires_a_private_key_id() {
+        assert!(validate(EMAIL, test_key_pem(), "   ", GOOGLE_TOKEN_URI, &scopes()).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_short_non_rsa_and_malformed_keys() {
+        let short = generate_rsa_pem(1024);
+        assert!(
+            validate(EMAIL, &short, KID, GOOGLE_TOKEN_URI, &scopes()).is_err(),
+            "a 1024-bit RSA key is below the floor"
+        );
+
+        let ec = Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-outform",
+                "PEM",
+            ])
+            .output()
+            .expect("openssl generates the EC test key");
+        assert!(ec.status.success());
+        let ec_pem = String::from_utf8(ec.stdout).unwrap();
+        assert!(
+            validate(EMAIL, &ec_pem, KID, GOOGLE_TOKEN_URI, &scopes()).is_err(),
+            "a P-256 key is not an RSA signing key"
+        );
+
+        for malformed in [
+            "",
+            "not a pem at all",
+            "-----BEGIN PRIVATE KEY-----\nnot base64!!!\n-----END PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----",
+        ] {
+            assert!(
+                validate(EMAIL, malformed, KID, GOOGLE_TOKEN_URI, &scopes()).is_err(),
+                "malformed key {malformed:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn no_validation_error_ever_quotes_key_material() {
+        let pem = test_key_pem();
+        let body = pem.lines().nth(1).expect("the PEM has a body line");
+        let cases: Vec<Result<(), &'static str>> = vec![
+            validate(EMAIL, pem, KID, "https://evil.example/token", &scopes()),
+            validate("owner@feir.ai", pem, KID, GOOGLE_TOKEN_URI, &scopes()),
+            validate(EMAIL, pem, "", GOOGLE_TOKEN_URI, &scopes()),
+            validate(
+                EMAIL,
+                pem,
+                KID,
+                GOOGLE_TOKEN_URI,
+                &["https://www.googleapis.com/auth/drive".to_string()],
+            ),
+            validate(EMAIL, "garbage", KID, GOOGLE_TOKEN_URI, &scopes()),
+        ];
+        for case in cases {
+            let message = case.unwrap_err();
+            assert!(!message.contains(body), "no key body in a refusal");
+            assert!(
+                !message.contains("BEGIN PRIVATE KEY"),
+                "no PEM framing in a refusal"
+            );
+        }
+    }
+}

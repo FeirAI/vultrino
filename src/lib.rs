@@ -100,6 +100,9 @@ pub enum CredentialType {
     ApiKey,
     /// OAuth2 credentials with token refresh
     OAuth2,
+    /// Google service-account key: mints its own access tokens by signing an
+    /// RS256 JWT-bearer assertion, so there is no refresh token to expire.
+    GoogleServiceAccount,
     /// HTTP Basic Authentication
     BasicAuth,
     /// Private key for signing (SSH, crypto)
@@ -128,6 +131,7 @@ impl std::fmt::Display for CredentialType {
         match self {
             CredentialType::ApiKey => write!(f, "api_key"),
             CredentialType::OAuth2 => write!(f, "oauth2"),
+            CredentialType::GoogleServiceAccount => write!(f, "google_service_account"),
             CredentialType::BasicAuth => write!(f, "basic_auth"),
             CredentialType::PrivateKey => write!(f, "private_key"),
             CredentialType::Certificate => write!(f, "certificate"),
@@ -233,6 +237,33 @@ pub enum CredentialData {
         scopes: Vec<String>,
     },
 
+    /// Google service-account key (RFC 7523 JWT-bearer grant).
+    ///
+    /// Deserialized straight from Google's downloaded JSON key file plus an
+    /// operator-supplied `scopes` array: the other fields that file carries
+    /// (`project_id`, `client_id`, `auth_uri`, `client_x509_cert_url`,
+    /// `universe_domain`, …) are ignored by serde and therefore never reach the
+    /// vault. `access_token` / `expires_at` are the same in-place cache the
+    /// OAuth2 variant uses, refreshed on the same margin.
+    ///
+    /// No `sub` field exists on purpose: domain-wide delegation is not offered,
+    /// so a service account can only reach a spreadsheet or calendar an operator
+    /// has explicitly shared with its own address. See [`crate::plugins`]'s
+    /// `google_sa` module for the pinned endpoint and scope allowlist.
+    #[serde(rename = "google_service_account")]
+    GoogleServiceAccount {
+        client_email: String,
+        private_key: Secret,
+        private_key_id: String,
+        #[serde(default = "default_google_token_uri")]
+        token_uri: String,
+        scopes: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        access_token: Option<Secret>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expires_at: Option<DateTime<Utc>>,
+    },
+
     /// HTTP Basic Authentication
     BasicAuth { username: String, password: Secret },
 
@@ -335,6 +366,13 @@ fn default_bearer_prefix() -> String {
     "Bearer ".to_string()
 }
 
+/// The only token endpoint a service-account credential may name. A seeded
+/// envelope that omits `token_uri` gets the pinned value; one that names
+/// anything else is refused by `plugins::google_sa::validate`.
+fn default_google_token_uri() -> String {
+    plugins::google_sa::GOOGLE_TOKEN_URI.to_string()
+}
+
 fn default_hmac_header() -> String {
     "X-MBX-APIKEY".to_string()
 }
@@ -386,6 +424,23 @@ impl CredentialData {
                     && optional_secret(access_token)
                     && text(token_url)
             }
+            CredentialData::GoogleServiceAccount {
+                client_email,
+                private_key,
+                private_key_id,
+                token_uri,
+                scopes,
+                access_token,
+                ..
+            } => {
+                text(client_email)
+                    && secret(private_key)
+                    && text(private_key_id)
+                    && text(token_uri)
+                    && !scopes.is_empty()
+                    && scopes.iter().all(|scope| text(scope))
+                    && optional_secret(access_token)
+            }
             CredentialData::BasicAuth { username, password } => text(username) && secret(password),
             CredentialData::PrivateKey {
                 key_pem,
@@ -436,7 +491,38 @@ impl CredentialData {
         };
         valid
             .then_some(())
-            .ok_or("credential contains a blank required field or empty secret")
+            .ok_or("credential contains a blank required field or empty secret")?;
+        // Re-run the deep, type-specific checks at vault open too: a record that
+        // reached the encrypted file by some route other than the create API
+        // (a restored backup, a hand-edited vault) must still not become live.
+        self.validate_admission()
+    }
+
+    /// Deep, type-specific admission checks that go beyond the blank-field pass
+    /// in [`Self::validate_vault_shape`]. Called at credential create (seed
+    /// time), at vault open, and again immediately before the credential is
+    /// used, so the same rules gate every route into the enforcement path.
+    ///
+    /// Types with no deep rules return `Ok`: this is deliberately additive and
+    /// changes nothing for the credential shapes that existed before it.
+    pub(crate) fn validate_admission(&self) -> Result<(), &'static str> {
+        match self {
+            CredentialData::GoogleServiceAccount {
+                client_email,
+                private_key,
+                private_key_id,
+                token_uri,
+                scopes,
+                ..
+            } => plugins::google_sa::validate(
+                client_email,
+                private_key.expose(),
+                private_key_id,
+                token_uri,
+                scopes,
+            ),
+            _ => Ok(()),
+        }
     }
 
     /// The exposed secret strings this credential injects or uses, for **egress
@@ -476,6 +562,27 @@ impl CredentialData {
                 }
                 if let Some(r) = refresh_token {
                     v.push(z(r.expose().to_string()));
+                }
+                v
+            }
+            CredentialData::GoogleServiceAccount {
+                private_key,
+                access_token,
+                ..
+            } => {
+                // The PEM as stored, and the base64 body on its own: a reflected
+                // copy could arrive either framed or unframed.
+                let pem = private_key.expose();
+                let mut v = vec![z(pem.to_string())];
+                let body: String = pem
+                    .lines()
+                    .filter(|line| !line.starts_with("-----"))
+                    .collect();
+                if !body.is_empty() {
+                    v.push(z(body));
+                }
+                if let Some(token) = access_token {
+                    v.push(z(token.expose().to_string()));
                 }
                 v
             }
@@ -528,6 +635,7 @@ impl CredentialData {
         match self {
             CredentialData::ApiKey { .. } => CredentialType::ApiKey,
             CredentialData::OAuth2 { .. } => CredentialType::OAuth2,
+            CredentialData::GoogleServiceAccount { .. } => CredentialType::GoogleServiceAccount,
             CredentialData::BasicAuth { .. } => CredentialType::BasicAuth,
             CredentialData::PrivateKey { .. } => CredentialType::PrivateKey,
             CredentialData::Certificate { .. } => CredentialType::Certificate,
@@ -1019,6 +1127,237 @@ mod tests {
             r#"{"type":"o_auth2","client_id":"client","client_secret":"secret","token_url":"https://example.com/token"}"#
         )
         .is_err());
+    }
+
+    /// A Google service-account key file, verbatim, with only `type` and
+    /// `scopes` added by the operator. Every other field Google ships must be
+    /// tolerated on the way in and must not survive into the vault record.
+    #[cfg(test)]
+    fn google_key_file_envelope(private_key: &str) -> String {
+        serde_json::json!({
+            "type": "google_service_account",
+            "client_email": "solo@feir-demo.iam.gserviceaccount.com",
+            "private_key": private_key,
+            "private_key_id": "0123456789abcdef0123456789abcdef01234567",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "scopes": ["https://www.googleapis.com/auth/spreadsheets"],
+            // Fields Google's downloaded key file carries that this vault has no
+            // business keeping.
+            "project_id": "feir-demo-471212",
+            "client_id": "109876543210987654321",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/solo%40feir-demo.iam.gserviceaccount.com",
+            "universe_domain": "googleapis.com"
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn google_service_account_tolerates_the_key_file_and_stores_none_of_its_extras() {
+        let pem = plugins::google_sa::tests::test_key_pem();
+        let data: CredentialData = serde_json::from_str(&google_key_file_envelope(pem))
+            .expect("Google's downloaded key file plus scopes must deserialize as-is");
+        let CredentialData::GoogleServiceAccount {
+            ref client_email,
+            ref private_key_id,
+            ref token_uri,
+            ref scopes,
+            ref access_token,
+            ..
+        } = data
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(client_email, "solo@feir-demo.iam.gserviceaccount.com");
+        assert_eq!(private_key_id, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(token_uri, plugins::google_sa::GOOGLE_TOKEN_URI);
+        assert_eq!(scopes, &["https://www.googleapis.com/auth/spreadsheets"]);
+        assert!(access_token.is_none(), "no token is cached at seed");
+        assert_eq!(data.credential_type(), CredentialType::GoogleServiceAccount);
+        assert_eq!(data.credential_type().to_string(), "google_service_account");
+        data.validate_admission()
+            .expect("the key file's own fields pass admission");
+
+        // The extras are gone from the record that reaches the encrypted vault.
+        let stored = with_vault_secret_serialization(|| serde_json::to_string(&data)).unwrap();
+        for dropped in [
+            "project_id",
+            "feir-demo-471212",
+            "auth_uri",
+            "auth_provider_x509_cert_url",
+            "client_x509_cert_url",
+            "universe_domain",
+            "109876543210987654321",
+        ] {
+            assert!(
+                !stored.contains(dropped),
+                "{dropped} must not be stored in the vault record"
+            );
+        }
+    }
+
+    #[test]
+    fn google_service_account_omits_token_uri_to_the_pinned_default() {
+        let pem = plugins::google_sa::tests::test_key_pem();
+        let envelope = serde_json::json!({
+            "type": "google_service_account",
+            "client_email": "solo@feir-demo.iam.gserviceaccount.com",
+            "private_key": pem,
+            "private_key_id": "kid-1",
+            "scopes": ["https://www.googleapis.com/auth/calendar"]
+        })
+        .to_string();
+        let data: CredentialData = serde_json::from_str(&envelope).unwrap();
+        let CredentialData::GoogleServiceAccount { ref token_uri, .. } = data else {
+            panic!("wrong variant");
+        };
+        assert_eq!(token_uri, plugins::google_sa::GOOGLE_TOKEN_URI);
+        assert!(data.validate_admission().is_ok());
+    }
+
+    #[test]
+    fn google_service_account_admission_refuses_every_invalid_shape() {
+        let pem = plugins::google_sa::tests::test_key_pem();
+        let build = |client_email: &str,
+                     private_key: &str,
+                     private_key_id: &str,
+                     token_uri: &str,
+                     scopes: Vec<&str>| {
+            CredentialData::GoogleServiceAccount {
+                client_email: client_email.to_string(),
+                private_key: Secret::new(private_key),
+                private_key_id: private_key_id.to_string(),
+                token_uri: token_uri.to_string(),
+                scopes: scopes.into_iter().map(String::from).collect(),
+                access_token: None,
+                expires_at: None,
+            }
+        };
+        let pinned = plugins::google_sa::GOOGLE_TOKEN_URI;
+        let sheets = "https://www.googleapis.com/auth/spreadsheets";
+        let ok = build(
+            "solo@feir-demo.iam.gserviceaccount.com",
+            pem,
+            "kid-1",
+            pinned,
+            vec![sheets],
+        );
+        assert!(ok.validate_vault_shape().is_ok());
+
+        let bad = [
+            // Any endpoint but the pinned one.
+            build(
+                "solo@feir-demo.iam.gserviceaccount.com",
+                pem,
+                "kid-1",
+                "https://evil.example/token",
+                vec![sheets],
+            ),
+            // Not a service-account address.
+            build("owner@feir.ai", pem, "kid-1", pinned, vec![sheets]),
+            // No key id, so the JWT would carry no `kid`.
+            build(
+                "solo@feir-demo.iam.gserviceaccount.com",
+                pem,
+                "",
+                pinned,
+                vec![sheets],
+            ),
+            // No scope at all.
+            build(
+                "solo@feir-demo.iam.gserviceaccount.com",
+                pem,
+                "kid-1",
+                pinned,
+                vec![],
+            ),
+            // A scope outside the Sheets/Calendar allowlist.
+            build(
+                "solo@feir-demo.iam.gserviceaccount.com",
+                pem,
+                "kid-1",
+                pinned,
+                vec![sheets, "https://www.googleapis.com/auth/drive"],
+            ),
+            // Not a key.
+            build(
+                "solo@feir-demo.iam.gserviceaccount.com",
+                "-----BEGIN PRIVATE KEY-----\nzzzz\n-----END PRIVATE KEY-----",
+                "kid-1",
+                pinned,
+                vec![sheets],
+            ),
+        ];
+        for (index, data) in bad.iter().enumerate() {
+            assert!(
+                data.validate_admission().is_err(),
+                "case {index} must be refused at admission"
+            );
+            assert!(
+                data.validate_vault_shape().is_err(),
+                "case {index} must also be refused at vault open"
+            );
+        }
+    }
+
+    #[test]
+    fn google_service_account_key_is_redacted_in_debug_and_unserializable_outside_the_vault() {
+        let pem = plugins::google_sa::tests::test_key_pem();
+        let body = pem.lines().nth(1).expect("the PEM has a body line");
+        let data: CredentialData = serde_json::from_str(&google_key_file_envelope(pem)).unwrap();
+
+        let debug = format!("{data:?}");
+        assert!(!debug.contains(body), "Debug must not print the key body");
+        assert!(
+            !debug.contains("BEGIN PRIVATE KEY"),
+            "Debug must not print the PEM at all"
+        );
+
+        assert!(
+            serde_json::to_string(&data).is_err(),
+            "the key must not serialize outside the encrypted-vault codec"
+        );
+
+        // The API read-back projections carry metadata only, by construction.
+        let cred = Credential::new("cred-google-sheets".into(), data);
+        let meta = serde_json::to_string(&CredentialMetadata::from(&cred)).unwrap();
+        assert!(!meta.contains(body));
+        assert!(!meta.contains("BEGIN PRIVATE KEY"));
+        assert_eq!(
+            cred.credential_type,
+            CredentialType::GoogleServiceAccount,
+            "the read-back type names the variant"
+        );
+    }
+
+    #[test]
+    fn google_service_account_secret_material_covers_the_key_and_the_cached_token() {
+        let pem = plugins::google_sa::tests::test_key_pem();
+        let unframed: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let data = CredentialData::GoogleServiceAccount {
+            client_email: "solo@feir-demo.iam.gserviceaccount.com".into(),
+            private_key: Secret::new(pem),
+            private_key_id: "kid-1".into(),
+            token_uri: plugins::google_sa::GOOGLE_TOKEN_URI.into(),
+            scopes: vec!["https://www.googleapis.com/auth/spreadsheets".into()],
+            access_token: Some(Secret::new("minted-access-token")),
+            expires_at: None,
+        };
+        let materials: Vec<String> = data
+            .secret_material()
+            .iter()
+            .map(|z| z.as_str().to_string())
+            .collect();
+        assert!(materials.iter().any(|m| m == pem));
+        assert!(
+            materials.iter().any(|m| m == &unframed),
+            "an unframed reflected copy is redacted too"
+        );
+        assert!(materials.iter().any(|m| m == "minted-access-token"));
     }
 
     #[test]

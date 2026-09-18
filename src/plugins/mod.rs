@@ -10,6 +10,7 @@
 //! local paths, or URLs.
 
 mod ecdsa;
+pub(crate) mod google_sa;
 mod hmac;
 mod http;
 pub mod installer;
