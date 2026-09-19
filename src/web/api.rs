@@ -191,9 +191,16 @@ fn resolve_inbound_principal(
     state.server.resolve_identity(value)
 }
 
-/// Authenticate a caller and return its principal id (without action scoping),
-/// for read-only operations like polling an approval.
-async fn resolve_caller_id(state: &AppState, secret: &str) -> Result<String, Response> {
+/// Authenticate a caller and return its approval-ownership identity (without
+/// action scoping), for read-only operations like polling an approval.
+///
+/// Every field is read off the STORED row the presented secret resolved to, so
+/// no part of the identity can be supplied by the request. See
+/// [`crate::server::ApprovalCaller`].
+async fn resolve_approval_caller(
+    state: &AppState,
+    secret: &str,
+) -> Result<crate::server::ApprovalCaller, Response> {
     if UseToken::looks_like_token(secret) {
         let _ = state.storage.reload().await;
         match state
@@ -203,7 +210,11 @@ async fn resolve_caller_id(state: &AppState, secret: &str) -> Result<String, Res
         {
             // Polling is read-only, so an exhausted/expired token still
             // authenticates — but a revoked token is rejected.
-            Ok(Some(t)) if !t.revoked => Ok(t.id),
+            Ok(Some(t)) if !t.revoked => Ok(crate::server::ApprovalCaller {
+                principal_id: t.id,
+                agent_label: t.agent_label,
+                tenant: t.tenant,
+            }),
             Ok(Some(_)) => Err(error_response(
                 StatusCode::FORBIDDEN,
                 "token_revoked",
@@ -217,7 +228,11 @@ async fn resolve_caller_id(state: &AppState, secret: &str) -> Result<String, Res
         }
     } else {
         match validate_api_key(state, secret).await {
-            Ok((key, _role)) => Ok(key.id),
+            Ok((key, _role)) => Ok(crate::server::ApprovalCaller {
+                principal_id: key.id,
+                agent_label: key.agent_label,
+                tenant: key.tenant,
+            }),
             Err(e) => Err(error_response(
                 StatusCode::UNAUTHORIZED,
                 "invalid_api_key",
@@ -412,8 +427,8 @@ pub async fn api_check_approval(
         }
     };
 
-    let principal_id = match resolve_caller_id(&state, &secret).await {
-        Ok(id) => id,
+    let caller = match resolve_approval_caller(&state, &secret).await {
+        Ok(caller) => caller,
         Err(resp) => return resp,
     };
     // R6: ownership keys on the credential id (the halt/ownership anchor), NOT the
@@ -425,7 +440,7 @@ pub async fn api_check_approval(
     // execution, so a non-owner can never trigger another principal's action.
     let approval = match state
         .server
-        .check_and_resume_approval(&id, Some(&principal_id))
+        .check_and_resume_approval(&id, Some(&caller))
         .await
     {
         Ok(a) => a,

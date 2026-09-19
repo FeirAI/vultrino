@@ -20,7 +20,7 @@ use vultrino::config::Config;
 use vultrino::govder::GovderConfig;
 use vultrino::plugins::{Plugin, PluginError, PluginRequest};
 use vultrino::router::CredentialResolver;
-use vultrino::server::{ExecAuth, VultrinoServer};
+use vultrino::server::{ApprovalCaller, ExecAuth, VultrinoServer};
 use vultrino::storage::{FileStorage, StorageBackend};
 use vultrino::{
     Credential, CredentialData, CredentialType, ExecuteRequest, ExecuteResponse, ExecutionOutcome,
@@ -1879,7 +1879,7 @@ async fn test_ownership_check_blocks_foreign_principal() {
 
     // Foreign principal: rejected, and the action must NOT have run.
     let err = server
-        .check_and_resume_approval(&approval.id, Some("intruder"))
+        .check_and_resume_approval(&approval.id, Some(&ApprovalCaller::id_only("intruder")))
         .await
         .unwrap_err();
     assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)));
@@ -1888,10 +1888,321 @@ async fn test_ownership_check_blocks_foreign_principal() {
 
     // The real owner can.
     let resumed = server
-        .check_and_resume_approval(&approval.id, Some("owner"))
+        .check_and_resume_approval(&approval.id, Some(&ApprovalCaller::id_only("owner")))
         .await
         .unwrap();
     assert!(resumed.executed);
+}
+
+/// Open an approval as a governed agent identified by `(agent_label, tenant)`,
+/// through a use token with the given id-bearing name, and return the approval.
+///
+/// This models the production shape the rotation tests need: the approval's
+/// `agent_label` and `tenant` are stamped from the AUTHENTICATED principal at
+/// open (`execute_gated`), never from the request, and the token's own id is what
+/// lands in `requester.principal_id`.
+async fn open_as_governed_agent(
+    server: &VultrinoServer,
+    storage: &Arc<dyn StorageBackend>,
+    credential: &str,
+    agent_label: Option<&str>,
+    tenant: Option<&str>,
+) -> (ApprovalRequest, UseToken) {
+    let (_plaintext, mut token) = UseToken::create(NewUseToken {
+        name: format!("mint-{}", uuid_like()),
+        credential_scope: credential.to_string(),
+        action_scope: None,
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.agent_label = agent_label.map(str::to_string);
+    token.tenant = tenant.map(str::to_string);
+    storage.store_use_token(&token).await.unwrap();
+
+    let approval = match server
+        .execute_gated(
+            count_request(credential),
+            ExecAuth::from_use_token(token.clone()),
+        )
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(a) => a,
+        other => panic!("expected a pending approval, got {other:?}"),
+    };
+    (*approval, token)
+}
+
+/// A distinct, storage-resident mint of the SAME governed agent: a new token id,
+/// the same label and tenant. This is what an eve agent's rotating token file
+/// hands it a few minutes later.
+async fn remint(
+    storage: &Arc<dyn StorageBackend>,
+    credential: &str,
+    agent_label: Option<&str>,
+    tenant: Option<&str>,
+) -> UseToken {
+    let (_plaintext, mut token) = UseToken::create(NewUseToken {
+        name: format!("mint-{}", uuid_like()),
+        credential_scope: credential.to_string(),
+        action_scope: None,
+        max_uses: None,
+        require_approval: false,
+        expires_in: None,
+    });
+    token.agent_label = agent_label.map(str::to_string);
+    token.tenant = tenant.map(str::to_string);
+    storage.store_use_token(&token).await.unwrap();
+    token
+}
+
+/// Monotonic suffix so two mints in one test never collide on name.
+fn uuid_like() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    NEXT.fetch_add(1, Ordering::SeqCst)
+}
+
+async fn approve(storage: &Arc<dyn StorageBackend>, id: &str) {
+    storage
+        .decide_approval(
+            id, true, "test", "secops", false, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+}
+
+/// The bug this fixes: an agent that opened an approval could not collect its
+/// result, because its use token had rotated in the meantime and every mint is
+/// its own principal id.
+///
+/// Ownership of an approval is the governed AGENT, not the one token that opened
+/// it. Same non-empty `agent_label`, same tenant, different principal id: the
+/// poll is authorized, the approved action runs, and it runs exactly once.
+#[tokio::test]
+async fn test_rotated_token_of_the_same_agent_may_poll_and_resume() {
+    let (server, storage) = setup().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    store_credential(&storage, "gated-cred", true).await;
+
+    let (approval, opening_token) = open_as_governed_agent(
+        &server,
+        &storage,
+        "gated-cred",
+        Some("ep_eve_binder"),
+        Some("acme"),
+    )
+    .await;
+    assert_eq!(approval.agent_label.as_deref(), Some("ep_eve_binder"));
+    assert_eq!(approval.tenant.as_deref(), Some("acme"));
+    approve(&storage, &approval.id).await;
+
+    // The token rotated while the human was deciding.
+    let rotated = remint(&storage, "gated-cred", Some("ep_eve_binder"), Some("acme")).await;
+    assert_ne!(
+        rotated.id, opening_token.id,
+        "precondition: a remint is a different principal id, or this proves nothing"
+    );
+
+    let resumed = server
+        .check_and_resume_approval(
+            &approval.id,
+            Some(&ApprovalCaller {
+                principal_id: rotated.id.clone(),
+                agent_label: rotated.agent_label.clone(),
+                tenant: rotated.tenant.clone(),
+            }),
+        )
+        .await
+        .expect("the same governed agent may collect its own approved action");
+    assert!(resumed.executed, "the approved action must have run");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly once"
+    );
+
+    // A second poll on yet another mint replays the recorded result and does not
+    // run the action again.
+    let rotated_again = remint(&storage, "gated-cred", Some("ep_eve_binder"), Some("acme")).await;
+    let again = server
+        .check_and_resume_approval(
+            &approval.id,
+            Some(&ApprovalCaller {
+                principal_id: rotated_again.id,
+                agent_label: rotated_again.agent_label,
+                tenant: rotated_again.tenant,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(again.executed);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "still exactly once"
+    );
+}
+
+/// Every way the agent-label rule must FAIL CLOSED. In each case the poll is
+/// refused and, critically, the approved action does not run.
+#[tokio::test]
+async fn test_agent_label_ownership_fails_closed() {
+    let (server, storage) = setup().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    store_credential(&storage, "gated-cred", true).await;
+
+    // Case 1: a DIFFERENT agent label, same tenant.
+    let (approval, _) = open_as_governed_agent(
+        &server,
+        &storage,
+        "gated-cred",
+        Some("ep_eve_binder"),
+        Some("acme"),
+    )
+    .await;
+    approve(&storage, &approval.id).await;
+    let other_agent = ApprovalCaller {
+        principal_id: "some-other-mint".to_string(),
+        agent_label: Some("ep_other_agent".to_string()),
+        tenant: Some("acme".to_string()),
+    };
+    let err = server
+        .check_and_resume_approval(&approval.id, Some(&other_agent))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, vultrino::VultrinoError::PolicyDenied(_)));
+    assert!(
+        !storage
+            .get_approval(&approval.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .executed,
+        "a different agent must not trigger execution"
+    );
+
+    // Case 2: the SAME label in a DIFFERENT tenant. A label is not a cross-tenant
+    // passport.
+    let cross_tenant = ApprovalCaller {
+        principal_id: "some-other-mint".to_string(),
+        agent_label: Some("ep_eve_binder".to_string()),
+        tenant: Some("globex".to_string()),
+    };
+    assert!(matches!(
+        server
+            .check_and_resume_approval(&approval.id, Some(&cross_tenant))
+            .await
+            .unwrap_err(),
+        vultrino::VultrinoError::PolicyDenied(_)
+    ));
+
+    // Case 3: the caller has a label, the requester has none.
+    let (unlabelled, _) =
+        open_as_governed_agent(&server, &storage, "gated-cred", None, Some("acme")).await;
+    approve(&storage, &unlabelled.id).await;
+    assert_eq!(unlabelled.agent_label, None);
+    let labelled_caller = ApprovalCaller {
+        principal_id: "some-other-mint".to_string(),
+        agent_label: Some("ep_eve_binder".to_string()),
+        tenant: Some("acme".to_string()),
+    };
+    assert!(
+        matches!(
+            server
+                .check_and_resume_approval(&unlabelled.id, Some(&labelled_caller))
+                .await
+                .unwrap_err(),
+            vultrino::VultrinoError::PolicyDenied(_)
+        ),
+        "a label-less requester leaves only the principal-id rule"
+    );
+
+    // Case 4: the requester has a label, the caller has none (the reverse).
+    let (labelled, _) = open_as_governed_agent(
+        &server,
+        &storage,
+        "gated-cred",
+        Some("ep_eve_binder"),
+        Some("acme"),
+    )
+    .await;
+    approve(&storage, &labelled.id).await;
+    assert!(matches!(
+        server
+            .check_and_resume_approval(
+                &labelled.id,
+                Some(&ApprovalCaller::id_only("some-other-mint")),
+            )
+            .await
+            .unwrap_err(),
+        vultrino::VultrinoError::PolicyDenied(_)
+    ));
+
+    // Case 5: both labels are the EMPTY STRING. Blank is not an identity, so this
+    // must not become a skeleton key across every unlabelled agent.
+    let (blank_labelled, _) =
+        open_as_governed_agent(&server, &storage, "gated-cred", Some("   "), Some("acme")).await;
+    approve(&storage, &blank_labelled.id).await;
+    assert!(matches!(
+        server
+            .check_and_resume_approval(
+                &blank_labelled.id,
+                Some(&ApprovalCaller {
+                    principal_id: "some-other-mint".to_string(),
+                    agent_label: Some(String::new()),
+                    tenant: Some("acme".to_string()),
+                }),
+            )
+            .await
+            .unwrap_err(),
+        vultrino::VultrinoError::PolicyDenied(_)
+    ));
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no refused poll may have run an action"
+    );
+}
+
+/// Rule (a) is untouched: a principal with no label at all still owns the
+/// approval it opened, and a stranger still does not.
+#[tokio::test]
+async fn test_principal_id_ownership_still_works_without_labels() {
+    let (server, storage) = setup().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    store_credential(&storage, "gated-cred", true).await;
+
+    let (approval, token) =
+        open_as_governed_agent(&server, &storage, "gated-cred", None, None).await;
+    approve(&storage, &approval.id).await;
+
+    assert!(matches!(
+        server
+            .check_and_resume_approval(&approval.id, Some(&ApprovalCaller::id_only("stranger")))
+            .await
+            .unwrap_err(),
+        vultrino::VultrinoError::PolicyDenied(_)
+    ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let resumed = server
+        .check_and_resume_approval(&approval.id, Some(&ApprovalCaller::id_only(token.id)))
+        .await
+        .unwrap();
+    assert!(resumed.executed);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 /// A preflight failure (plugin not loaded) when resuming an approved action leaves

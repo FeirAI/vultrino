@@ -274,6 +274,98 @@ impl ExecAuth {
     }
 }
 
+/// The authenticated caller of an approval poll, for the ownership check in
+/// [`VultrinoServer::check_and_resume_approval`].
+///
+/// Every field comes from the STORED record the presented secret resolved to
+/// (the api key row or the use token row) and never from request input. That is
+/// the whole reason this is a struct rather than three arguments: if an agent
+/// could supply `agent_label` itself, rule (b) below would let it name any
+/// agent's approval and resume it.
+#[derive(Debug, Clone)]
+pub struct ApprovalCaller {
+    /// Stable id of the principal: api key id, or use token id.
+    pub principal_id: String,
+    /// The enforcement label govder stamps on every token it mints for this
+    /// agent (`ep_…`). Not choosable by the agent. `None` for a principal that
+    /// carries no label.
+    pub agent_label: Option<String>,
+    /// Tenant of the calling principal. `None` = untenanted.
+    pub tenant: Option<String>,
+}
+
+impl ApprovalCaller {
+    /// From an authenticated principal. `AuthResult::api_key` is the real api key
+    /// row, or the synthesized one `AuthResult::for_use_token` builds from a use
+    /// token (which copies the token's own `agent_label` and `tenant`), so this
+    /// covers both principal kinds without the caller having to branch.
+    pub fn from_auth(auth: &AuthResult) -> Self {
+        Self {
+            principal_id: auth.api_key.id.clone(),
+            agent_label: auth.api_key.agent_label.clone(),
+            tenant: auth.api_key.tenant.clone(),
+        }
+    }
+
+    /// A principal known only by its id. Rule (b) can never fire for it, so it
+    /// behaves exactly like the pre-rotation ownership check.
+    pub fn id_only(principal_id: impl Into<String>) -> Self {
+        Self {
+            principal_id: principal_id.into(),
+            agent_label: None,
+            tenant: None,
+        }
+    }
+
+    /// Whether this caller owns `approval` and may therefore poll it and trigger
+    /// its approved execution.
+    ///
+    /// Two ways to own one, and an agent needs only one of them:
+    ///
+    /// (a) **Same principal.** The caller's principal id is the requester's. This
+    ///     is the original rule, unchanged.
+    ///
+    /// (b) **Same governed agent.** Both sides carry the same non-empty
+    ///     `agent_label`, in the same tenant. Ownership of an approval belongs to
+    ///     the AGENT, not to the one token that happened to open it: a governed
+    ///     agent re-mints its use token every few minutes (an eve agent re-reads a
+    ///     rotating token file), each mint is its own principal id, and a human
+    ///     approves minutes later, so under rule (a) alone the poll after ANY
+    ///     rotation is refused as "a different principal" and the agent can never
+    ///     collect the result of the action it opened. The label is govder's
+    ///     enforcement identity, stamped at mint and unchoosable by the agent, so
+    ///     it names the same governed agent across rotations and nothing else.
+    ///
+    /// Fail-closed throughout: a blank or absent label on EITHER side leaves only
+    /// rule (a), and the tenants must agree (a blank tenant normalizes to
+    /// untenanted, so an untenanted caller does not reach a tenanted agent's
+    /// approval and vice versa). Mirrors `approval_belongs_to_channel`, the same
+    /// (tenant, agent_label) ownership the approval-results and
+    /// approval-notifications feeds already use.
+    pub fn owns(&self, approval: &ApprovalRequest) -> bool {
+        // (a) the principal that opened it.
+        if approval.requester.principal_id.as_deref() == Some(self.principal_id.as_str()) {
+            return true;
+        }
+        // (b) the same governed agent, across a token rotation.
+        let (Some(caller_label), Some(requester_label)) = (
+            non_blank(self.agent_label.as_deref()),
+            non_blank(approval.agent_label.as_deref()),
+        ) else {
+            return false;
+        };
+        caller_label == requester_label
+            && non_blank(self.tenant.as_deref()) == non_blank(approval.tenant.as_deref())
+    }
+}
+
+/// An optional field that is present and not just whitespace, or `None`. Blank
+/// and absent must behave identically here: a label or tenant configured as an
+/// empty string is not an identity to authorize on.
+fn non_blank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 /// Error from [`VultrinoServer::run_action`], tagged with whether the
 /// side-effecting `plugin.execute` had begun.
 ///
@@ -3357,17 +3449,18 @@ impl VultrinoServer {
     /// calls via `check_approval` (MCP), `GET /api/v1/approvals/{id}` (HTTP), or
     /// `vultrino approval status` (CLI).
     ///
-    /// `expected_principal`, when `Some`, must match the approval's requester —
-    /// the ownership check happens **before** any execution, so a non-owner can
-    /// never trigger another principal's approved action. Pass `None` for a
-    /// trusted local caller (CLI/admin).
+    /// `caller`, when `Some`, must OWN the approval in the sense of
+    /// [`ApprovalCaller::owns`] — the same principal, or the same governed agent
+    /// after a token rotation. The ownership check happens **before** any
+    /// execution, so a non-owner can never trigger another agent's approved
+    /// action. Pass `None` for a trusted local caller (CLI/admin).
     ///
     /// Storage is reloaded first so a decision made by another process (the web
     /// admin panel, a Telegram button) is picked up.
     pub async fn check_and_resume_approval(
         &self,
         id: &str,
-        expected_principal: Option<&str>,
+        caller: Option<&ApprovalCaller>,
     ) -> Result<ApprovalRequest, VultrinoError> {
         // Best-effort: pick up cross-process decisions.
         let _ = self.storage.reload().await;
@@ -3379,8 +3472,8 @@ impl VultrinoServer {
 
         // Ownership check BEFORE any side effect: a non-owner must not be able to
         // trigger execution of someone else's approved action.
-        if let Some(pid) = expected_principal {
-            if approval.requester.principal_id.as_deref() != Some(pid) {
+        if let Some(caller) = caller {
+            if !caller.owns(&approval) {
                 return Err(VultrinoError::PolicyDenied(
                     "This approval was requested by a different principal; you are not authorized \
                      to access it"
@@ -5826,9 +5919,17 @@ mod tests {
     /// A use token's `require_approval: true` (govder: "human-confirmed write
     /// on every use" for L3) must gate WRITES, not reads. Otherwise every read
     /// through such a token (e.g. a Notion `GET`) opens a Pending approval, and
-    /// an eve-binder poll loop that re-reads the token file each iteration hits
-    /// "requested by a different principal" after remint — the marketing-demo
-    /// bug this test locks in the fix for.
+    /// an eve-binder poll loop that re-reads the token file each iteration drowns
+    /// in approvals nobody asked for — the marketing-demo bug this test locks in
+    /// the fix for.
+    ///
+    /// This comment used to end "…hits 'requested by a different principal' after
+    /// remint". That consequence no longer follows and is no longer this test's
+    /// business: ownership of an approval is now the governed AGENT rather than
+    /// the one token that opened it ([`ApprovalCaller::owns`]), so a reminted
+    /// token with the same `agent_label` and tenant polls its own approvals
+    /// normally. What is still true, and still what this test proves, is that a
+    /// read should never have opened an approval in the first place.
     #[tokio::test]
     async fn force_approval_token_gates_writes_not_reads() {
         use crate::auth::NewUseToken;

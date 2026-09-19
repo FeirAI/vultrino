@@ -158,15 +158,10 @@ enum McpPrincipal {
 }
 
 impl McpPrincipal {
-    /// Stable id of the underlying principal (api key id or use token id).
-    fn id(&self) -> &str {
-        match self {
-            McpPrincipal::ApiKey(a) => &a.api_key.id,
-            McpPrincipal::UseToken { token, .. } => &token.id,
-        }
-    }
-
-    /// The permission/scope source for this principal.
+    /// The permission/scope source for this principal. Its `api_key` is the real
+    /// api key row, or the one `AuthResult::for_use_token` synthesizes from a use
+    /// token, so it is also where the principal's stable id, agent label and
+    /// tenant come from (see `ApprovalCaller::from_auth`).
     fn auth(&self) -> &AuthResult {
         match self {
             McpPrincipal::ApiKey(a) => a,
@@ -1322,13 +1317,15 @@ impl McpServer {
         // Authenticate the caller (API key or use token). Polling is a read, so
         // an exhausted/expired use token is still allowed — only revoked is not.
         let principal = self.resolve_principal_for_read(&args.api_key).await?;
-        let caller_id = principal.id().to_string();
+        // Built from the STORED record the presented secret resolved to, never
+        // from `args`: the agent names the approval, never its own identity.
+        let caller = crate::server::ApprovalCaller::from_auth(principal.auth());
 
         // The ownership check is enforced inside check_and_resume_approval BEFORE
         // any execution, so a non-owner can never trigger the approved action.
         let approval = self
             .vultrino
-            .check_and_resume_approval(&args.approval_id, Some(&caller_id))
+            .check_and_resume_approval(&args.approval_id, Some(&caller))
             .await
             .map_err(|e| e.to_string())?;
 

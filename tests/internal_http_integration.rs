@@ -1524,7 +1524,10 @@ async fn a_gated_internal_http_action_runs_when_the_approval_is_granted() {
 
     // The poll the agent makes. This is where the action runs.
     let resumed = server
-        .check_and_resume_approval(&approval.id, Some(token.id.as_str()))
+        .check_and_resume_approval(
+            &approval.id,
+            Some(&vultrino::server::ApprovalCaller::id_only(token.id.clone())),
+        )
         .await
         .expect("the resume poll must not error");
     assert!(
