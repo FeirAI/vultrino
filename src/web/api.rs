@@ -1205,9 +1205,13 @@ pub async fn api_decide_approval(
                 )
             }
         };
+        // The approver-identity verifier, which is the dedicated approval secret
+        // when the deployment configures one and the govder client key otherwise
+        // (see `GovderConfig::approval_verification_secret`). Outbound calls to
+        // govder keep signing with `assertion_secret` either way.
         if let Err(error) = crate::govder::verify_tenant_assertion(
             assertion,
-            &govder.assertion_secret,
+            govder.approval_verification_secret(),
             acting_tenant,
             method.as_str(),
             original_uri.path(),
@@ -1376,17 +1380,46 @@ pub async fn api_decide_approval(
     if existing.same_aggregator_key_guard_active(enforce_sod)
         && existing.contributes_positive_slot(body.approve, resolved_class)
     {
-        let key_prefix = format!("agg:{}:", admin.0.api_key.id);
-        if existing.signoffs().iter().any(|s| {
-            s.approver_identity.starts_with(&key_prefix)
-                && existing.contributes_positive_slot(s.approve, s.resolved_class)
-        }) {
-            return error_response(
-                StatusCode::CONFLICT,
-                "separation_of_duty",
-                "Separation of duty: this approval already has a positive sign-off from \
-                 this aggregator key; a distinct co-approver must use a different key.",
-            );
+        // The same-key arm applies only when the INCOMING identity is itself
+        // aggregator-asserted, exactly as the in-lock guard does (it keys on the
+        // incoming identity's `agg:` prefix). Unconditional here, it 409'd a
+        // genuinely distinct VERIFIED co-approver for a same-key reason that was
+        // not true of them, on any approval already carrying an unsigned sign-off
+        // from this key. That case is now answered by the mixed-provenance arm
+        // below, with the cause that is actually true.
+        if !verified_broker_assertion {
+            let key_prefix = format!("agg:{}:", admin.0.api_key.id);
+            if existing.signoffs().iter().any(|s| {
+                s.approver_identity.starts_with(&key_prefix)
+                    && existing.contributes_positive_slot(s.approve, s.resolved_class)
+            }) {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    "separation_of_duty",
+                    "Separation of duty: this approval already has a positive sign-off from \
+                     this aggregator key; a distinct co-approver must use a different key.",
+                );
+            }
+        }
+        // Fast-fail mirror of the in-lock NO MIXED PROVENANCE rule (see
+        // `ApprovalRequest::transition`): an unsigned aggregator claim may not
+        // fill a slot next to a broker-verified subject, in either order, because
+        // one compromised api key would then be worth the second approver on
+        // every two-person rule. Authoritative enforcement is under the storage
+        // write lock; this is the clean 409 with the machine-readable code the
+        // product surface maps.
+        if let Some(incoming) = crate::approval::approver_provenance(&approver) {
+            if existing.signoffs().iter().any(|s| {
+                existing.contributes_positive_slot(s.approve, s.resolved_class)
+                    && crate::approval::approver_provenance(&s.approver_identity)
+                        .is_some_and(|recorded| recorded != incoming)
+            }) {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    "mixed_approval_provenance",
+                    crate::approval::MIXED_PROVENANCE_MESSAGE,
+                );
+            }
         }
     }
     match state
@@ -1448,6 +1481,15 @@ pub async fn api_decide_approval(
         // decide_approval returns Conflict for an already-decided/expired request
         // AND for a hard-enforced separation-of-duty self-approval. 409 conveys
         // "not actionable in the current state"; the message distinguishes them.
+        // The one exception is the in-lock mixed-provenance refusal, which the
+        // product surface must be able to recognize without reading prose: it
+        // keeps its own code. The fast-fail above answers the same way, so a
+        // caller sees one code whichever side catches it.
+        Err(crate::storage::StorageError::Conflict(msg))
+            if msg == crate::approval::MIXED_PROVENANCE_MESSAGE =>
+        {
+            error_response(StatusCode::CONFLICT, "mixed_approval_provenance", msg)
+        }
         Err(crate::storage::StorageError::Conflict(msg)) => {
             error_response(StatusCode::CONFLICT, "approval_not_decidable", msg)
         }
@@ -1602,6 +1644,16 @@ pub async fn api_list_credentials(
             internal_binding: InternalBindingInfo::from_metadata(&c.metadata),
             id: c.id,
             alias: c.alias,
+            // KNOWN SPELLING MISMATCH, left as-is on purpose. `Debug` lowercased
+            // drops the word boundary, so this route has always reported
+            // `apikey`, `basicauth`, `urltoken` and now `googleserviceaccount`,
+            // while `Display`, the create wire format and the orgpack envelope
+            // all use the snake_case spelling (`api_key`, `google_service_account`).
+            // `c.credential_type.to_string()` fixes it, but it changes eight
+            // existing labels in an admin API at once, so it is a deliberate
+            // breaking change to make on its own, not a side effect of adding a
+            // type. `credential_type_list_spelling_is_pinned` pins today's output
+            // so that change cannot happen by accident.
             credential_type: format!("{:?}", c.credential_type).to_lowercase(),
             description: c.metadata.get("description").cloned(),
         })
@@ -4307,15 +4359,21 @@ pub async fn api_create_credential(
                 serde_json::json!({"code":"invalid_credential","error":"alias must not be empty"}),
             );
         }
-        // Seed-time admission. The blank-field/deep shape checks otherwise only
-        // run at vault OPEN, which is far too late: a credential that cannot be
-        // used would be accepted here, written to the encrypted file, and only
-        // refused on the next restart. For the types that carry deep rules
-        // (today: google_service_account's pinned endpoint, service-account
-        // address, scope allowlist and PKCS#8 RSA key) that refusal belongs at
-        // the seed call, where the operator is still watching. The message is a
-        // fixed string and never quotes the submitted material.
-        if let Err(reason) = req.data.validate_admission() {
+        // Seed-time validation, BOTH halves. The structural pass
+        // (`validate_vault_shape`: no blank required field, no empty secret) is
+        // the one that otherwise runs only at vault OPEN, where it is fatal to
+        // the whole open: `{"type":"api_key","key":""}` was accepted here,
+        // written to the encrypted file, and took the plane down at the next
+        // restart. Admission (today: google_service_account's pinned endpoint,
+        // service-account address, scope allowlist and PKCS#8 RSA key) belongs
+        // here too, while the operator is still watching, rather than at the
+        // first governed call. Both messages are fixed strings and neither
+        // quotes the submitted material.
+        if let Err(reason) = req
+            .data
+            .validate_vault_shape()
+            .and_then(|()| req.data.validate_admission())
+        {
             return (
                 StatusCode::BAD_REQUEST,
                 serde_json::json!({"code":"invalid_credential","error":reason}),
@@ -4998,6 +5056,51 @@ mod tests {
                 "no token on the wire"
             );
         }
+    }
+
+    #[test]
+    fn credential_type_list_spelling_is_pinned() {
+        // The list route renders `format!("{:?}", ..).to_lowercase()`, which is
+        // NOT the snake_case spelling `Display`, the create wire format and the
+        // orgpack envelope use. That mismatch predates the service-account type
+        // (`ApiKey` has always listed as `apikey`) and is left alone here; see
+        // the note at the `credential_type` assignment in `api_list_credentials`.
+        // This pins what the route emits TODAY so the eventual switch to
+        // `to_string()` is a deliberate, visible change to eight labels at once
+        // rather than a silent one nobody reviewed.
+        use crate::CredentialType;
+        let listed = |t: &CredentialType| format!("{:?}", t).to_lowercase();
+        for (variant, list_spelling, wire_spelling) in [
+            (CredentialType::ApiKey, "apikey", "api_key"),
+            (
+                CredentialType::GoogleServiceAccount,
+                "googleserviceaccount",
+                "google_service_account",
+            ),
+            (CredentialType::BasicAuth, "basicauth", "basic_auth"),
+            (CredentialType::UrlToken, "urltoken", "url_token"),
+            (CredentialType::HmacApiKey, "hmacapikey", "hmac_api_key"),
+        ] {
+            assert_eq!(
+                listed(&variant),
+                list_spelling,
+                "the list route's spelling changed"
+            );
+            assert_eq!(
+                variant.to_string(),
+                wire_spelling,
+                "the documented wire spelling changed"
+            );
+            assert_ne!(
+                list_spelling, wire_spelling,
+                "if these now agree the list route was fixed; drop this pin"
+            );
+        }
+        // Single-word variants already agree, and must keep agreeing.
+        assert_eq!(listed(&CredentialType::OAuth2), "oauth2");
+        assert_eq!(CredentialType::OAuth2.to_string(), "oauth2");
+        assert_eq!(listed(&CredentialType::Postgres), "postgres");
+        assert_eq!(CredentialType::Postgres.to_string(), "postgres");
     }
 
     #[test]

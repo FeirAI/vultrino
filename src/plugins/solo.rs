@@ -750,9 +750,15 @@ async fn google_service_account_credential(
             "solo service-account path requires google_service_account".into(),
         ));
     };
+    // Use-time re-validation, cheap half first. The pinned endpoint, the
+    // service-account address, the key id and the scope allowlist are re-checked
+    // on EVERY governed call, including the ones served from the cached token.
+    // The PKCS#8 parse is not: it is the expensive part and it is unavoidable on
+    // the mint path anyway (`signed_assertion` parses the key it signs with, and
+    // refuses with the same messages), so a cache hit no longer pays for it.
     credential
         .data
-        .validate_admission()
+        .validate_admission_fields()
         .map_err(|reason| invalid(reason.to_string()))?;
     if !token_is_stale(access_token.as_ref(), *expires_at) {
         return Ok((

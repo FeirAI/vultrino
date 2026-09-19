@@ -491,17 +491,25 @@ impl CredentialData {
         };
         valid
             .then_some(())
-            .ok_or("credential contains a blank required field or empty secret")?;
-        // Re-run the deep, type-specific checks at vault open too: a record that
-        // reached the encrypted file by some route other than the create API
-        // (a restored backup, a hand-edited vault) must still not become live.
-        self.validate_admission()
+            .ok_or("credential contains a blank required field or empty secret")
+        // STRUCTURAL ONLY, deliberately. This runs at vault open, where the first
+        // failing credential aborts the whole open and the enforcement plane then
+        // serves nothing. A blank field or empty secret is an invariant that
+        // cannot drift under a stored record, so it is safe to be fatal there.
+        // Admission is policy — a pinned endpoint string, an email suffix, a
+        // scope allowlist, what `ring` accepts as a key — and any of those can
+        // change under a credential that was valid when it was seeded, which
+        // would take the plane down at restart over ONE bad credential. Admission
+        // is enforced where it costs only that credential: at CREATE
+        // (`api_create_credential`) and at USE (the plugin resolves it through
+        // `validate_admission` before the secret is touched).
     }
 
     /// Deep, type-specific admission checks that go beyond the blank-field pass
     /// in [`Self::validate_vault_shape`]. Called at credential create (seed
-    /// time), at vault open, and again immediately before the credential is
-    /// used, so the same rules gate every route into the enforcement path.
+    /// time) and again immediately before the credential is used, so both routes
+    /// into the enforcement path apply the same rules. NOT called at vault open:
+    /// see the note on [`Self::validate_vault_shape`].
     ///
     /// Types with no deep rules return `Ok`: this is deliberately additive and
     /// changes nothing for the credential shapes that existed before it.
@@ -521,6 +529,26 @@ impl CredentialData {
                 token_uri,
                 scopes,
             ),
+            _ => Ok(()),
+        }
+    }
+
+    /// The half of [`Self::validate_admission`] that touches no key material:
+    /// every type-specific rule except proving the private key parses. The use
+    /// path runs this on EVERY governed call and the full check only when it is
+    /// actually about to mint, so a cached access token is handed back without
+    /// re-parsing an RSA key that the mint path parses anyway.
+    pub(crate) fn validate_admission_fields(&self) -> Result<(), &'static str> {
+        match self {
+            CredentialData::GoogleServiceAccount {
+                client_email,
+                private_key_id,
+                token_uri,
+                scopes,
+                ..
+            } => {
+                plugins::google_sa::validate_fields(client_email, private_key_id, token_uri, scopes)
+            }
             _ => Ok(()),
         }
     }
@@ -1294,11 +1322,34 @@ mod tests {
                 data.validate_admission().is_err(),
                 "case {index} must be refused at admission"
             );
-            assert!(
-                data.validate_vault_shape().is_err(),
-                "case {index} must also be refused at vault open"
-            );
         }
+        // Vault open is STRUCTURAL ONLY, on purpose: the first failing credential
+        // aborts the whole open, and an admission rule can tighten under a
+        // credential that was valid when it was seeded (a scope leaves the
+        // allowlist, `ring` stops accepting a key), which would take the
+        // enforcement plane down at restart over one record. So a
+        // policy-only failure opens fine and is refused at USE; only a blank
+        // field or empty secret is fatal at open.
+        assert!(
+            bad[0].validate_vault_shape().is_ok(),
+            "an unpinned token_uri is admission, not vault shape: it must not block the open"
+        );
+        assert!(
+            bad[1].validate_vault_shape().is_ok(),
+            "a non-service-account address must not block the open"
+        );
+        assert!(
+            bad[4].validate_vault_shape().is_ok(),
+            "an off-allowlist scope must not block the open"
+        );
+        assert!(
+            bad[5].validate_vault_shape().is_ok(),
+            "an unparseable key must not block the open"
+        );
+        // These two are ALSO structural (a blank key id, no scopes at all), so
+        // they stay fatal at open — that has nothing to do with admission.
+        assert!(bad[2].validate_vault_shape().is_err(), "a blank key id");
+        assert!(bad[3].validate_vault_shape().is_err(), "an empty scope set");
     }
 
     #[test]

@@ -318,6 +318,7 @@ async fn start_mutable_gate_rule(
         GovderConfig {
             base_url: format!("http://{address}"),
             assertion_secret: "test-govder-assertion-secret".to_string(),
+            approval_assertion_secret: None,
             assertion_ttl: std::time::Duration::from_secs(90),
             http_timeout: std::time::Duration::from_secs(5),
         },

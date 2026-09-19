@@ -68,6 +68,18 @@ const MIN_RSA_MODULUS_BITS: usize = 2048;
 const PKCS8_PEM_BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
 const PKCS8_PEM_END: &str = "-----END PRIVATE KEY-----";
 
+/// Framings an operator plausibly pastes instead of PKCS#8. Each is refused, but
+/// by a message that names what they actually have; see [`pem_framing_reason`].
+const PKCS1_PEM_BEGIN: &str = "-----BEGIN RSA PRIVATE KEY-----";
+const ENCRYPTED_PKCS8_PEM_BEGIN: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----";
+const SEC1_EC_PEM_BEGIN: &str = "-----BEGIN EC PRIVATE KEY-----";
+
+/// Google's own clock is the one that judges `iat`, so the assertion is backdated
+/// by this much: a vultrino host running even slightly fast would otherwise mint
+/// an assertion issued in the future, which Google rejects as `invalid_grant` on
+/// every single call.
+const ASSERTION_BACKDATE_SECS: i64 = 30;
+
 const JWT_BEARER_GRANT: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
 /// The subset of Google's token response this path uses.
@@ -102,6 +114,23 @@ pub(crate) fn validate(
     token_uri: &str,
     scopes: &[String],
 ) -> Result<(), &'static str> {
+    validate_fields(client_email, private_key_id, token_uri, scopes)?;
+    // Proving the key parses is part of admission: a credential that cannot sign
+    // must be refused at seed, not at the first governed call.
+    signing_key(private_key).map(|_| ())
+}
+
+/// The half of [`validate`] that touches no key material. Split out so the use
+/// path can re-check the pinned endpoint, the service-account address and the
+/// scope allowlist on EVERY governed call while a cached access token is served,
+/// and only pay for the PKCS#8 parse when it is actually about to mint (the mint
+/// path parses the key itself, so nothing is unchecked).
+pub(crate) fn validate_fields(
+    client_email: &str,
+    private_key_id: &str,
+    token_uri: &str,
+    scopes: &[String],
+) -> Result<(), &'static str> {
     if token_uri != GOOGLE_TOKEN_URI {
         return Err(
             "google_service_account token_uri must be exactly https://oauth2.googleapis.com/token",
@@ -125,9 +154,7 @@ pub(crate) fn validate(
             "google_service_account scopes must be a subset of the Sheets/Calendar allowlist",
         );
     }
-    // Proving the key parses is part of admission: a credential that cannot sign
-    // must be refused at seed, not at the first governed call.
-    signing_key(private_key).map(|_| ())
+    Ok(())
 }
 
 /// Decode a PKCS#8 PEM private key and hand back a `ring` RSA key pair.
@@ -147,17 +174,51 @@ fn signing_key(private_key: &str) -> Result<ring::signature::RsaKeyPair, &'stati
 }
 
 fn decode_pkcs8_pem(private_key: &str) -> Result<Zeroizing<Vec<u8>>, &'static str> {
-    let trimmed = private_key.trim();
-    let body = trimmed
+    // An operator pasting Google's JSON key into an env var, a .env file or a
+    // compose file very often lands the PEM with its newlines still escaped as
+    // the two characters backslash-n, because nothing in that chain interprets
+    // JSON escapes. It is the same key, so normalize it rather than refuse: the
+    // trailing literal `\n` is what used to survive `trim()`, defeat
+    // `strip_suffix` and produce a "must be a PKCS#8 PEM block" message that
+    // reads as "wrong key type". Applies to both callers, validate and mint,
+    // because both reach the key through here.
+    let normalized: Zeroizing<String> = Zeroizing::new(if private_key.contains("\\n") {
+        private_key.replace("\\n", "\n")
+    } else {
+        private_key.to_string()
+    });
+    let trimmed = normalized.trim();
+    let body = match trimmed
         .strip_prefix(PKCS8_PEM_BEGIN)
         .and_then(|rest| rest.strip_suffix(PKCS8_PEM_END))
-        .ok_or("google_service_account private_key must be a PKCS#8 PEM block")?;
+    {
+        Some(body) => body,
+        None => return Err(pem_framing_reason(trimmed)),
+    };
     let base64_body: Zeroizing<String> =
         Zeroizing::new(body.chars().filter(|c| !c.is_whitespace()).collect());
     STANDARD
         .decode(base64_body.as_bytes())
         .map(Zeroizing::new)
         .map_err(|_| "google_service_account private_key PEM body is not valid base64")
+}
+
+/// Name the framing the operator actually pasted, so the refusal points at the
+/// remedy instead of restating the requirement. Every arm is a fixed string and
+/// none of them quotes any part of the key.
+fn pem_framing_reason(trimmed: &str) -> &'static str {
+    if trimmed.starts_with(PKCS1_PEM_BEGIN) {
+        "google_service_account private_key is a PKCS#1 RSA key; convert it to PKCS#8 with \
+         'openssl pkcs8 -topk8 -nocrypt' and store that block"
+    } else if trimmed.starts_with(ENCRYPTED_PKCS8_PEM_BEGIN) {
+        "google_service_account private_key is an encrypted PKCS#8 key; this path cannot \
+         hold a passphrase, so store the decrypted key (Google's JSON key is not encrypted)"
+    } else if trimmed.starts_with(SEC1_EC_PEM_BEGIN) {
+        "google_service_account private_key is an EC key; a Google service-account key is \
+         RSA in PKCS#8 form"
+    } else {
+        "google_service_account private_key must be a PKCS#8 PEM block"
+    }
 }
 
 /// Build and sign the RS256 assertion. Public inputs only in the output; the
@@ -170,7 +231,9 @@ fn signed_assertion(
     scopes: &[String],
 ) -> Result<Zeroizing<String>, &'static str> {
     let key_pair = signing_key(private_key)?;
-    let issued_at = Utc::now().timestamp();
+    // Backdated; `exp` stays exactly one hour after `iat`, which is Google's
+    // ceiling. See ASSERTION_BACKDATE_SECS.
+    let issued_at = Utc::now().timestamp() - ASSERTION_BACKDATE_SECS;
 
     // No `sub`: this is the service account acting as itself. Adding one would
     // be domain-wide delegation, which this deployment does not do.
@@ -374,7 +437,16 @@ pub(crate) mod tests {
         let iat = claims["iat"].as_i64().expect("iat is a number");
         let exp = claims["exp"].as_i64().expect("exp is a number");
         assert_eq!(exp - iat, 3600, "the assertion lives exactly one hour");
-        assert!((before..=after).contains(&iat), "iat is minted now");
+        // Backdated by ASSERTION_BACKDATE_SECS so a host whose clock runs fast
+        // does not issue an assertion Google reads as being from the future.
+        assert!(
+            (before - ASSERTION_BACKDATE_SECS..=after - ASSERTION_BACKDATE_SECS).contains(&iat),
+            "iat is minted now, backdated 30s"
+        );
+        assert!(
+            exp <= after + 3600,
+            "exp is never more than an hour past the real clock"
+        );
 
         // Exactly the five claims above, and nothing the brief did not ask for.
         let claim_names: Vec<&String> = claims
@@ -522,6 +594,126 @@ pub(crate) mod tests {
                 "malformed key {malformed:?} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_pem_whose_newlines_arrived_escaped_is_accepted() {
+        // Google's JSON key holds the PEM with `\n` escapes. Paste that value into
+        // an env var, a .env file or a compose file and the two characters
+        // backslash-n are what reaches us. Same key, so it is accepted, on both
+        // the validate and the mint path.
+        let escaped = test_key_pem().replace('\n', "\\n");
+        assert!(
+            escaped.contains("\\n") && !escaped.contains('\n'),
+            "the fixture really is the escaped form"
+        );
+        validate(EMAIL, &escaped, KID, GOOGLE_TOKEN_URI, &scopes())
+            .expect("an escaped-newline PEM is the same key");
+
+        let jwt = signed_assertion(EMAIL, &escaped, KID, GOOGLE_TOKEN_URI, &scopes())
+            .expect("the mint path accepts it too");
+        let (signing_input, signature_b64) = jwt.rsplit_once('.').expect("jwt has a signature");
+        let signature = URL_SAFE_NO_PAD.decode(signature_b64).unwrap();
+        let key_pair = signing_key(test_key_pem()).unwrap();
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+            key_pair.public().as_ref(),
+        )
+        .verify(signing_input.as_bytes(), &signature)
+        .expect("it signed with the very same key");
+
+        // A trailing escaped newline, the exact shape that used to defeat
+        // strip_suffix and report "must be a PKCS#8 PEM block".
+        let trailing = format!("{}\\n", test_key_pem().trim_end());
+        validate(EMAIL, &trailing, KID, GOOGLE_TOKEN_URI, &scopes())
+            .expect("a trailing escaped newline is not a different key");
+    }
+
+    #[test]
+    fn the_wrong_pem_framing_is_named_in_the_refusal() {
+        // Each of these is refused either way; what is tested is that the message
+        // tells the operator which mistake they made.
+        let pkcs1 = validate(
+            EMAIL,
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----",
+            KID,
+            GOOGLE_TOKEN_URI,
+            &scopes(),
+        )
+        .unwrap_err();
+        assert!(pkcs1.contains("PKCS#1"), "names what they pasted: {pkcs1}");
+        assert!(pkcs1.contains("PKCS#8"), "names what is needed: {pkcs1}");
+        assert!(
+            pkcs1.contains("openssl pkcs8 -topk8"),
+            "names the remedy: {pkcs1}"
+        );
+
+        let encrypted = validate(
+            EMAIL,
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIB\n-----END ENCRYPTED PRIVATE KEY-----",
+            KID,
+            GOOGLE_TOKEN_URI,
+            &scopes(),
+        )
+        .unwrap_err();
+        assert!(
+            encrypted.contains("encrypted"),
+            "names the encryption: {encrypted}"
+        );
+
+        let sec1_ec = validate(
+            EMAIL,
+            "-----BEGIN EC PRIVATE KEY-----\nMIIB\n-----END EC PRIVATE KEY-----",
+            KID,
+            GOOGLE_TOKEN_URI,
+            &scopes(),
+        )
+        .unwrap_err();
+        assert!(sec1_ec.contains("EC key"), "names the curve key: {sec1_ec}");
+        assert!(sec1_ec.contains("RSA"), "names what is needed: {sec1_ec}");
+
+        // A PKCS#8-framed key that is simply not RSA still gets the generic
+        // not-a-usable-RSA-key message from `ring`'s parse.
+        let ec_pkcs8 = Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-outform",
+                "PEM",
+            ])
+            .output()
+            .expect("openssl generates the EC test key");
+        let ec_pem = String::from_utf8(ec_pkcs8.stdout).unwrap();
+        let message = validate(EMAIL, &ec_pem, KID, GOOGLE_TOKEN_URI, &scopes()).unwrap_err();
+        assert!(
+            message.contains("PKCS#8 RSA key"),
+            "a PKCS#8-framed non-RSA key: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_fields_runs_every_rule_but_the_key_parse() {
+        // The use path calls this on every governed call; it must still refuse an
+        // unpinned endpoint, a non-service-account address, a blank key id and an
+        // off-allowlist scope, and must NOT care about the key (the mint path
+        // parses it).
+        assert!(validate_fields(EMAIL, KID, GOOGLE_TOKEN_URI, &scopes()).is_ok());
+        assert!(validate_fields(EMAIL, KID, "https://evil.example/token", &scopes()).is_err());
+        assert!(validate_fields("owner@feir.ai", KID, GOOGLE_TOKEN_URI, &scopes()).is_err());
+        assert!(validate_fields(EMAIL, "  ", GOOGLE_TOKEN_URI, &scopes()).is_err());
+        assert!(validate_fields(EMAIL, KID, GOOGLE_TOKEN_URI, &[]).is_err());
+        assert!(validate_fields(
+            EMAIL,
+            KID,
+            GOOGLE_TOKEN_URI,
+            &["https://www.googleapis.com/auth/drive".to_string()]
+        )
+        .is_err());
+        // The full `validate` is the one that also proves the key parses.
+        assert!(validate(EMAIL, "garbage", KID, GOOGLE_TOKEN_URI, &scopes()).is_err());
     }
 
     #[test]

@@ -1714,6 +1714,34 @@ impl ApprovalRequest {
                     return Err(ApprovalError::SameAggregatorKey);
                 }
             }
+            // NO MIXED PROVENANCE. The two positive provenances answer different
+            // questions: `verified:<subject>` means the subject arrived inside a
+            // request-bound assertion signed with the approval key, while
+            // `agg:<key-id>:<operator>` is an UNVERIFIABLE claim by the bearer of
+            // an admin api key. Letting both fill slots of ONE approval is what
+            // makes a compromised key worth half of every two-person rule: the
+            // key-holder posts an unsigned positive next to a genuine verified
+            // one (or the reverse), and neither the same-key guard (no `agg:`
+            // prefix on a verified identity) nor DuplicateApprover (different
+            // subjects) sees it. So once this approval carries a contributing
+            // positive of one class, a contributing positive of the OTHER class
+            // is refused. Within a class the existing rules still apply: two
+            // `agg:` positives collide on the key above, two `verified:` ones are
+            // distinct subjects the broker authenticated separately.
+            //
+            // Deny decisions are untouched (they contribute no slot, and dissent
+            // is never lost). An `agg:`-only or `verified:`-only approval behaves
+            // exactly as before, as does a single-slot recipe or numeric
+            // threshold, where the guard is not active at all.
+            if let Some(incoming) = approver_provenance(&identity) {
+                if self.signoffs.iter().any(|s| {
+                    self.contributes_positive_slot(s.approve, s.resolved_class)
+                        && approver_provenance(&s.approver_identity)
+                            .is_some_and(|existing| existing != incoming)
+                }) {
+                    return Err(ApprovalError::MixedProvenance);
+                }
+            }
         }
         // Approvers must be DISTINCT — the same identity can't satisfy two of the
         // required M sign-offs (nor dissent once and later approve, or vice versa).
@@ -2589,7 +2617,19 @@ pub enum ApprovalError {
     /// it), so under hard SoD one key may not satisfy two of the M sign-offs.
     #[error("separation of duty: this aggregator key already supplied a sign-off; a distinct co-approver must use a different key")]
     SameAggregatorKey,
+    /// A positive sign-off arrived whose identity provenance differs from that of
+    /// a positive sign-off the approval already holds — an unsigned aggregator
+    /// claim next to a broker-verified subject, or the reverse. See
+    /// [`MIXED_PROVENANCE_MESSAGE`] and the guard in [`ApprovalRequest::transition`].
+    #[error("{}", MIXED_PROVENANCE_MESSAGE)]
+    MixedProvenance,
 }
+
+/// The fixed operator-facing reason for [`ApprovalError::MixedProvenance`]. It
+/// names the rule and nothing else: no subject, operator string or api-key id
+/// appears in it. `web::api` matches this exact string so the decision route can
+/// answer with the machine-readable `mixed_approval_provenance` code.
+pub const MIXED_PROVENANCE_MESSAGE: &str = "mixed approval provenance: every positive sign-off on one approval must share the same identity provenance, either all broker-verified or all aggregator-asserted";
 
 /// Prefix that marks an **aggregator-asserted** approver identity recorded by the
 /// product-aggregator JSON surface: `agg:<acting-api-key-id>:<operator>`. The
@@ -2637,6 +2677,35 @@ fn aggregator_key_prefix(identity: &str) -> Option<&str> {
     // Keep through the second overall colon: `agg:<key-id>:`.
     let key_id_len = rest.find(':')?;
     Some(&identity[..AGG_IDENTITY_PREFIX.len() + key_id_len + 1])
+}
+
+/// How an approver identity's subject was established. The two classes are not
+/// interchangeable: a `Verified` subject was named inside a request-bound
+/// assertion the approval key authenticated, an `Aggregator` one is a string the
+/// bearer of an admin api key supplied. Mixing them on one approval is what the
+/// [`ApprovalError::MixedProvenance`] rule refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproverProvenance {
+    /// `verified:<subject>`.
+    Verified,
+    /// `agg:<key-id>:<operator>`.
+    Aggregator,
+}
+
+/// Classify an approver identity, or `None` when it is neither broker-verified
+/// nor aggregator-asserted — a bare identity (the HTML console records the
+/// session username, the delegate path an agent identity) belongs to no class
+/// and the mixed-provenance rule leaves it alone, exactly as the same-key guard
+/// does. A malformed `agg:` value with no second colon is opaque here for the
+/// same reason it is opaque to [`aggregator_key_prefix`].
+pub fn approver_provenance(identity: &str) -> Option<ApproverProvenance> {
+    if identity.starts_with(VERIFIED_IDENTITY_PREFIX) {
+        Some(ApproverProvenance::Verified)
+    } else if aggregator_key_prefix(identity).is_some() {
+        Some(ApproverProvenance::Aggregator)
+    } else {
+        None
+    }
 }
 
 /// Links embedded in out-of-band notifications.
@@ -4486,6 +4555,197 @@ mod tests {
             ApprovalStatus::Approved,
             "a senior + a teammate on DISTINCT keys legitimately fill {{teammate:2}}"
         );
+    }
+
+    #[test]
+    fn positive_signoffs_may_not_mix_verified_and_aggregator_provenance() {
+        // The asymmetry this closes: a `verified:` identity carries no `agg:`
+        // prefix, so the same-key guard never saw it, in EITHER direction. One
+        // compromised admin key could therefore post an unsigned positive next to
+        // a genuine broker-verified one and fill the second slot of a two-person
+        // rule with a name it made up.
+        let make_rule = || ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        };
+        let signoff = |ident: &str, class| {
+            let mut d = Decision::new("json-api", ident)
+                .with_resolved_class(class)
+                .enforcing_sod(true);
+            d.approver_kind = "human".to_string();
+            d
+        };
+
+        // verified THEN unsigned: the attacker-preferred order (sign next to a
+        // real human who already approved).
+        let mut a = new_approval_with_rule(make_rule());
+        a.authoritative_risk_tier = "High".to_string();
+        a.approve(signoff("verified:sub-alice", ApproverClass::Teammate))
+            .unwrap();
+        assert_eq!(a.status, ApprovalStatus::Pending);
+        let err = a
+            .approve(signoff("agg:keyK:fake-bob@corp", ApproverClass::Teammate))
+            .unwrap_err();
+        assert!(
+            matches!(err, ApprovalError::MixedProvenance),
+            "an unsigned claim must not fill a slot beside a verified subject, got {err:?}"
+        );
+        assert_eq!(a.status, ApprovalStatus::Pending);
+        assert_eq!(a.signoffs.len(), 1, "the refused sign-off is not recorded");
+
+        // unsigned THEN verified: refused too, and with the MIXED cause. This is
+        // the leg that used to answer "same aggregator key" at the api layer
+        // about an approver who had never used that key.
+        let mut b = new_approval_with_rule(make_rule());
+        b.authoritative_risk_tier = "High".to_string();
+        b.approve(signoff("agg:keyK:fake-carol@corp", ApproverClass::Teammate))
+            .unwrap();
+        let err2 = b
+            .approve(signoff("verified:sub-dave", ApproverClass::Teammate))
+            .unwrap_err();
+        assert!(
+            matches!(err2, ApprovalError::MixedProvenance),
+            "the cause is the mixed provenance, not a same-key collision, got {err2:?}"
+        );
+
+        // Two DISTINCT verified subjects still satisfy {teammate:2}: this rule
+        // must not cost the signed posture its legitimate two-person grant.
+        let mut c = new_approval_with_rule(make_rule());
+        c.authoritative_risk_tier = "High".to_string();
+        c.approve(signoff("verified:sub-erin", ApproverClass::Teammate))
+            .unwrap();
+        c.approve(signoff("verified:sub-frank", ApproverClass::Teammate))
+            .unwrap();
+        assert_eq!(
+            c.status,
+            ApprovalStatus::Approved,
+            "two distinct verified subjects are two people"
+        );
+
+        // The SAME verified subject twice is still the duplicate it always was.
+        let mut d = new_approval_with_rule(make_rule());
+        d.authoritative_risk_tier = "High".to_string();
+        d.approve(signoff("verified:sub-erin", ApproverClass::Teammate))
+            .unwrap();
+        let err3 = d
+            .approve(signoff("verified:sub-erin", ApproverClass::Teammate))
+            .unwrap_err();
+        assert!(
+            matches!(err3, ApprovalError::DuplicateApprover),
+            "one subject cannot be two approvers, got {err3:?}"
+        );
+
+        // Two `agg:` positives on one key still collide on the KEY, not on
+        // provenance: the same-key guard runs first and keeps its own cause.
+        let mut e = new_approval_with_rule(make_rule());
+        e.authoritative_risk_tier = "High".to_string();
+        e.approve(signoff("agg:keyK:fake-gina@corp", ApproverClass::Teammate))
+            .unwrap();
+        let err4 = e
+            .approve(signoff("agg:keyK:fake-hank@corp", ApproverClass::Teammate))
+            .unwrap_err();
+        assert!(
+            matches!(err4, ApprovalError::SameAggregatorKey),
+            "same-key stays the same-key cause, got {err4:?}"
+        );
+
+        // Two `agg:` positives on DISTINCT keys are unchanged as well: mixing is
+        // about provenance CLASS, not about which key inside a class.
+        let mut f = new_approval_with_rule(make_rule());
+        f.authoritative_risk_tier = "High".to_string();
+        f.approve(signoff("agg:keyA:alice@corp", ApproverClass::Teammate))
+            .unwrap();
+        f.approve(signoff("agg:keyB:bob@corp", ApproverClass::Teammate))
+            .unwrap();
+        assert_eq!(f.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn mixed_provenance_leaves_denials_and_single_slot_recipes_alone() {
+        let signoff = |ident: &str, class| {
+            let mut d = Decision::new("json-api", ident)
+                .with_resolved_class(class)
+                .enforcing_sod(true);
+            d.approver_kind = "human".to_string();
+            d
+        };
+
+        // A DENY of either provenance is always accepted: it fills no slot, and
+        // dissent is never lost. Majority mode so the first deny does not seal
+        // the request before the second arrives.
+        let mut a = new_approval_with_rule(ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Teammate,
+                    count: 2,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        });
+        a.authoritative_risk_tier = "Low".to_string();
+        a.approve(signoff("verified:sub-alice", ApproverClass::Teammate))
+            .unwrap();
+        a.deny(signoff("agg:keyK:fake-bob@corp", ApproverClass::Teammate))
+            .expect("an aggregator DENY beside a verified approval is still recorded");
+        assert_eq!(a.signoffs.len(), 2);
+        assert!(!a.signoffs[1].approve);
+
+        // A single-slot recipe is granted by its first sign-off, so a later one
+        // of the other provenance meets an already-decided request, exactly as
+        // before this rule existed.
+        let mut b = new_approval_with_rule(ApprovalRule {
+            recipes: vec![Recipe {
+                terms: vec![RecipeTerm {
+                    class: ApproverClass::Senior,
+                    count: 1,
+                }],
+            }],
+            decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        });
+        b.authoritative_risk_tier = "High".to_string();
+        b.approve(signoff("verified:sub-alice", ApproverClass::Senior))
+            .unwrap();
+        assert_eq!(b.status, ApprovalStatus::Approved);
+        let err = b
+            .approve(signoff("agg:keyK:fake-bob@corp", ApproverClass::Senior))
+            .unwrap_err();
+        assert!(
+            matches!(err, ApprovalError::AlreadyDecided(_)),
+            "a decided single-slot recipe answers already-decided, got {err:?}"
+        );
+
+        // With NO recipe and a threshold of 1 the guard is inactive entirely:
+        // one approver of either provenance grants, unchanged.
+        let (mut c, _) = new_approval();
+        c.approve(signoff("verified:sub-alice", ApproverClass::Senior))
+            .unwrap();
+        assert_eq!(c.status, ApprovalStatus::Approved);
+        let (mut d, _) = new_approval();
+        d.approve(signoff("agg:keyK:alice@corp", ApproverClass::Senior))
+            .unwrap();
+        assert_eq!(d.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn approver_provenance_classifies_only_the_two_namespaced_forms() {
+        assert_eq!(
+            approver_provenance("verified:sub-alice"),
+            Some(ApproverProvenance::Verified)
+        );
+        assert_eq!(
+            approver_provenance("agg:key-1:alice@corp"),
+            Some(ApproverProvenance::Aggregator)
+        );
+        // A bare console/session identity belongs to no class and is untouched.
+        assert_eq!(approver_provenance("alice@example.com"), None);
+        // Malformed `agg:` with no second colon stays opaque, as it is to
+        // aggregator_key_prefix.
+        assert_eq!(approver_provenance("agg:no-second-colon"), None);
     }
 
     #[test]

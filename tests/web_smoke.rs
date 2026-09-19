@@ -429,11 +429,31 @@ fn signed_admin_decision_req(
     signed_body: serde_json::Value,
     sent_body: serde_json::Value,
 ) -> Request<Body> {
+    signed_admin_decision_req_with_secret(
+        uri,
+        key,
+        tenant,
+        signed_body,
+        sent_body,
+        TEST_BROKER_ASSERTION_SECRET,
+    )
+}
+
+/// [`signed_admin_decision_req`] with the signing secret named, for the tests
+/// that prove WHICH key the approval route verifies with.
+fn signed_admin_decision_req_with_secret(
+    uri: &str,
+    key: &str,
+    tenant: &str,
+    signed_body: serde_json::Value,
+    sent_body: serde_json::Value,
+    secret: &str,
+) -> Request<Body> {
     let signed_bytes = serde_json::to_vec(&signed_body).unwrap();
     let sent_bytes = serde_json::to_vec(&sent_body).unwrap();
     let parsed: axum::http::Uri = uri.parse().unwrap();
     let assertion = vultrino::govder::sign_tenant_assertion(
-        TEST_BROKER_ASSERTION_SECRET,
+        secret,
         tenant,
         "POST",
         parsed.path(),
@@ -3507,6 +3527,18 @@ async fn build_hard_sod_recipe_fixture(
     rule: ApprovalRule,
     risk_tier: &str,
 ) -> (axum::Router, Arc<dyn StorageBackend>, String, String) {
+    build_hard_sod_recipe_fixture_with_approval_secret(tenant, rule, risk_tier, None).await
+}
+
+/// [`build_hard_sod_recipe_fixture`] with an optional dedicated
+/// `VULTRINO_APPROVAL_ASSERTION_SECRET`, so a test can prove the approval route
+/// verifies approver identities with THAT key and not the shared govder one.
+async fn build_hard_sod_recipe_fixture_with_approval_secret(
+    tenant: &str,
+    rule: ApprovalRule,
+    risk_tier: &str,
+    approval_assertion_secret: Option<&str>,
+) -> (axum::Router, Arc<dyn StorageBackend>, String, String) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
     std::mem::forget(dir);
@@ -3526,6 +3558,7 @@ async fn build_hard_sod_recipe_fixture(
     sod_config.govder = Some(GovderConfig {
         base_url: "http://govder.invalid".to_string(),
         assertion_secret: TEST_BROKER_ASSERTION_SECRET.to_string(),
+        approval_assertion_secret: approval_assertion_secret.map(str::to_string),
         assertion_ttl: Duration::from_secs(90),
         http_timeout: Duration::from_secs(1),
     });
@@ -3730,6 +3763,375 @@ async fn test_verified_broker_assertion_requires_named_and_allows_two_bound_subj
         after_two.signoffs()[1].approver_identity,
         "verified:sub-bob"
     );
+}
+
+/// A `{teammate:2}` rule for the mixed-provenance tests below.
+fn two_teammate_rule() -> ApprovalRule {
+    ApprovalRule {
+        recipes: vec![Recipe {
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Teammate,
+                count: 2,
+            }],
+        }],
+        decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+    }
+}
+
+#[tokio::test]
+async fn test_unsigned_positive_is_refused_beside_a_verified_one() {
+    // The attacker-preferred order: a real human has approved through the broker
+    // and is recorded `verified:sub-alice`; the holder of the tenant's vultrino
+    // admin key then posts an UNSIGNED positive with a name it invented. Before
+    // this rule neither guard saw it (a verified identity carries no `agg:`
+    // prefix, and the two subjects differ), so one key was worth the second
+    // approver of every two-person rule.
+    let (router, storage, key, id) =
+        build_hard_sod_recipe_fixture("team-a", two_teammate_rule(), "High").await;
+    let uri = format!("/api/v1/approvals/{id}/decision");
+
+    let alice = serde_json::json!({
+        "approve": true,
+        "approver": "sub-alice",
+        "approver_class": "teammate",
+    });
+    let response = router
+        .clone()
+        .oneshot(signed_admin_decision_req(
+            &uri,
+            &key,
+            "team-a",
+            alice.clone(),
+            alice,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .oneshot(admin_req(
+            "POST",
+            &uri,
+            &key,
+            serde_json::json!({"approve": true, "approver": "fake-bob", "approver_class": "teammate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "an unsigned claim must not fill the slot beside a verified subject"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["code"], "mixed_approval_provenance");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        !error.contains("sub-alice") && !error.contains("fake-bob"),
+        "the refusal names the rule, not the people: {error}"
+    );
+
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.signoffs().len(), 1, "nothing was recorded");
+}
+
+#[tokio::test]
+async fn test_verified_positive_after_an_unsigned_one_is_refused_for_the_true_cause() {
+    // The reverse order, and the availability half of the same asymmetry: the
+    // api-layer fast-fail used to answer 409 `separation_of_duty` here, telling
+    // a genuinely distinct verified approver that they had already signed off
+    // with this key, which they never had. The refusal stands, but the cause is
+    // now the one that is true.
+    let (router, storage, key, id) =
+        build_hard_sod_recipe_fixture("team-a", two_teammate_rule(), "High").await;
+    let uri = format!("/api/v1/approvals/{id}/decision");
+
+    let response = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &uri,
+            &key,
+            serde_json::json!({"approve": true, "approver": "legacy-alice", "approver_class": "teammate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bob = serde_json::json!({
+        "approve": true,
+        "approver": "sub-bob",
+        "approver_class": "teammate",
+    });
+    let response = router
+        .oneshot(signed_admin_decision_req(
+            &uri,
+            &key,
+            "team-a",
+            bob.clone(),
+            bob,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(
+        body["code"], "mixed_approval_provenance",
+        "not separation_of_duty: this approver never used that key"
+    );
+
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(stored.signoffs().len(), 1);
+}
+
+#[tokio::test]
+async fn test_denials_of_either_provenance_are_unaffected_by_the_provenance_rule() {
+    // A deny contributes no slot, and dissent is never lost.
+    let rule = ApprovalRule {
+        recipes: vec![Recipe {
+            terms: vec![RecipeTerm {
+                class: ApproverClass::Teammate,
+                count: 2,
+            }],
+        }],
+        decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+    };
+    let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "Low").await;
+    let uri = format!("/api/v1/approvals/{id}/decision");
+
+    let alice = serde_json::json!({
+        "approve": true,
+        "approver": "sub-alice",
+        "approver_class": "teammate",
+    });
+    let response = router
+        .clone()
+        .oneshot(signed_admin_decision_req(
+            &uri,
+            &key,
+            "team-a",
+            alice.clone(),
+            alice,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .oneshot(admin_req(
+            "POST",
+            &uri,
+            &key,
+            serde_json::json!({"approve": false, "approver": "legacy-bob", "approver_class": "teammate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "an unsigned DENY beside a verified approval is still recorded"
+    );
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.signoffs().len(), 2);
+    assert!(!stored.signoffs()[1].approve);
+}
+
+const TEST_APPROVAL_ASSERTION_SECRET: &str = "test-dedicated-approval-assertion-secret";
+
+#[tokio::test]
+async fn test_approval_route_verifies_with_the_dedicated_approval_secret() {
+    // With VULTRINO_APPROVAL_ASSERTION_SECRET configured, the approver-identity
+    // verifier uses ONLY that key: the shared govder key, which govder, leria and
+    // vultrino itself all hold, can no longer assert who approved.
+    let (router, storage, key, id) = build_hard_sod_recipe_fixture_with_approval_secret(
+        "team-a",
+        two_teammate_rule(),
+        "High",
+        Some(TEST_APPROVAL_ASSERTION_SECRET),
+    )
+    .await;
+    let uri = format!("/api/v1/approvals/{id}/decision");
+    let alice = serde_json::json!({
+        "approve": true,
+        "approver": "sub-alice",
+        "approver_class": "teammate",
+    });
+
+    // Signed with the GOVDER secret: refused, and no sign-off recorded.
+    let response = router
+        .clone()
+        .oneshot(signed_admin_decision_req_with_secret(
+            &uri,
+            &key,
+            "team-a",
+            alice.clone(),
+            alice.clone(),
+            TEST_BROKER_ASSERTION_SECRET,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "the shared cross-plane key must not assert an approver"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["code"], "invalid_tenant_assertion");
+    assert!(storage
+        .get_approval(&id)
+        .await
+        .unwrap()
+        .unwrap()
+        .signoffs()
+        .is_empty());
+
+    // Signed with the APPROVAL secret: verified.
+    let response = router
+        .oneshot(signed_admin_decision_req_with_secret(
+            &uri,
+            &key,
+            "team-a",
+            alice.clone(),
+            alice,
+            TEST_APPROVAL_ASSERTION_SECRET,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.signoffs().len(), 1);
+    assert_eq!(stored.signoffs()[0].approver_identity, "verified:sub-alice");
+}
+
+#[tokio::test]
+async fn test_approval_route_falls_back_to_the_govder_secret_when_unseparated() {
+    // Unconfigured, the verifier keeps using the govder assertion secret, which
+    // is the pre-existing behaviour (the startup warning is what says so).
+    let (router, storage, key, id) =
+        build_hard_sod_recipe_fixture("team-a", two_teammate_rule(), "High").await;
+    let uri = format!("/api/v1/approvals/{id}/decision");
+    let alice = serde_json::json!({
+        "approve": true,
+        "approver": "sub-alice",
+        "approver_class": "teammate",
+    });
+    let response = router
+        .oneshot(signed_admin_decision_req_with_secret(
+            &uri,
+            &key,
+            "team-a",
+            alice.clone(),
+            alice,
+            TEST_BROKER_ASSERTION_SECRET,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.signoffs()[0].approver_identity, "verified:sub-alice");
+}
+
+#[tokio::test]
+async fn test_approval_assertion_secret_is_never_printed() {
+    let config = GovderConfig {
+        base_url: "http://govder.invalid".to_string(),
+        assertion_secret: TEST_BROKER_ASSERTION_SECRET.to_string(),
+        approval_assertion_secret: Some(TEST_APPROVAL_ASSERTION_SECRET.to_string()),
+        assertion_ttl: Duration::from_secs(90),
+        http_timeout: Duration::from_secs(1),
+    };
+    let printed = format!("{:?}", config);
+    assert!(
+        !printed.contains(TEST_APPROVAL_ASSERTION_SECRET),
+        "the approval secret must never reach a Debug dump: {printed}"
+    );
+    assert!(!printed.contains(TEST_BROKER_ASSERTION_SECRET));
+    assert!(
+        printed.contains("approval_assertion_secret: Some(\"<redacted>\")"),
+        "whether one is configured is still visible: {printed}"
+    );
+    assert_eq!(
+        config.approval_verification_secret(),
+        TEST_APPROVAL_ASSERTION_SECRET
+    );
+    // Outbound signing to govder is untouched by the separation.
+    assert_eq!(config.assertion_secret, TEST_BROKER_ASSERTION_SECRET);
+}
+
+#[tokio::test]
+async fn test_create_credential_refuses_a_blank_secret_that_would_brick_the_vault() {
+    // `{"type":"api_key","key":""}` used to be accepted here, written to the
+    // encrypted vault, and take the plane down at the NEXT restart: vault open
+    // runs the structural check and its first failure aborts the whole open. The
+    // create path now runs that same structural check, where it costs one 400.
+    let (router, storage, _server, key) = build_admin_router().await;
+
+    let response = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/credentials",
+            &key,
+            serde_json::json!({
+                "alias": "blank-key",
+                "data": {"type": "api_key", "key": "", "header_name": "X-Key"}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["code"], "invalid_credential");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("blank required field or empty secret"),
+        "the structural reason, not a generic one: {}",
+        body["error"]
+    );
+    assert!(
+        storage.get_by_alias("blank-key").await.unwrap().is_none(),
+        "nothing may be stored"
+    );
+
+    // A blank header_name is the other half of the same structural rule.
+    let response = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/credentials",
+            &key,
+            serde_json::json!({
+                "alias": "blank-header",
+                "data": {"type": "api_key", "key": "k", "header_name": "  "}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(storage
+        .get_by_alias("blank-header")
+        .await
+        .unwrap()
+        .is_none());
+
+    // The control: a well-formed credential is still created.
+    let response = router
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/credentials",
+            &key,
+            serde_json::json!({
+                "alias": "good-key",
+                "data": {"type": "api_key", "key": "k", "header_name": "X-Key"}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(storage.get_by_alias("good-key").await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -5636,6 +6038,7 @@ async fn test_delegate_decide_503s_when_govder_unreachable() {
     config.govder = Some(GovderConfig {
         base_url: govder_url,
         assertion_secret: "test-govder-assertion-secret".to_string(),
+        approval_assertion_secret: None,
         assertion_ttl: Duration::from_secs(90),
         http_timeout: Duration::from_secs(5),
     });
@@ -6198,6 +6601,7 @@ async fn start_mock_govder_keyed_gate(
         GovderConfig {
             base_url: format!("http://{addr}"),
             assertion_secret: "test-govder-assertion-secret".to_string(),
+            approval_assertion_secret: None,
             assertion_ttl: Duration::from_secs(90),
             http_timeout: Duration::from_secs(5),
         },
@@ -6226,6 +6630,7 @@ async fn start_mock_govder_gate_rule(status: StatusCode, body: serde_json::Value
     GovderConfig {
         base_url: format!("http://{addr}"),
         assertion_secret: "test-govder-assertion-secret".to_string(),
+        approval_assertion_secret: None,
         assertion_ttl: Duration::from_secs(90),
         http_timeout: Duration::from_secs(5),
     }
@@ -6259,6 +6664,7 @@ async fn execute_open_fails_closed_when_gate_rule_fetch_is_unreachable() {
     let config = approval_open_test_config(GovderConfig {
         base_url: govder_url,
         assertion_secret: "test-govder-assertion-secret".to_string(),
+        approval_assertion_secret: None,
         assertion_ttl: Duration::from_secs(90),
         http_timeout: Duration::from_secs(5),
     });

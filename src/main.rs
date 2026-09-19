@@ -580,6 +580,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|s| !s.trim().is_empty());
     config.govder = vultrino::govder::GovderConfig::from_env();
+    // Say once, at startup, when the key that verifies WHO approved is the same
+    // shared key other planes hold.
+    if let Some(govder) = config.govder.as_ref() {
+        govder.warn_if_approval_secret_shared();
+    }
     // averin seal-client API key (plan 086): env-only so a config dump never
     // carries it. Only consulted when `[averin] enabled = true`.
     config.averin.api_key = std::env::var("AVERIN_API_KEY")

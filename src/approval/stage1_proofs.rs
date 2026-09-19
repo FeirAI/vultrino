@@ -301,6 +301,7 @@ fn err_tag(e: &ApprovalError) -> &'static str {
         ApprovalError::SeparationOfDuty => "sod",
         ApprovalError::DuplicateApprover => "duplicate",
         ApprovalError::SameAggregatorKey => "same_agg_key",
+        ApprovalError::MixedProvenance => "mixed_provenance",
         // `transition` cannot produce these two (they belong to the lookup and
         // OOB-token paths). Named explicitly rather than caught by a wildcard, so
         // that a NEW ApprovalError variant fails to compile here and has to be

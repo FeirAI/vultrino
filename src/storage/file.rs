@@ -2626,6 +2626,69 @@ mod tests {
     use std::collections::HashSet;
     use tempfile::tempdir;
 
+    /// One credential whose ADMISSION rules no longer pass must not take the
+    /// whole enforcement plane down at the next restart. Admission is policy
+    /// (a pinned endpoint, a scope allowlist, what `ring` accepts as a key) and
+    /// can tighten under a credential that was valid when it was seeded; vault
+    /// open is all-or-nothing, so it checks structure only. The refusal happens
+    /// at USE, where it costs exactly that one credential
+    /// (`solo::tests::service_account_use_time_refuses_an_unpinned_token_uri`).
+    #[tokio::test]
+    async fn a_credential_that_fails_admission_still_lets_the_vault_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let password = SecretString::from("pw");
+
+        // Structurally complete, but the endpoint is not the pinned one, so
+        // admission refuses it.
+        let unpinned = Credential::new(
+            "google-sheets".to_string(),
+            CredentialData::GoogleServiceAccount {
+                client_email: "solo@feir-demo.iam.gserviceaccount.com".to_string(),
+                private_key: Secret::new(crate::plugins::google_sa::tests::test_key_pem()),
+                private_key_id: "kid-1".to_string(),
+                token_uri: "https://evil.example/token".to_string(),
+                scopes: vec!["https://www.googleapis.com/auth/spreadsheets".to_string()],
+                access_token: None,
+                expires_at: None,
+            },
+        );
+        assert!(
+            unpinned.data.validate_admission().is_err(),
+            "the fixture really does fail admission"
+        );
+
+        let storage = FileStorage::new(&path, &password).await.unwrap();
+        // Written straight to the vault, the way a restored backup or a
+        // credential seeded before the rule tightened would arrive.
+        storage.store(&unpinned).await.unwrap();
+        // A second, ordinary credential proves the blast radius: it must still be
+        // reachable after the reopen.
+        storage
+            .store(&test_credential("stripe-prod"))
+            .await
+            .unwrap();
+        drop(storage);
+
+        let reopened = FileStorage::new(&path, &password)
+            .await
+            .expect("one credential failing admission must not abort the vault open");
+        assert!(reopened
+            .get_by_alias("stripe-prod")
+            .await
+            .unwrap()
+            .is_some());
+        let stored = reopened
+            .get_by_alias("google-sheets")
+            .await
+            .unwrap()
+            .expect("the record is still there, unusable rather than fatal");
+        assert!(
+            stored.data.validate_admission().is_err(),
+            "and it is still the credential admission refuses at use"
+        );
+    }
+
     /// A minimal API-key credential for storage round-trip tests.
     fn test_credential(alias: &str) -> Credential {
         Credential::new(

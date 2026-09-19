@@ -20,6 +20,19 @@ pub use tenant_assert::{sign_tenant_assertion, verify_tenant_assertion, TenantAs
 pub struct GovderConfig {
     pub base_url: String,
     pub assertion_secret: String,
+    /// Dedicated secret for verifying an INBOUND broker approver assertion on
+    /// the approval decision route, when the deployment separates it.
+    ///
+    /// `assertion_secret` answers "vultrino is allowed to call govder"; this one
+    /// answers "the broker says THIS human approved". Held as one value they are
+    /// the same authority, and every plane that holds it (govder, leria, the
+    /// broker, and vultrino itself, which is the verifier) can mint the second
+    /// approver of a two-person rule. Set
+    /// `VULTRINO_APPROVAL_ASSERTION_SECRET` and only the broker and vultrino
+    /// hold the approver-identity key; outbound signing keeps using
+    /// `assertion_secret`. Unset, the verifier falls back to `assertion_secret`
+    /// and [`Self::warn_if_approval_secret_shared`] says so once at startup.
+    pub approval_assertion_secret: Option<String>,
     pub assertion_ttl: Duration,
     pub http_timeout: Duration,
 }
@@ -29,6 +42,15 @@ impl std::fmt::Debug for GovderConfig {
         f.debug_struct("GovderConfig")
             .field("base_url", &self.base_url)
             .field("assertion_secret", &"<redacted>")
+            // Whether a dedicated key is configured is a posture fact worth
+            // seeing in a dump; its value never is.
+            .field(
+                "approval_assertion_secret",
+                &self
+                    .approval_assertion_secret
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
             .field("assertion_ttl", &self.assertion_ttl)
             .field("http_timeout", &self.http_timeout)
             .finish()
@@ -38,6 +60,10 @@ impl std::fmt::Debug for GovderConfig {
 impl GovderConfig {
     /// Load from `GOVDER_BASE_URL` + `GOVDER_TENANT_ASSERTION_SECRET`.
     /// Both must be non-empty for delegate enforcement to be active.
+    ///
+    /// `VULTRINO_APPROVAL_ASSERTION_SECRET` (or its `_FILE` form) is optional and
+    /// independent: it separates the approver-identity verifier from the
+    /// cross-plane client key without changing whether govder is configured.
     pub fn from_env() -> Option<Self> {
         let base = std::env::var("GOVDER_BASE_URL")
             .ok()
@@ -53,6 +79,7 @@ impl GovderConfig {
         Some(Self {
             base_url: base.trim_end_matches('/').to_string(),
             assertion_secret: secret,
+            approval_assertion_secret: approval_assertion_secret_from_env(),
             assertion_ttl: Duration::from_secs(ttl_secs),
             http_timeout: Duration::from_secs(30),
         })
@@ -61,6 +88,68 @@ impl GovderConfig {
     pub fn is_configured(&self) -> bool {
         !self.base_url.is_empty() && !self.assertion_secret.is_empty()
     }
+
+    /// The secret the approval DECISION route verifies an inbound broker
+    /// approver assertion with: ONLY the dedicated key when one is configured,
+    /// otherwise the govder client key. Never used for outbound signing.
+    pub fn approval_verification_secret(&self) -> &str {
+        self.approval_assertion_secret
+            .as_deref()
+            .unwrap_or(&self.assertion_secret)
+    }
+
+    /// One startup line when approver identities are verified with the shared
+    /// cross-plane key. Called once from the binary; not from `from_env`, so a
+    /// library caller does not emit it.
+    pub fn warn_if_approval_secret_shared(&self) {
+        if self.approval_assertion_secret.is_none() {
+            tracing::warn!(
+                "approver identities on the approval decision route are verified with \
+                 GOVDER_TENANT_ASSERTION_SECRET, the key this deployment also shares with \
+                 govder and leria and signs its own outbound calls with; anyone holding it \
+                 can assert an approver. Set VULTRINO_APPROVAL_ASSERTION_SECRET (broker and \
+                 vultrino only) to separate them."
+            );
+        }
+    }
+}
+
+/// Read `VULTRINO_APPROVAL_ASSERTION_SECRET`, preferring the `_FILE` form the
+/// rest of the codebase uses for secrets (see `main::read_secret_env` and the
+/// workload-assertion verifier). A blank or unreadable value is treated as
+/// unset: the fallback is the existing behaviour, and the startup warning says
+/// the deployment is on it.
+fn approval_assertion_secret_from_env() -> Option<String> {
+    if let Ok(path) = std::env::var("VULTRINO_APPROVAL_ASSERTION_SECRET_FILE") {
+        if !path.trim().is_empty() {
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => {
+                    let secret = contents.trim().to_string();
+                    if !secret.is_empty() {
+                        return Some(secret);
+                    }
+                    tracing::warn!(
+                        "VULTRINO_APPROVAL_ASSERTION_SECRET_FILE is empty; falling back to the \
+                         shared govder assertion secret"
+                    );
+                }
+                Err(error) => {
+                    // The path, not the contents. A missing file must not be a
+                    // silent downgrade, so say which one could not be read.
+                    tracing::warn!(
+                        %error,
+                        path = %path,
+                        "VULTRINO_APPROVAL_ASSERTION_SECRET_FILE cannot be read; falling back \
+                         to the shared govder assertion secret"
+                    );
+                }
+            }
+        }
+    }
+    std::env::var("VULTRINO_APPROVAL_ASSERTION_SECRET")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[derive(Error, Debug)]

@@ -63,6 +63,7 @@ async fn start_mock_govder(grants: Vec<MockGrant>) -> GovderConfig {
     GovderConfig {
         base_url: format!("http://{addr}"),
         assertion_secret: TEST_GOVDER_SECRET.to_string(),
+        approval_assertion_secret: None,
         assertion_ttl: Duration::from_secs(90),
         http_timeout: Duration::from_secs(5),
     }
