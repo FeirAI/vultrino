@@ -182,6 +182,13 @@ independently of the original request bearer.
 Filtered to credentials the caller's role scope allows. **Secrets are never
 returned.** Requires the `read` permission.
 
+**Known spelling wart on this route only.** `credential_type` here is rendered from the
+Rust `Debug` name lowercased, not from the canonical serde tag used everywhere else. So a
+multi-word type reads back run together: `googleserviceaccount` for
+`google_service_account`, and likewise `basicauth`, `hmacapikey`, `apikey`, `ecdsakey`,
+`sshpassword`, `privatekey`. Create, the `Display` impl and the `CredentialData` tag all
+use the canonical spelling. Do not use this field as a round-trip input.
+
 `id` is the server-side UUID, and it is the key **every id-addressed credential route
 uses** — `DELETE /api/v1/credentials/{id}` resolves the id map and never the alias index,
 so an alias sent there is a `404`. The alias is the *execution* index (what a capability
@@ -591,6 +598,7 @@ The `data` field of a credential. Recognized types and their fields:
 | `api_key` | **`key`**, `header_name` (default `Authorization`), `header_prefix` (default `Bearer `) |
 | `basic_auth` | `username`, **`password`** |
 | `oauth2` | `client_id`, **`client_secret`**, **`refresh_token`?**, **`access_token`?**, `expires_at?`, `token_url`, `scopes[]` |
+| `google_service_account` | `client_email`, **`private_key`** (PKCS#8 PEM), `private_key_id`, `token_uri` (default `https://oauth2.googleapis.com/token`), `scopes[]`, **`access_token`?**, `expires_at?` |
 | `hmac_api_key` | `api_key`, **`api_secret`**, `header_name` (default `X-MBX-APIKEY`), `recv_window` (default 5000) |
 | `ecdsa_key` | **`private_key`**, `api_address?`, `testnet` |
 | `ssh_password` | `host`, `port` (22), `user`, **`password`** |

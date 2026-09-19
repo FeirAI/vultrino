@@ -171,6 +171,35 @@ those — checking **every** resolved IP, not just an IP literal. OAuth2 token U
 get the same guard and must be HTTPS. So a proxied request to `127.0.0.1` or a
 metadata endpoint is denied at the transport step.
 
+## Google service accounts (`google_service_account`)
+
+The RFC 7523 JWT-bearer credential type (`src/plugins/google_sa.rs`) is admitted only
+under these bounds. All of them are enforcement, not documentation:
+
+- **Pinned token endpoint.** `token_uri` must equal
+  `https://oauth2.googleapis.com/token` byte for byte. Any other value is refused at
+  create, and refused again on every governed call. Redirects are disabled on the mint
+  client, so a 3xx from the endpoint is an error rather than a follow.
+- **Scope allowlist.** `scopes` must be non-empty and a subset of the five Sheets and
+  Calendar scopes the connector actually calls (`spreadsheets`,
+  `spreadsheets.readonly`, `calendar`, `calendar.events`, `calendar.readonly`). A key
+  asking for anything else, Drive or Gmail included, is refused.
+- **RSA 2048 minimum.** The `private_key` must parse as a PKCS#8 PEM RSA key whose
+  modulus is at least 2048 bits. A shorter key is refused.
+- **No `sub`, so no domain-wide delegation.** The assertion never carries a `sub`
+  claim, so the service account can only act as itself and can only reach a
+  spreadsheet or calendar an operator has explicitly shared with its own address.
+  Impersonating a human in the Workspace domain is not offered.
+- **One hour lifetime.** The assertion is minted with a 3600 second lifetime, which is
+  the longest Google accepts; the returned access token is cached in the credential
+  record and refreshed on the same margin as the OAuth2 variant.
+- **The key never leaves the vault.** The PEM and its bare base64 body are both
+  registered as secret material, so the response scrubber holds them back on every
+  egress path, and the key is never serialized to any caller.
+- **Admission is checked at create and at use.** `validate` runs on
+  `POST /api/v1/credentials`, and the endpoint, scope and key checks run again on every
+  governed call rather than being trusted from the stored record.
+
 ## Egress / read-back defense (V7)
 
 Two layers at the execution seam, obtained through the private
