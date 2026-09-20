@@ -198,8 +198,10 @@ fn llm_error(status: StatusCode, kind: &str, message: &str) -> Response {
 /// agent-controlled), with a path-suffix fallback so a Responses call is still caught
 /// even if `protocol` were ever something other than `"openai-responses"` (e.g. routed
 /// through a generic/observed protocol whose upstream still ends in `/responses`). Every
-/// other routed protocol/path (openai-chat, azure-openai, anthropic-messages, nvidia,
-/// legacy `/v1/completions`) uses `max_tokens`, unchanged from prior behavior.
+/// other routed protocol/path (azure-openai, anthropic-messages, nvidia, an
+/// OpenAI-compatible third party under openai-chat, legacy `/v1/completions`) uses
+/// `max_tokens`, unchanged from prior behavior. The one further exception is OpenAI's own
+/// Chat Completions, which takes `max_completion_tokens` (see below).
 fn default_output_token_field(protocol: &str, upstream: &str) -> &'static str {
     let path = upstream
         .split(['?', '#'])
@@ -208,9 +210,29 @@ fn default_output_token_field(protocol: &str, upstream: &str) -> &'static str {
         .trim_end_matches('/');
     if protocol == "openai-responses" || path.ends_with("/responses") {
         "max_output_tokens"
+    } else if protocol == "openai-chat"
+        && path.ends_with("/chat/completions")
+        && upstream_host_is(upstream, "api.openai.com")
+    {
+        // OpenAI's own Chat Completions deprecated `max_tokens`, and its current models
+        // (the GPT-5 family and the reasoning models) REJECT it with a 400
+        // `unsupported_parameter`, so an injected `max_tokens` there would fail every call
+        // from a client that names no limit. `max_completion_tokens` is accepted by every
+        // chat model OpenAI serves. Host-pinned on purpose: an OpenAI-COMPATIBLE third
+        // party routed under `openai-chat` may only know `max_tokens`, so it keeps it.
+        "max_completion_tokens"
     } else {
         "max_tokens"
     }
+}
+
+/// True when `upstream` parses as a URL whose host is exactly `host` (case-insensitive).
+/// An unparseable upstream is simply "not that host": the caller then keeps its default.
+fn upstream_host_is(upstream: &str, host: &str) -> bool {
+    reqwest::Url::parse(upstream)
+        .ok()
+        .and_then(|url| url.host_str().map(|h| h.eq_ignore_ascii_case(host)))
+        .unwrap_or(false)
 }
 
 /// Bound a request's TOTAL output-token cost to the per-call `ceiling`. This is the
@@ -962,9 +984,29 @@ mod tests {
             default_output_token_field("openai-chat", "https://api.openai.com/v1/responses"),
             "max_output_tokens"
         );
-        // Chat/completions and every other routed protocol keep max_tokens.
+        // OpenAI's own chat/completions takes max_completion_tokens: its current models
+        // reject max_tokens outright.
         assert_eq!(
             default_output_token_field("openai-chat", "https://api.openai.com/v1/chat/completions"),
+            "max_completion_tokens"
+        );
+        assert_eq!(
+            default_output_token_field("openai-chat", "https://API.OpenAI.com/v1/chat/completions/"),
+            "max_completion_tokens"
+        );
+        // An OpenAI-compatible third party under the same protocol keeps max_tokens, and a
+        // look-alike host or an unparseable upstream is not OpenAI.
+        for upstream in [
+            "https://llm.example.test/v1/chat/completions",
+            "https://api.openai.com.evil.test/v1/chat/completions",
+            "https://evil.test/api.openai.com/v1/chat/completions",
+            "not a url/chat/completions",
+        ] {
+            assert_eq!(default_output_token_field("openai-chat", upstream), "max_tokens");
+        }
+        // Other protocols pointed at the same host are unaffected.
+        assert_eq!(
+            default_output_token_field("nvidia", "https://api.openai.com/v1/chat/completions"),
             "max_tokens"
         );
         assert_eq!(
