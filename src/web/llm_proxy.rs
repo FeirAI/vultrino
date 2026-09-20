@@ -991,7 +991,10 @@ mod tests {
             "max_completion_tokens"
         );
         assert_eq!(
-            default_output_token_field("openai-chat", "https://API.OpenAI.com/v1/chat/completions/"),
+            default_output_token_field(
+                "openai-chat",
+                "https://API.OpenAI.com/v1/chat/completions/"
+            ),
             "max_completion_tokens"
         );
         // An OpenAI-compatible third party under the same protocol keeps max_tokens, and a
@@ -1002,7 +1005,10 @@ mod tests {
             "https://evil.test/api.openai.com/v1/chat/completions",
             "not a url/chat/completions",
         ] {
-            assert_eq!(default_output_token_field("openai-chat", upstream), "max_tokens");
+            assert_eq!(
+                default_output_token_field("openai-chat", upstream),
+                "max_tokens"
+            );
         }
         // Other protocols pointed at the same host are unaffected.
         assert_eq!(
