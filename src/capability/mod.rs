@@ -144,11 +144,37 @@ pub struct LlmProxy {
     /// sizes it from the budget's cost hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// When set, the gateway-owned reasoning effort for this model channel: the
+    /// `/llm` proxy SETS the provider's reasoning-effort field on every request,
+    /// overwriting whatever the agent sent. One of `none`, `minimal`, `low`,
+    /// `medium`, `high` (exact lowercase), and only meaningful on the OpenAI wire
+    /// families (`openai-chat` writes top-level `reasoning_effort`,
+    /// `openai-responses` writes `reasoning.effort`).
+    ///
+    /// This is a SPEND control as much as a compatibility one: reasoning tokens
+    /// bill as output tokens, so the effort a channel runs at belongs to the
+    /// gateway beside [`LlmProxy::max_output_tokens`], not to the agent. It is
+    /// also a hard compatibility requirement for some models: OpenAI refuses
+    /// function tools on Chat Completions for `gpt-5.6-luna` at any effort other
+    /// than `none`. `None`/absent = today's behavior, the proxy touches nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 fn default_llm_protocol() -> String {
     "openai-chat".to_string()
 }
+
+/// The exact reasoning-effort values a capability may declare (OpenAI's ladder).
+/// Lowercase and exact: a mis-cased or unknown value is a configuration error, not
+/// a silently-dropped field.
+pub const LLM_REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high"];
+
+/// The `llm.protocol` values that carry a reasoning-effort field on the wire.
+/// Declaring `llm.reasoning_effort` on any other protocol is a configuration
+/// error: the proxy would have nowhere to write it, and silently ignoring a spend
+/// control is the forbidden direction.
+pub const LLM_REASONING_EFFORT_PROTOCOLS: &[&str] = &["openai-chat", "openai-responses"];
 
 /// Operator-declared approval-preview SPEC on a [`Capability`]: which fields of
 /// the request `params` an approver should see when this capability's action is
@@ -275,6 +301,7 @@ impl Default for LlmProxy {
             provider_base: String::new(),
             allowed_models: Vec::new(),
             max_output_tokens: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -342,6 +369,26 @@ impl Capability {
                         "capability llm.protocol '{}' is not supported",
                         other
                     ))
+                }
+            }
+            // Gateway-owned reasoning effort (spend control): fail closed on a value
+            // the proxy could not write, and on a protocol with nowhere to write it.
+            // Silently ignoring either would leave the operator believing a ceiling
+            // is in force that is not.
+            if let Some(effort) = &llm.reasoning_effort {
+                if !LLM_REASONING_EFFORTS.contains(&effort.as_str()) {
+                    return Err(format!(
+                        "capability llm.reasoning_effort '{}' must be one of {}",
+                        effort,
+                        LLM_REASONING_EFFORTS.join(", ")
+                    ));
+                }
+                if !LLM_REASONING_EFFORT_PROTOCOLS.contains(&llm.protocol.as_str()) {
+                    return Err(format!(
+                        "capability llm.reasoning_effort is only supported on llm.protocol {} (got '{}')",
+                        LLM_REASONING_EFFORT_PROTOCOLS.join(" or "),
+                        llm.protocol
+                    ));
                 }
             }
             let base = llm.provider_base.trim();
@@ -531,6 +578,16 @@ impl Capability {
     /// per-call cost leg of the rate_companion, P1-8). `None` = no ceiling.
     pub fn llm_max_output_tokens(&self) -> Option<u64> {
         self.llm.as_ref().and_then(|l| l.max_output_tokens)
+    }
+
+    /// The gateway-owned reasoning effort for this LLM-proxy capability, if any.
+    /// `None` = unconfigured, and the proxy leaves the request body untouched.
+    /// A configured value is validated to one of [`LLM_REASONING_EFFORTS`] at
+    /// create/replace time, so the proxy can write it without re-checking.
+    pub fn llm_reasoning_effort(&self) -> Option<&str> {
+        self.llm
+            .as_ref()
+            .and_then(|l| l.reasoning_effort.as_deref())
     }
 
     /// Build the upstream provider URL for an LLM-proxy `tools` call: the

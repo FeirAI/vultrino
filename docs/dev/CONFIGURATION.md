@@ -154,6 +154,15 @@ Every key is optional; an absent key falls back to the streaming-on default.
 The provider-protocol gate (`VULTRINO_PROVIDER_*_ENABLED`, above) is separate from
 these streaming tunables and governs which protocols may carry traffic at all.
 
+Per-channel request shaping is **not** configured here: it lives on the capability
+itself (admin API `POST`/`PUT /api/v1/capabilities`, see `API.md`). Two fields on the
+capability's `llm` block are gateway-owned, meaning the agent's own value is clamped
+or overwritten rather than honored: `llm.max_output_tokens` (per-call output-token
+ceiling) and `llm.reasoning_effort` (one of `none`, `minimal`, `low`, `medium`,
+`high`, accepted only on `llm.protocol` `openai-chat` or `openai-responses`). Both
+are spend controls: reasoning tokens are billed as output tokens. An absent
+`reasoning_effort` leaves the request body untouched.
+
 ### `[[policies]]` — static declarative policies
 
 ```toml

@@ -48,6 +48,19 @@
 //! `/v1/responses` report usage natively. Honest residuals: a capability with an operator
 //! `block`/`redact_patterns` egress rule, or a compressed response, is served BUFFERED;
 //! a stream that is truncated/halted BEFORE the usage trailer arrives meters V13a only.
+//!
+//! ## Gateway-owned reasoning effort
+//! A capability may declare `llm.reasoning_effort` (one of `none`, `minimal`, `low`,
+//! `medium`, `high`). When it is set, vultrino WRITES that effort into every request on
+//! the channel — top-level `reasoning_effort` for OpenAI Chat Completions, nested
+//! `reasoning.effort` (other `reasoning` keys preserved) for OpenAI Responses —
+//! OVERWRITING any value the agent supplied, of any type. Like `include_usage` and the
+//! `max_output_tokens` ceiling this is gateway-owned and not negotiable by the agent:
+//! reasoning tokens are billed as OUTPUT tokens, so the effort a channel runs at is
+//! spend, and an agent that could raise it could raise its own bill past the ceiling the
+//! operator sized. It is also a compatibility requirement on some models (OpenAI refuses
+//! function tools on Chat Completions for `gpt-5.6-luna` at any effort above `none`).
+//! Unconfigured, the proxy touches nothing.
 
 use axum::{
     extract::{Path, Query, State},
@@ -233,6 +246,84 @@ fn upstream_host_is(upstream: &str, host: &str) -> bool {
         .ok()
         .and_then(|url| url.host_str().map(|h| h.eq_ignore_ascii_case(host)))
         .unwrap_or(false)
+}
+
+/// Where a configured `llm.reasoning_effort` is written for this protocol/upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningEffortShape {
+    /// OpenAI Chat Completions: top-level `"reasoning_effort": "<value>"`.
+    ChatTopLevel,
+    /// OpenAI Responses: nested `"reasoning": {"effort": "<value>"}`.
+    ResponsesNested,
+}
+
+/// Which reasoning-effort shape (if any) the given protocol / resolved upstream
+/// speaks. The resolved PATH is consulted first because it is what the provider
+/// actually parses: a channel labeled `openai-chat` whose provider_base is a
+/// `/v1/responses` endpoint still has to be written the Responses way, or the
+/// gateway-owned effort would be an unrecognized top-level field the provider
+/// ignores. `protocol` is the fallback for the common case where the inbound path
+/// is empty (a bare `POST /llm` against a provider_base that is already the
+/// endpoint). Any other protocol/path returns `None` — but validation already
+/// refuses to store a reasoning_effort on such a capability, so `None` here means
+/// "nothing configured", not "silently dropped".
+fn reasoning_effort_shape(protocol: &str, upstream: &str) -> Option<ReasoningEffortShape> {
+    let path = upstream
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(upstream)
+        .trim_end_matches('/');
+    if path.ends_with("/chat/completions") {
+        return Some(ReasoningEffortShape::ChatTopLevel);
+    }
+    if path.ends_with("/responses") {
+        return Some(ReasoningEffortShape::ResponsesNested);
+    }
+    match protocol {
+        "openai-chat" => Some(ReasoningEffortShape::ChatTopLevel),
+        "openai-responses" => Some(ReasoningEffortShape::ResponsesNested),
+        _ => None,
+    }
+}
+
+/// Write the capability's gateway-owned reasoning `effort` into the request body,
+/// OVERWRITING whatever the agent sent (of any type: string, number, null). The
+/// agent can neither raise the effort (reasoning tokens bill as output tokens, so
+/// raising it is spend) nor lower it below what the operator chose. A non-object
+/// body is untouched, exactly as in [`clamp_max_output_tokens`].
+///
+/// For the Responses shape the sibling keys of `reasoning` (e.g. `summary`) are
+/// preserved when it is already an object; a `reasoning` that is absent or is not
+/// an object is replaced by a fresh object carrying only `effort`.
+fn apply_reasoning_effort(body: &mut serde_json::Value, effort: &str, shape: ReasoningEffortShape) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    match shape {
+        ReasoningEffortShape::ChatTopLevel => {
+            obj.insert(
+                "reasoning_effort".to_string(),
+                serde_json::Value::String(effort.to_string()),
+            );
+        }
+        ReasoningEffortShape::ResponsesNested => {
+            if !obj
+                .get("reasoning")
+                .is_some_and(serde_json::Value::is_object)
+            {
+                obj.insert(
+                    "reasoning".to_string(),
+                    serde_json::Value::Object(serde_json::Map::new()),
+                );
+            }
+            if let Some(reasoning) = obj.get_mut("reasoning").and_then(|r| r.as_object_mut()) {
+                reasoning.insert(
+                    "effort".to_string(),
+                    serde_json::Value::String(effort.to_string()),
+                );
+            }
+        }
+    }
 }
 
 /// Bound a request's TOTAL output-token cost to the per-call `ceiling`. This is the
@@ -553,6 +644,23 @@ async fn llm_proxy_impl(
         }
     }
 
+    // 4c-bis. Gateway-owned reasoning effort: when the capability declares
+    //     `llm.reasoning_effort`, SET the provider's reasoning-effort field on the
+    //     request, overwriting whatever the agent sent. Reasoning tokens bill as
+    //     output tokens, so the effort is a spend control owned by the gateway,
+    //     exactly like the 4c ceiling and the forced `include_usage` below. It is
+    //     also a hard compatibility requirement on some models (OpenAI refuses
+    //     function tools on Chat Completions for gpt-5.6-luna above `none`). Runs
+    //     ABOVE the streaming decision (4d) so `stream:true` cannot evade it.
+    //     Unconfigured = the body is untouched, byte for byte.
+    if let Some(effort) = capability.llm_reasoning_effort() {
+        if let Some(shape) = reasoning_effort_shape(&llm.protocol, &upstream) {
+            if let Some(body) = request_body.as_mut() {
+                apply_reasoning_effort(body, effort, shape);
+            }
+        }
+    }
+
     // 4d. Decide buffered vs streaming. Streaming engages purely on the wire flag
     //     `{"stream": true}` and the operator kill-switch. When streaming is
     //     DISABLED but the client asked for it, strip the stream flags so the
@@ -746,8 +854,9 @@ async fn llm_proxy_impl(
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_max_output_tokens, default_output_token_field, is_openai_chat_endpoint,
-        normalize_nvidia_tool_stream_options, provider_feature_enabled,
+        apply_reasoning_effort, clamp_max_output_tokens, default_output_token_field,
+        is_openai_chat_endpoint, normalize_nvidia_tool_stream_options, provider_feature_enabled,
+        reasoning_effort_shape, ReasoningEffortShape,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -1049,5 +1158,192 @@ mod tests {
         clamp_max_output_tokens(&mut body, 1000, field);
         assert_eq!(body["max_output_tokens"], json!(1000));
         assert!(body.get("max_tokens").is_none());
+    }
+
+    // ---- Gateway-owned reasoning effort ----
+
+    const CHAT_UPSTREAM: &str = "https://api.openai.com/v1/chat/completions";
+    const RESPONSES_UPSTREAM: &str = "https://api.openai.com/v1/responses";
+
+    #[test]
+    fn reasoning_effort_shape_keys_on_path_then_protocol() {
+        assert_eq!(
+            reasoning_effort_shape("openai-chat", CHAT_UPSTREAM),
+            Some(ReasoningEffortShape::ChatTopLevel)
+        );
+        assert_eq!(
+            reasoning_effort_shape("openai-responses", RESPONSES_UPSTREAM),
+            Some(ReasoningEffortShape::ResponsesNested)
+        );
+        // The resolved PATH wins over the protocol label: a channel labeled
+        // openai-chat whose provider_base IS the Responses endpoint must still be
+        // written the Responses way, or the effort would be an ignored stray field.
+        assert_eq!(
+            reasoning_effort_shape("openai-chat", RESPONSES_UPSTREAM),
+            Some(ReasoningEffortShape::ResponsesNested)
+        );
+        // Bare `POST /llm`: empty inbound path, so the protocol decides.
+        assert_eq!(
+            reasoning_effort_shape("openai-chat", "https://api.openai.com"),
+            Some(ReasoningEffortShape::ChatTopLevel)
+        );
+        // Query strings and trailing slashes do not defeat the suffix match.
+        assert_eq!(
+            reasoning_effort_shape(
+                "nvidia",
+                "https://integrate.api.nvidia.com/v1/chat/completions?x=1"
+            ),
+            Some(ReasoningEffortShape::ChatTopLevel)
+        );
+        // A protocol with no reasoning field on the wire and no OpenAI-shaped path.
+        assert_eq!(
+            reasoning_effort_shape(
+                "anthropic-messages",
+                "https://api.anthropic.com/v1/messages"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn inserts_reasoning_effort_on_a_chat_body_that_omits_it() {
+        let mut body = json!({ "model": "gpt-5.6-luna", "messages": [] });
+        apply_reasoning_effort(&mut body, "none", ReasoningEffortShape::ChatTopLevel);
+        assert_eq!(body["reasoning_effort"], json!("none"));
+        // Nothing else is disturbed.
+        assert_eq!(body["model"], json!("gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn overwrites_a_client_supplied_chat_reasoning_effort_of_any_type() {
+        // Gateway-owned: the agent can neither raise nor lower it, and a non-string
+        // value is replaced rather than left to reach the provider.
+        for supplied in [
+            json!("high"),
+            json!(3),
+            json!(null),
+            json!({"effort": "high"}),
+        ] {
+            let mut body = json!({ "model": "gpt-5.6-luna", "reasoning_effort": supplied });
+            apply_reasoning_effort(&mut body, "none", ReasoningEffortShape::ChatTopLevel);
+            assert_eq!(body["reasoning_effort"], json!("none"));
+        }
+    }
+
+    #[test]
+    fn sets_nested_reasoning_effort_on_a_responses_body() {
+        // Absent `reasoning` → created as an object carrying only `effort`.
+        let mut body = json!({ "model": "gpt-5-codex", "input": "hi" });
+        apply_reasoning_effort(&mut body, "low", ReasoningEffortShape::ResponsesNested);
+        assert_eq!(body["reasoning"], json!({"effort": "low"}));
+
+        // An existing `reasoning` OBJECT keeps its other keys; only `effort` moves.
+        let mut body = json!({
+            "model": "gpt-5-codex",
+            "reasoning": { "effort": "high", "summary": "auto" }
+        });
+        apply_reasoning_effort(&mut body, "minimal", ReasoningEffortShape::ResponsesNested);
+        assert_eq!(body["reasoning"]["effort"], json!("minimal"));
+        assert_eq!(body["reasoning"]["summary"], json!("auto"));
+
+        // A `reasoning` that is NOT an object is replaced outright (fail closed:
+        // the gateway value must land, never be dropped because the agent sent junk).
+        for junk in [json!("high"), json!(7), json!(null), json!(["high"])] {
+            let mut body = json!({ "model": "gpt-5-codex", "reasoning": junk });
+            apply_reasoning_effort(&mut body, "medium", ReasoningEffortShape::ResponsesNested);
+            assert_eq!(body["reasoning"], json!({"effort": "medium"}));
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_leaves_a_non_object_body_untouched() {
+        for mut body in [json!("a string body"), json!([1, 2, 3]), json!(null)] {
+            let before = body.clone();
+            apply_reasoning_effort(&mut body, "none", ReasoningEffortShape::ChatTopLevel);
+            apply_reasoning_effort(&mut body, "none", ReasoningEffortShape::ResponsesNested);
+            assert_eq!(body, before);
+        }
+    }
+
+    #[test]
+    fn an_unconfigured_channel_leaves_the_body_byte_for_byte() {
+        // The proxy only calls apply_reasoning_effort under a configured value; this
+        // locks the contract that an absent capability field adds no field at all.
+        use crate::capability::{Capability, CapabilityTarget, LlmProxy};
+        let cap = Capability {
+            id: "cap-x".into(),
+            tool_name: "model_proxy".into(),
+            description: String::new(),
+            action: "http.request".into(),
+            plugin: None,
+            target: CapabilityTarget::default(),
+            credential_ref: "cred-openai".into(),
+            input_schema: json!({}),
+            reversibility: "reversible".into(),
+            llm: Some(LlmProxy {
+                provider_base: "https://api.openai.com".into(),
+                ..Default::default()
+            }),
+            approval_preview: None,
+        };
+        assert_eq!(cap.llm_reasoning_effort(), None);
+    }
+
+    #[test]
+    fn validation_rejects_bad_efforts_and_wrong_protocols() {
+        use crate::capability::{Capability, CapabilityTarget, LlmProxy};
+        let build = |protocol: &str, effort: Option<&str>, base: &str| Capability {
+            id: "cap-x".into(),
+            tool_name: "model_proxy".into(),
+            description: String::new(),
+            action: "http.request".into(),
+            plugin: None,
+            target: CapabilityTarget::default(),
+            credential_ref: "cred-openai".into(),
+            input_schema: json!({}),
+            reversibility: "reversible".into(),
+            llm: Some(LlmProxy {
+                protocol: protocol.into(),
+                provider_base: base.into(),
+                reasoning_effort: effort.map(str::to_string),
+                ..Default::default()
+            }),
+            approval_preview: None,
+        };
+        // Every allowed value passes on both OpenAI wire families.
+        for effort in ["none", "minimal", "low", "medium", "high"] {
+            for protocol in ["openai-chat", "openai-responses"] {
+                assert!(
+                    build(protocol, Some(effort), "https://api.openai.com")
+                        .validate()
+                        .is_ok(),
+                    "{protocol} + {effort} must validate"
+                );
+            }
+        }
+        // Unknown / mis-cased / empty values fail closed.
+        for bad in ["", "None", "HIGH", "maximum", "medium ", "off"] {
+            assert!(
+                build("openai-chat", Some(bad), "https://api.openai.com")
+                    .validate()
+                    .is_err(),
+                "reasoning_effort {bad:?} must be rejected"
+            );
+        }
+        // A protocol with no reasoning field on the wire is a configuration error,
+        // never a silently ignored field.
+        for protocol in ["nvidia", "anthropic-messages", "observed-only", "gemini"] {
+            let base = if protocol == "nvidia" {
+                "https://integrate.api.nvidia.com"
+            } else {
+                "https://api.example.com"
+            };
+            assert!(
+                build(protocol, Some("none"), base).validate().is_err(),
+                "reasoning_effort on {protocol} must be rejected"
+            );
+            // ...but the same capability WITHOUT the field is still fine.
+            assert!(build(protocol, None, base).validate().is_ok());
+        }
     }
 }

@@ -576,6 +576,20 @@ the buffered-vs-streaming branch, so a `{"stream": true}` request cannot evade i
   The Responses API does not read `max_tokens`, so injecting the wrong field would
   leave the per-call ceiling unenforced on a Responses request that omits its own
   limit.
+- **Reasoning effort (gateway-owned):** when the capability sets
+  `llm.reasoning_effort` (one of `none`, `minimal`, `low`, `medium`, `high`),
+  Vultrino WRITES it into the body, **overwriting a client-supplied value of any
+  type** — top-level `reasoning_effort` for Chat Completions traffic, nested
+  `reasoning.effort` (other `reasoning` keys preserved) for Responses traffic. The
+  shape is chosen from the resolved upstream path first (`…/chat/completions` vs
+  `…/responses`), falling back to the capability's `llm.protocol`. Reasoning tokens
+  bill as OUTPUT tokens, so the effort is spend and belongs to the gateway, like the
+  clamp above and the forced `include_usage` below; it is also a hard compatibility
+  requirement on some models (OpenAI refuses function tools on Chat Completions for
+  `gpt-5.6-luna` at any effort above `none`). The field is only accepted on
+  `llm.protocol` `openai-chat` or `openai-responses`, and only with one of the five
+  values: any other value or protocol is rejected at capability create/replace with
+  `400`, never silently ignored. Unset, the body is untouched.
 - **Streaming:** `{"stream": true}` is forwarded incrementally as
   `text/event-stream` when `[llm_proxy] streaming_enabled` is on (default); when off,
   the stream flags are stripped and the turn is served buffered. Bounded by stream
