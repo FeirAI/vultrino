@@ -97,12 +97,18 @@ impl Plugin for MockLlmPlugin {
                 "choices": [{ "delta": { "content": "hi" } }]
             })
         } else {
-            // Echo the forwarded body's max_tokens so the per-call-ceiling test can
-            // prove vultrino clamped it before the upstream call.
+            // Echo the forwarded body's output-token limit so the per-call-ceiling test
+            // can prove vultrino clamped it before the upstream call. Since c3abe12 a
+            // request that names NO limit gets `max_completion_tokens` on OpenAI's own
+            // Chat Completions (`default_output_token_field`), so echo whichever of the
+            // two the proxy set.
             let received_max_tokens = request
                 .params
                 .get("body")
-                .and_then(|b| b.get("max_tokens"))
+                .and_then(|b| {
+                    b.get("max_tokens")
+                        .or_else(|| b.get("max_completion_tokens"))
+                })
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
             serde_json::json!({
@@ -1006,8 +1012,9 @@ async fn llm_max_output_tokens_ceiling_clamps_the_forwarded_request() {
         "over-ceiling max_tokens must be clamped to the ceiling"
     );
 
-    // (b) A request that OMITS max_tokens has it SET to the ceiling (so the provider
-    //     default can't exceed the per-call bound).
+    // (b) A request that OMITS max_tokens has a limit SET to the ceiling (so the provider
+    //     default can't exceed the per-call bound). On OpenAI's own chat endpoint that
+    //     injected field is `max_completion_tokens` (c3abe12); the stub echoes either.
     let resp = router
         .oneshot(llm_req(
             Some(&token),
