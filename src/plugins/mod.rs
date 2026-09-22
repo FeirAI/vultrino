@@ -9,6 +9,7 @@
 //! and dynamically loaded WASM plugins installed from git repos,
 //! local paths, or URLs.
 
+mod buffer;
 mod ecdsa;
 pub(crate) mod google_sa;
 mod hmac;
@@ -24,6 +25,7 @@ pub mod types;
 #[cfg(feature = "wasm-plugins")]
 pub mod wasm;
 
+pub use buffer::BufferPlugin;
 pub use ecdsa::EcdsaPlugin;
 pub use hmac::HmacPlugin;
 pub use http::HttpPlugin;
@@ -34,7 +36,7 @@ pub use internal_http::{
     InternalHttpParams, InternalHttpPlugin, META_ALLOW_METHODS, META_DESTINATION, META_PATH_PREFIX,
 };
 pub use loader::{PluginLoader, PluginRegistryExt};
-pub use marketing::{BufferPlugin, SheetsPlugin};
+pub use marketing::SheetsPlugin;
 pub use postgres::PostgresPlugin;
 pub use solo::SoloPlugin;
 pub use ssh::SshPlugin;

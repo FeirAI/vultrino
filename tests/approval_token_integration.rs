@@ -6395,7 +6395,7 @@ async fn test_approval_window_is_unchanged_for_a_non_expiring_token() {
     );
 }
 
-/// Declare `buffer.<action>` reversible so a gated typed Buffer request reaches
+/// Declare an exact canonical Buffer create action reversible so a gated typed request reaches
 /// approval-open on the ordinary numeric path (no Govder wired in this suite).
 /// The Buffer plugin is registered by `VultrinoServer::new`; no request in these
 /// tests is ever dispatched, so nothing contacts an upstream.
@@ -6405,7 +6405,7 @@ async fn declare_reversible_buffer_capability(storage: &Arc<dyn StorageBackend>,
             id: format!("cap-fixture-buffer-{action}"),
             tool_name: format!("buffer_{action}"),
             description: "typed Buffer fixture; never dispatched in this suite".to_string(),
-            action: format!("buffer.{action}"),
+            action: action.to_string(),
             plugin: None,
             target: vultrino::capability::CapabilityTarget::default(),
             credential_ref: "*".to_string(),
@@ -6418,16 +6418,23 @@ async fn declare_reversible_buffer_capability(storage: &Arc<dyn StorageBackend>,
         .unwrap();
 }
 
-fn valid_buffer_draft_params() -> serde_json::Value {
+fn valid_buffer_draft_create_params() -> serde_json::Value {
     serde_json::json!({
-        "base_url": "https://api.buffer.com",
-        "channel_id": "channel-1",
-        "account_id": "account-1",
-        "text": "hello",
-        "media_hash": "media-1",
-        "content_hash": "a".repeat(64),
-        "row_version": "1",
-        "due_at": "2026-10-01T09:00:00Z",
+        "target_alias": "linkedin",
+        "campaign_id": "campaign-1",
+        "variant_id": "variant-1",
+        "channel": "linkedin",
+        "account_id": "acct",
+        "audience": "audience-1",
+        "content_type": "text",
+        "draft_copy": "Approved copy",
+        "media_brief": "",
+        "asset_url": "",
+        "asset_hash": "",
+        "publish_at": "",
+        "source_ids": ["source-1"],
+        "row_version": 1,
+        "content_hash": "c5bcf19417ff4a9e5640b9af930852d5e369bdea675e623b797d80d93a916412",
     })
 }
 
@@ -6435,7 +6442,7 @@ async fn one_use_approval_token(storage: &Arc<dyn StorageBackend>) -> UseToken {
     let (_plaintext, token) = UseToken::create(NewUseToken {
         name: "buffer-drafter".to_string(),
         credential_scope: "buffer-cred".to_string(),
-        action_scope: Some("buffer.draft".to_string()),
+        action_scope: Some("buffer.draft_create".to_string()),
         max_uses: Some(1),
         require_approval: true,
         expires_in: None,
@@ -6453,9 +6460,9 @@ async fn one_use_approval_token(storage: &Arc<dyn StorageBackend>) -> UseToken {
 async fn typed_validation_failure_opens_no_approval_and_spends_no_use() {
     for (case, mutate) in [
         (
-            "bad content_hash",
+            "zero row_version",
             Box::new(|p: &mut serde_json::Value| {
-                p["content_hash"] = serde_json::json!("not-a-hash");
+                p["row_version"] = serde_json::json!(0);
             }) as Box<dyn Fn(&mut serde_json::Value)>,
         ),
         (
@@ -6465,24 +6472,24 @@ async fn typed_validation_failure_opens_no_approval_and_spends_no_use() {
             }),
         ),
         (
-            "empty frozen field",
+            "missing variant_id",
             Box::new(|p: &mut serde_json::Value| {
-                p["text"] = serde_json::json!("");
+                p.as_object_mut().unwrap().remove("variant_id");
             }),
         ),
     ] {
         let (server, storage) = setup().await;
         store_credential(&storage, "buffer-cred", true).await;
-        declare_reversible_buffer_capability(&storage, "draft").await;
+        declare_reversible_buffer_capability(&storage, "buffer.draft_create").await;
         let token = one_use_approval_token(&storage).await;
 
-        let mut params = valid_buffer_draft_params();
+        let mut params = valid_buffer_draft_create_params();
         mutate(&mut params);
         let result = server
             .execute_gated(
                 ExecuteRequest {
                     credential: "buffer-cred".to_string(),
-                    action: "buffer.draft".to_string(),
+                    action: "buffer.draft_create".to_string(),
                     params,
                 },
                 ExecAuth::from_use_token(token.clone()),
@@ -6515,15 +6522,15 @@ async fn typed_validation_failure_opens_no_approval_and_spends_no_use() {
 async fn typed_validation_success_still_opens_approval_and_reserves_use() {
     let (server, storage) = setup().await;
     store_credential(&storage, "buffer-cred", true).await;
-    declare_reversible_buffer_capability(&storage, "draft").await;
+    declare_reversible_buffer_capability(&storage, "buffer.draft_create").await;
     let token = one_use_approval_token(&storage).await;
 
     let outcome = server
         .execute_gated(
             ExecuteRequest {
                 credential: "buffer-cred".to_string(),
-                action: "buffer.draft".to_string(),
-                params: valid_buffer_draft_params(),
+                action: "buffer.draft_create".to_string(),
+                params: valid_buffer_draft_create_params(),
             },
             ExecAuth::from_use_token(token.clone()),
         )

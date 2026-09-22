@@ -8,12 +8,17 @@ mod file;
 mod outbox_model;
 mod outbox_store;
 mod popkey_store;
+mod social;
 
 pub use averin_deadletter::{AverinDeadLetterStore, QuarantineRecord, QuarantineStatus};
 pub use averin_queue::AverinQueue;
 pub use file::FileStorage;
 pub use outbox_store::OutboxStore;
 pub use popkey_store::{PopKeyEntry, PopKeyStore};
+pub use social::{
+    DraftReceipt, DraftSyncStatus, NativeDraftKey, NativeDraftMetadata, NativeDraftOutcome,
+    NativeDraftRecord, NativeDraftReservation,
+};
 
 use crate::approval::{ApprovalRequest, ApprovalStatus};
 use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
@@ -898,6 +903,49 @@ pub trait StorageBackend: Send + Sync {
     /// key can be retried. Must not clobber an already-completed record.
     async fn idempotency_release(&self, _key: &str) -> Result<(), StorageError> {
         Ok(())
+    }
+
+    // ==================== Native draft handoff ====================
+
+    /// Atomically reserve one provider-native draft operation. Unlike the
+    /// admin idempotency table, a native-draft reservation is never stale,
+    /// released, or reclaimed: a crash after this write leaves an ambiguous
+    /// remote outcome and must block blind recreation.
+    async fn reserve_native_draft(
+        &self,
+        _key: &NativeDraftKey,
+        _payload_hash: &str,
+        _metadata: NativeDraftMetadata,
+    ) -> Result<NativeDraftReservation, StorageError> {
+        Err(StorageError::Unavailable(
+            "native draft durable storage not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Read one durable mapping. Callers that share a file backend should
+    /// reload first when they need cross-process read freshness.
+    async fn get_native_draft(
+        &self,
+        _key: &NativeDraftKey,
+    ) -> Result<Option<NativeDraftRecord>, StorageError> {
+        Err(StorageError::Unavailable(
+            "native draft durable storage not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Compare-and-set a reserved operation to a terminal/reconciled outcome.
+    /// The token and payload hash bind the update to the exact operation; no
+    /// later approval can overwrite an existing record.
+    async fn finalize_native_draft(
+        &self,
+        _key: &NativeDraftKey,
+        _reservation_token: &str,
+        _payload_hash: &str,
+        _outcome: NativeDraftOutcome,
+    ) -> Result<NativeDraftRecord, StorageError> {
+        Err(StorageError::Unavailable(
+            "native draft durable storage not supported by this backend".to_string(),
+        ))
     }
 
     /// Reload data from underlying storage

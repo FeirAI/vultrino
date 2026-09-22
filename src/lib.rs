@@ -787,6 +787,19 @@ pub struct RequestContext {
     /// matching via the legacy `evaluate` path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
+    /// Tenant copied from the authenticated key/token. This is an internal
+    /// trust-context field; it is never accepted from action parameters or
+    /// serialized into a plugin-facing request.
+    #[serde(skip)]
+    pub(crate) tenant: Option<String>,
+    /// Approval identity bound only by the server's approved-execution path.
+    /// Kept crate-visible so typed plugins can require it, but unavailable to
+    /// downstream callers constructing a `PluginRequest`.
+    #[serde(skip)]
+    pub(crate) approval_id: Option<String>,
+    /// Execution-claim fence paired with `approval_id`.
+    #[serde(skip)]
+    pub(crate) approval_execution_epoch: Option<u64>,
 }
 
 impl RequestContext {
@@ -801,6 +814,9 @@ impl RequestContext {
             api_key_name: None,
             role_name: None,
             agent_label: None,
+            tenant: None,
+            approval_id: None,
+            approval_execution_epoch: None,
         }
     }
 
@@ -810,7 +826,21 @@ impl RequestContext {
         self.api_key_name = Some(auth.api_key.name.clone());
         self.role_name = Some(auth.role.name.clone());
         self.agent_label = auth.api_key.agent_label.clone();
+        self.tenant = auth.api_key.tenant.clone();
         self
+    }
+
+    /// Bind the non-forgeable execution identity after the persisted approval
+    /// grant has been validated and claimed. Direct execution never calls this.
+    pub(crate) fn bind_approved_execution(
+        &mut self,
+        approval_id: impl Into<String>,
+        execution_epoch: u64,
+        tenant: Option<String>,
+    ) {
+        self.approval_id = Some(approval_id.into());
+        self.approval_execution_epoch = Some(execution_epoch);
+        self.tenant = tenant;
     }
 }
 
@@ -1049,6 +1079,26 @@ mod base64_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_context_serde_cannot_forge_trusted_approval_authority() {
+        let forged = serde_json::json!({
+            "request_id": "req-1",
+            "timestamp": Utc::now(),
+            "tenant": "attacker-tenant",
+            "approval_id": "attacker-approval",
+            "approval_execution_epoch": 99,
+            "api_key_id": "key-1"
+        });
+        let context: RequestContext = serde_json::from_value(forged).unwrap();
+        assert!(context.tenant.is_none());
+        assert!(context.approval_id.is_none());
+        assert!(context.approval_execution_epoch.is_none());
+        let encoded = serde_json::to_value(context).unwrap();
+        assert!(encoded.get("tenant").is_none());
+        assert!(encoded.get("approval_id").is_none());
+        assert!(encoded.get("approval_execution_epoch").is_none());
+    }
 
     #[test]
     fn test_credential_creation() {

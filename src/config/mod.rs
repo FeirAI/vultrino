@@ -2,10 +2,12 @@
 //!
 //! Loads configuration from TOML files and environment variables.
 
+mod buffer;
 mod sheets;
 mod solo;
 mod types;
 
+pub use buffer::{validate_buffer_pins, BufferPin};
 pub use sheets::{A1Range, SheetsPin, MAX_SHEETS_ROW};
 pub use solo::SoloPins;
 pub use types::*;
@@ -103,6 +105,9 @@ pub struct Config {
     /// `solo` plugin (`[solo_pins]`). Default = nothing pinned = the plugin
     /// refuses every Sheets and Calendar call. Never shared with `sheets_pins`.
     pub solo_pins: SoloPins,
+    /// Operator-pinned Buffer social targets. Empty = the plugin refuses every
+    /// target; requests cannot name an unconfigured remote account.
+    pub buffer_pins: Vec<BufferPin>,
 }
 
 /// One operator-pinned internal destination (plan 103 D8/F8), validated at
@@ -726,6 +731,27 @@ impl Config {
             None => SoloPins::default(),
         };
 
+        // Operator-pinned Buffer targets. Empty = deny every Buffer target.
+        // Parse each field strictly, then enforce cross-pin ambiguity rules.
+        let buffer_pins = raw
+            .buffer_pins
+            .into_iter()
+            .map(|pin| {
+                BufferPin::parse(
+                    &pin.tenant_id,
+                    &pin.project_id,
+                    &pin.credential_alias,
+                    &pin.organization_id,
+                    &pin.target_alias,
+                    &pin.channel_id,
+                    &pin.service_id,
+                    &pin.account_id,
+                )
+                .map_err(ConfigError::Invalid)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_buffer_pins(&buffer_pins).map_err(ConfigError::Invalid)?;
+
         Ok(Self {
             server,
             storage,
@@ -756,6 +782,7 @@ impl Config {
             internal_destinations,
             sheets_pins,
             solo_pins,
+            buffer_pins,
         })
     }
 
@@ -782,6 +809,7 @@ impl Config {
             internal_destinations: vec![],
             sheets_pins: vec![],
             solo_pins: SoloPins::default(),
+            buffer_pins: vec![],
         }
     }
 

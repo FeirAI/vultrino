@@ -8,7 +8,12 @@ use super::outbox_store::OutboxStore;
 #[cfg(test)]
 use super::popkey_store::PopKeyEntry;
 use super::popkey_store::PopKeyStore;
-use super::{ExecutionClaim, IdempotencyState, StorageBackend, StorageError};
+#[cfg(test)]
+use super::DraftReceipt;
+use super::{
+    DraftSyncStatus, ExecutionClaim, IdempotencyState, NativeDraftKey, NativeDraftMetadata,
+    NativeDraftOutcome, NativeDraftRecord, NativeDraftReservation, StorageBackend, StorageError,
+};
 use crate::approval::{tenant_may_act, ApprovalRequest};
 use crate::auth::{ApiKey, ApprovalToken, Role, UseToken};
 use crate::capability::Capability;
@@ -42,7 +47,7 @@ const STALE_EXECUTING_SECS: i64 = 120;
 /// v6 (connector M1): adds the `capabilities` map (named-MCP-tool definitions).
 /// `#[serde(default)]`, so a v6 binary reads older vaults; an older binary is
 /// refused a v6 vault rather than silently dropping capabilities on its next write.
-const STORAGE_VERSION: u32 = 7; // v7: the signed outbox moved OUT of the vault into its own encrypted file
+const STORAGE_VERSION: u32 = 8; // v8: durable provider-native draft mappings
 
 /// A reservation older than this (seconds) is assumed orphaned by a crashed
 /// request and may be re-reserved, so a single failed admin call can't block a
@@ -484,6 +489,10 @@ struct StorageCache {
     /// Idempotency records for admin-API mutations, keyed by Idempotency-Key.
     #[serde(default)]
     idempotency: HashMap<String, IdempotencyRecord>,
+    /// Durable provider-native draft operations. These records are never
+    /// reclaimed by age: a reserved operation may have fired remotely.
+    #[serde(default)]
+    native_drafts: HashMap<String, NativeDraftRecord>,
     /// LEGACY (v6): the signed event outbox used to live IN the vault. v7 moved it to its own file
     /// (OutboxStore). These two fields are retained ONLY so a v6 vault's outbox can be READ and
     /// drained on first v7 open (migrate_v6_outbox); they stay empty thereafter. Do not append here.
@@ -555,6 +564,21 @@ impl StorageCache {
                 StorageError::Serialization(format!(
                     "approval {:?} has an invalid persisted shape: {reason}",
                     approval.id
+                ))
+            })?;
+        }
+
+        for (map_id, draft) in &self.native_drafts {
+            if map_id != &draft.key.storage_key() {
+                return Err(StorageError::Serialization(format!(
+                    "native draft map key does not match embedded key for {:?}",
+                    draft.key.variant_id
+                )));
+            }
+            draft.validate().map_err(|reason| {
+                StorageError::Serialization(format!(
+                    "native draft {:?} has an invalid persisted shape: {reason}",
+                    draft.key.variant_id
                 ))
             })?;
         }
@@ -2613,6 +2637,146 @@ impl StorageBackend for FileStorage {
         .await
     }
 
+    // ==================== Native draft handoff ====================
+
+    async fn reserve_native_draft(
+        &self,
+        key: &NativeDraftKey,
+        payload_hash: &str,
+        metadata: NativeDraftMetadata,
+    ) -> Result<NativeDraftReservation, StorageError> {
+        key.validate()
+            .map_err(|reason| StorageError::InvalidConfig(reason.to_string()))?;
+        if payload_hash.trim().is_empty() {
+            return Err(StorageError::InvalidConfig(
+                "native draft payload_hash is blank".to_string(),
+            ));
+        }
+        let key = key.clone();
+        let payload_hash = payload_hash.to_string();
+        self.locked_mutate(move |cache| {
+            let storage_key = key.storage_key();
+            if let Some(existing) = cache.native_drafts.get(&storage_key) {
+                if existing.payload_hash != payload_hash
+                    || existing.metadata.content_hash != metadata.content_hash
+                {
+                    return Err(StorageError::Conflict(
+                        "native draft key is already bound to different content".to_string(),
+                    ));
+                }
+                // Existing records are deliberately returned for every status:
+                // Reserved/Unknown/Failed must block a blind recreate, while a
+                // Succeeded receipt can be replayed exactly.
+                return Ok(NativeDraftReservation::Existing {
+                    record: existing.clone(),
+                });
+            }
+            let now = Utc::now();
+            let record = NativeDraftRecord {
+                key,
+                payload_hash,
+                metadata,
+                reservation_token: uuid::Uuid::new_v4().to_string(),
+                status: DraftSyncStatus::Reserved,
+                receipt: None,
+                original_receipt: None,
+                error: None,
+                created_at: now,
+                updated_at: now,
+            };
+            record.validate().map_err(|reason| {
+                StorageError::Serialization(format!("new native draft record is invalid: {reason}"))
+            })?;
+            cache.native_drafts.insert(storage_key, record.clone());
+            Ok(NativeDraftReservation::Fresh { record })
+        })
+        .await
+    }
+
+    async fn get_native_draft(
+        &self,
+        key: &NativeDraftKey,
+    ) -> Result<Option<NativeDraftRecord>, StorageError> {
+        key.validate()
+            .map_err(|reason| StorageError::InvalidConfig(reason.to_string()))?;
+        // Unlike the hot-path reserve/finalize operations, reads may use the
+        // normal reload lock path; this makes status/reconciliation see a
+        // sibling web/MCP process's committed mapping.
+        FileStorage::reload(self).await?;
+        let cache = self.cache.read();
+        Ok(cache.native_drafts.get(&key.storage_key()).cloned())
+    }
+
+    async fn finalize_native_draft(
+        &self,
+        key: &NativeDraftKey,
+        reservation_token: &str,
+        payload_hash: &str,
+        outcome: NativeDraftOutcome,
+    ) -> Result<NativeDraftRecord, StorageError> {
+        key.validate()
+            .map_err(|reason| StorageError::InvalidConfig(reason.to_string()))?;
+        if reservation_token.trim().is_empty() || payload_hash.trim().is_empty() {
+            return Err(StorageError::InvalidConfig(
+                "native draft finalize token/hash is blank".to_string(),
+            ));
+        }
+        let key = key.clone();
+        let reservation_token = reservation_token.to_string();
+        let payload_hash = payload_hash.to_string();
+        self.locked_mutate(move |cache| {
+            let storage_key = key.storage_key();
+            let record = cache
+                .native_drafts
+                .get_mut(&storage_key)
+                .ok_or_else(|| StorageError::NotFound("native draft mapping".to_string()))?;
+            if record.payload_hash != payload_hash {
+                return Err(StorageError::Conflict(
+                    "native draft finalize payload does not match reservation".to_string(),
+                ));
+            }
+            if record.reservation_token != reservation_token {
+                return Err(StorageError::Conflict(
+                    "native draft finalize token is not the reservation owner".to_string(),
+                ));
+            }
+            if !matches!(record.status, DraftSyncStatus::Reserved) {
+                // Idempotent same-owner finalize after a lost response is safe
+                // only when the requested outcome is byte-for-byte equivalent.
+                // A contradictory second outcome must not silently relabel an
+                // already durable success/unknown result.
+                if record.status == outcome.status
+                    && record.receipt == outcome.receipt
+                    && record.error == outcome.error
+                {
+                    return Ok(record.clone());
+                }
+                return Err(StorageError::Conflict(
+                    "native draft operation already has a different terminal outcome".to_string(),
+                ));
+            }
+            if matches!(outcome.status, DraftSyncStatus::Reserved) {
+                return Err(StorageError::Conflict(
+                    "native draft cannot finalize back to reserved".to_string(),
+                ));
+            }
+            record.status = outcome.status;
+            if record.original_receipt.is_none() {
+                record.original_receipt = outcome.receipt.clone();
+            }
+            record.receipt = outcome.receipt;
+            record.error = outcome.error;
+            record.updated_at = Utc::now();
+            record.validate().map_err(|reason| {
+                StorageError::Serialization(format!(
+                    "finalized native draft record is invalid: {reason}"
+                ))
+            })?;
+            Ok(record.clone())
+        })
+        .await
+    }
+
     async fn reload(&self) -> Result<(), StorageError> {
         FileStorage::reload(self).await
     }
@@ -4396,5 +4560,237 @@ mod tests {
         // rotated is the SAME widened crash window the two-file case already accepted — this test's
         // job is to prove the vault is fail-closed and intact, and that the mismatch is DETECTED, not
         // silently served.
+    }
+
+    fn native_draft_key() -> NativeDraftKey {
+        NativeDraftKey {
+            tenant: "tenant-a".to_string(),
+            project_ref: "sheet-project".to_string(),
+            provider: "buffer".to_string(),
+            target_alias: "x".to_string(),
+            credential_alias: "buffer-main".to_string(),
+            campaign_id: "campaign-1".to_string(),
+            variant_id: "variant-x".to_string(),
+            row_version: 1,
+        }
+    }
+
+    fn native_draft_metadata(approval_id: &str) -> NativeDraftMetadata {
+        NativeDraftMetadata {
+            approval_id: approval_id.to_string(),
+            execution_epoch: 1,
+            principal_id: Some("ep_agent".to_string()),
+            agent_label: Some("solo-publisher".to_string()),
+            content_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+            credential_id: "cred-1".to_string(),
+        }
+    }
+
+    fn native_draft_receipt(
+        key: &NativeDraftKey,
+        hash: &str,
+        status: DraftSyncStatus,
+    ) -> DraftReceipt {
+        DraftReceipt {
+            provider: key.provider.clone(),
+            campaign_id: key.campaign_id.clone(),
+            variant_id: key.variant_id.clone(),
+            row_version: key.row_version,
+            content_hash: hash.to_string(),
+            channel_ref: key.target_alias.clone(),
+            external_content_hash: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
+            external_id: Some("post-123".to_string()),
+            external_status: Some("draft".to_string()),
+            review_url: Some("https://buffer.example/review/post-123".to_string()),
+            sync_status: status,
+        }
+    }
+
+    #[tokio::test]
+    async fn native_draft_reservation_survives_restart_and_blocks_recreate() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let password = SecretString::from("native-draft-password");
+        let key = native_draft_key();
+        let storage = FileStorage::new(&path, &password).await.unwrap();
+        let reservation = storage
+            .reserve_native_draft(&key, "payload-a", native_draft_metadata("appr-1"))
+            .await
+            .unwrap();
+        let token = match reservation {
+            NativeDraftReservation::Fresh { record } => record.reservation_token,
+            NativeDraftReservation::Existing { .. } => panic!("first reservation was not fresh"),
+        };
+        storage
+            .finalize_native_draft(
+                &key,
+                &token,
+                "payload-a",
+                NativeDraftOutcome {
+                    status: DraftSyncStatus::Unknown,
+                    receipt: None,
+                    error: Some("provider timeout".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        drop(storage);
+
+        let reopened = FileStorage::new(&path, &password).await.unwrap();
+        let existing = reopened
+            .reserve_native_draft(&key, "payload-a", native_draft_metadata("appr-2"))
+            .await
+            .unwrap();
+        match existing {
+            NativeDraftReservation::Existing { record } => {
+                assert_eq!(record.status, DraftSyncStatus::Unknown);
+                assert_eq!(record.metadata.approval_id, "appr-1");
+            }
+            NativeDraftReservation::Fresh { .. } => panic!("unknown operation was recreated"),
+        }
+        assert!(matches!(
+            reopened
+                .reserve_native_draft(&key, "payload-b", native_draft_metadata("appr-3"))
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        let mut mismatched_row = native_draft_metadata("appr-4");
+        mismatched_row.content_hash =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
+        assert!(matches!(
+            reopened
+                .reserve_native_draft(&key, "payload-a", mismatched_row)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_draft_reservation_is_cross_process_atomic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let password = SecretString::from("native-draft-race-password");
+        let first = FileStorage::new(&path, &password).await.unwrap();
+        let second = FileStorage::new(&path, &password).await.unwrap();
+        let key = native_draft_key();
+        let (left, right) = tokio::join!(
+            first.reserve_native_draft(&key, "payload-a", native_draft_metadata("appr-a")),
+            second.reserve_native_draft(&key, "payload-a", native_draft_metadata("appr-b")),
+        );
+        let fresh = [left, right]
+            .into_iter()
+            .filter(|result| matches!(result, Ok(NativeDraftReservation::Fresh { .. })))
+            .count();
+        assert_eq!(
+            fresh, 1,
+            "exactly one concurrent caller may reserve the key"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_draft_invalid_reservation_rolls_back_without_persisting() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let password = SecretString::from("native-draft-rollback-password");
+        let storage = FileStorage::new(&path, &password).await.unwrap();
+        let key = native_draft_key();
+        let mut metadata = native_draft_metadata("appr-invalid");
+        metadata.principal_id = None;
+
+        assert!(matches!(
+            storage
+                .reserve_native_draft(&key, "payload-a", metadata)
+                .await,
+            Err(StorageError::Serialization(_))
+        ));
+        assert!(storage.get_native_draft(&key).await.unwrap().is_none());
+
+        let reopened = FileStorage::new(&path, &password).await.unwrap();
+        assert!(reopened.get_native_draft(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn native_draft_finalize_rejects_contradictory_outcome_and_bad_receipt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let password = SecretString::from("native-draft-cas-password");
+        let storage = FileStorage::new(&path, &password).await.unwrap();
+        let key = native_draft_key();
+        let reservation = storage
+            .reserve_native_draft(&key, "payload-a", native_draft_metadata("appr-1"))
+            .await
+            .unwrap();
+        let token = match reservation {
+            NativeDraftReservation::Fresh { record } => record.reservation_token,
+            NativeDraftReservation::Existing { .. } => panic!("first reservation was not fresh"),
+        };
+        let receipt = native_draft_receipt(
+            &key,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            DraftSyncStatus::Succeeded,
+        );
+        storage
+            .finalize_native_draft(
+                &key,
+                &token,
+                "payload-a",
+                NativeDraftOutcome {
+                    status: DraftSyncStatus::Succeeded,
+                    receipt: Some(receipt.clone()),
+                    error: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Exact replay is idempotent; a conflicting status/receipt is fenced.
+        storage
+            .finalize_native_draft(
+                &key,
+                &token,
+                "payload-a",
+                NativeDraftOutcome {
+                    status: DraftSyncStatus::Succeeded,
+                    receipt: Some(receipt.clone()),
+                    error: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage
+                .finalize_native_draft(
+                    &key,
+                    &token,
+                    "payload-a",
+                    NativeDraftOutcome {
+                        status: DraftSyncStatus::Unknown,
+                        receipt: None,
+                        error: Some("late timeout".to_string()),
+                    },
+                )
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        let mut bad = receipt;
+        bad.channel_ref = "linkedin".to_string();
+        assert!(matches!(
+            NativeDraftRecord {
+                key,
+                payload_hash: "payload-a".to_string(),
+                metadata: native_draft_metadata("appr-1"),
+                reservation_token: token,
+                status: DraftSyncStatus::Succeeded,
+                receipt: Some(bad),
+                original_receipt: None,
+                error: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }
+            .validate(),
+            Err("native draft receipt identity does not match its key")
+        ));
     }
 }

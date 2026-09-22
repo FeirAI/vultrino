@@ -932,7 +932,10 @@ impl VultrinoServer {
         plugins.register(Arc::new(crate::plugins::SheetsPlugin::new(
             config.sheets_pins.clone(),
         )));
-        plugins.register(Arc::new(crate::plugins::BufferPlugin::new()));
+        plugins.register(Arc::new(crate::plugins::BufferPlugin::new(
+            config.buffer_pins.clone(),
+            storage.clone(),
+        )));
         // Typed Solo-project coordination operations. This keeps learner,
         // Calendar, and outbound-message destinations inside provider-specific
         // adapters while the policy layer presents one `solo.*` write domain.
@@ -3409,6 +3412,14 @@ impl VultrinoServer {
                 "approved execution permit refused ({reason:?}); nothing ran"
             )))
         })?;
+        // Only the claimed, persisted grant may bind approval authority into
+        // plugin context. Ordinary/direct execution leaves these fields empty;
+        // action parameters can never manufacture an approval identity.
+        context.bind_approved_execution(
+            approval.id.clone(),
+            execution_epoch,
+            approval.tenant.clone(),
+        );
         // Prefer the frozen catalog class: undeclared approvals may carry the
         // broader trusted_irreversible stamp for recipe refusal without forcing
         // Averin evidence. Legacy rows without a class keep the stamp fail-closed.
@@ -5608,6 +5619,9 @@ fn parse_action(action: &str) -> Result<(&str, &str), VultrinoError> {
         Ok(("http", action))
     }
 }
+
+#[cfg(test)]
+mod buffer_draft_tests;
 
 #[cfg(test)]
 mod tests {

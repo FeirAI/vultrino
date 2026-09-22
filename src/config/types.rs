@@ -47,6 +47,28 @@ pub struct RawConfig {
     /// Operator-pinned learner spreadsheet ids and Calendar ids for the typed
     /// `solo` plugin. Absent/empty → every solo Sheets/Calendar call is refused.
     pub solo_pins: Option<RawSoloPins>,
+    /// Operator-pinned Buffer social targets. Absent/empty → every Buffer call
+    /// is refused.
+    #[serde(default)]
+    pub buffer_pins: Vec<RawBufferPin>,
+}
+
+/// TOML shape for `[[buffer_pins]]`.
+///
+/// All eight fields are mandatory. `service_id` is the remote social-account
+/// id; the Buffer service is derived from `target_alias` (`x` → `twitter`,
+/// `linkedin` → `linkedin`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawBufferPin {
+    pub tenant_id: String,
+    pub project_id: String,
+    pub credential_alias: String,
+    pub organization_id: String,
+    pub target_alias: String,
+    pub channel_id: String,
+    pub service_id: String,
+    pub account_id: String,
 }
 
 /// TOML shape for `[solo_pins]`.
