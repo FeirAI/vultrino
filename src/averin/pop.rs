@@ -105,7 +105,18 @@ pub struct GrantRequestV2<'a> {
     pub request_expires_at: i64,
 }
 
-pub fn grant_challenge_v2(r: &GrantRequestV2<'_>) -> [u8; 32] {
+fn checked_lp4_len(n: u64) -> Result<u32, PopError> {
+    u32::try_from(n).map_err(|_| PopError::GrantFieldTooLong)
+}
+
+fn lp_v2(out: &mut Vec<u8>, b: &[u8]) -> Result<(), PopError> {
+    let len = checked_lp4_len(b.len() as u64)?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(b);
+    Ok(())
+}
+
+pub fn grant_challenge_v2(r: &GrantRequestV2<'_>) -> Result<[u8; 32], PopError> {
     let mut b = Vec::new();
     for s in [
         GRANT_POP_TAG_V2,
@@ -122,17 +133,19 @@ pub fn grant_challenge_v2(r: &GrantRequestV2<'_>) -> [u8; 32] {
         r.justification,
         "capability",
     ] {
-        lp(&mut b, s.as_bytes());
+        lp_v2(&mut b, s.as_bytes())?;
     }
     b.extend_from_slice(&r.use_limit.to_be_bytes());
     b.extend_from_slice(&r.ttl_seconds.to_be_bytes());
-    b.extend_from_slice(&(r.delegation_chain.len() as i64).to_be_bytes());
+    let chain_len =
+        i64::try_from(r.delegation_chain.len()).map_err(|_| PopError::GrantFieldTooLong)?;
+    b.extend_from_slice(&chain_len.to_be_bytes());
     for s in r.delegation_chain {
-        lp(&mut b, s.as_bytes());
+        lp_v2(&mut b, s.as_bytes())?;
     }
     b.extend_from_slice(&r.issued_at.to_be_bytes());
     b.extend_from_slice(&r.request_expires_at.to_be_bytes());
-    Sha256::digest(&b).into()
+    Ok(Sha256::digest(&b).into())
 }
 
 /// The grant PoP challenge bytes `agent_sig` signs. Byte-identical to Go's
@@ -241,6 +254,8 @@ pub enum PopError {
     BadParamsNonce,
     #[error("malformed capability token (want <payload>.<sig>)")]
     MalformedCapability,
+    #[error("grant PoP v2 field exceeds the 32-bit length framing limit")]
+    GrantFieldTooLong,
 }
 
 #[cfg(test)]
@@ -304,10 +319,20 @@ mod tests {
             delegation_chain: &[],
             issued_at: 1718445000,
             request_expires_at: 1718445900,
-        });
+        })
+        .unwrap();
         assert_eq!(
             hex::encode(c),
             "20809965afd8dd263d5f02afb1461cdce5a8cb7adf1187ba0feb43a46b48fe94"
+        );
+    }
+
+    #[test]
+    fn grant_pop_v2_rejects_truncating_length_frame() {
+        assert_eq!(checked_lp4_len(u32::MAX as u64), Ok(u32::MAX));
+        assert_eq!(
+            checked_lp4_len(u32::MAX as u64 + 1),
+            Err(PopError::GrantFieldTooLong)
         );
     }
 

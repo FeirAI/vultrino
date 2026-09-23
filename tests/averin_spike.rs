@@ -293,7 +293,8 @@ async fn durable_worker_shape_accepts_bounded_reuse_sequence_and_dedups_retry() 
         delegation_chain: &[],
         issued_at,
         request_expires_at,
-    });
+    })
+    .unwrap();
     let agent_sig = keypair.sign_b64(&grant_challenge);
     let grant_body = serde_json::json!({
         "pop_version": 2,

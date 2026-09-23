@@ -613,24 +613,27 @@ impl AverinClient {
         let (scope_class, averin_use_limit) = grant_shape(scope, action, use_limit);
         let issued_at = chrono::Utc::now().timestamp();
         let request_expires_at = issued_at + 15 * 60;
-        let agent_sig = keypair.sign_b64(&pop::grant_challenge_v2(&pop::GrantRequestV2 {
-            project_id: &self.cfg.project_id,
-            idempotency_key: token_id,
-            session_id: &self.cfg.session_id,
-            agent_id: &agent_id,
-            action,
-            resource: &resource,
-            scope,
-            scope_class: scope_class.unwrap_or("single_operation"),
-            agent_pubkey: &agent_pubkey,
-            principal: "",
-            justification: "",
-            use_limit: i64::from(averin_use_limit),
-            ttl_seconds: i64::from(self.cfg.grant_ttl_secs),
-            delegation_chain: &[],
-            issued_at,
-            request_expires_at,
-        }));
+        let agent_sig = keypair.sign_b64(
+            &pop::grant_challenge_v2(&pop::GrantRequestV2 {
+                project_id: &self.cfg.project_id,
+                idempotency_key: token_id,
+                session_id: &self.cfg.session_id,
+                agent_id: &agent_id,
+                action,
+                resource: &resource,
+                scope,
+                scope_class: scope_class.unwrap_or("single_operation"),
+                agent_pubkey: &agent_pubkey,
+                principal: "",
+                justification: "",
+                use_limit: i64::from(averin_use_limit),
+                ttl_seconds: i64::from(self.cfg.grant_ttl_secs),
+                delegation_chain: &[],
+                issued_at,
+                request_expires_at,
+            })
+            .map_err(AverinError::Pop)?,
+        );
         let body = serde_json::json!({
             "pop_version": 2,
             "issued_at": issued_at,
@@ -1014,24 +1017,27 @@ impl AverinClient {
         let grant_idem = format!("{token_id}:d8-grant:{request_id}");
         let issued_at = chrono::Utc::now().timestamp();
         let request_expires_at = issued_at + 15 * 60;
-        let agent_sig = keypair.sign_b64(&pop::grant_challenge_v2(&pop::GrantRequestV2 {
-            project_id: &self.cfg.project_id,
-            idempotency_key: &grant_idem,
-            session_id: &self.cfg.session_id,
-            agent_id: &agent_id,
-            action,
-            resource: &self.cfg.resource_id,
-            scope: credential_scope,
-            scope_class: "single_operation",
-            agent_pubkey: &agent_pubkey,
-            principal: "",
-            justification: "",
-            use_limit: 0,
-            ttl_seconds: i64::from(self.cfg.grant_ttl_secs),
-            delegation_chain: &[],
-            issued_at,
-            request_expires_at,
-        }));
+        let agent_sig = keypair.sign_b64(
+            &pop::grant_challenge_v2(&pop::GrantRequestV2 {
+                project_id: &self.cfg.project_id,
+                idempotency_key: &grant_idem,
+                session_id: &self.cfg.session_id,
+                agent_id: &agent_id,
+                action,
+                resource: &self.cfg.resource_id,
+                scope: credential_scope,
+                scope_class: "single_operation",
+                agent_pubkey: &agent_pubkey,
+                principal: "",
+                justification: "",
+                use_limit: 0,
+                ttl_seconds: i64::from(self.cfg.grant_ttl_secs),
+                delegation_chain: &[],
+                issued_at,
+                request_expires_at,
+            })
+            .map_err(AverinError::Pop)?,
+        );
         let grant_body = serde_json::json!({
             "pop_version": 2,
             "issued_at": issued_at,

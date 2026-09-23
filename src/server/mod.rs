@@ -4754,8 +4754,8 @@ async fn deliver_averin_grant(
         crate::averin::grant_shape(&entry.scope, &entry.action, entry.use_limit);
     let issued_at = chrono::Utc::now().timestamp();
     let request_expires_at = issued_at + 15 * 60;
-    let agent_sig = keypair.sign_b64(&crate::averin::pop::grant_challenge_v2(
-        &crate::averin::pop::GrantRequestV2 {
+    let agent_sig = keypair.sign_b64(
+        &crate::averin::pop::grant_challenge_v2(&crate::averin::pop::GrantRequestV2 {
             project_id: &project_id,
             idempotency_key: &token_id,
             session_id: &session_id,
@@ -4772,8 +4772,9 @@ async fn deliver_averin_grant(
             delegation_chain: &[],
             issued_at,
             request_expires_at,
-        },
-    ));
+        })
+        .map_err(|e| format!("grant PoP v2 preimage: {e}"))?,
+    );
     let body = serde_json::json!({
         "pop_version": 2,
         "issued_at": issued_at,
