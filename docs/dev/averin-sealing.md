@@ -72,18 +72,17 @@ Lower frequency (one grant per token mint), no hot path. Fully specified:
 2. **Deterministic `grant_id`.** averin derives `grant_id =
    uuidV5(averin.grant.id.v1, project_id, idempotency_key)`
    (`server.go:deterministicGrantID`). The seal-client sends `idempotency_key =
-   token.id` (the stable `vut_…`/`ut_…` id), so a lost-response retry collapses
-   to the same grant and never mints a second live credential
-   (`handleGrant` requires the idempotency key for exactly this reason).
+   token.id` (the stable `vut_…`/`ut_…` id). An exact semantic retry can return
+   the original grant; a retry with a different sender key conflicts and cannot
+   mint a second grant under that key.
 3. **PoP-key binding.** The client generates an Ed25519 keypair, sends
    `agent_pubkey` (base64url-no-pad, raw 32 bytes) and `agent_sig` = Ed25519 over
    the broker PoP challenge (see §5). averin binds the pubkey's kid as the
    capability's `cnf` — the use later must prove possession of the same key.
 4. **Scope class.** A vultrino token minted with `--uses 1` maps to
    `single_operation`; a token with `--uses N` (N>1) maps to averin's
-   `bounded_reuse` with `use_limit = N` (ADR 0005 M1). The spike ships
-   `single_operation`; `bounded_reuse` field wiring is specified but is Phase-2
-   (see §7). vultrino's `credential_scope`/`action_scope` map to the grant's
+   `bounded_reuse` with `use_limit = N` (ADR 0005 M1). vultrino's
+   `credential_scope`/`action_scope` map to the grant's
    `scope`/`action`; the grant `resource` is the configured averin `resource_id`
    (the audience the use receipt validates against).
 5. **Record-before-issue is averin's, not vultrino's.** averin seals the grant
@@ -96,6 +95,14 @@ Mint-seal fail-mode is **fail-open, always**: a token is a vultrino artifact; it
 existence must not depend on averin's availability. A failed grant seal is logged
 (and, in production, must raise an operator alarm — `vultrino-integration.md §5`)
 but never blocks the mint.
+
+The synchronous `seal_grant`/`on_mint` path is best-effort and one-shot. It keeps
+its PoP key in memory after a successful response; if that response is lost, a
+later direct invocation generates a different key and averin returns an
+idempotency conflict. No recovered grant or renewed expiry is claimed for that
+path. The durable delivery worker persists the original PoP seed and frozen
+semantic request, then may refresh only the v2 signed time envelope on retry.
+It uses averin's returned absolute capability expiry, even after a lost response.
 
 ## 3. Execute → `POST /v2/use` — the crux (sync vs async + fail-mode)
 
@@ -207,11 +214,13 @@ These are a cross-language binding averin keeps in
 `averin/spec/golden-vectors/broker-preimages.json`; the seal-client
 (`src/averin/pop.rs`) reproduces them and is unit-tested against those vectors.
 
-- **Grant PoP** (`agent_sig`): Ed25519 over the JSON object with keys in
-  alphabetical order — `{"action","agent_id","agent_pubkey","resource","scope","tag"}`,
-  `tag = "averin.broker.pop.v1"` (matches Go's sorted-key `json.Marshal`;
-  `broker.Request.Challenge`). ASCII field values only (base64url pubkey, dotted
-  action/scope) so serde's non-sorting, non-HTML-escaping output is byte-identical.
+- **Grant PoP v2** (`agent_sig`): Ed25519 over the SHA-256 digest of averin's
+  length-prefixed effective request and signed issue/expiry envelope (see
+  `averin/spec/grant-pop-v2.md`). It binds project, idempotency key, session,
+  sender key, scope, class/use limit, TTL, and authorization context. The v2
+  encoder rejects any field above the 32-bit length-frame limit before signing.
+  The older sorted-key JSON `averin.broker.pop.v1` preimage remains historical;
+  current online brokered grant routes refuse v1 proofs.
 - **Use PoP** (`use_sig`): Ed25519 over the 32-byte digest
   `SHA256( LP(tag) ‖ LP(grant_id) ‖ LP(resource_id) ‖ LP(action) ‖
   LP(params_commitment) ‖ LP(credential_binding) ‖ LP(nonce) )`,
