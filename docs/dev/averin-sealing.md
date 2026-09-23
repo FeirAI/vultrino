@@ -556,12 +556,13 @@ touching the trust verdict, the default posture, or anything about averin itself
     holding each token's PoP private seed and the grant's resolved
     `capability`/`grant_id` once the grant delivers.
   - `averin-deadletter.enc` — the dead-letter quarantine (D4, below).
-  - Deterministic-rebuild idempotency (D5): because the worker rebuilds every
+  - Deterministic-rebuild use idempotency (D5): the worker rebuilds each use
     retry from the exact `nonce`/`params_nonce` stored at enqueue time (never
-    fresh ones) and Ed25519 signing is deterministic (RFC 8032), a retried
-    delivery reproduces a byte-identical request — averin's own idempotency-key
-    matching treats it as an honest replay, never a 409 that would wrongly
-    quarantine an already-sealed use.
+    fresh ones). Ed25519 signing is deterministic (RFC 8032), so a retried use
+    delivery reproduces a byte-identical request. Grant retries instead keep
+    the frozen v2 semantic subject and PoP key while re-signing a current
+    issue/expiry envelope; averin compares the semantic digest and returns the
+    original committed result without extending capability expiry.
   - Together, the O(1) journal + the encrypted PoP-key store + this determinism
     is what turns "best-effort, restart-losable" into **at-least-once,
     restart-durable**. `cargo test survives_restart` exercises exactly this: a
