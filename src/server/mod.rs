@@ -6448,7 +6448,7 @@ mod averin_worker_tests {
     #[tokio::test]
     async fn averin_worker_lost_grant_response_keeps_original_absolute_expiry() {
         let dir = tempfile::tempdir().unwrap();
-        let (queue, popkeys, _deadletter) = test_stores(dir.path());
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
         let (base_url, fake) = responding_averin().await;
         let client = test_client(&base_url);
         popkeys
@@ -6475,6 +6475,12 @@ mod averin_worker_tests {
             .get("tok-expiry")
             .unwrap()
             .clone();
+        drop(event);
+        drop(queue);
+        drop(popkeys);
+        drop(deadletter);
+        let (queue, popkeys, _deadletter) = test_stores(dir.path());
+        let event = queue.get(seq).unwrap();
         deliver_averin_grant(&event, &queue, &popkeys, &client)
             .await
             .unwrap();
