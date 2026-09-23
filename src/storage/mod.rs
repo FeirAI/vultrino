@@ -933,6 +933,22 @@ pub trait StorageBackend: Send + Sync {
         ))
     }
 
+    /// Release a reservation whose remote attempt provably never executed
+    /// (the provider refused the request before running it). This is the one
+    /// narrow exception to "a reservation is never reclaimed": it removes the
+    /// record only while it is still `Reserved` and only for the reservation
+    /// owner's token, so an ambiguous or terminal outcome can never be
+    /// reclaimed and retried. Returns whether a record was removed.
+    async fn release_native_draft(
+        &self,
+        _key: &NativeDraftKey,
+        _reservation_token: &str,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::Unavailable(
+            "native draft durable storage not supported by this backend".to_string(),
+        ))
+    }
+
     /// Compare-and-set a reserved operation to a terminal/reconciled outcome.
     /// The token and payload hash bind the update to the exact operation; no
     /// later approval can overwrite an existing record.

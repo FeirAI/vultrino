@@ -314,11 +314,41 @@ fn credential_headers(credential: &Credential) -> Result<reqwest::header::Header
 
 #[derive(Debug)]
 struct UpstreamError {
+    /// The remote outcome is not observable from here. Never retried.
     unknown: bool,
+    /// The provider refused the request before executing it, so no remote
+    /// draft can exist. This is the only outcome that releases a reservation.
+    rejected: bool,
     message: String,
     external_id: Option<String>,
     external_content_hash: Option<String>,
     external_status: Option<String>,
+}
+
+impl UpstreamError {
+    /// The attempt may or may not have run: the operation stays terminal.
+    fn ambiguous(message: impl Into<String>) -> Self {
+        Self {
+            unknown: true,
+            rejected: false,
+            message: message.into(),
+            external_id: None,
+            external_content_hash: None,
+            external_status: None,
+        }
+    }
+
+    /// The provider refused the request before it could execute.
+    fn refused(message: impl Into<String>) -> Self {
+        Self {
+            unknown: false,
+            rejected: true,
+            message: message.into(),
+            external_id: None,
+            external_content_hash: None,
+            external_status: None,
+        }
+    }
 }
 
 fn external_id(value: &Value) -> Option<String> {
@@ -363,6 +393,7 @@ fn partial_error(document: &Value, unknown: bool, message: impl Into<String>) ->
         .and_then(bounded_status);
     UpstreamError {
         unknown,
+        rejected: false,
         message: message.into(),
         external_id: id,
         external_content_hash: text_hash,
@@ -370,9 +401,42 @@ fn partial_error(document: &Value, unknown: bool, message: impl Into<String>) ->
     }
 }
 
+/// HTTP statuses that mean the provider refused the request instead of running
+/// it: authentication, authorization, routing, schema/validation, and quota.
+/// Anything else (5xx, 3xx, transport) stays ambiguous.
+fn refusal_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 401 | 403 | 404 | 405 | 422 | 429)
+}
+
+/// A bounded, control-character-free rendering of the provider's first GraphQL
+/// error message. It names why a request was refused without letting
+/// provider-controlled text through unbounded. Never contains the credential
+/// or any response header.
+fn first_error_detail(errors: &[Value]) -> String {
+    let message = errors
+        .first()
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(|message| {
+            message
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(200)
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    let message = message.trim();
+    if message.is_empty() {
+        String::new()
+    } else {
+        format!(": {message}")
+    }
+}
+
 async fn graphql(
     client: &Client,
     url: &Url,
+    timeout: std::time::Duration,
     credential: &Credential,
     query: &str,
     vars: Value,
@@ -382,40 +446,43 @@ async fn graphql(
         .headers(
             credential_headers(credential).map_err(|error| UpstreamError {
                 unknown: false,
+                rejected: false,
                 message: error.to_string(),
                 external_id: None,
                 external_content_hash: None,
                 external_status: None,
             })?,
         )
+        .timeout(timeout)
         .json(&json!({ "query": query, "variables": vars }))
         .send()
         .await
-        .map_err(|_| UpstreamError {
-            unknown: true,
-            message: "Buffer request outcome is unknown; reconcile before retrying".into(),
-            external_id: None,
-            external_content_hash: None,
-            external_status: None,
+        // A timeout lands here too: the mutation may still be running, so the
+        // outcome stays ambiguous rather than refused.
+        .map_err(|_| {
+            UpstreamError::ambiguous("Buffer request outcome is unknown; reconcile before retrying")
         })?;
     let status = response.status();
     let body = crate::plugins::read_body_capped(response)
         .await
-        .map_err(|_| UpstreamError {
-            unknown: true,
-            message: "Buffer response outcome is unknown; reconcile before retrying".into(),
-            external_id: None,
-            external_content_hash: None,
-            external_status: None,
+        .map_err(|_| {
+            UpstreamError::ambiguous(
+                "Buffer response outcome is unknown; reconcile before retrying",
+            )
         })?;
-    let document: Value = serde_json::from_slice(&body).map_err(|_| UpstreamError {
-        unknown: true,
-        message: "Buffer response outcome is unknown; reconcile before retrying".into(),
-        external_id: None,
-        external_content_hash: None,
-        external_status: None,
+    let document: Value = serde_json::from_slice(&body).map_err(|_| {
+        UpstreamError::ambiguous("Buffer response outcome is unknown; reconcile before retrying")
     })?;
     if !status.is_success() {
+        // A refusal status with no post anywhere in the body proves the
+        // mutation never executed. A body that still carries a post object is
+        // contradictory and stays ambiguous.
+        if refusal_status(status) && partial_post(&document).is_none() {
+            return Err(UpstreamError::refused(format!(
+                "Buffer refused the request before execution (HTTP {})",
+                status.as_u16()
+            )));
+        }
         return Err(partial_error(
             &document,
             true,
@@ -425,11 +492,23 @@ async fn graphql(
     match document.get("errors") {
         None | Some(Value::Null) => Ok(document),
         Some(Value::Array(errors)) if errors.is_empty() => Ok(document),
-        Some(Value::Array(_)) => Err(partial_error(
-            &document,
-            true,
-            "Buffer GraphQL response contains errors; reconcile before retrying",
-        )),
+        Some(Value::Array(errors)) => {
+            // Errors with no data at all is GraphQL's shape for a request that
+            // was rejected before the resolver ran. Errors alongside any data
+            // (or a partial post) is a partial/contradictory success.
+            let data_absent = document.get("data").is_none_or(Value::is_null);
+            if data_absent && partial_post(&document).is_none() {
+                return Err(UpstreamError::refused(format!(
+                    "Buffer refused the request before execution{}",
+                    first_error_detail(errors)
+                )));
+            }
+            Err(partial_error(
+                &document,
+                true,
+                "Buffer GraphQL response contains errors; reconcile before retrying",
+            ))
+        }
         Some(_) => Err(partial_error(
             &document,
             true,
@@ -444,6 +523,8 @@ pub struct BufferPlugin {
     storage: Arc<dyn StorageBackend>,
     #[cfg(test)]
     endpoint: Url,
+    #[cfg(test)]
+    request_timeout: std::time::Duration,
 }
 
 impl BufferPlugin {
@@ -454,6 +535,8 @@ impl BufferPlugin {
             storage,
             #[cfg(test)]
             endpoint: Url::parse(BUFFER_URL).expect("static Buffer URL"),
+            #[cfg(test)]
+            request_timeout: crate::plugins::REQUEST_TIMEOUT,
         }
     }
 
@@ -469,7 +552,17 @@ impl BufferPlugin {
             pins: Arc::new(pins),
             storage,
             endpoint,
+            request_timeout: crate::plugins::REQUEST_TIMEOUT,
         }
+    }
+
+    /// A per-request total timeout is applied by `graphql`, and reqwest lets a
+    /// request-level timeout win over the client's, so a short client timeout
+    /// alone cannot stall-test this adapter. Tests shorten the deadline here.
+    #[cfg(test)]
+    pub(crate) fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     fn endpoint(&self) -> Url {
@@ -480,6 +573,17 @@ impl BufferPlugin {
         #[cfg(not(test))]
         {
             Url::parse(BUFFER_URL).expect("static Buffer URL")
+        }
+    }
+
+    fn request_timeout(&self) -> std::time::Duration {
+        #[cfg(test)]
+        {
+            self.request_timeout
+        }
+        #[cfg(not(test))]
+        {
+            crate::plugins::REQUEST_TIMEOUT
         }
     }
 
@@ -580,6 +684,7 @@ impl BufferPlugin {
         let document = graphql(
             &self.client,
             &self.endpoint(),
+            self.request_timeout(),
             credential,
             query,
             json!({ "input": { "id": pin.channel_id } }),
@@ -618,6 +723,7 @@ impl BufferPlugin {
         let document = graphql(
             &self.client,
             &self.endpoint(),
+            self.request_timeout(),
             credential,
             query,
             json!({ "input": { "text": p.draft_copy, "channelId": pin.channel_id, "schedulingType": "automatic", "mode": "addToQueue", "saveToDraft": true, "assets": [], "needsApproval": false, "aiAssisted": true } }),
@@ -647,16 +753,14 @@ impl BufferPlugin {
                 .and_then(Value::as_str)
                 .is_some_and(|message| !message.is_empty());
             if !has_post && has_message {
-                return Err(UpstreamError {
-                    unknown: false,
-                    // Do not persist provider-controlled error text. These
-                    // concrete Buffer error variants are confirmed rejections;
-                    // every other malformed/partial response remains Unknown.
-                    message: "Buffer create was rejected by upstream".into(),
-                    external_id: None,
-                    external_content_hash: None,
-                    external_status: None,
-                });
+                // Do not persist provider-controlled error text. These concrete
+                // Buffer error variants are confirmed refusals with no created
+                // post (including a transient quota refusal such as
+                // LimitReachedError); every other malformed/partial response
+                // remains Unknown.
+                return Err(UpstreamError::refused(
+                    "Buffer refused the create before execution",
+                ));
             }
             return Err(partial_error(
                 &document,
@@ -712,6 +816,7 @@ impl BufferPlugin {
         let document = graphql(
             &self.client,
             &self.endpoint(),
+            self.request_timeout(),
             credential,
             query,
             json!({ "input": { "id": id } }),
@@ -723,6 +828,7 @@ impl BufferPlugin {
             .filter(|post| !post.is_null())
             .ok_or_else(|| UpstreamError {
                 unknown: false,
+                rejected: false,
                 message: "Buffer owned draft was not found or returned no post".into(),
                 external_id: None,
                 external_content_hash: None,
@@ -740,6 +846,7 @@ impl BufferPlugin {
         if !typed {
             return Err(UpstreamError {
                 unknown: true,
+                rejected: false,
                 message: "Buffer read response was incomplete; reconcile before retrying".into(),
                 external_id: post.get("id").and_then(external_id),
                 external_content_hash: None,
@@ -848,7 +955,36 @@ impl BufferPlugin {
                 };
             }
         };
-        let outcome = match self.create_remote(&request.credential, &pin, &p).await {
+        let attempt = self.create_remote(&request.credential, &pin, &p).await;
+        if let Err(error) = &attempt {
+            if error.rejected {
+                // The provider refused the mutation before running it, so no
+                // remote draft exists. Releasing the reservation keeps the key
+                // usable instead of bricking it on a wrong key, a schema
+                // rejection, or a quota refusal. The approval permit is single
+                // use, so the retry needs a fresh approval.
+                match self
+                    .storage
+                    .release_native_draft(&key, &record.reservation_token)
+                    .await
+                {
+                    Ok(true) => {
+                        return Err(PluginError::ExecutionFailed(format!(
+                            "{}; nothing was created, and the request may be retried after a new approval",
+                            error.message
+                        )))
+                    }
+                    // The release did not happen, so the key must not look
+                    // retryable: fall through and record it as ambiguous.
+                    Ok(false) => {}
+                    Err(release_error) => tracing::warn!(
+                        error = %release_error,
+                        "Buffer refused a create, but releasing its reservation failed; the operation stays ambiguous"
+                    ),
+                }
+            }
+        }
+        let outcome = match attempt {
             Ok(external_id) => {
                 let receipt = DraftReceipt {
                     provider: "buffer".into(),
@@ -872,10 +1008,20 @@ impl BufferPlugin {
                 }
             }
             Err(error) => {
-                let status = if error.unknown {
-                    DraftSyncStatus::Unknown
+                let (status, message) = if error.rejected {
+                    // Only reachable when the release above did not happen: the
+                    // request provably did not execute, but the reservation
+                    // could not be reclaimed, so it stays ambiguous rather than
+                    // silently retryable. The durable error never carries
+                    // provider-controlled text.
+                    (
+                        DraftSyncStatus::Unknown,
+                        "Buffer refused the request before execution, but the local reservation could not be released; reconcile before retrying".to_string(),
+                    )
+                } else if error.unknown {
+                    (DraftSyncStatus::Unknown, error.message.clone())
                 } else {
-                    DraftSyncStatus::Failed
+                    (DraftSyncStatus::Failed, error.message.clone())
                 };
                 let receipt = error.external_id.map(|external_id| DraftReceipt {
                     provider: "buffer".into(),
@@ -893,7 +1039,7 @@ impl BufferPlugin {
                 NativeDraftOutcome {
                     status,
                     receipt,
-                    error: Some(error.message),
+                    error: Some(message),
                 }
             }
         };

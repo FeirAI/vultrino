@@ -8,7 +8,7 @@
 use super::*;
 use crate::config::BufferPin;
 use crate::plugins::marketing::{draft_content_hash, DraftHashPayload};
-use crate::storage::{DraftSyncStatus, FileStorage, StorageBackend};
+use crate::storage::{DraftSyncStatus, FileStorage, NativeDraftKey, StorageBackend};
 use crate::{Credential, CredentialData, RequestContext, Secret};
 use axum::body::Body;
 use axum::extract::State;
@@ -643,9 +643,10 @@ async fn legacy_mutations_and_unknown_actions_are_unsupported() {
 
 #[tokio::test]
 async fn upstream_failures_are_terminal_and_never_blindly_recreated() {
+    // A top-level GraphQL error with no data at all is a refusal, not an
+    // ambiguous outcome; it is covered by the release fixtures below.
     let failures = [
         Reply::Status(500, "upstream failure".into()),
-        Reply::Json(json!({"errors": [{"message": "top level graphql error"}]})),
         Reply::Json(json!({"data": {"createPost": {"__typename": "PostActionSuccess"}}})),
         Reply::Raw(200, "not json".into()),
         Reply::Json(
@@ -683,6 +684,149 @@ async fn upstream_failures_are_terminal_and_never_blindly_recreated() {
             fixture.count_query(CREATE_QUERY),
             creates_after_first,
             "terminal failure was recreated"
+        );
+    }
+}
+
+fn draft_key(fixture: &Fixture) -> NativeDraftKey {
+    BufferPlugin::native_key(
+        "tenant-a",
+        &fixture.pin("x"),
+        &fixture.credential("credential-1"),
+        "campaign-1",
+        "variant-1",
+        1,
+    )
+}
+
+/// Drive one create that the provider refuses before executing it, then prove
+/// the reservation was released and the same canonical row can be attempted
+/// again under a new approval.
+async fn assert_refusal_releases_the_key(refusal: Reply) {
+    let fixture = Fixture::new().await;
+    fixture.queue([Reply::Json(channel_success(&fixture.pin("x"))), refusal]);
+    let params = fixture.params("x", "hello");
+    let refused = fixture
+        .plugin
+        .execute(fixture.request("draft_create", params.clone(), "credential-1", true))
+        .await
+        .expect_err("a refused create must never report success");
+    let message = refused.to_string();
+    assert!(
+        message.contains("refused the request before execution")
+            || message.contains("refused the create before execution"),
+        "{message}"
+    );
+    assert!(message.contains("new approval"), "{message}");
+    assert!(!message.contains("fixture-token"), "{message}");
+    assert_eq!(fixture.count_query(CREATE_QUERY), 1);
+    assert!(
+        fixture
+            .storage
+            .get_native_draft(&draft_key(&fixture))
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused create must leave no durable record"
+    );
+
+    // The queue is now empty, so the fixture's default replies let a retry
+    // through: the key is usable again rather than permanently blocked.
+    let retry = fixture
+        .plugin
+        .execute(fixture.request("draft_create", params, "credential-1", true))
+        .await
+        .expect("a released key is attemptable again");
+    assert_eq!(
+        fixture.count_query(CREATE_QUERY),
+        2,
+        "the retry must reach the provider"
+    );
+    let receipt: Value = serde_json::from_slice(&retry.body).unwrap();
+    assert_eq!(receipt["external_id"], "post-1");
+    let record = fixture
+        .storage
+        .get_native_draft(&draft_key(&fixture))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.status, DraftSyncStatus::Succeeded);
+}
+
+#[tokio::test]
+async fn unauthorized_create_is_refused_and_releases_the_reservation() {
+    assert_refusal_releases_the_key(Reply::Raw(401, "{}".into())).await;
+}
+
+#[tokio::test]
+async fn schema_rejected_create_is_refused_and_releases_the_reservation() {
+    assert_refusal_releases_the_key(Reply::Raw(
+        400,
+        json!({"errors": [{"message": "Variable \"$input\" got an invalid value"}]}).to_string(),
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn graphql_errors_without_data_are_refused_and_release_the_reservation() {
+    assert_refusal_releases_the_key(Reply::Json(
+        json!({"data": null, "errors": [{"message": "Not authorized for this channel"}]}),
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn typed_limit_reached_is_refused_and_releases_the_reservation() {
+    assert_refusal_releases_the_key(Reply::Json(json!({
+        "data": {"createPost": {
+            "__typename": "LimitReachedError",
+            "message": "channel queue limit reached"
+        }}
+    })))
+    .await;
+}
+
+#[tokio::test]
+async fn contradictory_or_server_side_outcomes_stay_ambiguous_and_terminal() {
+    let ambiguous = [
+        // Errors next to a created post: the mutation may well have run.
+        Reply::Json(json!({
+            "errors": [{"message": "partial failure"}],
+            "data": {"createPost": {"__typename": "PostActionSuccess", "post": {
+                "id": "half-post", "text": "hello", "status": "draft",
+                "channelId": "channel-x", "channelService": "twitter",
+                "dueAt": null, "assets": []
+            }}}
+        })),
+        // A 5xx is never a refusal, even when it carries a GraphQL error body.
+        Reply::Raw(500, json!({"errors": [{"message": "boom"}]}).to_string()),
+    ];
+    for reply in ambiguous {
+        let fixture = Fixture::new().await;
+        fixture.queue([Reply::Json(channel_success(&fixture.pin("x"))), reply]);
+        let params = fixture.params("x", "hello");
+        let first = fixture
+            .plugin
+            .execute(fixture.request("draft_create", params.clone(), "credential-1", true))
+            .await;
+        assert!(first.is_err());
+        let record = fixture
+            .storage
+            .get_native_draft(&draft_key(&fixture))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, DraftSyncStatus::Unknown);
+        let creates = fixture.count_query(CREATE_QUERY);
+        let second = fixture
+            .plugin
+            .execute(fixture.request("draft_create", params, "credential-1", true))
+            .await;
+        assert!(second.is_err(), "an ambiguous outcome stays terminal");
+        assert_eq!(
+            fixture.count_query(CREATE_QUERY),
+            creates,
+            "an ambiguous outcome was blindly recreated"
         );
     }
 }
@@ -764,16 +908,13 @@ async fn timeout_after_reservation_remains_durably_blocked() {
             }))),
         ),
     ]);
-    let short_client = Client::builder()
-        .timeout(Duration::from_millis(20))
-        .build()
-        .unwrap();
     let plugin = BufferPlugin::with_client_endpoint(
-        short_client,
+        Client::builder().build().unwrap(),
         fixture.endpoint.clone(),
         fixture.pins.clone(),
         fixture.storage.clone(),
-    );
+    )
+    .with_request_timeout(Duration::from_millis(20));
     let params = fixture.params("x", "hello");
     let first = plugin
         .execute(fixture.request("draft_create", params.clone(), "credential-1", true))

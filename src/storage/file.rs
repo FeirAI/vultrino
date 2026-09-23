@@ -2707,6 +2707,40 @@ impl StorageBackend for FileStorage {
         Ok(cache.native_drafts.get(&key.storage_key()).cloned())
     }
 
+    async fn release_native_draft(
+        &self,
+        key: &NativeDraftKey,
+        reservation_token: &str,
+    ) -> Result<bool, StorageError> {
+        key.validate()
+            .map_err(|reason| StorageError::InvalidConfig(reason.to_string()))?;
+        if reservation_token.trim().is_empty() {
+            return Err(StorageError::InvalidConfig(
+                "native draft release token is blank".to_string(),
+            ));
+        }
+        let key = key.clone();
+        let reservation_token = reservation_token.to_string();
+        self.locked_mutate(move |cache| {
+            let storage_key = key.storage_key();
+            // Only the reservation owner may release, and only while the
+            // operation is still Reserved. A Succeeded/Failed/Unknown/Drift
+            // record is durable knowledge about the provider and is never
+            // reclaimed, so a caller cannot manufacture a blind retry.
+            let releasable = matches!(
+                cache.native_drafts.get(&storage_key),
+                Some(record)
+                    if record.status == DraftSyncStatus::Reserved
+                        && record.reservation_token == reservation_token
+            );
+            if releasable {
+                cache.native_drafts.remove(&storage_key);
+            }
+            Ok(releasable)
+        })
+        .await
+    }
+
     async fn finalize_native_draft(
         &self,
         key: &NativeDraftKey,
@@ -4666,6 +4700,75 @@ mod tests {
                 .await,
             Err(StorageError::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn native_draft_release_only_reclaims_its_own_live_reservation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let password = SecretString::from("native-draft-release-password");
+        let storage = FileStorage::new(&path, &password).await.unwrap();
+        let key = native_draft_key();
+        let token = match storage
+            .reserve_native_draft(&key, "payload-a", native_draft_metadata("appr-1"))
+            .await
+            .unwrap()
+        {
+            NativeDraftReservation::Fresh { record } => record.reservation_token,
+            NativeDraftReservation::Existing { .. } => panic!("first reservation was not fresh"),
+        };
+
+        // A wrong token never reclaims someone else's live reservation.
+        assert!(!storage
+            .release_native_draft(&key, "not-the-owner")
+            .await
+            .unwrap());
+        let still_reserved = storage.get_native_draft(&key).await.unwrap().unwrap();
+        assert_eq!(still_reserved.status, DraftSyncStatus::Reserved);
+        assert_eq!(still_reserved.reservation_token, token);
+
+        // The owner releases the reservation, and the key becomes reservable.
+        assert!(storage.release_native_draft(&key, &token).await.unwrap());
+        assert!(storage.get_native_draft(&key).await.unwrap().is_none());
+        let reopened = FileStorage::new(&path, &password).await.unwrap();
+        assert!(reopened.get_native_draft(&key).await.unwrap().is_none());
+        let second_token = match reopened
+            .reserve_native_draft(&key, "payload-a", native_draft_metadata("appr-2"))
+            .await
+            .unwrap()
+        {
+            NativeDraftReservation::Fresh { record } => record.reservation_token,
+            NativeDraftReservation::Existing { .. } => panic!("released key was not reservable"),
+        };
+
+        // Once terminal, the same owner's token can no longer release it.
+        reopened
+            .finalize_native_draft(
+                &key,
+                &second_token,
+                "payload-a",
+                NativeDraftOutcome {
+                    status: DraftSyncStatus::Succeeded,
+                    receipt: Some(native_draft_receipt(
+                        &key,
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        DraftSyncStatus::Succeeded,
+                    )),
+                    error: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!reopened
+            .release_native_draft(&key, &second_token)
+            .await
+            .unwrap());
+        let kept = reopened.get_native_draft(&key).await.unwrap().unwrap();
+        assert_eq!(kept.status, DraftSyncStatus::Succeeded);
+        assert_eq!(
+            kept.receipt.unwrap().external_id.as_deref(),
+            Some("post-123")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
