@@ -867,3 +867,702 @@ impl Plugin for SheetsPlugin {
         self.validate_typed(action, params)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{RequestContext, Secret};
+    use axum::{extract::State, routing::get, Router};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    async fn fake(
+        State(seen): State<Arc<parking_lot::Mutex<Value>>>,
+        body: axum::Json<Value>,
+    ) -> axum::Json<Value> {
+        *seen.lock() = body.0;
+        axum::Json(json!({"data":{"ok":true}}))
+    }
+
+    async fn sources_get() -> axum::Json<Value> {
+        axum::Json(json!({"values": [
+            ["source_id", "url", "title", "fetched_at", "fresh_for_hours", "content_hash"],
+            ["source-1", "https://example.com/source", "Source", Utc::now().to_rfc3339(), "168", "source-hash"]
+        ]}))
+    }
+
+    async fn sheets_server() -> (String, Arc<parking_lot::Mutex<Value>>) {
+        let seen = Arc::new(parking_lot::Mutex::new(Value::Null));
+        let app = Router::new()
+            .route("/{*path}", get(sources_get).post(fake))
+            .with_state(seen.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/"), seen)
+    }
+
+    async fn pipeline_get() -> axum::Json<Value> {
+        axum::Json(json!({"values": [
+            ["campaign_id", "variant_id", "channel", "account_id", "audience", "content_type", "draft_copy", "media_brief", "asset_url", "asset_hash", "state", "lucas_notes", "publish_at", "row_version", "content_hash", "approval_id", "buffer_post_id", "published_url", "attempt_count", "last_error", "updated_at", "updated_by", "source_ids"],
+            ["camp-1", "var-1", "linkedin", "lucas-linkedin", "builders", "text", "old", "", "", "", "Pending Review", "", "", "1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "", "", "", "0", "", "2026-08-18T00:00:00Z", "feir_approval", "[\"source-1\"]"]
+        ]}))
+    }
+
+    async fn revision_server() -> (String, Arc<parking_lot::Mutex<Value>>) {
+        let seen = Arc::new(parking_lot::Mutex::new(Value::Null));
+        let app = Router::new()
+            .route("/{*path}", get(pipeline_get).put(fake))
+            .with_state(seen.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/"), seen)
+    }
+
+    fn credential() -> Credential {
+        Credential::new(
+            "marketing-test".to_string(),
+            CredentialData::ApiKey {
+                key: Secret::new("not-logged"),
+                header_name: "Authorization".into(),
+                header_prefix: "Bearer ".into(),
+            },
+        )
+    }
+
+    fn test_draft_hash(draft_copy: &str, media_brief: &str) -> String {
+        draft_content_hash(DraftHashPayload {
+            campaign_id: "camp-1",
+            variant_id: "var-1",
+            channel: "linkedin",
+            account_id: "lucas-linkedin",
+            audience: "builders",
+            content_type: "text",
+            draft_copy,
+            media_brief,
+            asset_url: "",
+            asset_hash: "",
+            publish_at: "",
+            source_ids: vec!["source-1".to_string()],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn sheets_source_lineage_requires_present_fresh_unique_sources() {
+        let now = Utc::now();
+        let document = json!({"values": [
+            ["source_id", "url", "title", "fetched_at", "fresh_for_hours", "content_hash"],
+            ["fresh", "https://example.com", "Fresh", now.to_rfc3339(), "24", "hash"],
+            ["stale", "https://example.com/old", "Old", (now - chrono::Duration::hours(48)).to_rfc3339(), "1", "hash"]
+        ]});
+        assert_eq!(
+            validate_source_rows(&document, &["fresh".to_string()], now).unwrap(),
+            vec!["fresh".to_string()]
+        );
+        assert!(matches!(
+            validate_source_rows(&document, &["missing".to_string()], now),
+            Err(PluginError::InvalidParams(message)) if message.contains("not present")
+        ));
+        assert!(matches!(
+            validate_source_rows(&document, &["stale".to_string()], now),
+            Err(PluginError::InvalidParams(message)) if message.contains("stale")
+        ));
+        assert!(matches!(
+            validate_source_rows(&document, &["fresh".to_string(), "fresh".to_string()], now),
+            Err(PluginError::InvalidParams(message)) if message.contains("duplicates")
+        ));
+    }
+
+    #[test]
+    fn sheets_append_rejects_a_hash_not_bound_to_the_draft() {
+        let params = json!({
+            "base_url": SHEETS_BASE_URL,
+            "spreadsheet_id": "solo-marketing-fixture",
+            "range": "Pipeline!A:Z",
+            "campaign_id": "camp-1",
+            "variant_id": "var-1",
+            "channel": "linkedin",
+            "account_id": "lucas-linkedin",
+            "audience": "builders",
+            "content_type": "text",
+            "draft_copy": "A sourced draft",
+            "row_version": "1",
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_ids": ["source-1"]
+        });
+        assert!(matches!(
+            pinned_plugin().validate_typed("append_draft", &params),
+            Err(PluginError::InvalidParams(message)) if message.contains("canonical draft payload")
+        ));
+    }
+
+    #[tokio::test]
+    async fn sheets_append_advances_only_to_pending_review_after_the_governed_write() {
+        let (base_url, seen) = sheets_server().await;
+        let plugin = pinned_plugin();
+        let params = json!({
+            "base_url": base_url,
+            "spreadsheet_id": "solo-marketing-fixture",
+            "range": "Pipeline!A:Z",
+            "campaign_id": "camp-1",
+            "variant_id": "var-1",
+            "channel": "linkedin",
+            "account_id": "lucas-linkedin",
+            "audience": "builders",
+            "content_type": "text",
+            "draft_copy": "A sourced draft",
+            "media_brief": "",
+            "asset_url": "",
+            "asset_hash": "",
+            "lucas_notes": "review",
+            "publish_at": "",
+            "row_version": "1",
+            "content_hash": test_draft_hash("A sourced draft", ""),
+            "source_ids": ["source-1"]
+        });
+        plugin
+            .execute(PluginRequest {
+                credential: credential(),
+                action: "append_draft".into(),
+                params,
+                context: RequestContext::default(),
+            })
+            .await
+            .unwrap();
+        let seen = seen.lock();
+        let row = seen["values"][0].as_array().unwrap();
+        assert_eq!(row[1], "var-1");
+        assert_eq!(row[10], PENDING_REVIEW_STATE);
+        assert_eq!(row[13], "1");
+        assert_eq!(row.len(), PIPELINE_COLUMN_COUNT);
+        assert_eq!(row[15], "");
+        assert_eq!(row[18], "0");
+        assert_eq!(row[PIPELINE_UPDATED_BY], FEIR_APPROVAL_ACTOR);
+        assert_eq!(row[PIPELINE_SOURCE_IDS], "[\"source-1\"]");
+    }
+
+    #[tokio::test]
+    async fn sheets_revision_rejects_zero_row_version_before_network() {
+        let params = json!({
+            "base_url": SHEETS_BASE_URL,
+            "spreadsheet_id": "solo-marketing-fixture",
+            "range": "Pipeline!A:Z",
+            "variant_id": "var-1",
+            "expected_row_version": "0",
+            "draft_copy": "new",
+            "media_brief": "",
+            "lucas_notes": "",
+            "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        });
+        let result = pinned_plugin()
+            .execute(PluginRequest {
+                credential: credential(),
+                action: "revise_draft".into(),
+                params,
+                context: RequestContext::default(),
+            })
+            .await;
+        assert!(
+            matches!(result, Err(PluginError::InvalidParams(message)) if message.contains("positive decimal"))
+        );
+    }
+
+    #[tokio::test]
+    async fn sheets_revision_performs_row_version_cas_and_targets_the_resolved_row() {
+        let (base_url, seen) = revision_server().await;
+        let plugin = pinned_plugin();
+        let result = plugin
+            .execute(PluginRequest {
+                credential: credential(),
+                action: "revise_draft".into(),
+                params: json!({
+                    "base_url": base_url,
+                    "spreadsheet_id": "solo-marketing-fixture",
+                    "range": "Pipeline!A:Z",
+                    "variant_id": "var-1",
+                    "expected_row_version": "1",
+                    "draft_copy": "revised",
+                    "media_brief": "",
+                    "lucas_notes": "reviewed",
+                    "content_hash": test_draft_hash("revised", ""),
+                }),
+                context: RequestContext::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.status, 200);
+        let row = &seen.lock()["values"][0];
+        assert_eq!(row[6], "revised");
+        assert_eq!(row[10], PENDING_REVIEW_STATE);
+        assert_eq!(row[13], "2");
+        assert_eq!(row[14], test_draft_hash("revised", ""));
+        assert_eq!(row[15], "");
+        assert_eq!(row[PIPELINE_UPDATED_BY], FEIR_APPROVAL_ACTOR);
+        assert_eq!(row[PIPELINE_SOURCE_IDS], "[\"source-1\"]");
+    }
+
+    // -----------------------------------------------------------------------
+    // G1b: the adapter itself pins spreadsheet id and A1 ranges.
+    // -----------------------------------------------------------------------
+
+    const PINNED_SPREADSHEET: &str = "solo-marketing-fixture";
+
+    type Hits = Arc<parking_lot::Mutex<Vec<(String, String)>>>;
+
+    /// A loopback upstream that records EVERY request (method + path/query) and
+    /// answers GETs with `get_body`. An empty `Hits` after a call proves that no
+    /// outbound request was made.
+    async fn recording_sheets_server(get_body: Value) -> (String, Hits) {
+        let hits: Hits = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = hits.clone();
+        let app =
+            Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri| {
+                let recorded = recorded.clone();
+                let get_body = get_body.clone();
+                async move {
+                    recorded.lock().push((method.to_string(), uri.to_string()));
+                    if method == axum::http::Method::GET {
+                        axum::Json(get_body)
+                    } else {
+                        axum::Json(json!({"ok": true}))
+                    }
+                }
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/"), hits)
+    }
+
+    fn fixture_pins() -> Vec<SheetsPin> {
+        vec![SheetsPin::parse(
+            PINNED_SPREADSHEET,
+            &[
+                "Brand!A1:Z100",
+                "Sources!A1:Z100",
+                "Campaigns!A1:Z100",
+                "Pipeline!A1:Z100",
+            ],
+            &["Pipeline!A:Z"],
+        )
+        .unwrap()]
+    }
+
+    fn pinned_plugin() -> SheetsPlugin {
+        SheetsPlugin::with_client(Client::new(), fixture_pins())
+    }
+
+    fn unpinned_plugin() -> SheetsPlugin {
+        SheetsPlugin::with_client(Client::new(), Vec::new())
+    }
+
+    fn read_params(base_url: &str, spreadsheet_id: &str, range: &str) -> Value {
+        json!({"base_url": base_url, "spreadsheet_id": spreadsheet_id, "range": range})
+    }
+
+    fn append_params(base_url: &str, spreadsheet_id: &str, range: &str) -> Value {
+        json!({
+            "base_url": base_url,
+            "spreadsheet_id": spreadsheet_id,
+            "range": range,
+            "campaign_id": "camp-1",
+            "variant_id": "var-1",
+            "channel": "linkedin",
+            "account_id": "lucas-linkedin",
+            "audience": "builders",
+            "content_type": "text",
+            "draft_copy": "A sourced draft",
+            "row_version": "1",
+            "content_hash": test_draft_hash("A sourced draft", ""),
+            "source_ids": ["source-1"]
+        })
+    }
+
+    fn revise_params(base_url: &str, spreadsheet_id: &str, range: &str) -> Value {
+        json!({
+            "base_url": base_url,
+            "spreadsheet_id": spreadsheet_id,
+            "range": range,
+            "variant_id": "var-1",
+            "expected_row_version": "1",
+            "draft_copy": "revised",
+            "media_brief": "",
+            "lucas_notes": "reviewed",
+            "content_hash": test_draft_hash("revised", ""),
+        })
+    }
+
+    async fn run_sheets(
+        plugin: &SheetsPlugin,
+        action: &str,
+        params: Value,
+    ) -> Result<ExecuteResponse, PluginError> {
+        plugin
+            .execute(PluginRequest {
+                credential: credential(),
+                action: action.into(),
+                params,
+                context: RequestContext::default(),
+            })
+            .await
+    }
+
+    /// Assert both the preflight (`validate_params`) and a DIRECT `execute`
+    /// refuse, and that the upstream saw nothing.
+    async fn assert_refused_without_network(
+        plugin: &SheetsPlugin,
+        hits: &Hits,
+        action: &str,
+        params: Value,
+        why: &str,
+    ) {
+        assert!(
+            plugin.validate_params(action, &params).is_err(),
+            "{action} preflight must refuse {why}"
+        );
+        let result = run_sheets(plugin, action, params).await;
+        assert!(
+            matches!(result, Err(PluginError::InvalidParams(_))),
+            "{action} execute must refuse {why}, got {result:?}"
+        );
+        assert!(
+            hits.lock().is_empty(),
+            "{action} must make no outbound request for {why}: {:?}",
+            hits.lock()
+        );
+    }
+
+    /// Range spellings that are NOT the pinned `Pipeline!A1:Z100` read range:
+    /// case tricks, whitespace, absolute refs, quoting, `!` injection, R1C1,
+    /// whole-sheet and widened ranges, and a different sheet.
+    const SNEAKY_READ_RANGES: &[&str] = &[
+        "Secrets!A1:Z100",
+        "pipeline!A1:Z100",
+        "PIPELINE!A1:Z100",
+        "Pipeline!a1:z100",
+        " Pipeline!A1:Z100",
+        "Pipeline!A1:Z100 ",
+        "Pipeline! A1:Z100",
+        "Pipeline!A1 :Z100",
+        "Pipeline!A1:Z100\n",
+        "Pipeline!$A$1:$Z$100",
+        "'Pipeline'!A1:Z100",
+        "Pipeline!A1:Z100!Secrets",
+        "Pipeline!Secrets!A1:Z100",
+        "Secrets!A1:Z100,Pipeline!A1:Z100",
+        "Pipeline!R1C1:R100C26",
+        "Pipeline",
+        "Pipeline!A:Z",
+        "Pipeline!A:ZZ",
+        "Pipeline!A1:Z1000",
+        "Pipeline!A1:AA100",
+        "Pipeline!A1",
+        "Pipeline!1:100",
+        "Pipeline!A01:Z100",
+        "Pipeline!Z100:A1",
+        "Pipeline!A1:Z100/../Secrets",
+        "Pipeline%21A1%3AZ100",
+        "",
+    ];
+
+    #[tokio::test]
+    async fn sheets_pinned_read_is_the_positive_control() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = pinned_plugin();
+        let params = read_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z100");
+        plugin.validate_params("read", &params).unwrap();
+        let response = run_sheets(&plugin, "read", params).await.unwrap();
+        assert_eq!(response.status, 200);
+        let hits = hits.lock();
+        assert_eq!(hits.len(), 1, "exactly one upstream read: {hits:?}");
+        assert_eq!(hits[0].0, "GET");
+        assert!(
+            hits[0]
+                .1
+                .starts_with("/v4/spreadsheets/solo-marketing-fixture/values/Pipeline"),
+            "{hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sheets_read_refuses_a_foreign_spreadsheet_before_network() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = pinned_plugin();
+        for foreign in [
+            "attacker-spreadsheet",
+            "Solo-marketing-fixture",
+            "solo-marketing-fixture ",
+            "solo-marketing-fixture/values/Secrets!A1:Z9?x=",
+            "solo-marketing-fixture%2F..",
+            "",
+        ] {
+            assert_refused_without_network(
+                &plugin,
+                &hits,
+                "read",
+                read_params(&base_url, foreign, "Pipeline!A1:Z100"),
+                &format!("foreign spreadsheet {foreign:?}"),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sheets_read_refuses_ranges_outside_the_pin_before_network() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = pinned_plugin();
+        for range in SNEAKY_READ_RANGES {
+            assert_refused_without_network(
+                &plugin,
+                &hits,
+                "read",
+                read_params(&base_url, PINNED_SPREADSHEET, range),
+                &format!("range {range:?}"),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sheets_append_refuses_foreign_spreadsheet_and_ranges_before_network() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = pinned_plugin();
+        assert_refused_without_network(
+            &plugin,
+            &hits,
+            "append_draft",
+            append_params(&base_url, "attacker-spreadsheet", "Pipeline!A:Z"),
+            "a foreign spreadsheet",
+        )
+        .await;
+        for range in [
+            "Secrets!A:Z",
+            "pipeline!A:Z",
+            "Pipeline!a:z",
+            "Pipeline!A:ZZ",
+            " Pipeline!A:Z",
+            "Pipeline!A:Z!Secrets",
+            "Pipeline!C1:R9999",
+            "Pipeline",
+            // A READ pin is not a write pin.
+            "Pipeline!A1:Z100",
+        ] {
+            assert_refused_without_network(
+                &plugin,
+                &hits,
+                "append_draft",
+                append_params(&base_url, PINNED_SPREADSHEET, range),
+                &format!("write range {range:?}"),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sheets_revise_refuses_foreign_spreadsheet_and_ranges_before_network() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = pinned_plugin();
+        assert_refused_without_network(
+            &plugin,
+            &hits,
+            "revise_draft",
+            revise_params(&base_url, "attacker-spreadsheet", "Pipeline!A:Z"),
+            "a foreign spreadsheet",
+        )
+        .await;
+        for range in [
+            "Secrets!A:Z",
+            "PIPELINE!A:Z",
+            "Pipeline!A:AA",
+            "Pipeline!A1:Z100",
+        ] {
+            assert_refused_without_network(
+                &plugin,
+                &hits,
+                "revise_draft",
+                revise_params(&base_url, PINNED_SPREADSHEET, range),
+                &format!("write range {range:?}"),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sheets_with_no_pin_config_refuses_every_action_before_network() {
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let plugin = unpinned_plugin();
+        assert_refused_without_network(
+            &plugin,
+            &hits,
+            "read",
+            read_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z100"),
+            "a call with no operator pin configured",
+        )
+        .await;
+        assert_refused_without_network(
+            &plugin,
+            &hits,
+            "append_draft",
+            append_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A:Z"),
+            "a call with no operator pin configured",
+        )
+        .await;
+        assert_refused_without_network(
+            &plugin,
+            &hits,
+            "revise_draft",
+            revise_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A:Z"),
+            "a call with no operator pin configured",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sheets_revise_never_writes_a_row_outside_the_pinned_write_range() {
+        // The pinned write range covers only row 1; the variant resolves to
+        // row 2, so the adapter must refuse before the PUT.
+        let (base_url, hits) = recording_sheets_server(pipeline_get().await.0).await;
+        let plugin = SheetsPlugin::with_client(
+            Client::new(),
+            vec![SheetsPin::parse(PINNED_SPREADSHEET, &[], &["Pipeline!A1:Z2"]).unwrap()],
+        );
+        // Row 2 IS inside A1:Z2: positive control for the derived write range.
+        run_sheets(
+            &plugin,
+            "revise_draft",
+            revise_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z2"),
+        )
+        .await
+        .unwrap();
+        {
+            let hits = hits.lock();
+            assert_eq!(hits.len(), 2, "{hits:?}");
+            assert_eq!(hits[1].0, "PUT");
+            assert!(
+                hits[1].1.starts_with(
+                    "/v4/spreadsheets/solo-marketing-fixture/values/Pipeline%21A2%3AW2?"
+                ),
+                "{hits:?}"
+            );
+            drop(hits);
+        }
+        hits.lock().clear();
+
+        let (base_url, hits) = recording_sheets_server(pipeline_get().await.0).await;
+        let plugin = SheetsPlugin::with_client(
+            Client::new(),
+            vec![SheetsPin::parse(PINNED_SPREADSHEET, &[], &["Pipeline!A1:Z1"]).unwrap()],
+        );
+        let result = run_sheets(
+            &plugin,
+            "revise_draft",
+            revise_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z1"),
+        )
+        .await;
+        assert!(result.is_err(), "row 2 is outside Pipeline!A1:Z1");
+        assert!(
+            hits.lock().iter().all(|(method, _)| method == "GET"),
+            "no write may reach the upstream: {:?}",
+            hits.lock()
+        );
+    }
+
+    /// Through the server's enforced execute path (`VultrinoServer::execute_gated`,
+    /// which `/api/v1/execute` and MCP `tools/call` both reach) under a policy that
+    /// allows every `sheets.*` action: the refusal of a foreign spreadsheet is the
+    /// adapter's own, from operator TOML, and happens before any upstream request.
+    #[tokio::test]
+    async fn server_execute_path_refuses_a_foreign_spreadsheet_from_operator_pins() {
+        use crate::auth::{NewUseToken, UseToken};
+        use crate::server::{ExecAuth, VultrinoServer};
+        use crate::storage::{FileStorage, StorageBackend};
+        use crate::{ExecuteRequest, ExecutionOutcome};
+
+        let (base_url, hits) = recording_sheets_server(json!({"values": []})).await;
+        let config = crate::config::Config::parse(
+            r#"
+[[sheets_pins]]
+spreadsheet_id = "solo-marketing-fixture"
+read_ranges = ["Pipeline!A1:Z100"]
+write_ranges = ["Pipeline!A:Z"]
+
+[[policies]]
+name = "permissive-sheets"
+credential_pattern = "sheets-*"
+default_action = "deny"
+
+[[policies.rules]]
+action = "allow"
+condition = { action_match = "sheets.*" }
+"#,
+        )
+        .expect("operator config parses");
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            FileStorage::new(
+                &dir.path().join("store.enc"),
+                &secrecy::SecretString::from("test-password"),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut cred = credential();
+        cred.alias = "sheets-google".to_string();
+        storage.store(&cred).await.unwrap();
+        let (_full, token) = UseToken::create(NewUseToken {
+            name: "sheets-token".to_string(),
+            credential_scope: "sheets-google".to_string(),
+            action_scope: Some("sheets.read".to_string()),
+            max_uses: None,
+            require_approval: false,
+            expires_in: None,
+        });
+        storage.store_use_token(&token).await.unwrap();
+        let resolver = crate::router::CredentialResolver::new(storage.clone());
+        let server = VultrinoServer::new(config, storage, resolver);
+
+        let run = |spreadsheet: &str| ExecuteRequest {
+            credential: "sheets-google".to_string(),
+            action: "sheets.read".to_string(),
+            params: read_params(&base_url, spreadsheet, "Pipeline!A1:Z100"),
+        };
+
+        let refused = server
+            .execute_gated(
+                run("attacker-spreadsheet"),
+                ExecAuth::from_use_token(token.clone()),
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "a foreign spreadsheet must be refused on the execute path"
+        );
+        assert!(
+            hits.lock().is_empty(),
+            "the foreign spreadsheet must never reach the upstream: {:?}",
+            hits.lock()
+        );
+
+        // Positive control: the same token, policy and credential reach the
+        // upstream for the operator-pinned spreadsheet, so the refusal above is
+        // the pin and not an unrelated denial.
+        let allowed = server
+            .execute_gated(run(PINNED_SPREADSHEET), ExecAuth::from_use_token(token))
+            .await;
+        assert!(
+            matches!(allowed, Ok(ExecutionOutcome::Completed(_))),
+            "pinned spreadsheet must execute, got {allowed:?}"
+        );
+        assert_eq!(hits.lock().len(), 1);
+    }
+}
