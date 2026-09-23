@@ -21,6 +21,7 @@ const B64: base64::engine::general_purpose::GeneralPurpose =
 /// averin domain tags (RCP §9.2 / ADR 0003/0004). Must match averin verbatim:
 /// `server/internal/broker/broker.go` and `server/internal/resourceshim/resourceshim.go`.
 pub const GRANT_POP_TAG: &str = "averin.broker.pop.v1";
+pub const GRANT_POP_TAG_V2: &str = "averin.broker.pop.v2";
 pub const USE_POP_TAG: &str = "averin.broker.use.pop.v1";
 pub const COMMIT_TAG: &str = "averin.commit.v1";
 pub const COMMIT_DOMAIN_INPUT: &str = "input";
@@ -80,6 +81,58 @@ impl PopKeypair {
 fn lp(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(&(b.len() as u32).to_be_bytes());
     out.extend_from_slice(b);
+}
+
+/// Fully resolved brokered issuance subject. `issued_at`/`request_expires_at`
+/// form a separate freshness envelope; a retry may refresh them only while all
+/// semantic fields (including the idempotency key) remain identical.
+pub struct GrantRequestV2<'a> {
+    pub project_id: &'a str,
+    pub idempotency_key: &'a str,
+    pub session_id: &'a str,
+    pub agent_id: &'a str,
+    pub action: &'a str,
+    pub resource: &'a str,
+    pub scope: &'a str,
+    pub scope_class: &'a str,
+    pub agent_pubkey: &'a str,
+    pub principal: &'a str,
+    pub justification: &'a str,
+    pub use_limit: i64,
+    pub ttl_seconds: i64,
+    pub delegation_chain: &'a [&'a str],
+    pub issued_at: i64,
+    pub request_expires_at: i64,
+}
+
+pub fn grant_challenge_v2(r: &GrantRequestV2<'_>) -> [u8; 32] {
+    let mut b = Vec::new();
+    for s in [
+        GRANT_POP_TAG_V2,
+        r.project_id,
+        r.idempotency_key,
+        r.session_id,
+        r.agent_id,
+        r.action,
+        r.resource,
+        r.scope,
+        r.scope_class,
+        r.agent_pubkey,
+        r.principal,
+        r.justification,
+        "capability",
+    ] {
+        lp(&mut b, s.as_bytes());
+    }
+    b.extend_from_slice(&r.use_limit.to_be_bytes());
+    b.extend_from_slice(&r.ttl_seconds.to_be_bytes());
+    b.extend_from_slice(&(r.delegation_chain.len() as i64).to_be_bytes());
+    for s in r.delegation_chain {
+        lp(&mut b, s.as_bytes());
+    }
+    b.extend_from_slice(&r.issued_at.to_be_bytes());
+    b.extend_from_slice(&r.request_expires_at.to_be_bytes());
+    Sha256::digest(&b).into()
 }
 
 /// The grant PoP challenge bytes `agent_sig` signs. Byte-identical to Go's
@@ -228,6 +281,33 @@ mod tests {
         assert_eq!(
             String::from_utf8(c).unwrap(),
             r#"{"action":"db.query:orders-ro","agent_id":"agent-1","agent_pubkey":"AAAA","resource":"orders-db","scope":"read:orders","tag":"averin.broker.pop.v1"}"#
+        );
+    }
+
+    #[test]
+    fn grant_challenge_v2_matches_averin_shared_vector() {
+        // averin/spec/golden-vectors/broker-preimages.json: grant_pop_v2[0].
+        let c = grant_challenge_v2(&GrantRequestV2 {
+            project_id: "p1",
+            idempotency_key: "idem-1",
+            session_id: "s1",
+            agent_id: "agent-1",
+            action: "db.query:orders-ro",
+            resource: "orders-db",
+            scope: "read:orders",
+            scope_class: "single_operation",
+            agent_pubkey: "AAAA",
+            principal: "",
+            justification: "",
+            use_limit: 0,
+            ttl_seconds: 300,
+            delegation_chain: &[],
+            issued_at: 1718445000,
+            request_expires_at: 1718445900,
+        });
+        assert_eq!(
+            hex::encode(c),
+            "20809965afd8dd263d5f02afb1461cdce5a8cb7adf1187ba0feb43a46b48fe94"
         );
     }
 

@@ -274,10 +274,31 @@ async fn durable_worker_shape_accepts_bounded_reuse_sequence_and_dedups_retry() 
 
     // POST /v2/grants directly — mirrors `AverinClient::seal_grant`'s exact body shape, with
     // `use_limit: 2` so averin classifies this grant `bounded_reuse`.
-    let grant_challenge =
-        pop::grant_challenge(ACTION, &agent_id, &agent_pubkey, RESOURCE_ID, SCOPE);
+    let issued_at = chrono::Utc::now().timestamp();
+    let request_expires_at = issued_at + 15 * 60;
+    let grant_challenge = pop::grant_challenge_v2(&pop::GrantRequestV2 {
+        project_id: PROJECT,
+        idempotency_key: token_id,
+        session_id: SESSION,
+        agent_id: &agent_id,
+        action: ACTION,
+        resource: RESOURCE_ID,
+        scope: SCOPE,
+        scope_class: "bounded_reuse",
+        agent_pubkey: &agent_pubkey,
+        principal: "",
+        justification: "",
+        use_limit: 2,
+        ttl_seconds: 300,
+        delegation_chain: &[],
+        issued_at,
+        request_expires_at,
+    });
     let agent_sig = keypair.sign_b64(&grant_challenge);
     let grant_body = serde_json::json!({
+        "pop_version": 2,
+        "issued_at": issued_at,
+        "request_expires_at": request_expires_at,
         "idempotency_key": token_id,
         "project_id": PROJECT,
         "session_id": SESSION,

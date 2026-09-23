@@ -4746,21 +4746,37 @@ async fn deliver_averin_grant(
     let agent_pubkey = keypair.agent_pubkey_b64();
     let agent_id = format!("vultrino:{token_id}");
 
-    let challenge = crate::averin::pop::grant_challenge(
-        &entry.action,
-        &agent_id,
-        &agent_pubkey,
-        &resource,
-        &entry.scope,
-    );
-    let agent_sig = keypair.sign_b64(&challenge);
-
     // Mirrors `AverinClient::seal_grant`'s exact body shape (`src/averin/mod.rs`) — same fields,
     // same `scope_class`/`use_limit` derivation — rebuilt here from the entry instead of the
     // in-memory `pop` map `seal_grant` uses (this worker never touches that map; D1).
     let (scope_class, averin_use_limit) =
         crate::averin::grant_shape(&entry.scope, &entry.action, entry.use_limit);
+    let issued_at = chrono::Utc::now().timestamp();
+    let request_expires_at = issued_at + 15 * 60;
+    let agent_sig = keypair.sign_b64(&crate::averin::pop::grant_challenge_v2(
+        &crate::averin::pop::GrantRequestV2 {
+            project_id: &project_id,
+            idempotency_key: &token_id,
+            session_id: &session_id,
+            agent_id: &agent_id,
+            action: &entry.action,
+            resource: &resource,
+            scope: &entry.scope,
+            scope_class: scope_class.unwrap_or("single_operation"),
+            agent_pubkey: &agent_pubkey,
+            principal: "",
+            justification: "",
+            use_limit: i64::from(averin_use_limit),
+            ttl_seconds: i64::from(grant_ttl_secs),
+            delegation_chain: &[],
+            issued_at,
+            request_expires_at,
+        },
+    ));
     let body = serde_json::json!({
+        "pop_version": 2,
+        "issued_at": issued_at,
+        "request_expires_at": request_expires_at,
         "idempotency_key": token_id,
         "project_id": project_id,
         "session_id": session_id,
@@ -4793,7 +4809,15 @@ async fn deliver_averin_grant(
         .to_string();
 
     let delivered_at = chrono::Utc::now();
-    let expires_at = Some(delivered_at + chrono::Duration::seconds(i64::from(grant_ttl_secs)));
+    // A lost-response retry can return the ORIGINAL grant. Its absolute expiry
+    // comes from Averin, never from this delivery attempt's wall clock.
+    let expires_at = resp
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "averin grant response missing expires_at".to_string())?
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .map(Some)
+        .map_err(|e| format!("averin grant response invalid expires_at: {e}"))?;
 
     popkeys
         .grant_resolved(
@@ -6231,9 +6255,12 @@ mod averin_worker_tests {
         let payload_b64 =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(agent_id.as_bytes());
         let capability = format!("{payload_b64}.sig");
+        let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
         (
             StatusCode::OK,
-            Json(serde_json::json!({"grant_id": grant_id, "capability": capability})),
+            Json(
+                serde_json::json!({"grant_id": grant_id, "capability": capability, "expires_at": expires_at}),
+            ),
         )
     }
 
