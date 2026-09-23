@@ -4674,8 +4674,9 @@ fn run_averin_queue_blocking<T>(f: impl FnOnce() -> T) -> T {
 /// from live `averin_client.config()`: `resource_id` feeds the signed grant-PoP challenge, so a live
 /// config change between enqueue and delivery would rebuild a different signature under the same
 /// idempotency key (`token_id`) and averin would see a conflicting retry (409) instead of an honest
-/// one. The `?project=` routing query is likewise frozen (via `post_for_project`), so the whole
-/// request — body AND route — is byte-identical on every retry. FAIL-CLOSED: a missing frozen field
+/// one. The `?project=` routing query is likewise frozen (via `post_for_project`).
+/// The v2 semantic subject stays byte-identical on retry; only its signed freshness
+/// envelope and signature may change when the worker re-signs. FAIL-CLOSED: a missing frozen field
 /// ERRORS the delivery (retries/dead-letters visibly); there is NO live-config fallback — durable is
 /// default-OFF and unreleased, so no legacy field-less event exists, and silently substituting live
 /// config was exactly the per-field fallback that reproduced the 409 this freeze prevents.
@@ -4792,7 +4793,8 @@ async fn deliver_averin_grant(
     });
 
     // Codex re-review #6 — route the `?project=` auth query by the FROZEN `project_id`, not live
-    // config, so a retry after the deployment's project changed stays byte-identical (body AND query).
+    // config, so a retry after the deployment's project changed keeps the
+    // signed semantic subject and routing query identical.
     let resp = averin_client
         .post_for_project("/v2/grants", &body, &project_id)
         .await
@@ -6213,6 +6215,11 @@ mod averin_worker_tests {
         call_log: parking_lot::Mutex<Vec<String>>,
         /// `agent_id` values whose `/v2/grants` call should return 500.
         fail_grant_agents: parking_lot::Mutex<HashSet<String>>,
+        /// Simulate a committed grant whose first response is lost. The retry
+        /// receives the original capability and absolute expiry.
+        lose_grant_response_once: parking_lot::Mutex<HashSet<String>>,
+        grant_by_idempotency_key: parking_lot::Mutex<HashMap<String, (String, String, String)>>,
+        grant_request_bodies: parking_lot::Mutex<Vec<serde_json::Value>>,
         /// `action` values whose `/v2/use` call should return 500.
         fail_use_actions: parking_lot::Mutex<HashSet<String>>,
         /// Plan 088 Step 4 (D5) — every `/v2/use` request body received, IN ORDER, regardless of
@@ -6246,6 +6253,12 @@ mod averin_worker_tests {
             );
         }
         state.call_log.lock().push(format!("grant:{agent_id}"));
+        state.grant_request_bodies.lock().push(body.clone());
+        let idempotency_key = body
+            .get("idempotency_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let grant_id = format!("grant-{agent_id}");
         // `credential_binding` (src/averin/pop.rs) splits at the first '.' and base64url-decodes
         // the payload half — so, unlike a real averin capability, this fake's payload half must
@@ -6256,6 +6269,18 @@ mod averin_worker_tests {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(agent_id.as_bytes());
         let capability = format!("{payload_b64}.sig");
         let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        let (grant_id, capability, expires_at) = state
+            .grant_by_idempotency_key
+            .lock()
+            .entry(idempotency_key)
+            .or_insert_with(|| (grant_id, capability, expires_at))
+            .clone();
+        if state.lose_grant_response_once.lock().remove(&agent_id) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "response lost after grant commit"})),
+            );
+        }
         (
             StatusCode::OK,
             Json(
@@ -6417,6 +6442,68 @@ mod averin_worker_tests {
             "resource_id": "orders-db",
             "grant_ttl_secs": 300,
         })
+    }
+
+    #[tokio::test]
+    async fn averin_worker_lost_grant_response_keeps_original_absolute_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, _deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+        popkeys
+            .insert(
+                "tok-expiry",
+                popkey_entry("db.query:orders-ro", "read:orders"),
+            )
+            .await
+            .unwrap();
+        let seq = queue
+            .append("tok-expiry", "averin.grant", grant_payload())
+            .unwrap();
+        let event = queue.get(seq).unwrap();
+        fake.lose_grant_response_once
+            .lock()
+            .insert("vultrino:tok-expiry".to_string());
+
+        assert!(deliver_averin_grant(&event, &queue, &popkeys, &client)
+            .await
+            .is_err());
+        let original = fake
+            .grant_by_idempotency_key
+            .lock()
+            .get("tok-expiry")
+            .unwrap()
+            .clone();
+        deliver_averin_grant(&event, &queue, &popkeys, &client)
+            .await
+            .unwrap();
+        let resolved = popkeys.get("tok-expiry").await.unwrap().unwrap();
+        assert_eq!(resolved.capability.as_deref(), Some(original.1.as_str()));
+        assert_eq!(
+            resolved.grant_expires_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339(&original.2)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            ),
+            "lost-response retry must retain Averin's original absolute expiry"
+        );
+
+        let mut bodies = fake.grant_request_bodies.lock().clone();
+        assert_eq!(bodies.len(), 2);
+        for body in &bodies {
+            assert_eq!(body["pop_version"], 2);
+        }
+        for body in &mut bodies {
+            let object = body.as_object_mut().unwrap();
+            object.remove("issued_at");
+            object.remove("request_expires_at");
+            object.remove("agent_sig");
+        }
+        assert_eq!(
+            bodies[0], bodies[1],
+            "retry changed the semantic grant subject"
+        );
     }
 
     #[tokio::test]
