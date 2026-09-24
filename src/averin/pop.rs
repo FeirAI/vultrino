@@ -116,8 +116,8 @@ fn lp_v2(out: &mut Vec<u8>, b: &[u8]) -> Result<(), PopError> {
     Ok(())
 }
 
-// This is the production framing path, exposed to the local test so the Lean
-// oracle vector can pin bytes before SHA-256 hides an encoder mismatch.
+// This is the production framing path. The local Lean vector test compares the
+// encoded bytes directly, so field and framing differences are easy to diagnose.
 fn grant_preimage_v2(r: &GrantRequestV2<'_>) -> Result<Vec<u8>, PopError> {
     let mut b = Vec::new();
     for s in [
@@ -336,6 +336,38 @@ mod tests {
         assert_eq!(
             hex::encode(c),
             "20809965afd8dd263d5f02afb1461cdce5a8cb7adf1187ba0feb43a46b48fe94"
+        );
+    }
+
+    #[test]
+    fn grant_challenge_v2_multihop_unicode_matches_lean_vector() {
+        // averin/formal/oracle/expected.json, second "grant PoP v2" row;
+        // averin/spec/golden-vectors/broker-preimages.json, grant_pop_v2[1].
+        let request = GrantRequestV2 {
+            project_id: "p-équipe",
+            idempotency_key: "idem-2",
+            session_id: "s2",
+            agent_id: "agent-2",
+            action: "db.query:orders-ro",
+            resource: "orders-db",
+            scope: "read:café",
+            scope_class: "bounded_reuse",
+            agent_pubkey: "AAAA",
+            principal: "acct:café",
+            justification: "approved by Zoë",
+            use_limit: 7,
+            ttl_seconds: 120,
+            delegation_chain: &["delegate:α", "delegate:東京"],
+            issued_at: 1718445000,
+            request_expires_at: 1718445900,
+        };
+        assert_eq!(
+            hex::encode(grant_preimage_v2(&request).unwrap()),
+            "0000001461766572696e2e62726f6b65722e706f702e763200000009702dc3a97175697065000000066964656d2d32000000027332000000076167656e742d320000001264622e71756572793a6f72646572732d726f000000096f72646572732d64620000000a726561643a636166c3a90000000d626f756e6465645f726575736500000004414141410000000a616363743a636166c3a900000010617070726f766564206279205a6fc3ab0000000a6361706162696c6974790000000000000007000000000000007800000000000000020000000b64656c65676174653aceb10000000f64656c65676174653ae69db1e4baac00000000666d63c800000000666d674c"
+        );
+        assert_eq!(
+            hex::encode(grant_challenge_v2(&request).unwrap()),
+            "4b134bc82d3d5bce854c3c63e4f6e85f50f5aad710e8fefded9ea303cf5f7ce1"
         );
     }
 
