@@ -116,7 +116,9 @@ fn lp_v2(out: &mut Vec<u8>, b: &[u8]) -> Result<(), PopError> {
     Ok(())
 }
 
-pub fn grant_challenge_v2(r: &GrantRequestV2<'_>) -> Result<[u8; 32], PopError> {
+// This is the production framing path, exposed to the local test so the Lean
+// oracle vector can pin bytes before SHA-256 hides an encoder mismatch.
+fn grant_preimage_v2(r: &GrantRequestV2<'_>) -> Result<Vec<u8>, PopError> {
     let mut b = Vec::new();
     for s in [
         GRANT_POP_TAG_V2,
@@ -145,7 +147,11 @@ pub fn grant_challenge_v2(r: &GrantRequestV2<'_>) -> Result<[u8; 32], PopError> 
     }
     b.extend_from_slice(&r.issued_at.to_be_bytes());
     b.extend_from_slice(&r.request_expires_at.to_be_bytes());
-    Ok(Sha256::digest(&b).into())
+    Ok(b)
+}
+
+pub fn grant_challenge_v2(r: &GrantRequestV2<'_>) -> Result<[u8; 32], PopError> {
+    Ok(Sha256::digest(grant_preimage_v2(r)?).into())
 }
 
 /// The grant PoP challenge bytes `agent_sig` signs. Byte-identical to Go's
@@ -302,7 +308,7 @@ mod tests {
     #[test]
     fn grant_challenge_v2_matches_averin_shared_vector() {
         // averin/spec/golden-vectors/broker-preimages.json: grant_pop_v2[0].
-        let c = grant_challenge_v2(&GrantRequestV2 {
+        let request = GrantRequestV2 {
             project_id: "p1",
             idempotency_key: "idem-1",
             session_id: "s1",
@@ -319,8 +325,14 @@ mod tests {
             delegation_chain: &[],
             issued_at: 1718445000,
             request_expires_at: 1718445900,
-        })
-        .unwrap();
+        };
+        // averin/formal/oracle/expected.json, family "grant PoP v2": the
+        // framed bytes, not merely their digest, match the production signer.
+        assert_eq!(
+            hex::encode(grant_preimage_v2(&request).unwrap()),
+            "0000001461766572696e2e62726f6b65722e706f702e7632000000027031000000066964656d2d31000000027331000000076167656e742d310000001264622e71756572793a6f72646572732d726f000000096f72646572732d64620000000b726561643a6f72646572730000001073696e676c655f6f7065726174696f6e000000044141414100000000000000000000000a6361706162696c6974790000000000000000000000000000012c000000000000000000000000666d63c800000000666d674c"
+        );
+        let c = grant_challenge_v2(&request).unwrap();
         assert_eq!(
             hex::encode(c),
             "20809965afd8dd263d5f02afb1461cdce5a8cb7adf1187ba0feb43a46b48fe94"
