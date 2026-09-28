@@ -643,6 +643,9 @@ impl SheetsPlugin {
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
                 // Pin check first: before credential refresh or any request.
                 let (_, range) = self.pinned_range(&p.spreadsheet_id, &p.range, false)?;
+                // Host pin before the credential step: an off-host base_url
+                // must not cost a token mint or refresh.
+                let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let (credential, updated) = effective_marketing_credential(
                     &self.client,
                     &self.google_token_endpoint,
@@ -650,7 +653,6 @@ impl SheetsPlugin {
                     SHEETS_READ_SCOPES,
                 )
                 .await?;
-                let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let url = base
                     .join(&format!(
                         "v4/spreadsheets/{}/values/{}",
@@ -686,6 +688,9 @@ impl SheetsPlugin {
                             .to_string(),
                     ));
                 }
+                // Host pin before the credential step: an off-host base_url
+                // must not cost a token mint or refresh.
+                let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let (credential, updated) = effective_marketing_credential(
                     &self.client,
                     &self.google_token_endpoint,
@@ -693,7 +698,6 @@ impl SheetsPlugin {
                     SHEETS_WRITE_SCOPES,
                 )
                 .await?;
-                let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let sources_url = base
                     .join(&format!(
                         "v4/spreadsheets/{}/values/{}",
@@ -769,6 +773,9 @@ impl SheetsPlugin {
                     ));
                 }
                 validate_content_hash(&p.content_hash, "revise_draft")?;
+                // Host pin before the credential step: an off-host base_url
+                // must not cost a token mint or refresh.
+                let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let (credential, updated) = effective_marketing_credential(
                     &self.client,
                     &self.google_token_endpoint,
@@ -781,7 +788,6 @@ impl SheetsPlugin {
                 // the authoritative row_version check below protects a stale
                 // or replayed request after a restart as well.
                 let _revision_guard = self.revise_lock.lock().await;
-                let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let read_url = base
                     .join(&format!(
                         "v4/spreadsheets/{}/values/{}",
@@ -2095,6 +2101,45 @@ condition = { action_match = "sheets.*" }
         assert!(
             !snippet.contains(&pem_body[..32]),
             "no key material: {snippet}"
+        );
+    }
+
+    /// An off-host base_url is refused before the credential step, so it never
+    /// costs a service-account mint.
+    #[tokio::test]
+    async fn sheets_off_host_base_url_is_refused_before_any_mint() {
+        let (token_endpoint, token_hits) = minting_token_endpoint().await;
+        let plugin = sa_plugin(token_endpoint);
+        let off_host = "https://sheets.attacker.example/";
+        for (action, params) in [
+            (
+                "read",
+                read_params(off_host, PINNED_SPREADSHEET, "Pipeline!A1:Z100"),
+            ),
+            (
+                "append_draft",
+                append_params(off_host, PINNED_SPREADSHEET, "Pipeline!A:Z"),
+            ),
+            (
+                "revise_draft",
+                revise_params(off_host, PINNED_SPREADSHEET, "Pipeline!A:Z"),
+            ),
+        ] {
+            let result = run_sheets_as(
+                &plugin,
+                service_account_credential(&[SHEETS_SCOPE], None, None),
+                action,
+                params,
+            )
+            .await;
+            assert!(
+                matches!(&result, Err(PluginError::InvalidParams(m)) if m.contains("operator-pinned")),
+                "{action}: {result:?}"
+            );
+        }
+        assert!(
+            token_hits.lock().unwrap().is_empty(),
+            "no mint for an off-host base_url"
         );
     }
 }
