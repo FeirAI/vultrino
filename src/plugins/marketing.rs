@@ -399,6 +399,40 @@ fn attach_credential_update(
     }
 }
 
+/// Upper bound on the upstream error body that reaches the operator log.
+const UPSTREAM_LOG_SNIPPET_CHARS: usize = 256;
+
+/// A non-2xx upstream reply reaches the caller as its status code only, like
+/// the solo connector. The body can echo request content or credential
+/// material, so only a bounded, scrubbed snippet goes to the operator log.
+fn upstream_failure(status: u16, body: &[u8], credential: &Credential) -> PluginError {
+    tracing::warn!(
+        status,
+        body = %upstream_log_snippet(body, credential),
+        "marketing upstream request failed"
+    );
+    PluginError::ExecutionFailed(format!("marketing upstream returned HTTP {status}"))
+}
+
+/// The credential's own secret material (including a minted or refreshed
+/// access token, since the effective credential is what reaches here) is
+/// scrubbed from the WHOLE body before it is cut to
+/// [`UPSTREAM_LOG_SNIPPET_CHARS`], so a secret cannot survive split across the
+/// cut. Control characters are flattened so the snippet is one log line.
+fn upstream_log_snippet(body: &[u8], credential: &Credential) -> String {
+    let mut scrubbed = ExecuteResponse::new(0, Default::default(), body.to_vec());
+    crate::egress::redact_secret_material(
+        &mut scrubbed,
+        &credential.data.secret_material(),
+        &credential.alias,
+    );
+    String::from_utf8_lossy(&scrubbed.body)
+        .chars()
+        .take(UPSTREAM_LOG_SNIPPET_CHARS)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 async fn send_json(
     client: &Client,
     url: reqwest::Url,
@@ -425,11 +459,7 @@ async fn send_json(
         .collect();
     let body = crate::plugins::read_body_capped(response).await?;
     if !status.is_success() {
-        return Err(PluginError::ExecutionFailed(format!(
-            "marketing upstream returned {}: {}",
-            status.as_u16(),
-            String::from_utf8_lossy(&body)
-        )));
+        return Err(upstream_failure(status.as_u16(), &body, credential));
     }
     Ok(ExecuteResponse {
         status: status.as_u16(),
@@ -470,11 +500,7 @@ async fn send_json_method(
         .collect();
     let body = crate::plugins::read_body_capped(response).await?;
     if !status.is_success() {
-        return Err(PluginError::ExecutionFailed(format!(
-            "marketing upstream returned {}: {}",
-            status.as_u16(),
-            String::from_utf8_lossy(&body)
-        )));
+        return Err(upstream_failure(status.as_u16(), &body, credential));
     }
     Ok(ExecuteResponse {
         status: status.as_u16(),
@@ -1940,5 +1966,135 @@ condition = { action_match = "sheets.*" }
         assert!(SheetsPlugin::default()
             .supported_credential_types()
             .contains(&CredentialType::GoogleServiceAccount));
+    }
+
+    // -----------------------------------------------------------------------
+    // Upstream failures: status only to the caller, scrubbed snippet to the log.
+    // -----------------------------------------------------------------------
+
+    /// Captures everything the fmt subscriber writes, for log assertions.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A Sheets upstream that answers every request with `status` and `body`.
+    async fn failing_sheets_server(status: u16, body: String) -> String {
+        let app = Router::new().fallback(move || {
+            let body = body.clone();
+            async move { (axum::http::StatusCode::from_u16(status).unwrap(), body) }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn sheets_upstream_failure_returns_status_only_and_logs_a_scrubbed_snippet() {
+        let reflected = format!(
+            "{{\"error\":{{\"message\":\"bad Authorization: Bearer cached-token\nrow=secret-row-content\"}},\"pad\":\"{}\"}}",
+            "x".repeat(1000)
+        );
+        let base_url = failing_sheets_server(403, reflected).await;
+        let (token_endpoint, _token_hits) = minting_token_endpoint().await;
+        let plugin = sa_plugin(token_endpoint);
+        let credential = service_account_credential(
+            &[SHEETS_SCOPE],
+            Some("cached-token"),
+            Some(Utc::now() + chrono::Duration::seconds(3000)),
+        );
+
+        let logs = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let error = run_sheets_as(
+            &plugin,
+            credential,
+            "read",
+            read_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z100"),
+        )
+        .await
+        .expect_err("a 403 fails the call");
+        assert_eq!(
+            error.to_string(),
+            "Execution failed: marketing upstream returned HTTP 403"
+        );
+
+        let logged = String::from_utf8(logs.0.lock().clone()).unwrap();
+        assert!(
+            logged.contains("marketing upstream request failed"),
+            "{logged}"
+        );
+        assert!(logged.contains("status=403"), "{logged}");
+        assert!(logged.contains("[REDACTED]"), "{logged}");
+        assert!(
+            !logged.contains("cached-token"),
+            "no token in the log: {logged}"
+        );
+        assert!(
+            !logged.contains(&"x".repeat(UPSTREAM_LOG_SNIPPET_CHARS)),
+            "the snippet is bounded: {logged}"
+        );
+        assert_eq!(
+            logged.trim_end().lines().count(),
+            1,
+            "one log line: {logged}"
+        );
+    }
+
+    /// The scrub runs over the whole body before the cut, so a secret that
+    /// straddles the bound leaves no prefix behind.
+    #[test]
+    fn upstream_log_snippet_is_bounded_single_line_and_scrubbed_across_the_cut() {
+        let credential = service_account_credential(
+            &[SHEETS_SCOPE],
+            Some("straddling-secret-token"),
+            Some(Utc::now() + chrono::Duration::seconds(3000)),
+        );
+        let body = format!(
+            "{}\r\n{}straddling-secret-token tail",
+            "a".repeat(100),
+            "b".repeat(UPSTREAM_LOG_SNIPPET_CHARS - 110)
+        );
+        let snippet = upstream_log_snippet(body.as_bytes(), &credential);
+        assert_eq!(snippet.chars().count(), UPSTREAM_LOG_SNIPPET_CHARS);
+        assert!(!snippet.chars().any(char::is_control), "{snippet:?}");
+        assert!(!snippet.contains("straddling"), "{snippet:?}");
+        // The cut lands inside the marker, never inside the secret.
+        assert!(snippet.ends_with("[REDACTE"), "{snippet:?}");
+
+        // The unframed key body, the form the egress scrubber knows, is scrubbed
+        // too; the upstream never sees the key, but the log must not either.
+        let pem_body: String = crate::plugins::google_sa::tests::test_key_pem()
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let snippet = upstream_log_snippet(pem_body.as_bytes(), &credential);
+        assert!(
+            !snippet.contains(&pem_body[..32]),
+            "no key material: {snippet}"
+        );
     }
 }
