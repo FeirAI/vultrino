@@ -11,6 +11,7 @@
 //! spreadsheet id or range outside the pins is refused before credential use
 //! or network I/O, and no pins at all refuses every call.
 
+use super::google_sa;
 use super::{Plugin, PluginError, PluginRequest};
 use crate::config::{A1Range, SheetsPin};
 use crate::{Credential, CredentialData, CredentialType, ExecuteResponse};
@@ -24,6 +25,13 @@ use std::{collections::BTreeMap, sync::Arc};
 
 const SHEETS_BASE_URL: &str = "https://sheets.googleapis.com";
 const SHEETS_SOURCES_RANGE: &str = "Sources!A1:F100";
+/// A `google_service_account` credential must carry one of these to serve a
+/// Sheets read, and the full Sheets scope to serve a write.
+const SHEETS_READ_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+];
+const SHEETS_WRITE_SCOPES: &[&str] = &["https://www.googleapis.com/auth/spreadsheets"];
 const PIPELINE_COLUMN_COUNT: usize = 23;
 const PIPELINE_VARIANT_ID: usize = 1;
 const PIPELINE_DRAFT_COPY: usize = 6;
@@ -328,6 +336,15 @@ fn credential_headers(credential: &Credential) -> Result<reqwest::header::Header
                 "marketing connector requires a live OAuth2 access token".to_string(),
             ))
         }
+        CredentialData::GoogleServiceAccount {
+            access_token: Some(token),
+            ..
+        } => token.expose().to_string(),
+        CredentialData::GoogleServiceAccount { .. } => {
+            return Err(PluginError::UnsupportedCredentialType(
+                "marketing connector requires a minted service-account access token".to_string(),
+            ))
+        }
         other => {
             return Err(PluginError::UnsupportedCredentialType(format!(
                 "marketing connector does not support {:?}",
@@ -343,9 +360,21 @@ fn credential_headers(credential: &Credential) -> Result<reqwest::header::Header
     Ok(headers)
 }
 
+/// `sa_scopes` is what a `google_service_account` credential must cover for
+/// this call; the cached token is served or a new one minted by the shared
+/// [`google_sa::service_account_token`], exactly as for the solo connector.
 async fn effective_marketing_credential(
+    client: &Client,
+    google_token_endpoint: &reqwest::Url,
     credential: &Credential,
+    sa_scopes: &[&str],
 ) -> Result<(Credential, Option<CredentialData>), PluginError> {
+    if matches!(credential.data, CredentialData::GoogleServiceAccount { .. }) {
+        let (effective, updated, _) =
+            google_sa::service_account_token(client, credential, google_token_endpoint, sa_scopes)
+                .await?;
+        return Ok((effective, updated));
+    }
     if !matches!(credential.data, CredentialData::OAuth2 { .. }) {
         return Ok((credential.clone(), None));
     }
@@ -458,6 +487,10 @@ async fn send_json_method(
 pub struct SheetsPlugin {
     client: Client,
     revise_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Where a `google_service_account` credential mints. Always
+    /// [`google_sa::GOOGLE_TOKEN_URI`] outside unit tests, which is also the
+    /// only value the shared mint path accepts there.
+    google_token_endpoint: reqwest::Url,
     /// Operator pins from `[[sheets_pins]]`. Empty = every call is refused.
     pins: Arc<Vec<SheetsPin>>,
 }
@@ -477,8 +510,16 @@ impl SheetsPlugin {
         Self {
             client,
             revise_lock: Arc::new(tokio::sync::Mutex::new(())),
+            google_token_endpoint: reqwest::Url::parse(google_sa::GOOGLE_TOKEN_URI)
+                .expect("Google token URL is valid"),
             pins: Arc::new(pins),
         }
+    }
+
+    #[cfg(test)]
+    fn with_google_token_endpoint(mut self, endpoint: reqwest::Url) -> Self {
+        self.google_token_endpoint = endpoint;
+        self
     }
 
     /// The pin for an exact (byte-for-byte) spreadsheet id.
@@ -576,8 +617,13 @@ impl SheetsPlugin {
                     .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
                 // Pin check first: before credential refresh or any request.
                 let (_, range) = self.pinned_range(&p.spreadsheet_id, &p.range, false)?;
-                let (credential, updated) =
-                    effective_marketing_credential(&request.credential).await?;
+                let (credential, updated) = effective_marketing_credential(
+                    &self.client,
+                    &self.google_token_endpoint,
+                    &request.credential,
+                    SHEETS_READ_SCOPES,
+                )
+                .await?;
                 let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let url = base
                     .join(&format!(
@@ -614,8 +660,13 @@ impl SheetsPlugin {
                             .to_string(),
                     ));
                 }
-                let (credential, updated) =
-                    effective_marketing_credential(&request.credential).await?;
+                let (credential, updated) = effective_marketing_credential(
+                    &self.client,
+                    &self.google_token_endpoint,
+                    &request.credential,
+                    SHEETS_WRITE_SCOPES,
+                )
+                .await?;
                 let base = validate_base_url(&p.base_url, SHEETS_BASE_URL)?;
                 let sources_url = base
                     .join(&format!(
@@ -692,8 +743,13 @@ impl SheetsPlugin {
                     ));
                 }
                 validate_content_hash(&p.content_hash, "revise_draft")?;
-                let (credential, updated) =
-                    effective_marketing_credential(&request.credential).await?;
+                let (credential, updated) = effective_marketing_credential(
+                    &self.client,
+                    &self.google_token_endpoint,
+                    &request.credential,
+                    SHEETS_WRITE_SCOPES,
+                )
+                .await?;
                 // One Eve agent is the only writer in this pack. The mutex makes
                 // the read/compare/update sequence a process-local CAS, while
                 // the authoritative row_version check below protects a stale
@@ -855,7 +911,11 @@ impl Plugin for SheetsPlugin {
         "sheets"
     }
     fn supported_credential_types(&self) -> Vec<CredentialType> {
-        vec![CredentialType::ApiKey, CredentialType::OAuth2]
+        vec![
+            CredentialType::ApiKey,
+            CredentialType::OAuth2,
+            CredentialType::GoogleServiceAccount,
+        ]
     }
     fn supported_actions(&self) -> Vec<&str> {
         vec!["read", "append_draft", "revise_draft"]
@@ -1564,5 +1624,321 @@ condition = { action_match = "sheets.*" }
             "pinned spreadsheet must execute, got {allowed:?}"
         );
         assert_eq!(hits.lock().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // google_service_account: minted through the shared google_sa path.
+    // -----------------------------------------------------------------------
+
+    use crate::plugins::google_sa::tests::{
+        loopback_client, recording_token_server, service_account_credential, TokenHits,
+    };
+
+    const SHEETS_SCOPE: &str = "https://www.googleapis.com/auth/spreadsheets";
+    const SHEETS_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/spreadsheets.readonly";
+
+    /// Every Sheets request as (method, path/query, Authorization header).
+    type AuthHits = Arc<parking_lot::Mutex<Vec<(String, String, String)>>>;
+
+    async fn auth_recording_sheets_server(get_body: Value) -> (String, AuthHits) {
+        let hits: AuthHits = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = hits.clone();
+        let app = Router::new().fallback(
+            move |method: axum::http::Method,
+                  uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap| {
+                let recorded = recorded.clone();
+                let get_body = get_body.clone();
+                async move {
+                    let auth = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    recorded
+                        .lock()
+                        .push((method.to_string(), uri.to_string(), auth));
+                    if method == axum::http::Method::GET {
+                        axum::Json(get_body)
+                    } else {
+                        axum::Json(json!({"ok": true}))
+                    }
+                }
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/"), hits)
+    }
+
+    async fn minting_token_endpoint() -> (reqwest::Url, TokenHits) {
+        let (url, hits) = recording_token_server(
+            200,
+            json!({"access_token": "minted-token", "expires_in": 3599, "token_type": "Bearer"}),
+        )
+        .await;
+        (reqwest::Url::parse(&url).unwrap(), hits)
+    }
+
+    fn sa_plugin(token_endpoint: reqwest::Url) -> SheetsPlugin {
+        SheetsPlugin::with_client(loopback_client(), fixture_pins())
+            .with_google_token_endpoint(token_endpoint)
+    }
+
+    async fn run_sheets_as(
+        plugin: &SheetsPlugin,
+        credential: Credential,
+        action: &str,
+        params: Value,
+    ) -> Result<ExecuteResponse, PluginError> {
+        plugin
+            .execute(PluginRequest {
+                credential,
+                action: action.into(),
+                params,
+                context: RequestContext::default(),
+            })
+            .await
+    }
+
+    /// Each action, given a service-account credential with no cached token,
+    /// mints once, sends `Bearer <minted>` on every Sheets request it makes, and
+    /// hands the minted token back for persistence.
+    #[tokio::test]
+    async fn sheets_service_account_mints_and_sends_the_minted_bearer() {
+        let cases = [
+            ("read", json!({"values": []}), 1),
+            ("append_draft", sources_get().await.0, 2),
+            ("revise_draft", pipeline_get().await.0, 2),
+        ];
+        for (action, get_body, expected_requests) in cases {
+            let (token_endpoint, token_hits) = minting_token_endpoint().await;
+            let (base_url, hits) = auth_recording_sheets_server(get_body).await;
+            let plugin = sa_plugin(token_endpoint);
+            let params = match action {
+                "read" => read_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z100"),
+                "append_draft" => append_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A:Z"),
+                _ => revise_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A:Z"),
+            };
+            let response = run_sheets_as(
+                &plugin,
+                service_account_credential(&[SHEETS_SCOPE], None, None),
+                action,
+                params,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{action} with a service account: {error}"));
+
+            assert_eq!(token_hits.lock().unwrap().len(), 1, "{action}: one mint");
+            let hits = hits.lock();
+            assert_eq!(hits.len(), expected_requests, "{action}: {hits:?}");
+            assert!(
+                hits.iter()
+                    .all(|(_, _, auth)| auth == "Bearer minted-token"),
+                "{action}: every request carries the minted token: {hits:?}"
+            );
+            assert!(
+                matches!(
+                    &response.updated_credential,
+                    Some(CredentialData::GoogleServiceAccount { access_token: Some(token), .. })
+                        if token.expose() == "minted-token"
+                ),
+                "{action}: the minted token is persisted"
+            );
+        }
+    }
+
+    /// A cached token that is not yet stale is sent as-is: no mint and nothing
+    /// to persist.
+    #[tokio::test]
+    async fn sheets_service_account_reuses_a_cached_token() {
+        let (token_endpoint, token_hits) = minting_token_endpoint().await;
+        let (base_url, hits) = auth_recording_sheets_server(json!({"values": []})).await;
+        let plugin = sa_plugin(token_endpoint);
+        let credential = service_account_credential(
+            &[SHEETS_SCOPE],
+            Some("cached-token"),
+            Some(Utc::now() + chrono::Duration::seconds(3000)),
+        );
+        for _ in 0..2 {
+            let response = run_sheets_as(
+                &plugin,
+                credential.clone(),
+                "read",
+                read_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z100"),
+            )
+            .await
+            .unwrap();
+            assert!(response.updated_credential.is_none());
+        }
+        assert!(
+            token_hits.lock().unwrap().is_empty(),
+            "no mint on a cache hit"
+        );
+        let hits = hits.lock();
+        assert_eq!(hits.len(), 2);
+        assert!(hits
+            .iter()
+            .all(|(_, _, auth)| auth == "Bearer cached-token"));
+    }
+
+    /// A credential whose scopes do not cover the action is refused before any
+    /// mint or Sheets request. A read-only key serves reads but not writes.
+    #[tokio::test]
+    async fn sheets_service_account_scope_mismatch_fails_closed() {
+        let (token_endpoint, token_hits) = minting_token_endpoint().await;
+        let (base_url, hits) = auth_recording_sheets_server(sources_get().await.0).await;
+        let plugin = sa_plugin(token_endpoint);
+        let calendar_only =
+            service_account_credential(&["https://www.googleapis.com/auth/calendar"], None, None);
+        let readonly = service_account_credential(&[SHEETS_READONLY_SCOPE], None, None);
+        for (credential, action, params) in [
+            (
+                calendar_only,
+                "read",
+                read_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z100"),
+            ),
+            (
+                readonly.clone(),
+                "append_draft",
+                append_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A:Z"),
+            ),
+            (
+                readonly.clone(),
+                "revise_draft",
+                revise_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A:Z"),
+            ),
+        ] {
+            let result = run_sheets_as(&plugin, credential, action, params).await;
+            assert!(
+                matches!(&result, Err(PluginError::InvalidParams(m)) if m.contains("do not cover")),
+                "{action}: {result:?}"
+            );
+        }
+        assert!(
+            token_hits.lock().unwrap().is_empty(),
+            "no mint on a refusal"
+        );
+        assert!(hits.lock().is_empty(), "no Sheets request on a refusal");
+
+        run_sheets_as(
+            &plugin,
+            readonly,
+            "read",
+            read_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z100"),
+        )
+        .await
+        .expect("a read-only key serves a read");
+    }
+
+    /// The pins bind a service-account credential exactly as any other: an
+    /// off-pin spreadsheet or range is refused before the key is used.
+    #[tokio::test]
+    async fn sheets_service_account_pins_refuse_before_mint_or_network() {
+        let (token_endpoint, token_hits) = minting_token_endpoint().await;
+        let (base_url, hits) = auth_recording_sheets_server(json!({"values": []})).await;
+        let plugin = sa_plugin(token_endpoint);
+        for (action, params) in [
+            (
+                "read",
+                read_params(&base_url, "attacker-spreadsheet", "Pipeline!A1:Z100"),
+            ),
+            (
+                "read",
+                read_params(&base_url, PINNED_SPREADSHEET, "Secrets!A1:Z100"),
+            ),
+            (
+                "append_draft",
+                append_params(&base_url, "attacker-spreadsheet", "Pipeline!A:Z"),
+            ),
+            (
+                "revise_draft",
+                revise_params(&base_url, "attacker-spreadsheet", "Pipeline!A:Z"),
+            ),
+            (
+                "revise_draft",
+                revise_params(&base_url, PINNED_SPREADSHEET, "Brand!A1:Z100"),
+            ),
+        ] {
+            let result = run_sheets_as(
+                &plugin,
+                service_account_credential(&[SHEETS_SCOPE], None, None),
+                action,
+                params,
+            )
+            .await;
+            assert!(
+                matches!(&result, Err(PluginError::InvalidParams(m)) if m.starts_with("sheets pin:")),
+                "{action}: {result:?}"
+            );
+        }
+        assert!(
+            token_hits.lock().unwrap().is_empty(),
+            "no mint for an off-pin call"
+        );
+        assert!(
+            hits.lock().is_empty(),
+            "no Sheets request for an off-pin call"
+        );
+    }
+
+    /// ApiKey and OAuth2 headers, and the OAuth2 refusal, are unchanged.
+    #[test]
+    fn api_key_and_oauth2_headers_are_unchanged() {
+        let headers = credential_headers(&credential()).unwrap();
+        assert_eq!(headers[reqwest::header::AUTHORIZATION], "Bearer not-logged");
+        assert_eq!(headers[reqwest::header::CONTENT_TYPE], "application/json");
+
+        let oauth = |access_token: Option<&str>| {
+            Credential::new(
+                "oauth".into(),
+                CredentialData::OAuth2 {
+                    client_id: "client".into(),
+                    client_secret: Secret::new("secret"),
+                    refresh_token: None,
+                    access_token: access_token.map(Secret::new),
+                    expires_at: None,
+                    token_url: "https://oauth2.googleapis.com/token".into(),
+                    scopes: vec![],
+                },
+            )
+        };
+        let headers = credential_headers(&oauth(Some("live"))).unwrap();
+        assert_eq!(headers[reqwest::header::AUTHORIZATION], "Bearer live");
+        assert!(matches!(
+            credential_headers(&oauth(None)),
+            Err(PluginError::UnsupportedCredentialType(m))
+                if m == "marketing connector requires a live OAuth2 access token"
+        ));
+    }
+
+    /// An ApiKey credential passes through the effective-credential step
+    /// untouched even on a plugin wired to a token endpoint.
+    #[tokio::test]
+    async fn api_key_skips_the_service_account_path() {
+        let (token_endpoint, token_hits) = minting_token_endpoint().await;
+        let (base_url, hits) = auth_recording_sheets_server(json!({"values": []})).await;
+        let plugin = sa_plugin(token_endpoint);
+        let response = run_sheets_as(
+            &plugin,
+            credential(),
+            "read",
+            read_params(&base_url, PINNED_SPREADSHEET, "Pipeline!A1:Z100"),
+        )
+        .await
+        .unwrap();
+        assert!(response.updated_credential.is_none());
+        assert!(token_hits.lock().unwrap().is_empty());
+        assert_eq!(hits.lock()[0].2, "Bearer not-logged");
+    }
+
+    #[test]
+    fn the_connector_accepts_the_service_account_credential_type() {
+        assert!(SheetsPlugin::default()
+            .supported_credential_types()
+            .contains(&CredentialType::GoogleServiceAccount));
     }
 }

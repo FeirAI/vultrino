@@ -28,9 +28,10 @@
 //! further than the log.
 
 use super::PluginError;
+use crate::{Credential, CredentialData, Secret};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::json;
@@ -81,6 +82,11 @@ const SEC1_EC_PEM_BEGIN: &str = "-----BEGIN EC PRIVATE KEY-----";
 const ASSERTION_BACKDATE_SECS: i64 = 30;
 
 const JWT_BEARER_GRANT: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
+/// A cached Google access token this close to its `expires_at` is replaced
+/// rather than served. Shared with the solo oauth2 refresh path so both Google
+/// credential shapes roll over at the same point.
+const REFRESH_MARGIN_SECS: i64 = 300;
 
 /// The subset of Google's token response this path uses.
 #[derive(Debug, Deserialize)]
@@ -328,6 +334,118 @@ pub(crate) async fn mint_access_token(
     Ok(token)
 }
 
+/// Whether a cached Google access token must be replaced before use: absent, or
+/// inside [`REFRESH_MARGIN_SECS`] of its `expires_at`.
+pub(crate) fn token_is_stale(
+    access_token: Option<&Secret>,
+    expires_at: Option<DateTime<Utc>>,
+) -> bool {
+    match access_token {
+        None => true,
+        Some(_) => expires_at
+            .is_some_and(|expires| Utc::now() + Duration::seconds(REFRESH_MARGIN_SECS) >= expires),
+    }
+}
+
+/// Resolve a `google_service_account` credential to a bearer token: the cached
+/// access token while it is outside [`token_is_stale`]'s margin, otherwise a
+/// freshly minted one plus the updated credential data for the caller to
+/// persist. Every connector that accepts this credential shape goes through
+/// here, so re-validation, caching and minting live in exactly one place.
+///
+/// The credential is re-validated even though the create path already did:
+/// use time is the last gate before the private key is exercised, and the
+/// vault is not the only way a record can arrive.
+///
+/// `required_scopes` is the calling connector's own need: the credential must
+/// carry at least one of them or the call is refused before any token is
+/// served or minted. An empty slice relies on the allowlist alone. The mint
+/// still requests the credential's full scope set, because the minted token is
+/// persisted on the shared credential and served to every connector using it.
+///
+/// `token_endpoint` must be [`GOOGLE_TOKEN_URI`]; outside unit tests anything
+/// else is refused. It is a parameter only so tests can mint against a
+/// loopback endpoint while the credential still carries the pinned `token_uri`.
+pub(crate) async fn service_account_token(
+    client: &Client,
+    credential: &Credential,
+    token_endpoint: &Url,
+    required_scopes: &[&str],
+) -> Result<(Credential, Option<CredentialData>, String), PluginError> {
+    let CredentialData::GoogleServiceAccount {
+        client_email,
+        private_key,
+        private_key_id,
+        token_uri,
+        scopes,
+        access_token,
+        expires_at,
+    } = &credential.data
+    else {
+        return Err(PluginError::UnsupportedCredentialType(
+            "service-account path requires google_service_account".into(),
+        ));
+    };
+    if !cfg!(test) && token_endpoint.as_str() != GOOGLE_TOKEN_URI {
+        return Err(PluginError::InvalidParams(
+            "google_service_account token endpoint must be exactly https://oauth2.googleapis.com/token"
+                .into(),
+        ));
+    }
+    // Use-time re-validation, cheap half first. The pinned endpoint, the
+    // service-account address, the key id and the scope allowlist are re-checked
+    // on EVERY governed call, including the ones served from the cached token.
+    // The PKCS#8 parse is not: it is the expensive part and it is unavoidable on
+    // the mint path anyway (`signed_assertion` parses the key it signs with, and
+    // refuses with the same messages), so a cache hit does not pay for it.
+    credential
+        .data
+        .validate_admission_fields()
+        .map_err(|reason| PluginError::InvalidParams(reason.to_string()))?;
+    if !required_scopes.is_empty()
+        && !scopes
+            .iter()
+            .any(|scope| required_scopes.contains(&scope.as_str()))
+    {
+        return Err(PluginError::InvalidParams(
+            "google_service_account scopes do not cover this connector".into(),
+        ));
+    }
+    if let Some(token) = access_token {
+        if !token_is_stale(Some(token), *expires_at) {
+            return Ok((credential.clone(), None, token.expose().into()));
+        }
+    }
+    let token = mint_access_token(
+        client,
+        token_endpoint,
+        client_email,
+        private_key.expose(),
+        private_key_id,
+        scopes,
+    )
+    .await?;
+    let expires_at = token.expires_in.and_then(|seconds| {
+        i64::try_from(seconds)
+            .ok()
+            .and_then(Duration::try_seconds)
+            .and_then(|duration| Utc::now().checked_add_signed(duration))
+    });
+    let updated_data = CredentialData::GoogleServiceAccount {
+        client_email: client_email.clone(),
+        private_key: private_key.clone(),
+        private_key_id: private_key_id.clone(),
+        token_uri: token_uri.clone(),
+        scopes: scopes.clone(),
+        access_token: Some(Secret::new(token.access_token.clone())),
+        expires_at,
+    };
+    let mut effective = credential.clone();
+    effective.data = updated_data.clone();
+    effective.updated_at = Utc::now();
+    Ok((effective, Some(updated_data), token.access_token))
+}
+
 /// Operator-log only. Google's `error` / `error_description` are the two strings
 /// that make a failed mint diagnosable (`invalid_grant`, `invalid_scope`,
 /// "Invalid JWT Signature."); nothing else from the body is logged, and the
@@ -348,8 +466,10 @@ fn log_upstream_failure(status: u16, body: &[u8]) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use axum::{routing::any, Json, Router};
     use std::process::Command;
-    use std::sync::OnceLock;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::net::TcpListener;
 
     /// A 2048-bit RSA key generated locally, once, for this test run. It is
     /// never a real key and never leaves the process image.
@@ -741,5 +861,240 @@ pub(crate) mod tests {
                 "no PEM framing in a refusal"
             );
         }
+    }
+
+    // ---- service_account_token ------------------------------------------
+    //
+    // The mock token endpoint lives on 127.0.0.1, which `build_guarded_client`
+    // deliberately cannot reach (its connect-time resolver keeps public IPs
+    // only). These tests therefore use a client that keeps the one property
+    // under test here (`redirect::Policy::none()`) and drops only the DNS
+    // guard. Production still goes through `build_guarded_client`.
+    pub(crate) fn loopback_client() -> Client {
+        Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test client builds")
+    }
+
+    pub(crate) type TokenHits = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// A token endpoint that records every request it receives and answers with
+    /// `reply`. Returns its URL and the recording.
+    pub(crate) async fn recording_token_server(
+        status: u16,
+        reply: serde_json::Value,
+    ) -> (String, TokenHits) {
+        let hits: TokenHits = Arc::new(Mutex::new(Vec::new()));
+        let recorder = hits.clone();
+        let app = Router::new().route(
+            "/{*path}",
+            any(move |request: axum::extract::Request| {
+                let recorder = recorder.clone();
+                let reply = reply.clone();
+                async move {
+                    let uri = request.uri().to_string();
+                    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    recorder
+                        .lock()
+                        .unwrap()
+                        .push((uri, String::from_utf8_lossy(&body).to_string()));
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        Json(reply),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/token"), hits)
+    }
+
+    /// A `google_service_account` credential carrying the pinned `token_uri`,
+    /// the test key and `scopes`, with an optional cached access token.
+    pub(crate) fn service_account_credential(
+        scopes: &[&str],
+        access_token: Option<&str>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Credential {
+        Credential::new(
+            "cred-google-sheets".into(),
+            CredentialData::GoogleServiceAccount {
+                client_email: EMAIL.into(),
+                private_key: Secret::new(test_key_pem()),
+                private_key_id: KID.into(),
+                token_uri: GOOGLE_TOKEN_URI.into(),
+                scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+                access_token: access_token.map(Secret::new),
+                expires_at,
+            },
+        )
+    }
+
+    const SHEETS: &str = "https://www.googleapis.com/auth/spreadsheets";
+    const SHEETS_READONLY: &str = "https://www.googleapis.com/auth/spreadsheets.readonly";
+    const CALENDAR: &str = "https://www.googleapis.com/auth/calendar";
+
+    async fn minting_endpoint() -> (Url, TokenHits) {
+        let (url, hits) = recording_token_server(
+            200,
+            json!({"access_token": "minted-token", "expires_in": 3599, "token_type": "Bearer"}),
+        )
+        .await;
+        (Url::parse(&url).unwrap(), hits)
+    }
+
+    /// A credential with no cached token mints once, returns the update to
+    /// persist, and the persisted form is then served from cache with no
+    /// second mint and nothing new to persist.
+    #[tokio::test]
+    async fn service_account_token_mints_once_then_serves_the_persisted_token() {
+        let (endpoint, hits) = minting_endpoint().await;
+        let client = loopback_client();
+        let credential = service_account_credential(&[SHEETS], None, None);
+
+        let (effective, updated, token) =
+            service_account_token(&client, &credential, &endpoint, &[SHEETS])
+                .await
+                .expect("a pinned credential mints");
+        assert_eq!(token, "minted-token");
+        let Some(CredentialData::GoogleServiceAccount {
+            access_token: Some(persisted),
+            expires_at: Some(expires_at),
+            scopes,
+            ..
+        }) = &updated
+        else {
+            panic!("the minted token is handed back for persistence: {updated:?}");
+        };
+        assert_eq!(persisted.expose(), "minted-token");
+        assert!(*expires_at > Utc::now() + Duration::seconds(3500));
+        assert_eq!(scopes, &[SHEETS.to_string()], "scopes carried unchanged");
+        assert_eq!(hits.lock().unwrap().len(), 1, "exactly one mint");
+
+        let (_again, updated, token) =
+            service_account_token(&client, &effective, &endpoint, &[SHEETS])
+                .await
+                .expect("the persisted token is served");
+        assert_eq!(token, "minted-token");
+        assert!(updated.is_none(), "nothing to persist on a cache hit");
+        assert_eq!(hits.lock().unwrap().len(), 1, "no second mint");
+    }
+
+    /// A cached token inside the refresh margin is replaced, not served.
+    #[tokio::test]
+    async fn service_account_token_replaces_a_token_inside_the_refresh_margin() {
+        let (endpoint, hits) = minting_endpoint().await;
+        let credential = service_account_credential(
+            &[SHEETS],
+            Some("nearly-expired"),
+            Some(Utc::now() + Duration::seconds(REFRESH_MARGIN_SECS - 1)),
+        );
+        let (_effective, updated, token) =
+            service_account_token(&loopback_client(), &credential, &endpoint, &[])
+                .await
+                .expect("a stale token is replaced");
+        assert_eq!(token, "minted-token");
+        assert!(updated.is_some());
+        assert_eq!(hits.lock().unwrap().len(), 1);
+    }
+
+    /// A credential whose scopes do not cover the caller's need is refused
+    /// before any token is served or minted, including a fresh cached one.
+    #[tokio::test]
+    async fn service_account_token_refuses_a_scope_the_caller_needs_but_the_credential_lacks() {
+        let (endpoint, hits) = minting_endpoint().await;
+        let client = loopback_client();
+        for credential in [
+            service_account_credential(&[CALENDAR], None, None),
+            service_account_credential(
+                &[CALENDAR],
+                Some("cached-calendar-token"),
+                Some(Utc::now() + Duration::seconds(3000)),
+            ),
+            service_account_credential(&[SHEETS_READONLY], None, None),
+        ] {
+            let error = service_account_token(&client, &credential, &endpoint, &[SHEETS])
+                .await
+                .expect_err("a scope mismatch fails closed");
+            assert!(
+                matches!(&error, PluginError::InvalidParams(m) if m.contains("do not cover")),
+                "{error}"
+            );
+            assert!(!error.to_string().contains("cached-calendar-token"));
+        }
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "no mint on a scope refusal"
+        );
+
+        // Any one of the accepted scopes suffices.
+        let readonly = service_account_credential(&[SHEETS_READONLY], None, None);
+        service_account_token(&client, &readonly, &endpoint, &[SHEETS, SHEETS_READONLY])
+            .await
+            .expect("a read-only credential covers a read");
+    }
+
+    /// Use-time re-validation runs before the scope check and the cache, so a
+    /// widened vault record is refused even with a fresh cached token.
+    #[tokio::test]
+    async fn service_account_token_revalidates_before_serving_the_cache() {
+        let (endpoint, hits) = minting_endpoint().await;
+        let mut credential = service_account_credential(
+            &[SHEETS],
+            Some("cached"),
+            Some(Utc::now() + Duration::seconds(3000)),
+        );
+        if let CredentialData::GoogleServiceAccount { scopes, .. } = &mut credential.data {
+            scopes.push("https://www.googleapis.com/auth/drive".into());
+        }
+        let error = service_account_token(&loopback_client(), &credential, &endpoint, &[SHEETS])
+            .await
+            .expect_err("a scope outside the allowlist is refused");
+        assert!(error.to_string().contains("allowlist"), "{error}");
+        assert!(hits.lock().unwrap().is_empty());
+    }
+
+    /// A refused mint surfaces only the status to the caller.
+    #[tokio::test]
+    async fn service_account_token_surfaces_a_refused_mint_as_status_only() {
+        let (url, _hits) = recording_token_server(400, json!({"error": "invalid_grant"})).await;
+        let credential = service_account_credential(&[SHEETS], None, None);
+        let error = service_account_token(
+            &loopback_client(),
+            &credential,
+            &Url::parse(&url).unwrap(),
+            &[SHEETS],
+        )
+        .await
+        .expect_err("a 400 fails the call");
+        assert!(error.to_string().contains("HTTP 400"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn service_account_token_refuses_other_credential_types() {
+        let credential = Credential::new(
+            "k".into(),
+            CredentialData::ApiKey {
+                key: Secret::new("k"),
+                header_name: "Authorization".into(),
+                header_prefix: "Bearer ".into(),
+            },
+        );
+        let error = service_account_token(
+            &loopback_client(),
+            &credential,
+            &Url::parse(GOOGLE_TOKEN_URI).unwrap(),
+            &[],
+        )
+        .await
+        .expect_err("not a service account");
+        assert!(matches!(error, PluginError::UnsupportedCredentialType(_)));
     }
 }
