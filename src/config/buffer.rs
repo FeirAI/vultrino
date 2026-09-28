@@ -61,7 +61,6 @@ impl BufferPin {
         ] {
             validate_id(name, value)?;
         }
-        validate_service_id(service_id)?;
 
         match target_alias {
             "x" | "linkedin" => {}
@@ -72,6 +71,7 @@ impl BufferPin {
                 ));
             }
         }
+        validate_service_id(target_alias, service_id)?;
 
         Ok(Self {
             tenant_id: tenant_id.to_string(),
@@ -169,17 +169,22 @@ fn validate_id(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `service_id` is either a safe id (the X form, a numeric account id) or a
-/// LinkedIn URN; see [`LINKEDIN_URN_PREFIX`]. It is only ever compared
-/// byte-exactly against Buffer's channel record, never interpolated.
-fn validate_service_id(value: &str) -> Result<(), String> {
-    if is_linkedin_urn(value) {
+/// `service_id` is a safe id (the X form, a numeric account id) for every
+/// target; a `linkedin` target may instead carry a LinkedIn URN (see
+/// [`LINKEDIN_URN_PREFIX`]), and only a `linkedin` target may. It is only ever
+/// compared byte-exactly against Buffer's channel record, never interpolated.
+fn validate_service_id(target_alias: &str, value: &str) -> Result<(), String> {
+    if target_alias == "linkedin" && is_linkedin_urn(value) {
         return Ok(());
     }
     validate_id("service_id", value).map_err(|_| {
-        "buffer_pins: service_id must be 1-128 characters from [A-Za-z0-9_-] or \
-         urn:li:(organization|person|member):<1-64 of [A-Za-z0-9_-]>"
-            .to_string()
+        if target_alias == "linkedin" {
+            "buffer_pins: linkedin service_id must be 1-128 characters from [A-Za-z0-9_-] or \
+             urn:li:(organization|person|member):<1-64 of [A-Za-z0-9_-]>"
+                .to_string()
+        } else {
+            "buffer_pins: x service_id must be 1-128 characters from [A-Za-z0-9_-]".to_string()
+        }
     })
 }
 
@@ -402,8 +407,35 @@ mod tests {
             over_128.as_str(),
         ] {
             let error = linkedin_pin(rejected).expect_err(rejected);
-            assert!(error.contains("service_id"), "{rejected}: {error}");
+            assert!(error.contains("linkedin service_id"), "{rejected}: {error}");
         }
+    }
+
+    #[test]
+    fn a_linkedin_urn_is_refused_on_an_x_pin() {
+        let x_pin = |service_id: &str| {
+            BufferPin::parse(
+                "tenant-a",
+                "project-a",
+                "cred-buffer",
+                "org-a",
+                "x",
+                "channel-x",
+                service_id,
+                "owner-x",
+            )
+        };
+        for urn in [
+            "urn:li:organization:135696968",
+            "urn:li:person:AbC-12_x",
+            "urn:li:member:42",
+        ] {
+            let error = x_pin(urn).expect_err(urn);
+            assert!(error.contains("x service_id"), "{urn}: {error}");
+        }
+        assert!(x_pin("2084242309374156800").is_ok());
+        // The safe-id form stays valid for linkedin as well.
+        assert!(linkedin_pin("remote-linkedin").is_ok());
     }
 
     #[test]
@@ -445,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn toml_round_trips_a_linkedin_urn_service_id() {
+    fn toml_round_trips_a_linkedin_urn_service_id_and_refuses_it_on_x() {
         let config = Config::parse(
             "[[buffer_pins]]\n\
              tenant_id = \"tenant-a\"\n\
@@ -464,5 +496,8 @@ mod tests {
             "urn:li:organization:135696968"
         );
         assert_eq!(config.buffer_pins[0].service(), "linkedin");
+
+        let on_x = "[[buffer_pins]]\ntenant_id = \"tenant-a\"\nproject_id = \"project-a\"\ncredential_alias = \"cred-buffer\"\norganization_id = \"org-a\"\ntarget_alias = \"x\"\nchannel_id = \"channel-x\"\nservice_id = \"urn:li:organization:135696968\"\naccount_id = \"owner-x\"\n";
+        assert!(Config::parse(on_x).is_err());
     }
 }
