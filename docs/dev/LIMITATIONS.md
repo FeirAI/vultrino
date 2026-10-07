@@ -189,9 +189,10 @@ noninterference. Honest scope:
   implementations correct.
 - **Operator-authored truth stays outside the model.** A truthful
   reversible/irreversible label, a correct Govder recipe, and a matching
-  workload-assertion signing key are operational assumptions — the gates prove
-  enforcement continuity of what the stores and verifiers report, not that the
-  external world matches those labels.
+  workload-assertion signing key are operational assumptions. The gates check
+  enforcement continuity of what the stores and verifiers report only in the
+  Lean model and as source shape (see above); they do not show that the external
+  world matches those labels.
 
 `./ci-local.sh` runs Lean + refinement + the Rust gates; it does **not** run
 Kani (install + toolchain cost). CI's separate `kani` job is the authoritative

@@ -58,7 +58,9 @@ run_harness recipe_cap_prevents_need_overflow
 run_harness class_slot_contribution_agrees_with_satisfaction
 
 # Every #[kani::proof] must be listed above, or it would silently not run.
-listed="$(grep -c '^run_harness [a-z]' "$0")"
+# The script has already cd'd to the repo root, so name itself by that path
+# (a relative "$0" would break when run from inside formal/).
+listed="$(grep -c '^run_harness [a-z]' formal/run-kani.sh)"
 actual="$(grep -rEc '#\[kani::proof\]' src | awk -F: '{s+=$2} END {print s}')"
 if [ "$listed" -ne "$actual" ]; then
   echo "run-kani.sh: $actual #[kani::proof] harnesses in src but $listed run" >&2
