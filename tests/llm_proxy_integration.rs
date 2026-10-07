@@ -1310,3 +1310,223 @@ async fn llm_streamed_halt_cancels_midstream() {
         "a halted stream emits no V13b token event: {events:?}"
     );
 }
+
+// ===========================================================================
+// SB-02: credential material minted or refreshed DURING the action must be
+// scrubbed from what the agent sees (buffered body + headers, streamed body +
+// headers), for both an OAuth2 refresh and a Google service-account mint.
+// ===========================================================================
+
+/// A token minted during the action. It contains `/`, a space and `+` so its
+/// percent-encoded and form-encoded forms differ from the raw form.
+const MINTED_TOKEN: &str = "minted/tok en+AAAA1234567890zzzzBBBB";
+
+#[derive(Clone, Copy)]
+enum MintKind {
+    OAuth2Refresh,
+    GoogleSaMint,
+}
+
+fn minted_credential(kind: MintKind) -> CredentialData {
+    match kind {
+        MintKind::OAuth2Refresh => CredentialData::OAuth2 {
+            client_id: "client-id".to_string(),
+            client_secret: Secret::new("client-secret-value-0123456789"),
+            refresh_token: Some(Secret::new("refresh-token-value-0123456789")),
+            access_token: Some(Secret::new(MINTED_TOKEN)),
+            expires_at: None,
+            token_url: "https://oauth.example.test/token".to_string(),
+            scopes: vec![],
+        },
+        MintKind::GoogleSaMint => CredentialData::GoogleServiceAccount {
+            client_email: "sa@proj.iam.gserviceaccount.test".to_string(),
+            private_key: Secret::new(
+                "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0g=\n-----END PRIVATE KEY-----\n",
+            ),
+            private_key_id: "kid".to_string(),
+            token_uri: "https://oauth2.googleapis.test/token".to_string(),
+            scopes: vec!["https://example.test/scope".to_string()],
+            access_token: Some(Secret::new(MINTED_TOKEN)),
+            expires_at: None,
+        },
+    }
+}
+
+/// Every form of the minted token an upstream might reflect.
+fn minted_forms() -> Vec<String> {
+    let forms =
+        vultrino::egress::derive_secret_forms(&[zeroize::Zeroizing::new(MINTED_TOKEN.to_string())]);
+    assert!(forms.len() >= 3, "expected raw + encoded forms: {forms:?}");
+    forms
+}
+
+/// Stub upstream that mints a token during the action and then reflects its own
+/// `Authorization: Bearer <minted>` header back (in body and header), the way an
+/// echoing upstream or error body would.
+struct MockMintingPlugin {
+    kind: MintKind,
+}
+
+impl MockMintingPlugin {
+    fn reflection(&self) -> String {
+        // One line per derived form, so each is checked independently.
+        minted_forms().join("\n")
+    }
+}
+
+#[async_trait]
+impl Plugin for MockMintingPlugin {
+    fn name(&self) -> &str {
+        "mockmint"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["chat"]
+    }
+    async fn execute(&self, _request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        // A JSON encoder would re-escape a form that itself contains a backslash
+        // (double encoding, out of scope for byte-exact scrubbing), so the buffered
+        // JSON body reflects only the backslash-free forms. The streamed text body
+        // reflects all of them.
+        let json_safe: Vec<String> = minted_forms()
+            .into_iter()
+            .filter(|f| !f.contains('\\'))
+            .collect();
+        let body = serde_json::json!({
+            "error": format!("bad request, Authorization: Bearer {MINTED_TOKEN}"),
+            "forms": json_safe.join("\n"),
+        });
+        Ok(ExecuteResponse::new(
+            200,
+            HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                (
+                    "x-echo-authorization".to_string(),
+                    format!("Bearer {MINTED_TOKEN}"),
+                ),
+            ]),
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .with_updated_credential(minted_credential(self.kind)))
+    }
+    async fn execute_streaming(
+        &self,
+        _request: PluginRequest,
+    ) -> Result<vultrino::StreamingResponse, PluginError> {
+        let chunks = vec![
+            Ok(bytes::Bytes::from(format!(
+                "data: {{\"error\":\"Authorization: Bearer {MINTED_TOKEN}\"}}\n\n"
+            ))),
+            Ok(bytes::Bytes::from(format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                self.reflection().replace('\n', " | ")
+            ))),
+        ];
+        Ok(vultrino::StreamingResponse::new(
+            200,
+            HashMap::from([
+                ("content-type".to_string(), "text/event-stream".to_string()),
+                (
+                    "x-echo-authorization".to_string(),
+                    format!("Bearer {MINTED_TOKEN}"),
+                ),
+            ]),
+            Box::pin(futures::stream::iter(chunks)),
+        )
+        .with_updated_credential(minted_credential(self.kind)))
+    }
+    fn validate_params(
+        &self,
+        _action: &str,
+        _params: &serde_json::Value,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+async fn run_minting(kind: MintKind, stream: bool) -> (Vec<(String, String)>, String) {
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    srv.plugins().register(Arc::new(MockMintingPlugin { kind }));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockmint.chat",
+        "https://api.openai.com",
+    )
+    .await;
+    let token = mint_token(&storage, "cred-openai", Some("mockmint.chat")).await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": stream, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let raw = body_bytes(resp).await;
+    (headers, String::from_utf8_lossy(&raw).into_owned())
+}
+
+fn assert_minted_absent(headers: &[(String, String)], body: &str) {
+    for form in minted_forms() {
+        assert!(
+            !body.contains(&form),
+            "minted token form {form:?} leaked in body: {body}"
+        );
+        for (k, v) in headers {
+            assert!(
+                !v.contains(&form),
+                "minted token form {form:?} leaked in header {k}: {v}"
+            );
+        }
+    }
+    assert!(
+        !body.contains("AAAA1234567890zzzz"),
+        "leaked fragment: {body}"
+    );
+    for (k, v) in headers {
+        assert!(
+            !v.contains("AAAA1234567890zzzz"),
+            "leaked fragment in {k}: {v}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sb02_buffered_oauth2_refreshed_token_reflected_is_scrubbed() {
+    let (h, b) = run_minting(MintKind::OAuth2Refresh, false).await;
+    assert_minted_absent(&h, &b);
+}
+
+#[tokio::test]
+async fn sb02_buffered_google_sa_minted_token_reflected_is_scrubbed() {
+    let (h, b) = run_minting(MintKind::GoogleSaMint, false).await;
+    assert_minted_absent(&h, &b);
+}
+
+#[tokio::test]
+async fn sb02_streamed_oauth2_refreshed_token_reflected_is_scrubbed() {
+    let (h, b) = run_minting(MintKind::OAuth2Refresh, true).await;
+    assert_minted_absent(&h, &b);
+}
+
+#[tokio::test]
+async fn sb02_streamed_google_sa_minted_token_reflected_is_scrubbed() {
+    let (h, b) = run_minting(MintKind::GoogleSaMint, true).await;
+    assert_minted_absent(&h, &b);
+}
