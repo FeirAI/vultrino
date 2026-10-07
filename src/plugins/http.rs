@@ -148,6 +148,97 @@ impl Resolve for SsrfGuardResolver {
     }
 }
 
+/// IPv4 ranges the SSRF guard refuses, as (network, prefix length). Every range the
+/// IANA IPv4 Special-Purpose Address Registry marks "Globally Reachable: False",
+/// plus all of multicast. Two /32 entries inside 192.0.0.0/24 (192.0.0.9, 192.0.0.10)
+/// are globally reachable per the registry but are blocked here on purpose: the
+/// guard prefers a false positive to a hole.
+/// Source: https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
+const IPV4_BLOCKED: [(u32, u8); 15] = [
+    (0x0000_0000, 8),  // 0.0.0.0/8 "this network"
+    (0x0A00_0000, 8),  // 10.0.0.0/8 private
+    (0x6440_0000, 10), // 100.64.0.0/10 shared address space (CGNAT)
+    (0x7F00_0000, 8),  // 127.0.0.0/8 loopback
+    (0xA9FE_0000, 16), // 169.254.0.0/16 link-local (cloud metadata)
+    (0xAC10_0000, 12), // 172.16.0.0/12 private
+    (0xC000_0000, 24), // 192.0.0.0/24 IETF protocol assignments
+    (0xC000_0200, 24), // 192.0.2.0/24 documentation (TEST-NET-1)
+    (0xC0A8_0000, 16), // 192.168.0.0/16 private
+    (0xC612_0000, 15), // 198.18.0.0/15 benchmarking
+    (0xC633_6400, 24), // 198.51.100.0/24 documentation (TEST-NET-2)
+    (0xCB00_7100, 24), // 203.0.113.0/24 documentation (TEST-NET-3)
+    (0xE000_0000, 4),  // 224.0.0.0/4 multicast (all of it)
+    (0xF000_0000, 4),  // 240.0.0.0/4 reserved, includes 255.255.255.255 broadcast
+    (0xC058_6300, 24), // 192.88.99.0/24 deprecated 6to4 relay anycast
+];
+
+/// IPv6 ranges the SSRF guard refuses outright, as (network, prefix length). Every
+/// range the IANA IPv6 Special-Purpose Address Registry marks not globally
+/// reachable, plus multicast, the deprecated site-local and IPv4-compatible blocks,
+/// Teredo, and the NAT64 local-use prefix. Not listed because they are decoded and
+/// classified by their embedded IPv4 instead: ::ffff:0:0/96 (IPv4-mapped),
+/// 64:ff9b::/96 (NAT64) and 2002::/16 (6to4). 2001::/23 is blocked whole (it holds
+/// Teredo 2001::/32); that also blocks a few globally reachable anycast and
+/// AS112 sub-ranges, which is the safe direction.
+/// Source: https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
+const IPV6_BLOCKED: [(u128, u8); 11] = [
+    (0x0, 96), // ::/96 unspecified, loopback, IPv4-compatible
+    (0x0064_ff9b_0001_0000_0000_0000_0000_0000, 48), // 64:ff9b:1::/48 NAT64 local use
+    (0x0100_0000_0000_0000_0000_0000_0000_0000, 64), // 100::/64 discard-only
+    (0x2001_0000_0000_0000_0000_0000_0000_0000, 23), // 2001::/23 IETF assignments incl. Teredo
+    (0x2001_0db8_0000_0000_0000_0000_0000_0000, 32), // 2001:db8::/32 documentation
+    (0x3fff_0000_0000_0000_0000_0000_0000_0000, 20), // 3fff::/20 documentation
+    (0x5f00_0000_0000_0000_0000_0000_0000_0000, 16), // 5f00::/16 SRv6 SIDs
+    (0xfc00_0000_0000_0000_0000_0000_0000_0000, 7), // fc00::/7 unique local
+    (0xfe80_0000_0000_0000_0000_0000_0000_0000, 10), // fe80::/10 link-local
+    (0xfec0_0000_0000_0000_0000_0000_0000_0000, 10), // fec0::/10 site-local (deprecated)
+    (0xff00_0000_0000_0000_0000_0000_0000_0000, 8), // ff00::/8 multicast
+];
+
+/// Whether `addr` is inside the `len`-bit prefix of `net`. Pure, no allocation.
+const fn v4_in_prefix(addr: u32, net: u32, len: u8) -> bool {
+    let mask = if len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - len as u32)
+    };
+    (addr & mask) == (net & mask)
+}
+
+/// IPv6 twin of [`v4_in_prefix`].
+const fn v6_in_prefix(addr: u128, net: u128, len: u8) -> bool {
+    let mask = if len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - len as u32)
+    };
+    (addr & mask) == (net & mask)
+}
+
+/// True when the IPv4 address (as a big-endian u32) is in any [`IPV4_BLOCKED`] range.
+pub(crate) fn ipv4_is_special_purpose(addr: u32) -> bool {
+    let mut i = 0;
+    while i < IPV4_BLOCKED.len() {
+        if v4_in_prefix(addr, IPV4_BLOCKED[i].0, IPV4_BLOCKED[i].1) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when the IPv6 address (as a big-endian u128) is in any [`IPV6_BLOCKED`] range.
+pub(crate) fn ipv6_is_special_purpose(addr: u128) -> bool {
+    let mut i = 0;
+    while i < IPV6_BLOCKED.len() {
+        if v6_in_prefix(addr, IPV6_BLOCKED[i].0, IPV6_BLOCKED[i].1) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// embedded_v4 reconstructs the IPv4 address carried in two IPv6 segments (used to
 /// decode the IPv4 embedded in NAT64 / 6to4 prefixes so it can be SSRF-classified).
 fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
@@ -614,45 +705,17 @@ impl HttpPlugin {
     /// (`::ffff:a.b.c.d`) that a separate copy is easy to forget (Codex high).
     pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
         match ip {
-            IpAddr::V4(ipv4) => {
-                // Loopback (127.0.0.0/8)
-                ipv4.is_loopback()
-                // Private ranges
-                || ipv4.is_private()
-                // Link-local (169.254.0.0/16)
-                || ipv4.is_link_local()
-                // Broadcast
-                || ipv4.is_broadcast()
-                // Documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)
-                || ipv4.is_documentation()
-                // "This host on this network" — the WHOLE 0.0.0.0/8, not just
-                // 0.0.0.0: on Linux 0.0.0.1 etc. route to the local host (Codex high).
-                || ipv4.octets()[0] == 0
-                // Shared address space (100.64.0.0/10 - CGNAT)
-                || (ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64)
-                // Loopback extended (127.0.0.0/8 - already covered by is_loopback)
-                // Reserved for future use (240.0.0.0/4)
-                || ipv4.octets()[0] >= 240
-                // Local network control block (224.0.0.0/24)
-                || (ipv4.octets()[0] == 224 && ipv4.octets()[1] == 0 && ipv4.octets()[2] == 0)
-            }
+            IpAddr::V4(ipv4) => ipv4_is_special_purpose(u32::from(*ipv4)),
             IpAddr::V6(ipv6) => {
                 let seg = ipv6.segments();
-                // Loopback (::1)
-                ipv6.is_loopback()
-                // Unspecified (::)
-                || ipv6.is_unspecified()
-                // Unique local (fc00::/7)
-                || ((seg[0] & 0xfe00) == 0xfc00)
-                // Link-local (fe80::/10)
-                || ((seg[0] & 0xffc0) == 0xfe80)
+                ipv6_is_special_purpose(u128::from(*ipv6))
                 // IPv4-mapped addresses - check the IPv4 portion
                 || Self::is_ipv4_mapped_private(ipv6)
-                // NAT64 well-known prefix 64:ff9b::/96 — embedded IPv4 in the low 32
+                // NAT64 well-known prefix 64:ff9b::/96 - embedded IPv4 in the low 32
                 // bits; decode + recurse so an internal IPv4 can't be reached via NAT64.
                 || (seg[0] == 0x0064 && seg[1] == 0xff9b
                     && Self::is_private_ip(&IpAddr::V4(embedded_v4(seg[6], seg[7]))))
-                // 6to4 2002::/16 — embedded IPv4 in segments [1..=2]; decode + recurse.
+                // 6to4 2002::/16 - embedded IPv4 in segments [1..=2]; decode + recurse.
                 || (seg[0] == 0x2002
                     && Self::is_private_ip(&IpAddr::V4(embedded_v4(seg[1], seg[2]))))
             }
@@ -1562,6 +1625,132 @@ mod tests {
         assert!(!HttpPlugin::is_private_ip(
             &"2001:4860:4860::8888".parse::<IpAddr>().unwrap()
         ));
+    }
+
+    // SB-22: special-purpose ranges. Snapshot of the IANA registries, retrieved
+    // 2026-10-07:
+    //   https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
+    //   https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
+    // Each row: (range label, an address inside, an address just outside, ).
+    const SB22_RANGES: &[(&str, &str, &str)] = &[
+        // IPv4
+        ("0.0.0.0/8", "0.255.255.255", "1.0.0.1"),
+        ("10.0.0.0/8", "10.255.255.255", "11.0.0.1"),
+        ("100.64.0.0/10", "100.127.255.255", "100.128.0.1"),
+        ("127.0.0.0/8", "127.255.255.255", "128.0.0.1"),
+        ("169.254.0.0/16", "169.254.255.255", "169.255.0.1"),
+        ("172.16.0.0/12", "172.31.255.255", "172.32.0.1"),
+        (
+            "192.0.0.0/24 IETF protocol assignments",
+            "192.0.0.1",
+            "192.0.1.1",
+        ),
+        ("192.0.2.0/24", "192.0.2.255", "192.0.3.1"),
+        ("192.168.0.0/16", "192.168.255.255", "192.169.0.1"),
+        ("198.18.0.0/15 benchmarking", "198.19.255.255", "198.20.0.1"),
+        ("198.51.100.0/24", "198.51.100.255", "198.51.101.1"),
+        ("203.0.113.0/24", "203.0.113.255", "203.0.114.1"),
+        (
+            "224.0.0.0/4 multicast (beyond /24)",
+            "224.0.1.1",
+            "223.255.255.254",
+        ),
+        (
+            "224.0.0.0/4 multicast (admin scoped)",
+            "239.255.255.255",
+            "223.0.0.1",
+        ),
+        (
+            "240.0.0.0/4 reserved + broadcast",
+            "255.255.255.255",
+            "223.255.255.254",
+        ),
+        // IPv6
+        ("::/96 IPv4-compatible", "::8.8.8.8", "::1:0:0"),
+        ("::/128 unspecified", "::", "::1:0:0"),
+        ("::1/128 loopback", "::1", "::1:0:0"),
+        (
+            "64:ff9b:1::/48 NAT64 local use",
+            "64:ff9b:1:ffff::1",
+            "64:ff9b:2::808:808",
+        ),
+        ("100::/64 discard", "100::1", "100:0:0:1::1"),
+        (
+            "2001::/32 Teredo",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:4860:4860::8888",
+        ),
+        ("2001:db8::/32 documentation", "2001:db8::1", "2001:db9::1"),
+        ("3fff::/20 documentation", "3fff:fff::1", "3fff:1000::1"),
+        ("5f00::/16 SRv6", "5f00::1", "5f01::1"),
+        ("fc00::/7 unique local", "fdff::1", "fe00::1"),
+        ("fe80::/10 link-local", "febf::1", "fe7f::1"),
+        ("fec0::/10 site-local", "feff::1", "fe00::1"),
+        ("ff00::/8 multicast", "ff02::1", "2606:4700::1111"),
+        (
+            "ff00::/8 multicast (global scope)",
+            "ff0e::1",
+            "2606:4700::1111",
+        ),
+    ];
+
+    #[test]
+    fn test_sb22_special_purpose_ranges_blocked_and_neighbours_allowed() {
+        use std::net::IpAddr;
+        for (label, inside, outside) in SB22_RANGES {
+            let i: IpAddr = inside.parse().unwrap();
+            let o: IpAddr = outside.parse().unwrap();
+            assert!(
+                HttpPlugin::is_private_ip(&i),
+                "{label}: {inside} must be blocked"
+            );
+            assert!(
+                !HttpPlugin::is_private_ip(&o),
+                "{label}: neighbour {outside} must stay public (or be tested via a different row)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sb22_tables_are_well_formed() {
+        // Every entry's network address must have no bits set below its prefix, so a
+        // typo in a const table cannot silently widen or shift a range.
+        for (net, len) in IPV4_BLOCKED {
+            assert!(len <= 32 && v4_in_prefix(net, net, len));
+            assert_eq!(
+                net & !(u32::MAX.checked_shl(32 - len as u32).unwrap_or(0)),
+                0,
+                "{net:#x}/{len}"
+            );
+        }
+        for (net, len) in IPV6_BLOCKED {
+            assert!(len <= 128 && v6_in_prefix(net, net, len));
+            assert_eq!(
+                net & !(u128::MAX.checked_shl(128 - len as u32).unwrap_or(0)),
+                0,
+                "{net:#x}/{len}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sb22_wrapped_special_purpose_ipv4_stays_blocked() {
+        use std::net::IpAddr;
+        // Decode-and-recurse still applies to the new IPv4 ranges.
+        for s in [
+            "::ffff:198.18.0.1",
+            "::ffff:224.0.1.1",
+            "64:ff9b::c612:1",  // NAT64 /96 embedding 198.18.0.1
+            "2002:c000:0001::", // 6to4 embedding 192.0.0.1
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(HttpPlugin::is_private_ip(&ip), "{s} must be blocked");
+        }
+        // Public embedded IPv4 stays allowed.
+        for s in ["::ffff:8.8.8.8", "64:ff9b::808:808", "2002:0808:0808::"] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!HttpPlugin::is_private_ip(&ip), "{s} must be allowed");
+        }
     }
 
     #[test]
