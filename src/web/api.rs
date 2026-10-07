@@ -1220,13 +1220,28 @@ pub async fn api_decide_approval(
                 )
             }
         };
-        // The approver-identity verifier, which is the dedicated approval secret
-        // when the deployment configures one and the govder client key otherwise
-        // (see `GovderConfig::approval_verification_secret`). Outbound calls to
-        // govder keep signing with `assertion_secret` either way.
+        // The approver-identity verifier: the dedicated approval secret, or the
+        // govder client key only under the explicit dev escape (see
+        // `GovderConfig::approval_verification_secret`). Without either, verified
+        // approvals are disabled and the signed decision is refused with a clear
+        // reason. Outbound govder calls keep signing with `assertion_secret`.
+        let Some(approval_secret) = govder.approval_verification_secret() else {
+            tracing::error!(
+                tenant = %acting_tenant,
+                approval_id = %id,
+                "rejected signed approver decision: VULTRINO_APPROVAL_ASSERTION_SECRET is not \
+                 configured (or equals the shared govder key)"
+            );
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "verified_approvals_disabled",
+                "Verified approver decisions are disabled: this vultrino has no dedicated \
+                 VULTRINO_APPROVAL_ASSERTION_SECRET distinct from the shared govder key",
+            );
+        };
         if let Err(error) = crate::govder::verify_tenant_assertion(
             assertion,
-            govder.approval_verification_secret(),
+            approval_secret,
             acting_tenant,
             method.as_str(),
             original_uri.path(),

@@ -580,10 +580,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|s| !s.trim().is_empty());
     config.govder = vultrino::govder::GovderConfig::from_env();
-    // Say once, at startup, when the key that verifies WHO approved is the same
-    // shared key other planes hold.
+    // Say at startup whether verified approver decisions are enabled, disabled,
+    // or running on the explicit shared-key escape.
     if let Some(govder) = config.govder.as_ref() {
-        govder.warn_if_approval_secret_shared();
+        govder.log_approval_key_posture();
     }
     // averin seal-client API key (plan 086): env-only so a config dump never
     // carries it. Only consulted when `[averin] enabled = true`.

@@ -3527,7 +3527,8 @@ async fn build_hard_sod_recipe_fixture(
     rule: ApprovalRule,
     risk_tier: &str,
 ) -> (axum::Router, Arc<dyn StorageBackend>, String, String) {
-    build_hard_sod_recipe_fixture_with_approval_secret(tenant, rule, risk_tier, None).await
+    // Legacy fixtures sign with the shared key, so they opt in to the dev escape.
+    build_hard_sod_recipe_fixture_with_keys(tenant, rule, risk_tier, None, true).await
 }
 
 /// [`build_hard_sod_recipe_fixture`] with an optional dedicated
@@ -3538,6 +3539,23 @@ async fn build_hard_sod_recipe_fixture_with_approval_secret(
     rule: ApprovalRule,
     risk_tier: &str,
     approval_assertion_secret: Option<&str>,
+) -> (axum::Router, Arc<dyn StorageBackend>, String, String) {
+    build_hard_sod_recipe_fixture_with_keys(
+        tenant,
+        rule,
+        risk_tier,
+        approval_assertion_secret,
+        false,
+    )
+    .await
+}
+
+async fn build_hard_sod_recipe_fixture_with_keys(
+    tenant: &str,
+    rule: ApprovalRule,
+    risk_tier: &str,
+    approval_assertion_secret: Option<&str>,
+    allow_shared_approval_key: bool,
 ) -> (axum::Router, Arc<dyn StorageBackend>, String, String) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
@@ -3559,6 +3577,7 @@ async fn build_hard_sod_recipe_fixture_with_approval_secret(
         base_url: "http://govder.invalid".to_string(),
         assertion_secret: TEST_BROKER_ASSERTION_SECRET.to_string(),
         approval_assertion_secret: approval_assertion_secret.map(str::to_string),
+        allow_shared_approval_key,
         assertion_ttl: Duration::from_secs(90),
         http_timeout: Duration::from_secs(1),
     });
@@ -4004,10 +4023,94 @@ async fn test_approval_route_verifies_with_the_dedicated_approval_secret() {
     assert_eq!(stored.signoffs()[0].approver_identity, "verified:sub-alice");
 }
 
+/// SB-04: signed decision with F while M is unset (no escape) is refused with a
+/// clear 403 and records no sign-off; M equal to F is refused the same way.
 #[tokio::test]
-async fn test_approval_route_falls_back_to_the_govder_secret_when_unseparated() {
-    // Unconfigured, the verifier keeps using the govder assertion secret, which
-    // is the pre-existing behaviour (the startup warning is what says so).
+async fn test_sb04_signed_decision_rejected_without_distinct_approval_key() {
+    for m in [None, Some(TEST_BROKER_ASSERTION_SECRET)] {
+        let (router, storage, key, id) = build_hard_sod_recipe_fixture_with_keys(
+            "team-a",
+            two_teammate_rule(),
+            "High",
+            m,
+            false,
+        )
+        .await;
+        let uri = format!("/api/v1/approvals/{id}/decision");
+        let alice = serde_json::json!({
+            "approve": true,
+            "approver": "sub-alice",
+            "approver_class": "teammate",
+        });
+        let response = router
+            .oneshot(signed_admin_decision_req_with_secret(
+                &uri,
+                &key,
+                "team-a",
+                alice.clone(),
+                alice,
+                TEST_BROKER_ASSERTION_SECRET,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "m={m:?}");
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["code"], "verified_approvals_disabled");
+        assert!(storage
+            .get_approval(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .signoffs()
+            .is_empty());
+    }
+}
+
+/// SB-04: M equal to F with the escape flag is accepted (dev/test).
+#[tokio::test]
+async fn test_sb04_m_equal_to_f_accepted_under_escape() {
+    let (router, storage, key, id) = build_hard_sod_recipe_fixture_with_keys(
+        "team-a",
+        two_teammate_rule(),
+        "High",
+        Some(TEST_BROKER_ASSERTION_SECRET),
+        true,
+    )
+    .await;
+    let uri = format!("/api/v1/approvals/{id}/decision");
+    let alice = serde_json::json!({
+        "approve": true,
+        "approver": "sub-alice",
+        "approver_class": "teammate",
+    });
+    let response = router
+        .oneshot(signed_admin_decision_req_with_secret(
+            &uri,
+            &key,
+            "team-a",
+            alice.clone(),
+            alice,
+            TEST_BROKER_ASSERTION_SECRET,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        storage
+            .get_approval(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .signoffs()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_approval_route_uses_the_govder_secret_only_under_the_dev_escape() {
+    // Unconfigured M plus VULTRINO_ALLOW_SHARED_APPROVAL_KEY=1: the verifier uses
+    // the govder assertion secret (the startup WARNING says so).
     let (router, storage, key, id) =
         build_hard_sod_recipe_fixture("team-a", two_teammate_rule(), "High").await;
     let uri = format!("/api/v1/approvals/{id}/decision");
@@ -4038,6 +4141,7 @@ async fn test_approval_assertion_secret_is_never_printed() {
         base_url: "http://govder.invalid".to_string(),
         assertion_secret: TEST_BROKER_ASSERTION_SECRET.to_string(),
         approval_assertion_secret: Some(TEST_APPROVAL_ASSERTION_SECRET.to_string()),
+        allow_shared_approval_key: false,
         assertion_ttl: Duration::from_secs(90),
         http_timeout: Duration::from_secs(1),
     };
@@ -4053,7 +4157,7 @@ async fn test_approval_assertion_secret_is_never_printed() {
     );
     assert_eq!(
         config.approval_verification_secret(),
-        TEST_APPROVAL_ASSERTION_SECRET
+        Some(TEST_APPROVAL_ASSERTION_SECRET)
     );
     // Outbound signing to govder is untouched by the separation.
     assert_eq!(config.assertion_secret, TEST_BROKER_ASSERTION_SECRET);
@@ -6039,6 +6143,7 @@ async fn test_delegate_decide_503s_when_govder_unreachable() {
         base_url: govder_url,
         assertion_secret: "test-govder-assertion-secret".to_string(),
         approval_assertion_secret: None,
+        allow_shared_approval_key: false,
         assertion_ttl: Duration::from_secs(90),
         http_timeout: Duration::from_secs(5),
     });
@@ -6602,6 +6707,7 @@ async fn start_mock_govder_keyed_gate(
             base_url: format!("http://{addr}"),
             assertion_secret: "test-govder-assertion-secret".to_string(),
             approval_assertion_secret: None,
+            allow_shared_approval_key: false,
             assertion_ttl: Duration::from_secs(90),
             http_timeout: Duration::from_secs(5),
         },
@@ -6631,6 +6737,7 @@ async fn start_mock_govder_gate_rule(status: StatusCode, body: serde_json::Value
         base_url: format!("http://{addr}"),
         assertion_secret: "test-govder-assertion-secret".to_string(),
         approval_assertion_secret: None,
+        allow_shared_approval_key: false,
         assertion_ttl: Duration::from_secs(90),
         http_timeout: Duration::from_secs(5),
     }
@@ -6665,6 +6772,7 @@ async fn execute_open_fails_closed_when_gate_rule_fetch_is_unreachable() {
         base_url: govder_url,
         assertion_secret: "test-govder-assertion-secret".to_string(),
         approval_assertion_secret: None,
+        allow_shared_approval_key: false,
         assertion_ttl: Duration::from_secs(90),
         http_timeout: Duration::from_secs(5),
     });

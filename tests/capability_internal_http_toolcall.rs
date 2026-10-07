@@ -270,6 +270,7 @@ async fn start_mock_govder_confirming_no_recipe() -> vultrino::govder::GovderCon
         base_url: format!("http://{addr}"),
         assertion_secret: "test-govder-assertion-secret".to_string(),
         approval_assertion_secret: None,
+        allow_shared_approval_key: false,
         assertion_ttl: std::time::Duration::from_secs(90),
         http_timeout: std::time::Duration::from_secs(5),
     }
