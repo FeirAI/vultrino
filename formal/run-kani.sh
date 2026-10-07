@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 KANI_VERSION="0.67.0"
 
 # Pure-kernel proofs only: no wasmtime. Kani 0.67 ships rustc 1.93.0-nightly;
-# wasmtime 47 declares rust-version = 1.94, so default features (wasm-plugins)
+# wasmtime 48 declares rust-version = 1.95, so default features (wasm-plugins)
 # cannot be compiled under Kani's toolchain.
 KANI_ARGS=(--no-default-features)
 

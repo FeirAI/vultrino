@@ -180,7 +180,7 @@ noninterference. Honest scope:
 - **Kani (`formal/run-kani.sh`)** runs pure-kernel harnesses with
   `--no-default-features` (no `wasm-plugins` / wasmtime). Kani 0.67 ships rustc
   **1.93** nightly; the production default feature set pulls wasmtime **47**,
-  which declares rust-version **1.94**. So Kani does **not** verify the WASM
+  which declares rust-version **1.95**. So Kani does **not** verify the WASM
   plugin host, and a default-features build is outside that proof job.
 - **Refinement (`formal/check-refinement.sh`)** is a source-shape / choke-point
   gate (execution-binding fields, permit mint sites, WASM ABI-before-copy
@@ -294,7 +294,7 @@ kernels.
 - Outbox push fan-out (today a single push subscriber; additional consumers poll).
 - A transactional storage layer for exactly-once idempotency.
 - A Kani toolchain that can verify the default `wasm-plugins` feature set (today
-  Kani 0.67’s rustc 1.93 cannot compile wasmtime 47’s rustc-1.94 MSRV — proofs
+  Kani 0.67’s rustc 1.93 cannot compile wasmtime 48’s rustc-1.95 MSRV — proofs
   stay on `--no-default-features`).
 - Migrating the Askama axum integration off `askama_axum = "0.4"` — crates.io’s
   `0.5.0+deprecated` is an empty hard-`compile_error!` stub; stay on 0.4 until a

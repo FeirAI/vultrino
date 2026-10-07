@@ -1188,7 +1188,7 @@ async fn render_tokens_list(
     let _ = state.storage.reload().await;
     let mut tokens = state.storage.list_use_tokens().await.unwrap_or_default();
     // Newest first.
-    tokens.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    tokens.sort_by_key(|b| std::cmp::Reverse(b.created_at));
     let token_displays: Vec<UseTokenDisplay> = tokens.iter().map(UseTokenDisplay::from).collect();
     let csrf_token = get_or_create_csrf_token(session).await.unwrap_or_default();
 
