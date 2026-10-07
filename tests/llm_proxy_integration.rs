@@ -1360,6 +1360,17 @@ fn minted_forms() -> Vec<String> {
     forms
 }
 
+/// An upstream Content-Type that reflects the minted token (raw and
+/// percent-encoded). The LLM proxy forwards only the upstream Content-Type to
+/// the agent, so this is the reflected header the agent can actually see.
+fn reflecting_content_type(media_type: &str) -> String {
+    let pct = minted_forms()
+        .into_iter()
+        .find(|f| f.contains("%2F"))
+        .expect("percent-encoded form");
+    format!("{media_type}; echo=\"Bearer {MINTED_TOKEN}\"; pct={pct}")
+}
+
 /// Stub upstream that mints a token during the action and then reflects its own
 /// `Authorization: Bearer <minted>` header back (in body and header), the way an
 /// echoing upstream or error body would.
@@ -1401,7 +1412,10 @@ impl Plugin for MockMintingPlugin {
         Ok(ExecuteResponse::new(
             200,
             HashMap::from([
-                ("content-type".to_string(), "application/json".to_string()),
+                (
+                    "content-type".to_string(),
+                    reflecting_content_type("application/json"),
+                ),
                 (
                     "x-echo-authorization".to_string(),
                     format!("Bearer {MINTED_TOKEN}"),
@@ -1427,7 +1441,10 @@ impl Plugin for MockMintingPlugin {
         Ok(vultrino::StreamingResponse::new(
             200,
             HashMap::from([
-                ("content-type".to_string(), "text/event-stream".to_string()),
+                (
+                    "content-type".to_string(),
+                    reflecting_content_type("text/event-stream"),
+                ),
                 (
                     "x-echo-authorization".to_string(),
                     format!("Bearer {MINTED_TOKEN}"),
@@ -1483,28 +1500,30 @@ async fn run_minting(kind: MintKind, stream: bool) -> (Vec<(String, String)>, St
 }
 
 fn assert_minted_absent(headers: &[(String, String)], body: &str) {
-    for form in minted_forms() {
-        assert!(
-            !body.contains(&form),
-            "minted token form {form:?} leaked in body: {body}"
-        );
-        for (k, v) in headers {
+    // Headers first, so a header leak fails on its own and is not masked by a
+    // body leak. The reflected Content-Type is agent-visible.
+    for (k, v) in headers {
+        for form in minted_forms() {
             assert!(
                 !v.contains(&form),
                 "minted token form {form:?} leaked in header {k}: {v}"
             );
         }
-    }
-    assert!(
-        !body.contains("AAAA1234567890zzzz"),
-        "leaked fragment: {body}"
-    );
-    for (k, v) in headers {
         assert!(
             !v.contains("AAAA1234567890zzzz"),
             "leaked fragment in {k}: {v}"
         );
     }
+    for form in minted_forms() {
+        assert!(
+            !body.contains(&form),
+            "minted token form {form:?} leaked in body: {body}"
+        );
+    }
+    assert!(
+        !body.contains("AAAA1234567890zzzz"),
+        "leaked fragment: {body}"
+    );
 }
 
 #[tokio::test]
