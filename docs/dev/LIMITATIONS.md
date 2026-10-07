@@ -212,9 +212,12 @@ kernels.
   Govder risk facts frozen at open. The parser/library default remains
   non-strict for compatibility with older stdio/embedded callers (new `vultrino
   init` files opt in); those callers must set
-  `require_declared_capabilities = true` for the same guarantee. Lean and the
-  refinement gate prove that the declared class plus recipe authority and their
-  open-to-resume continuity are enforced. They cannot establish that an operator
+  `require_declared_capabilities = true` for the same guarantee. Lean proves
+  decision tables about a hand-written model of that rule (the declared class plus
+  recipe authority and their open-to-resume continuity), and the refinement gate
+  (`formal/check-refinement.sh`) is a structural source-shape check that the code
+  still has the expected seams; neither proves the production code enforces the rule
+  end to end, which is covered by integration tests. They cannot establish that an operator
   truthfully labeled the real-world side effect reversible, that Govder's stored
   recipe is organizationally correct, or detect an external semantic change not
   reflected in either authority store; those remain explicit operational assumptions.

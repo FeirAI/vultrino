@@ -2322,6 +2322,14 @@ mod kani_recipe_proofs {
     #[kani::unwind(4)]
     fn zero_approvers_never_satisfy() {
         let recipe = any_recipe();
+        kani::cover!(
+            recipe_well_formed(&recipe),
+            "well-formed recipe reaches the check"
+        );
+        kani::cover!(
+            !recipe_well_formed(&recipe),
+            "malformed recipe reaches the check"
+        );
         assert!(!recipe_satisfied(&recipe, 0, 0, 0));
     }
 
@@ -2335,6 +2343,14 @@ mod kani_recipe_proofs {
         let avail_teammate: u32 = kani::any();
         let avail_agent: u32 = kani::any();
 
+        kani::cover!(
+            recipe_satisfied(&recipe, avail_senior, avail_teammate, avail_agent),
+            "a recipe is satisfied"
+        );
+        kani::cover!(
+            !recipe_satisfied(&recipe, avail_senior, avail_teammate, avail_agent),
+            "a recipe is not satisfied"
+        );
         if recipe_satisfied(&recipe, avail_senior, avail_teammate, avail_agent) {
             let (need_senior, need_teammate, need_agent) =
                 recipe_needs(&recipe).expect("a satisfied recipe is well formed");
@@ -2394,8 +2410,11 @@ mod kani_recipe_proofs {
         let (need_senior, need_teammate, need_agent) =
             recipe_needs(&recipe).expect("bounded human recipe is well formed");
         assert_eq!(need_agent, 0);
+        let sat = recipe_satisfied(&recipe, avail_senior, avail_teammate, 0);
+        kani::cover!(sat, "bounded recipe satisfied");
+        kani::cover!(!sat, "bounded recipe unsatisfied");
         assert_eq!(
-            recipe_satisfied(&recipe, avail_senior, avail_teammate, 0),
+            sat,
             injective_match_exists_bound_5(
                 need_senior,
                 need_teammate,
@@ -2418,6 +2437,14 @@ mod kani_recipe_proofs {
         let more_teammate: u32 = kani::any();
         let more_agent: u32 = kani::any();
 
+        kani::cover!(
+            recipe_satisfied(&recipe, senior, teammate, agent),
+            "base availability satisfies"
+        );
+        kani::cover!(
+            !recipe_satisfied(&recipe, senior, teammate, agent),
+            "base availability does not satisfy"
+        );
         if recipe_satisfied(&recipe, senior, teammate, agent) {
             assert!(recipe_satisfied(
                 &recipe,
@@ -2477,7 +2504,13 @@ mod kani_recipe_proofs {
             },
         ];
 
+        kani::cover!(
+            first.saturating_add(second) > MAX_RECIPE_TERM_COUNT,
+            "term-sum overflow case"
+        );
         for recipe in malformed {
+            kani::cover!(recipe.terms.is_empty(), "empty recipe");
+            kani::cover!(recipe.terms.len() == 2, "two-term overflow recipe");
             assert!(!recipe_well_formed(&recipe));
             assert!(!recipe_satisfied(&recipe, u32::MAX, u32::MAX, u32::MAX,));
         }
@@ -2490,6 +2523,8 @@ mod kani_recipe_proofs {
     #[kani::unwind(4)]
     fn recipe_cap_prevents_need_overflow() {
         let recipe = any_recipe();
+        kani::cover!(recipe_well_formed(&recipe), "well-formed recipe");
+        kani::cover!(!recipe_well_formed(&recipe), "malformed recipe");
         if recipe_well_formed(&recipe) {
             let (senior, teammate, agent) =
                 recipe_needs(&recipe).expect("well-formed recipe has needs");
@@ -2525,6 +2560,10 @@ mod kani_recipe_proofs {
             ApproverClass::Unknown => before,
         };
 
+        kani::cover!(!before && after, "adding a class clears the recipe");
+        kani::cover!(before, "already satisfied before");
+        kani::cover!(!before && !after, "still unsatisfied after");
+        kani::cover!(!class_fills_a_slot(&recipe, class), "class fills no slot");
         if !before && after {
             assert!(class_fills_a_slot(&recipe, class));
         }
