@@ -181,10 +181,11 @@ const IPV4_BLOCKED: [(u32, u8); 15] = [
 /// Teredo 2001::/32); that also blocks a few globally reachable anycast and
 /// AS112 sub-ranges, which is the safe direction.
 /// Source: https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
-const IPV6_BLOCKED: [(u128, u8); 11] = [
+const IPV6_BLOCKED: [(u128, u8); 12] = [
     (0x0, 96), // ::/96 unspecified, loopback, IPv4-compatible
     (0x0064_ff9b_0001_0000_0000_0000_0000_0000, 48), // 64:ff9b:1::/48 NAT64 local use
     (0x0100_0000_0000_0000_0000_0000_0000_0000, 64), // 100::/64 discard-only
+    (0x0100_0000_0000_0001_0000_0000_0000_0000, 64), // 100:0:0:1::/64 dummy IPv6 prefix (RFC 9780)
     (0x2001_0000_0000_0000_0000_0000_0000_0000, 23), // 2001::/23 IETF assignments incl. Teredo
     (0x2001_0db8_0000_0000_0000_0000_0000_0000, 32), // 2001:db8::/32 documentation
     (0x3fff_0000_0000_0000_0000_0000_0000_0000, 20), // 3fff::/20 documentation
@@ -1631,7 +1632,7 @@ mod tests {
     // 2026-10-07:
     //   https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
     //   https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
-    // Each row: (range label, an address inside, an address just outside, ).
+    // Each row: (range label, an address inside, an address just outside).
     const SB22_RANGES: &[(&str, &str, &str)] = &[
         // IPv4
         ("0.0.0.0/8", "0.255.255.255", "1.0.0.1"),
@@ -1644,6 +1645,11 @@ mod tests {
             "192.0.0.0/24 IETF protocol assignments",
             "192.0.0.1",
             "192.0.1.1",
+        ),
+        (
+            "192.88.99.0/24 6to4 relay anycast",
+            "192.88.99.1",
+            "192.88.100.1",
         ),
         ("192.0.2.0/24", "192.0.2.255", "192.0.3.1"),
         ("192.168.0.0/16", "192.168.255.255", "192.169.0.1"),
@@ -1671,10 +1677,15 @@ mod tests {
         ("::1/128 loopback", "::1", "::1:0:0"),
         (
             "64:ff9b:1::/48 NAT64 local use",
-            "64:ff9b:1:ffff::1",
+            "64:ff9b:1::808:808",
             "64:ff9b:2::808:808",
         ),
-        ("100::/64 discard", "100::1", "100:0:0:1::1"),
+        ("100::/64 discard", "100::1", "100:0:0:2::1"),
+        (
+            "100:0:0:1::/64 dummy IPv6 prefix (RFC 9780)",
+            "100:0:0:1::1",
+            "100:0:0:2::1",
+        ),
         (
             "2001::/32 Teredo",
             "2001:0:4136:e378:8000:63bf:3fff:fdd2",
@@ -1711,12 +1722,81 @@ mod tests {
         }
     }
 
+    /// Registry rows marked "Globally Reachable: False" (plus the 2001::/23 design
+    /// choice and multicast). Source CSVs, retrieved 2026-10-07:
+    ///   https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry-1.csv
+    ///   https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry-1.csv
+    /// Not listed: ::ffff:0:0/96, 64:ff9b::/96 and 2002::/16 (decoded, not table-blocked).
+    const REGISTRY_NOT_GLOBAL_V6: &[&str] = &[
+        "::1/128",
+        "::/128",
+        "64:ff9b:1::/48",
+        "100::/64",
+        "100:0:0:1::/64",
+        "2001::/23",
+        "2001:db8::/32",
+        "3fff::/20",
+        "5f00::/16",
+        "fc00::/7",
+        "fe80::/10",
+        "fec0::/10",
+        "ff00::/8",
+    ];
+    const REGISTRY_NOT_GLOBAL_V4: &[&str] = &[
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.88.99.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    ];
+
+    #[test]
+    fn test_sb22_registry_blocks_first_and_last_address_blocked() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        for c in REGISTRY_NOT_GLOBAL_V6 {
+            let (a, l) = c.split_once('/').unwrap();
+            let net = u128::from(a.parse::<Ipv6Addr>().unwrap());
+            let l: u32 = l.parse().unwrap();
+            let host = if l == 128 { 0 } else { u128::MAX >> l };
+            for addr in [net, net | host] {
+                assert!(
+                    HttpPlugin::is_private_ip(&IpAddr::V6(Ipv6Addr::from(addr))),
+                    "{c}: {} must be blocked",
+                    Ipv6Addr::from(addr)
+                );
+            }
+        }
+        for c in REGISTRY_NOT_GLOBAL_V4 {
+            let (a, l) = c.split_once('/').unwrap();
+            let net = u32::from(a.parse::<Ipv4Addr>().unwrap());
+            let l: u32 = l.parse().unwrap();
+            let host = u32::MAX >> l;
+            for addr in [net, net | host] {
+                assert!(
+                    HttpPlugin::is_private_ip(&IpAddr::V4(Ipv4Addr::from(addr))),
+                    "{c}: {} must be blocked",
+                    Ipv4Addr::from(addr)
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_sb22_tables_are_well_formed() {
         // Every entry's network address must have no bits set below its prefix, so a
         // typo in a const table cannot silently widen or shift a range.
         for (net, len) in IPV4_BLOCKED {
-            assert!(len <= 32 && v4_in_prefix(net, net, len));
+            assert!(len <= 32);
             assert_eq!(
                 net & !(u32::MAX.checked_shl(32 - len as u32).unwrap_or(0)),
                 0,
@@ -1724,7 +1804,7 @@ mod tests {
             );
         }
         for (net, len) in IPV6_BLOCKED {
-            assert!(len <= 128 && v6_in_prefix(net, net, len));
+            assert!(len <= 128);
             assert_eq!(
                 net & !(u128::MAX.checked_shl(128 - len as u32).unwrap_or(0)),
                 0,
