@@ -30,9 +30,10 @@ pub struct GovderConfig {
     /// approver of a two-person rule. Set
     /// `VULTRINO_APPROVAL_ASSERTION_SECRET` and only the broker and vultrino
     /// hold the approver-identity key; outbound signing keeps using
-    /// `assertion_secret`. Unset, the verifier falls back to `assertion_secret`
-    /// and signed approver decisions are rejected unless the explicit escape
-    /// `allow_shared_approval_key` is set (see [`Self::log_approval_key_posture`]).
+    /// `assertion_secret`. Unset, blank, unreadable or equal to
+    /// `assertion_secret`, signed approver decisions are rejected; only the
+    /// explicit escape `allow_shared_approval_key` lets the verifier use
+    /// `assertion_secret` instead (see [`Self::approval_verification_secret`]).
     pub approval_assertion_secret: Option<String>,
     /// Explicit dev/test escape (`VULTRINO_ALLOW_SHARED_APPROVAL_KEY=1`): verify
     /// approver identities with the shared govder key when no distinct
@@ -68,9 +69,10 @@ impl GovderConfig {
     /// Load from `GOVDER_BASE_URL` + `GOVDER_TENANT_ASSERTION_SECRET`.
     /// Both must be non-empty for delegate enforcement to be active.
     ///
-    /// `VULTRINO_APPROVAL_ASSERTION_SECRET` (or its `_FILE` form) is optional and
-    /// independent: it separates the approver-identity verifier from the
-    /// cross-plane client key without changing whether govder is configured.
+    /// `VULTRINO_APPROVAL_ASSERTION_SECRET` (or its `_FILE` form) is independent
+    /// of whether govder is configured, but it is REQUIRED for verified approver
+    /// decisions: without a distinct value they are rejected (see
+    /// [`Self::approval_verification_secret`]).
     pub fn from_env() -> Option<Self> {
         let base = std::env::var("GOVDER_BASE_URL")
             .ok()
@@ -107,15 +109,21 @@ impl GovderConfig {
     /// explicit shared-key escape is off. Never used for outbound signing.
     pub fn approval_verification_secret(&self) -> Option<&str> {
         match self.approval_assertion_secret.as_deref() {
-            Some(m) if m != self.assertion_secret => Some(m),
+            Some(m) if self.approval_key_is_distinct() => Some(m),
             _ if self.allow_shared_approval_key => Some(&self.assertion_secret),
             _ => None,
         }
     }
 
     /// True when the dedicated approver-identity key is configured and distinct.
+    /// The dedicated key is always trimmed on load while the shared key is not,
+    /// so compare against the trimmed shared key: a copy of F that differs only
+    /// by surrounding whitespace is still a key every F holder knows.
     fn approval_key_is_distinct(&self) -> bool {
-        matches!(self.approval_assertion_secret.as_deref(), Some(m) if m != self.assertion_secret)
+        matches!(
+            self.approval_assertion_secret.as_deref(),
+            Some(m) if m != self.assertion_secret.trim()
+        )
     }
 
     /// Startup posture line for the approver-identity key. Called once from the
@@ -144,8 +152,8 @@ impl GovderConfig {
 /// Read `VULTRINO_APPROVAL_ASSERTION_SECRET`, preferring the `_FILE` form the
 /// rest of the codebase uses for secrets (see `main::read_secret_env` and the
 /// workload-assertion verifier). A blank or unreadable value is treated as
-/// unset: the fallback is the existing behaviour, and the startup warning says
-/// the deployment is on it.
+/// unset, which disables verified approver decisions unless the explicit
+/// shared-key escape is on; the startup posture line says which.
 fn approval_assertion_secret_from_env() -> Option<String> {
     if let Ok(path) = std::env::var("VULTRINO_APPROVAL_ASSERTION_SECRET_FILE") {
         if !path.trim().is_empty() {
@@ -156,8 +164,8 @@ fn approval_assertion_secret_from_env() -> Option<String> {
                         return Some(secret);
                     }
                     tracing::warn!(
-                        "VULTRINO_APPROVAL_ASSERTION_SECRET_FILE is empty; falling back to the \
-                         shared govder assertion secret"
+                        "VULTRINO_APPROVAL_ASSERTION_SECRET_FILE is empty; treating the \
+                         approver-identity key as unset"
                     );
                 }
                 Err(error) => {
@@ -166,8 +174,8 @@ fn approval_assertion_secret_from_env() -> Option<String> {
                     tracing::warn!(
                         %error,
                         path = %path,
-                        "VULTRINO_APPROVAL_ASSERTION_SECRET_FILE cannot be read; falling back \
-                         to the shared govder assertion secret"
+                        "VULTRINO_APPROVAL_ASSERTION_SECRET_FILE cannot be read; treating \
+                         the approver-identity key as unset"
                     );
                 }
             }
@@ -1020,6 +1028,11 @@ mod tests {
             cfg(Some("m"), false).approval_verification_secret(),
             Some("m")
         );
+        // A copy of F that differs only by whitespace is not a distinct key.
+        let mut padded = cfg(Some("shared-f"), false);
+        padded.assertion_secret = "shared-f\n".into();
+        assert_eq!(padded.approval_verification_secret(), None);
+        assert!(posture_log(&padded).contains("ERROR"));
         assert!(posture_log(&cfg(None, false)).contains("ERROR"));
         assert!(posture_log(&cfg(Some("shared-f"), false)).contains("ERROR"));
         assert_eq!(posture_log(&cfg(Some("m"), false)), "");
