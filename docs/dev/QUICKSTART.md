@@ -8,7 +8,7 @@ authoritative record of how the binary is actually built, configured, and run.
 
 ## Prerequisites
 
-- **Rust 1.94.0** (edition 2021; pinned in `rust-toolchain.toml` — `rustup`
+- **Rust 1.95.0** (edition 2021; pinned in `rust-toolchain.toml` — `rustup`
   installs it). Matches the CI / wasmtime-47 MSRV floor.
 - **TLS:** reqwest is built with `rustls-tls` — no system OpenSSL development
   packages are required for a normal build.
