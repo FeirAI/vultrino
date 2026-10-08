@@ -580,10 +580,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|s| !s.trim().is_empty());
     config.govder = vultrino::govder::GovderConfig::from_env();
-    // Say once, at startup, when the key that verifies WHO approved is the same
-    // shared key other planes hold.
+    // Say at startup whether verified approver decisions are enabled, disabled,
+    // or running on the explicit shared-key escape.
     if let Some(govder) = config.govder.as_ref() {
-        govder.warn_if_approval_secret_shared();
+        govder.log_approval_key_posture();
     }
     // averin seal-client API key (plan 086): env-only so a config dump never
     // carries it. Only consulted when `[averin] enabled = true`.
@@ -2451,7 +2451,7 @@ async fn create_use_token(
 async fn list_use_tokens(config: Config, format: String) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
     let mut tokens = storage.list_use_tokens().await?;
-    tokens.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    tokens.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
     if tokens.is_empty() {
         println!("No use tokens found");
@@ -2529,7 +2529,7 @@ async fn revoke_use_token(config: Config, id: String) -> Result<(), Box<dyn std:
 async fn list_approvals(config: Config, format: String) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
     let mut approvals = storage.list_approvals().await?;
-    approvals.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    approvals.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
     if approvals.is_empty() {
         println!("No approval requests");

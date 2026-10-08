@@ -248,6 +248,9 @@ impl PluginRegistry {
     }
 
     /// Find a plugin that supports the given credential type
+    ///
+    /// Ambiguous: several plugins claim the same type (e.g. OAuth2, google_service_account) and
+    /// the map order decides. It has no callers; dispatch goes by plugin name.
     pub fn find_by_credential_type(&self, cred_type: &CredentialType) -> Option<Arc<dyn Plugin>> {
         let plugins = self.plugins.read();
         plugins

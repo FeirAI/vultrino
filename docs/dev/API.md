@@ -435,7 +435,12 @@ ticket subject) and `approver_class`, plus an `X-Govder-Tenant-Assertion` signed
 over the exact tenant, method, path, query, Host, and raw JSON body. When that
 header is present Vultrino requires a valid, unexpired assertion (server-capped
 at five minutes) before recording `verified:<subject>`; any mismatch fails `401`
-and records nothing. Without the header the identity remains
+and records nothing. The assertion is verified with
+`VULTRINO_APPROVAL_ASSERTION_SECRET`; when that key is not configured, or equals
+`GOVDER_TENANT_ASSERTION_SECRET`, a request carrying the header is refused
+`403 verified_approvals_disabled` and records nothing (unless the dev/test
+escape `VULTRINO_ALLOW_SHARED_APPROVAL_KEY=1` is set, see CONFIGURATION.md).
+Without the header the identity remains
 `agg:<acting-key-id>:<claimed-operator>`, and one key may contribute at most one
 positive slot to a multi-person recipe. A bearer key alone therefore cannot
 manufacture two approvers, while one verified broker can transport two distinct

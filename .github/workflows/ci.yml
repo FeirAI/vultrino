@@ -7,19 +7,27 @@ on:
 
 jobs:
   kani:
-    name: Kani pure-kernel proofs
+    name: Kani pure-kernel proofs (with vacuity gate)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Install only — do not run bare `cargo-kani` (the action default), which
-      # would try to verify the whole crate including wasmtime and fail Kani
-      # 0.67's rustc-1.93 MSRV check. formal/run-kani.sh drives the harnesses
-      # with `--no-default-features` (no wasm-plugins / wasmtime).
-      - uses: model-checking/kani-github-action@v1.1
+      # Install exactly the version pinned in formal/run-kani.sh. Do not run
+      # bare `cargo kani` on the whole crate: it would try to build wasmtime,
+      # which fails Kani 0.67's rustc-1.93 MSRV check; run-kani.sh passes
+      # `--no-default-features` per harness.
+      - uses: actions/cache@v4
         with:
-          kani-version: 0.67.0
-          command: cargo-kani
-          args: --version
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-0.67.0-${{ runner.os }}
+      - name: install pinned Kani
+        run: |
+          if ! cargo kani --version 2>/dev/null | grep -q ' 0.67.0$'; then
+            cargo install --locked kani-verifier@0.67.0
+            cargo kani setup
+          fi
       - run: bash formal/run-kani.sh
 
   lean:
@@ -46,9 +54,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # The Rust version is pinned in rust-toolchain.toml (1.94.0 + clippy/rustfmt). cargo honors that file
+      # The Rust version is pinned in rust-toolchain.toml (1.95.0 + clippy/rustfmt). cargo honors that file
       # regardless of which toolchain this action installs, so local builds and CI share ONE source of truth.
-      # The zero-warning clippy gate below therefore always runs under 1.94.0. Bump it there, not here
+      # The zero-warning clippy gate below therefore always runs under 1.95.0. Bump it there, not here
       # (mirrors averin/.github/workflows/ci.yml). components: is a belt-and-suspenders pre-install.
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -85,3 +93,14 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
         run: cargo audit
+
+  ci-required:
+    name: ci-required
+    if: always()
+    needs: [kani, lean, rust, audit]
+    runs-on: ubuntu-latest
+    steps:
+      - name: every required job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: echo "$NEEDS" | jq -e 'to_entries | all(.value.result == "success")'

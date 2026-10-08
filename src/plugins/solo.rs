@@ -4,6 +4,7 @@
 //! the file so the connector can be reviewed as one narrow, deny-by-default
 //! capability surface.
 
+use super::google_sa::{self, token_is_stale};
 use super::{Plugin, PluginError, PluginRequest};
 use crate::config::SoloPins;
 use crate::{Credential, CredentialData, CredentialType, ExecuteResponse, Secret};
@@ -654,13 +655,6 @@ fn attach_credential_update(
     })
 }
 
-fn token_is_stale(access_token: Option<&Secret>, expires_at: Option<DateTime<Utc>>) -> bool {
-    match access_token {
-        None => true,
-        Some(_) => expires_at.is_some_and(|expires| Utc::now() + Duration::seconds(300) >= expires),
-    }
-}
-
 async fn refresh_google_token(
     client: &Client,
     client_id: &str,
@@ -718,87 +712,14 @@ async fn effective_google_credential(
     match &credential.data {
         CredentialData::OAuth2 { .. } => google_oauth_credential(client, credential).await,
         CredentialData::GoogleServiceAccount { .. } => {
-            google_service_account_credential(client, credential).await
+            let token_url =
+                Url::parse(google_sa::GOOGLE_TOKEN_URI).expect("Google token URL is valid");
+            google_sa::service_account_token(client, credential, &token_url, &[]).await
         }
         _ => Err(PluginError::UnsupportedCredentialType(
             "solo Sheets/Calendar actions require oauth2 or google_service_account".into(),
         )),
     }
-}
-
-/// Mint a fresh access token from the service-account key, or hand back the
-/// cached one when it is still comfortably in date.
-///
-/// The credential is re-validated here even though the create path already
-/// validated it: use time is the last gate before the private key is exercised,
-/// and the vault is not the only way a record can arrive.
-async fn google_service_account_credential(
-    client: &Client,
-    credential: &Credential,
-) -> Result<(Credential, Option<CredentialData>, String), PluginError> {
-    let CredentialData::GoogleServiceAccount {
-        client_email,
-        private_key,
-        private_key_id,
-        token_uri,
-        scopes,
-        access_token,
-        expires_at,
-    } = &credential.data
-    else {
-        return Err(PluginError::UnsupportedCredentialType(
-            "solo service-account path requires google_service_account".into(),
-        ));
-    };
-    // Use-time re-validation, cheap half first. The pinned endpoint, the
-    // service-account address, the key id and the scope allowlist are re-checked
-    // on EVERY governed call, including the ones served from the cached token.
-    // The PKCS#8 parse is not: it is the expensive part and it is unavoidable on
-    // the mint path anyway (`signed_assertion` parses the key it signs with, and
-    // refuses with the same messages), so a cache hit no longer pays for it.
-    credential
-        .data
-        .validate_admission_fields()
-        .map_err(|reason| invalid(reason.to_string()))?;
-    if !token_is_stale(access_token.as_ref(), *expires_at) {
-        return Ok((
-            credential.clone(),
-            None,
-            access_token.as_ref().unwrap().expose().into(),
-        ));
-    }
-    // validate_admission has already proved this is byte-for-byte the pinned
-    // endpoint, so the parse cannot fail on operator input.
-    let token_url = Url::parse(token_uri)
-        .map_err(|_| invalid("google_service_account token_uri is not a URL"))?;
-    let token = crate::plugins::google_sa::mint_access_token(
-        client,
-        &token_url,
-        client_email,
-        private_key.expose(),
-        private_key_id,
-        scopes,
-    )
-    .await?;
-    let expires_at = token.expires_in.and_then(|seconds| {
-        i64::try_from(seconds)
-            .ok()
-            .and_then(Duration::try_seconds)
-            .and_then(|duration| Utc::now().checked_add_signed(duration))
-    });
-    let updated_data = CredentialData::GoogleServiceAccount {
-        client_email: client_email.clone(),
-        private_key: private_key.clone(),
-        private_key_id: private_key_id.clone(),
-        token_uri: token_uri.clone(),
-        scopes: scopes.clone(),
-        access_token: Some(Secret::new(token.access_token.clone())),
-        expires_at,
-    };
-    let mut effective = credential.clone();
-    effective.data = updated_data.clone();
-    effective.updated_at = Utc::now();
-    Ok((effective, Some(updated_data), token.access_token))
 }
 
 async fn google_oauth_credential(
@@ -2098,18 +2019,10 @@ mod tests {
 
     // ---- google_service_account ----------------------------------------
     //
-    // The mock token endpoint lives on 127.0.0.1, which `build_guarded_client`
-    // deliberately cannot reach (its connect-time resolver keeps public IPs
-    // only). These tests therefore use a client that keeps the one property
-    // under test here (`redirect::Policy::none()`) and drops only the DNS
-    // guard. Production still goes through `build_guarded_client`:
-    // `SoloPlugin::new` is the only constructor the registry calls.
-    fn loopback_client() -> Client {
-        Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("test client builds")
-    }
+    // The loopback client and recording token endpoint are the shared
+    // fixtures from `google_sa::tests`; see the note there on why the test
+    // client drops only the DNS guard.
+    use crate::plugins::google_sa::tests::{loopback_client, recording_token_server};
 
     const SA_EMAIL: &str = "solo@feir-demo.iam.gserviceaccount.com";
     const SA_KID: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -2132,43 +2045,6 @@ mod tests {
             access_token: access_token.map(Secret::new),
             expires_at,
         }
-    }
-
-    /// A token endpoint that records every request it receives and answers with
-    /// `reply`. Returns its base URL and the recording.
-    async fn recording_token_server(
-        status: u16,
-        reply: Value,
-    ) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
-        let hits: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorder = hits.clone();
-        let app = Router::new().route(
-            "/{*path}",
-            any(move |request: axum::extract::Request| {
-                let recorder = recorder.clone();
-                let reply = reply.clone();
-                async move {
-                    let uri = request.uri().to_string();
-                    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
-                        .await
-                        .unwrap_or_default();
-                    recorder
-                        .lock()
-                        .unwrap()
-                        .push((uri, String::from_utf8_lossy(&body).to_string()));
-                    (
-                        axum::http::StatusCode::from_u16(status).unwrap(),
-                        Json(reply),
-                    )
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{address}/token"), hits)
     }
 
     /// A fresh cached token is handed straight back: no mint, and no credential
