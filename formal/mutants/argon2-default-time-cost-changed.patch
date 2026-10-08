@@ -1,0 +1,13 @@
+diff --git a/src/crypto/encrypt.rs b/src/crypto/encrypt.rs
+index e4ea40c..00fb60c 100644
+--- a/src/crypto/encrypt.rs
++++ b/src/crypto/encrypt.rs
+@@ -119,7 +119,7 @@ impl Default for KdfParams {
+         // key that `Argon2::default()` produced when the vault was created. See the type doc.
+         Self {
+             m_cost: 19 * 1024,
+-            t_cost: 2,
++            t_cost: 3,
+             p_cost: 1,
+         }
+     }

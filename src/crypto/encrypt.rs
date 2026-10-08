@@ -4,7 +4,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use argon2::{password_hash::SaltString, Algorithm, Argon2, Params, PasswordHasher, Version};
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::{rngs::SysRng, TryRng};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -133,28 +133,20 @@ pub fn derive_key(
     salt: &[u8],
     params: KdfParams,
 ) -> Result<MasterKey, CryptoError> {
-    // Use a fixed salt string for Argon2 (the actual salt is in the data)
-    let salt_string = SaltString::encode_b64(salt)
-        .map_err(|e| CryptoError::KeyDerivationFailed(e.to_string()))?;
-
     // Pin the cost params explicitly instead of relying on `Argon2::default()` (whose values are a
-    // crate default that can shift under a version bump). `output_len: None` matches `Params::DEFAULT`
-    // exactly, so the derived key is identical to the pre-pinning derivation for the default params.
-    let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, None)
+    // crate default that can shift under a version bump). The output is 32 bytes, the length the
+    // argon2 0.5 PHC path produced for `output_len: None`.
+    let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(KEY_SIZE))
         .map_err(|e| CryptoError::KeyDerivationFailed(e.to_string()))?;
     let argon2 = Argon2::new(Algorithm::default(), Version::default(), argon_params);
 
-    // Hash the password
-    let hash = argon2
-        .hash_password(password.expose_secret().as_bytes(), &salt_string)
+    // The raw salt bytes go straight in. argon2 0.5 reached the same bytes by base64-encoding the
+    // salt into a PHC `SaltString` and decoding it again inside `hash_password`, so the derived
+    // key is unchanged (tests/argon2_kat.rs proves it against 0.5.3 fixtures).
+    let mut key_bytes = vec![0u8; KEY_SIZE];
+    argon2
+        .hash_password_into(password.expose_secret().as_bytes(), salt, &mut key_bytes)
         .map_err(|e| CryptoError::KeyDerivationFailed(e.to_string()))?;
-
-    // Get the hash output and use first 32 bytes as key
-    let hash_bytes = hash
-        .hash
-        .ok_or_else(|| CryptoError::KeyDerivationFailed("No hash output".to_string()))?;
-
-    let key_bytes: Vec<u8> = hash_bytes.as_bytes()[..KEY_SIZE].to_vec();
     MasterKey::from_bytes(key_bytes)
 }
 
@@ -288,12 +280,11 @@ mod tests {
 
         let pinned = derive_key(&password, &salt, KdfParams::default()).unwrap();
 
-        // Reproduce the pre-pinning derivation independently: Argon2::default() + first 32 bytes.
-        let salt_string = SaltString::encode_b64(&salt).unwrap();
-        let hash = Argon2::default()
-            .hash_password(password.expose_secret().as_bytes(), &salt_string)
+        // Reproduce the pre-pinning derivation independently: crate default params, 32 bytes out.
+        let mut legacy_key = vec![0u8; KEY_SIZE];
+        Argon2::default()
+            .hash_password_into(password.expose_secret().as_bytes(), &salt, &mut legacy_key)
             .unwrap();
-        let legacy_key = hash.hash.unwrap().as_bytes()[..KEY_SIZE].to_vec();
 
         assert_eq!(
             pinned.as_bytes(),
