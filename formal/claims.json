@@ -159,6 +159,18 @@
     },
     "kani-ssrf-nat64-decode-dropped": {
       "tier": "full"
+    },
+    "policy-precedence-deny-prompt-swapped": {
+      "tier": "fast"
+    },
+    "policy-precedence-tail-allow": {
+      "tier": "fast"
+    },
+    "kani-policy-precedence-default-allow-over-prompt": {
+      "tier": "full"
+    },
+    "rate-limit-default-deny-validation-removed": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -1051,6 +1063,99 @@
         "kani-ssrf-nat64-decode-dropped"
       ],
       "does_not_establish": "The drift lock covers whole files (symbol *) because it cannot address the IPV4_BLOCKED and IPV6_BLOCKED constants, so any edit to http.rs or the spec file needs a deliberate relock. That the IANA registry itself is correct or current: the CSV snapshots were fetched on 2026-10-08 and the spec tables are transcribed from them, so a later registry change is not noticed until the snapshots are refreshed by hand. That the spec is the right policy: it blocks multicast, 192.88.99.0/24, ::/96, fec0::/10 and the registry-reachable rows inside blocked rows (192.0.0.9/32 and 192.0.0.10/32 inside 192.0.0.0/24; 2001:1::1/128, 2001:1::2/128, 2001:1::3/128, 2001:3::/32, 2001:4:112::/48, 2001:20::/28 and 2001:30::/28 inside 2001::/23) on purpose, and it decodes NAT64 over 64:ff9b::/32 (not only the /96 well-known prefix) because the shipped decode does not check the middle 64 bits; both only over-block. The proof covers the pure classifier on an address value only. It does not cover DNS resolution or rebinding, redirects, proxies, hostname parsing, other URL spellings of an address (decimal, octal, bracketed forms handled by the URL parser), the HMAC plugin or any other caller, the separate internal_http allowlist (is_internal_destination_ip), or the config-time is_link_local_or_metadata_ip check. The cover (vacuity) check lives in formal/run-kani.sh, not in this detector, which checks only that the tests and harnesses pass. Kani reasons about the Rust standard library address conversions as shipped in its toolchain; it does not cover the wasm-plugins build."
+    },
+    {
+      "id": "policy-precedence-exhaustive",
+      "statement": "The pure precedence function equals the written order kill > deny > prompt > allow > policy default > engine default for every sequence of up to 4 rule outcomes (kill, deny, prompt, allow, no-match; every multiset in every order), every sequence of up to 3 policy default actions and both engine defaults; its result does not change when the outcome or default lists are reordered; its fail-closed tail is never reached anywhere in that domain; and the tail itself denies. Example tests check that the engine maps each outcome to the decision and the policy name in the deny reason.",
+      "method": "exhaustive",
+      "artifacts": [
+        "src/policy/precedence.rs",
+        "src/policy/mod.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact policy::precedence::tests::precedence_equals_spec_and_is_order_independent_over_the_finite_domain policy::precedence::tests::precedence_order_examples policy::precedence::tests::the_unreachable_tail_fails_closed policy::tests::engine_maps_precedence_outcomes_with_policy_names",
+      "covers": [
+        {
+          "path": "src/policy/precedence.rs",
+          "symbol": "resolve_precedence",
+          "sha256": "0e71ed7a91b724dc90f276143de029deacf39282e9037f4bc194b95e1b95c1b7"
+        },
+        {
+          "path": "src/policy/precedence.rs",
+          "symbol": "fail_closed_tail",
+          "sha256": "3c12df2aedd923032a23aacdc5de71e40bb47966431e1a279166b7f6d0d3d6cd"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::evaluate_inner",
+          "sha256": "00862c011c609f69d0c796df529aeaa1c5028c2214186de24184614ce888170c"
+        }
+      ],
+      "mutants": [
+        "policy-precedence-deny-prompt-swapped",
+        "policy-precedence-tail-allow"
+      ],
+      "does_not_establish": "Only the precedence step. Whether a rule matches (URL, method, time window, rate limit, spend cap, action label) is outside it, and the domain is bounded at 4 outcomes and 3 policy defaults. The engine wiring (which rules are scanned, in what order, and that the scan stops at the first match so weaker tiers are not charged) is checked by example tests only, and the first matching rule within a tier is chosen by storage order. The oracle is test code. Layered Allow-RateLimit rules are still first-match, not conjunctive. The engine default applies only when no policy matches, and is not applied on top of a matching policy's default."
+    },
+    {
+      "id": "kani-policy-precedence",
+      "statement": "For every list of up to 4 rule outcomes, every list of up to 3 policy default actions and both engine defaults, the precedence function returns the verdict with the highest rank in the order kill > deny > prompt > allow > policy default deny > prompt > allow > engine default, swapping two entries of either list does not change it, and it never returns the fail-closed tail. All nine verdict kinds are reachable in the harness (cover statements, enforced by the vacuity gate in run-kani.sh).",
+      "method": "kani",
+      "artifacts": [
+        "src/policy/precedence.rs",
+        "formal/run-kani.sh"
+      ],
+      "gates": [
+        "kani"
+      ],
+      "detector": "set -e; cargo kani --no-default-features --harness policy::precedence::kani_precedence_proofs::precedence_is_the_maximum_rank_and_order_independent --exact",
+      "covers": [
+        {
+          "path": "src/policy/precedence.rs",
+          "symbol": "resolve_precedence",
+          "sha256": "0e71ed7a91b724dc90f276143de029deacf39282e9037f4bc194b95e1b95c1b7"
+        },
+        {
+          "path": "src/policy/precedence.rs",
+          "symbol": "fail_closed_tail",
+          "sha256": "3c12df2aedd923032a23aacdc5de71e40bb47966431e1a279166b7f6d0d3d6cd"
+        }
+      ],
+      "mutants": [
+        "kani-policy-precedence-default-allow-over-prompt"
+      ],
+      "does_not_establish": "Bounded: lists longer than 4 outcomes or 3 defaults are not covered by the proof (the exhaustive test covers the same bounds). The rank table in the harness is written by hand. Nothing about rule matching or the engine code that builds the lists. Swap-based order independence is checked for one swap of each list per run, not for every permutation at once."
+    },
+    {
+      "id": "rate-limit-default-deny-validation",
+      "statement": "Policy::validate refuses a policy that contains a RateLimit condition at any depth (top level, inside and, or, not) unless its default action is deny, and accepts the deny-default shape. An exhausted Allow-RateLimit rule falls through to the policy default in the engine (deny under deny, prompt under prompt, allow under allow), which is why the validation exists.",
+      "method": "test",
+      "artifacts": [
+        "src/policy/types.rs",
+        "src/policy/mod.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact policy::types::tests::test_policy_with_rate_limit_must_default_deny policy::tests::exhausted_rate_limit_falls_through_to_the_policy_default",
+      "covers": [
+        {
+          "path": "src/policy/types.rs",
+          "symbol": "Policy::validate",
+          "sha256": "b1f98b4b88afc64c56109721f804a8bc19f1ac6a4cbc0a977cc2294756fd1cb0"
+        },
+        {
+          "path": "src/policy/types.rs",
+          "symbol": "condition_contains_rate_limit",
+          "sha256": "99b5e313dc5aba225e54c471f769a71421f17dd0c8ed366bd4eec3fc8eae0f87"
+        }
+      ],
+      "mutants": [
+        "rate-limit-default-deny-validation-removed"
+      ],
+      "does_not_establish": "Validation runs at config load and on the admin API, not when policies are read back from the vault, so a policy stored before this check keeps working as written. The engine itself does not validate, so a policy added through PolicyEngine::add_policy without validation is not refused. Example tests over a few condition shapes. Layered rate limits remain first-match."
     }
   ]
 }
