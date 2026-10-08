@@ -153,6 +153,12 @@
     },
     "lean-model-agent-reviewer-guard-dropped": {
       "tier": "full"
+    },
+    "kani-ssrf-v4-benchmarking-row-dropped": {
+      "tier": "full"
+    },
+    "kani-ssrf-nat64-decode-dropped": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -1010,6 +1016,41 @@
         "lean-model-agent-reviewer-guard-dropped"
       ],
       "does_not_establish": "supported_recipe_satisfies_every_floor follows from the definition of a supported recipe: its risk tier, autonomy and irreversibility arguments are unused, so it does not model a floor that depends on them. Nothing about the execution-boundary theorems in ExecutionSafety.lean (separate claim). Sign-off sets are abstract counts and flags, so how the Rust code derives named, distinct and resolved sign-offs is not covered. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "kani-ssrf-classifier",
+      "statement": "Kani bounded model checking (0.67.0, pure-kernel build without wasm plugins) shows that HttpPlugin::is_private_ip returns the same answer as an independent specification for every IPv4 address (all 2^32 values) and every IPv6 address (all 2^128 values), with the IPv4-mapped, NAT64 and 6to4 decode branches and the outright Teredo and NAT64 local-use blocks each exercised by a satisfiable kani::cover. The specification is a separate transcription of the IANA special-purpose registry snapshots committed under formal/vectors/, plus documented extra policy ranges, and a normal test asserts its registry tables equal the rows parsed from the committed CSV files.",
+      "method": "kani",
+      "artifacts": [
+        "src/plugins/http.rs",
+        "src/plugins/http/ssrf_spec.rs",
+        "formal/vectors/iana-ipv4-special-registry-1.csv",
+        "formal/vectors/iana-ipv6-special-registry-1.csv",
+        "formal/vectors/README.md",
+        "formal/run-kani.sh"
+      ],
+      "gates": [
+        "kani",
+        "rust"
+      ],
+      "detector": "set -e; cargo test --locked --no-default-features --lib -- plugins::http::ssrf_spec::tests; for h in plugins::http::ssrf_spec::kani_ssrf_proofs::ipv4_classifier_equals_spec_over_all_u32 plugins::http::ssrf_spec::kani_ssrf_proofs::ipv6_classifier_equals_spec_over_all_u128; do cargo kani --no-default-features --harness $h --exact; done",
+      "covers": [
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "*",
+          "sha256": "ffc3ab185a64d9173895ad182675af536c3ecf1b1d67e5d50bff80e01897c6a5"
+        },
+        {
+          "path": "src/plugins/http/ssrf_spec.rs",
+          "symbol": "*",
+          "sha256": "d70afdcad7decf4f3c70ac6b784bfb1d68d8dc4318ab159a5bd6148de359e55a"
+        }
+      ],
+      "mutants": [
+        "kani-ssrf-v4-benchmarking-row-dropped",
+        "kani-ssrf-nat64-decode-dropped"
+      ],
+      "does_not_establish": "The drift lock covers whole files (symbol *) because it cannot address the IPV4_BLOCKED and IPV6_BLOCKED constants, so any edit to http.rs or the spec file needs a deliberate relock. That the IANA registry itself is correct or current: the CSV snapshots were fetched on 2026-10-08 and the spec tables are transcribed from them, so a later registry change is not noticed until the snapshots are refreshed by hand. That the spec is the right policy: it blocks multicast, 192.88.99.0/24, ::/96, fec0::/10 and the registry-reachable carve-outs 192.0.0.9/32 and 192.0.0.10/32 on purpose, and it decodes NAT64 over 64:ff9b::/32 (not only the /96 well-known prefix) because the shipped decode does not check the middle 64 bits; both only over-block. The proof covers the pure classifier on an address value only. It does not cover DNS resolution or rebinding, redirects, proxies, hostname parsing, other URL spellings of an address (decimal, octal, bracketed forms handled by the URL parser), the HMAC plugin or any other caller, or the config-time is_link_local_or_metadata_ip check. The cover (vacuity) check lives in formal/run-kani.sh, not in this detector, which checks only that the tests and harnesses pass. Kani reasons about the Rust standard library address conversions as shipped in its toolchain; it does not cover the wasm-plugins build."
     }
   ]
 }
