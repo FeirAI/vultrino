@@ -335,7 +335,8 @@ remaining per-replica multiplication, which is inherent to in-process counters.)
 `default_action` is deny (config load and admin API). Policies already stored in
 the vault are not re-validated when loaded, so one saved earlier with an allow or
 prompt default keeps working as written: when its Allow-`RateLimit` rule is
-exhausted the request falls through to that default and is allowed (or prompted).
+exhausted and no other rule matches, the request falls through to that default
+and is allowed (or prompted).
 Re-save such a policy through the admin API (which validates) or change its
 default to deny. No warning is logged for these today; adding a log-only check on
 load is a follow-up.

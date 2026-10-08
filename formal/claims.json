@@ -1165,7 +1165,7 @@
     },
     {
       "id": "rate-limit-default-deny-validation",
-      "statement": "Policy::validate refuses a policy that contains a RateLimit condition at any depth (top level, inside and, or, not) unless its default action is deny, and accepts the deny-default shape. An exhausted Allow-RateLimit rule falls through to the policy default in the engine (deny under deny, prompt under prompt, allow under allow), which is why the validation exists.",
+      "statement": "Policy::validate refuses a policy that contains a RateLimit condition at any depth (top level, inside and, or, not) unless its default action is deny, and accepts the deny-default shape. An exhausted Allow-RateLimit rule stops matching; when no other rule matches, the request falls through to the policy default in the engine (deny under deny, prompt under prompt, allow under allow), which is why the validation exists.",
       "method": "test",
       "artifacts": [
         "src/policy/types.rs",
@@ -1190,7 +1190,7 @@
       "mutants": [
         "rate-limit-default-deny-validation-removed"
       ],
-      "does_not_establish": "Validation runs at config load and on the admin API, not when policies are read back from the vault, so a policy stored before this check keeps working as written. The engine itself does not validate, so a policy added through PolicyEngine::add_policy without validation is not refused. Example tests over a few condition shapes. Layered rate limits remain first-match."
+      "does_not_establish": "Validation runs at config load and on the admin API, not when policies are read back from the vault, so a policy stored before this check keeps working as written. The engine itself does not validate, so a policy added through PolicyEngine::add_policy without validation is not refused. Example tests over a few condition shapes. Layered rate limits remain first-match. Default deny makes an over-limit request a denial only when no other rule matches it: the exhausted rule falls through to the other deny, prompt and allow rules of every matching policy first, so another allow rule (in this or another matching policy) still allows the request, and a rule whose only condition is a RateLimit allows every request on the credential until it is spent."
     }
   ]
 }
