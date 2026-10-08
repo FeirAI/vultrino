@@ -1,0 +1,12 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index e434852..b86ab3b 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -5642,7 +5642,6 @@ pub async fn refresh_policies_with_hooks(
+     // ticket order equals list-read order. The ticket compare stays as a second
+     // guard. Visibility of another process's write is still bounded by the
+     // refresh interval: this lock is per process.
+-    let _cycle = engine.lock_load().await;
+     let ticket = engine.begin_load();
+     after_ticket.await;
+     storage.reload().await?;

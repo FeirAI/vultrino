@@ -60,6 +60,9 @@
     "refresh-stale-load-overwrites-newer": {
       "tier": "fast"
     },
+    "refresh-load-lock-removed": {
+      "tier": "full"
+    },
     "rate-window-allows-one-past-max": {
       "tier": "fast"
     },
@@ -295,7 +298,7 @@
     },
     {
       "id": "policy-refresh-ordering",
-      "statement": "A periodic policy refresh that listed stored policies before an admin write cannot overwrite the newer admin reload: loads are ticketed, and an older ticket is discarded, in a deterministic interleaving test that races a kill-policy write against a stale refresh.",
+      "statement": "A periodic policy refresh that has already listed stored policies cannot overwrite a newer admin reload that carries a kill policy: both load paths take one in-process async load lock across ticket, vault re-read, list and apply (with a ticket compare as a second guard), in a deterministic interleaving test that starts an admin write and reload inside the refresh window and checks the admin reload waits and the kill policy survives.",
       "method": "test",
       "artifacts": [
         "src/policy/mod.rs",
@@ -307,6 +310,11 @@
       ],
       "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact test_refresh_listing_before_kill_policy_cannot_overwrite_newer_admin_reload",
       "covers": [
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::lock_load",
+          "sha256": "cf893a631251d670d14453eee0feade8760846b35d573bfe4711772ba0243add"
+        },
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::begin_load",
@@ -324,14 +332,20 @@
         },
         {
           "path": "src/server/mod.rs",
+          "symbol": "refresh_policies_with_hooks",
+          "sha256": "97141188534a1340132d17b169db8849caabc94c78cd85414345e1e095ebc282"
+        },
+        {
+          "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::reload_policies",
           "sha256": "09d865612c11111e1fc95b0800f7676492fe7cc4a20a4a6c85f08e0876ba9ecd"
         }
       ],
       "mutants": [
-        "refresh-stale-load-overwrites-newer"
+        "refresh-stale-load-overwrites-newer",
+        "refresh-load-lock-removed"
       ],
-      "does_not_establish": "One scripted interleaving, not a model of all schedules. Does not cover multi-process races on shared storage, a lost write in storage itself, or other policy load paths that call load_policies directly (construction and tests)."
+      "does_not_establish": "One scripted interleaving, not a model of all schedules. The lock is per process: another process's write becomes visible only on the next refresh tick, so cross-process visibility is bounded-staleness, not instant. Removing only the ticket compare (the second guard) is not detected by this test. Does not cover other policy load paths that call load_policies directly (construction and tests) or a lost write in storage itself."
     },
     {
       "id": "rate-limiter-vectors",
