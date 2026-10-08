@@ -21,16 +21,20 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          run=$(gh run list -R "$REPO" --workflow ci --branch main --limit 1 --json conclusion,status,url,headSha --jq '.[0] // {}')
-          concl=$(jq -r '.conclusion // ""' <<<"$run")
-          url=$(jq -r '.url // ""' <<<"$run")
-          sha=$(jq -r '.headSha // ""' <<<"$run")
           gh label create main-red --color B60205 --description "main CI is red" -R "$REPO" 2>/dev/null || true
+          red=""; pending=0; seen=0
+          for ev in push schedule; do
+            run=$(gh run list -R "$REPO" --workflow ci --branch main --event "$ev" --limit 1 --json conclusion,status,url,headSha --jq '.[0] // {}')
+            st=$(jq -r '.status // ""' <<<"$run"); concl=$(jq -r '.conclusion // ""' <<<"$run")
+            [ -z "$st" ] && continue
+            seen=1
+            if [ "$st" != "completed" ]; then pending=1; continue; fi
+            if [ "$concl" != "success" ]; then red="$red\n- $ev run on $(jq -r .headSha <<<"$run"): $concl $(jq -r .url <<<"$run")"; fi
+          done
           open=$(gh issue list -R "$REPO" --label main-red --state open --json number --jq '.[0].number // empty')
-          if [ "$concl" = "success" ]; then
-            if [ -n "$open" ]; then gh issue close "$open" -R "$REPO" --comment "main CI is green again: $url"; fi
-            exit 0
+          if [ -n "$red" ]; then
+            body=$(printf 'Latest completed ci runs on main that are not green:%b' "$red")
+            if [ -n "$open" ]; then gh issue comment "$open" -R "$REPO" --body "$body"; else gh issue create -R "$REPO" --title "main CI is red" --label main-red --body "$body"; fi
+          elif [ "$seen" = 1 ] && [ "$pending" = 0 ] && [ -n "$open" ]; then
+            gh issue close "$open" -R "$REPO" --comment "Latest push and scheduled ci runs on main are green."
           fi
-          if [ -z "$concl" ]; then exit 0; fi
-          body="Latest ci run on main ($sha) concluded: $concl. $url"
-          if [ -n "$open" ]; then gh issue comment "$open" -R "$REPO" --body "$body"; else gh issue create -R "$REPO" --title "main CI is red" --label main-red --body "$body"; fi

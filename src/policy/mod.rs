@@ -13,9 +13,9 @@ pub use types::*;
 
 use crate::RequestContext;
 use glob::Pattern;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -214,6 +214,14 @@ pub struct PolicyEngine {
     /// `true` = fail-closed (deny), `false` = fail-open (allow, legacy).
     /// Read on the hot path, so it's a plain atomic rather than a lock.
     default_deny: AtomicBool,
+    /// Source of monotonically increasing load tickets (see [`Self::begin_load`]).
+    next_load_ticket: AtomicU64,
+    /// Highest ticket whose policy list has been applied. Guards the
+    /// compare-and-swap in [`Self::load_policies_if_newer`].
+    applied_load_ticket: Mutex<u64>,
+    /// Async mutex serializing whole load cycles (ticket, storage reload, list,
+    /// apply). See [`Self::lock_load`].
+    load_cycle: tokio::sync::Mutex<()>,
 }
 
 impl PolicyEngine {
@@ -230,6 +238,9 @@ impl PolicyEngine {
             policies: RwLock::new(Vec::new()),
             rate_limits: RwLock::new(HashMap::new()),
             default_deny: AtomicBool::new(true),
+            next_load_ticket: AtomicU64::new(0),
+            applied_load_ticket: Mutex::new(0),
+            load_cycle: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -270,7 +281,42 @@ impl PolicyEngine {
         policies.clone()
     }
 
-    /// Load policies from configuration
+    /// Serialize a whole load cycle. Hold the guard from [`Self::begin_load`]
+    /// through the storage reload, the list and [`Self::load_policies_if_newer`],
+    /// in BOTH the periodic refresh and the admin reload. With it, a load cannot
+    /// start listing while another is between list and apply, so ticket order
+    /// equals list-read order. The ticket compare stays as a second guard.
+    /// Not reentrant: do not call a reload while holding the guard.
+    pub async fn lock_load(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.load_cycle.lock().await
+    }
+
+    /// Take a load ticket. Call this BEFORE reading the policy list from storage
+    /// (and, for an admin path, AFTER the storage write it must observe). A list
+    /// read under a ticket can then only replace the engine's set if no list read
+    /// under a later ticket has been applied already, so a stale list can never
+    /// overwrite a newer one (for example, drop a freshly written kill policy).
+    pub fn begin_load(&self) -> u64 {
+        self.next_load_ticket.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Replace the policy set with `policies` unless a list read under a later
+    /// ticket was already applied. Returns whether the set was replaced. The
+    /// compare and the swap happen under one lock, so concurrent loads serialize.
+    pub fn load_policies_if_newer(&self, ticket: u64, policies: Vec<Policy>) -> bool {
+        let mut applied = self.applied_load_ticket.lock();
+        if ticket <= *applied {
+            return false;
+        }
+        *applied = ticket;
+        let mut p = self.policies.write();
+        *p = policies;
+        true
+    }
+
+    /// Load policies from configuration (unconditional; used at construction and
+    /// in tests). Runtime reloads from storage use [`Self::begin_load`] and
+    /// [`Self::load_policies_if_newer`] instead.
     pub fn load_policies(&self, policies: Vec<Policy>) {
         let mut p = self.policies.write();
         *p = policies;

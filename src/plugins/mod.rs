@@ -29,7 +29,9 @@ pub use buffer::BufferPlugin;
 pub use ecdsa::EcdsaPlugin;
 pub use hmac::HmacPlugin;
 pub use http::HttpPlugin;
-pub(crate) use http::{build_guarded_client, read_body_capped, REQUEST_TIMEOUT};
+pub(crate) use http::{
+    build_guarded_client, is_link_local_or_metadata_ip, read_body_capped, REQUEST_TIMEOUT,
+};
 pub use installer::PluginInstaller;
 pub(crate) use internal_http::is_internal_destination_ip;
 pub use internal_http::{

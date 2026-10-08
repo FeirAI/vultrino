@@ -171,6 +171,20 @@ those — checking **every** resolved IP, not just an IP literal. OAuth2 token U
 get the same guard and must be HTTPS. So a proxied request to `127.0.0.1` or a
 metadata endpoint is denied at the transport step.
 
+The authoritative list of ranges the HTTP plugin's guard blocks is the
+`IPV4_BLOCKED` and `IPV6_BLOCKED` tables in `src/plugins/http.rs`, plus the IPv4
+address carried inside an IPv4-mapped (`::ffff:0:0/96`), NAT64 (`64:ff9b::/96`) or
+6to4 (`2002::/16`) address, which the guard decodes and checks as IPv4. The prose
+above is a summary; the code wins if they differ.
+
+The config-time `llm.provider_base` check is narrower on purpose. It looks only at an
+IP-literal host and rejects link-local addresses (`169.254.0.0/16`, `fe80::/10`) and
+the AWS IPv6 metadata address `fd00:ec2::254`, including those addresses written in
+IPv4-mapped, IPv4-compatible, NAT64 or 6to4 form. It does not resolve host names and
+does not know every provider's metadata address (for example Alibaba Cloud's
+`100.100.100.200`). It allows loopback and RFC1918 so self-hosted model gateways
+work. Requests sent through the HTTP plugin still pass the execute-time guard above.
+
 ## Google service accounts (`google_service_account`)
 
 The RFC 7523 JWT-bearer credential type (`src/plugins/google_sa.rs`) is admitted only
