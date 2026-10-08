@@ -162,11 +162,14 @@ fn host_part(s: &str) -> Option<&str> {
 }
 
 /// Comparison form used only to decide whether canonicalisation changed what a
-/// pattern means: percent escapes normalised, case folded, default ports and a
-/// trailing slash ignored. Anything else that differs (fragment, dot segments,
-/// backslashes, a moved `?`) is a meaning change.
+/// pattern means: percent escapes decoded (the parser encodes `{`, `}`, a space
+/// and the like in the URL the same way, so such an escape is not a change),
+/// case folded, default ports and a trailing slash ignored. Anything else that
+/// differs (fragment, dot segments, backslashes, a moved `?`) is a meaning
+/// change.
 fn loose(s: &str) -> String {
-    let mut t = normalize_percent(s).to_ascii_lowercase();
+    let mut t =
+        String::from_utf8_lossy(&urlencoding::decode_binary(s.as_bytes())).to_ascii_lowercase();
     for port in [":443", ":80"] {
         t = t
             .replace(&format!("{port}/"), "/")
@@ -176,6 +179,14 @@ fn loose(s: &str) -> String {
         }
     }
     t.trim_end_matches('/').to_string()
+}
+
+/// Whether a `*` cuts a percent escape short (`/v1/%2*`, `a%*b`). That `%` is
+/// re-encoded as `%25`, so the pattern no longer matches the escapes it used to
+/// match. `loose` cannot see this: it decodes `%25` back to the same `%`.
+fn star_cuts_an_escape(pattern: &str) -> bool {
+    let b = pattern.as_bytes();
+    (0..b.len()).any(|i| b[i] == b'%' && b[i + 1..].iter().take(2).any(|&c| c == b'*'))
 }
 
 /// Canonicalise a policy pattern. Same two shapes as before: a trailing `*`
@@ -243,7 +254,7 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
     if host_only {
         warnings.push(PatternWarning::StarAfterHost);
     }
-    if loose(body) != loose(&canon) {
+    if loose(body) != loose(&canon) || star_cuts_an_escape(pattern) {
         warnings.push(PatternWarning::MeaningChanged);
     }
     let text = if host_only {
@@ -385,6 +396,10 @@ mod tests {
         // Quiet cases: case, default port, percent rewrites, plain prefixes.
         for quiet in [
             "https://api.example.com/*",
+            // The parser encodes `{` and `}` in a path; the URL side is encoded
+            // the same way, so this is not a meaning change.
+            "https://api.telegram.org/bot{credential}/sendMessage",
+            "https://api.example.com/a b/*",
             "HTTPS://API.example.com:443/v1/%61*",
             "https://api.github.com/x",
             "*",
@@ -428,6 +443,10 @@ mod tests {
         assert!(w("*.example.com/*").contains(&PatternWarning::StarInHost));
         assert!(w("*example.com*").contains(&PatternWarning::StarInHost));
         assert!(!w("https://api?.example.com/v1/*/x").is_empty());
+        // A `*` that cuts an escape short: the stray `%` is re-encoded as %25.
+        assert!(w("https://api.example.com/v1/%2*").contains(&PatternWarning::MeaningChanged));
+        assert!(w("https://api.example.com/v1/a%*/x").contains(&PatternWarning::MeaningChanged));
+        assert!(w("https://api.example.com/v1/%2F*").is_empty());
         assert_eq!(canonical_pattern("HTTPS://*").text, "https://*");
         assert_eq!(
             canonical_pattern("https://api?.example.com/v1/*/x").text,

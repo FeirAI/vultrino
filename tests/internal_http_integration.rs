@@ -944,8 +944,9 @@ async fn query_is_forwarded_and_is_part_of_the_policy_matched_string() {
 
     // Strict policy with url_glob "/v1/refunds": a query-bearing `url` no longer
     // matches the glob, so it is DENIED. This is the authoring nuance packs must
-    // respect — pin `url_glob` with a trailing `*` if the agent may pass a query
-    // inside `url`, or require the `query` map instead.
+    // respect: pin `url_glob` with a trailing `*` if the agent may pass a query.
+    // Since SB-03 the `query` map is merged into the judged URL too, so moving the
+    // query into the map does not get past an exact glob either.
     let (server2, storage2) = build_server(operator_config(port, "")).await;
     let token2 = seed(
         &storage2,
@@ -965,6 +966,19 @@ async fn query_is_forwarded_and_is_part_of_the_policy_matched_string() {
     .await
     .expect_err("a query inside `url` changes the policy-matched string");
     eprintln!("QUERY-IN-URL vs STRICT url_glob -> {err}");
+    assert!(err.to_lowercase().contains("polic"), "{err}");
+    // SB-03: the server judges the `query` map merged into the URL, so the same
+    // exact glob refuses the query when it arrives in the map instead.
+    let err = run(
+        &server2,
+        &token2,
+        refund_request(
+            "finsandbox-refund",
+            serde_json::json!({"url": "/v1/refunds", "method": "POST", "query": {"dry_run": "1"}}),
+        ),
+    )
+    .await
+    .expect_err("a query in the `query` map changes the policy-matched string");
     assert!(err.to_lowercase().contains("polic"), "{err}");
 }
 

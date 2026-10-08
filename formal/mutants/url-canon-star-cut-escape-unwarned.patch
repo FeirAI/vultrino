@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index 7f0576d..17088ca 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -254,7 +254,7 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
+     if host_only {
+         warnings.push(PatternWarning::StarAfterHost);
+     }
+-    if loose(body) != loose(&canon) || star_cuts_an_escape(pattern) {
++    if loose(body) != loose(&canon) || false && star_cuts_an_escape(pattern) {
+         warnings.push(PatternWarning::MeaningChanged);
+     }
+     let text = if host_only {
