@@ -108,6 +108,7 @@ Every claim is bounded; read the last column before citing one.
 - The Kani vacuity (cover) gate is enforced by `formal/run-kani.sh` in the `kani`
   job, not by the mutation detectors.
 - The phrase list in `overclaim_denylist` is seeded from claim styles this
-  repository should not use and from wording that earlier downgrades removed
-  ("refinement gate prove", "gates prove enforcement"). Phrases such as "fails closed" are used widely and
+  repository should not use and from wording that earlier documentation
+  downgrades removed (the list itself is in `formal/claims.json`, which is not
+  scanned). Phrases such as "fails closed" are used widely and
   legitimately for specific code paths, so they are not on the list.
