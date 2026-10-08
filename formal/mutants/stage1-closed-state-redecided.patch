@@ -1,0 +1,13 @@
+diff --git a/src/approval/mod.rs b/src/approval/mod.rs
+index 7f5f5db..c73e0cf 100644
+--- a/src/approval/mod.rs
++++ b/src/approval/mod.rs
+@@ -1620,7 +1620,7 @@ impl ApprovalRequest {
+             && !self.executed
+             && self.delegate_veto_until.map(|t| now < t).unwrap_or(false)
+             && decision.approver_kind != "delegate-agent";
+-        if !self.status.is_open() && !is_delegate_veto {
++        if !self.status.is_open() && !is_delegate_veto && self.status != ApprovalStatus::Approved {
+             return Err(ApprovalError::AlreadyDecided(self.status));
+         }
+         let sod = self.sod_for(&identity);

@@ -1,0 +1,12 @@
+diff --git a/src/approval/mod.rs b/src/approval/mod.rs
+index 7f5f5db..3116e57 100644
+--- a/src/approval/mod.rs
++++ b/src/approval/mod.rs
+@@ -469,6 +469,7 @@ impl ApproverClass {
+             "senior" => Some(ApproverClass::Senior),
+             "teammate" => Some(ApproverClass::Teammate),
+             "agent-reviewer" => Some(ApproverClass::AgentReviewer),
++            "" => Some(ApproverClass::Teammate),
+             _ => None,
+         }
+     }

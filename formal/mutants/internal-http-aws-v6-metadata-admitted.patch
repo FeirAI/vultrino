@@ -1,0 +1,13 @@
+diff --git a/src/plugins/internal_http.rs b/src/plugins/internal_http.rs
+index a63ac74..2cfc1d0 100644
+--- a/src/plugins/internal_http.rs
++++ b/src/plugins/internal_http.rs
+@@ -108,7 +108,7 @@ pub(crate) fn is_internal_destination_ip(ip: &IpAddr) -> bool {
+                 return is_internal_destination_ip(&IpAddr::V4(mapped));
+             }
+             // AWS IPv6 metadata endpoint, inside fc00::/7.
+-            if *v6 == std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254) {
++            if *v6 == std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0255) {
+                 return false;
+             }
+             let seg = v6.segments();

@@ -1,0 +1,13 @@
+diff --git a/src/approval/mod.rs b/src/approval/mod.rs
+index 7f5f5db..c04f92e 100644
+--- a/src/approval/mod.rs
++++ b/src/approval/mod.rs
+@@ -2256,7 +2256,7 @@ fn recipe_well_formed(r: &Recipe) -> bool {
+         // rejected outright — this is how a huge (or negative-after-wrap on the wire)
+         // count would otherwise let a small sign-off set clear a recipe reading as
+         // enormous on paper.
+-        if t.count == 0 || t.count > MAX_RECIPE_TERM_COUNT {
++        if t.count > MAX_RECIPE_TERM_COUNT {
+             return false;
+         }
+         // Running total, capped after every addition (BLOCKER 3): catches both a

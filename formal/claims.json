@@ -85,6 +85,48 @@
     },
     "lean-approval-freshness-check-dropped": {
       "tier": "full"
+    },
+    "vectors-leftover-senior-ignored": {
+      "tier": "full"
+    },
+    "sweeps-zero-count-allowed": {
+      "tier": "full"
+    },
+    "greedy-leftover-senior-ignored": {
+      "tier": "full"
+    },
+    "stage1-closed-state-redecided": {
+      "tier": "full"
+    },
+    "stage1-blank-identity-accepted": {
+      "tier": "full"
+    },
+    "stage1-extreme-tier-not-forced": {
+      "tier": "fast"
+    },
+    "stage1-unknown-class-parsed": {
+      "tier": "full"
+    },
+    "stage1-unusable-credential-not-blocked": {
+      "tier": "full"
+    },
+    "roundtrip-blank-identity-accepted": {
+      "tier": "full"
+    },
+    "ssrf-metadata-v6-row-dropped": {
+      "tier": "full"
+    },
+    "ssrf-link-local-nat64-not-decoded": {
+      "tier": "full"
+    },
+    "internal-http-alibaba-metadata-admitted": {
+      "tier": "fast"
+    },
+    "internal-http-aws-v6-metadata-admitted": {
+      "tier": "full"
+    },
+    "refresh-vault-not-reloaded": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -310,7 +352,7 @@
     },
     {
       "id": "policy-refresh-ordering",
-      "statement": "A periodic policy refresh that has already listed stored policies cannot overwrite a newer admin reload that carries a kill policy: both load paths take one in-process async load lock across ticket, vault re-read, list and apply (with a ticket compare as a second guard), in a scripted interleaving test that starts an admin write and reload inside the refresh window, waits 150 ms, and checks the admin reload has not finished and the kill policy survives.",
+      "statement": "A periodic policy refresh that has already listed stored policies cannot overwrite a newer admin reload that carries a kill policy: both load paths take one in-process async load lock across ticket, vault re-read, list and apply (with a ticket compare as a second guard), in a scripted interleaving test that starts an admin write and reload inside the refresh window, waits 150 ms, and checks the admin reload has not finished and the kill policy survives. A second scripted interleaving (the refresh takes its ticket first, a local admin reload waits, then another process writes a kill policy to the same vault) checks that the refresh re-reads the vault and the kill policy becomes live.",
       "method": "test",
       "artifacts": [
         "src/policy/mod.rs",
@@ -320,7 +362,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact test_refresh_listing_before_kill_policy_cannot_overwrite_newer_admin_reload",
+      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact test_refresh_listing_before_kill_policy_cannot_overwrite_newer_admin_reload test_refresh_taking_ticket_first_still_applies_cross_process_kill_policy",
       "covers": [
         {
           "path": "src/policy/mod.rs",
@@ -360,9 +402,10 @@
       ],
       "mutants": [
         "refresh-stale-load-overwrites-newer",
-        "refresh-load-lock-removed"
+        "refresh-load-lock-removed",
+        "refresh-vault-not-reloaded"
       ],
-      "does_not_establish": "One scripted interleaving, not a model of all schedules. The wait check relies on a 150 ms sleep: on a very slow machine a mutant could survive, but the unmutated code cannot fail it, because the admin reload is blocked on the lock. The lock is per process: another process's write becomes visible only on the next refresh tick, so cross-process visibility is bounded-staleness, not instant. Removing only the ticket compare (the second guard) is not detected by this test. Does not cover other policy load paths that call load_policies directly (construction and tests) or a lost write in storage itself."
+      "does_not_establish": "One scripted interleaving, not a model of all schedules. The wait check relies on a 150 ms sleep: on a very slow machine a mutant could survive, but the unmutated code cannot fail it, because the admin reload is blocked on the lock. The lock is per process: another process's write becomes visible only on the next refresh tick, so cross-process visibility is bounded-staleness, not instant. Cross-process visibility in the second test is the same bounded staleness: the test writes before the refresh re-read, it does not show the write is seen if it lands after. Removing only the ticket compare (the second guard) is not detected by this test. Does not cover other policy load paths that call load_policies directly (construction and tests) or a lost write in storage itself."
     },
     {
       "id": "rate-limiter-vectors",
@@ -504,6 +547,248 @@
         "lean-approval-freshness-check-dropped"
       ],
       "does_not_establish": "A property of the Lean model, not of the Rust code: the model is hand-written and not extracted from Rust, and the link is the structural refinement gate only. The detector runs lake build, not the independent nanda check that CI also runs. Only ExecutionSafety.lean is drift-locked, not Model.lean that it imports. The one-shot theorem is stated over the consumed-binding list: it means at most one execution per approval binding only together with State.afterExecute recording every approved binding (a model change that stopped recording would keep the theorem true)."
+    },
+    {
+      "id": "recipe-shared-vectors",
+      "method": "differential-vectors",
+      "statement": "vultrino's recipe satisfaction function agrees with the committed shared vector file src/approval/testdata/recipe_vectors.json (byte-identical to govder internal/oversight/testdata/recipe_vectors.json; both sides pin its sha256), including the rows that are unrepresentable and the rows whose agent-reviewer terms must be unsatisfiable.",
+      "artifacts": [
+        "src/approval/recipe_conformance.rs",
+        "src/approval/testdata/recipe_vectors.json"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::recipe_conformance::vectors_satisfied_matches_the_shared_contract approval::recipe_conformance::vectors_unrepresentable_rows_really_are_unrepresentable approval::recipe_conformance::vectors_agent_reviewer_terms_are_unsatisfiable",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_well_formed",
+          "sha256": "14f21e8791f51c93676c9018ad11055ed6d52dc8f376bb1e2fda85f809eb4ac8"
+        }
+      ],
+      "mutants": [
+        "vectors-leftover-senior-ignored"
+      ],
+      "does_not_establish": "Agreement only on the committed vectors and on the sweep domain they were generated over. The govder half runs only in govder CI, not here: this claim shows vultrino matches the file, and the pinned hash shows the file did not change, not that govder currently matches it. Two implementations can agree and both be wrong (the exhaustive claims check correctness against an independent oracle over a bounded domain). Says nothing about sign-off collection or identity handling."
+    },
+    {
+      "id": "recipe-sweeps-exhaustive",
+      "method": "exhaustive",
+      "statement": "recipe_satisfied agrees with an independent maximum-matching oracle at every point of three committed sweeps (human axis, agent-reviewer simplex, cap cliff), senior-first greedy equals the oracle over the sweep domain, and the oracle itself is shown to discriminate a wrong implementation.",
+      "artifacts": [
+        "src/approval/recipe_conformance.rs",
+        "src/approval/testdata/recipe_vectors.json"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::recipe_conformance::sweep_human_axis_exhaustive approval::recipe_conformance::sweep_agent_reviewer_simplex_exhaustive approval::recipe_conformance::sweep_cap_cliff_exhaustive approval::recipe_conformance::greedy_senior_first_is_optimal approval::recipe_conformance::matching_oracle_is_discriminating",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_well_formed",
+          "sha256": "14f21e8791f51c93676c9018ad11055ed6d52dc8f376bb1e2fda85f809eb4ac8"
+        }
+      ],
+      "mutants": [
+        "sweeps-zero-count-allowed"
+      ],
+      "does_not_establish": "Only the sweep domains named in the vector file (small need and availability bounds plus the cap cliff). Not a proof for all counts. The oracle is a second hand-written implementation in the same test module, not an extracted specification. Sweeps check satisfaction, not sign-off collection."
+    },
+    {
+      "id": "recipe-greedy-optimal-real-cap",
+      "method": "exhaustive",
+      "statement": "At the real per-recipe cap of 64 sign-offs, the senior-first greedy rule used by recipe_satisfied agrees with the independent split-search oracle on every enumerated need and availability combination, and the split-search oracle agrees with the unit matching oracle.",
+      "artifacts": [
+        "src/approval/stage1_proofs.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::stage1_proofs::greedy_is_optimal_at_the_real_cap approval::stage1_proofs::split_search_oracle_agrees_with_the_unit_matching_oracle",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_well_formed",
+          "sha256": "14f21e8791f51c93676c9018ad11055ed6d52dc8f376bb1e2fda85f809eb4ac8"
+        }
+      ],
+      "mutants": [
+        "greedy-leftover-senior-ignored"
+      ],
+      "does_not_establish": "The enumerated domain in the test (see the test body for the exact bounds), with three classes and one recipe term per class. Recipes with several alternative terms are covered by the Kani and vector claims, not here. The oracles are test-local code."
+    },
+    {
+      "id": "approval-lifecycle-table",
+      "method": "exhaustive",
+      "statement": "The approval decision transition accepts or rejects every one of 720 enumerated states (status, target, executed flag, veto window, approver kind, ttl expiry, identity shape) exactly as an independently written legality oracle says, including the guard order (a blank identity is refused before the ttl check), and an unnamed principal fills no recipe slot.",
+      "artifacts": [
+        "src/approval/stage1_proofs.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::stage1_proofs::lifecycle_table_is_total_and_guard_order_holds approval::stage1_proofs::blank_identity_guard_runs_before_the_ttl_guard approval::stage1_proofs::an_unnamed_principal_fills_no_slot",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalRequest::transition",
+          "sha256": "99a3400485ee6c8f1170f77e85fe4eb229a2fc1b913a40c246db7e6b1aabb3b3"
+        }
+      ],
+      "mutants": [
+        "stage1-closed-state-redecided",
+        "stage1-blank-identity-accepted"
+      ],
+      "does_not_establish": "Only the 720 enumerated states, with three identity shapes and two approver kinds; no recipe-gated or multi-approver sequences (the property claim samples those). The oracle is hand-written in the test file. Says nothing about persistence, concurrency or the API layer that calls the transition."
+    },
+    {
+      "id": "approval-wire-tables",
+      "method": "exhaustive",
+      "statement": "The closed wire and state decisions are enumerated: risk-tier text forces deny-on-any-deny for every spelling except Low, Medium and High (blank and unknown included), approver-class parsing accepts only the three exact spellings, the recipe decision-mode JSON decodes every listed shape to deny-on-any-deny except the one majority spelling, and the execution-state classifier matches its oracle over all 80 combinations of status, executed, failed and credential check.",
+      "artifacts": [
+        "src/approval/stage1_proofs.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::stage1_proofs::risk_tier_and_approver_class_wire_tables_fail_closed approval::stage1_proofs::recipe_decision_mode_json_shapes_fail_closed approval::stage1_proofs::execution_state_table_is_total_over_all_closed_axes",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "risk_tier_forces_deny_on_any_deny",
+          "sha256": "0299719bb33f7fe872728a41a115a71a40ae815c309144816329778d8d36b0f6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApproverClass::parse_wire",
+          "sha256": "a7b99c732799336932fff81ae57c54769095a6e16bc9a086ba41d0e22172c01c"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "execution_state_at_decision",
+          "sha256": "a930b1947b65dfecf4d0c53870df0e25ff4590230922ed0038ffb8ea48935096"
+        }
+      ],
+      "mutants": [
+        "stage1-extreme-tier-not-forced",
+        "stage1-unknown-class-parsed",
+        "stage1-unusable-credential-not-blocked"
+      ],
+      "does_not_establish": "Listed spellings only (ten risk-tier strings, six class strings, nine JSON shapes), not every possible string. The execution-state oracle is a restatement of the same rules in test code. Does not show the callers use these functions on every path, nor the Lean model of execution."
+    },
+    {
+      "id": "approval-vault-roundtrip-property",
+      "method": "property",
+      "statement": "For 20,000 generated sequences of approve and deny decisions (numeric and recipe gated, several identity shapes including blank and aggregator-prefixed), every state produced by the real transition passes the vault shape check, survives a serde round trip unchanged, and passes the shape check again after decoding.",
+      "artifacts": [
+        "src/approval/stage1_proofs.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::stage1_proofs::reachable_approval_vault_roundtrip_preserves_invariants_20k",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalRequest::transition",
+          "sha256": "99a3400485ee6c8f1170f77e85fe4eb229a2fc1b913a40c246db7e6b1aabb3b3"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalRequest::validate_vault_shape",
+          "sha256": "2f75f2222359e3109382e8915e9e3bf9a67d30556e96cf909f9aea29f37f28da"
+        }
+      ],
+      "mutants": [
+        "roundtrip-blank-identity-accepted"
+      ],
+      "does_not_establish": "Random sampling with a fixed case count, not an exhaustive or symbolic check; decision sequences are at most 6 long with at most 3 required approvals. It checks that transition output satisfies validate_vault_shape, so a defect that both functions share would pass. Does not cover load-time handling of a tampered vault file beyond the shape check, nor state reached by paths other than approve and deny."
+    },
+    {
+      "id": "ssrf-link-local-config-check",
+      "method": "test",
+      "statement": "The config-time check on llm.provider_base rejects the link-local and cloud-metadata range in every listed spelling (dotted, decimal and hex IPv4, IPv4-mapped, IPv4-compatible, NAT64, 6to4, fe80::/10, the AWS IPv6 metadata address) and accepts the listed neighbouring addresses, through is_link_local_or_metadata_ip.",
+      "artifacts": [
+        "src/plugins/http.rs",
+        "src/capability/mod.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact capability::tests::test_llm_validate_ssrf_narrowed_to_link_local",
+      "covers": [
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "is_link_local_or_metadata_ip",
+          "sha256": "cdf4953522a4ff91be20a0d64f9623a8f9b044001c2f75a3ceece898ba9d3ef1"
+        },
+        {
+          "path": "src/capability/mod.rs",
+          "symbol": "Capability::validate",
+          "sha256": "511dada4c8fdd8d7739caa694e6ca9b7c713509e935aa968fdc3bee49ce4376e"
+        }
+      ],
+      "mutants": [
+        "ssrf-metadata-v6-row-dropped",
+        "ssrf-link-local-nat64-not-decoded"
+      ],
+      "does_not_establish": "One example-based test over listed spellings, not the address space. This is a config-time defence in depth; the execute-time classifier is covered by ssrf-special-purpose. Hostnames that resolve to metadata addresses (DNS), redirects and a provider_base changed after validation are not covered. Loopback and RFC1918 provider bases are deliberately allowed."
+    },
+    {
+      "id": "internal-http-allowlist",
+      "method": "test",
+      "statement": "The internal_http destination classifier admits only the listed loopback, RFC1918, CGNAT and unique-local addresses, refuses link-local, documentation, multicast, broadcast, NAT64 and 6to4 encodings and the Alibaba (100.100.100.200) and AWS IPv6 (fd00:ec2::254) metadata endpoints, and every admitted address is one the public-only http guard refuses.",
+      "artifacts": [
+        "src/plugins/internal_http.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact plugins::internal_http::tests::internal_address_space_is_an_allowlist_and_excludes_metadata",
+      "covers": [
+        {
+          "path": "src/plugins/internal_http.rs",
+          "symbol": "is_internal_destination_ip",
+          "sha256": "8dde411c196bf26ad228f37fe7741983c31deea25bbbdbed1c7b9acfad6efaa6"
+        }
+      ],
+      "mutants": [
+        "internal-http-alibaba-metadata-admitted",
+        "internal-http-aws-v6-metadata-admitted"
+      ],
+      "does_not_establish": "Listed addresses only, not an exhaustive check of the address space. Says nothing about hostname resolution, redirects or connect-time rebinding for internal_http, nor the allowlist configured per capability. Other cloud metadata endpoints not on the list are not tested."
     }
   ]
 }
