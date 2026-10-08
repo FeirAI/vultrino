@@ -2577,7 +2577,10 @@ async fn test_refresh_listing_before_kill_policy_cannot_overwrite_newer_admin_re
             .unwrap();
         server.reload_policies().await.unwrap();
         assert!(
-            engine.list_policies().iter().any(|p| p.id == "halt:agent-x"),
+            engine
+                .list_policies()
+                .iter()
+                .any(|p| p.id == "halt:agent-x"),
             "admin reload must install the kill policy"
         );
     })
@@ -2585,7 +2588,10 @@ async fn test_refresh_listing_before_kill_policy_cannot_overwrite_newer_admin_re
     .unwrap();
 
     assert!(
-        engine.list_policies().iter().any(|p| p.id == "halt:agent-x"),
+        engine
+            .list_policies()
+            .iter()
+            .any(|p| p.id == "halt:agent-x"),
         "a refresh that listed before the kill-policy write must not drop it"
     );
 
@@ -2593,7 +2599,10 @@ async fn test_refresh_listing_before_kill_policy_cannot_overwrite_newer_admin_re
     vultrino::server::refresh_policies_once(&storage, &engine, &[])
         .await
         .unwrap();
-    assert!(engine.list_policies().iter().any(|p| p.id == "halt:agent-x"));
+    assert!(engine
+        .list_policies()
+        .iter()
+        .any(|p| p.id == "halt:agent-x"));
 }
 
 #[tokio::test]
