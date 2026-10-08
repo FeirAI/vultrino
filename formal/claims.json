@@ -520,7 +520,7 @@
         "sb04-shared-key-fallback-without-escape",
         "sb04-equal-key-counts-as-distinct"
       ],
-      "does_not_establish": "The unit tests cover the key-selection function. The 403 on the decision route (api_decide_approval) has route-level tests in tests/web_smoke.rs that run in the rust job, but they are not registered, not run by this detector and not drift-locked. Key strength, key distribution and whether the broker signs with the dedicated key are operational matters."
+      "does_not_establish": "The unit tests cover the key-selection function. They pad only the shared key; the dedicated key is trimmed at load by approval_assertion_secret_from_env, which is not drift-locked and not exercised here. The 403 on the decision route (api_decide_approval) has route-level tests in tests/web_smoke.rs that run in the rust job, but they are not registered, not run by this detector and not drift-locked. Key strength, key distribution and whether the broker signs with the dedicated key are operational matters."
     },
     {
       "id": "refinement-structural",
