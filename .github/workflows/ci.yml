@@ -4,38 +4,45 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  schedule:
+    # Re-check main at least daily so main-health sees a fresh result even when
+    # nothing is pushed.
+    - cron: '41 5 * * *'
 
 jobs:
   kani:
     name: Kani pure-kernel proofs (with vacuity gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Install exactly the version pinned in formal/run-kani.sh. Do not run
       # bare `cargo kani` on the whole crate: it would try to build wasmtime,
       # which fails Kani 0.67's rustc-1.93 MSRV check; run-kani.sh passes
       # `--no-default-features` per harness.
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/cargo-kani
             ~/.cargo/bin/kani
             ~/.kani
-          key: kani-0.67.0-${{ runner.os }}
+            ~/.rustup/toolchains/nightly-2025-11-21-*
+          key: kani-0.67.0-nightly-2025-11-21-${{ runner.os }}
       - name: install pinned Kani
         run: |
           if ! cargo kani --version 2>/dev/null | grep -q ' 0.67.0$'; then
             cargo install --locked kani-verifier@0.67.0
-            cargo kani setup
           fi
+          # Always run setup: ~/.kani holds a toolchain link into ~/.rustup, so a
+          # restored cache with a missing toolchain directory must be repaired.
+          cargo kani setup
       - run: bash formal/run-kani.sh
 
   lean:
     name: Lean critical-boundary proofs (no sorry)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: leanprover/lean-action@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: leanprover/lean-action@f061402b660e0c34644504b324e830f2991d4865 # v1.6.1
         with:
           lake-package-directory: formal/lean
           auto-config: false
@@ -53,15 +60,15 @@ jobs:
     name: build + test + clippy (zero-warning gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The Rust version is pinned in rust-toolchain.toml (1.95.0 + clippy/rustfmt). cargo honors that file
       # regardless of which toolchain this action installs, so local builds and CI share ONE source of truth.
       # The zero-warning clippy gate below therefore always runs under 1.95.0. Bump it there, not here
       # (mirrors averin/.github/workflows/ci.yml). components: is a belt-and-suspenders pre-install.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --locked
       - run: bash formal/check-refinement.sh
       - run: cargo test --locked
@@ -86,9 +93,9 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
