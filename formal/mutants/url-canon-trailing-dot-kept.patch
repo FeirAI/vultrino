@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index d476b1f..23782a4 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -101,7 +101,7 @@ fn one_pass(raw: &str) -> Option<String> {
+     // `host.` and `host` are the same destination (client-side DNS): drop the
+     // trailing dot so one spelling remains.
+     let trimmed = match u.host() {
+-        Some(url::Host::Domain(h)) if h.ends_with('.') => Some(h.trim_end_matches('.').to_string()),
++        Some(url::Host::Domain(h)) if false && h.ends_with('.') => Some(h.trim_end_matches('.').to_string()),
+         _ => None,
+     };
+     if let Some(h) = trimmed {

@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 644acd1..3794e77 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -475,7 +475,7 @@ impl PolicyEngine {
+             if canonical_url(raw).is_none() {
+                 if let Some(p) = matching_policies.iter().find(|p| {
+                     p.rules.iter().any(|r| {
+-                        (matches!(r.action, PolicyAction::Deny | PolicyAction::Prompt)
++                        (matches!(r.action, PolicyAction::Deny)
+                             && contains_url_match(&r.condition))
+                             || contains_negated_url_match(&r.condition, false)
+                     })

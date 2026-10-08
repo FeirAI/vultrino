@@ -1,15 +1,13 @@
 diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
-index 626d366..11142e9 100644
+index d476b1f..fadce12 100644
 --- a/src/policy/url_canon.rs
 +++ b/src/policy/url_canon.rs
-@@ -187,7 +187,9 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
-         warnings.push(PatternWarning::MeaningChanged);
-     }
-     CanonPattern {
--        text: if prefix_mode {
-+        text: if prefix_mode && warnings.contains(&PatternWarning::StarAfterHost) {
-+            pattern.to_string()
-+        } else if prefix_mode {
-             format!("{canon}*")
-         } else {
-             canon
+@@ -269,7 +269,7 @@ pub fn canonical_matches(url: &str, pattern: &str) -> bool {
+         let host_only = prefix
+             .split_once("://")
+             .is_some_and(|(_, r)| !r.is_empty() && !r.contains('/'));
+-        if host_only {
++        if false && host_only {
+             let rest = &url[prefix.len()..];
+             return rest.is_empty() || rest.starts_with(['/', ':', '?']);
+         }

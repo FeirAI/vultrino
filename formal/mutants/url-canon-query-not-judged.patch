@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index d476b1f..eb21351 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -289,7 +289,7 @@ pub fn effective_url(
+     query: &std::collections::HashMap<String, String>,
+ ) -> Option<String> {
+     let base = canonical_url(url)?;
+-    if query.is_empty() {
++    if true {
+         return Some(base);
+     }
+     let mut pairs: Vec<_> = query.iter().collect();

@@ -1,8 +1,8 @@
 diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
-index 626d366..2fbd0a3 100644
+index d476b1f..02aead7 100644
 --- a/src/policy/url_canon.rs
 +++ b/src/policy/url_canon.rs
-@@ -210,7 +210,7 @@ pub fn canonical_matches(url: &str, pattern: &str) -> bool {
+@@ -329,7 +329,7 @@ pub fn policy_url(params: &serde_json::Value) -> Option<String> {
  /// `UrlMatch` semantics: canonicalise both sides, then match. A URL that cannot
  /// be canonicalised never matches.
  pub fn url_matches(raw_url: &str, raw_pattern: &str) -> bool {

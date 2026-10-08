@@ -1,0 +1,12 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 644acd1..091470f 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -270,7 +270,6 @@ impl PolicyEngine {
+ 
+     /// Add a policy
+     pub fn add_policy(&self, policy: Policy) {
+-        warn_url_patterns(&policy);
+         let mut policies = self.policies.write();
+         policies.push(policy);
+     }

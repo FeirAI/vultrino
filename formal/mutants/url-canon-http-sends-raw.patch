@@ -1,13 +1,13 @@
 diff --git a/src/plugins/http.rs b/src/plugins/http.rs
-index 9592d56..e8adb83 100644
+index 55f902a..d650308 100644
 --- a/src/plugins/http.rs
 +++ b/src/plugins/http.rs
-@@ -852,7 +852,7 @@ impl HttpPlugin {
+@@ -855,7 +855,7 @@ impl HttpPlugin {
          // pinned above).
          let send_url = match cred_data {
              CredentialData::UrlToken { .. } => params.url.clone(),
--            _ => crate::policy::canonical_url(&params.url).unwrap_or_else(|| params.url.clone()),
-+            _ => params.url.clone(),
-         };
- 
-         // Validate URL for SSRF before proceeding
+-            _ => crate::policy::effective_url(&params.url, &params.query).ok_or_else(|| {
++            _ => Some(params.url.clone()).ok_or_else(|| {
+                 PluginError::InvalidParams(
+                     "URL cannot be canonicalised (policy could not judge it)".to_string(),
+                 )

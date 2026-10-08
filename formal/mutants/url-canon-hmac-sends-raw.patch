@@ -1,0 +1,13 @@
+diff --git a/src/plugins/hmac.rs b/src/plugins/hmac.rs
+index 0b906dd..55da082 100644
+--- a/src/plugins/hmac.rs
++++ b/src/plugins/hmac.rs
+@@ -136,7 +136,7 @@ impl HmacPlugin {
+     /// SB-03: the URL this plugin sends is the canonical URL policy judged. A
+     /// URL that cannot be canonicalised is refused, never sent raw.
+     fn canonical_send_url(raw: &str) -> Result<String, PluginError> {
+-        crate::policy::canonical_url(raw).ok_or_else(|| {
++        Some(raw.to_string()).ok_or_else(|| {
+             PluginError::InvalidParams(
+                 "URL cannot be canonicalised (policy could not judge it)".to_string(),
+             )

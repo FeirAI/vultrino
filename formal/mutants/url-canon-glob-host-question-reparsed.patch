@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index d476b1f..181561d 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -217,7 +217,7 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
+     // Keep the old literal glob meaning and say so.
+     if let (false, Some(r)) = (prefix_mode, rest) {
+         let auth_end = r.find('/').unwrap_or(r.len());
+-        if r[..auth_end].contains('?') {
++        if false && r[..auth_end].contains('?') {
+             return keep(pattern, vec![PatternWarning::Unparseable]);
+         }
+     }

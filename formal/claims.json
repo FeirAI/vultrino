@@ -198,6 +198,36 @@
     },
     "url-canon-http-sends-raw": {
       "tier": "fast"
+    },
+    "url-canon-glob-host-question-reparsed": {
+      "tier": "fast"
+    },
+    "url-canon-hmac-sends-raw": {
+      "tier": "fast"
+    },
+    "url-canon-host-boundary-port-dropped": {
+      "tier": "fast"
+    },
+    "url-canon-http-query-appended-after-evaluation": {
+      "tier": "fast"
+    },
+    "url-canon-query-not-judged": {
+      "tier": "fast"
+    },
+    "url-canon-stray-percent-unencoded": {
+      "tier": "fast"
+    },
+    "url-canon-trailing-dot-kept": {
+      "tier": "fast"
+    },
+    "url-canon-unparseable-prompt-skipped": {
+      "tier": "fast"
+    },
+    "url-canon-userinfo-accepted": {
+      "tier": "fast"
+    },
+    "url-canon-warnings-dropped-on-add": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -1283,12 +1313,22 @@
         }
       ],
       "mutants": [
-        "url-canon-skipped",
+        "url-canon-glob-host-question-reparsed",
+        "url-canon-hmac-sends-raw",
         "url-canon-host-boundary-dropped",
+        "url-canon-host-boundary-port-dropped",
+        "url-canon-http-query-appended-after-evaluation",
+        "url-canon-http-sends-raw",
+        "url-canon-query-not-judged",
+        "url-canon-skipped",
+        "url-canon-stray-percent-unencoded",
+        "url-canon-trailing-dot-kept",
         "url-canon-unparseable-deny-dropped",
-        "url-canon-http-sends-raw"
+        "url-canon-unparseable-prompt-skipped",
+        "url-canon-userinfo-accepted",
+        "url-canon-warnings-dropped-on-add"
       ],
-      "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or path case differently is not modelled). Patterns with * inside the host, or glob patterns whose * crosses a / (a glob * matches /), can still match a different host: they only log a warning this release. A glob whose host holds ? keeps literal glob meaning. Only the http and hmac plugins send the canonical URL; internal_http sends the url-crate composition of the raw path (differing only in unreserved percent escapes and hex case) after its own path allowlist ran on the raw path; the wasm plugin egress, ssh and postgres plugins do not use params url. The hmac plugin adds timestamp, recvWindow and signature after evaluation, and AWS SigV4 re-sorts query pairs for signing; those additions are not judged. UrlToken requests are judged on the placeholder URL and sent with the secret substituted unmodified. The query map is merged only when it is a JSON object. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested. The load-time warning is a log line and is not a refusal."
+      "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or path case differently is not modelled). Patterns with * inside the host, or glob patterns whose * crosses a / (a glob * matches /), can still match a different host: they only log a warning this release. A glob whose host holds ? keeps literal glob meaning. Only the http and hmac plugins send the canonical URL; internal_http sends the url-crate composition of the raw path (differing only in unreserved percent escapes and hex case) after its own path allowlist ran on the raw path; the wasm plugin egress, ssh and postgres plugins do not use params url. The hmac plugin adds timestamp, recvWindow and signature after evaluation, and AWS SigV4 re-sorts query pairs for signing; those additions are not judged. UrlToken requests are judged on the placeholder URL and sent with the secret substituted unmodified. The query map is merged only when it is a JSON object. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested. The load-time warning is a log line and is not a refusal. The server call sites that build the judged URL (policy_url at request time and at approval resume) are not covered by the detector."
     }
   ]
 }
