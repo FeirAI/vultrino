@@ -2989,6 +2989,33 @@ impl VultrinoServer {
             .await;
         }
 
+        // SB-02 parity with the buffered path (`confine_response`): a credential
+        // minted during the action that is shorter than MIN_REDACT_LEN cannot be
+        // reliably redacted, so withhold the whole response (empty head and body).
+        // Decided from the stream head, before any byte reaches the agent. The
+        // minted credential was persisted above and the call still meters.
+        if crate::egress::has_unredactable_secret(&secret_material) {
+            warn!(
+                request_id = %request_id,
+                credential = %credential_alias,
+                "streamed response withheld: a credential minted during the action is too short to redact"
+            );
+            emit_meter(&Arc::clone(&self.storage), &attribution, None, None).await;
+            if let Some((av, evidence)) = &exact_evidence {
+                if let Err(error) = av.complete_exact_use(evidence, "error").await {
+                    warn!(request_id = %request_id, error = %error, "withheld stream D8 outcome evidence failed");
+                }
+            }
+            return Ok(StreamingExecution {
+                status,
+                headers: std::collections::HashMap::new(),
+                body: Box::pin(futures::stream::once(async move {
+                    let _guard = session_guard;
+                    Ok::<Bytes, std::io::Error>(Bytes::new())
+                })),
+            });
+        }
+
         // Scrub the response HEADERS before the head commits to the wire (a secret
         // reflected in a provider header would otherwise escape — the streaming head
         // is sent before any body byte), then strip framing headers a re-chunked /

@@ -1549,3 +1549,125 @@ async fn sb02_streamed_google_sa_minted_token_reflected_is_scrubbed() {
     let (h, b) = run_minting(MintKind::GoogleSaMint, true).await;
     assert_minted_absent(&h, &b);
 }
+
+// A token minted during the action that is shorter than MIN_REDACT_LEN cannot be
+// reliably redacted, so the response must be withheld on BOTH paths (the buffered
+// path already does this via confine_response; the streaming path must match).
+const SHORT_MINTED: &str = "ab12";
+
+struct MockShortMintPlugin;
+
+#[async_trait]
+impl Plugin for MockShortMintPlugin {
+    fn name(&self) -> &str {
+        "mockshort"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["chat"]
+    }
+    async fn execute(&self, _request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        Ok(ExecuteResponse::new(
+            200,
+            HashMap::from([(
+                "x-echo-authorization".to_string(),
+                format!("Bearer {SHORT_MINTED}"),
+            )]),
+            format!("{{\"echo\":\"Bearer {SHORT_MINTED}\"}}").into_bytes(),
+        )
+        .with_updated_credential(short_minted_credential()))
+    }
+    async fn execute_streaming(
+        &self,
+        _request: PluginRequest,
+    ) -> Result<vultrino::StreamingResponse, PluginError> {
+        let chunks = vec![Ok(bytes::Bytes::from(format!(
+            "data: {{\"error\":\"Authorization: Bearer {SHORT_MINTED}\"}}\n\ndata: [DONE]\n\n"
+        )))];
+        Ok(vultrino::StreamingResponse::new(
+            200,
+            HashMap::from([(
+                "x-echo-authorization".to_string(),
+                format!("Bearer {SHORT_MINTED}"),
+            )]),
+            Box::pin(futures::stream::iter(chunks)),
+        )
+        .with_updated_credential(short_minted_credential()))
+    }
+    fn validate_params(
+        &self,
+        _action: &str,
+        _params: &serde_json::Value,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+fn short_minted_credential() -> CredentialData {
+    CredentialData::OAuth2 {
+        client_id: "client-id".to_string(),
+        client_secret: Secret::new("client-secret-value-0123456789"),
+        refresh_token: Some(Secret::new("refresh-token-value-0123456789")),
+        access_token: Some(Secret::new(SHORT_MINTED)),
+        expires_at: None,
+        token_url: "https://oauth.example.test/token".to_string(),
+        scopes: vec![],
+    }
+}
+
+async fn run_short_minting(stream: bool) -> (Vec<(String, String)>, String) {
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    srv.plugins().register(Arc::new(MockShortMintPlugin));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockshort.chat",
+        "https://api.openai.com",
+    )
+    .await;
+    let token = mint_token(&storage, "cred-openai", Some("mockshort.chat")).await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": stream, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let raw = body_bytes(resp).await;
+    (headers, String::from_utf8_lossy(&raw).into_owned())
+}
+
+#[tokio::test]
+async fn sb02_buffered_short_minted_token_withholds_response() {
+    let (h, b) = run_short_minting(false).await;
+    assert!(!b.contains(SHORT_MINTED), "short minted token leaked: {b}");
+    assert!(
+        h.iter().all(|(_, v)| !v.contains(SHORT_MINTED)),
+        "short minted token leaked in a header: {h:?}"
+    );
+}
+
+#[tokio::test]
+async fn sb02_streamed_short_minted_token_withholds_response() {
+    let (h, b) = run_short_minting(true).await;
+    assert!(!b.contains(SHORT_MINTED), "short minted token leaked: {b}");
+    assert!(
+        h.iter().all(|(_, v)| !v.contains(SHORT_MINTED)),
+        "short minted token leaked in a header: {h:?}"
+    );
+}
