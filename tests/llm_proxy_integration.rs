@@ -1549,3 +1549,289 @@ async fn sb02_streamed_google_sa_minted_token_reflected_is_scrubbed() {
     let (h, b) = run_minting(MintKind::GoogleSaMint, true).await;
     assert_minted_absent(&h, &b);
 }
+
+// A token minted during the action that is shorter than MIN_REDACT_LEN cannot be
+// reliably redacted, so the response must be withheld on BOTH paths (the buffered
+// path already does this via confine_response; the streaming path must match).
+const SHORT_MINTED: &str = "ab12";
+
+struct MockShortMintPlugin;
+
+#[async_trait]
+impl Plugin for MockShortMintPlugin {
+    fn name(&self) -> &str {
+        "mockshort"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["chat"]
+    }
+    async fn execute(&self, _request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        Ok(ExecuteResponse::new(
+            200,
+            HashMap::from([(
+                "x-echo-authorization".to_string(),
+                format!("Bearer {SHORT_MINTED}"),
+            )]),
+            format!("{{\"echo\":\"Bearer {SHORT_MINTED}\"}}").into_bytes(),
+        )
+        .with_updated_credential(short_minted_credential()))
+    }
+    async fn execute_streaming(
+        &self,
+        _request: PluginRequest,
+    ) -> Result<vultrino::StreamingResponse, PluginError> {
+        let chunks = vec![Ok(bytes::Bytes::from(format!(
+            "data: {{\"error\":\"Authorization: Bearer {SHORT_MINTED}\"}}\n\ndata: [DONE]\n\n"
+        )))];
+        Ok(vultrino::StreamingResponse::new(
+            200,
+            HashMap::from([(
+                "x-echo-authorization".to_string(),
+                format!("Bearer {SHORT_MINTED}"),
+            )]),
+            Box::pin(futures::stream::iter(chunks)),
+        )
+        .with_updated_credential(short_minted_credential()))
+    }
+    fn validate_params(
+        &self,
+        _action: &str,
+        _params: &serde_json::Value,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+fn short_minted_credential() -> CredentialData {
+    CredentialData::OAuth2 {
+        client_id: "client-id".to_string(),
+        client_secret: Secret::new("client-secret-value-0123456789"),
+        refresh_token: Some(Secret::new("refresh-token-value-0123456789")),
+        access_token: Some(Secret::new(SHORT_MINTED)),
+        expires_at: None,
+        token_url: "https://oauth.example.test/token".to_string(),
+        scopes: vec![],
+    }
+}
+
+async fn run_short_minting(stream: bool) -> (Vec<(String, String)>, String) {
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    srv.plugins().register(Arc::new(MockShortMintPlugin));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockshort.chat",
+        "https://api.openai.com",
+    )
+    .await;
+    let token = mint_token(&storage, "cred-openai", Some("mockshort.chat")).await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": stream, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let raw = body_bytes(resp).await;
+    (headers, String::from_utf8_lossy(&raw).into_owned())
+}
+
+#[tokio::test]
+async fn sb02_buffered_short_minted_token_withholds_response() {
+    let (h, b) = run_short_minting(false).await;
+    assert!(!b.contains(SHORT_MINTED), "short minted token leaked: {b}");
+    assert!(
+        h.iter().all(|(_, v)| !v.contains(SHORT_MINTED)),
+        "short minted token leaked in a header: {h:?}"
+    );
+}
+
+#[tokio::test]
+async fn sb02_streamed_short_minted_token_withholds_response() {
+    let (h, b) = run_short_minting(true).await;
+    assert!(!b.contains(SHORT_MINTED), "short minted token leaked: {b}");
+    assert!(
+        h.iter().all(|(_, v)| !v.contains(SHORT_MINTED)),
+        "short minted token leaked in a header: {h:?}"
+    );
+}
+
+// A compressed (exotic codec) streamed response is withheld, but the credential
+// the action minted or rotated must still be persisted, as on the buffered path.
+// Otherwise a rotated refresh token is lost and the stored credential is bricked.
+const ZSTD_MINTED: &str = "minted-access-token-value-0123456789";
+
+/// Streams an opaque zstd body and mints an OAuth2 credential whose access token
+/// is the given value.
+struct MockZstdMintPlugin(&'static str);
+
+#[async_trait]
+impl Plugin for MockZstdMintPlugin {
+    fn name(&self) -> &str {
+        "mockzstd"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["chat"]
+    }
+    async fn execute(&self, _request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        Ok(ExecuteResponse::new(200, HashMap::new(), Vec::new()))
+    }
+    async fn execute_streaming(
+        &self,
+        _request: PluginRequest,
+    ) -> Result<vultrino::StreamingResponse, PluginError> {
+        let chunks = vec![Ok(bytes::Bytes::from_static(b"\x28\xb5\x2f\xfd opaque"))];
+        Ok(vultrino::StreamingResponse::new(
+            200,
+            HashMap::from([("content-encoding".to_string(), "zstd".to_string())]),
+            Box::pin(futures::stream::iter(chunks)),
+        )
+        .with_updated_credential(CredentialData::OAuth2 {
+            client_id: "client-id".to_string(),
+            client_secret: Secret::new("client-secret-value-0123456789"),
+            refresh_token: Some(Secret::new("rotated-refresh-token-0123456789")),
+            access_token: Some(Secret::new(self.0)),
+            expires_at: None,
+            token_url: "https://oauth.example.test/token".to_string(),
+            scopes: vec![],
+        }))
+    }
+    fn validate_params(
+        &self,
+        _action: &str,
+        _params: &serde_json::Value,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn sb02_streamed_compressed_response_still_persists_updated_credential() {
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    srv.plugins()
+        .register(Arc::new(MockZstdMintPlugin(ZSTD_MINTED)));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockzstd.chat",
+        "https://api.openai.com",
+    )
+    .await;
+    let token = mint_token(&storage, "cred-openai", Some("mockzstd.chat")).await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": true, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    let raw = body_bytes(resp).await;
+    let body = String::from_utf8_lossy(&raw);
+    assert!(!body.contains("opaque"), "compressed body leaked: {body}");
+
+    let stored = storage
+        .get_by_alias("cred-openai")
+        .await
+        .unwrap()
+        .expect("credential present");
+    match stored.data {
+        CredentialData::OAuth2 { access_token, .. } => assert_eq!(
+            access_token.as_ref().map(|s| s.expose().to_string()),
+            Some(ZSTD_MINTED.to_string()),
+            "the minted credential must be persisted even when the response is withheld"
+        ),
+        other => panic!(
+            "updated credential was not persisted, still {:?}",
+            other.credential_type()
+        ),
+    }
+}
+
+// A compressed streamed response whose action ALSO minted a credential shorter
+// than MIN_REDACT_LEN must be withheld exactly as the buffered path withholds it
+// (empty head and body). The compressed-body placeholder is fixed text, so it
+// can itself contain a short secret ("with" is inside "withheld"); the short
+// minted secret check must therefore run before the compressed-body withhold.
+const ZSTD_SHORT_MINTED: &str = "with";
+
+#[tokio::test]
+async fn sb02_streamed_compressed_short_minted_token_withholds_like_buffered() {
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    srv.plugins()
+        .register(Arc::new(MockZstdMintPlugin(ZSTD_SHORT_MINTED)));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockzstd.chat",
+        "https://api.openai.com",
+    )
+    .await;
+    let token = mint_token(&storage, "cred-openai", Some("mockzstd.chat")).await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": true, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let raw = body_bytes(resp).await;
+    let body = String::from_utf8_lossy(&raw);
+    assert!(
+        !body.contains(ZSTD_SHORT_MINTED),
+        "short minted token present in the withheld body: {body}"
+    );
+    assert!(
+        raw.is_empty(),
+        "withheld body must be empty, as on the buffered path: {body}"
+    );
+    assert!(
+        headers.iter().all(|(_, v)| !v.contains(ZSTD_SHORT_MINTED)),
+        "short minted token present in a header: {headers:?}"
+    );
+    // The minted credential is still persisted, as on every withhold.
+    let stored = storage
+        .get_by_alias("cred-openai")
+        .await
+        .unwrap()
+        .expect("credential present");
+    assert_eq!(
+        stored.credential_type,
+        CredentialType::OAuth2,
+        "the minted credential must be persisted even when the response is withheld"
+    );
+}

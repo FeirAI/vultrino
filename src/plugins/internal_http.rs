@@ -85,13 +85,18 @@ const OPERATOR_OWNED_HEADERS: [&str; 5] = [
 /// `169.254.0.0/16` as private, and that is the cloud-metadata range — an
 /// "internal" destination must never resolve there. Accepted: IPv4 loopback,
 /// RFC1918, CGNAT (100.64/10 — EKS pod space); IPv6 loopback, unique-local
-/// (fc00::/7), and IPv4-mapped forms of the above. Everything else (public,
+/// (fc00::/7), and IPv4-mapped forms of the above, minus the two known metadata
+/// addresses inside those ranges (100.100.100.200, fd00:ec2::254). Everything else (public,
 /// link-local/metadata, 0.0.0.0/8, documentation, multicast, broadcast, NAT64 and
 /// 6to4 encodings) is refused.
 pub(crate) fn is_internal_destination_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
+            if o == [100, 100, 100, 200] {
+                // Alibaba Cloud metadata endpoint, inside the CGNAT range.
+                return false;
+            }
             v4.is_loopback()
                 || o[0] == 10
                 || (o[0] == 172 && (16..=31).contains(&o[1]))
@@ -101,6 +106,10 @@ pub(crate) fn is_internal_destination_ip(ip: &IpAddr) -> bool {
         IpAddr::V6(v6) => {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return is_internal_destination_ip(&IpAddr::V4(mapped));
+            }
+            // AWS IPv6 metadata endpoint, inside fc00::/7.
+            if *v6 == std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254) {
+                return false;
             }
             let seg = v6.segments();
             v6.is_loopback() || (seg[0] & 0xfe00) == 0xfc00
@@ -1009,6 +1018,9 @@ mod tests {
             "64:ff9b::0a00:0001", // NAT64-encoded 10.0.0.1
             "2002:0a00:0001::1",  // 6to4-encoded 10.0.0.1
             "::ffff:8.8.8.8",
+            "100.100.100.200",        // Alibaba Cloud metadata, inside CGNAT
+            "::ffff:100.100.100.200", // same, IPv4-mapped
+            "fd00:ec2::254",          // AWS IPv6 metadata, inside fc00::/7
         ];
         for ip in internal {
             let ip: IpAddr = ip.parse().unwrap();

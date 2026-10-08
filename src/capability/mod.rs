@@ -423,7 +423,21 @@ impl Capability {
                     .trim_start_matches('[')
                     .trim_end_matches(']')
                     .to_ascii_lowercase();
-                if h.starts_with("169.254.") {
+                // Parse the host as an IP (the url crate already normalises decimal,
+                // hex and octal IPv4 spellings) and reuse the http plugin's
+                // classifier helpers, so IPv6 link-local ([fe80::/10]), IPv4-mapped
+                // ([::ffff:a9fe:a9fe]) and NAT64/6to4-embedded metadata addresses
+                // are caught as well as plain 169.254.x.y.
+                let link_local = match parsed.host() {
+                    Some(url::Host::Ipv4(v4)) => {
+                        crate::plugins::is_link_local_or_metadata_ip(&std::net::IpAddr::V4(v4))
+                    }
+                    Some(url::Host::Ipv6(v6)) => {
+                        crate::plugins::is_link_local_or_metadata_ip(&std::net::IpAddr::V6(v6))
+                    }
+                    _ => h.starts_with("169.254."),
+                };
+                if link_local {
                     return Err(format!(
                         "capability llm.provider_base '{}' points at the link-local / cloud-metadata range (SSRF)",
                         base
@@ -1506,6 +1520,42 @@ mod tests {
             err.contains("link-local") || err.contains("metadata"),
             "got: {err}"
         );
+
+        // Other spellings of link-local / metadata addresses are rejected too.
+        for base in [
+            "http://[fe80::1]/v1",
+            "http://[febf::1]:8080",
+            "http://[::ffff:a9fe:a9fe]/latest/meta-data",
+            "http://[::ffff:169.254.169.254]/latest/meta-data",
+            "http://[::169.254.169.254]/",
+            "http://[64:ff9b::a9fe:a9fe]/",
+            "http://[2002:a9fe:a9fe::]/",
+            "http://[fd00:ec2::254]/latest/meta-data",
+            "http://2852039166/latest/meta-data", // decimal spelling of 169.254.169.254
+            "http://0xa9fea9fe/latest/meta-data",
+            "http://169.254.169.254./latest/meta-data",
+        ] {
+            let err = llm_cap(base).validate().unwrap_err();
+            assert!(
+                err.contains("link-local") || err.contains("metadata"),
+                "{base}: {err}"
+            );
+        }
+        // Neighbours of those ranges and IPv6 loopback stay valid.
+        for base in [
+            "http://[::1]:11434",
+            "http://[fec0::1]:8000",
+            "http://[::ffff:10.0.0.5]:8000",
+            "http://[64:ff9b::808:808]/",
+            "http://169.253.1.1/",
+            "http://169.255.1.1/",
+            "http://[fd00:ec2::255]/",
+        ] {
+            assert!(
+                llm_cap(base).validate().is_ok(),
+                "must validate at config: {base}"
+            );
+        }
 
         // Loopback + RFC1918 are LEGITIMATE self-hosted model-gateway addresses (the
         // operator-fixed host is agent-untouchable). They VALIDATE at config; the

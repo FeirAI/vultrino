@@ -164,6 +164,24 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   read back what a policy actually enforces. It can only compare `content_hash` (see above)
   and assert on the grant set the decide plane reports. Any claim of the form "we verified
   the compiled rules" is really "we verified the hash and the grant set".
+- **A credential minted by a plugin that then returns an error is neither persisted nor
+  scrubbed.** Scrubbing of material minted or refreshed during an action (OAuth2 refresh,
+  Google service-account mint) works from the plugin's successful response. If a plugin
+  mints a token and then returns `Err`, the minted credential is not stored and is not added
+  to the scrub set for that call's error text. The built-in plugins do not echo a minted
+  token in their errors, but a third-party or WASM plugin that did would not be covered.
+  Closing this needs a plugin API change so an error can carry the minted credential; that is
+  not done.
+
+- **Policy load ordering is per process.** Every engine policy load (the periodic refresh
+  and the admin reload) runs as one cycle under a single async lock, ticketed in list order,
+  so within one process an older list cannot replace a newer one. The lock does not span
+  processes: a kill policy written by another process (CLI halt, HA replica) becomes visible
+  here on the next refresh tick, so propagation stays bounded by the refresh interval.
+- **`internal_http` refuses only two named metadata addresses inside its allowed ranges.**
+  100.100.100.200 (inside CGNAT) and fd00:ec2::254 (inside fc00::/7) are excluded, including
+  IPv4-mapped forms. Another provider's metadata address inside RFC1918, CGNAT or
+  unique-local space would still be admitted, because those ranges are allowed on purpose.
 
 ## Formal verification bounds (what the gates prove — and do not)
 

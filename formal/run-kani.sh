@@ -23,39 +23,55 @@ fi
 # one cover property and "N of N cover properties satisfied". A harness whose
 # assumptions became contradictory, or whose branches are unreachable, shows
 # up as N < M (or no cover line at all) and fails here.
+#
+# Each harness is run by its exact, fully qualified path (`--exact`). Without
+# `--exact`, Kani matches the name as a substring, so one invocation could check
+# several harnesses and the parsed cover line would belong to only one of them.
+# As a second guard, an invocation must report exactly one "Checking harness"
+# line and exactly one cover summary line.
 run_harness() {
-  local name="$1" out
+  local path="$1" out
   out="$(mktemp)"
-  if ! cargo kani "${KANI_ARGS[@]}" --harness "$name" 2>&1 | tee "$out"; then
-    echo "run-kani.sh: harness $name FAILED verification" >&2
+  if ! cargo kani "${KANI_ARGS[@]}" --harness "$path" --exact 2>&1 | tee "$out"; then
+    echo "run-kani.sh: harness $path FAILED verification" >&2
     rm -f "$out"
     exit 1
   fi
-  local line sat total
+  local checking covers line sat total
+  checking="$(grep -cE '^Checking harness ' "$out" || true)"
+  covers="$(grep -cE '[0-9]+ of [0-9]+ cover properties satisfied' "$out" || true)"
   line="$(grep -E '[0-9]+ of [0-9]+ cover properties satisfied' "$out" | tail -n 1 || true)"
   rm -f "$out"
+  if [ "$checking" -ne 1 ]; then
+    echo "run-kani.sh: $path: expected exactly 1 'Checking harness' line, saw $checking" >&2
+    exit 1
+  fi
+  if [ "$covers" -gt 1 ]; then
+    echo "run-kani.sh: $path: saw $covers cover summaries, expected exactly 1 (more than one harness ran?)" >&2
+    exit 1
+  fi
   if [ -z "$line" ]; then
-    echo "run-kani.sh: harness $name has no kani::cover! statements (vacuity gate)" >&2
+    echo "run-kani.sh: harness $path has no kani::cover! statements (vacuity gate)" >&2
     exit 1
   fi
   sat="$(sed -E 's/.*[^0-9]([0-9]+) of ([0-9]+) cover properties satisfied.*/\1/' <<<"$line")"
   total="$(sed -E 's/.*[^0-9]([0-9]+) of ([0-9]+) cover properties satisfied.*/\2/' <<<"$line")"
   if [ "$total" -lt 1 ] || [ "$sat" -ne "$total" ]; then
-    echo "run-kani.sh: harness $name has unsatisfiable cover statements ($sat of $total satisfied)" >&2
+    echo "run-kani.sh: harness $path has unsatisfiable cover statements ($sat of $total satisfied)" >&2
     exit 1
   fi
-  echo "run-kani.sh: $name OK ($sat of $total covers satisfied)"
+  echo "run-kani.sh: $path OK ($sat of $total covers satisfied)"
 }
 
-run_harness direct_permit_truth_table_is_exact
-run_harness execution_epoch_never_wraps
-run_harness zero_approvers_never_satisfy
-run_harness satisfaction_never_underfills_a_slot
-run_harness greedy_matches_exhaustive_assignment_at_bound_5
-run_harness satisfaction_is_monotone_in_availability
-run_harness malformed_recipes_never_satisfy
-run_harness recipe_cap_prevents_need_overflow
-run_harness class_slot_contribution_agrees_with_satisfaction
+run_harness formal_kernel::kani_proofs::direct_permit_truth_table_is_exact
+run_harness formal_kernel::kani_proofs::execution_epoch_never_wraps
+run_harness approval::kani_recipe_proofs::zero_approvers_never_satisfy
+run_harness approval::kani_recipe_proofs::satisfaction_never_underfills_a_slot
+run_harness approval::kani_recipe_proofs::greedy_matches_exhaustive_assignment_at_bound_5
+run_harness approval::kani_recipe_proofs::satisfaction_is_monotone_in_availability
+run_harness approval::kani_recipe_proofs::malformed_recipes_never_satisfy
+run_harness approval::kani_recipe_proofs::recipe_cap_prevents_need_overflow
+run_harness approval::kani_recipe_proofs::class_slot_contribution_agrees_with_satisfaction
 
 # Every #[kani::proof] must be listed above, or it would silently not run.
 # The script has already cd'd to the repo root, so name itself by that path
