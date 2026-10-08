@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 966c8bc..1f5c2ac 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -487,7 +487,7 @@ impl PolicyEngine {
+         let mut deny_policy: Option<&str> = None;
+         let policy_defaults: Vec<PolicyAction> =
+             matching_policies.iter().map(|p| p.default_action).collect();
+-        let kill = matching_policies.iter().any(|p| p.kill);
++        let kill = false;
+         let verdict = resolve_lazily(
+             kill,
+             |tier| {

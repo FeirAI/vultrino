@@ -171,6 +171,21 @@
     },
     "rate-limit-default-deny-validation-removed": {
       "tier": "fast"
+    },
+    "policy-precedence-tail-arm-allow": {
+      "tier": "fast"
+    },
+    "policy-precedence-lazy-prompt-allow-swapped": {
+      "tier": "fast"
+    },
+    "policy-precedence-lazy-kill-precheck-dropped": {
+      "tier": "fast"
+    },
+    "policy-precedence-engine-kill-flag-ignored": {
+      "tier": "fast"
+    },
+    "kani-policy-precedence-lazy-prompt-allow-swapped": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -1066,7 +1081,7 @@
     },
     {
       "id": "policy-precedence-exhaustive",
-      "statement": "The pure precedence function equals the written order kill > deny > prompt > allow > policy default > engine default for every sequence of up to 4 rule outcomes (kill, deny, prompt, allow, no-match; every multiset in every order), every sequence of up to 3 policy default actions and both engine defaults; its result does not change when the outcome or default lists are reordered; its fail-closed tail is never reached anywhere in that domain; and the tail itself denies. Example tests check that the engine maps each outcome to the decision and the policy name in the deny reason.",
+      "statement": "The tier order that the shipped engine scans (resolve_lazily: kill pre-check, then deny, prompt, allow, stopping at the first tier that matches) gives the same verdict as the pure precedence function over the full outcome set, for every sequence of up to 4 rule outcomes (kill, deny, prompt, allow, no-match; every multiset in every order), every sequence of up to 3 policy default actions and both engine defaults, and it asks no tier weaker than the one that decided and no tier at all under a kill flag. The pure function equals the written order kill > deny > prompt > allow > policy default > engine default and does not change when the lists are reordered; its fail-closed tail is never reached in that domain. Every verdict maps to its decision (kill, deny rule, deny default, engine default deny and the fail-closed tail all deny; prompt verdicts prompt; allow verdicts allow). The shipped evaluate equals the same order for every ordered list of up to two policies drawn from 48 shapes (kill flag, default action, any subset of always-deny, always-prompt and always-allow rules) under both engine defaults.",
       "method": "exhaustive",
       "artifacts": [
         "src/policy/precedence.rs",
@@ -1075,33 +1090,47 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- --exact policy::precedence::tests::precedence_equals_spec_and_is_order_independent_over_the_finite_domain policy::precedence::tests::precedence_order_examples policy::precedence::tests::the_unreachable_tail_fails_closed policy::tests::engine_maps_precedence_outcomes_with_policy_names",
+      "detector": "cargo test --locked --no-default-features --lib -- --exact policy::precedence::tests::precedence_equals_spec_and_is_order_independent_over_the_finite_domain policy::precedence::tests::precedence_order_examples policy::precedence::tests::the_unreachable_tail_fails_closed policy::precedence::tests::every_verdict_maps_to_its_decision policy::precedence::tests::lazy_scan_equals_full_precedence_and_asks_no_weaker_tier policy::tests::engine_precedence_equals_spec_over_every_small_policy_set policy::tests::engine_maps_precedence_outcomes_with_policy_names",
       "covers": [
         {
           "path": "src/policy/precedence.rs",
           "symbol": "resolve_precedence",
-          "sha256": "0e71ed7a91b724dc90f276143de029deacf39282e9037f4bc194b95e1b95c1b7"
+          "sha256": "d410e321cfe20e0a078ebebf610a94b5ab6c888075bcb3386c478c1eeb390ee0"
         },
         {
           "path": "src/policy/precedence.rs",
           "symbol": "fail_closed_tail",
-          "sha256": "3c12df2aedd923032a23aacdc5de71e40bb47966431e1a279166b7f6d0d3d6cd"
+          "sha256": "0c0db52b37c99f311022299f1b52f7995bc156c94be13b305b069868ff314392"
         },
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "00862c011c609f69d0c796df529aeaa1c5028c2214186de24184614ce888170c"
+          "sha256": "0aea8e28ada44a3562eef8bcf4f9058e67fd7be366edfadf400e81f4371cb705"
+        },
+        {
+          "path": "src/policy/precedence.rs",
+          "symbol": "resolve_lazily",
+          "sha256": "d7f0572ff8692eeabf1acf0be39fd703baed7a2dd4bcf5654746ba4a7ac46d10"
+        },
+        {
+          "path": "src/policy/precedence.rs",
+          "symbol": "decision_for",
+          "sha256": "8c44b9e07265ab09142c91965f6ee3aa9499b8d8ab1167dc5d6518f05ec1dc4f"
         }
       ],
       "mutants": [
         "policy-precedence-deny-prompt-swapped",
-        "policy-precedence-tail-allow"
+        "policy-precedence-tail-allow",
+        "policy-precedence-tail-arm-allow",
+        "policy-precedence-lazy-prompt-allow-swapped",
+        "policy-precedence-lazy-kill-precheck-dropped",
+        "policy-precedence-engine-kill-flag-ignored"
       ],
-      "does_not_establish": "Only the precedence step. Whether a rule matches (URL, method, time window, rate limit, spend cap, action label) is outside it, and the domain is bounded at 4 outcomes and 3 policy defaults. The engine wiring (which rules are scanned, in what order, and that the scan stops at the first match so weaker tiers are not charged) is checked by example tests only, and the first matching rule within a tier is chosen by storage order. The oracle is test code. Layered Allow-RateLimit rules are still first-match, not conjunctive. The engine default applies only when no policy matches, and is not applied on top of a matching policy's default."
+      "does_not_establish": "Only the precedence step. Whether a rule matches (URL, method, time window, rate limit, spend cap, action label) is outside it, and the domain is bounded at 4 outcomes and 3 policy defaults for the pure and lazy functions and at two policies of 48 shapes for the engine test. The engine test uses only always-matching rules and a fixed credential, so it does not cover rate-limit charging order beyond the lazy-scan check that no weaker tier is asked, and the first matching rule within a tier is chosen by storage order. The oracles are test code. The engine hands the lazy function at most one outcome per call by design; the multi-outcome equivalence is shown for membership of tiers, which is all the scan can observe. Layered Allow-RateLimit rules are still first-match, not conjunctive. The engine default applies only when no policy matches, and is not applied on top of a matching policy's default. The tail is shown to deny by the mapping test, not shown unreachable from the engine (it is unreachable only because any matching policy has a default action)."
     },
     {
       "id": "kani-policy-precedence",
-      "statement": "For every list of up to 4 rule outcomes, every list of up to 3 policy default actions and both engine defaults, the precedence function returns the verdict with the highest rank in the order kill > deny > prompt > allow > policy default deny > prompt > allow > engine default, swapping two entries of either list does not change it, and it never returns the fail-closed tail. All nine verdict kinds are reachable in the harness (cover statements, enforced by the vacuity gate in run-kani.sh).",
+      "statement": "For every list of up to 4 rule outcomes, every list of up to 3 policy default actions and both engine defaults, the precedence function returns the verdict with the highest rank in the order kill > deny > prompt > allow > policy default deny > prompt > allow > engine default, swapping two entries of either list does not change it, and it never returns the fail-closed tail; and the lazy tier scan the engine runs (resolve_lazily) returns the same verdict as the full function and asks no tier under a kill flag. All verdict kinds and the lazy cases are reachable in the harnesses (cover statements, enforced by the vacuity gate in run-kani.sh).",
       "method": "kani",
       "artifacts": [
         "src/policy/precedence.rs",
@@ -1110,23 +1139,29 @@
       "gates": [
         "kani"
       ],
-      "detector": "set -e; cargo kani --no-default-features --harness policy::precedence::kani_precedence_proofs::precedence_is_the_maximum_rank_and_order_independent --exact",
+      "detector": "set -e; cargo kani --no-default-features --harness policy::precedence::kani_precedence_proofs::precedence_is_the_maximum_rank_and_order_independent --exact; cargo kani --no-default-features --harness policy::precedence::kani_precedence_proofs::lazy_scan_equals_full_precedence --exact",
       "covers": [
         {
           "path": "src/policy/precedence.rs",
           "symbol": "resolve_precedence",
-          "sha256": "0e71ed7a91b724dc90f276143de029deacf39282e9037f4bc194b95e1b95c1b7"
+          "sha256": "d410e321cfe20e0a078ebebf610a94b5ab6c888075bcb3386c478c1eeb390ee0"
         },
         {
           "path": "src/policy/precedence.rs",
           "symbol": "fail_closed_tail",
-          "sha256": "3c12df2aedd923032a23aacdc5de71e40bb47966431e1a279166b7f6d0d3d6cd"
+          "sha256": "0c0db52b37c99f311022299f1b52f7995bc156c94be13b305b069868ff314392"
+        },
+        {
+          "path": "src/policy/precedence.rs",
+          "symbol": "resolve_lazily",
+          "sha256": "d7f0572ff8692eeabf1acf0be39fd703baed7a2dd4bcf5654746ba4a7ac46d10"
         }
       ],
       "mutants": [
-        "kani-policy-precedence-default-allow-over-prompt"
+        "kani-policy-precedence-default-allow-over-prompt",
+        "kani-policy-precedence-lazy-prompt-allow-swapped"
       ],
-      "does_not_establish": "Bounded: lists longer than 4 outcomes or 3 defaults are not covered by the proof (the exhaustive test covers the same bounds). The rank table in the harness is written by hand. Nothing about rule matching or the engine code that builds the lists. Swap-based order independence is checked for one swap of each list per run, not for every permutation at once."
+      "does_not_establish": "Bounded: lists longer than 4 outcomes or 3 defaults are not covered by the proof (the exhaustive test covers the same bounds). The rank table in the harness is written by hand. Nothing about rule matching, the verdict-to-decision mapping or the engine code that builds the default list and supplies the matcher. Swap-based order independence is checked for one swap of each list per run, not for every permutation at once."
     },
     {
       "id": "rate-limit-default-deny-validation",

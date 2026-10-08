@@ -1,13 +1,13 @@
 diff --git a/src/policy/precedence.rs b/src/policy/precedence.rs
-index 005ea9b..a7a31ff 100644
+index 0c73b1d..925a877 100644
 --- a/src/policy/precedence.rs
 +++ b/src/policy/precedence.rs
 @@ -51,7 +51,7 @@ pub(crate) enum Verdict {
- /// The verdict when no rule and no default produced a decision. Always a denial:
- /// the engine default when it is deny, and deny when it is allow.
- pub(crate) fn fail_closed_tail(_engine_default_deny: bool) -> Verdict {
+ /// The verdict when no rule and no default produced a decision. It maps to a
+ /// denial in [`decision_for`], whatever the engine default is.
+ pub(crate) fn fail_closed_tail() -> Verdict {
 -    Verdict::FailClosedTail
 +    Verdict::Allow
  }
  
- /// Resolve the decision from the matched rule outcomes, the `default_action` of
+ /// Map a verdict to the decision the engine returns. `rule_deny_policy` is the
