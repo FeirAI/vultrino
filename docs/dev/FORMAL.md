@@ -22,7 +22,8 @@ and limits).
   `formal-nightly` job has an `if:` and is deliberately outside it);
 - the sha256 of a covered function no longer matches (the drift lock);
 - a mutant id has no patch file;
-- a phrase from `overclaim_denylist` appears in `README.md` or `docs/**/*.md`.
+- a phrase from `overclaim_denylist` appears in `README.md`, `docs/**/*.md` or
+  `formal/**/*.md`.
 
 `python3 scripts/formal/check_mutants.py --tier fast|full` applies each mutant
 patch to a scratch copy of HEAD, runs the claim's detector, and requires the
@@ -95,7 +96,7 @@ Every claim is bounded; read the last column before citing one.
 | `approval-wire-tables` | exhaustive | risk-tier, approver-class, decision-mode and execution-state tables enumerated over their listed spellings and 80 state combinations | strings outside the lists; callers' use of these functions |
 | `approval-vault-roundtrip-property` | property | 20,000 generated decision sequences stay valid and round-trip unchanged through the vault serde boundary | sampling, not exhaustive; sequences are at most 6 long; shared defects pass |
 | `ssrf-link-local-config-check` | test | `llm.provider_base` is rejected at config time for link-local and metadata addresses in many spellings | one example test; DNS names, redirects, later changes |
-| `internal-http-allowlist` | test | `internal_http` admits only the listed internal ranges and refuses metadata endpoints and encodings | listed addresses only; hostname resolution; per-capability allowlists |
+| `internal-http-allowlist` | test | on listed addresses, `internal_http` admits the internal examples and refuses metadata endpoints and encodings | listed addresses only; hostname resolution; per-capability allowlists |
 | `lean-approval-authority` | lean | model-level: verified broker identity is exact-bound; changed tuples are rejected; bearer claims are not independent | MAC and parser (assumptions); the Rust code |
 | `lean-approval-action-authority` | lean | model-level: canonical-alias refusal, strict inconclusive refusal, resume requires same recipe and credential authority | abstract numbers stand in for recipes and records; the Rust code |
 | `lean-approval-criticality` | lean | model-level: human-floor, ambiguous and unavailable never direct; strict direct implies reversible; resume needs same catalog class | criticality only, not the other gate checks; the Rust code |

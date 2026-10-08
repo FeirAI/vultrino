@@ -25,7 +25,8 @@
     ],
     "globs": [
       "README.md",
-      "docs/**/*.md"
+      "docs/**/*.md",
+      "formal/**/*.md"
     ]
   },
   "mutants": {
@@ -429,7 +430,7 @@
         "refresh-load-lock-removed",
         "refresh-vault-not-reloaded"
       ],
-      "does_not_establish": "One scripted interleaving, not a model of all schedules. The wait check relies on a 150 ms sleep: on a very slow machine a mutant could survive, but the unmutated code cannot fail it, because the admin reload is blocked on the lock. The lock is per process: another process's write becomes visible only on the next refresh tick, so cross-process visibility is bounded-staleness, not instant. Cross-process visibility in the second test is the same bounded staleness: the test writes before the refresh re-read, it does not show the write is seen if it lands after. Removing only the ticket compare (the second guard) is not detected by this test. Does not cover other policy load paths that call load_policies directly (construction and tests) or a lost write in storage itself."
+      "does_not_establish": "Two scripted interleavings, not a model of all schedules. The wait check relies on a 150 ms sleep: on a very slow machine a mutant could survive, but the unmutated code cannot fail it, because the admin reload is blocked on the lock. The lock is per process: another process's write becomes visible only on the next refresh tick, so cross-process visibility is bounded-staleness, not instant. Cross-process visibility in the second test is the same bounded staleness: the test writes before the refresh re-read, it does not show the write is seen if it lands after. Removing only the ticket compare (the second guard) is not detected by this test. Does not cover other policy load paths that call load_policies directly (construction and tests) or a lost write in storage itself."
     },
     {
       "id": "rate-limiter-vectors",
@@ -580,7 +581,7 @@
       "mutants": [
         "lean-approval-freshness-check-dropped"
       ],
-      "does_not_establish": "A property of the Lean model, not of the Rust code: the model is hand-written and not extracted from Rust, and the link is the structural refinement gate only. The detector runs lake build, not the independent nanda check that CI also runs. ExecutionSafety.lean, Model.lean and Types.lean are drift-locked. The one-shot theorem is stated over the consumed-binding list: it means at most one execution per approval binding only together with State.afterExecute recording every approved binding (a model change that stopped recording would keep the theorem true)."
+      "does_not_establish": "A property of the Lean model, not of the Rust code: the model is hand-written and not extracted from Rust, and the link is the structural refinement gate only. The detector runs lake build, not the independent nanoda check that CI also runs. ExecutionSafety.lean, Model.lean and Types.lean are drift-locked. The one-shot theorem is stated over the consumed-binding list: it means at most one execution per approval binding only together with State.afterExecute recording every approved binding (a model change that stopped recording would keep the theorem true)."
     },
     {
       "id": "recipe-shared-vectors",
@@ -653,7 +654,7 @@
     {
       "id": "recipe-greedy-optimal-real-cap",
       "method": "exhaustive",
-      "statement": "At the real per-term cap of 64, the senior-first greedy rule in recipe_satisfied agrees with an independent split-search oracle on all 9,628,905 points of need (senior, teammate) with ns+nt <= 64 against availability 0..=65 plus u32::MAX for each class (no agent-reviewer slots), and the split-search oracle agrees with the unit matching oracle.",
+      "statement": "At the real per-term cap of 64, the senior-first greedy rule in recipe_satisfied agrees with an independent split-search oracle on all 9,628,905 points of need (senior, teammate) with ns+nt <= 64 against availability 0..=65 plus u32::MAX for each class (no agent-reviewer slots), and the split-search oracle agrees with the unit matching oracle on the 4,500-point cube (need sum at most 8, availability 0..=9 per class).",
       "artifacts": [
         "src/approval/stage1_proofs.rs"
       ],
@@ -710,7 +711,7 @@
     {
       "id": "approval-wire-tables",
       "method": "exhaustive",
-      "statement": "The closed wire and state decisions are enumerated: risk-tier text forces deny-on-any-deny for every spelling except Low, Medium and High (blank and unknown included), approver-class parsing accepts only the three exact spellings, the recipe decision-mode JSON decodes every listed shape to deny-on-any-deny except the one majority spelling, and the execution-state classifier matches its oracle over all 80 combinations of status, executed, failed and credential check.",
+      "statement": "The closed wire and state decisions are enumerated over listed inputs: of ten listed risk-tier strings only Low, Medium and High (after trimming) do not force deny-on-any-deny (Extreme, blank, lower-case, upper-case and unknown spellings force it), of six listed approver-class strings only the three class names (after trimming) parse, the recipe decision-mode JSON decodes every listed shape to deny-on-any-deny except the one majority spelling, and the execution-state classifier matches its oracle over all 80 combinations of status, executed, failed and credential check.",
       "artifacts": [
         "src/approval/stage1_proofs.rs"
       ],
@@ -803,7 +804,7 @@
     {
       "id": "internal-http-allowlist",
       "method": "test",
-      "statement": "The internal_http destination classifier admits only the listed loopback, RFC1918, CGNAT and unique-local addresses, refuses link-local, documentation, multicast, broadcast, NAT64 and 6to4 encodings and the Alibaba (100.100.100.200) and AWS IPv6 (fd00:ec2::254) metadata endpoints, and every admitted address is one the public-only http guard refuses.",
+      "statement": "On the listed addresses, the internal_http destination classifier admits the loopback, RFC1918, CGNAT and unique-local examples, refuses the link-local, documentation, multicast, broadcast, NAT64 and 6to4 examples and the Alibaba (100.100.100.200) and AWS IPv6 (fd00:ec2::254) metadata endpoints, and each admitted example is one the public-only http guard refuses.",
       "artifacts": [
         "src/plugins/internal_http.rs"
       ],

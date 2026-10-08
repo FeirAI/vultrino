@@ -25,7 +25,8 @@ evidence that is:
 - based only on named, distinct, authority-resolved sign-offs with the required
   controller separation; and
 - unable to satisfy any recipe containing a disabled agent-reviewer term, so
-  Govder-only D4(c)/(d)/(e) reviewer checks cannot be bypassed at this consumer; and
+  in this model the Govder-only D4(c)/(d)/(e) reviewer checks are not bypassed at
+  this consumer; and
 - restricted to a non-empty human-only recipe domain that
   `supported_recipe_satisfies_every_floor` proves remains valid for every current
   risk/autonomy/irreversibility floor; and
