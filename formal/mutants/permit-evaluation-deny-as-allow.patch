@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 9196e29..3b388fb 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -111,7 +111,7 @@ impl Evaluation {
+     pub(crate) fn verdict(&self) -> crate::formal_kernel::Verdict {
+         match self.decision {
+             PolicyDecision::Allow => crate::formal_kernel::Verdict::Allow,
+-            PolicyDecision::Deny(_) => crate::formal_kernel::Verdict::Deny,
++            PolicyDecision::Deny(_) => crate::formal_kernel::Verdict::Allow,
+             PolicyDecision::Prompt => crate::formal_kernel::Verdict::Prompt,
+         }
+     }

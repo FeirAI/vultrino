@@ -1,15 +1,15 @@
 diff --git a/src/formal_kernel.rs b/src/formal_kernel.rs
-index 77fbf66..1aa0eb1 100644
+index 490798c..9f0a6f5 100644
 --- a/src/formal_kernel.rs
 +++ b/src/formal_kernel.rs
-@@ -145,9 +145,7 @@ impl ExecutionPermit {
-         actual: &ExecutionBinding,
-         payload: T,
-     ) -> Result<Authorized<T>, PermitError> {
--        if &self.binding != actual {
+@@ -380,9 +380,7 @@ impl ExecutionPermit {
+         let dispatched = payload
+             .dispatched_binding()
+             .ok_or(PermitError::Unbindable)?;
+-        if dispatched.approved != self.basis.is_approved() || !self.binding.binds(&dispatched) {
 -            return Err(PermitError::BindingMismatch);
 -        }
-+        let _ = actual;
++        let _ = dispatched;
          Ok(Authorized {
              payload,
              _permit: self,

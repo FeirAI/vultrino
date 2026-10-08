@@ -1,0 +1,14 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 98cc73a..252415d 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -492,9 +492,6 @@ impl crate::formal_kernel::Dispatch for ActionPayload {
+                 context.approval_execution_epoch?,
+             )
+         } else {
+-            if context.approval_id.is_some() || context.approval_execution_epoch.is_some() {
+-                return None;
+-            }
+             (format!("direct:{}", context.request_id), 0)
+         };
+         Some(crate::formal_kernel::DispatchedBinding {

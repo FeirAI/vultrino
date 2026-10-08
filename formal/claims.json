@@ -43,6 +43,37 @@
     "kani-epoch-wraps": {
       "tier": "full"
     },
+    "permit-authorize-ignores-params-digest": {
+      "tier": "fast"
+    },
+    "permit-mint-without-admission": {
+      "tier": "fast"
+    },
+    "permit-approved-window-inclusive-expiry": {
+      "tier": "fast"
+    },
+    "kani-authorize-ignores-params-digest": {
+      "tier": "full"
+    },
+    "kani-mint-without-admission": {
+      "tier": "full"
+    },
+    "kani-approved-window-inclusive-expiry": {
+      "tier": "full"
+    },
+    "permit-dispatch-accepts-approval-identity-on-direct": {
+      "tier": "fast"
+    },
+    "permit-observe-ignores-kill-switch": {
+      "tier": "fast"
+    },
+    "permit-evaluation-deny-as-allow": {
+      "tier": "fast"
+    },
+    "permit-admit-approval-literal-false": {
+      "tier": "full",
+      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact test_credential_flag_gates_then_executes_on_approval declared_irreversible_capability_cannot_take_the_direct_path"
+    },
     "recipe-agent-reviewer-guard-removed": {
       "tier": "fast"
     },
@@ -242,7 +273,7 @@
   "claims": [
     {
       "id": "permit-kernel-tests",
-      "statement": "The execution-permit constructor for the direct path refuses a policy denial and refuses an approval-required request, and a permit refuses a dispatch binding whose action differs from the one it was minted for, in the unit tests that exercise those two functions.",
+      "statement": "In the unit tests of src/formal_kernel.rs: the admission gate returns the written expected outcome for all 12 inputs (verdict Allow, Deny or Prompt; observe downgrade; approval required), so only Allow, or a Deny under an observe downgrade, without an approval requirement, yields a witness, and then only when the evaluation recorded what it judged; a direct permit's binding carries the judged credential, principal and params digest and a rule digest naming the witness kind (Allow or ObservedDeny); authorize refuses a payload whose recomputed binding differs from the permit's in any one of approval id, epoch, tenant, principal, credential, action, params digest or the approved flag, and refuses a payload that cannot be bound; the approved gate refuses a Deny and is valid exactly from the grant's issue time up to its expiry at the window edges.",
       "method": "test",
       "artifacts": [
         "src/formal_kernel.rs"
@@ -250,28 +281,66 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- --exact formal_kernel::tests::direct_permit_refuses_deny_and_approval_required formal_kernel::tests::exact_binding_prevents_action_substitution",
+      "detector": "cargo test --locked --no-default-features --lib -- --exact formal_kernel::tests::admission_gate_exhaustive formal_kernel::tests::direct_rule_digests_are_the_digests_they_name formal_kernel::tests::direct_permit_carries_the_judged_subject_and_kind formal_kernel::tests::authorize_refuses_every_single_field_substitution formal_kernel::tests::authorize_refuses_an_unbindable_payload formal_kernel::tests::approved_gate_exhaustive_at_the_window_edges",
       "covers": [
         {
           "path": "src/formal_kernel.rs",
+          "symbol": "admission_gate",
+          "sha256": "2cb3a45b206cbcfad543132309d54ce3473fe9320d20061d1f20ac24fd616fa6"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "witness_from",
+          "sha256": "2c4ad9b5419a138595beef42d2d93a48952181fa9d2217ad983689e8b2ba1ffa"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "approved_gate",
+          "sha256": "98e04268e18ea94aa81402e2907de19a99b75b9142467ca6146f8f3a731c8af9"
+        },
+        {
+          "path": "src/formal_kernel.rs",
           "symbol": "ExecutionPermit::direct",
-          "sha256": "14d153c362a4983d6f2c86b67c1aa6f3f679aabe276d24a09fc19a3744013d9e"
+          "sha256": "4e60942082025c2fe5fa5a6fcca34a0543370f9f6cb2ed0c3ec0f9cb512c13a0"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "ExecutionPermit::approved",
+          "sha256": "dec5ba33a340ed60bc449fd6fef5c1e49cc3a9d4abad7e9a51758183394dec49"
         },
         {
           "path": "src/formal_kernel.rs",
           "symbol": "ExecutionPermit::authorize",
-          "sha256": "07370676bc18906fecd7774845f7becd1dd187c4d142df29b636f1ea78fee616"
+          "sha256": "5e86a305f80a745817fd2a45a2dddcbdb8304439b07c2fe9ad759d1eabf0291e"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "ExecutionBinding::binds",
+          "sha256": "65e0764ca23f7e201b7d421551402e4069bd6c4a17aa08fba1c786864a3dfa9a"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "AdmissionKind::rule_digest",
+          "sha256": "9f30518de760c7a72276a4cc31910f42c6bbf2497d590cd57d43f05c6e7c5591"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "PermitBasis::is_approved",
+          "sha256": "83729e7c958533712be26cab2a5874acca026b86d8814dd7c6fbc7ce438cb69f"
         }
       ],
       "mutants": [
         "permit-direct-skips-approval-check",
-        "permit-authorize-skips-binding-check"
+        "permit-authorize-ignores-params-digest",
+        "permit-mint-without-admission",
+        "permit-authorize-skips-binding-check",
+        "permit-approved-window-inclusive-expiry"
       ],
-      "does_not_establish": "Two example-based tests, not a proof. The binding test substitutes only the action field; a comparison that ignored another binding field would not be caught here. Says nothing about ExecutionPermit::approved, about the grant evidence it consumes, or about whether every dispatch site goes through a permit (the structural refinement gate checks only the dispatch seam count). Production does not constrain admission through this kernel: it mints the permit with literal arguments (direct(binding.clone(), true, false) and approved(binding.clone(), true, true, ...) in src/server/mod.rs), after the admission decision has already been made, and then calls authorize against the binding the permit was minted from. So this claim does not constrain the production admission decision or the dispatched payload. VUL-05 (a non-tautological permit kernel) is the open fix."
+      "does_not_establish": "Table and example tests over the kernel, not a proof. The gate inputs (the policy decision, whether observe mode downgrades a Deny, and the server's approval requirement) are computed outside the kernel and are trusted here. The rule digest is not recomputed from the payload; it is checked only where the permit is minted. Says nothing about which code builds the payload or about code that runs after authorize. The approved-permit path is exercised only through approved_gate here; the claim permit-binding-production exercises ExecutionPermit::approved with a real grant."
     },
     {
       "id": "kani-permit-kernel",
-      "statement": "Kani bounded model checking (0.67.0, pure-kernel build without wasm plugins) exhausts the boolean inputs of ExecutionPermit::direct and shows it admits exactly when policy allows and approval is not required, and shows next_epoch never wraps (it returns None at u64::MAX). Each harness carries kani::cover statements that the CI vacuity gate requires to be satisfiable.",
+      "statement": "Kani bounded model checking (0.67.0, pure-kernel build without wasm plugins) shows, over every input of the admission gate (verdict, observe downgrade, approval required, and whether the evaluation could bind its params), that a witness exists exactly when the verdict is Allow, or Deny under an observe downgrade, approval is not required and the params were bound, with a kind naming which of the two; that a direct permit copies the judged credential, principal and params digest, the request id, tenant and action, and the kind's rule digest into its binding; that authorize succeeds exactly when the seven payload-determined fields equal the permit's and the payload does not claim approved execution for a direct permit, whatever the rule digest; that the approved gate refuses a Deny and is valid exactly on [issued, expires) for every i64 clock value; and that next_epoch never wraps. Each harness carries kani::cover statements that the CI vacuity gate requires to be satisfiable.",
       "method": "kani",
       "artifacts": [
         "src/formal_kernel.rs",
@@ -280,12 +349,37 @@
       "gates": [
         "kani"
       ],
-      "detector": "set -e; for h in formal_kernel::kani_proofs::direct_permit_truth_table_is_exact formal_kernel::kani_proofs::execution_epoch_never_wraps; do cargo kani --no-default-features --harness $h --exact; done",
+      "detector": "set -e; for h in formal_kernel::kani_proofs::admission_gate_truth_table_is_exact formal_kernel::kani_proofs::authorize_accepts_exactly_the_recomputed_binding formal_kernel::kani_proofs::approved_gate_enforces_deny_and_window formal_kernel::kani_proofs::execution_epoch_never_wraps; do cargo kani --no-default-features --harness $h --exact; done",
       "covers": [
         {
           "path": "src/formal_kernel.rs",
+          "symbol": "admission_gate",
+          "sha256": "2cb3a45b206cbcfad543132309d54ce3473fe9320d20061d1f20ac24fd616fa6"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "witness_from",
+          "sha256": "2c4ad9b5419a138595beef42d2d93a48952181fa9d2217ad983689e8b2ba1ffa"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "approved_gate",
+          "sha256": "98e04268e18ea94aa81402e2907de19a99b75b9142467ca6146f8f3a731c8af9"
+        },
+        {
+          "path": "src/formal_kernel.rs",
           "symbol": "ExecutionPermit::direct",
-          "sha256": "14d153c362a4983d6f2c86b67c1aa6f3f679aabe276d24a09fc19a3744013d9e"
+          "sha256": "4e60942082025c2fe5fa5a6fcca34a0543370f9f6cb2ed0c3ec0f9cb512c13a0"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "ExecutionPermit::authorize",
+          "sha256": "5e86a305f80a745817fd2a45a2dddcbdb8304439b07c2fe9ad759d1eabf0291e"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "ExecutionBinding::binds",
+          "sha256": "65e0764ca23f7e201b7d421551402e4069bd6c4a17aa08fba1c786864a3dfa9a"
         },
         {
           "path": "src/formal_kernel.rs",
@@ -295,9 +389,96 @@
       ],
       "mutants": [
         "kani-direct-skips-approval-check",
-        "kani-epoch-wraps"
+        "kani-epoch-wraps",
+        "kani-authorize-ignores-params-digest",
+        "kani-mint-without-admission",
+        "kani-approved-window-inclusive-expiry"
       ],
-      "does_not_establish": "The vacuity (cover) check lives in formal/run-kani.sh, not in this detector, which checks only that the harnesses verify. Covers the pure functions only: not ExecutionPermit::approved, not the durable one-shot storage fence that uses the epoch, and nothing under the wasm-plugins feature (Kani cannot build it). Production does not constrain admission through this kernel: it mints the permit with literal arguments (direct(binding.clone(), true, false) and approved(binding.clone(), true, true, ...) in src/server/mod.rs), after the admission decision has already been made, and then calls authorize against the binding the permit was minted from. So this claim does not constrain the production admission decision or the dispatched payload. VUL-05 (a non-tautological permit kernel) is the open fix."
+      "does_not_establish": "The vacuity (cover) check lives in formal/run-kani.sh, not in this detector, which checks only that the harnesses verify. Kani sees the kernel only: not the ActionPayload recomputation, not the policy engine that produces the Evaluation, not the approval module's grant derivation, and not ExecutionPermit::approved itself (only the pure approved_gate it calls). Each string field is drawn from two fixed values, so the authorize harness shows field-by-field equality is checked, not anything about string contents. Nothing under the wasm-plugins feature (Kani cannot build it). The gate inputs are trusted."
+    },
+    {
+      "id": "permit-binding-production",
+      "statement": "With the production policy engine (PolicyEngine::evaluate_for_admission and evaluate_readonly_for_admission, the only builders of the private Evaluation), the approval module's grant derivation and the production ActionPayload binding recomputation: a direct permit minted for one params value refuses a payload with other params (BindingMismatch), and so does an approved permit; changing the payload's credential, plugin, action, params, tenant, principal, approved flag, approval id or approval epoch after the mint is refused; an enforced Deny (a fail-closed engine with no policy) never yields a direct witness, with or without an approval requirement; an observe-only tenant's ordinary Deny yields only the ObservedDeny witness kind, which the permit keeps, and never for a kill switch or a RateLimit guard; a Prompt, or Allow with a server approval requirement, goes to approval; a Deny at resume refuses the approved permit, a resume evaluation of other params refuses it, and a Prompt at resume is satisfied by the grant.",
+      "method": "test",
+      "artifacts": [
+        "src/formal_kernel.rs",
+        "src/server/mod.rs",
+        "src/server/permit_binding_tests.rs",
+        "src/policy/mod.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- server::permit_binding_tests",
+      "covers": [
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "Dispatch for ActionPayload::dispatched_binding",
+          "sha256": "0bf51f4890a5e3cfbce61dce4fe9bbddac6938df4235912705038381ee527c4e"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::prepare_execution",
+          "sha256": "177059684cc7fb4d951f5c1419765349ae1ee01eeafbc6148b2576451bdd7dff"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::resume_approved",
+          "sha256": "c4bbf0a5a5dc74e073cd55a84ca269ddb6dad86abcdfd339f9431ab7ae8257e7"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::direct_admission",
+          "sha256": "6650757976a97f795330c7a66345d7f57797a941ae369cb2176ff88e03618e39"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::evaluate_for_admission",
+          "sha256": "84e02be4a345e9933ba72a17d28ba5356f79ad1ab20556475a8152424279c852"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::evaluate_readonly_for_admission",
+          "sha256": "42dc02260fceb9dd1bb90cb4f8817819916516200c1d22b2d657b7b514071437"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "AdmissionQuery::eval_input",
+          "sha256": "38a8e7f9241d1e783c133762ef32e1aadd45a797c4c0c8d3346a1a836e341be6"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "AdmissionQuery::subject",
+          "sha256": "4ecb6176594758ac4e7a95382048542dc3fa0e1860c184e088ad231cf6d96b95"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "Evaluation::verdict",
+          "sha256": "0542b0c753ad629ed5ce28b8c32283e9dee91e3feef59b6e3c2b653bfad6bd74"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "admit",
+          "sha256": "600c20581cc29cf79e6a422635ca3c3ecf2ec444c3a54d5bff520156422b1abc"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "digest_params",
+          "sha256": "10678e732f60bb66bfc0e2d5b12dd82ee4d1ae719d52499b2b6682311c536310"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "ExecutionPermit::approved",
+          "sha256": "dec5ba33a340ed60bc449fd6fef5c1e49cc3a9d4abad7e9a51758183394dec49"
+        }
+      ],
+      "mutants": [
+        "permit-dispatch-accepts-approval-identity-on-direct",
+        "permit-observe-ignores-kill-switch",
+        "permit-evaluation-deny-as-allow",
+        "permit-admit-approval-literal-false"
+      ],
+      "does_not_establish": "The tests call the mint and authorize functions with production inputs; they do not run prepare_execution or resume_approved (the integration tests in tests/approval_token_integration.rs do, and the full-tier mutant permit-admit-approval-literal-false is detected by two of them). The kernel trusts its inputs: which policy rules matched, the tenant mode, and the server's approval requirement (credential flag, token, dual control, capability catalog). The rule digest is not recomputed from the payload. run_action unpacks the authorized payload and builds the plugin request after authorize; that code, and anything a plugin does with the payload, is not checked by the kernel. The params digest is over the serde_json bytes of the stored value, not over bytes an approver saw. Covers only the two mint sites and their helpers by drift lock; other callers of the policy engine (for example list-time capability visibility) do not go through the kernel."
     },
     {
       "id": "recipe-unit-tests",
@@ -623,7 +804,7 @@
         {
           "path": "src/formal_kernel.rs",
           "symbol": "*",
-          "sha256": "c3fea22a66e1ab11c719e5da5ae0d699e7aef81d5cc2c1527b8260606fe02882"
+          "sha256": "d005d7d2fdec7721d9da34b1db1ed9360d033aa06a04ea9affa122c5e688710f"
         }
       ],
       "mutants": [

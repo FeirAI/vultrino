@@ -1,0 +1,14 @@
+diff --git a/src/formal_kernel.rs b/src/formal_kernel.rs
+index 490798c..6f086c2 100644
+--- a/src/formal_kernel.rs
++++ b/src/formal_kernel.rs
+@@ -214,7 +214,8 @@ fn witness_from(
+     approval_required: bool,
+     subject: Option<JudgedSubject>,
+ ) -> Result<AdmissionWitness, PermitError> {
+-    let kind = admission_gate(verdict, observe_downgrade, approval_required)?;
++    let kind = admission_gate(verdict, observe_downgrade, approval_required)
++        .unwrap_or(AdmissionKind::Allow);
+     let subject = subject.ok_or(PermitError::Unbindable)?;
+     Ok(AdmissionWitness { kind, subject })
+ }

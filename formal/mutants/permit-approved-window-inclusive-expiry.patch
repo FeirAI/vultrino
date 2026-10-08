@@ -1,0 +1,13 @@
+diff --git a/src/formal_kernel.rs b/src/formal_kernel.rs
+index 490798c..2d539c8 100644
+--- a/src/formal_kernel.rs
++++ b/src/formal_kernel.rs
+@@ -235,7 +235,7 @@ pub(crate) fn approved_gate(
+     if now_unix_seconds < issued_at_unix_seconds {
+         return Err(PermitError::GrantNotYetIssued);
+     }
+-    if now_unix_seconds >= expires_at_unix_seconds {
++    if now_unix_seconds > expires_at_unix_seconds {
+         return Err(PermitError::GrantExpired);
+     }
+     Ok(())
