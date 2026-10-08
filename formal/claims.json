@@ -186,6 +186,18 @@
     },
     "kani-policy-precedence-lazy-prompt-allow-swapped": {
       "tier": "full"
+    },
+    "url-canon-skipped": {
+      "tier": "fast"
+    },
+    "url-canon-host-boundary-dropped": {
+      "tier": "fast"
+    },
+    "url-canon-unparseable-deny-dropped": {
+      "tier": "fast"
+    },
+    "url-canon-http-sends-raw": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -436,7 +448,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::load_policies_if_newer",
-          "sha256": "3b860a4dccbbee01b2edd3c1d49bdbc0240a99257c5aee3f2d62363e8aead0e5"
+          "sha256": "c52c6246373965a13c5e71d36653c2e9629315c438ae419a493792650e72cbc6"
         },
         {
           "path": "src/server/mod.rs",
@@ -1065,7 +1077,7 @@
         {
           "path": "src/plugins/http.rs",
           "symbol": "*",
-          "sha256": "ffc3ab185a64d9173895ad182675af536c3ecf1b1d67e5d50bff80e01897c6a5"
+          "sha256": "bea6fa5db58c22c6294905b7b51e01d5497e81ebfc6d98d5a7932055bc1cecb7"
         },
         {
           "path": "src/plugins/http/ssrf_spec.rs",
@@ -1105,7 +1117,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "0aea8e28ada44a3562eef8bcf4f9058e67fd7be366edfadf400e81f4371cb705"
+          "sha256": "494991803555398b629bf9ff79e2d70f8f9b4d65237c856fa797b5fe324bd8dc"
         },
         {
           "path": "src/policy/precedence.rs",
@@ -1191,6 +1203,56 @@
         "rate-limit-default-deny-validation-removed"
       ],
       "does_not_establish": "Validation runs at config load and on the admin API, not when policies are read back from the vault, so a policy stored before this check keeps working as written. The engine itself does not validate, so a policy added through PolicyEngine::add_policy without validation is not refused. Example tests over a few condition shapes. Layered rate limits remain first-match. Default deny makes an over-limit request a denial only when no other rule matches it: the exhausted rule falls through to the other deny, prompt and allow rules of every matching policy first, so another allow rule (in this or another matching policy) still allows the request, and a rule whose only condition is a RateLimit allows every request on the credential until it is spent."
+    },
+    {
+      "id": "url-match-canonical",
+      "statement": "UrlMatch is evaluated on a canonical form of the request URL (url crate parse: scheme and host lowercased, IDNA, default port dropped, dot segments resolved, fragment dropped, percent-encoding normalised so unreserved escapes are decoded) against a pattern canonicalised the same way. For generated equivalent spellings (host case, default port, dot segments, encoded unreserved characters, fragment) the engine decision equals the decision for the plain spelling under Deny-prefix, Allow-prefix and Allow-glob rules. A prefix pattern that ends in * directly after a host stops at the host boundary, so look-alike hosts (api.example.com.evil.net, api.example.com@evil.net) do not match. A URL that cannot be parsed never matches an Allow rule and is denied when a matching policy has a UrlMatch under a Deny rule or under a Not. The http and hmac plugins send the same canonical string (except UrlToken credentials, whose substituted path is left untouched). Risky patterns (star right after the host, star in the host, dot segments) log a load-time warning.",
+      "method": "property",
+      "artifacts": [
+        "src/policy/url_canon.rs",
+        "src/policy/mod.rs",
+        "src/plugins/http.rs",
+        "src/plugins/hmac.rs",
+        "tests/url_canonical.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "set -e; cargo test --locked --no-default-features --test url_canonical; cargo test --locked --no-default-features --lib -- policy::url_canon::tests plugins::http::tests::test_prepare_request_sends_the_canonical_url",
+      "covers": [
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "canonical_url",
+          "sha256": "16f1d454e01fb2a8bcb1a428c44648202f788b1a11063491035be2d39a47b8e6"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "canonical_pattern",
+          "sha256": "2eb2df9b7563148f474681dba0a96b9756776078f3d66c486b920c30f3382cac"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "url_matches",
+          "sha256": "b47c71b8faabf2cbf239ab68251197c0946e1f43a676cf92d93ccb5638cf7c25"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::evaluate_inner",
+          "sha256": "494991803555398b629bf9ff79e2d70f8f9b4d65237c856fa797b5fe324bd8dc"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "HttpPlugin::prepare_request",
+          "sha256": "97eb60ef8582ac79cf850a5021e505e9a7ba6d663f42e82c78b789147a00538c"
+        }
+      ],
+      "mutants": [
+        "url-canon-skipped",
+        "url-canon-host-boundary-dropped",
+        "url-canon-unparseable-deny-dropped",
+        "url-canon-http-sends-raw"
+      ],
+      "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or a trailing dot in the host differently is not modelled). Patterns with * inside the host, or glob patterns whose * crosses a / (a glob * matches /), can still match a different host: they only log a warning this release. Host-boundary coverage is for prefix patterns without a port or userinfo wildcard. Only the http and hmac plugins send the canonical URL; the wasm plugin egress, ssh and postgres plugins do not use params url. UrlToken requests are judged on the placeholder URL and sent with the secret substituted unmodified. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested."
     }
   ]
 }

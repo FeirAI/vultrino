@@ -340,3 +340,17 @@ and is allowed (or prompted).
 Re-save such a policy through the admin API (which validates) or change its
 default to deny. No warning is logged for these today; adding a log-only check on
 load is a follow-up.
+
+## URL policy matching: what canonical matching does not cover
+
+`url_match` is evaluated on a canonical form of the URL (see CONFIGURATION.md).
+This does not model what an upstream server does with the bytes: a server that
+treats an encoded slash, a trailing-dot host or a different case in the path
+as the same resource as another spelling is outside it. A glob pattern (no
+trailing `*`) with `*` in the host part can still match a different host,
+because a glob `*` also matches `/`; this release only logs a warning and
+the pattern will be refused in a later release. Patterns are canonicalised
+when they are matched, not rewritten in storage, so the admin API still shows the
+text the operator wrote. A `UrlToken` credential is judged on its placeholder URL
+and sent with the secret substituted unmodified. The WASM plugin egress does
+not use the `url` param and is not covered.

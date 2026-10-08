@@ -1,0 +1,15 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index 626d366..11142e9 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -187,7 +187,9 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
+         warnings.push(PatternWarning::MeaningChanged);
+     }
+     CanonPattern {
+-        text: if prefix_mode {
++        text: if prefix_mode && warnings.contains(&PatternWarning::StarAfterHost) {
++            pattern.to_string()
++        } else if prefix_mode {
+             format!("{canon}*")
+         } else {
+             canon

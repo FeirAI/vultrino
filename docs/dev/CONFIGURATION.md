@@ -189,6 +189,21 @@ per_action_max = N } }`, `{ and = [ … ] }`, `{ or = [ … ] }`. Actions: `allo
 `deny` / `prompt`. Config policies are merged with admin-API-managed stored
 policies into the live engine (config-first, never deduped by id).
 
+**`url_match` compares canonical URLs.** The request URL and the pattern are both
+put in canonical form before matching: scheme and host lowercased (IDNA to ASCII),
+default port dropped, dot segments resolved, fragment dropped, percent-encoded
+unreserved characters decoded and other escapes upper-cased. A pattern ending in
+`*` is a literal prefix of the canonical URL; any other pattern is a glob. A
+prefix that ends in `*` directly after a host (`https://api.example.com*`) now
+stops at the host boundary, so it no longer matches `api.example.com.evil.net`
+(it is treated as `https://api.example.com/*`). A URL that cannot be parsed never
+matches an Allow rule and is denied when a matching policy has a `url_match`
+under a deny rule or under a `not`. Path-only values (`/v1/refunds`) are
+canonicalised the same way. At load, vultrino logs a WARNING for patterns with
+`*` right after the host, `*` inside the host, or dot segments; these will be
+refused in the next release. The `http` and `hmac` plugins send the canonical
+string that was evaluated. See the limits in `docs/dev/LIMITATIONS.md`.
+
 **SpendCap validation (hard error at load):** a `SpendCap` must be a rule's
 top-level condition (not nested), `asset` non-empty, `per_action_max > 0`, and the
 policy must be `default_action = "deny"`.

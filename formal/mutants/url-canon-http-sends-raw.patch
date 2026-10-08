@@ -1,0 +1,13 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 9592d56..e8adb83 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -852,7 +852,7 @@ impl HttpPlugin {
+         // pinned above).
+         let send_url = match cred_data {
+             CredentialData::UrlToken { .. } => params.url.clone(),
+-            _ => crate::policy::canonical_url(&params.url).unwrap_or_else(|| params.url.clone()),
++            _ => params.url.clone(),
+         };
+ 
+         // Validate URL for SSRF before proceeding
