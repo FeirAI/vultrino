@@ -207,7 +207,8 @@ condition = {{ and = [
 }
 
 /// The SAME pinned destination, but with a deliberately PERMISSIVE policy
-/// (`url_match = "*"`, every verb). This isolates the plugin: any refusal under
+/// (an action-only Allow for every action and verb; it does not depend on the URL string, so
+/// a value that cannot be canonicalised still reaches the plugin). This isolates the plugin: any refusal under
 /// this config is the plugin's own doing, not the policy's. It is the config an
 /// operator must never ship — and the point is that even then, the caller cannot
 /// steer the destination.
@@ -231,7 +232,7 @@ default_action = "deny"
 
 [[policies.rules]]
 action = "allow"
-condition = {{ url_match = "*" }}
+condition = {{ action_match = "*" }}
 "#
     );
     Config::parse(&toml).expect("permissive config parses")
@@ -639,7 +640,7 @@ async fn http_plugin_still_refuses_loopback_metadata_and_clusterip() {
     let config = Config {
         policies: vec![
             vultrino::policy::Policy::allow_all("allow-http", "web-*").with_rule(
-                vultrino::policy::PolicyCondition::UrlMatch("*".to_string()),
+                vultrino::policy::PolicyCondition::Always,
                 vultrino::policy::PolicyAction::Allow,
             ),
         ],
@@ -749,7 +750,7 @@ async fn per_credential_path_prefix_pins_a_scoped_credential() {
 // (g) The PLUGIN is the refuser — proven with policy deliberately permissive
 // ===========================================================================
 
-/// Same attacks as (b)/(c), but under `url_match = "*"`: the policy would admit
+/// Same attacks as (b)/(c), but under an always-allow policy: the policy would admit
 /// them all, so every refusal below is produced by `internal_http` itself. This
 /// is the load-bearing proof that the destination is not caller-influenceable
 /// even on a badly authored policy.
@@ -907,7 +908,7 @@ async fn plugin_itself_refuses_every_steering_attempt_under_a_permissive_policy(
 async fn query_is_forwarded_and_is_part_of_the_policy_matched_string() {
     let (port, rec) = start_sandbox().await;
 
-    // Permissive policy (url_match "*"): both query forms reach the sandbox.
+    // Permissive policy (any URL, every verb): both query forms reach the sandbox.
     let (server, storage) = build_server(permissive_config(port)).await;
     let token = seed(
         &storage,
@@ -943,8 +944,9 @@ async fn query_is_forwarded_and_is_part_of_the_policy_matched_string() {
 
     // Strict policy with url_glob "/v1/refunds": a query-bearing `url` no longer
     // matches the glob, so it is DENIED. This is the authoring nuance packs must
-    // respect — pin `url_glob` with a trailing `*` if the agent may pass a query
-    // inside `url`, or require the `query` map instead.
+    // respect: pin `url_glob` with a trailing `*` if the agent may pass a query.
+    // Since SB-03 the `query` map is merged into the judged URL too, so moving the
+    // query into the map does not get past an exact glob either.
     let (server2, storage2) = build_server(operator_config(port, "")).await;
     let token2 = seed(
         &storage2,
@@ -964,6 +966,19 @@ async fn query_is_forwarded_and_is_part_of_the_policy_matched_string() {
     .await
     .expect_err("a query inside `url` changes the policy-matched string");
     eprintln!("QUERY-IN-URL vs STRICT url_glob -> {err}");
+    assert!(err.to_lowercase().contains("polic"), "{err}");
+    // SB-03: the server judges the `query` map merged into the URL, so the same
+    // exact glob refuses the query when it arrives in the map instead.
+    let err = run(
+        &server2,
+        &token2,
+        refund_request(
+            "finsandbox-refund",
+            serde_json::json!({"url": "/v1/refunds", "method": "POST", "query": {"dry_run": "1"}}),
+        ),
+    )
+    .await
+    .expect_err("a query in the `query` map changes the policy-matched string");
     assert!(err.to_lowercase().contains("polic"), "{err}");
 }
 

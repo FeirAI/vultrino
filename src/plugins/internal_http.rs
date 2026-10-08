@@ -155,10 +155,11 @@ const VERBS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTI
 #[serde(deny_unknown_fields)]
 pub struct InternalHttpParams {
     /// RELATIVE reference within the pinned destination: `/v1/refunds`, or
-    /// `/v1/transactions?flagged=1`. MUST start with a single `/`. This is also
-    /// the string the policy engine's `url_glob` conditions match against
-    /// (`server::execute_gated` reads `params["url"]`), so an operator bounds the
-    /// path surface with the same policy dimension the `http` plugin uses.
+    /// `/v1/transactions?flagged=1`. MUST start with a single `/`. Policy
+    /// `url_match` conditions judge the canonical form of this value with the
+    /// `query` map merged in (`crate::policy::policy_url`, read by
+    /// `server::execute_gated`), so an operator bounds the path surface with the
+    /// same policy dimension the `http` plugin uses.
     pub url: String,
     /// HTTP method. Checked against the destination's `allow_methods`.
     pub method: String,

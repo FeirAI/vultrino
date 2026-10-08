@@ -1,0 +1,13 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 55f902a..5e94862 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -953,7 +953,7 @@ impl HttpPlugin {
+         // Add query parameters
+         // (Already merged into the URL policy judged, except for UrlToken, whose
+         // URL is the substituted placeholder form.)
+-        if matches!(cred_data, CredentialData::UrlToken { .. }) && !params.query.is_empty() {
++        if !params.query.is_empty() {
+             request = request.query(&params.query);
+         }
+ 

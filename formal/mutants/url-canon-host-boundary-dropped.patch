@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index d476b1f..fadce12 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -269,7 +269,7 @@ pub fn canonical_matches(url: &str, pattern: &str) -> bool {
+         let host_only = prefix
+             .split_once("://")
+             .is_some_and(|(_, r)| !r.is_empty() && !r.contains('/'));
+-        if host_only {
++        if false && host_only {
+             let rest = &url[prefix.len()..];
+             return rest.is_empty() || rest.starts_with(['/', ':', '?']);
+         }

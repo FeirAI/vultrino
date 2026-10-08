@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index d476b1f..b66bc1c 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -56,7 +56,7 @@ fn normalize_percent(s: &str) -> String {
+         // A '%' that does not start a valid escape is encoded, so a URL the parser
+         // accepts always reaches a fixed point (a decoded unreserved character
+         // can never complete a new escape).
+-        if bytes[i] == b'%' {
++        if false && bytes[i] == b'%' {
+             out.push_str("%25");
+             i += 1;
+             continue;

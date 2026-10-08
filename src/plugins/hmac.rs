@@ -133,6 +133,16 @@ impl HmacPlugin {
         Ok(url)
     }
 
+    /// SB-03: the URL this plugin sends is the canonical URL policy judged. A
+    /// URL that cannot be canonicalised is refused, never sent raw.
+    fn canonical_send_url(raw: &str) -> Result<String, PluginError> {
+        crate::policy::canonical_url(raw).ok_or_else(|| {
+            PluginError::InvalidParams(
+                "URL cannot be canonicalised (policy could not judge it)".to_string(),
+            )
+        })
+    }
+
     /// Execute an HMAC-signed HTTP request
     async fn execute_request(
         &self,
@@ -159,7 +169,12 @@ impl HmacPlugin {
         };
 
         // Validate URL
-        let validated_url = Self::validate_url_ssrf(&params.url)?;
+        // SB-03: send the canonical URL that policy evaluated.
+        // The query map is judged by policy merged into the URL (sorted); this
+        // plugin adds only `timestamp`, `recvWindow` and `signature`. A URL
+        // that cannot be canonicalised is refused, never sent raw.
+        let send_url = Self::canonical_send_url(&params.url)?;
+        let validated_url = Self::validate_url_ssrf(&send_url)?;
 
         // Parse method
         let method = Method::from_str(&params.method.to_uppercase()).map_err(|_| {
@@ -378,6 +393,24 @@ impl Plugin for HmacPlugin {
 mod tests {
     use super::*;
     use crate::Secret;
+
+    /// SB-03: hmac sends the canonical URL and refuses what cannot be judged.
+    #[test]
+    fn test_hmac_sends_the_canonical_url_and_refuses_the_rest() {
+        assert_eq!(
+            HmacPlugin::canonical_send_url("HTTPS://Api.Example.com:443/a/../v1?x=%7e#f").unwrap(),
+            "https://api.example.com/v1?x=~"
+        );
+        for bad in ["https://[::1", "https://u@api.example.com/x", ""] {
+            assert!(
+                matches!(
+                    HmacPlugin::canonical_send_url(bad),
+                    Err(PluginError::InvalidParams(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_compute_signature() {

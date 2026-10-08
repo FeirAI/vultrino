@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 644acd1..62131e2 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -472,7 +472,7 @@ impl PolicyEngine {
+         // Deny or Prompt rule, or under a `Not` in any rule. Otherwise an unparseable spelling could
+         // slip past the very rule written to stop it.
+         if let Some(raw) = input.url {
+-            if canonical_url(raw).is_none() {
++            if false && canonical_url(raw).is_none() {
+                 if let Some(p) = matching_policies.iter().find(|p| {
+                     p.rules.iter().any(|r| {
+                         (matches!(r.action, PolicyAction::Deny | PolicyAction::Prompt)

@@ -189,6 +189,34 @@ per_action_max = N } }`, `{ and = [ … ] }`, `{ or = [ … ] }`. Actions: `allo
 `deny` / `prompt`. Config policies are merged with admin-API-managed stored
 policies into the live engine (config-first, never deduped by id).
 
+**`url_match` compares canonical URLs.** The request URL and the pattern are
+both put in canonical form before matching: scheme and host lowercased (IDNA to
+ASCII), one trailing dot on the host dropped, default port dropped, dot segments
+resolved, fragment dropped, percent-encoded unreserved characters decoded, other
+escapes upper-cased, and a stray `%` encoded as `%25`. The caller's `query` map
+is merged into the URL (sorted by key, percent-encoded) before matching, so a
+rule on `https://host/v1/search?q=secret*` sees the query the plugin will send.
+A URL with userinfo (`https://user@host/...`) is treated as unparseable. A
+pattern ending in `*` is a literal prefix of the canonical URL; any other
+pattern is a glob. A prefix that ends in `*` directly after a host
+(`https://api.example.com*`) is a host match: the prefix must be followed by a
+port, a path, a query or the end, so it matches the same host on any port but no
+longer matches `api.example.com.evil.net`. A prefix that stops inside a host
+(`https://api.*`, `https://10.0.0*`) is a host match of the host the parser
+reads from it (`api`, `10.0.0.0`), so it matches less than before. A pattern
+without a trailing `*` must match the merged query as well. A URL that cannot be
+parsed never matches an Allow rule and is denied when a matching policy has a
+`url_match` under a deny or prompt rule or under a `not`. Path-only values
+(`/v1/refunds`) are canonicalised the same way. At load, vultrino logs a WARNING
+(once per policy and pattern) for patterns with `*` right after the host, `*`
+inside the host (also without a scheme), or where canonicalisation changes the
+meaning (dot segments, encoded dots, a fragment, a backslash, a `*` that cuts a
+percent escape short); these will be refused in the next release. The `http`
+plugin sends the evaluated string and refuses a URL that cannot be
+canonicalised. The `hmac` plugin sends the canonical URL and adds only
+`timestamp`, `recvWindow` and `signature` to the evaluated query pairs. See the
+limits in `docs/dev/LIMITATIONS.md`.
+
 **SpendCap validation (hard error at load):** a `SpendCap` must be a rule's
 top-level condition (not nested), `asset` non-empty, `per_action_max > 0`, and the
 policy must be `default_action = "deny"`.

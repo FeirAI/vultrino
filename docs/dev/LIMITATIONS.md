@@ -340,3 +340,42 @@ and is allowed (or prompted).
 Re-save such a policy through the admin API (which validates) or change its
 default to deny. No warning is logged for these today; adding a log-only check on
 load is a follow-up.
+
+## URL policy matching: what canonical matching does not cover
+
+`url_match` is evaluated on a canonical form of the URL (see CONFIGURATION.md).
+This does not model what an upstream server does with the bytes: a server that
+treats an encoded slash or a different case in the path as the same resource as
+another spelling is outside it. A trailing dot on the host is removed by
+canonicalisation, because it names the same destination in DNS. A glob pattern
+(no trailing `*`) with `*` in the host part can still match a different host,
+because a glob `*` also matches `/`; this release only logs a warning and
+the pattern will be refused in a later release. A glob whose host part holds `?`
+keeps its old literal glob meaning and is not canonicalised (warned). Patterns
+are canonicalised when they are matched, not rewritten in storage, so the admin
+API still shows the text the operator wrote. A `UrlToken` credential is judged
+on its placeholder URL and sent with the secret substituted unmodified. Only the
+`http` and `hmac` plugins send the canonical string. The `internal_http` plugin
+does not: it sends the `url`-crate composition of the raw path, and its own
+path allowlists run on that composed path, not on the canonical form. What it
+sends can differ from the evaluated form in percent-escape spelling: unreserved
+escapes, hex case, and the form encoding of the `query` map (a space is sent as
+`+`, a `*` unescaped). The WASM
+plugin egress, ssh and postgres plugins do not use the `url` param and are not
+covered. The `hmac` plugin appends `timestamp`, `recvWindow` and `signature` to
+the evaluated query pairs, sorted among them; those three are not judged. AWS
+SigV4 requests re-sort the query pairs for signing. The `query` map is judged
+only when it is a JSON object; a value that is not a string is judged as its
+JSON text, and the `http` and `hmac` plugins refuse such a map. A prefix that
+ends in `*` inside a host (`https://api.*`, `https://10.0.0*`) is matched as
+the one host the URL parser reads from it (`api`, `10.0.0.0`) and is warned, so
+a deny rule of that shape no longer matches longer host names or other
+addresses and denies less than before. A pattern without a trailing `*` (an
+exact URL or a glob that ends in a path) must match the query too: a deny rule
+on `https://host/admin` does not match `https://host/admin?x=1`, whether the
+query is in `url` or in the `query` map. The meaning-change warning compares
+the pattern with a loose normal form and is tested on examples only, so it can
+miss a change. Deny rules and the unparseable
+pre-check run before the kill tier, so a halted principal with an unparseable
+URL gets the unparseable reason instead of the halt reason; the outcome is still
+Deny.

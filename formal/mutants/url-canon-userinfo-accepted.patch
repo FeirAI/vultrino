@@ -1,0 +1,14 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index d476b1f..2503fa5 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -94,9 +94,6 @@ fn one_pass(raw: &str) -> Option<String> {
+     // Userinfo is not part of the destination but reqwest turns it into a
+     // Basic header on the same host and path, so `https://u@host/admin` would
+     // sidestep a rule on `https://host/admin/*`. Refuse it.
+-    if !u.username().is_empty() || u.password().is_some() {
+-        return None;
+-    }
+     u.set_fragment(None);
+     // `host.` and `host` are the same destination (client-side DNS): drop the
+     // trailing dot so one spelling remains.
