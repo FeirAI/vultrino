@@ -367,7 +367,7 @@
     {
       "id": "rate-limiter-vectors",
       "statement": "The fixed-window rate limiter transition function reproduces, byte for byte, the committed trace fixture formal/vectors/rate_limiter_traces.json (cold start, sub-window lag, exact whole-window lag, two-window lag), and an invalid limiter (max 0 or window 0) denies without creating state.",
-      "method": "differential-vectors",
+      "method": "test",
       "artifacts": [
         "src/policy/mod.rs",
         "formal/vectors/rate_limiter_traces.json",
