@@ -2451,7 +2451,7 @@ async fn create_use_token(
 async fn list_use_tokens(config: Config, format: String) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
     let mut tokens = storage.list_use_tokens().await?;
-    tokens.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    tokens.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
     if tokens.is_empty() {
         println!("No use tokens found");
@@ -2529,7 +2529,7 @@ async fn revoke_use_token(config: Config, id: String) -> Result<(), Box<dyn std:
 async fn list_approvals(config: Config, format: String) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
     let mut approvals = storage.list_approvals().await?;
-    approvals.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    approvals.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
     if approvals.is_empty() {
         println!("No approval requests");

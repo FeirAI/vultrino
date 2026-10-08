@@ -171,8 +171,8 @@ The separate fixed-window limiter seam is extracted to the pure
 `formal/vectors/rate_limiter_traces.json` through that function and compares it
 byte-for-byte; the refinement checker pins SHA-256
 `ab102718048eb7fd40d045daf1e5b1c0ab355361e0b5a7352e4cd7ed0f8b86ec`.
-Govder consumes the identical fixture when checking its proved overshoot
-formula. Invalid zero dimensions deny before creating counter state.
+A Govder-side consumer of this fixture exists only on an unmerged Govder
+branch; it is not on Govder main. Invalid zero dimensions deny before creating counter state.
 
 `formal/check-refinement.sh` is a structural drift gate over those exact Rust
 objects and seams. Nine Kani harnesses check the direct-permit truth table,
