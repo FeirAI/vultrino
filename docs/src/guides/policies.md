@@ -143,6 +143,12 @@ condition = { rate_limit = { max = 1000, window_secs = 3600 } }
 condition = { rate_limit = { max = 10, window_secs = 1 } }
 ```
 
+Use it as the condition of an `allow` rule. A policy that contains a `rate_limit`
+anywhere (including inside `and`/`or`/`not`) must use `default_action = "deny"`,
+which is enforced at config load and by the admin API. Once the limit is spent
+the rule stops matching and the request falls through to the policy default, so a
+non-deny default would turn an over-limit request into an allow.
+
 ### Spend Cap
 
 Cap the value an agent can spend in a **single call**, in **minor units** (e.g.

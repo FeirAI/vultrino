@@ -192,8 +192,13 @@ impl Policy {
     ///   through to deny rather than being allowed.
     /// - every `RateLimit`, including nested limits, must have `max > 0` and
     ///   `window_secs > 0`; zero dimensions cannot establish a finite bound.
+    /// - a policy that uses a `RateLimit` at any depth must be fail-closed
+    ///   (`default_action = deny`) too (OD-12): an exhausted Allow-`RateLimit` rule
+    ///   does not match, so the request falls through to the policy default, and a
+    ///   non-deny default would turn the limit into an Allow.
     pub fn validate(&self) -> Result<(), String> {
         let mut uses_spend_cap = false;
+        let mut uses_rate_limit = false;
         for rule in &self.rules {
             if let PolicyCondition::SpendCap {
                 asset,
@@ -231,6 +236,9 @@ impl Policy {
                     self.name, start, end
                 ));
             }
+            if condition_contains_rate_limit(&rule.condition) {
+                uses_rate_limit = true;
+            }
             if let Some((max, window_secs)) = condition_invalid_rate_limit(&rule.condition) {
                 return Err(format!(
                     "policy '{}': RateLimit max and window_secs must both be > 0 (got max={}, window_secs={})",
@@ -244,7 +252,25 @@ impl Policy {
                 self.name
             ));
         }
+        if uses_rate_limit && self.default_action != PolicyAction::Deny {
+            return Err(format!(
+                "policy '{}': a policy with a RateLimit condition must use default_action = \"deny\" (fail-closed): an exhausted limit falls through to the policy default",
+                self.name
+            ));
+        }
         Ok(())
+    }
+}
+
+/// Whether a condition tree contains a `RateLimit` at any depth.
+fn condition_contains_rate_limit(c: &PolicyCondition) -> bool {
+    match c {
+        PolicyCondition::RateLimit { .. } => true,
+        PolicyCondition::And(cs) | PolicyCondition::Or(cs) => {
+            cs.iter().any(condition_contains_rate_limit)
+        }
+        PolicyCondition::Not(inner) => condition_contains_rate_limit(inner),
+        _ => false,
     }
 }
 
@@ -403,5 +429,55 @@ mod tests {
                 .expect_err("zero dimensions must fail closed");
             assert!(error.contains("RateLimit max and window_secs must both be > 0"));
         }
+    }
+    /// OD-12: an exhausted Allow-RateLimit rule does not match, so the request falls
+    /// through to the policy default. With any non-deny default that is an Allow, so
+    /// the limit would not limit anything. A policy with a RateLimit, at any depth,
+    /// must therefore be default-deny, like SpendCap.
+    #[test]
+    fn test_policy_with_rate_limit_must_default_deny() {
+        for default_action in [PolicyAction::Allow, PolicyAction::Prompt] {
+            for condition in [
+                PolicyCondition::RateLimit {
+                    max: 1,
+                    window_secs: 60,
+                },
+                PolicyCondition::And(vec![
+                    PolicyCondition::Always,
+                    PolicyCondition::RateLimit {
+                        max: 1,
+                        window_secs: 60,
+                    },
+                ]),
+                PolicyCondition::Not(Box::new(PolicyCondition::Or(vec![
+                    PolicyCondition::RateLimit {
+                        max: 1,
+                        window_secs: 60,
+                    },
+                ]))),
+            ] {
+                let mut policy =
+                    Policy::deny_all("rl-open", "*").with_rule(condition, PolicyAction::Allow);
+                policy.default_action = default_action;
+                let error = policy
+                    .validate()
+                    .expect_err("a RateLimit policy with a non-deny default must be refused");
+                assert!(
+                    error.contains("RateLimit") && error.contains("default_action"),
+                    "unexpected error: {error}"
+                );
+            }
+        }
+        // The fail-closed shape stays valid.
+        Policy::deny_all("rl-ok", "*")
+            .with_rule(
+                PolicyCondition::RateLimit {
+                    max: 1,
+                    window_secs: 60,
+                },
+                PolicyAction::Allow,
+            )
+            .validate()
+            .expect("deny-default RateLimit policy is valid");
     }
 }

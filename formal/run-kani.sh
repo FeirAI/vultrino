@@ -74,6 +74,7 @@ run_harness approval::kani_recipe_proofs::recipe_cap_prevents_need_overflow
 run_harness approval::kani_recipe_proofs::class_slot_contribution_agrees_with_satisfaction
 run_harness plugins::http::ssrf_spec::kani_ssrf_proofs::ipv4_classifier_equals_spec_over_all_u32
 run_harness plugins::http::ssrf_spec::kani_ssrf_proofs::ipv6_classifier_equals_spec_over_all_u128
+run_harness policy::precedence::kani_precedence_proofs::precedence_is_the_maximum_rank_and_order_independent
 
 # Every #[kani::proof] must be listed above, or it would silently not run.
 # The script has already cd'd to the repo root, so name itself by that path

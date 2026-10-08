@@ -7,9 +7,12 @@
 //! - Time windows
 //! - Rate limits
 
+mod precedence;
 mod types;
 
 pub use types::*;
+
+use precedence::{resolve_precedence, RuleOutcome, Verdict};
 
 use crate::RequestContext;
 use glob::Pattern;
@@ -456,31 +459,19 @@ impl PolicyEngine {
             })
             .collect();
 
+        // Collect the matched rule outcomes lazily, then let the pure
+        // `resolve_precedence` decide (kill > deny > prompt > allow > policy
+        // default > engine default).
+        //
         // V6 kill switch: an authoritative per-principal halt overrides everything
-        // — evaluated before any normal policy so an allow rule ordered first can
-        // never let a halted agent through. (A kill policy matches a credential +
-        // principal like any other, but its `kill` flag makes it unconditional.)
-        if matching_policies.iter().any(|p| p.kill) {
-            // Generic reason to the caller — don't leak the kill-policy name or
-            // label scheme to a (possibly compromised) agent. The specifics live
-            // in the halt audit log.
-            return PolicyDecision::Deny("denied: this principal has been halted".to_string());
-        }
-
-        // If no policies match, fall back to the configured engine default.
-        if matching_policies.is_empty() {
-            if self.default_deny.load(Ordering::SeqCst) {
-                return PolicyDecision::Deny(
-                    "no_policy: no policy matches this credential (default-deny enforcement)"
-                        .to_string(),
-                );
-            }
-            return PolicyDecision::Allow;
-        }
-
+        // — no rule is looked at (and no rate-limit slot is charged) once a
+        // matching policy carries the kill flag, so an allow rule ordered first can
+        // never let a halted agent through.
+        //
         // Stored policies originate in a HashMap, so their iteration order cannot
-        // determine authorization. Explicit decisions use fail-closed precedence:
-        // Deny > Prompt > Allow. Defaults apply only if no explicit rule matched.
+        // determine authorization. Tiers are scanned Deny, Prompt, Allow and the
+        // scan stops at the first matched rule, which is the strongest outcome
+        // present (a weaker tier is never evaluated, so it is never charged).
         //
         // KNOWN LIMITATION (layered RateLimit — bounded): the FIRST matching Allow
         // rule short-circuits and returns Allow, so if a credential/principal has
@@ -488,74 +479,92 @@ impl PolicyEngine {
         // first-iterated one is charged+enforced per request; the second is not
         // conjunctively evaluated. Each cap now has its OWN counter (see
         // `rate_limit_key`), so they no longer corrupt each other — but "all caps
-        // must pass" is not enforced for layered Allow-RateLimit rules. To enforce a
+        // must pass" is not enforced for layered Allow-`RateLimit` rules. To enforce a
         // hard ceiling today, express it as a single rule, or as a Deny rule (Deny is
         // evaluated first and is authoritative). Making layered RateLimit Allow rules
         // conjunctive is tracked in LIMITATIONS.md.
-        for wanted in [
-            PolicyAction::Deny,
-            PolicyAction::Prompt,
-            PolicyAction::Allow,
-        ] {
-            for policy in &matching_policies {
-                for rule in &policy.rules {
-                    if rule.action != wanted {
-                        continue;
-                    }
-                    // A top-level SpendCap is evaluated here (per-action, stateless) —
-                    // NOT as a side effect of the recursive boolean walk. Nested
-                    // SpendCap is rejected by Policy::validate at config/admin load.
-                    let matched = match &rule.condition {
-                        PolicyCondition::SpendCap {
-                            asset,
-                            per_action_max,
-                        } => {
-                            self.spend_within_cap(
-                                input.spend,
-                                asset,
-                                *per_action_max,
-                                record, // check the cap on the live path; skip on resume
-                            )
+        let mut outcomes: Vec<RuleOutcome> = Vec::new();
+        let mut deny_policy: Option<&str> = None;
+        if matching_policies.iter().any(|p| p.kill) {
+            outcomes.push(RuleOutcome::Kill);
+        } else {
+            'tiers: for (wanted, outcome) in [
+                (PolicyAction::Deny, RuleOutcome::Deny),
+                (PolicyAction::Prompt, RuleOutcome::Prompt),
+                (PolicyAction::Allow, RuleOutcome::Allow),
+            ] {
+                for policy in &matching_policies {
+                    for rule in &policy.rules {
+                        if rule.action != wanted {
+                            continue;
                         }
-                        other => self.evaluate_condition(other, input, record),
-                    };
-                    if matched {
-                        return match rule.action {
-                            PolicyAction::Allow => PolicyDecision::Allow,
-                            PolicyAction::Deny => PolicyDecision::Deny(format!(
-                                "Denied by policy '{}': rule matched",
-                                policy.name
-                            )),
-                            PolicyAction::Prompt => PolicyDecision::Prompt,
+                        // A top-level SpendCap is evaluated here (per-action, stateless) —
+                        // NOT as a side effect of the recursive boolean walk. Nested
+                        // SpendCap is rejected by Policy::validate at config/admin load.
+                        let matched = match &rule.condition {
+                            PolicyCondition::SpendCap {
+                                asset,
+                                per_action_max,
+                            } => {
+                                self.spend_within_cap(
+                                    input.spend,
+                                    asset,
+                                    *per_action_max,
+                                    record, // check the cap on the live path; skip on resume
+                                )
+                            }
+                            other => self.evaluate_condition(other, input, record),
                         };
+                        if matched {
+                            if outcome == RuleOutcome::Deny {
+                                deny_policy = Some(policy.name.as_str());
+                            }
+                            outcomes.push(outcome);
+                            break 'tiers;
+                        }
                     }
                 }
             }
         }
 
-        for wanted in [
-            PolicyAction::Deny,
-            PolicyAction::Prompt,
-            PolicyAction::Allow,
-        ] {
-            for policy in &matching_policies {
-                if policy.default_action != wanted {
-                    continue;
-                }
-                match policy.default_action {
-                    PolicyAction::Allow => return PolicyDecision::Allow,
-                    PolicyAction::Deny => {
-                        return PolicyDecision::Deny(format!(
-                            "Denied by policy '{}': default action",
-                            policy.name
-                        ))
-                    }
-                    PolicyAction::Prompt => return PolicyDecision::Prompt,
-                }
+        let policy_defaults: Vec<PolicyAction> =
+            matching_policies.iter().map(|p| p.default_action).collect();
+        match resolve_precedence(
+            &outcomes,
+            &policy_defaults,
+            self.default_deny.load(Ordering::SeqCst),
+        ) {
+            // Generic reason to the caller — don't leak the kill-policy name or
+            // label scheme to a (possibly compromised) agent. The specifics live
+            // in the halt audit log.
+            Verdict::Kill => {
+                PolicyDecision::Deny("denied: this principal has been halted".to_string())
             }
+            Verdict::Deny => PolicyDecision::Deny(format!(
+                "Denied by policy '{}': rule matched",
+                deny_policy.unwrap_or_default()
+            )),
+            Verdict::Prompt | Verdict::PolicyDefaultPrompt => PolicyDecision::Prompt,
+            Verdict::Allow | Verdict::PolicyDefaultAllow | Verdict::EngineDefaultAllow => {
+                PolicyDecision::Allow
+            }
+            Verdict::PolicyDefaultDeny => {
+                let name = matching_policies
+                    .iter()
+                    .find(|p| p.default_action == PolicyAction::Deny)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or_default();
+                PolicyDecision::Deny(format!("Denied by policy '{name}': default action"))
+            }
+            Verdict::EngineDefaultDeny => PolicyDecision::Deny(
+                "no_policy: no policy matches this credential (default-deny enforcement)"
+                    .to_string(),
+            ),
+            // Unreachable: a matching policy always has a default_action. Fail closed.
+            Verdict::FailClosedTail => PolicyDecision::Deny(
+                "denied: policy evaluation reached no decision (fail-closed)".to_string(),
+            ),
         }
-
-        PolicyDecision::Allow
     }
 
     /// Evaluate a single condition against the request input.
@@ -2127,6 +2136,90 @@ mod tests {
             long.count, 2,
             "the budget-window counter must hold ONLY the 2 admitted calls — a call denied by \
              the burst limit must not consume day-long allowance it never got to use"
+        );
+    }
+    /// OD-12 evidence: an exhausted Allow-RateLimit rule does not match, and the
+    /// request falls through to the policy default. Under a non-deny default that
+    /// is an Allow (or Prompt), so the limit limits nothing; under deny it denies.
+    /// `Policy::validate` therefore refuses the non-deny shapes. The engine itself
+    /// does not validate, so this test builds the policies directly.
+    #[test]
+    fn exhausted_rate_limit_falls_through_to_the_policy_default() {
+        for (default_action, spent) in [
+            (PolicyAction::Deny, false),
+            (PolicyAction::Prompt, true),
+            (PolicyAction::Allow, true),
+        ] {
+            let mut policy = Policy::deny_all("rl", "*").with_rule(
+                PolicyCondition::RateLimit {
+                    max: 1,
+                    window_secs: 3600,
+                },
+                PolicyAction::Allow,
+            );
+            policy.default_action = default_action;
+            assert_eq!(
+                policy.validate().is_ok(),
+                default_action == PolicyAction::Deny
+            );
+            let engine = PolicyEngine::new();
+            engine.add_policy(policy);
+            let call = || {
+                engine.evaluate(
+                    "test",
+                    Some("https://api.example.com"),
+                    Some("GET"),
+                    &make_context(),
+                )
+            };
+            assert_eq!(
+                call(),
+                PolicyDecision::Allow,
+                "first call is within the limit"
+            );
+            let second = call();
+            match default_action {
+                PolicyAction::Deny => assert!(matches!(second, PolicyDecision::Deny(_))),
+                PolicyAction::Prompt => assert_eq!(second, PolicyDecision::Prompt),
+                PolicyAction::Allow => assert_eq!(second, PolicyDecision::Allow),
+            }
+            // `spent` marks the shapes where the exhausted limit did not deny.
+            assert_eq!(spent, !matches!(second, PolicyDecision::Deny(_)));
+        }
+    }
+
+    /// The engine maps each precedence outcome to the decision and reason the
+    /// callers and audit log rely on, including the deny reason names.
+    #[test]
+    fn engine_maps_precedence_outcomes_with_policy_names() {
+        let engine = PolicyEngine::new();
+        engine.add_policy(Policy::allow_all("open", "*"));
+        engine.add_policy(Policy::deny_all("blocker", "blocked-*"));
+        let eval = |cred: &str| {
+            engine.evaluate(
+                cred,
+                Some("https://x.example"),
+                Some("GET"),
+                &make_context(),
+            )
+        };
+        assert_eq!(eval("other"), PolicyDecision::Allow);
+        // Deny default of one matching policy beats the Allow default of another.
+        assert_eq!(
+            eval("blocked-1"),
+            PolicyDecision::Deny("Denied by policy 'blocker': default action".to_string())
+        );
+        let with_rule = PolicyEngine::new();
+        with_rule.add_policy(
+            Policy::allow_all("open", "*").with_rule(PolicyCondition::Always, PolicyAction::Prompt),
+        );
+        with_rule.add_policy(
+            Policy::deny_all("rule-deny", "*")
+                .with_rule(PolicyCondition::Always, PolicyAction::Deny),
+        );
+        assert_eq!(
+            with_rule.evaluate("c", None, None, &make_context()),
+            PolicyDecision::Deny("Denied by policy 'rule-deny': rule matched".to_string())
         );
     }
 }
