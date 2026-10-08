@@ -21,6 +21,10 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 
+// Independent spec for the SSRF classifier; Kani proofs and table tests only.
+#[cfg(any(test, kani))]
+mod ssrf_spec;
+
 type HmacSha256 = Hmac<Sha256>;
 
 fn hmac_bytes(key: &[u8], data: &str) -> Vec<u8> {
