@@ -11,7 +11,7 @@
 //! engine default applies only when no policy matched the credential and
 //! principal at all, which is the case `policy_defaults` is empty.
 
-use super::PolicyAction;
+use super::{PolicyAction, PolicyDecision};
 
 /// What one matched rule (or one matching policy's kill flag) contributed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,10 +48,68 @@ pub(crate) enum Verdict {
     FailClosedTail,
 }
 
-/// The verdict when no rule and no default produced a decision. Always a denial:
-/// the engine default when it is deny, and deny when it is allow.
-pub(crate) fn fail_closed_tail(_engine_default_deny: bool) -> Verdict {
+/// The verdict when no rule and no default produced a decision. It maps to a
+/// denial in [`decision_for`], whatever the engine default is.
+pub(crate) fn fail_closed_tail() -> Verdict {
     Verdict::FailClosedTail
+}
+
+/// Map a verdict to the decision the engine returns. `rule_deny_policy` is the
+/// name of the policy whose deny rule matched and `default_deny_policy` the name
+/// of a matching policy whose default action is deny; both only feed the reason
+/// text. Every denying verdict (kill, deny rule, deny default, engine default
+/// deny and the fail-closed tail) yields `Deny`.
+pub(crate) fn decision_for(
+    verdict: Verdict,
+    rule_deny_policy: &str,
+    default_deny_policy: &str,
+) -> PolicyDecision {
+    match verdict {
+        // Generic reason to the caller: don't leak the kill-policy name or
+        // label scheme to a (possibly compromised) agent. The specifics live
+        // in the halt audit log.
+        Verdict::Kill => PolicyDecision::Deny("denied: this principal has been halted".to_string()),
+        Verdict::Deny => PolicyDecision::Deny(format!(
+            "Denied by policy '{rule_deny_policy}': rule matched"
+        )),
+        Verdict::Prompt | Verdict::PolicyDefaultPrompt => PolicyDecision::Prompt,
+        Verdict::Allow | Verdict::PolicyDefaultAllow | Verdict::EngineDefaultAllow => {
+            PolicyDecision::Allow
+        }
+        Verdict::PolicyDefaultDeny => PolicyDecision::Deny(format!(
+            "Denied by policy '{default_deny_policy}': default action"
+        )),
+        Verdict::EngineDefaultDeny => PolicyDecision::Deny(
+            "no_policy: no policy matches this credential (default-deny enforcement)".to_string(),
+        ),
+        Verdict::FailClosedTail => PolicyDecision::Deny(
+            "denied: policy evaluation reached no decision (fail-closed)".to_string(),
+        ),
+    }
+}
+
+/// The shipped, lazy form of the precedence decision. `kill` is true when a
+/// matching policy carries the kill flag; then no rule is asked about. Otherwise
+/// the tiers are asked in the order deny, prompt, allow through `matched` (which
+/// reads the clock and charges rate limits in the engine) and the scan stops at
+/// the first tier that matches, so a weaker tier is never asked and never
+/// charged. The result equals `resolve_precedence` over the full set of tier
+/// outcomes (checked exhaustively in the tests and by a Kani harness).
+pub(crate) fn resolve_lazily(
+    kill: bool,
+    mut matched: impl FnMut(RuleOutcome) -> bool,
+    policy_defaults: &[PolicyAction],
+    engine_default_deny: bool,
+) -> Verdict {
+    if kill {
+        return resolve_precedence(&[RuleOutcome::Kill], policy_defaults, engine_default_deny);
+    }
+    for tier in [RuleOutcome::Deny, RuleOutcome::Prompt, RuleOutcome::Allow] {
+        if matched(tier) {
+            return resolve_precedence(&[tier], policy_defaults, engine_default_deny);
+        }
+    }
+    resolve_precedence(&[], policy_defaults, engine_default_deny)
 }
 
 /// Resolve the decision from the matched rule outcomes, the `default_action` of
@@ -90,7 +148,7 @@ pub(crate) fn resolve_precedence(
             Verdict::EngineDefaultAllow
         };
     }
-    fail_closed_tail(engine_default_deny)
+    fail_closed_tail()
 }
 
 #[cfg(test)]
@@ -236,13 +294,99 @@ mod tests {
         assert_eq!(r(&[], &[], false), Verdict::EngineDefaultAllow);
     }
 
-    /// The tail is unreachable from `resolve_precedence`, so only a direct call can
-    /// check what it would do: it must deny, whatever the engine default is.
+    /// The tail is unreachable from `resolve_precedence`, so only a direct call
+    /// can check it. It is the verdict `decision_for` turns into a denial.
     #[test]
     fn the_unreachable_tail_fails_closed() {
-        for engine_deny in [true, false] {
-            assert_eq!(fail_closed_tail(engine_deny), Verdict::FailClosedTail);
+        assert_eq!(fail_closed_tail(), Verdict::FailClosedTail);
+        assert!(matches!(
+            decision_for(fail_closed_tail(), "r", "d"),
+            PolicyDecision::Deny(_)
+        ));
+    }
+
+    /// Every verdict maps to the decision class the specification gives it, so
+    /// the shipped mapping (not only the verdict) is checked, including the tail.
+    #[test]
+    fn every_verdict_maps_to_its_decision() {
+        let deny = |v| matches!(decision_for(v, "r", "d"), PolicyDecision::Deny(_));
+        for v in [
+            Verdict::Kill,
+            Verdict::Deny,
+            Verdict::PolicyDefaultDeny,
+            Verdict::EngineDefaultDeny,
+            Verdict::FailClosedTail,
+        ] {
+            assert!(deny(v), "{v:?} must deny");
         }
+        for v in [Verdict::Prompt, Verdict::PolicyDefaultPrompt] {
+            assert_eq!(decision_for(v, "r", "d"), PolicyDecision::Prompt, "{v:?}");
+        }
+        for v in [
+            Verdict::Allow,
+            Verdict::PolicyDefaultAllow,
+            Verdict::EngineDefaultAllow,
+        ] {
+            assert_eq!(decision_for(v, "r", "d"), PolicyDecision::Allow, "{v:?}");
+        }
+        assert_eq!(
+            decision_for(Verdict::Deny, "rule-p", "def-p"),
+            PolicyDecision::Deny("Denied by policy 'rule-p': rule matched".to_string())
+        );
+        assert_eq!(
+            decision_for(Verdict::PolicyDefaultDeny, "rule-p", "def-p"),
+            PolicyDecision::Deny("Denied by policy 'def-p': default action".to_string())
+        );
+    }
+
+    /// The lazy scan the engine runs equals `resolve_precedence` over the full
+    /// outcome set, for every sequence of up to 4 outcomes (so every multiset in
+    /// every order), every sequence of up to 3 policy defaults and both engine
+    /// defaults. It asks no tier weaker than the one that decided, asks every
+    /// stronger tier, and asks nothing once a kill flag is present.
+    #[test]
+    fn lazy_scan_equals_full_precedence_and_asks_no_weaker_tier() {
+        let tiers = [RuleOutcome::Deny, RuleOutcome::Prompt, RuleOutcome::Allow];
+        let mut cases = 0usize;
+        for outcomes in &sequences(&OUTCOMES, 4) {
+            let kill = outcomes.contains(&RuleOutcome::Kill);
+            for defaults in &sequences(&ACTIONS, 3) {
+                for engine_deny in [true, false] {
+                    let mut asked: Vec<RuleOutcome> = Vec::new();
+                    let got = resolve_lazily(
+                        kill,
+                        |t| {
+                            asked.push(t);
+                            outcomes.contains(&t)
+                        },
+                        defaults,
+                        engine_deny,
+                    );
+                    assert_eq!(
+                        got,
+                        resolve_precedence(outcomes, defaults, engine_deny),
+                        "{outcomes:?} {defaults:?} engine_deny={engine_deny}"
+                    );
+                    // Expected questions: tiers in order up to and including the
+                    // first present one; none at all under a kill flag.
+                    let expected: Vec<RuleOutcome> = if kill {
+                        vec![]
+                    } else {
+                        let mut v = Vec::new();
+                        for t in tiers {
+                            v.push(t);
+                            if outcomes.contains(&t) {
+                                break;
+                            }
+                        }
+                        v
+                    };
+                    assert_eq!(asked, expected, "{outcomes:?}");
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 781 * 40 * 2);
     }
 }
 
@@ -382,6 +526,57 @@ mod kani_precedence_proofs {
         kani::cover!(
             got == Verdict::EngineDefaultAllow,
             "engine default allow decides"
+        );
+    }
+
+    /// The lazy scan equals the full resolver for every list of up to 4 outcomes
+    /// (membership is all the engine's tier scan can observe), and under a kill
+    /// flag it asks about no tier.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn lazy_scan_equals_full_precedence() {
+        let o: [u8; 4] = kani::any();
+        let d: [u8; 3] = kani::any();
+        let olen: usize = kani::any();
+        let dlen: usize = kani::any();
+        kani::assume(olen <= 4 && dlen <= 3);
+        let engine_deny: bool = kani::any();
+        let mut outs = [RuleOutcome::NoMatch; 4];
+        for n in 0..4 {
+            outs[n] = outcome(o[n]);
+        }
+        let mut defs = [PolicyAction::Deny; 3];
+        for n in 0..3 {
+            defs[n] = action(d[n]);
+        }
+        let outs = &outs[..olen];
+        let defs = &defs[..dlen];
+        let kill = outs.contains(&RuleOutcome::Kill);
+        let mut asked = 0u8;
+        let got = resolve_lazily(
+            kill,
+            |t| {
+                asked += 1;
+                outs.contains(&t)
+            },
+            defs,
+            engine_deny,
+        );
+        assert!(got == resolve_precedence(outs, defs, engine_deny));
+        if kill {
+            assert!(asked == 0);
+        }
+        assert!(asked <= 3);
+        kani::cover!(kill, "kill present");
+        kani::cover!(!kill && got == Verdict::Allow, "allow tier decides lazily");
+        kani::cover!(
+            !kill && got == Verdict::Prompt,
+            "prompt tier decides lazily"
+        );
+        kani::cover!(!kill && got == Verdict::Deny, "deny tier decides lazily");
+        kani::cover!(
+            !kill && got == Verdict::PolicyDefaultAllow,
+            "no tier matched"
         );
     }
 }

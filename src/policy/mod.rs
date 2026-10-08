@@ -12,7 +12,7 @@ mod types;
 
 pub use types::*;
 
-use precedence::{resolve_precedence, RuleOutcome, Verdict};
+use precedence::{decision_for, resolve_lazily, RuleOutcome};
 
 use crate::RequestContext;
 use glob::Pattern;
@@ -459,9 +459,10 @@ impl PolicyEngine {
             })
             .collect();
 
-        // Collect the matched rule outcomes lazily, then let the pure
-        // `resolve_precedence` decide (kill > deny > prompt > allow > policy
-        // default > engine default).
+        // The tier order and the verdict-to-decision mapping live in
+        // `precedence.rs` (`resolve_lazily`, `decision_for`), which is where they
+        // are tested and proved: kill > deny > prompt > allow > policy default >
+        // engine default. This function only supplies the rule matcher.
         //
         // V6 kill switch: an authoritative per-principal halt overrides everything
         // — no rule is looked at (and no rate-limit slot is charged) once a
@@ -483,16 +484,19 @@ impl PolicyEngine {
         // hard ceiling today, express it as a single rule, or as a Deny rule (Deny is
         // evaluated first and is authoritative). Making layered RateLimit Allow rules
         // conjunctive is tracked in LIMITATIONS.md.
-        let mut outcomes: Vec<RuleOutcome> = Vec::new();
         let mut deny_policy: Option<&str> = None;
-        if matching_policies.iter().any(|p| p.kill) {
-            outcomes.push(RuleOutcome::Kill);
-        } else {
-            'tiers: for (wanted, outcome) in [
-                (PolicyAction::Deny, RuleOutcome::Deny),
-                (PolicyAction::Prompt, RuleOutcome::Prompt),
-                (PolicyAction::Allow, RuleOutcome::Allow),
-            ] {
+        let policy_defaults: Vec<PolicyAction> =
+            matching_policies.iter().map(|p| p.default_action).collect();
+        let kill = matching_policies.iter().any(|p| p.kill);
+        let verdict = resolve_lazily(
+            kill,
+            |tier| {
+                let wanted = match tier {
+                    RuleOutcome::Deny => PolicyAction::Deny,
+                    RuleOutcome::Prompt => PolicyAction::Prompt,
+                    RuleOutcome::Allow => PolicyAction::Allow,
+                    RuleOutcome::Kill | RuleOutcome::NoMatch => return false,
+                };
                 for policy in &matching_policies {
                     for rule in &policy.rules {
                         if rule.action != wanted {
@@ -516,55 +520,28 @@ impl PolicyEngine {
                             other => self.evaluate_condition(other, input, record),
                         };
                         if matched {
-                            if outcome == RuleOutcome::Deny {
+                            if tier == RuleOutcome::Deny {
                                 deny_policy = Some(policy.name.as_str());
                             }
-                            outcomes.push(outcome);
-                            break 'tiers;
+                            return true;
                         }
                     }
                 }
-            }
-        }
-
-        let policy_defaults: Vec<PolicyAction> =
-            matching_policies.iter().map(|p| p.default_action).collect();
-        match resolve_precedence(
-            &outcomes,
+                false
+            },
             &policy_defaults,
             self.default_deny.load(Ordering::SeqCst),
-        ) {
-            // Generic reason to the caller — don't leak the kill-policy name or
-            // label scheme to a (possibly compromised) agent. The specifics live
-            // in the halt audit log.
-            Verdict::Kill => {
-                PolicyDecision::Deny("denied: this principal has been halted".to_string())
-            }
-            Verdict::Deny => PolicyDecision::Deny(format!(
-                "Denied by policy '{}': rule matched",
-                deny_policy.unwrap_or_default()
-            )),
-            Verdict::Prompt | Verdict::PolicyDefaultPrompt => PolicyDecision::Prompt,
-            Verdict::Allow | Verdict::PolicyDefaultAllow | Verdict::EngineDefaultAllow => {
-                PolicyDecision::Allow
-            }
-            Verdict::PolicyDefaultDeny => {
-                let name = matching_policies
-                    .iter()
-                    .find(|p| p.default_action == PolicyAction::Deny)
-                    .map(|p| p.name.as_str())
-                    .unwrap_or_default();
-                PolicyDecision::Deny(format!("Denied by policy '{name}': default action"))
-            }
-            Verdict::EngineDefaultDeny => PolicyDecision::Deny(
-                "no_policy: no policy matches this credential (default-deny enforcement)"
-                    .to_string(),
-            ),
-            // Unreachable: a matching policy always has a default_action. Fail closed.
-            Verdict::FailClosedTail => PolicyDecision::Deny(
-                "denied: policy evaluation reached no decision (fail-closed)".to_string(),
-            ),
-        }
+        );
+        let default_deny_policy = matching_policies
+            .iter()
+            .find(|p| p.default_action == PolicyAction::Deny)
+            .map(|p| p.name.as_str())
+            .unwrap_or_default();
+        decision_for(
+            verdict,
+            deny_policy.unwrap_or_default(),
+            default_deny_policy,
+        )
     }
 
     /// Evaluate a single condition against the request input.
@@ -2221,5 +2198,113 @@ mod tests {
             with_rule.evaluate("c", None, None, &make_context()),
             PolicyDecision::Deny("Denied by policy 'rule-deny': rule matched".to_string())
         );
+    }
+
+    /// Engine level, exhaustive over a finite domain: every ordered list of up to
+    /// two policies, each drawn from 48 shapes (kill flag, default action, any
+    /// subset of Always-deny, Always-prompt, Always-allow rules), under both
+    /// engine defaults. The shipped `evaluate` equals an independent statement of
+    /// kill > deny rule > prompt rule > allow rule > policy default (deny >
+    /// prompt > allow) > engine default, whatever the order of the policies.
+    #[test]
+    fn engine_precedence_equals_spec_over_every_small_policy_set() {
+        #[derive(Clone, Copy)]
+        struct Shape {
+            kill: bool,
+            default: PolicyAction,
+            rules: u8, // bit 0 deny, bit 1 prompt, bit 2 allow
+        }
+        let mut shapes = Vec::new();
+        for kill in [false, true] {
+            for default in [
+                PolicyAction::Deny,
+                PolicyAction::Prompt,
+                PolicyAction::Allow,
+            ] {
+                for rules in 0u8..8 {
+                    shapes.push(Shape {
+                        kill,
+                        default,
+                        rules,
+                    });
+                }
+            }
+        }
+        assert_eq!(shapes.len(), 48);
+        let mut sets: Vec<Vec<Shape>> = vec![vec![]];
+        for a in &shapes {
+            sets.push(vec![*a]);
+            for b in &shapes {
+                sets.push(vec![*a, *b]);
+            }
+        }
+        assert_eq!(sets.len(), 1 + 48 + 48 * 48);
+        // Decision class: the reason text separates the four denial kinds.
+        fn class(d: &PolicyDecision) -> &'static str {
+            match d {
+                PolicyDecision::Allow => "allow",
+                PolicyDecision::Prompt => "prompt",
+                PolicyDecision::Deny(r) if r.contains("halted") => "deny-kill",
+                PolicyDecision::Deny(r) if r.contains("rule matched") => "deny-rule",
+                PolicyDecision::Deny(r) if r.contains("default action") => "deny-default",
+                PolicyDecision::Deny(r) if r.starts_with("no_policy") => "deny-engine",
+                PolicyDecision::Deny(_) => "deny-other",
+            }
+        }
+        fn spec(set: &[Shape], engine_deny: bool) -> &'static str {
+            if set.iter().any(|p| p.kill) {
+                return "deny-kill";
+            }
+            if set.iter().any(|p| p.rules & 1 != 0) {
+                return "deny-rule";
+            }
+            if set.iter().any(|p| p.rules & 2 != 0) {
+                return "prompt";
+            }
+            if set.iter().any(|p| p.rules & 4 != 0) {
+                return "allow";
+            }
+            if set.is_empty() {
+                return if engine_deny { "deny-engine" } else { "allow" };
+            }
+            if set.iter().any(|p| p.default == PolicyAction::Deny) {
+                return "deny-default";
+            }
+            if set.iter().any(|p| p.default == PolicyAction::Prompt) {
+                return "prompt";
+            }
+            "allow"
+        }
+        for set in &sets {
+            for engine_deny in [true, false] {
+                let engine = PolicyEngine::new();
+                engine.set_default_deny(engine_deny);
+                for (i, sh) in set.iter().enumerate() {
+                    let mut p = Policy::allow_all(format!("p{i}"), "*");
+                    p.default_action = sh.default;
+                    p.kill = sh.kill;
+                    for (bit, act) in [
+                        (1u8, PolicyAction::Deny),
+                        (2, PolicyAction::Prompt),
+                        (4, PolicyAction::Allow),
+                    ] {
+                        if sh.rules & bit != 0 {
+                            p = p.with_rule(PolicyCondition::Always, act);
+                        }
+                    }
+                    engine.add_policy(p);
+                }
+                let got = engine.evaluate("cred", None, None, &make_context());
+                let want = spec(set, engine_deny);
+                assert_eq!(
+                    class(&got),
+                    want,
+                    "{:?} engine_deny={engine_deny}",
+                    set.iter()
+                        .map(|p| (p.kill, p.default, p.rules))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
     }
 }
