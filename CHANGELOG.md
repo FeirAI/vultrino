@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- argon2 0.5.3 to 0.6.0. The vault master key is byte-identical: tests/argon2_kat.rs opens vault files and AES-GCM blobs written by 0.5.3 and checks that new vaults persist the same cost parameters. Replaces Dependabot PR #32.
+
 ### Added
 
 - Open-source release hygiene: `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, Dependabot, release/GHCR workflow, and committed `Cargo.lock`.
