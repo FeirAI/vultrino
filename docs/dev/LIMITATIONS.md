@@ -210,8 +210,11 @@ noninterference. Honest scope:
   observe mode applies, whether approval is required, and that the canonical
   action the server resolved belongs to the label the policy judged); the rule
   digest is not recomputed from the payload; `run_action` unpacks the payload
-  after `authorize`, and that code is outside the kernel; the params digest is
-  over serde_json bytes of the stored value, not over bytes an approver saw.
+  after `authorize`, and that code is outside the kernel; `authorize` does not
+  check payload fields outside the binding (the credential record beyond its
+  alias, the use token id, the evidence subject and action, and whether Averin
+  evidence is required); the params digest is over serde_json bytes of the
+  stored value, not over bytes an approver saw.
 - **Refinement (`formal/check-refinement.sh`)** is a source-shape / choke-point
   gate (execution-binding fields, permit mint sites, WASM ABI-before-copy
   install order, pinned harness inventory, etc.). It catches drift of the
