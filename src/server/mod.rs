@@ -5756,6 +5756,9 @@ fn parse_action(action: &str) -> Result<(&str, &str), VultrinoError> {
 mod buffer_draft_tests;
 
 #[cfg(test)]
+mod permit_binding_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
