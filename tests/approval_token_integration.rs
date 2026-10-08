@@ -2558,6 +2558,45 @@ async fn test_refresh_policies_once_picks_up_cross_process_write() {
 }
 
 #[tokio::test]
+async fn test_refresh_listing_before_kill_policy_cannot_overwrite_newer_admin_reload() {
+    // Race: the periodic refresh lists stored policies BEFORE a halt writes its kill
+    // policy, the admin path then writes + reloads the engine, and only then does the
+    // refresh apply its (stale) list. Without ordering, that replaces the engine's
+    // set with the stale list and the kill policy vanishes until the next tick.
+    use vultrino::policy::Policy;
+    use vultrino::server::refresh_policies_after_list;
+
+    let (server, storage) = setup_with_policies(vec![]).await;
+    let engine = server.policy_engine().clone();
+
+    refresh_policies_after_list(&storage, &engine, &[], async {
+        // Inside the refresh window: storage was already listed (no kill policy).
+        storage
+            .store_policy(&Policy::kill_switch("halt:agent-x", "agent-x"))
+            .await
+            .unwrap();
+        server.reload_policies().await.unwrap();
+        assert!(
+            engine.list_policies().iter().any(|p| p.id == "halt:agent-x"),
+            "admin reload must install the kill policy"
+        );
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        engine.list_policies().iter().any(|p| p.id == "halt:agent-x"),
+        "a refresh that listed before the kill-policy write must not drop it"
+    );
+
+    // A normal later refresh still converges on storage (nothing is stuck).
+    vultrino::server::refresh_policies_once(&storage, &engine, &[])
+        .await
+        .unwrap();
+    assert!(engine.list_policies().iter().any(|p| p.id == "halt:agent-x"));
+}
+
+#[tokio::test]
 async fn test_refresh_auth_once_drops_revoked_key_cross_process() {
     // The web/admin process revokes a vk_ key; a sibling process (MCP, or an HA web
     // replica) that built its AuthManager at startup must stop authenticating that key

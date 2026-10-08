@@ -4413,9 +4413,13 @@ impl VultrinoServer {
     /// without a restart. Config policies remain declarative/code-managed; the
     /// admin API only adds, edits, or removes *stored* policies (by id).
     pub async fn reload_policies(&self) -> Result<(), VultrinoError> {
+        // Ticket first (after the caller's storage write), then list, then a
+        // compare-and-swap apply: a concurrent periodic refresh that listed
+        // before this write can no longer overwrite this newer set.
+        let ticket = self.policy_engine.begin_load();
         let stored = self.storage.list_stored_policies().await?;
         self.policy_engine
-            .load_policies(merge_policies(&self.config.policies, stored));
+            .load_policies_if_newer(ticket, merge_policies(&self.config.policies, stored));
         Ok(())
     }
 
@@ -5564,9 +5568,30 @@ pub async fn refresh_policies_once(
     engine: &PolicyEngine,
     config_policies: &[crate::policy::Policy],
 ) -> Result<(), crate::storage::StorageError> {
+    refresh_policies_after_list(storage, engine, config_policies, std::future::ready(())).await
+}
+
+/// [`refresh_policies_once`] with a hook awaited between listing the stored
+/// policies and applying them. Exists so tests can interleave an admin write and
+/// reload deterministically inside the refresh window. Not part of the stable API.
+#[doc(hidden)]
+pub async fn refresh_policies_after_list(
+    storage: &Arc<dyn StorageBackend>,
+    engine: &PolicyEngine,
+    config_policies: &[crate::policy::Policy],
+    after_list: impl std::future::Future<Output = ()>,
+) -> Result<(), crate::storage::StorageError> {
+    // Ticket before the read: if an admin reload (ticketed after its own write)
+    // is applied while this refresh is in flight, this older list is discarded
+    // instead of replacing the newer set. A discarded refresh is harmless: the
+    // next tick re-reads storage.
+    let ticket = engine.begin_load();
     storage.reload().await?;
     let stored = storage.list_stored_policies().await?;
-    engine.load_policies(merge_policies(config_policies, stored));
+    after_list.await;
+    if !engine.load_policies_if_newer(ticket, merge_policies(config_policies, stored)) {
+        tracing::debug!("periodic policy refresh superseded by a newer load; discarded");
+    }
     Ok(())
 }
 
