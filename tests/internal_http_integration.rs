@@ -865,8 +865,17 @@ async fn plugin_itself_refuses_every_steering_attempt_under_a_permissive_policy(
         .await
         .expect_err(&format!("must be refused: {params}"));
         eprintln!("PLUGIN-REFUSED {params} -> {err}");
+        // SB-03: a URL string that cannot be canonicalised never matches an
+        // Allow rule, so even this permissive `url_match = "*"` policy refuses it
+        // (default deny) before the plugin runs. That is a refusal too; the
+        // plugin's own reason is still required for every parseable value.
+        let policy_refused_unparseable = params
+            .get("url")
+            .and_then(|u| u.as_str())
+            .is_some_and(|u| vultrino::policy::canonical_url(u).is_none())
+            && err.contains("default action");
         assert!(
-            err.contains(want),
+            err.contains(want) || policy_refused_unparseable,
             "refusal for {params} must name '{want}', got: {err}"
         );
     }
@@ -1121,8 +1130,14 @@ async fn a_path_that_normalization_would_rewrite_is_refused_before_it_executes()
     for (bad, outcome) in outcomes {
         let err = outcome.expect_err(&format!("must be refused: {bad:?}"));
         eprintln!("DIVERGENT-REFUSED {bad:?} -> {err}");
+        // SB-03: " /v1/ledger" is not a canonicalisable URL, so the permissive
+        // `url_match = "*"` Allow no longer matches it and policy refuses first.
+        let policy_refused_unparseable =
+            vultrino::policy::canonical_url(bad).is_none() && err.contains("default action");
         assert!(
-            err.contains("control character or space") || err.contains("fragment"),
+            err.contains("control character or space")
+                || err.contains("fragment")
+                || policy_refused_unparseable,
             "refusal for {bad:?} must name the reason, got: {err}"
         );
     }
