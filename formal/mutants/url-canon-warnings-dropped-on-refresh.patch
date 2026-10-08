@@ -1,0 +1,12 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 644acd1..41420c3 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -317,7 +317,6 @@ impl PolicyEngine {
+             return false;
+         }
+         *applied = ticket;
+-        policies.iter().for_each(warn_url_patterns);
+         let mut p = self.policies.write();
+         *p = policies;
+         true

@@ -228,6 +228,12 @@
     },
     "url-canon-warnings-dropped-on-add": {
       "tier": "fast"
+    },
+    "url-canon-warnings-dropped-on-load": {
+      "tier": "fast"
+    },
+    "url-canon-warnings-dropped-on-refresh": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -1310,6 +1316,21 @@
           "path": "src/plugins/hmac.rs",
           "symbol": "HmacPlugin::canonical_send_url",
           "sha256": "5269180b8c3da96ada7413fcf1272d621f96af491e38aa4aaf5950cde30f9862"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::add_policy",
+          "sha256": "d7178b7f2386c841ec45fb0d6ddc6243f60d13238e9d17051aa8c90c74bf11a1"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::load_policies",
+          "sha256": "2e6827db22c2fb20b93787447a54dcb3d72a5a949474866d470610037eeb8c73"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::load_policies_if_newer",
+          "sha256": "c52c6246373965a13c5e71d36653c2e9629315c438ae419a493792650e72cbc6"
         }
       ],
       "mutants": [
@@ -1326,7 +1347,9 @@
         "url-canon-unparseable-deny-dropped",
         "url-canon-unparseable-prompt-skipped",
         "url-canon-userinfo-accepted",
-        "url-canon-warnings-dropped-on-add"
+        "url-canon-warnings-dropped-on-add",
+        "url-canon-warnings-dropped-on-load",
+        "url-canon-warnings-dropped-on-refresh"
       ],
       "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or path case differently is not modelled). Patterns with * inside the host, or glob patterns whose * crosses a / (a glob * matches /), can still match a different host: they only log a warning this release. A glob whose host holds ? keeps literal glob meaning. Only the http and hmac plugins send the canonical URL; internal_http sends the url-crate composition of the raw path (differing only in unreserved percent escapes and hex case) after its own path allowlist ran on the raw path; the wasm plugin egress, ssh and postgres plugins do not use params url. The hmac plugin adds timestamp, recvWindow and signature after evaluation, and AWS SigV4 re-sorts query pairs for signing; those additions are not judged. UrlToken requests are judged on the placeholder URL and sent with the secret substituted unmodified. The query map is merged only when it is a JSON object. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested. The load-time warning is a log line and is not a refusal. The server call sites that build the judged URL (policy_url at request time and at approval resume) are not covered by the detector."
     }

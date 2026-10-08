@@ -1,0 +1,12 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 644acd1..8a80a85 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -327,7 +327,6 @@ impl PolicyEngine {
+     /// in tests). Runtime reloads from storage use [`Self::begin_load`] and
+     /// [`Self::load_policies_if_newer`] instead.
+     pub fn load_policies(&self, policies: Vec<Policy>) {
+-        policies.iter().for_each(warn_url_patterns);
+         let mut p = self.policies.write();
+         *p = policies;
+     }
