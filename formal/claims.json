@@ -182,7 +182,7 @@
         "permit-direct-skips-approval-check",
         "permit-authorize-skips-binding-check"
       ],
-      "does_not_establish": "Two example-based tests, not a proof. The binding test substitutes only the action field; a comparison that ignored another binding field would not be caught here. Says nothing about ExecutionPermit::approved, about the grant evidence it consumes, or about whether every dispatch site goes through a permit (the structural refinement gate checks only the dispatch seam count)."
+      "does_not_establish": "Two example-based tests, not a proof. The binding test substitutes only the action field; a comparison that ignored another binding field would not be caught here. Says nothing about ExecutionPermit::approved, about the grant evidence it consumes, or about whether every dispatch site goes through a permit (the structural refinement gate checks only the dispatch seam count). Production does not constrain admission through this kernel: it mints the permit with literal arguments (direct(binding.clone(), true, false) and approved(binding.clone(), true, true, ...) in src/server/mod.rs), after the admission decision has already been made, and then calls authorize against the binding the permit was minted from. So this claim does not constrain the production admission decision or the dispatched payload. VUL-05 (a non-tautological permit kernel) is the open fix."
     },
     {
       "id": "kani-permit-kernel",
@@ -212,7 +212,7 @@
         "kani-direct-skips-approval-check",
         "kani-epoch-wraps"
       ],
-      "does_not_establish": "The vacuity (cover) check lives in formal/run-kani.sh, not in this detector, which checks only that the harnesses verify. Covers the pure functions only: not ExecutionPermit::approved, not the durable one-shot storage fence that uses the epoch, and nothing under the wasm-plugins feature (Kani cannot build it)."
+      "does_not_establish": "The vacuity (cover) check lives in formal/run-kani.sh, not in this detector, which checks only that the harnesses verify. Covers the pure functions only: not ExecutionPermit::approved, not the durable one-shot storage fence that uses the epoch, and nothing under the wasm-plugins feature (Kani cannot build it). Production does not constrain admission through this kernel: it mints the permit with literal arguments (direct(binding.clone(), true, false) and approved(binding.clone(), true, true, ...) in src/server/mod.rs), after the admission decision has already been made, and then calls authorize against the binding the permit was minted from. So this claim does not constrain the production admission decision or the dispatched payload. VUL-05 (a non-tautological permit kernel) is the open fix."
     },
     {
       "id": "recipe-unit-tests",
@@ -497,9 +497,7 @@
       "statement": "Verified approver decisions use a dedicated approval key only: with the key unset, equal to the shared govder key, or equal after trimming whitespace, verified approvals are disabled unless the explicit shared-key escape is set, in the named unit tests.",
       "method": "test",
       "artifacts": [
-        "src/govder/mod.rs",
-        "src/web/api.rs",
-        "tests/web_smoke.rs"
+        "src/govder/mod.rs"
       ],
       "gates": [
         "rust"
@@ -521,7 +519,7 @@
         "sb04-shared-key-fallback-without-escape",
         "sb04-equal-key-counts-as-distinct"
       ],
-      "does_not_establish": "The unit tests cover the key-selection function. The 403 on the decision route (api_decide_approval) is covered by tests/web_smoke.rs in the rust job but not by this detector or the drift lock. Key strength, key distribution and whether the broker signs with the dedicated key are operational matters."
+      "does_not_establish": "The unit tests cover the key-selection function. The 403 on the decision route (api_decide_approval) has route-level tests in tests/web_smoke.rs that run in the rust job, but they are not registered, not run by this detector and not drift-locked. Key strength, key distribution and whether the broker signs with the dedicated key are operational matters."
     },
     {
       "id": "refinement-structural",
@@ -581,7 +579,7 @@
       "mutants": [
         "lean-approval-freshness-check-dropped"
       ],
-      "does_not_establish": "A property of the Lean model, not of the Rust code: the model is hand-written and not extracted from Rust, and the link is the structural refinement gate only. The detector runs lake build, not the independent nanoda check that CI also runs. ExecutionSafety.lean, Model.lean and Types.lean are drift-locked. The one-shot theorem is stated over the consumed-binding list: it means at most one execution per approval binding only together with State.afterExecute recording every approved binding (a model change that stopped recording would keep the theorem true)."
+      "does_not_establish": "A property of the Lean model, not of the Rust code: the model is hand-written and not extracted from Rust, and the link is the structural refinement gate only. The detector runs lake build, not the independent nanoda check that CI also runs. ExecutionSafety.lean, Model.lean and Types.lean are drift-locked. The one-shot theorem is stated over the consumed-binding list: it means at most one execution per approval binding only together with State.afterExecute recording every approved binding (a model change that stopped recording would keep the theorem true). reachable_execution_is_proper holds by construction (an Execution carries its permit, and proper_of_permit makes every Execution proper), so it shows nothing about the transition system. The one-shot theorem is per RequestBinding, which includes the execution epoch, and the Rust code mints a fresh epoch per claim, so this is not at most one execution per approval id."
     },
     {
       "id": "recipe-shared-vectors",
@@ -687,7 +685,7 @@
     {
       "id": "approval-lifecycle-table",
       "method": "exhaustive",
-      "statement": "The approval decision transition accepts or rejects every one of 720 enumerated states (status, target, executed flag, veto window, approver kind, ttl expiry, identity shape) exactly as an independently written legality oracle says, including the guard order (a blank identity is refused before the ttl check), and an unnamed principal fills no recipe slot.",
+      "statement": "The approval decision transition accepts or rejects every one of 720 enumerated states (status, target, executed flag, veto window, approver kind, ttl expiry, identity shape) exactly as an independently written legality oracle says, including the guard order (a blank identity is refused before the ttl check).",
       "artifacts": [
         "src/approval/stage1_proofs.rs"
       ],
@@ -706,7 +704,7 @@
         "stage1-closed-state-redecided",
         "stage1-blank-identity-accepted"
       ],
-      "does_not_establish": "Only the 720 enumerated states, with three identity shapes and two approver kinds; no recipe-gated or multi-approver sequences (the property claim samples those). The oracle is hand-written in the test file. Says nothing about persistence, concurrency or the API layer that calls the transition."
+      "does_not_establish": "Only the 720 enumerated states, with three identity shapes and two approver kinds; no recipe-gated or multi-approver sequences (the property claim samples those). The oracle is hand-written in the test file. Says nothing about persistence, concurrency or the API layer that calls the transition. The detector also runs an_unnamed_principal_fills_no_slot, but approval_rule_satisfied and the bare-identity drop are not drift-locked and no mutant targets them, so that test is not part of this claim."
     },
     {
       "id": "approval-wire-tables",

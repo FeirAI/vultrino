@@ -77,8 +77,8 @@ Every claim is bounded; read the last column before citing one.
 
 | Claim | Method | What it checks | Does NOT establish |
 |---|---|---|---|
-| `permit-kernel-tests` | test | `ExecutionPermit::direct` refuses denial and approval-required; `authorize` refuses a binding with a different action | not `approved`, not that every dispatch site uses a permit; only the action field is substituted; two example tests |
-| `kani-permit-kernel` | kani | `direct` truth table over both boolean inputs (one fixed binding) and `next_epoch` no-wrap over every `u64` | vacuity gate lives in `run-kani.sh`; pure functions only; nothing under `wasm-plugins` |
+| `permit-kernel-tests` | test | `ExecutionPermit::direct` refuses denial and approval-required; `authorize` refuses a binding with a different action | not `approved`, not that every dispatch site uses a permit; only the action field is substituted; two example tests; production mints the permit with literal arguments after admission is decided (`direct(binding.clone(), true, false)`, `approved(binding.clone(), true, true, ...)` in `src/server/mod.rs`) and authorizes against the binding it was minted from, so this does not constrain the production admission decision or the dispatched payload (VUL-05 is the open fix) |
+| `kani-permit-kernel` | kani | `direct` truth table over both boolean inputs (one fixed binding) and `next_epoch` no-wrap over every `u64` | vacuity gate lives in `run-kani.sh`; pure functions only; nothing under `wasm-plugins`; same production caveat as `permit-kernel-tests` (literal arguments, so it does not constrain the production admission decision or payload; VUL-05) |
 | `recipe-unit-tests` | test | agent-reviewer terms unsatisfiable, over-cap counts unsatisfiable, one key cannot fabricate slots | other recipe shapes, sign-off collection, agreement with govder |
 | `kani-recipe-safety` | kani | symbolic three-term recipes plus fixed malformed shapes: no satisfaction with zero approvers, no underfill, malformed never satisfied, cap prevents overflow | recipes beyond 3 terms or the harness bounds; separation of duties |
 | `kani-recipe-greedy` | kani | greedy assignment equals exhaustive search at bound 5, monotone, slot contribution agrees | counts beyond bound 5; reference written in the same module |
@@ -88,11 +88,11 @@ Every claim is bounded; read the last column before citing one.
 | `sb02-minted-scrub` | test | credentials minted during an action are scrubbed or the response withheld, buffered and streamed | other encodings and types; server dispatch code is not drift-locked; plugin error-path residual |
 | `sb04-approval-key` | test | verified approver decisions need a dedicated key distinct from the shared govder key | route-level 403 is outside the detector; key strength and distribution |
 | `refinement-structural` | test | source-shape checks only: binding field list equals the Lean field list, seams and strings present | semantic refinement; it greps strings and counts call sites |
-| `lean-approval-execution` | lean | model-level: reachable executions are authorized and the consumed-binding list has no duplicates | the Rust code; the model is hand-written; nanoda check is not in the detector |
+| `lean-approval-execution` | lean | model-level: reachable executions are authorized and the consumed-binding list has no duplicates | the Rust code; the model is hand-written; nanoda check is not in the detector; `reachable_execution_is_proper` holds by construction (an Execution carries its permit), so it says nothing about the transition system; one-shot is per binding, which includes the epoch, and Rust mints a fresh epoch per claim, so it is not at most one execution per approval id |
 | `recipe-shared-vectors` | differential-vectors | `recipe_satisfied` matches the committed vector file shared byte for byte with govder | agreement only on the committed vectors and sweep domain; the govder half runs only in govder CI |
 | `recipe-sweeps-exhaustive` | exhaustive | `recipe_satisfied` equals an independent matching oracle on three committed sweeps; the oracle discriminates | the sweep domains only; the oracle is test code |
 | `recipe-greedy-optimal-real-cap` | exhaustive | senior-first greedy equals split search on 9,628,905 points at the real cap of 64 | one senior and one teammate term, no agent-reviewer slots; availability above 65 is argued, not enumerated |
-| `approval-lifecycle-table` | exhaustive | `transition` matches a legality oracle on 720 states including guard order; unnamed principals fill no slot | only those 720 states; no recipe-gated sequences; oracle is test code |
+| `approval-lifecycle-table` | exhaustive | `transition` matches a legality oracle on 720 states including guard order | only those 720 states; no recipe-gated sequences; oracle is test code |
 | `approval-wire-tables` | exhaustive | risk-tier, approver-class, decision-mode and execution-state tables enumerated over their listed spellings and 80 state combinations | strings outside the lists; callers' use of these functions |
 | `approval-vault-roundtrip-property` | property | 20,000 generated decision sequences stay valid and round-trip unchanged through the vault serde boundary | sampling, not exhaustive; sequences are at most 6 long; shared defects pass |
 | `ssrf-link-local-config-check` | test | `llm.provider_base` is rejected at config time for link-local and metadata addresses in many spellings | one example test; DNS names, redirects, later changes |
@@ -115,6 +115,7 @@ Every claim is bounded; read the last column before citing one.
   `src/approval/stage1_proofs.rs` (for example the policy-precedence table and the
   grant-witness tests) run in CI but are not registered. Mutants are single
   hand-written changes, not an exhaustive mutation campaign.
+- Not registered: the proptest `egress::tests::streamed_scrub_equals_buffered` (streamed scrubbing equals buffered scrubbing for any chunk split, for one fixed secret in raw form only; VUL-10 is the stronger target), and the route-level SB-04 tests in `tests/web_smoke.rs`.
 - The Kani vacuity (cover) gate is enforced by `formal/run-kani.sh` in the `kani`
   job, not by the mutation detectors.
 - The phrase list in `overclaim_denylist` is seeded from claim styles this
