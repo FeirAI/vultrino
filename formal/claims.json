@@ -127,6 +127,30 @@
     },
     "refresh-vault-not-reloaded": {
       "tier": "full"
+    },
+    "lean-authority-binding-equality-dropped": {
+      "tier": "full"
+    },
+    "lean-action-authority-label-guard-inverted": {
+      "tier": "full"
+    },
+    "lean-criticality-human-floor-direct-when-approvals-off": {
+      "tier": "full"
+    },
+    "lean-confinement-raw-credential-to-agent": {
+      "tier": "full"
+    },
+    "lean-confinement-retained-tail-one-short": {
+      "tier": "full"
+    },
+    "lean-method-caller-verb-accepted": {
+      "tier": "full"
+    },
+    "lean-startup-policy-hash-check-dropped": {
+      "tier": "full"
+    },
+    "lean-model-agent-reviewer-guard-dropped": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -541,12 +565,22 @@
           "path": "formal/lean/Vultrino/Approval/ExecutionSafety.lean",
           "symbol": "*",
           "sha256": "92c9c6346acab8ba6c93407495a19769d4b6be88e9e832325b8f3282ac11d1a8"
+        },
+        {
+          "path": "formal/lean/Vultrino/Approval/Model.lean",
+          "symbol": "*",
+          "sha256": "839e7004e3ef32d46d4ef2c3d49f5d679b72a7a312f17e76a3666c817360ff58"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
         }
       ],
       "mutants": [
         "lean-approval-freshness-check-dropped"
       ],
-      "does_not_establish": "A property of the Lean model, not of the Rust code: the model is hand-written and not extracted from Rust, and the link is the structural refinement gate only. The detector runs lake build, not the independent nanda check that CI also runs. Only ExecutionSafety.lean is drift-locked, not Model.lean that it imports. The one-shot theorem is stated over the consumed-binding list: it means at most one execution per approval binding only together with State.afterExecute recording every approved binding (a model change that stopped recording would keep the theorem true)."
+      "does_not_establish": "A property of the Lean model, not of the Rust code: the model is hand-written and not extracted from Rust, and the link is the structural refinement gate only. The detector runs lake build, not the independent nanda check that CI also runs. ExecutionSafety.lean, Model.lean and Types.lean are drift-locked. The one-shot theorem is stated over the consumed-binding list: it means at most one execution per approval binding only together with State.afterExecute recording every approved binding (a model change that stopped recording would keep the theorem true)."
     },
     {
       "id": "recipe-shared-vectors",
@@ -619,7 +653,7 @@
     {
       "id": "recipe-greedy-optimal-real-cap",
       "method": "exhaustive",
-      "statement": "At the real per-recipe cap of 64 sign-offs, the senior-first greedy rule used by recipe_satisfied agrees with the independent split-search oracle on every enumerated need and availability combination, and the split-search oracle agrees with the unit matching oracle.",
+      "statement": "At the real per-term cap of 64, the senior-first greedy rule in recipe_satisfied agrees with an independent split-search oracle on all 9,628,905 points of need (senior, teammate) with ns+nt <= 64 against availability 0..=65 plus u32::MAX for each class (no agent-reviewer slots), and the split-search oracle agrees with the unit matching oracle.",
       "artifacts": [
         "src/approval/stage1_proofs.rs"
       ],
@@ -647,7 +681,7 @@
       "mutants": [
         "greedy-leftover-senior-ignored"
       ],
-      "does_not_establish": "The enumerated domain in the test (see the test body for the exact bounds), with three classes and one recipe term per class. Recipes with several alternative terms are covered by the Kani and vector claims, not here. The oracles are test-local code."
+      "does_not_establish": "Only the enumerated domain: a recipe with one senior term and one teammate term, no agent-reviewer slots (those are unsatisfiable by a fixed guard, covered by the vector claim). Availability above 65 is argued, not enumerated, to behave like 65; that argument and the finiteness of the recipe axis rest on recipe_well_formed's caps, which the Kani and vector claims cover, so this claim is a composition inside one plane. Recipes with several alternative terms are not enumerated here. The oracles are test-local code."
     },
     {
       "id": "approval-lifecycle-table",
@@ -789,6 +823,193 @@
         "internal-http-aws-v6-metadata-admitted"
       ],
       "does_not_establish": "Listed addresses only, not an exhaustive check of the address space. Says nothing about hostname resolution, redirects or connect-time rebinding for internal_http, nor the allowlist configured per capability. Other cloud metadata endpoints not on the list are not tested."
+    },
+    {
+      "id": "lean-approval-authority",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): a broker-verified approval identity has exactly the tenant, approval id, outcome, subject, class, method, path, query, host and body digest that its evidence bound (verified_broker_identity_is_exact), evidence cannot validate any changed tuple (changed_binding_rejected), and a bare aggregator-key claim carries no independent-authentication witness while a verified broker claim is named.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Approval/Authority.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Approval.Authority --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Approval/Authority.lean",
+          "symbol": "*",
+          "sha256": "7cb612d3debb64b368207c6c96e6bb073fcf1e3450f9e872cb1503950d994115"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
+        }
+      ],
+      "mutants": [
+        "lean-authority-binding-equality-dropped"
+      ],
+      "does_not_establish": "Nothing about the MAC primitive, the HTTP parser or the TTL clock source, which are trusted-computing-base assumptions. The one-positive-slot-per-key guard for aggregator claims is not modelled here, only that such claims are not independent. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-approval-action-authority",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): a canonical plugin verb shared by several business labels cannot open the weaker numeric approval path when no exact rule is found, production strict posture refuses an inconclusive recipe answer, and approval resume requires the same recipe authority and the same credential record revision as at open, with the opener still authorized for the record's current tenant.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Approval/ActionAuthority.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Approval.ActionAuthority --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Approval/ActionAuthority.lean",
+          "symbol": "*",
+          "sha256": "edb1c265d5e305b06e299c95760dc645674f1f62a2a0dc61a608c1fcafaebf44"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
+        }
+      ],
+      "mutants": [
+        "lean-action-authority-label-guard-inverted"
+      ],
+      "does_not_establish": "The model abstracts recipe, risk tier and credential record to numbers; it says nothing about how the Rust code parses or compares the real structures. Not a statement about govder's answer being correct, only about how vultrino reacts to each answer shape. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-approval-criticality",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): the critical-action gate never returns direct execution authority for a declared human-floor action, an ambiguous canonical verb, or an unavailable catalog, in production strict posture direct authority implies an exact reversible declaration, and an approval resumes only while the catalog authority class is unchanged and available.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Approval/Criticality.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Approval.Criticality --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Approval/Criticality.lean",
+          "symbol": "*",
+          "sha256": "6d33ceadfd0087433d325c9c2c792e196030c1b4ee5112600370ca156d844885"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
+        }
+      ],
+      "mutants": [
+        "lean-criticality-human-floor-direct-when-approvals-off"
+      ],
+      "does_not_establish": "Only criticality's contribution to the gate; policy, scope, recipe and permit checks are not modelled here. Says nothing about how the catalog resolution itself is computed. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-credential-confinement",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): in the model of the credential kernel every reachable raw-credential flow ends at the encrypted vault, the trusted injector or the authorized upstream, every public payload carries evidence that no declared secret byte-form occurs, accepted streaming chunks keep that true over the concatenated output, and retaining the last max_form_len - 1 released bytes is sufficient for the incremental boundary check.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Credentials/Confinement.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Credentials.Confinement --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Credentials/Confinement.lean",
+          "symbol": "*",
+          "sha256": "9f5381cee79455c7de2bdd053560b4d1127b19d53d16913ff5d2020cfd1e801a"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
+        }
+      ],
+      "mutants": [
+        "lean-confinement-raw-credential-to-agent",
+        "lean-confinement-retained-tail-one-short"
+      ],
+      "does_not_establish": "Only the declared secret forms: a transformation of a secret that is not in the declared list is not excluded. The sink list is the modelled operation vocabulary; a Rust path that does not go through it is outside the model. The bounded-tail result is about the algorithm, not the Rust StreamScrubber implementation. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-method-authority",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): a composed internal-HTTP method is always the operator's method and no caller-supplied method is accepted (successful_method_is_operator_method, caller_method_is_rejected).",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Action/MethodAuthority.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Action.MethodAuthority --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Action/MethodAuthority.lean",
+          "symbol": "*",
+          "sha256": "6e958082a959fcbb032d71dca6fcafcef44b682e6420be965021e673ad2d65c9"
+        }
+      ],
+      "mutants": [
+        "lean-method-caller-verb-accepted"
+      ],
+      "does_not_establish": "Nothing about how the operator method itself is validated at registration, or about the plugin's behaviour once the method is composed. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-startup-refusal",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): the production web startup decision starts only with strict catalog enforcement, a configured policy-hash key and, when workload exchange is enabled, a valid verifier, and refuses before listening if any of those is wrong.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Configuration/Startup.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Configuration.Startup --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Configuration/Startup.lean",
+          "symbol": "*",
+          "sha256": "3d7729771b3f8b7a53fa0c6f24091c3de81ee62f70e6bbb131a72ad95b9fa6b3"
+        }
+      ],
+      "mutants": [
+        "lean-startup-policy-hash-check-dropped"
+      ],
+      "does_not_establish": "Only the decision function over three summarised inputs; whether the Rust startup code computes those inputs correctly, or calls the decision before binding the listener, is not established. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-approval-recipe-model",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): every supported recipe has no agent-reviewer term and at least one human slot for every risk tier, autonomy and irreversibility value (supported_recipe_satisfies_every_floor), and a recipe that requires an agent reviewer is unsatisfiable by any sign-off set (agent_reviewer_recipe_is_unsatisfiable).",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Approval/Model.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Approval.Model --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Approval/Model.lean",
+          "symbol": "*",
+          "sha256": "839e7004e3ef32d46d4ef2c3d49f5d679b72a7a312f17e76a3666c817360ff58"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
+        }
+      ],
+      "mutants": [
+        "lean-model-agent-reviewer-guard-dropped"
+      ],
+      "does_not_establish": "Nothing about the execution-boundary theorems in ExecutionSafety.lean (separate claim). Sign-off sets are abstract counts and flags, so how the Rust code derives named, distinct and resolved sign-offs is not covered. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
     }
   ]
 }

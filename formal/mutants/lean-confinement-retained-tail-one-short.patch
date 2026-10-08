@@ -1,0 +1,13 @@
+diff --git a/formal/lean/Vultrino/Credentials/Confinement.lean b/formal/lean/Vultrino/Credentials/Confinement.lean
+index 2bffd67..016e712 100644
+--- a/formal/lean/Vultrino/Credentials/Confinement.lean
++++ b/formal/lean/Vultrino/Credentials/Confinement.lean
+@@ -145,7 +145,7 @@ def excludesAll (secretForms : List SecretForm) (bytes : List Char) : Prop :=
+ 
+ /-- The exact suffix retained by the Rust streaming output gate. -/
+ def retainedTail (released : List Char) (maxFormLength : Nat) : List Char :=
+-  released.drop (released.length - (maxFormLength - 1))
++  released.drop (released.length - (maxFormLength - 2))
+ 
+ theorem retained_tail_covers_every_possible_crossing_start
+     {part released : List Char} {maxFormLength : Nat}

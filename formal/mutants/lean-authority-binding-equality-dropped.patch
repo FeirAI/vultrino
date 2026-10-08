@@ -1,0 +1,13 @@
+diff --git a/formal/lean/Vultrino/Approval/Authority.lean b/formal/lean/Vultrino/Approval/Authority.lean
+index 5a61fb8..1dea762 100644
+--- a/formal/lean/Vultrino/Approval/Authority.lean
++++ b/formal/lean/Vultrino/Approval/Authority.lean
+@@ -39,7 +39,7 @@ def AssertionEvidence.validFor
+     (evidence : AssertionEvidence)
+     (received : DecisionBinding)
+     (now maxTtl : Instant) : Prop :=
+-  evidence.binding = received ∧
++  True ∧
+   now ≤ evidence.expiresAt ∧
+   evidence.expiresAt - now ≤ maxTtl
+ 

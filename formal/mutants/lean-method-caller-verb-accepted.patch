@@ -1,0 +1,13 @@
+diff --git a/formal/lean/Vultrino/Action/MethodAuthority.lean b/formal/lean/Vultrino/Action/MethodAuthority.lean
+index cabefe6..61fb775 100644
+--- a/formal/lean/Vultrino/Action/MethodAuthority.lean
++++ b/formal/lean/Vultrino/Action/MethodAuthority.lean
+@@ -23,7 +23,7 @@ def composeMethod
+     (callerMethod : Option String) : Option String :=
+   match callerMethod with
+   | none => some source.method
+-  | some _ => none
++  | some method => some method
+ 
+ /-- Every successfully composed method is exactly the operator's method and the
+ caller supplied no competing verb. -/

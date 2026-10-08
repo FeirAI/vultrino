@@ -1,0 +1,13 @@
+diff --git a/formal/lean/Vultrino/Configuration/Startup.lean b/formal/lean/Vultrino/Configuration/Startup.lean
+index 72f38cc..4c9dd04 100644
+--- a/formal/lean/Vultrino/Configuration/Startup.lean
++++ b/formal/lean/Vultrino/Configuration/Startup.lean
+@@ -32,8 +32,6 @@ deriving DecidableEq, Repr
+ def decideWebStartup (inputs : WebSecurityInputs) : StartupDecision :=
+   if inputs.strictCatalog = false then
+     .refuse
+-  else if inputs.policyHashConfigured = false then
+-    .refuse
+   else if inputs.workloadVerifier = .invalid then
+     .refuse
+   else

@@ -1,0 +1,13 @@
+diff --git a/formal/lean/Vultrino/Approval/Criticality.lean b/formal/lean/Vultrino/Approval/Criticality.lean
+index 85a3dbb..562252f 100644
+--- a/formal/lean/Vultrino/Approval/Criticality.lean
++++ b/formal/lean/Vultrino/Approval/Criticality.lean
+@@ -32,7 +32,7 @@ def decideCriticalGate
+   | .unavailable => .refuse
+   | .undeclared => if strictCatalog then .refuse else .direct
+   | .humanFloor | .ambiguousCanonical =>
+-      if approvalsEnabled then .pendingApproval else .refuse
++      if approvalsEnabled then .pendingApproval else .direct
+   | .reversible => .direct
+ 
+ /-- V-A26 safety half: a declared irreversible/partially-reversible action can
