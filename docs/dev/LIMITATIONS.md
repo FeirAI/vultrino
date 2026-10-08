@@ -328,3 +328,14 @@ rate limiter, or rely on the per-agent BUDGET (leria/govder, which IS global and
 authoritative spend boundary. (Item-6 vultrino#10 fixed the separate bug where layered/per-principal
 rules shared ONE counter — they are now keyed per (rule, alias, principal); this bound is the
 remaining per-replica multiplication, which is inherent to in-process counters.)
+
+## RateLimit policies stored before the default-deny rule
+
+`Policy::validate` now refuses a policy with a `RateLimit` condition unless its
+`default_action` is deny (config load and admin API). Policies already stored in
+the vault are not re-validated when loaded, so one saved earlier with an allow or
+prompt default keeps working as written: when its Allow-`RateLimit` rule is
+exhausted the request falls through to that default and is allowed (or prompted).
+Re-save such a policy through the admin API (which validates) or change its
+default to deny. No warning is logged for these today; adding a log-only check on
+load is a follow-up.
