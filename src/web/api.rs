@@ -654,7 +654,7 @@ fn pending_approval_notifications(
                 && !approval.is_past_ttl()
         })
         .collect();
-    pending.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    pending.sort_by_key(|b| std::cmp::Reverse(b.created_at));
     pending.truncate(100);
     pending
         .into_iter()
