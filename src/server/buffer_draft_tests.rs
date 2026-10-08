@@ -273,6 +273,7 @@ async fn fixture() -> (
         base_url: govder_endpoint.to_string(),
         assertion_secret: "fixture-govder-secret".to_string(),
         approval_assertion_secret: None,
+        allow_shared_approval_key: false,
         assertion_ttl: std::time::Duration::from_secs(90),
         http_timeout: std::time::Duration::from_secs(5),
     });
