@@ -1,0 +1,36 @@
+name: main-health
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+  issues: write
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: report main CI health as an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run=$(gh run list -R "$REPO" --workflow ci --branch main --limit 1 --json conclusion,status,url,headSha --jq '.[0] // {}')
+          concl=$(jq -r '.conclusion // ""' <<<"$run")
+          url=$(jq -r '.url // ""' <<<"$run")
+          sha=$(jq -r '.headSha // ""' <<<"$run")
+          gh label create main-red --color B60205 --description "main CI is red" -R "$REPO" 2>/dev/null || true
+          open=$(gh issue list -R "$REPO" --label main-red --state open --json number --jq '.[0].number // empty')
+          if [ "$concl" = "success" ]; then
+            if [ -n "$open" ]; then gh issue close "$open" -R "$REPO" --comment "main CI is green again: $url"; fi
+            exit 0
+          fi
+          if [ -z "$concl" ]; then exit 0; fi
+          body="Latest ci run on main ($sha) concluded: $concl. $url"
+          if [ -n "$open" ]; then gh issue comment "$open" -R "$REPO" --body "$body"; else gh issue create -R "$REPO" --title "main CI is red" --label main-red --body "$body"; fi

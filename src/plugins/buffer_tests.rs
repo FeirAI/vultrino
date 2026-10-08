@@ -26,6 +26,8 @@ use tokio::task::JoinHandle;
 
 const CHANNEL_QUERY: &str = "query BufferChannel($input: ChannelInput!) { channel(input: $input) { id organizationId service serviceId isDisconnected isLocked } }";
 const CREATE_QUERY: &str = "mutation BufferCreateDraft($input: CreatePostInput!) { createPost(input: $input) { __typename ... on PostActionSuccess { post { id text status channelId channelService dueAt assets { __typename } } } ... on MutationError { message } } }";
+/// Buffer reports a LinkedIn channel's serviceId as a LinkedIn URN.
+const LINKEDIN_SERVICE_ID: &str = "urn:li:organization:135696968";
 const POST_QUERY: &str = "query BufferPost($input: PostInput!) { post(input: $input) { id text status channelId channelService dueAt assets { __typename } } }";
 
 #[derive(Clone)]
@@ -85,7 +87,7 @@ fn default_reply(query: &str, request: &Value) -> Reply {
                 "id": id,
                 "organizationId": "org-a",
                 "service": if linkedin { "linkedin" } else { "twitter" },
-                "serviceId": if linkedin { "remote-linkedin" } else { "remote-x" },
+                "serviceId": if linkedin { LINKEDIN_SERVICE_ID } else { "remote-x" },
                 "isDisconnected": false,
                 "isLocked": false
             }}
@@ -181,7 +183,7 @@ impl Fixture {
                 "org-a",
                 "linkedin",
                 "channel-linkedin",
-                "remote-linkedin",
+                LINKEDIN_SERVICE_ID,
                 "owner-linkedin",
             )
             .unwrap(),
@@ -335,6 +337,30 @@ fn channel_success(pin: &BufferPin) -> Value {
         "service": pin.service(), "serviceId": pin.service_id, "isDisconnected": false,
         "isLocked": false}}
     })
+}
+
+/// The URN serviceId is compared byte-exactly: a channel reporting any other
+/// LinkedIn URN (another organization, or the same id under another entity
+/// kind) is refused before the create is sent.
+#[tokio::test]
+async fn linkedin_create_refuses_a_channel_with_a_different_urn_service_id() {
+    for other in [
+        "urn:li:organization:135696969",
+        "urn:li:person:135696968",
+        "URN:li:organization:135696968",
+    ] {
+        let fixture = Fixture::new().await;
+        let mut channel = channel_success(&fixture.pin("linkedin"));
+        channel["data"]["channel"]["serviceId"] = json!(other);
+        fixture.queue([Reply::Json(channel)]);
+        let (_, response) = create(&fixture, "linkedin").await;
+        let error = response.expect_err(other).to_string();
+        assert!(
+            error.contains("does not match the operator pin"),
+            "{other}: {error}"
+        );
+        assert_eq!(fixture.count_query(CREATE_QUERY), 0, "{other}");
+    }
 }
 
 async fn create(fixture: &Fixture, target: &str) -> (Value, Result<ExecuteResponse, PluginError>) {

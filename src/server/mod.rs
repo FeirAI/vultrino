@@ -2549,6 +2549,14 @@ impl VultrinoServer {
         // closed on a still-compressed body, else scrub the credential's own
         // reflected secret and apply operator egress classification, dropping
         // stale framing if the body changed. See `egress::scrub_response`.
+        // SB-02: material minted or refreshed DURING the action (OAuth2 refresh,
+        // Google service-account token mint) was not in the pre-dispatch capture.
+        // Add its forms before anything is confined, so an upstream that reflects
+        // the new Authorization header cannot leak it to the agent.
+        let mut secret_material = secret_material;
+        if let Some(updated) = response.updated_credential() {
+            secret_material.extend(updated.secret_material());
+        }
         let response = crate::egress::confine_response(
             response,
             &secret_material,
@@ -2904,6 +2912,15 @@ impl VultrinoServer {
         };
 
         let status = streaming.status;
+
+        // SB-02: the minted/refreshed credential is known from the stream head,
+        // before any header or body byte reaches the agent. Extend the scrub set
+        // with its forms (headers, terminal placeholder and body scrubber below
+        // all use `secret_material`).
+        let mut secret_material = secret_material;
+        if let Some(updated) = streaming.updated_credential() {
+            secret_material.extend(updated.secret_material());
+        }
 
         // Fail closed on a residual-compressed body (an encoding the HTTP client
         // didn't decode, e.g. zstd): it's opaque to the secret scrubber, so withhold
