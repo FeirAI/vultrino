@@ -1677,7 +1677,9 @@ async fn sb02_streamed_short_minted_token_withholds_response() {
 // Otherwise a rotated refresh token is lost and the stored credential is bricked.
 const ZSTD_MINTED: &str = "minted-access-token-value-0123456789";
 
-struct MockZstdMintPlugin;
+/// Streams an opaque zstd body and mints an OAuth2 credential whose access token
+/// is the given value.
+struct MockZstdMintPlugin(&'static str);
 
 #[async_trait]
 impl Plugin for MockZstdMintPlugin {
@@ -1707,7 +1709,7 @@ impl Plugin for MockZstdMintPlugin {
             client_id: "client-id".to_string(),
             client_secret: Secret::new("client-secret-value-0123456789"),
             refresh_token: Some(Secret::new("rotated-refresh-token-0123456789")),
-            access_token: Some(Secret::new(ZSTD_MINTED)),
+            access_token: Some(Secret::new(self.0)),
             expires_at: None,
             token_url: "https://oauth.example.test/token".to_string(),
             scopes: vec![],
@@ -1726,7 +1728,8 @@ impl Plugin for MockZstdMintPlugin {
 async fn sb02_streamed_compressed_response_still_persists_updated_credential() {
     let (router, storage, srv) =
         build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
-    srv.plugins().register(Arc::new(MockZstdMintPlugin));
+    srv.plugins()
+        .register(Arc::new(MockZstdMintPlugin(ZSTD_MINTED)));
     store_provider_credential(&storage, "cred-openai").await;
     register_llm_capability(
         &storage,
@@ -1764,4 +1767,71 @@ async fn sb02_streamed_compressed_response_still_persists_updated_credential() {
             other.credential_type()
         ),
     }
+}
+
+// A compressed streamed response whose action ALSO minted a credential shorter
+// than MIN_REDACT_LEN must be withheld exactly as the buffered path withholds it
+// (empty head and body). The compressed-body placeholder is fixed text, so it
+// can itself contain a short secret ("with" is inside "withheld"); the short
+// minted secret check must therefore run before the compressed-body withhold.
+const ZSTD_SHORT_MINTED: &str = "with";
+
+#[tokio::test]
+async fn sb02_streamed_compressed_short_minted_token_withholds_like_buffered() {
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    srv.plugins()
+        .register(Arc::new(MockZstdMintPlugin(ZSTD_SHORT_MINTED)));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockzstd.chat",
+        "https://api.openai.com",
+    )
+    .await;
+    let token = mint_token(&storage, "cred-openai", Some("mockzstd.chat")).await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": true, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let raw = body_bytes(resp).await;
+    let body = String::from_utf8_lossy(&raw);
+    assert!(
+        !body.contains(ZSTD_SHORT_MINTED),
+        "short minted token present in the withheld body: {body}"
+    );
+    assert!(
+        raw.is_empty(),
+        "withheld body must be empty, as on the buffered path: {body}"
+    );
+    assert!(
+        headers.iter().all(|(_, v)| !v.contains(ZSTD_SHORT_MINTED)),
+        "short minted token present in a header: {headers:?}"
+    );
+    // The minted credential is still persisted, as on every withhold.
+    let stored = storage
+        .get_by_alias("cred-openai")
+        .await
+        .unwrap()
+        .expect("credential present");
+    assert_eq!(
+        stored.credential_type,
+        CredentialType::OAuth2,
+        "the minted credential must be persisted even when the response is withheld"
+    );
 }

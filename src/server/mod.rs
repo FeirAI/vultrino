@@ -2923,7 +2923,7 @@ impl VultrinoServer {
         }
 
         // Persist any credential update (e.g. OAuth2 refresh), known before the body
-        // streams — identical to the buffered path. Done before ANY withhold below
+        // streams, identical to the buffered path. Done before ANY withhold below
         // (compressed body, unredactable minted secret): a withheld response must
         // not lose a rotated refresh token.
         if let Some(updated_data) = streaming.updated_credential() {
@@ -2948,6 +2948,36 @@ impl VultrinoServer {
                 }),
             )
             .await;
+        }
+
+        // SB-02 parity with the buffered path (`confine_response`): a credential
+        // minted during the action that is shorter than MIN_REDACT_LEN cannot be
+        // reliably redacted, so withhold the whole response (empty head and body).
+        // Decided from the stream head, before any byte reaches the agent. The
+        // minted credential was persisted above and the call still meters. This
+        // runs BEFORE the compressed-body withhold: that one emits a fixed
+        // placeholder, and fixed text can itself contain a secret too short for
+        // the scrubber to see (the buffered path checks this first as well).
+        if crate::egress::has_unredactable_secret(&secret_material) {
+            warn!(
+                request_id = %request_id,
+                credential = %credential_alias,
+                "streamed response withheld: a credential minted during the action is too short to redact"
+            );
+            emit_meter(&Arc::clone(&self.storage), &attribution, None, None).await;
+            if let Some((av, evidence)) = &exact_evidence {
+                if let Err(error) = av.complete_exact_use(evidence, "error").await {
+                    warn!(request_id = %request_id, error = %error, "withheld stream D8 outcome evidence failed");
+                }
+            }
+            return Ok(StreamingExecution {
+                status,
+                headers: std::collections::HashMap::new(),
+                body: Box::pin(futures::stream::once(async move {
+                    let _guard = session_guard;
+                    Ok::<Bytes, std::io::Error>(Bytes::new())
+                })),
+            });
         }
 
         // Fail closed on a residual-compressed body (an encoding the HTTP client
@@ -2987,33 +3017,6 @@ impl VultrinoServer {
                 body: Box::pin(futures::stream::once(async move {
                     let _guard = session_guard;
                     Ok::<Bytes, std::io::Error>(Bytes::from(placeholder))
-                })),
-            });
-        }
-
-        // SB-02 parity with the buffered path (`confine_response`): a credential
-        // minted during the action that is shorter than MIN_REDACT_LEN cannot be
-        // reliably redacted, so withhold the whole response (empty head and body).
-        // Decided from the stream head, before any byte reaches the agent. The
-        // minted credential was persisted above and the call still meters.
-        if crate::egress::has_unredactable_secret(&secret_material) {
-            warn!(
-                request_id = %request_id,
-                credential = %credential_alias,
-                "streamed response withheld: a credential minted during the action is too short to redact"
-            );
-            emit_meter(&Arc::clone(&self.storage), &attribution, None, None).await;
-            if let Some((av, evidence)) = &exact_evidence {
-                if let Err(error) = av.complete_exact_use(evidence, "error").await {
-                    warn!(request_id = %request_id, error = %error, "withheld stream D8 outcome evidence failed");
-                }
-            }
-            return Ok(StreamingExecution {
-                status,
-                headers: std::collections::HashMap::new(),
-                body: Box::pin(futures::stream::once(async move {
-                    let _guard = session_guard;
-                    Ok::<Bytes, std::io::Error>(Bytes::new())
                 })),
             });
         }
