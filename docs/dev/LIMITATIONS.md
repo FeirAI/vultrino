@@ -173,6 +173,16 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   Closing this needs a plugin API change so an error can carry the minted credential; that is
   not done.
 
+- **Policy load ordering is per process.** Every engine policy load (the periodic refresh
+  and the admin reload) runs as one cycle under a single async lock, ticketed in list order,
+  so within one process an older list cannot replace a newer one. The lock does not span
+  processes: a kill policy written by another process (CLI halt, HA replica) becomes visible
+  here on the next refresh tick, so propagation stays bounded by the refresh interval.
+- **`internal_http` refuses only two named metadata addresses inside its allowed ranges.**
+  100.100.100.200 (inside CGNAT) and fd00:ec2::254 (inside fc00::/7) are excluded, including
+  IPv4-mapped forms. Another provider's metadata address inside RFC1918, CGNAT or
+  unique-local space would still be admitted, because those ranges are allowed on purpose.
+
 ## Formal verification bounds (what the gates prove — and do not)
 
 Stage-1 artefacts under `formal/` are CI-gated on `main` (Lean + nanoda, Kani,

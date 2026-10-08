@@ -2922,6 +2922,34 @@ impl VultrinoServer {
             secret_material.extend(updated.secret_material());
         }
 
+        // Persist any credential update (e.g. OAuth2 refresh), known before the body
+        // streams — identical to the buffered path. Done before ANY withhold below
+        // (compressed body, unredactable minted secret): a withheld response must
+        // not lose a rotated refresh token.
+        if let Some(updated_data) = streaming.updated_credential() {
+            let updated_credential = crate::Credential {
+                id: credential_id,
+                alias: credential_alias.clone(),
+                credential_type: updated_data.credential_type(),
+                data: updated_data.clone(),
+                metadata: credential_metadata,
+                created_at: credential_created_at,
+                updated_at: chrono::Utc::now(),
+            };
+            if let Err(e) = self.storage.store(&updated_credential).await {
+                warn!(request_id = %request_id, error = %e, "Failed to persist updated credential (token refresh)");
+            }
+            self.emit_event(
+                &credential_alias,
+                crate::outbox::EVENT_CREDENTIAL_ROTATED,
+                serde_json::json!({
+                    "credential": credential_alias,
+                    "credential_type": updated_data.credential_type().to_string(),
+                }),
+            )
+            .await;
+        }
+
         // Fail closed on a residual-compressed body (an encoding the HTTP client
         // didn't decode, e.g. zstd): it's opaque to the secret scrubber, so withhold
         // it rather than forward un-scrubbable bytes. Decided from the head, before
@@ -2961,32 +2989,6 @@ impl VultrinoServer {
                     Ok::<Bytes, std::io::Error>(Bytes::from(placeholder))
                 })),
             });
-        }
-
-        // Persist any credential update (e.g. OAuth2 refresh), known before the body
-        // streams — identical to the buffered path.
-        if let Some(updated_data) = streaming.updated_credential() {
-            let updated_credential = crate::Credential {
-                id: credential_id,
-                alias: credential_alias.clone(),
-                credential_type: updated_data.credential_type(),
-                data: updated_data.clone(),
-                metadata: credential_metadata,
-                created_at: credential_created_at,
-                updated_at: chrono::Utc::now(),
-            };
-            if let Err(e) = self.storage.store(&updated_credential).await {
-                warn!(request_id = %request_id, error = %e, "Failed to persist updated credential (token refresh)");
-            }
-            self.emit_event(
-                &credential_alias,
-                crate::outbox::EVENT_CREDENTIAL_ROTATED,
-                serde_json::json!({
-                    "credential": credential_alias,
-                    "credential_type": updated_data.credential_type().to_string(),
-                }),
-            )
-            .await;
         }
 
         // SB-02 parity with the buffered path (`confine_response`): a credential
@@ -4443,6 +4445,7 @@ impl VultrinoServer {
         // Ticket first (after the caller's storage write), then list, then a
         // compare-and-swap apply: a concurrent periodic refresh that listed
         // before this write can no longer overwrite this newer set.
+        let _cycle = self.policy_engine.lock_load().await;
         let ticket = self.policy_engine.begin_load();
         let stored = self.storage.list_stored_policies().await?;
         self.policy_engine
@@ -5608,11 +5611,37 @@ pub async fn refresh_policies_after_list(
     config_policies: &[crate::policy::Policy],
     after_list: impl std::future::Future<Output = ()>,
 ) -> Result<(), crate::storage::StorageError> {
-    // Ticket before the read: if an admin reload (ticketed after its own write)
-    // is applied while this refresh is in flight, this older list is discarded
-    // instead of replacing the newer set. A discarded refresh is harmless: the
-    // next tick re-reads storage.
+    refresh_policies_with_hooks(
+        storage,
+        engine,
+        config_policies,
+        std::future::ready(()),
+        after_list,
+    )
+    .await
+}
+
+/// [`refresh_policies_once`] with hooks awaited (1) after the load cycle starts
+/// (lock and ticket taken) but before the vault is re-read, and (2) between
+/// listing and applying. Test-only seam. Not part of the stable API.
+#[doc(hidden)]
+pub async fn refresh_policies_with_hooks(
+    storage: &Arc<dyn StorageBackend>,
+    engine: &PolicyEngine,
+    config_policies: &[crate::policy::Policy],
+    after_ticket: impl std::future::Future<Output = ()>,
+    after_list: impl std::future::Future<Output = ()>,
+) -> Result<(), crate::storage::StorageError> {
+    // One load cycle at a time: hold the engine's async load lock from the ticket
+    // through the vault re-read, the list and the apply, exactly as the admin
+    // reload does. A concurrent admin reload therefore waits for this cycle to
+    // apply and then lists a vault that already contains what this one saw, so
+    // ticket order equals list-read order. The ticket compare stays as a second
+    // guard. Visibility of another process's write is still bounded by the
+    // refresh interval: this lock is per process.
+    let _cycle = engine.lock_load().await;
     let ticket = engine.begin_load();
+    after_ticket.await;
     storage.reload().await?;
     let stored = storage.list_stored_policies().await?;
     after_list.await;

@@ -2560,33 +2560,38 @@ async fn test_refresh_policies_once_picks_up_cross_process_write() {
 #[tokio::test]
 async fn test_refresh_listing_before_kill_policy_cannot_overwrite_newer_admin_reload() {
     // Race: the periodic refresh lists stored policies BEFORE a halt writes its kill
-    // policy, the admin path then writes + reloads the engine, and only then does the
-    // refresh apply its (stale) list. Without ordering, that replaces the engine's
-    // set with the stale list and the kill policy vanishes until the next tick.
+    // policy, the admin path then writes + reloads, and only then does the refresh
+    // apply its (stale) list. The admin reload must wait for the refresh cycle (one
+    // async load lock), then list a vault that has the kill policy.
     use vultrino::policy::Policy;
     use vultrino::server::refresh_policies_after_list;
 
     let (server, storage) = setup_with_policies(vec![]).await;
+    let server = Arc::new(server);
     let engine = server.policy_engine().clone();
 
+    let mut admin: Option<tokio::task::JoinHandle<()>> = None;
     refresh_policies_after_list(&storage, &engine, &[], async {
         // Inside the refresh window: storage was already listed (no kill policy).
-        storage
-            .store_policy(&Policy::kill_switch("halt:agent-x", "agent-x"))
-            .await
-            .unwrap();
-        server.reload_policies().await.unwrap();
+        let (s, st) = (server.clone(), storage.clone());
+        admin = Some(tokio::spawn(async move {
+            st.store_policy(&Policy::kill_switch("halt:agent-x", "agent-x"))
+                .await
+                .unwrap();
+            s.reload_policies().await.unwrap();
+        }));
+        // Let the admin task run as far as it can. It may write storage, but its
+        // reload must not complete before the refresh has applied.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert!(
-            engine
-                .list_policies()
-                .iter()
-                .any(|p| p.id == "halt:agent-x"),
-            "admin reload must install the kill policy"
+            !admin.as_ref().unwrap().is_finished(),
+            "admin reload must wait for the in-flight refresh cycle"
         );
     })
     .await
     .unwrap();
 
+    admin.unwrap().await.unwrap();
     assert!(
         engine
             .list_policies()
@@ -2603,6 +2608,63 @@ async fn test_refresh_listing_before_kill_policy_cannot_overwrite_newer_admin_re
         .list_policies()
         .iter()
         .any(|p| p.id == "halt:agent-x"));
+}
+
+#[tokio::test]
+async fn test_refresh_taking_ticket_first_still_applies_cross_process_kill_policy() {
+    // Interleaving B: the refresh takes its ticket, a local admin reload runs (and,
+    // without the load lock, applies a list taken BEFORE the external write), then
+    // another process (CLI halt, HA replica) writes a kill policy to the same vault.
+    // The refresh re-reads after that write and must apply it, not be discarded.
+    use vultrino::policy::Policy;
+    use vultrino::server::refresh_policies_with_hooks;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let external: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let mut config = Config::default();
+    config.enforcement.default_action = vultrino::config::EnforcementDefault::Allow;
+    let resolver = CredentialResolver::new(storage.clone());
+    let server = Arc::new(VultrinoServer::new(config, storage.clone(), resolver));
+    let engine = server.policy_engine().clone();
+
+    let mut admin: Option<tokio::task::JoinHandle<()>> = None;
+    refresh_policies_with_hooks(
+        &storage,
+        &engine,
+        &[],
+        async {
+            let s = server.clone();
+            admin = Some(tokio::spawn(async move {
+                s.reload_policies().await.unwrap();
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            assert!(
+                !admin.as_ref().unwrap().is_finished(),
+                "admin reload must wait for the in-flight refresh cycle"
+            );
+            external
+                .store_policy(&Policy::kill_switch("halt:agent-y", "agent-y"))
+                .await
+                .unwrap();
+        },
+        async {},
+    )
+    .await
+    .unwrap();
+    admin.unwrap().await.unwrap();
+
+    assert!(
+        engine
+            .list_policies()
+            .iter()
+            .any(|p| p.id == "halt:agent-y"),
+        "kill policy written by another process during the refresh window must be live"
+    );
 }
 
 #[tokio::test]

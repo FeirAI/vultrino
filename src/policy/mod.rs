@@ -219,6 +219,9 @@ pub struct PolicyEngine {
     /// Highest ticket whose policy list has been applied. Guards the
     /// compare-and-swap in [`Self::load_policies_if_newer`].
     applied_load_ticket: Mutex<u64>,
+    /// Async mutex serializing whole load cycles (ticket, storage reload, list,
+    /// apply). See [`Self::lock_load`].
+    load_cycle: tokio::sync::Mutex<()>,
 }
 
 impl PolicyEngine {
@@ -237,6 +240,7 @@ impl PolicyEngine {
             default_deny: AtomicBool::new(true),
             next_load_ticket: AtomicU64::new(0),
             applied_load_ticket: Mutex::new(0),
+            load_cycle: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -275,6 +279,16 @@ impl PolicyEngine {
     pub fn list_policies(&self) -> Vec<Policy> {
         let policies = self.policies.read();
         policies.clone()
+    }
+
+    /// Serialize a whole load cycle. Hold the guard from [`Self::begin_load`]
+    /// through the storage reload, the list and [`Self::load_policies_if_newer`],
+    /// in BOTH the periodic refresh and the admin reload. With it, a load cannot
+    /// start listing while another is between list and apply, so ticket order
+    /// equals list-read order. The ticket compare stays as a second guard.
+    /// Not reentrant: do not call a reload while holding the guard.
+    pub async fn lock_load(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.load_cycle.lock().await
     }
 
     /// Take a load ticket. Call this BEFORE reading the policy list from storage
