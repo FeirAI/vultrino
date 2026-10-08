@@ -50,6 +50,83 @@ pub enum PolicyDecision {
     Prompt,
 }
 
+/// What the execute path asks the engine to judge for one request (VUL-05).
+pub(crate) struct AdmissionQuery<'a> {
+    pub credential_alias: &'a str,
+    /// The business action label the requester presented (V8), for
+    /// `ActionMatch`.
+    pub action: &'a str,
+    /// The params that will be dispatched. The engine derives the URL
+    /// ([`policy_url`]) and the method from them.
+    pub params: &'a serde_json::Value,
+    pub principal: Option<&'a Principal>,
+    pub spend: Option<&'a SpendAttempt>,
+}
+
+impl AdmissionQuery<'_> {
+    fn eval_input<'b>(&'b self, url: Option<&'b str>) -> EvalInput<'b> {
+        EvalInput {
+            credential_alias: self.credential_alias,
+            url,
+            method: self.params.get("method").and_then(|v| v.as_str()),
+            action: Some(self.action),
+            principal: self.principal,
+            spend: self.spend,
+        }
+    }
+
+    fn subject(&self) -> Option<crate::formal_kernel::JudgedSubject> {
+        Some(crate::formal_kernel::JudgedSubject::new(
+            self.credential_alias,
+            self.principal.map(|p| p.id.as_str()).unwrap_or_default(),
+            crate::formal_kernel::digest_params(self.params)?,
+        ))
+    }
+}
+
+/// One real policy evaluation of one request, for the execution permit kernel
+/// (VUL-05). The fields are private and only
+/// [`PolicyEngine::evaluate_for_admission`] and
+/// [`PolicyEngine::evaluate_readonly_for_admission`] build it, so the kernel's
+/// admission gate is fed a decision this engine produced, together with what
+/// that decision judged. It is neither `Clone` nor `Default`.
+#[derive(Debug)]
+#[must_use = "an Evaluation is the permit kernel's input; dropping it discards the decision"]
+pub(crate) struct Evaluation {
+    decision: PolicyDecision,
+    observe_downgrade: bool,
+    subject: Option<crate::formal_kernel::JudgedSubject>,
+}
+
+impl Evaluation {
+    pub(crate) fn decision(&self) -> &PolicyDecision {
+        &self.decision
+    }
+
+    /// True only for a Deny that V11 observe mode lets run.
+    pub(crate) fn observe_downgrade(&self) -> bool {
+        self.observe_downgrade
+    }
+
+    pub(crate) fn verdict(&self) -> crate::formal_kernel::Verdict {
+        match self.decision {
+            PolicyDecision::Allow => crate::formal_kernel::Verdict::Allow,
+            PolicyDecision::Deny(_) => crate::formal_kernel::Verdict::Deny,
+            PolicyDecision::Prompt => crate::formal_kernel::Verdict::Prompt,
+        }
+    }
+
+    /// What this evaluation judged; `None` when its params could not be
+    /// serialized.
+    pub(crate) fn subject(&self) -> Option<&crate::formal_kernel::JudgedSubject> {
+        self.subject.as_ref()
+    }
+
+    pub(crate) fn into_subject(self) -> Option<crate::formal_kernel::JudgedSubject> {
+        self.subject
+    }
+}
+
 /// The resolved principal making a request (V4): the presenting key/token id
 /// and an optional agent label. Used to match [`Policy::principal_pattern`] so a
 /// policy (e.g. a per-agent Deny) can target one agent without affecting others
@@ -452,6 +529,46 @@ impl PolicyEngine {
     /// post-approval resume (same semantics as [`Self::evaluate_readonly`]).
     pub fn evaluate_readonly_full(&self, input: &EvalInput) -> PolicyDecision {
         self.evaluate_inner(input, false)
+    }
+
+    /// Evaluate one execute request for the permit kernel (VUL-05), counting
+    /// rate limits like [`Self::evaluate_full`]. The URL and method are taken
+    /// from `query.params` here, so the returned [`Evaluation`] records the
+    /// digest of exactly the params it judged.
+    ///
+    /// `observe_tenant` is the V11 tenant mode. A Deny is marked as an observe
+    /// downgrade only when the tenant is observe-only and the Deny came from
+    /// neither a kill switch nor a SpendCap or RateLimit guard.
+    pub(crate) fn evaluate_for_admission(
+        &self,
+        query: &AdmissionQuery<'_>,
+        observe_tenant: bool,
+    ) -> Evaluation {
+        let url = policy_url(query.params);
+        let input = query.eval_input(url.as_deref());
+        let decision = self.evaluate_full(&input);
+        let observe_downgrade = matches!(decision, PolicyDecision::Deny(_))
+            && observe_tenant
+            && !self.is_halted(&input)
+            && !self.has_resource_guard(&input);
+        Evaluation {
+            decision,
+            observe_downgrade,
+            subject: query.subject(),
+        }
+    }
+
+    /// Read-only evaluation of an approved request at resume, for the permit
+    /// kernel (VUL-05). No rate limit is counted and observe mode never
+    /// applies, so a Deny at resume always refuses.
+    pub(crate) fn evaluate_readonly_for_admission(&self, query: &AdmissionQuery<'_>) -> Evaluation {
+        let url = policy_url(query.params);
+        let input = query.eval_input(url.as_deref());
+        Evaluation {
+            decision: self.evaluate_readonly_full(&input),
+            observe_downgrade: false,
+            subject: query.subject(),
+        }
     }
 
     fn evaluate_inner(&self, input: &EvalInput, record: bool) -> PolicyDecision {

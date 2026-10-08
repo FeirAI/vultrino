@@ -63,7 +63,9 @@ run_harness() {
   echo "run-kani.sh: $path OK ($sat of $total covers satisfied)"
 }
 
-run_harness formal_kernel::kani_proofs::direct_permit_truth_table_is_exact
+run_harness formal_kernel::kani_proofs::admission_gate_truth_table_is_exact
+run_harness formal_kernel::kani_proofs::authorize_accepts_exactly_the_recomputed_binding
+run_harness formal_kernel::kani_proofs::approved_gate_enforces_deny_and_window
 run_harness formal_kernel::kani_proofs::execution_epoch_never_wraps
 run_harness approval::kani_recipe_proofs::zero_approvers_never_satisfy
 run_harness approval::kani_recipe_proofs::satisfaction_never_underfills_a_slot

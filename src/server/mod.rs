@@ -477,6 +477,39 @@ struct ActionPayload {
     evidence_required: bool,
 }
 
+impl crate::formal_kernel::Dispatch for ActionPayload {
+    /// VUL-05: recompute the permit binding from the values this payload will
+    /// dispatch: the plugin and action, the credential alias, the digest of the
+    /// params bytes, and the identity the context carries (approval id and
+    /// claim epoch for an approved execution; the request id and epoch 0 for a
+    /// direct one), tenant and principal. An approved payload without an
+    /// approval identity, or a direct payload carrying one, cannot be bound.
+    fn dispatched_binding(&self) -> Option<crate::formal_kernel::DispatchedBinding> {
+        let context = &self.context;
+        let (approval_id, epoch) = if self.approved_execution {
+            (
+                context.approval_id.clone()?,
+                context.approval_execution_epoch?,
+            )
+        } else {
+            if context.approval_id.is_some() || context.approval_execution_epoch.is_some() {
+                return None;
+            }
+            (format!("direct:{}", context.request_id), 0)
+        };
+        Some(crate::formal_kernel::DispatchedBinding {
+            approved: self.approved_execution,
+            approval_id,
+            epoch,
+            tenant: context.tenant.clone().unwrap_or_default(),
+            principal: context.api_key_id.clone().unwrap_or_default(),
+            credential: self.credential.alias.clone(),
+            action: format!("{}.{}", self.plugin_name, self.action_name),
+            params_digest: crate::formal_kernel::digest_params(&self.params)?,
+        })
+    }
+}
+
 /// Metering attribution captured before `context`/`credential` move into the
 /// plugin request, so the streamed-stream finalizer can emit the V13a/V13b
 /// `meter.observed` events after the stream ends — the same subject/timestamp the
@@ -1454,9 +1487,8 @@ impl VultrinoServer {
         // Evaluate policy (URL / method / rate limits / principal / spend). A
         // `Prompt` decision routes into the approval flow rather than failing.
         // SB-03: the URL policy judges is the canonical URL with the caller's
-        // `query` map merged in, the same string the HTTP plugins send.
-        let policy_url = crate::policy::policy_url(&request.params);
-        let url = policy_url.as_deref();
+        // `query` map merged in, the same string the HTTP plugins send; the
+        // engine derives it from `request.params` (`policy_url`).
         let method = request.params.get("method").and_then(|v| v.as_str());
         // V4: the resolved principal (key/token id + agent label) for
         // principal_pattern matching.
@@ -1477,16 +1509,22 @@ impl VultrinoServer {
             &credential.alias,
             &request.params,
         );
-        let eval_input = crate::policy::EvalInput {
-            credential_alias: &credential.alias,
-            url,
-            method,
-            // The business action label (V8) for the connector ActionMatch dimension.
-            action: Some(request.action.as_str()),
-            principal: principal.as_ref(),
-            spend: spend.as_ref(),
-        };
-        let decision = self.policy_engine.evaluate_full(&eval_input);
+        // VUL-05: the evaluation is the permit kernel's only admission input. It
+        // records what it judged (credential, principal, params digest) and,
+        // for a Deny, whether V11 observe mode lets the request run (never for a
+        // kill switch or a SpendCap/RateLimit guard).
+        let evaluation = self.policy_engine.evaluate_for_admission(
+            &crate::policy::AdmissionQuery {
+                credential_alias: &credential.alias,
+                // The business action label (V8) for the connector ActionMatch dimension.
+                action: request.action.as_str(),
+                params: &request.params,
+                principal: principal.as_ref(),
+                spend: spend.as_ref(),
+            },
+            self.config.tenant_mode(principal_tenant.as_deref())
+                == crate::config::TenantMode::Observe,
+        );
 
         // V12: a dual-control token forces the action through the approval flow
         // (M-of-N), even when policy would Allow it and the credential doesn't
@@ -1512,7 +1550,7 @@ impl VultrinoServer {
             .map(|m| m.eq_ignore_ascii_case("GET") || m.eq_ignore_ascii_case("HEAD"))
             .unwrap_or(false);
         let mut needs_approval = (exec_auth.force_approval && !is_read_verb) || dual_control;
-        match decision {
+        match evaluation.decision() {
             crate::policy::PolicyDecision::Allow => {}
             crate::policy::PolicyDecision::Deny(reason) => {
                 self.record_unauthorized_attempt();
@@ -1521,12 +1559,10 @@ impl VultrinoServer {
                 // can onboard in observe-only while another enforces on the same
                 // vultrino. NEVER downgraded (security/financial boundaries hold
                 // even in observe): cross-tenant isolation (above), a V6 halt/kill
-                // switch, and SpendCap/RateLimit resource guards.
-                if self.config.tenant_mode(principal_tenant.as_deref())
-                    == crate::config::TenantMode::Observe
-                    && !self.policy_engine.is_halted(&eval_input)
-                    && !self.policy_engine.has_resource_guard(&eval_input)
-                {
+                // switch, and SpendCap/RateLimit resource guards. The engine
+                // decided the downgrade; the permit kernel admits it only as the
+                // explicit `ObservedDeny` kind.
+                if evaluation.observe_downgrade() {
                     warn!(
                         tenant = ?principal_tenant,
                         credential = %credential.alias,
@@ -1561,11 +1597,11 @@ impl VultrinoServer {
                         &credential.alias,
                         &full_action,
                         principal_tenant.as_deref(),
-                        &reason,
+                        reason,
                         "policy",
                     )
                     .await;
-                    return Err(VultrinoError::PolicyDenied(reason));
+                    return Err(VultrinoError::PolicyDenied(reason.clone()));
                 }
             }
             crate::policy::PolicyDecision::Prompt => {
@@ -1621,7 +1657,17 @@ impl VultrinoServer {
         let trusted_irreversible = irreversibility.trusted_human_floor();
         let evidence_required = irreversibility.requires_committed_evidence();
 
-        if needs_approval {
+        // VUL-05: the pure admission gate decides between direct execution,
+        // human approval and refusal from the evaluation and `needs_approval`.
+        // A Prompt or any approval requirement routes to approval; an enforced
+        // Deny (already returned above) is refused again here; only Allow, or
+        // a Deny that observe mode downgraded, yields the witness that mints a
+        // direct permit below.
+        let admission = crate::formal_kernel::admit(evaluation, needs_approval);
+        if matches!(
+            admission,
+            Err(crate::formal_kernel::PermitError::ApprovalRequired)
+        ) {
             if !self.approval_config.enabled {
                 return Err(VultrinoError::PolicyDenied(
                     "This action requires human approval, but approvals are not enabled on this \
@@ -1869,31 +1915,17 @@ impl VultrinoServer {
         // `run_action_streaming` (via `execute_gated_streaming`). The use token is
         // NOT consumed here; the tail reserves it fail-closed just before the side
         // effect, identical on both paths.
-        let params_bytes = serde_json::to_vec(&request.params).map_err(|_| {
-            VultrinoError::PolicyDenied(
-                "execution parameters could not be bound; nothing ran".to_string(),
-            )
-        })?;
-        let binding = crate::formal_kernel::ExecutionBinding::new(
-            format!("direct:{}", context.request_id),
-            0,
-            principal_tenant.unwrap_or_default(),
-            principal
-                .as_ref()
-                .map(|value| value.id.clone())
-                .unwrap_or_default(),
-            credential.alias.clone(),
-            full_action,
-            crate::formal_kernel::digest_bytes(&params_bytes),
-            crate::formal_kernel::digest_bytes(b"effective-direct/no-approval"),
+        let permit = crate::formal_kernel::ExecutionPermit::direct(
+            Self::direct_admission(admission)?,
+            &context.request_id,
+            principal_tenant.as_deref().unwrap_or_default(),
+            &full_action,
         );
-        let permit = crate::formal_kernel::ExecutionPermit::direct(binding.clone(), true, false)
-            .map_err(|_| {
-                VultrinoError::PolicyDenied(
-                    "the execution permit kernel refused the effective policy decision; nothing ran"
-                        .to_string(),
-                )
-            })?;
+        tracing::debug!(
+            request_id = %context.request_id,
+            admission = ?permit.admission_kind(),
+            "direct execution permit minted"
+        );
         let payload = ActionPayload {
             credential,
             plugin_name: plugin_name.to_string(),
@@ -1906,12 +1938,29 @@ impl VultrinoServer {
             evidence_action: request.action.clone(),
             evidence_required,
         };
-        let authorized = permit.authorize(&binding, payload).map_err(|_| {
+        let authorized = permit.authorize(payload).map_err(|_| {
             VultrinoError::PolicyDenied(
                 "the execution payload did not match its permit; nothing ran".to_string(),
             )
         })?;
         Ok(PreparedAction::Ready(Box::new(authorized)))
+    }
+
+    /// The witness for a direct permit, or the refusal. Reached only after the
+    /// approval branch, so `ApprovalRequired` cannot occur here; it is mapped
+    /// to a refusal all the same.
+    fn direct_admission(
+        admission: Result<
+            crate::formal_kernel::AdmissionWitness,
+            crate::formal_kernel::PermitError,
+        >,
+    ) -> Result<crate::formal_kernel::AdmissionWitness, VultrinoError> {
+        admission.map_err(|reason| {
+            VultrinoError::PolicyDenied(format!(
+                "the execution permit kernel refused the effective policy decision \
+                 ({reason:?}); nothing ran"
+            ))
+        })
     }
 
     /// Execute a request, gating it on human approval when required (buffered).
@@ -3349,9 +3398,6 @@ impl VultrinoServer {
         // double-charge and could spuriously deny an already-approved action. A
         // `Prompt` is already satisfied (the human approved), so only `Deny`
         // blocks; the use token is left unconsumed when it does.
-        let policy_url = crate::policy::policy_url(&approval.params);
-        let url = policy_url.as_deref();
-        let method = approval.params.get("method").and_then(|v| v.as_str());
         // Rebuild the principal (V4) and spend (V3) from the recorded approval so
         // per-agent denies and spend caps are re-evaluated at resume. Spend is
         // checked read-only here (per-action, stateless — it was already checked at
@@ -3400,32 +3446,33 @@ impl VultrinoServer {
         // so no spend attempt is needed. A spend cap *changed* after the approval
         // opened therefore does not re-bind to this in-flight action; an operator
         // who needs to stop such an in-flight approval should push an explicit Deny.
-        if let crate::policy::PolicyDecision::Deny(reason) = self
-            .policy_engine
-            .evaluate_readonly_full(&crate::policy::EvalInput {
-                credential_alias: &credential.alias,
-                url,
-                method,
-                // Re-bind the approved action so an ActionMatch rule re-fires
-                // correctly on resume (the approved action matches its own rule; a
-                // Deny pushed mid-flight still blocks). Present the ORIGINAL business
-                // verb (the action_label the requester presented, e.g. "telegram.send"),
-                // not the resolved canonical plugin action ("http.request"): the
-                // live-path eval at open matched on `request.action` (the label), and a
-                // connector policy's ActionMatch rule is keyed on that business verb.
-                // Using the canonical action here would fall through to default-deny for
-                // every label-mapped action after approval. Dispatch still uses the
-                // canonical `approval.action` (parse_action above).
-                action: Some(
-                    approval
+        // VUL-05: the resume evaluation is also an input to the approved permit
+        // below, which refuses a Deny and a mismatch between what this
+        // evaluation judged and what the grant binds. SB-03: the engine derives
+        // the judged URL from `approval.params` (`policy_url`).
+        let resume_policy =
+            self.policy_engine
+                .evaluate_readonly_for_admission(&crate::policy::AdmissionQuery {
+                    credential_alias: &credential.alias,
+                    params: &approval.params,
+                    // Re-bind the approved action so an ActionMatch rule re-fires
+                    // correctly on resume (the approved action matches its own rule; a
+                    // Deny pushed mid-flight still blocks). Present the ORIGINAL business
+                    // verb (the action_label the requester presented, e.g. "telegram.send"),
+                    // not the resolved canonical plugin action ("http.request"): the
+                    // live-path eval at open matched on `request.action` (the label), and a
+                    // connector policy's ActionMatch rule is keyed on that business verb.
+                    // Using the canonical action here would fall through to default-deny for
+                    // every label-mapped action after approval. Dispatch still uses the
+                    // canonical `approval.action` (parse_action above).
+                    action: approval
                         .action_label
                         .as_deref()
                         .unwrap_or(approval.action.as_str()),
-                ),
-                principal: principal.as_ref(),
-                spend: None,
-            })
-        {
+                    principal: principal.as_ref(),
+                    spend: None,
+                });
+        if let crate::policy::PolicyDecision::Deny(reason) = resume_policy.decision() {
             // R3: a Deny/kill pushed between approval-open and resume re-fires here —
             // one of the more security-relevant enforce-mode denials (operator
             // stopped an in-flight action). Emit the same timestamped DETECT event
@@ -3438,26 +3485,19 @@ impl VultrinoServer {
                 &credential.alias,
                 &approval.action,
                 approval.tenant.as_deref(),
-                &reason,
+                reason,
                 "policy_resume",
             )
             .await;
-            return Err(RunError::terminal(VultrinoError::PolicyDenied(reason)));
+            return Err(RunError::terminal(VultrinoError::PolicyDenied(
+                reason.clone(),
+            )));
         }
 
-        let binding = approval
-            .execution_binding(grant.binding().epoch)
-            .ok_or_else(|| {
-                RunError::terminal(VultrinoError::PolicyDenied(
-                    "approved execution could not be exactly bound; nothing ran".to_string(),
-                ))
-            })?;
         let execution_epoch = grant.binding().epoch;
         let permit = crate::formal_kernel::ExecutionPermit::approved(
-            binding.clone(),
-            true,
-            true,
             grant,
+            resume_policy,
             chrono::Utc::now().timestamp(),
         )
         .map_err(|reason| {
@@ -3500,7 +3540,7 @@ impl VultrinoServer {
                 .unwrap_or_else(|| approval.action.clone()),
             evidence_required,
         };
-        let authorized = permit.authorize(&binding, payload).map_err(|reason| {
+        let authorized = permit.authorize(payload).map_err(|reason| {
             RunError::terminal(VultrinoError::PolicyDenied(format!(
                 "approved execution binding mismatch ({reason:?}); nothing ran"
             )))

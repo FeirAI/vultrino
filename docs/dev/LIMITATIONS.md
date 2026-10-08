@@ -200,6 +200,17 @@ noninterference. Honest scope:
   **1.93** nightly; the production default feature set pulls wasmtime **47**,
   which declares rust-version **1.95**. So Kani does **not** verify the WASM
   plugin host, and a default-features build is outside that proof job.
+- **Permit kernel (`src/formal_kernel.rs`, VUL-05).** A direct permit is minted
+  only from an `AdmissionWitness` that the pure admission gate builds from the
+  policy engine's `Evaluation` of the request, and an approved permit only from
+  the re-derived `Granted` witness plus the resume `Evaluation`. `authorize`
+  recomputes the approval or request id, epoch, tenant, principal, credential
+  alias, canonical action and params digest from the payload and refuses a
+  mismatch. Bounds: the kernel trusts its inputs (which policy matched, whether
+  observe mode applies, whether approval is required); the rule digest is not
+  recomputed from the payload; `run_action` unpacks the payload after
+  `authorize`, and that code is outside the kernel; the params digest is over
+  serde_json bytes of the stored value, not over bytes an approver saw.
 - **Refinement (`formal/check-refinement.sh`)** is a source-shape / choke-point
   gate (execution-binding fields, permit mint sites, WASM ABI-before-copy
   install order, pinned harness inventory, etc.). It catches drift of the
