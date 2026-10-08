@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Policies that contain a `RateLimit` condition (at any depth) must now set `default_action = "deny"`, like `SpendCap`. Config load and the admin API refuse other defaults, because when no other rule matches, an exhausted Allow-`RateLimit` rule falls through to the policy default, which would allow the request under an allow default (or ask for approval under a prompt default). Default deny does not stop another matching allow rule from allowing an over-limit request. Policies already stored in the vault are not re-validated on load, so an existing one keeps its old behaviour until it is re-saved.
+- Docs: the rate-limit examples in the policies guide now put `rate_limit` inside the rule it limits. The earlier examples used a separate allow rule whose only condition was `rate_limit`, which allowed any URL on the credential until the limit was spent. The guide's evaluation order section now describes the kill check and the deny, prompt, allow tiers instead of "first matching rule in written order".
+- Policy precedence is now decided by a lazy tier scan and a verdict-to-decision mapping in `src/policy/precedence.rs`; behaviour is unchanged. The former unreachable tail that returned Allow now denies.
 - Repository identity targets the `FeirAI` GitHub organization (`https://github.com/FeirAI/vultrino`).
 - Documentation install paths and clone URLs updated for the org cut; TLS requirements clarify rustls (no OpenSSL toolchain dependency).
 - Bump Rust toolchain pin to **1.95.0** and wasmtime/wasmtime-wasi to **48.0.4** (RUSTSEC-2026-0314/0315/0316/0321/0322/0323/0324/0325/0326/0327; earlier: RUSTSEC-2026-0188, RUSTSEC-2026-0222).

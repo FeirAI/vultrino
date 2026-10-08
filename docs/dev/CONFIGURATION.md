@@ -193,6 +193,13 @@ policies into the live engine (config-first, never deduped by id).
 top-level condition (not nested), `asset` non-empty, `per_action_max > 0`, and the
 policy must be `default_action = "deny"`.
 
+**RateLimit validation (hard error at load and on the admin API):** a policy that
+contains a `RateLimit` at any depth must be `default_action = "deny"`, because an
+exhausted Allow-`RateLimit` rule falls through to the policy default when no other
+rule matches. Another matching allow rule still allows an over-limit request, so
+put the `RateLimit` inside an `and` with the conditions it limits. Policies
+already stored in the vault are not re-validated on load.
+
 ### `[[spend_extractors]]` — read the amount for a SpendCap (V3)
 
 ```toml

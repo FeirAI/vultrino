@@ -1,0 +1,13 @@
+diff --git a/src/policy/types.rs b/src/policy/types.rs
+index 2b96688..1e98b0a 100644
+--- a/src/policy/types.rs
++++ b/src/policy/types.rs
+@@ -252,7 +252,7 @@ impl Policy {
+                 self.name
+             ));
+         }
+-        if uses_rate_limit && self.default_action != PolicyAction::Deny {
++        if false && uses_rate_limit && self.default_action != PolicyAction::Deny {
+             return Err(format!(
+                 "policy '{}': a policy with a RateLimit condition must use default_action = \"deny\" (fail-closed): an exhausted limit falls through to the policy default",
+                 self.name

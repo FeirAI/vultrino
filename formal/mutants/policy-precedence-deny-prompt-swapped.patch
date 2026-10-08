@@ -1,0 +1,20 @@
+diff --git a/src/policy/precedence.rs b/src/policy/precedence.rs
+index 005ea9b..5b0d36e 100644
+--- a/src/policy/precedence.rs
++++ b/src/policy/precedence.rs
+@@ -65,12 +65,12 @@ pub(crate) fn resolve_precedence(
+     if outcomes.contains(&RuleOutcome::Kill) {
+         return Verdict::Kill;
+     }
+-    if outcomes.contains(&RuleOutcome::Deny) {
+-        return Verdict::Deny;
+-    }
+     if outcomes.contains(&RuleOutcome::Prompt) {
+         return Verdict::Prompt;
+     }
++    if outcomes.contains(&RuleOutcome::Deny) {
++        return Verdict::Deny;
++    }
+     if outcomes.contains(&RuleOutcome::Allow) {
+         return Verdict::Allow;
+     }

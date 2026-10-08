@@ -1,0 +1,15 @@
+diff --git a/src/policy/precedence.rs b/src/policy/precedence.rs
+index 0c73b1d..b339b03 100644
+--- a/src/policy/precedence.rs
++++ b/src/policy/precedence.rs
+@@ -82,9 +82,7 @@ pub(crate) fn decision_for(
+         Verdict::EngineDefaultDeny => PolicyDecision::Deny(
+             "no_policy: no policy matches this credential (default-deny enforcement)".to_string(),
+         ),
+-        Verdict::FailClosedTail => PolicyDecision::Deny(
+-            "denied: policy evaluation reached no decision (fail-closed)".to_string(),
+-        ),
++        Verdict::FailClosedTail => PolicyDecision::Allow,
+     }
+ }
+ 

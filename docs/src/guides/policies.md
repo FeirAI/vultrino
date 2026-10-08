@@ -143,6 +143,17 @@ condition = { rate_limit = { max = 1000, window_secs = 3600 } }
 condition = { rate_limit = { max = 10, window_secs = 1 } }
 ```
 
+Put it inside an `and` with the conditions that scope the access (`url_match`,
+`method_match`, `action_match`) and use that as the condition of an `allow` rule.
+A rule whose only condition is `rate_limit` allows every request on the credential
+until the limit is spent. A policy that contains a `rate_limit` anywhere (including
+inside `and`/`or`/`not`) must use `default_action = "deny"`, which is enforced at
+config load and by the admin API. Once the limit is spent the rule stops matching,
+and the request is decided by the other rules and then the policy defaults, so a
+non-deny default would turn an over-limit request into an allow. Default deny does
+not make every over-limit request a denial: another `allow` rule that matches the
+request, in this policy or another matching policy, still allows it.
+
 ### Spend Cap
 
 Cap the value an agent can spend in a **single call**, in **minor units** (e.g.
@@ -226,14 +237,14 @@ name = "stripe-production"
 credential_pattern = "stripe-live-*"
 default_action = "deny"
 
-# Allow only Stripe API
+# Allow only the Stripe API, at most 100 requests per minute. The rate limit
+# sits inside the same rule: a separate rule whose only condition is rate_limit
+# would allow any URL until the limit is spent.
 [[policies.rules]]
-condition = { url_match = "https://api.stripe.com/*" }
-action = "allow"
-
-# Rate limit to prevent abuse
-[[policies.rules]]
-condition = { rate_limit = { max = 100, window_secs = 60 } }
+condition = { and = [
+  { url_match = "https://api.stripe.com/*" },
+  { rate_limit = { max = 100, window_secs = 60 } }
+]}
 action = "allow"
 ```
 
@@ -285,9 +296,12 @@ name = "ai-agent-safety"
 credential_pattern = "ai-*"
 default_action = "deny"
 
-# Only read operations
+# Only read operations, at most 60 per minute
 [[policies.rules]]
-condition = { method_match = ["GET", "HEAD"] }
+condition = { and = [
+  { method_match = ["GET", "HEAD"] },
+  { rate_limit = { max = 60, window_secs = 60 } }
+]}
 action = "allow"
 
 # Allow POST only to specific safe endpoints
@@ -301,11 +315,6 @@ condition = { and = [
 ]}
 action = "allow"
 
-# Rate limit all requests
-[[policies.rules]]
-condition = { rate_limit = { max = 60, window_secs = 60 } }
-action = "allow"
-
 # Block dangerous operations
 [[policies.rules]]
 condition = { url_match = "https://api.github.com/repos/*/delete" }
@@ -314,13 +323,22 @@ action = "deny"
 
 ## Policy Evaluation Order
 
-1. **RBAC check** — Does the API key have permission?
-2. **Credential scope** — Is the credential in scope for this role?
-3. **Policy match** — Find policies matching the credential alias
-4. **Rule evaluation** — Evaluate rules in order
-5. **Default action** — Apply if no rules matched
+1. **RBAC check**: Does the API key have permission?
+2. **Credential scope**: Is the credential in scope for this role?
+3. **Policy match**: Find policies matching the credential alias (and principal)
+4. **Rule evaluation**: A matching policy with the kill flag denies before any
+   rule is looked at. Otherwise the deny rules of every matching policy are
+   checked first, then the prompt rules, then the allow rules, and the first
+   rule that matches in that order decides.
+5. **Default action**: If no rule matched, a `deny` default of any matching
+   policy wins over `prompt`, and `prompt` over `allow`. If no policy matches the
+   credential, the engine default (`[enforcement] default_action`) applies.
 
-Rules are evaluated in order. First matching rule determines the action.
+The order in which rules and policies are written does not change whether a
+request is allowed, prompted or denied: a deny rule wins over an allow rule
+wherever it is written. Within one tier the order only picks which rule is
+named in the denial reason, or which `rate_limit` is charged (which can change
+the decision for later requests).
 
 ## Debugging Policies
 

@@ -1,0 +1,13 @@
+diff --git a/src/policy/precedence.rs b/src/policy/precedence.rs
+index 0c73b1d..5e8c3da 100644
+--- a/src/policy/precedence.rs
++++ b/src/policy/precedence.rs
+@@ -101,7 +101,7 @@ pub(crate) fn resolve_lazily(
+     policy_defaults: &[PolicyAction],
+     engine_default_deny: bool,
+ ) -> Verdict {
+-    if kill {
++    if false && kill {
+         return resolve_precedence(&[RuleOutcome::Kill], policy_defaults, engine_default_deny);
+     }
+     for tier in [RuleOutcome::Deny, RuleOutcome::Prompt, RuleOutcome::Allow] {
