@@ -316,9 +316,11 @@ The default backend is an **encrypted file vault**:
 - **Cipher:** AES-256-GCM (`crypto/encrypt.rs`; `aes-gcm` 0.11), 32-byte key,
   12-byte nonce per encryption drawn from `rand::rngs::SysRng`, nonce stored
   alongside the ciphertext.
-- **Key derivation:** Argon2 (`Argon2::default()`) over the storage password and a
-  16-byte salt from the same OS CSPRNG; the salt is stored in the file header
-  (cleartext), the key is never stored.
+- **Key derivation:** Argon2id (`derive_key`, 32-byte output) over the storage
+  password and a 16-byte salt from the same OS CSPRNG, with cost parameters
+  (m=19456 KiB, t=2, p=1 for a new vault) stored in the file header as `kdf`; a
+  vault with no `kdf` header uses those same values. The salt is stored in the
+  file header (cleartext), the key is never stored.
 - **On-disk shape:** a JSON file with `version`, `salt`, and an encrypted blob
   holding the cache (credentials, roles, API keys, use tokens, approvals, stored
   policies, and idempotency records; since v7 the signed outbox lives OUTSIDE the

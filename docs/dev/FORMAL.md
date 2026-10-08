@@ -108,6 +108,7 @@ Every claim is bounded; read the last column before citing one.
 | `lean-method-authority` | lean | model-level: composed method is the operator's, caller verbs are rejected | registration validation; plugin behaviour |
 | `lean-startup-refusal` | lean | model-level: web startup requires strict catalog, policy-hash key and valid verifier | whether the Rust code feeds and calls the decision correctly |
 | `lean-approval-recipe-model` | lean | model-level: supported recipes are human-only and non-empty; agent-reviewer recipes are unsatisfiable | execution theorems (separate claim); how sign-offs are derived; the floor theorem follows from the definition of a supported recipe and does not use risk tier, autonomy or irreversibility |
+| `argon2-kdf-known-answer` | test | `derive_key` on argon2 0.6 decrypts AES-GCM blobs sealed under keys argon2 0.5.3 derived for three fixed cases (default cost; non-default cost with a non-ASCII password; empty password with an 8-byte salt); a vault file written by 0.5.3 opens with and without its `kdf` header; a new vault persists m=19456 KiB, t=2, p=1 | only those cases, not every password, salt or cost; the fixtures come from this repository's own 0.5.3 build, not published Argon2 vectors; key equality is inferred from AES-GCM authentication, not compared byte by byte; salts longer than 48 bytes (rejected by 0.5.3, accepted by 0.6) and shorter than 8 bytes are not tested; admin passwords (bcrypt) and API keys (SHA-256) are not covered; not the AES-GCM layer, file format or rekey |
 
 ## Known gaps
 

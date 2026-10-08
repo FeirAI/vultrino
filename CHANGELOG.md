@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- argon2 0.5.3 to 0.6.0. The vault master key is byte-identical: tests/argon2_kat.rs opens vault files and AES-GCM blobs written by 0.5.3 and checks that new vaults persist the same cost parameters. Replaces Dependabot PR #32.
+- argon2 0.5.3 to 0.6.0. In the tested cases the vault master key is unchanged: tests/argon2_kat.rs opens vault files and AES-GCM blobs written by 0.5.3 and checks that new vaults persist the same cost parameters. These are fixed cases, not every password, salt or cost setting. One input now behaves differently: a salt longer than 48 bytes, which 0.5.3 rejected, is accepted; vultrino only creates 16-byte salts. Replaces Dependabot PR #32.
 
 ### Added
 
