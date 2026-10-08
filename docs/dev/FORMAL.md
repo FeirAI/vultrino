@@ -36,8 +36,8 @@ does not bite.
 | `formal-fast` | every push and pull request, required by `ci-required` | kit unit tests, `check_claims.py`, fast-tier mutants |
 | `formal-nightly` | schedule and manual dispatch only | all mutants, including Kani and Lean ones; JSON report kept as an artifact for 90 days |
 
-Fast-tier detectors run one exact test name with `--no-default-features`, so they
-do not build wasmtime. Kani and Lean mutants are full tier because they need those
+Fast-tier detectors run a fixed list of exact test names (`--exact`) with
+`--no-default-features`, so they do not build wasmtime. Kani and Lean mutants are full tier because they need those
 toolchains.
 
 Only a CI run counts as evidence for a claim. Local runs are informative only.
@@ -76,10 +76,10 @@ Every claim is bounded; read the last column before citing one.
 
 | Claim | Method | What it checks | Does NOT establish |
 |---|---|---|---|
-| `permit-kernel-tests` | test | `ExecutionPermit::direct` refuses denial and approval-required; `authorize` binds to the exact binding | not `approved`, not that every dispatch site uses a permit; two example tests |
-| `kani-permit-kernel` | kani | `direct` truth table and `next_epoch` no-wrap, exhaustive over their inputs | vacuity gate lives in `run-kani.sh`; pure functions only; nothing under `wasm-plugins` |
+| `permit-kernel-tests` | test | `ExecutionPermit::direct` refuses denial and approval-required; `authorize` refuses a binding with a different action | not `approved`, not that every dispatch site uses a permit; only the action field is substituted; two example tests |
+| `kani-permit-kernel` | kani | `direct` truth table over both boolean inputs (one fixed binding) and `next_epoch` no-wrap over every `u64` | vacuity gate lives in `run-kani.sh`; pure functions only; nothing under `wasm-plugins` |
 | `recipe-unit-tests` | test | agent-reviewer terms unsatisfiable, over-cap counts unsatisfiable, one key cannot fabricate slots | other recipe shapes, sign-off collection, agreement with govder |
-| `kani-recipe-safety` | kani | no satisfaction with zero approvers, no underfill, malformed never satisfied, cap prevents overflow | recipes beyond 3 terms or the harness bounds; separation of duties |
+| `kani-recipe-safety` | kani | symbolic three-term recipes plus fixed malformed shapes: no satisfaction with zero approvers, no underfill, malformed never satisfied, cap prevents overflow | recipes beyond 3 terms or the harness bounds; separation of duties |
 | `kani-recipe-greedy` | kani | greedy assignment equals exhaustive search at bound 5, monotone, slot contribution agrees | counts beyond bound 5; reference written in the same module |
 | `ssrf-special-purpose` | test | special-purpose IPv4/IPv6 table edges blocked, neighbours reachable, embedded IPv4 decoded | exhaustive address space; hand-copied registry rows; constants are not drift-locked; DNS rebinding |
 | `policy-refresh-ordering` | test | a stale refresh cannot overwrite a newer admin reload (async load lock plus ticket compare) in one scripted interleaving | all schedules; cross-process visibility is bounded-staleness; ticket compare alone is not tested |
@@ -87,11 +87,21 @@ Every claim is bounded; read the last column before citing one.
 | `sb02-minted-scrub` | test | credentials minted during an action are scrubbed or the response withheld, buffered and streamed | other encodings and types; server dispatch code is not drift-locked; plugin error-path residual |
 | `sb04-approval-key` | test | verified approver decisions need a dedicated key distinct from the shared govder key | route-level 403 is outside the detector; key strength and distribution |
 | `refinement-structural` | test | source-shape checks only: binding field list equals the Lean field list, seams and strings present | semantic refinement; it greps strings and counts call sites |
-| `lean-approval-execution` | lean | model-level: reachable executions are authorized and approval bindings are consumed once | the Rust code; the model is hand-written; nanoda check is not in the detector |
+| `lean-approval-execution` | lean | model-level: reachable executions are authorized and the consumed-binding list has no duplicates | the Rust code; the model is hand-written; nanoda check is not in the detector; only `ExecutionSafety.lean` is registered |
 
 ## Known gaps
 
 - No fuzz targets or TLA+ models exist in this repository, so none are registered.
+- Existing evidence that is not registered yet: the Lean modules
+  `Approval/Authority.lean`, `Approval/ActionAuthority.lean`,
+  `Approval/Criticality.lean`, `Credentials/Confinement.lean`,
+  `Action/MethodAuthority.lean`, `Configuration/Startup.lean` and the theorems in
+  `Approval/Model.lean` (all model-level); the close-out SSRF tests
+  `test_llm_validate_ssrf_narrowed_to_link_local` (config-time `llm.provider_base`
+  check) and `internal_address_space_is_an_allowlist_and_excludes_metadata`
+  (`internal_http` allowlist); and the second refresh race test
+  `test_refresh_taking_ticket_first_still_applies_cross_process_kill_policy`.
+  They still run in CI, but no claim, drift lock or mutant covers them.
 - The Kani vacuity (cover) gate is enforced by `formal/run-kani.sh` in the `kani`
   job, not by the mutation detectors.
 - The phrase list in `overclaim_denylist` is seeded from claim styles this

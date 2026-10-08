@@ -1,0 +1,13 @@
+diff --git a/formal/lean/Vultrino/Approval/ExecutionSafety.lean b/formal/lean/Vultrino/Approval/ExecutionSafety.lean
+index f613ee4..c3ed195 100644
+--- a/formal/lean/Vultrino/Approval/ExecutionSafety.lean
++++ b/formal/lean/Vultrino/Approval/ExecutionSafety.lean
+@@ -57,7 +57,7 @@ def Execution.approvalBinding (execution : Execution) : Option RequestBinding :=
+ def State.canExecute (state : State) (execution : Execution) : Prop :=
+   match execution.approvalBinding with
+   | none => True
+-  | some binding => binding ∉ state.consumedApprovalBindings
++  | some binding => binding ∉ state.consumedApprovalBindings ∨ True
+ 
+ def State.afterExecute (state : State) (execution : Execution) : State :=
+   { executions := execution :: state.executions

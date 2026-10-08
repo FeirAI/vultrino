@@ -19,7 +19,9 @@
       "verified implementation",
       "cannot leak",
       "unbreakable",
-      "tamper-proof"
+      "tamper-proof",
+      "refinement gate prove",
+      "gates prove enforcement"
     ],
     "globs": [
       "README.md",
@@ -81,14 +83,14 @@
     "refinement-binding-field-dropped": {
       "tier": "fast"
     },
-    "lean-approval-binding-not-consumed": {
+    "lean-approval-freshness-check-dropped": {
       "tier": "full"
     }
   },
   "claims": [
     {
       "id": "permit-kernel-tests",
-      "statement": "The execution-permit constructor for the direct path refuses a policy denial and refuses an approval-required request, and a permit authorizes only the exact execution binding it was minted for, in the unit tests that exercise those two functions.",
+      "statement": "The execution-permit constructor for the direct path refuses a policy denial and refuses an approval-required request, and a permit refuses a dispatch binding whose action differs from the one it was minted for, in the unit tests that exercise those two functions.",
       "method": "test",
       "artifacts": [
         "src/formal_kernel.rs"
@@ -113,7 +115,7 @@
         "permit-direct-skips-approval-check",
         "permit-authorize-skips-binding-check"
       ],
-      "does_not_establish": "Two example-based tests, not a proof. Says nothing about ExecutionPermit::approved, about the grant evidence it consumes, or about whether every dispatch site goes through a permit (the structural refinement gate checks only the dispatch seam count)."
+      "does_not_establish": "Two example-based tests, not a proof. The binding test substitutes only the action field; a comparison that ignored another binding field would not be caught here. Says nothing about ExecutionPermit::approved, about the grant evidence it consumes, or about whether every dispatch site goes through a permit (the structural refinement gate checks only the dispatch seam count)."
     },
     {
       "id": "kani-permit-kernel",
@@ -185,7 +187,7 @@
     },
     {
       "id": "kani-recipe-safety",
-      "statement": "Kani bounded model checking (0.67.0) over recipes of exactly three terms with a 4-iteration unwind shows: no recipe is satisfied with zero approvers, satisfaction never underfills a slot, malformed recipes are never satisfied, and the per-term cap prevents slot-need overflow.",
+      "statement": "Kani bounded model checking (0.67.0) over symbolic three-term recipes (4-iteration unwind), plus fixed empty, one-term and two-term malformed shapes in the malformed-recipe harness, shows: no recipe is satisfied with zero approvers, satisfaction never underfills a slot, malformed recipes are never satisfied, and the per-term cap prevents slot-need overflow.",
       "method": "kani",
       "artifacts": [
         "src/approval/mod.rs",
@@ -271,6 +273,16 @@
         },
         {
           "path": "src/plugins/http.rs",
+          "symbol": "HttpPlugin::is_ipv4_mapped_private",
+          "sha256": "cf4b1cf92f6d471214f62e7c80181974954e4bac29f0c7cf828646acf4bd7cc6"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "embedded_v4",
+          "sha256": "f50176eebcbbbb35965b08611771b248761ac3bc9536c17d2a68eb19aa7ae87d"
+        },
+        {
+          "path": "src/plugins/http.rs",
           "symbol": "ipv4_is_special_purpose",
           "sha256": "0af5036785f3f5a60f4bba5e625e14f11f2a35d5a03ad9be1b006b2acd6f2566"
         },
@@ -298,7 +310,7 @@
     },
     {
       "id": "policy-refresh-ordering",
-      "statement": "A periodic policy refresh that has already listed stored policies cannot overwrite a newer admin reload that carries a kill policy: both load paths take one in-process async load lock across ticket, vault re-read, list and apply (with a ticket compare as a second guard), in a deterministic interleaving test that starts an admin write and reload inside the refresh window and checks the admin reload waits and the kill policy survives.",
+      "statement": "A periodic policy refresh that has already listed stored policies cannot overwrite a newer admin reload that carries a kill policy: both load paths take one in-process async load lock across ticket, vault re-read, list and apply (with a ticket compare as a second guard), in a scripted interleaving test that starts an admin write and reload inside the refresh window, waits 150 ms, and checks the admin reload has not finished and the kill policy survives.",
       "method": "test",
       "artifacts": [
         "src/policy/mod.rs",
@@ -327,6 +339,11 @@
         },
         {
           "path": "src/server/mod.rs",
+          "symbol": "refresh_policies_once",
+          "sha256": "2e4d9abf5d5f703460882ac66e3e39564368255aec7172ade19dcd2b92ed6c17"
+        },
+        {
+          "path": "src/server/mod.rs",
           "symbol": "refresh_policies_after_list",
           "sha256": "56adab1ff5935cdd86ee64c332772103600a834ebd3c0809e7a94a727ef28697"
         },
@@ -345,7 +362,7 @@
         "refresh-stale-load-overwrites-newer",
         "refresh-load-lock-removed"
       ],
-      "does_not_establish": "One scripted interleaving, not a model of all schedules. The lock is per process: another process's write becomes visible only on the next refresh tick, so cross-process visibility is bounded-staleness, not instant. Removing only the ticket compare (the second guard) is not detected by this test. Does not cover other policy load paths that call load_policies directly (construction and tests) or a lost write in storage itself."
+      "does_not_establish": "One scripted interleaving, not a model of all schedules. The wait check relies on a 150 ms sleep: on a very slow machine a mutant could survive, but the unmutated code cannot fail it, because the admin reload is blocked on the lock. The lock is per process: another process's write becomes visible only on the next refresh tick, so cross-process visibility is bounded-staleness, not instant. Removing only the ticket compare (the second guard) is not detected by this test. Does not cover other policy load paths that call load_policies directly (construction and tests) or a lost write in storage itself."
     },
     {
       "id": "rate-limiter-vectors",
@@ -484,9 +501,9 @@
         }
       ],
       "mutants": [
-        "lean-approval-binding-not-consumed"
+        "lean-approval-freshness-check-dropped"
       ],
-      "does_not_establish": "A property of the Lean model, not of the Rust code: the model is hand-written and not extracted from Rust, and the link is the structural refinement gate only. The detector runs lake build, not the independent nanda check that CI also runs. Only ExecutionSafety.lean is drift-locked, not Model.lean that it imports."
+      "does_not_establish": "A property of the Lean model, not of the Rust code: the model is hand-written and not extracted from Rust, and the link is the structural refinement gate only. The detector runs lake build, not the independent nanda check that CI also runs. Only ExecutionSafety.lean is drift-locked, not Model.lean that it imports. The one-shot theorem is stated over the consumed-binding list: it means at most one execution per approval binding only together with State.afterExecute recording every approved binding (a model change that stopped recording would keep the theorem true)."
     }
   ]
 }
