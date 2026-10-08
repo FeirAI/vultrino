@@ -159,7 +159,10 @@ impl HmacPlugin {
         };
 
         // Validate URL
-        let validated_url = Self::validate_url_ssrf(&params.url)?;
+        // SB-03: send the canonical URL that policy evaluated.
+        let send_url =
+            crate::policy::canonical_url(&params.url).unwrap_or_else(|| params.url.clone());
+        let validated_url = Self::validate_url_ssrf(&send_url)?;
 
         // Parse method
         let method = Method::from_str(&params.method.to_uppercase()).map_err(|_| {

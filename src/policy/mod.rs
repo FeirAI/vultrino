@@ -9,6 +9,9 @@
 
 mod precedence;
 mod types;
+mod url_canon;
+
+pub use url_canon::{canonical_pattern, canonical_url, PatternWarning};
 
 pub use types::*;
 
@@ -21,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use url_canon::url_matches;
 
 /// Policy-related errors
 #[derive(Error, Debug)]
@@ -266,6 +270,7 @@ impl PolicyEngine {
 
     /// Add a policy
     pub fn add_policy(&self, policy: Policy) {
+        warn_url_patterns(&policy);
         let mut policies = self.policies.write();
         policies.push(policy);
     }
@@ -312,6 +317,7 @@ impl PolicyEngine {
             return false;
         }
         *applied = ticket;
+        policies.iter().for_each(warn_url_patterns);
         let mut p = self.policies.write();
         *p = policies;
         true
@@ -321,6 +327,7 @@ impl PolicyEngine {
     /// in tests). Runtime reloads from storage use [`Self::begin_load`] and
     /// [`Self::load_policies_if_newer`] instead.
     pub fn load_policies(&self, policies: Vec<Policy>) {
+        policies.iter().for_each(warn_url_patterns);
         let mut p = self.policies.write();
         *p = policies;
     }
@@ -458,6 +465,27 @@ impl PolicyEngine {
                     && principal_matches(p.principal_pattern.as_deref(), input.principal)
             })
             .collect();
+
+        // SB-03: a URL that cannot be canonicalised never matches an Allow rule
+        // (see `evaluate_condition`) and is denied outright when a matching
+        // policy has a URL-sensitive Deny rule: a `UrlMatch` under a Deny rule,
+        // or under a `Not` in any rule. Otherwise an unparseable spelling could
+        // slip past the very rule written to stop it.
+        if let Some(raw) = input.url {
+            if canonical_url(raw).is_none() {
+                if let Some(p) = matching_policies.iter().find(|p| {
+                    p.rules.iter().any(|r| {
+                        (r.action == PolicyAction::Deny && contains_url_match(&r.condition))
+                            || contains_negated_url_match(&r.condition, false)
+                    })
+                }) {
+                    return PolicyDecision::Deny(format!(
+                        "policy '{}': request URL cannot be canonicalised and the policy has a URL deny rule",
+                        p.name
+                    ));
+                }
+            }
+        }
 
         // The tier order and the verdict-to-decision mapping live in
         // `precedence.rs` (`resolve_lazily`, `decision_for`), which is where they
@@ -775,6 +803,59 @@ fn principal_matches(pattern: Option<&str>, principal: Option<&Principal>) -> bo
     }
 }
 
+/// Whether a condition contains a `UrlMatch` at any depth.
+fn contains_url_match(c: &PolicyCondition) -> bool {
+    match c {
+        PolicyCondition::UrlMatch(_) => true,
+        PolicyCondition::And(v) | PolicyCondition::Or(v) => v.iter().any(contains_url_match),
+        PolicyCondition::Not(b) => contains_url_match(b),
+        _ => false,
+    }
+}
+
+/// Whether a `UrlMatch` sits under an odd number of `Not`s (so "no match"
+/// would make the rule fire).
+fn contains_negated_url_match(c: &PolicyCondition, negated: bool) -> bool {
+    match c {
+        PolicyCondition::UrlMatch(_) => negated,
+        PolicyCondition::And(v) | PolicyCondition::Or(v) => {
+            v.iter().any(|x| contains_negated_url_match(x, negated))
+        }
+        PolicyCondition::Not(b) => contains_negated_url_match(b, !negated),
+        _ => false,
+    }
+}
+
+/// Log a WARNING for each `UrlMatch` pattern whose canonical form changes its
+/// meaning or that is risky (host wildcard, `*` right after the host). These
+/// are refused in a future release.
+fn warn_url_patterns(policy: &Policy) {
+    fn walk(c: &PolicyCondition, policy: &Policy) {
+        match c {
+            PolicyCondition::UrlMatch(p) => {
+                let canon = canonical_pattern(p);
+                for w in &canon.warnings {
+                    tracing::warn!(
+                        policy = %policy.name,
+                        pattern = %p,
+                        canonical = %canon.text,
+                        warning = ?w,
+                        "url_match pattern is risky or changes meaning under canonical matching; it will be refused in a future release"
+                    );
+                }
+            }
+            PolicyCondition::And(v) | PolicyCondition::Or(v) => {
+                v.iter().for_each(|x| walk(x, policy))
+            }
+            PolicyCondition::Not(b) => walk(b, policy),
+            _ => {}
+        }
+    }
+    for r in &policy.rules {
+        walk(&r.condition, policy);
+    }
+}
+
 /// Extracts a [`SpendAttempt`] from a request's params for `SpendCap` evaluation
 /// (V3). Matched by action + credential globs; reads the amount from a JSON
 /// pointer (an integer in minor units) and the asset from a literal or a second
@@ -829,17 +910,6 @@ pub fn extract_spend(
         .iter()
         .find(|e| e.matches(action, credential_alias))
         .and_then(|e| e.extract(params))
-}
-
-/// Check if a URL matches a pattern
-fn url_matches(url: &str, pattern: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        url.starts_with(prefix)
-    } else if let Ok(glob) = Pattern::new(pattern) {
-        glob.matches(url)
-    } else {
-        url == pattern
-    }
 }
 
 #[cfg(test)]

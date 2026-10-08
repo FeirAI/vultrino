@@ -845,8 +845,18 @@ impl HttpPlugin {
             params.url = Self::substitute_url_token(&params.url, token)?;
         }
 
+        // SB-03: send the SAME canonical URL that policy evaluated
+        // (`crate::policy::canonical_url`). A UrlToken URL is excluded: its path
+        // now carries the secret, which must not be rewritten (policy judged
+        // the placeholder form, whose host and scheme `substitute_url_token`
+        // pinned above).
+        let send_url = match cred_data {
+            CredentialData::UrlToken { .. } => params.url.clone(),
+            _ => crate::policy::canonical_url(&params.url).unwrap_or_else(|| params.url.clone()),
+        };
+
         // Validate URL for SSRF before proceeding
-        let mut validated_url = Self::validate_url_ssrf(&params.url)?;
+        let mut validated_url = Self::validate_url_ssrf(&send_url)?;
 
         // Parse method
         let method = Method::from_str(&params.method.to_uppercase()).map_err(|_| {
@@ -1437,6 +1447,32 @@ mod tests {
         assert_eq!(request.url().host_str(), Some("api.telegram.org"));
         // No auth header — the secret lives only in the URL for this credential type.
         assert!(request.headers().get("Authorization").is_none());
+    }
+
+    /// SB-03: the URL that is sent is the canonical URL policy evaluated.
+    #[tokio::test]
+    async fn test_prepare_request_sends_the_canonical_url() {
+        let plugin = HttpPlugin::new();
+        let cred_data = CredentialData::ApiKey {
+            key: Secret::new("k"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        };
+        let params = HttpRequestParams {
+            method: "GET".to_string(),
+            url: "HTTPS://Api.Example.com:443/a/../%76%31?q=%7e#frag".to_string(),
+            headers: HashMap::new(),
+            query: HashMap::new(),
+            body: None,
+        };
+        let raw = params.url.clone();
+        let (b, _) = plugin.prepare_request(params, &cred_data).await.unwrap();
+        let request = b.build().unwrap();
+        assert_eq!(request.url().as_str(), "https://api.example.com/v1?q=~");
+        assert_eq!(
+            crate::policy::canonical_url(&raw).as_deref(),
+            Some(request.url().as_str())
+        );
     }
 
     #[tokio::test]
