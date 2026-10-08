@@ -1,0 +1,13 @@
+diff --git a/formal/lean/Vultrino/Approval/ExecutionSafety.lean b/formal/lean/Vultrino/Approval/ExecutionSafety.lean
+index f613ee4..ba13539 100644
+--- a/formal/lean/Vultrino/Approval/ExecutionSafety.lean
++++ b/formal/lean/Vultrino/Approval/ExecutionSafety.lean
+@@ -64,7 +64,7 @@ def State.afterExecute (state : State) (execution : Execution) : State :=
+     consumedApprovalBindings :=
+       match execution.approvalBinding with
+       | none => state.consumedApprovalBindings
+-      | some binding => binding :: state.consumedApprovalBindings }
++      | some _ => state.consumedApprovalBindings }
+ 
+ /--
+ The only transition that appends a side effect requires an `ExecutionPermit`.

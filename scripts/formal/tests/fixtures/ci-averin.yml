@@ -1,0 +1,880 @@
+name: ci
+
+# The Rust version is pinned in rust-toolchain.toml (1.92.0 + wasm32/i686 targets + rustfmt/clippy). cargo
+# honors that file in every job below regardless of which toolchain the setup action installs, so the
+# reproducible verifier .wasm digest and the CI build share one source of truth. Bump it there, not here.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  schedule:
+    # Weekly (Sunday): the whole Kani string family and the larger fuzz campaign.
+    - cron: '17 3 * * 0'
+    # Nightly: the full 48-mutant suite (formal-mutants-full).
+    - cron: '41 2 * * *'
+  workflow_dispatch:
+
+# Every third-party action is pinned by full commit SHA (the tag it resolved to in the trailing
+# comment; last resolved 2026-10-08). Bump by resolving the new tag's commit, never by writing a tag.
+#
+# Required on pull requests: the single aggregator check `ci-required` at the end of this file, which
+# needs every job that runs on a pull request. Jobs that run only on the schedule or on manual
+# dispatch (the Kani string family slices, formal-mutants-full) are outside it; a failure there turns
+# the scheduled run on main red, which main-health.yml reports as an issue.
+#
+# Evidence: every formal job writes its log (and any Kani shard state) to $RUNNER_TEMP/evidence,
+# closes it with scripts/ci-evidence.sh (MANIFEST.txt with commit, run, tool versions, SHA-256 of
+# every file) and uploads it as an artifact retained 90 days (formal/README.md, "Evidence of record").
+# The PR head commit (the checkout on a pull request is a synthetic merge commit); empty off pull requests.
+env:
+  PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+jobs:
+  fuzz:
+    name: deterministic RCP fuzz (native C ABI + WASM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: 1.92.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+      - name: bounded pull-request or larger weekly campaign
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          bash formal/run-fuzz.sh ${{ github.event.schedule == '17 3 * * 0' && 'scheduled' || 'pr' }} 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-fuzz
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  core:
+    name: rust decision-core (golden vectors + adversarial fixtures)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test (golden vectors are the acceptance gate)
+        run: cargo test
+      - name: test rfc3161 + mini-TSA (real RFC 3161 token verify)
+        run: cargo test --features test-tsa
+      - name: build verify CLI
+        run: cargo build --release --bin averin-verify
+      - name: build verify CLI WITH rfc3161 (shippable real-TSA verifier stays green)
+        run: cargo build --release --bin averin-verify --features rfc3161
+
+  core-32bit:
+    name: rust decision-core on 32-bit (usize=u32, wasm32 truncation gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+          targets: i686-unknown-linux-gnu
+      # Distinct prefix so this job never shares a cache key with the host-target `core` job
+      # (Swatinem also hashes targets; prefix is belt-and-suspenders for the cross-compile case).
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: core-32bit
+      # i686 has usize == u32, exactly like the shipped wasm32 verifier. Running the FULL adversarial suite
+      # here makes the 32-bit-truncation regression tests load-bearing in CI — chiefly the cosig
+      # `tier_b_cosig_threshold_above_u32_is_not_truncated` and the bounded_reuse use_limit cases, where an
+      # `i64 as usize` would deflate a signed threshold/limit and fail OPEN on a 32-bit verdict but pass on
+      # 64-bit. wasm32-unknown-unknown can't run std `#[test]` without wasm-bindgen (which the core avoids),
+      # so i686 is the practical native stand-in for the same usize width.
+      # An apt mirror can hang (2026-10-07: this step and the opam step below sat for over an hour).
+      # Bound each attempt and retry instead of waiting out the job limit.
+      - name: install 32-bit linker (multilib)
+        run: |
+          for attempt in 1 2 3; do
+            sudo timeout 300 apt-get update && sudo timeout 600 apt-get install -y gcc-multilib && exit 0
+            echo "apt attempt $attempt failed or timed out; retrying" >&2
+            sleep 20
+          done
+          exit 1
+      - name: test on i686 (32-bit usize)
+        run: cargo test --target i686-unknown-linux-gnu
+
+  server:
+    name: go server (cgo -> rust core; ingestion + verify pipeline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25.13'
+      - name: build rust staticlib (cgo links it)
+        run: cargo build -p averin-decision-core --features rfc3161
+      - name: stale-staticlib guard (the cgo lib must match current core source, never a stale trust root)
+        run: ./scripts/check-staticlib-fresh.sh
+      - name: go vet + test
+        working-directory: server
+        run: |
+          go vet ./...
+          go test ./...
+      - name: govulncheck (Go stdlib + module CVE scan; cgo needs the staticlib built above)
+        working-directory: server
+        run: |
+          # Pinned deliberately (was @latest — the only unpinned tool install across the five repos).
+          # Bump on a schedule when reviewing supply-chain CI; do not float back to @latest.
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+  store-postgres:
+    name: Postgres API races + store parity + durable state (real Postgres, non-owner role)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        # Wait until Postgres accepts connections before the test step runs.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25.13'
+      - name: build native RFC 3161 rust staticlib for cgo API tests
+        run: cargo build -p averin-decision-core --features rfc3161
+      - name: reject stale cgo staticlib
+        run: ./scripts/check-staticlib-fresh.sh
+      # Setting AVERIN_TEST_DATABASE_URL un-skips the Postgres tests: the SAME exercise*(t, Store) contract
+      # helpers that TestMem* run now also run against real Postgres (parity), and
+      # TestPostgresAppendOnlyRejectsMutation proves UPDATE/DELETE/TRUNCATE are rejected (SQLSTATE 42501)
+      # under a freshly-created non-owner least-privilege role — the deployment topology the append-only
+      # claim depends on, exercised end to end. The superuser `postgres` role can CREATE ROLE for that test.
+      # pgdurable is INCLUDED here too: it is the durable-revocation + two-phase-grant store whose own doc
+      # calls a lost revoke "a fail-open — the verifier would then accept a grant an operator believed was
+      # blocked", and TestPutPendingConflictReturnsWinningRow arbitrates multi-replica pending-grant races.
+      # Its Postgres tests self-skip without a DSN. API durable and pgschema test helpers append
+      # `&search_path`, so the CI DSN includes an initial `?sslmode=disable` query parameter.
+      - name: self-test required Go event gate
+        run: python3 -m unittest discover -s scripts -p test_check_go_test_events.py
+      - name: API races + store + pgdurable against real Postgres
+        working-directory: server
+        env:
+          AVERIN_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+        run: |
+          set -o pipefail
+          : "${AVERIN_TEST_DATABASE_URL:?Postgres DSN is required for the API race gate}"
+          go test -json -count=1 ./internal/api/... ./internal/store/... ./internal/pgledger/... ./internal/pgdurable/... ./internal/pgschema/... ./internal/resourceshim/... | tee "${RUNNER_TEMP}/averin-go-events.json" | python3 ../scripts/check-go-test-events.py
+      - name: save Go test events on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: postgres-go-test-events
+          path: ${{ runner.temp }}/averin-go-events.json
+
+  web:
+    name: web app (svelte build + trace unit tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install --frozen-lockfile
+      - run: bun run test
+      - run: bun run build
+
+  sdk:
+    name: typescript sdk (test + typecheck)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run typecheck
+
+  verifier:
+    name: "offline verifier (trust-root tests: NUL-truncation, supply-chain pin, accountability)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      # build.sh builds the wasm + self-pins index.html/sidecar to THIS build (wasm32 bytes are host-specific,
+      # so the committed dev-host pin is re-derived here rather than asserted — see verifier/SUPPLY-CHAIN.md).
+      - name: build wasm + self-pin
+        run: ./verifier/build.sh
+      - name: verifier tests
+        working-directory: verifier
+        run: bun test
+
+  wasm:
+    name: "wasm build (verifier skew gate: same core, byte-for-byte)"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: build wasm (same C ABI as cgo; no wasm-bindgen, RNG-free)
+        run: cargo build --release --target wasm32-unknown-unknown --lib --no-default-features
+
+  supply-chain:
+    name: "supply chain (cargo-deny: advisories, licenses, sources, bans)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Scans Cargo.lock for known-vulnerable/yanked crates, non-permissive licenses, and any dependency
+      # not from crates.io — a defense for the Rust integrity core (the trust root). Policy: deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses sources bans
+
+  formal-lean:
+    name: "formal: Lean seal/canon/DAG/chain proofs (no sorry, standard axioms only)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: leanprover/lean-action@f061402b660e0c34644504b324e830f2991d4865 # v1.6.1
+        with:
+          lake-package-directory: formal/lean
+          auto-config: false
+          build: true
+          build-args: --wfail
+          test: false
+          lint: false
+          use-mathlib-cache: false
+      - name: headline theorems depend only on propext / Classical.choice / Quot.sound; no escape hatch
+        working-directory: formal/lean
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          { bash ./check-axioms.sh --self-test && bash ./check-axioms.sh; } 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-lean
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  formal-refinement:
+    name: "formal: Rust ↔ Lean refinement gate (executable Lean oracle + tag inventory)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: validate claim references and required CI gates
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          { python3 -m unittest discover -s scripts -p test_check_claims.py && python3 scripts/check-claims.py; } 2>&1 | tee "$RUNNER_TEMP/evidence/claims.log"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: leanprover/lean-action@f061402b660e0c34644504b324e830f2991d4865 # v1.6.1
+        with:
+          lake-package-directory: formal/lean
+          auto-config: false
+          build: false
+          test: false
+          lint: false
+          use-mathlib-cache: false
+      - name: tag inventory (every Rust domain tag is a Lean family, and vice versa)
+        run: |
+          set -o pipefail
+          python3 formal/check-refinement.py 2>&1 | tee "$RUNNER_TEMP/evidence/inventory.log"
+      - name: build the executable Lean oracle
+        working-directory: formal/lean
+        run: lake build --wfail oracle verdict_oracle
+      - name: regenerate expected.json from the model; the committed file must be its exact output
+        working-directory: formal/lean
+        run: |
+          lake exe oracle ../oracle/inputs.json ../oracle/expected.json
+          git diff --exit-code -- ../oracle/expected.json
+          lake exe verdict_oracle ../oracle/verdict-expected.json
+          git diff --exit-code -- ../oracle/verdict-expected.json
+      - name: Rust produces the model's bytes (canon, escapes, framing, every preimage family)
+        run: |
+          set -o pipefail
+          cargo test -p averin-decision-core --test oracle 2>&1 | tee "$RUNNER_TEMP/evidence/oracle.log"
+      - name: Rust verdict kernel matches the Lean evidence oracle
+        # cargo passes a name filter that matches nothing, so require that the test actually ran.
+        run: |
+          set -o pipefail
+          python3 scripts/check-test-count.py --self-test
+          cargo test -p averin-decision-core --lib verdict_differential 2>&1 | tee "$RUNNER_TEMP/evidence/verdict.log" | python3 scripts/check-test-count.py --min 1
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-refinement
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  # Mutation suite, fast tier (required on every pull request). Every Kani-detected mutant (m2-m4,
+  # m9-m13, m22-m25) must be refuted by its named harness's own counterexample, and a native subset
+  # covers every other detector family (inventory, oracle, golden, verdict, adversarial, temporal,
+  # the toolchain-free production checks). The production-proof detector (m50, m54-m58 and the
+  # parser mutants m60-m64) runs in formal-production. Each shard runs the unmutated baseline of
+  # exactly its own gates and harnesses first. The full 48 run nightly in formal-mutants-full.
+  formal-mutants-fast:
+    name: "formal: mutation suite, fast tier (${{ matrix.shard }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: native
+            skip_kani: '1'
+            mutants: m1-authority-lp-field-order,m8-rename-taxonomy-tag,m15-authority-v3-subject-binding,m16-verdict-omits-pop-capstone,m18-pop-after-closure,m21-disclosure-only-counts-present-openings,m40-temporal-equality-is-before,m51-stale-extraction,m52-verify-bypasses-preimage,m53-feature-selected-hash,m59-verify-overrides-kernel-claim
+          - shard: kani-1
+            skip_kani: '0'
+            mutants: m2-canon-drops-del,m3-utf16-cmp-byte-order,m4-lp-two-byte-length,m9-b64-one-byte-tail
+          - shard: kani-2
+            skip_kani: '0'
+            mutants: m10-b64-two-byte-tail,m11-b64-full-chunk,m12-utf16-pair-end,m13-negative-zero
+          - shard: kani-3
+            skip_kani: '0'
+            mutants: m22-integer-zero-serialization,m23-numeric-route-guard,m24-utf16-units-underallocates,m25-utf16-strict-underallocates
+    env:
+      KANI_TIMEOUT_SECONDS: "1800"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: add swap so a CBMC memory peak cannot kill the hosted runner
+        if: matrix.skip_kani == '0'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/cbmc.swap
+          sudo chmod 600 /mnt/cbmc.swap
+          sudo mkswap /mnt/cbmc.swap
+          sudo swapon /mnt/cbmc.swap
+          free -h
+      - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        if: matrix.skip_kani == '0'
+        with:
+          kani-version: 0.68.0
+          command: cargo-kani
+          args: --version
+      - name: named mutants must die to their named detectors (production-proof detector in formal-production)
+        env:
+          MUTANTS_ONLY: ${{ matrix.mutants }}
+          SKIP_KANI: ${{ matrix.skip_kani }}
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          MUTANTS_WORK="$RUNNER_TEMP/mutants" SKIP_PRODUCTION_PROOF=1 \
+            bash formal/check-mutants.sh --first 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: keep the per-gate mutant logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          if [ -d "$RUNNER_TEMP/mutants/logs" ]; then cp -R "$RUNNER_TEMP/mutants/logs" "$RUNNER_TEMP/evidence/mutant-logs"; fi
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-mutants-fast-${{ matrix.shard }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  # The full mutation suite: all 48 mutants, every Kani-detected one refuted by its named harness.
+  # Nightly and on manual dispatch only, never required on pull requests; a failure turns the
+  # scheduled run on main red (main-health.yml). The production-proof detector itself runs in
+  # formal-production (this job skips it, so m50, m54-m58 and m60-m64 must die to another gate here).
+  formal-mutants-full:
+    if: github.event.schedule == '41 2 * * *' || github.event_name == 'workflow_dispatch'
+    name: "formal: mutation suite, all 48 mutants (nightly)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      KANI_TIMEOUT_SECONDS: "1800"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: add swap so a CBMC memory peak cannot kill the hosted runner
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/cbmc.swap
+          sudo chmod 600 /mnt/cbmc.swap
+          sudo mkswap /mnt/cbmc.swap
+          sudo swapon /mnt/cbmc.swap
+          free -h
+      - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          kani-version: 0.68.0
+          command: cargo-kani
+          args: --version
+      - name: every mutant must be killed (Kani-designated ones by their named harness)
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          MUTANTS_WORK="$RUNNER_TEMP/mutants" SKIP_PRODUCTION_PROOF=1 \
+            bash formal/check-mutants.sh --first 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: keep the per-gate mutant logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          if [ -d "$RUNNER_TEMP/mutants/logs" ]; then cp -R "$RUNNER_TEMP/mutants/logs" "$RUNNER_TEMP/evidence/mutant-logs"; fi
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-mutants-full
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  # Plan 012 production proofs, plus their mutation detector. `prove` regenerates the extraction from
+  # core/src, requires the committed one, builds every proof and audits axioms. The two mutant legs
+  # run the production-proof detector against its named mutants: a changed preimage byte (m50) and
+  # verdict-kernel mutants (m54-m58), and the parser totality mutants (m60-m64, Refinement.Parse).
+  formal-production:
+    name: "formal: production refinement, Charon/Aeneas extraction proved against the Lean model (${{ matrix.leg }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: prove
+            mutants: ''
+          - leg: seal-verdict-mutants
+            mutants: m50-lp-little-endian,m54-verdict-unanchored-capstone-skips-temporal,m55-verdict-both-mode-list-deletion-skips-paths,m56-historical-drops-snapshot-verified,m57-historical-merkle-mode-drops-paths,m58-seal-accepts-unpinned-key
+          - leg: parser-mutants
+            mutants: m60-parser-utf8-truncation-unchecked,m61-parser-literal-unguarded,m62-parser-decimal-overflow,m63-parser-panic-unexpected-char,m64-parser-skip-ws-unbounded
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: toolchain-free checks (extraction freshness, call paths into the proved code, no cfg code, glue)
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          { python3 formal/production/check-production.py --self-test && python3 formal/production/check-production.py; } 2>&1 | tee "$RUNNER_TEMP/evidence/checks.log"
+      # The cache holds only what setup-toolchain.sh builds from the manifest's toolchain pins, so
+      # its key hashes those pins, not the whole manifest (whose source hashes change with every
+      # edit to an extracted file and used to force a cold toolchain build).
+      - name: toolchain cache key (the pins only)
+        id: pins
+        run: |
+          echo "key=$(python3 -c 'import hashlib, json; m = json.load(open("formal/production/manifest.json")); print(hashlib.sha256(json.dumps(m["toolchain"], sort_keys=True).encode()).hexdigest()[:16])')" >> "$GITHUB_OUTPUT"
+      - name: cache the pinned toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/averin-aeneas
+            ~/.rustup/toolchains
+          key: averin-aeneas-${{ runner.os }}-${{ steps.pins.outputs.key }}-${{ hashFiles('formal/production/setup-toolchain.sh') }}
+      - name: system packages for opam (bounded, retried; see core-32bit)
+        run: |
+          for attempt in 1 2 3; do
+            sudo timeout 300 apt-get update && sudo timeout 900 apt-get install -y opam libgmp-dev pkg-config zstd && exit 0
+            echo "apt attempt $attempt failed or timed out; retrying" >&2
+            sleep 20
+          done
+          exit 1
+      - name: build pinned Charon, Aeneas and Lean
+        run: bash formal/production/setup-toolchain.sh "$HOME/averin-aeneas"
+      - name: mathlib build cache at the manifest revision
+        working-directory: formal/production
+        run: |
+          ln -sfn "$HOME/averin-aeneas/sources/aeneas" .aeneas
+          "$HOME/averin-aeneas/with-aeneas.sh" lake exe cache get
+      - name: regenerate from core/src, require the committed extraction, build every proof, audit axioms
+        if: matrix.leg == 'prove'
+        run: |
+          set -o pipefail
+          AVERIN_AENEAS_TOOLS="$HOME/averin-aeneas" bash formal/run-production-refinement.sh 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: each named mutant fails the regenerated proof (detector production-proof, reason proof)
+        if: matrix.leg != 'prove'
+        env:
+          MUTANTS_ONLY: ${{ matrix.mutants }}
+        run: |
+          set -o pipefail
+          AVERIN_AENEAS_TOOLS="$HOME/averin-aeneas" SKIP_KANI=1 MUTANTS_WORK="$RUNNER_TEMP/mutants" \
+            bash formal/check-mutants.sh --first 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: keep the per-gate mutant logs
+        if: always() && matrix.leg != 'prove'
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          if [ -d "$RUNNER_TEMP/mutants/logs" ]; then cp -R "$RUNNER_TEMP/mutants/logs" "$RUNNER_TEMP/evidence/mutant-logs"; fi
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-production-${{ matrix.leg }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  formal-kani:
+    name: "formal: Kani bounded proofs over the real encoders"
+    runs-on: ubuntu-latest
+    # Starts with the G1 negative control (push_guard_is_in_force must fail on its guard), then the
+    # default set. Measured runtimes are in formal/README.md ("Default set"); the limit leaves room
+    # for the Kani setup, the build and a slow runner. A timeout is a failure, never a pass.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Install only; formal/run-kani.sh drives the named harnesses (bare `cargo-kani` would try every
+      # harness with default features).
+      - name: add swap so a CBMC memory peak cannot kill the hosted runner
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/cbmc.swap
+          sudo chmod 600 /mnt/cbmc.swap
+          sudo mkswap /mnt/cbmc.swap
+          sudo swapon /mnt/cbmc.swap
+          free -h
+      - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          kani-version: 0.68.0
+          command: cargo-kani
+          args: --version
+      - name: negative control, then the default set
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          KANI_LOG_DIR="$RUNNER_TEMP/evidence/kani" bash formal/run-kani.sh 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-kani
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  formal-kani-extended:
+    # One job per extended harness so CBMC memory is isolated, each with a limit several times its
+    # measured runtime on this runner (formal/README.md, "Extended set"); a timeout is a failure,
+    # never a pass. Every harness that requests kissat gets it from the Kani 0.68.0 bundle the
+    # action installs (bin/kissat 4.0.1).
+    name: "formal: Kani extended parser/encoding proofs (${{ matrix.harness }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { harness: one_byte_tail_is_canonical, minutes: 30 }
+          - { harness: two_byte_tail_is_canonical, minutes: 30 }
+          - { harness: full_chunk_is_canonical, minutes: 30 }
+          - { harness: utf16_strict_matches_std, minutes: 45 }
+          - { harness: integer_roundtrip, minutes: 60 }
+          # A checked shard family (formal/check-kani-shards.py): every shard must pass.
+          - { harness: accepted_integer_spelling, minutes: 120 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: add swap so a CBMC memory peak cannot kill the hosted runner
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/cbmc.swap
+          sudo chmod 600 /mnt/cbmc.swap
+          sudo mkswap /mnt/cbmc.swap
+          sudo swapon /mnt/cbmc.swap
+          free -h
+      - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          kani-version: 0.68.0
+          command: cargo-kani
+          args: --version
+      - name: the harness, or every shard of the checked family
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          limit=$(( (${{ matrix.minutes }} - 5) * 60 ))
+          if python3 formal/check-kani-shards.py --families | grep -xF "${{ matrix.harness }}" >/dev/null; then
+            cmd=(bash formal/run-kani-shards.sh "${{ matrix.harness }}")
+          else
+            cmd=(bash formal/run-kani.sh --harness "${{ matrix.harness }}")
+          fi
+          KANI_LOG_DIR="$RUNNER_TEMP/evidence/kani" timeout "$limit" "${cmd[@]}" 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-kani-extended-${{ matrix.harness }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  # PR/push drift check for the string family: a fixed 20-case smoke subset from every cost class
+  # (formal/kani-string-smoke.txt, checked against the proved case list). Not the family's proof.
+  formal-kani-strings-smoke:
+    name: "formal: Kani string round trip smoke subset (20 cases)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: add swap so a CBMC memory peak cannot kill the hosted runner
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/cbmc.swap
+          sudo chmod 600 /mnt/cbmc.swap
+          sudo mkswap /mnt/cbmc.swap
+          sudo swapon /mnt/cbmc.swap
+          free -h
+      - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          kani-version: 0.68.0
+          command: cargo-kani
+          args: --version
+      - name: the 20 smoke cases
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 formal/kani-string-slices.py --check
+          python3 formal/kani-string-slices.py --list smoke > "$RUNNER_TEMP/cases.txt"
+          KANI_SHARD_ONLY="$RUNNER_TEMP/cases.txt" KANI_SHARD_GROUP=4 \
+            timeout 3300 bash formal/run-kani-shards.sh string_escape_roundtrip 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-kani-strings-smoke
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  # string_escape_roundtrip: 17,031 concrete cases (check-kani-shards.py proves the case list is
+  # exactly the original domain). formal/kani-string-slices.py splits that checked list by cost into
+  # three classes (it proves they partition it), and each job below runs one contiguous slice of one
+  # class through KANI_SHARD_ONLY + KANI_SHARD_SLICE; every case must report VERIFICATION SUCCESSFUL,
+  # and the family is verified only when every job of all three passes. CI always starts from fresh
+  # resume state. The full family is too costly for every push (about 70 jobs): these jobs run only
+  # on the weekly schedule and on manual dispatch; pull requests run formal-kani-strings-smoke.
+  formal-kani-strings-ascii:
+    if: github.event.schedule == '17 3 * * 0' || github.event_name == 'workflow_dispatch'
+    name: "formal: Kani string round trip, ASCII (slice ${{ matrix.slice }}/48)"
+    runs-on: ubuntu-latest
+    # 345 cases per slice.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: add swap so a CBMC memory peak cannot kill the hosted runner
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/cbmc.swap
+          sudo chmod 600 /mnt/cbmc.swap
+          sudo mkswap /mnt/cbmc.swap
+          sudo swapon /mnt/cbmc.swap
+          free -h
+      - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          kani-version: 0.68.0
+          command: cargo-kani
+          args: --version
+      - name: one ASCII slice
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 formal/kani-string-slices.py --list ascii > "$RUNNER_TEMP/cases.txt"
+          KANI_SHARD_ONLY="$RUNNER_TEMP/cases.txt" KANI_SHARD_GROUP=64 KANI_SHARD_SLICE=${{ matrix.slice }}/48 \
+            timeout 21000 bash formal/run-kani-shards.sh string_escape_roundtrip 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-kani-strings-ascii-${{ matrix.slice }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  formal-kani-strings-mixed:
+    if: github.event.schedule == '17 3 * * 0' || github.event_name == 'workflow_dispatch'
+    name: "formal: Kani string round trip, one non-ASCII scalar (slice ${{ matrix.slice }}/16)"
+    runs-on: ubuntu-latest
+    # 33 cases per slice (the last 19).
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: add swap so a CBMC memory peak cannot kill the hosted runner
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/cbmc.swap
+          sudo chmod 600 /mnt/cbmc.swap
+          sudo mkswap /mnt/cbmc.swap
+          sudo swapon /mnt/cbmc.swap
+          free -h
+      - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          kani-version: 0.68.0
+          command: cargo-kani
+          args: --version
+      - name: one mixed slice
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 formal/kani-string-slices.py --list mixed > "$RUNNER_TEMP/cases.txt"
+          KANI_SHARD_ONLY="$RUNNER_TEMP/cases.txt" KANI_SHARD_GROUP=8 KANI_SHARD_SLICE=${{ matrix.slice }}/16 \
+            timeout 21000 bash formal/run-kani-shards.sh string_escape_roundtrip 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-kani-strings-mixed-${{ matrix.slice }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  formal-kani-strings-pure:
+    # The four cases whose two scalars are both non-ASCII, one per job. AVERIN_KANI_LARGE_RUNNER /
+    # AVERIN_KANI_PURE_TIMEOUT_MINUTES can move them to another runner or limit.
+    if: github.event.schedule == '17 3 * * 0' || github.event_name == 'workflow_dispatch'
+    name: "formal: Kani string round trip, two non-ASCII scalars (case ${{ matrix.slice }}/4)"
+    runs-on: ${{ vars.AVERIN_KANI_LARGE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: ${{ fromJSON(vars.AVERIN_KANI_PURE_TIMEOUT_MINUTES || '60') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: add swap so a CBMC memory peak cannot kill the hosted runner
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/cbmc.swap
+          sudo chmod 600 /mnt/cbmc.swap
+          sudo mkswap /mnt/cbmc.swap
+          sudo swapon /mnt/cbmc.swap
+          free -h
+      - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          kani-version: 0.68.0
+          command: cargo-kani
+          args: --version
+      - name: one pure case
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 formal/kani-string-slices.py --list pure > "$RUNNER_TEMP/cases.txt"
+          limit=$(( (${{ fromJSON(vars.AVERIN_KANI_PURE_TIMEOUT_MINUTES || '60') }} - 10) * 60 ))
+          KANI_SHARD_ONLY="$RUNNER_TEMP/cases.txt" KANI_SHARD_SLICE=${{ matrix.slice }}/4 \
+            timeout "$limit" bash formal/run-kani-shards.sh string_escape_roundtrip 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-kani-strings-pure-${{ matrix.slice }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  formal-tla:
+    name: "formal: TLA+ models (expected outcomes; GrantLog and ConsumeLedger model superseded designs)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: every configuration's expected outcome
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          bash formal/tla/run-tlc.sh 2>&1 | tee "$RUNNER_TEMP/evidence/run.log"
+      - name: evidence manifest
+        if: always()
+        run: bash scripts/ci-evidence.sh "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: evidence-formal-tla
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 90
+
+  # The single required check (branch protection requires only this). It passes only when every job
+  # that runs on a pull request passed; skipped, cancelled or failed counts as not passed.
+  ci-required:
+    name: ci-required
+    if: always()
+    needs: [fuzz, core, core-32bit, server, store-postgres, web, sdk, verifier, wasm, supply-chain, formal-lean, formal-refinement, formal-mutants-fast, formal-production, formal-kani, formal-kani-extended, formal-kani-strings-smoke, formal-tla]
+    runs-on: ubuntu-latest
+    steps:
+      - name: every required job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: echo "$NEEDS" | jq -e 'to_entries | all(.value.result == "success")'

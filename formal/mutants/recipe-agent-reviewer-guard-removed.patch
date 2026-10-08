@@ -1,0 +1,14 @@
+diff --git a/src/approval/mod.rs b/src/approval/mod.rs
+index 7f5f5db..eb24d2c 100644
+--- a/src/approval/mod.rs
++++ b/src/approval/mod.rs
+@@ -2174,9 +2174,6 @@ fn recipe_satisfied(
+     // teammate} — but if a hand-crafted or stale rule somehow arrives, a recipe
+     // REQUIRING an agent-reviewer term is UNSATISFIABLE here too (never clears via
+     // agents), regardless of how many agent-reviewer sign-offs were collected.
+-    if need_agent_reviewer > 0 {
+-        return false;
+-    }
+     if avail_senior < need_senior {
+         return false; // senior slots can ONLY be filled by seniors
+     }

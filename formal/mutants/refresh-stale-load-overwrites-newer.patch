@@ -1,0 +1,14 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index c2db1b6..6f34d1c 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -305,9 +305,6 @@ impl PolicyEngine {
+     /// compare and the swap happen under one lock, so concurrent loads serialize.
+     pub fn load_policies_if_newer(&self, ticket: u64, policies: Vec<Policy>) -> bool {
+         let mut applied = self.applied_load_ticket.lock();
+-        if ticket <= *applied {
+-            return false;
+-        }
+         *applied = ticket;
+         let mut p = self.policies.write();
+         *p = policies;

@@ -1,0 +1,13 @@
+diff --git a/src/formal_kernel.rs b/src/formal_kernel.rs
+index 77fbf66..2bf6e58 100644
+--- a/src/formal_kernel.rs
++++ b/src/formal_kernel.rs
+@@ -55,7 +55,7 @@ pub fn digest_bytes(bytes: &[u8]) -> String {
+ 
+ /// Advance the durable one-shot fence without wraparound.
+ pub(crate) fn next_epoch(current: u64) -> Option<u64> {
+-    current.checked_add(1)
++    Some(current.wrapping_add(1))
+ }
+ 
+ /// Why an execution permit exists. Private so possession, not inspection, is

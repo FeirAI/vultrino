@@ -8,7 +8,6 @@ on:
     # Re-check main at least daily so main-health sees a fresh result even when
     # nothing is pushed.
     - cron: '41 5 * * *'
-  workflow_dispatch:
 
 jobs:
   kani:
@@ -102,79 +101,10 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
-  formal-fast:
-    name: formal register and fast mutants
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      # One target dir under the workspace so rust-cache keeps the dependency
-      # build; the mutant scratch worktree reuses it.
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: kit unit tests
-        run: python3 -m unittest discover -s scripts/formal/tests
-      - name: claims register checks
-        run: python3 scripts/formal/check_claims.py
-      - name: fast-tier mutants must be killed
-        run: python3 scripts/formal/check_mutants.py --tier fast --json formal-fast.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always()
-        with:
-          name: formal-fast-report
-          path: formal-fast.json
-          if-no-files-found: ignore
-          retention-days: 14
-
-  formal-nightly:
-    name: formal full-tier mutants (scheduled)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/bin/cargo-kani
-            ~/.cargo/bin/kani
-            ~/.kani
-            ~/.rustup/toolchains/nightly-2025-11-21-*
-          key: kani-0.67.0-nightly-2025-11-21-${{ runner.os }}
-      - name: install pinned Kani
-        run: |
-          if ! cargo kani --version 2>/dev/null | grep -q ' 0.67.0$'; then
-            cargo install --locked kani-verifier@0.67.0
-          fi
-          cargo kani setup
-      - uses: leanprover/lean-action@f061402b660e0c34644504b324e830f2991d4865 # v1.6.1
-        with:
-          lake-package-directory: formal/lean
-          auto-config: false
-          build: false
-          test: false
-          lint: false
-          use-mathlib-cache: false
-      - name: all mutants must be killed
-        run: python3 scripts/formal/check_mutants.py --tier full --timeout 1500 --json formal-full.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always()
-        with:
-          name: formal-full-report
-          path: formal-full.json
-          if-no-files-found: ignore
-          retention-days: 90
-
   ci-required:
     name: ci-required
     if: always()
-    needs: [kani, lean, rust, audit, formal-fast]
+    needs: [kani, lean, rust, audit]
     runs-on: ubuntu-latest
     steps:
       - name: every required job passed

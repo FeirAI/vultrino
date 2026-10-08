@@ -1,0 +1,13 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 912a303..254f9cf 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -201,7 +201,7 @@ const fn v4_in_prefix(addr: u32, net: u32, len: u8) -> bool {
+     let mask = if len == 0 {
+         0
+     } else {
+-        u32::MAX << (32 - len as u32)
++        u32::MAX << (33 - len as u32)
+     };
+     (addr & mask) == (net & mask)
+ }

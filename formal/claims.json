@@ -1,0 +1,478 @@
+{
+  "schema": 1,
+  "$comment": "Register of formal and test evidence for vultrino. See docs/dev/FORMAL.md. Only a CI run counts as evidence of record.",
+  "overclaim_denylist": {
+    "phrases": [
+      "formally verified",
+      "proven secure",
+      "provably secure",
+      "fully verified",
+      "complete proof",
+      "proves the implementation",
+      "guaranteed secure",
+      "cannot be bypassed",
+      "impossible to bypass",
+      "end-to-end proof",
+      "proven correct",
+      "fully proven",
+      "mathematically proven",
+      "verified implementation",
+      "cannot leak",
+      "unbreakable",
+      "tamper-proof"
+    ],
+    "globs": [
+      "README.md",
+      "docs/**/*.md"
+    ]
+  },
+  "mutants": {
+    "permit-direct-skips-approval-check": {
+      "tier": "fast"
+    },
+    "permit-authorize-skips-binding-check": {
+      "tier": "full"
+    },
+    "kani-direct-skips-approval-check": {
+      "tier": "full"
+    },
+    "kani-epoch-wraps": {
+      "tier": "full"
+    },
+    "recipe-agent-reviewer-guard-removed": {
+      "tier": "fast"
+    },
+    "kani-recipe-teammates-fill-senior-slots": {
+      "tier": "full"
+    },
+    "kani-recipe-zero-count-allowed": {
+      "tier": "full"
+    },
+    "kani-recipe-leftover-senior-ignored": {
+      "tier": "full"
+    },
+    "ssrf-prefix-mask-off-by-one": {
+      "tier": "fast"
+    },
+    "ssrf-6to4-embedded-ipv4-not-decoded": {
+      "tier": "full"
+    },
+    "refresh-stale-load-overwrites-newer": {
+      "tier": "fast"
+    },
+    "rate-window-allows-one-past-max": {
+      "tier": "fast"
+    },
+    "sb02-short-minted-secret-not-withheld": {
+      "tier": "fast"
+    },
+    "sb02-minted-access-token-not-scrubbed": {
+      "tier": "full"
+    },
+    "sb04-shared-key-fallback-without-escape": {
+      "tier": "full"
+    },
+    "sb04-equal-key-counts-as-distinct": {
+      "tier": "fast"
+    },
+    "refinement-binding-field-dropped": {
+      "tier": "fast"
+    },
+    "lean-approval-binding-not-consumed": {
+      "tier": "full"
+    }
+  },
+  "claims": [
+    {
+      "id": "permit-kernel-tests",
+      "statement": "The execution-permit constructor for the direct path refuses a policy denial and refuses an approval-required request, and a permit authorizes only the exact execution binding it was minted for, in the unit tests that exercise those two functions.",
+      "method": "test",
+      "artifacts": [
+        "src/formal_kernel.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact formal_kernel::tests::direct_permit_refuses_deny_and_approval_required formal_kernel::tests::exact_binding_prevents_action_substitution",
+      "covers": [
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "ExecutionPermit::direct",
+          "sha256": "14d153c362a4983d6f2c86b67c1aa6f3f679aabe276d24a09fc19a3744013d9e"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "ExecutionPermit::authorize",
+          "sha256": "07370676bc18906fecd7774845f7becd1dd187c4d142df29b636f1ea78fee616"
+        }
+      ],
+      "mutants": [
+        "permit-direct-skips-approval-check",
+        "permit-authorize-skips-binding-check"
+      ],
+      "does_not_establish": "Two example-based tests, not a proof. Says nothing about ExecutionPermit::approved, about the grant evidence it consumes, or about whether every dispatch site goes through a permit (the structural refinement gate checks only the dispatch seam count)."
+    },
+    {
+      "id": "kani-permit-kernel",
+      "statement": "Kani bounded model checking (0.67.0, pure-kernel build without wasm plugins) exhausts the boolean inputs of ExecutionPermit::direct and shows it admits exactly when policy allows and approval is not required, and shows next_epoch never wraps (it returns None at u64::MAX). Each harness carries kani::cover statements that the CI vacuity gate requires to be satisfiable.",
+      "method": "kani",
+      "artifacts": [
+        "src/formal_kernel.rs",
+        "formal/run-kani.sh"
+      ],
+      "gates": [
+        "kani"
+      ],
+      "detector": "set -e; for h in formal_kernel::kani_proofs::direct_permit_truth_table_is_exact formal_kernel::kani_proofs::execution_epoch_never_wraps; do cargo kani --no-default-features --harness $h --exact; done",
+      "covers": [
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "ExecutionPermit::direct",
+          "sha256": "14d153c362a4983d6f2c86b67c1aa6f3f679aabe276d24a09fc19a3744013d9e"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "next_epoch",
+          "sha256": "f8c56348027b56b2687e52d0931549cd5842659fa6f5cfa3dec5c0d89e7110ea"
+        }
+      ],
+      "mutants": [
+        "kani-direct-skips-approval-check",
+        "kani-epoch-wraps"
+      ],
+      "does_not_establish": "The vacuity (cover) check lives in formal/run-kani.sh, not in this detector, which checks only that the harnesses verify. Covers the pure functions only: not ExecutionPermit::approved, not the durable one-shot storage fence that uses the epoch, and nothing under the wasm-plugins feature (Kani cannot build it)."
+    },
+    {
+      "id": "recipe-unit-tests",
+      "statement": "A recipe that requires an agent-reviewer term can never be satisfied even when fully signed, a recipe with an over-cap or overflowing count is unsatisfiable, and a senior sign-off on one aggregator key cannot fabricate several teammate slots, in the named unit tests.",
+      "method": "test",
+      "artifacts": [
+        "src/approval/mod.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::tests::recipe_with_agent_reviewer_term_is_unsatisfiable_even_when_fully_signed approval::tests::recipe_over_cap_or_overflow_count_is_unsatisfiable approval::tests::recipe_hard_sod_senior_cannot_fabricate_teammate_slots_via_one_key",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "class_fills_a_slot",
+          "sha256": "0bdcbd25fe72770869fb83e4c7efc13324c8f0a5cf3ff346d6d7254ff9c57433"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_well_formed",
+          "sha256": "14f21e8791f51c93676c9018ad11055ed6d52dc8f376bb1e2fda85f809eb4ac8"
+        }
+      ],
+      "mutants": [
+        "recipe-agent-reviewer-guard-removed"
+      ],
+      "does_not_establish": "Three example-based tests. They do not cover every recipe shape (see the Kani claims for bounded exhaustive coverage), the sign-off collection and deduplication code, or the match between these rules and govder's recipe evaluator."
+    },
+    {
+      "id": "kani-recipe-safety",
+      "statement": "Kani bounded model checking (0.67.0) over recipes of exactly three terms with a 4-iteration unwind shows: no recipe is satisfied with zero approvers, satisfaction never underfills a slot, malformed recipes are never satisfied, and the per-term cap prevents slot-need overflow.",
+      "method": "kani",
+      "artifacts": [
+        "src/approval/mod.rs",
+        "formal/run-kani.sh"
+      ],
+      "gates": [
+        "kani"
+      ],
+      "detector": "set -e; for h in approval::kani_recipe_proofs::zero_approvers_never_satisfy approval::kani_recipe_proofs::satisfaction_never_underfills_a_slot approval::kani_recipe_proofs::malformed_recipes_never_satisfy approval::kani_recipe_proofs::recipe_cap_prevents_need_overflow; do cargo kani --no-default-features --harness $h --exact; done",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_well_formed",
+          "sha256": "14f21e8791f51c93676c9018ad11055ed6d52dc8f376bb1e2fda85f809eb4ac8"
+        }
+      ],
+      "mutants": [
+        "kani-recipe-teammates-fill-senior-slots",
+        "kani-recipe-zero-count-allowed"
+      ],
+      "does_not_establish": "Recipes with more than three terms or sign-off counts beyond the harness bounds. The cover (vacuity) check is in formal/run-kani.sh, not in this detector. Says nothing about sign-off collection, identity deduplication or separation of duties."
+    },
+    {
+      "id": "kani-recipe-greedy",
+      "statement": "Kani bounded model checking (0.67.0) shows the greedy senior-first slot assignment in recipe_satisfied agrees with an exhaustive assignment search at the harness bound of 5, that satisfaction is monotone in the number of available approvers, and that class_fills_a_slot agrees with satisfaction.",
+      "method": "kani",
+      "artifacts": [
+        "src/approval/mod.rs",
+        "formal/run-kani.sh"
+      ],
+      "gates": [
+        "kani"
+      ],
+      "detector": "set -e; for h in approval::kani_recipe_proofs::greedy_matches_exhaustive_assignment_at_bound_5 approval::kani_recipe_proofs::satisfaction_is_monotone_in_availability approval::kani_recipe_proofs::class_slot_contribution_agrees_with_satisfaction; do cargo kani --no-default-features --harness $h --exact; done",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "class_fills_a_slot",
+          "sha256": "0bdcbd25fe72770869fb83e4c7efc13324c8f0a5cf3ff346d6d7254ff9c57433"
+        }
+      ],
+      "mutants": [
+        "kani-recipe-leftover-senior-ignored"
+      ],
+      "does_not_establish": "The agreement is for availability and recipe counts within the harness bound of 5, not for all u32 values. The cover (vacuity) check is in formal/run-kani.sh, not in this detector. The exhaustive reference is written in the same harness module, so a shared misreading of the intended rule would not be caught."
+    },
+    {
+      "id": "ssrf-special-purpose",
+      "statement": "The outbound-request address classifier blocks every range in the IPv4 and IPv6 special-purpose tables (first and last address of each range) and keeps the tested neighbouring addresses reachable, and it decodes IPv4 carried in IPv4-mapped, NAT64 and 6to4 IPv6 addresses before classifying, in the named unit tests.",
+      "method": "test",
+      "artifacts": [
+        "src/plugins/http.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact plugins::http::tests::test_sb22_special_purpose_ranges_blocked_and_neighbours_allowed plugins::http::tests::test_sb22_registry_blocks_first_and_last_address_blocked plugins::http::tests::test_sb22_wrapped_special_purpose_ipv4_stays_blocked plugins::http::tests::test_sb22_tables_are_well_formed plugins::http::tests::test_ssrf_blocks_nat64_and_6to4_embedded_private plugins::http::tests::test_ssrf_blocks_cgnat_range",
+      "covers": [
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "HttpPlugin::is_private_ip",
+          "sha256": "3bb8f57c7f5d01fdd26466173dfcc84ecb0dd752acc8b0bb1734bd286cd8e3a3"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "ipv4_is_special_purpose",
+          "sha256": "0af5036785f3f5a60f4bba5e625e14f11f2a35d5a03ad9be1b006b2acd6f2566"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "ipv6_is_special_purpose",
+          "sha256": "f9ae79887776e869dddb2b6c6b38f748b079939cfd9e02f2f09634a867d36ffa"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "v4_in_prefix",
+          "sha256": "168c4dc820ca81935396295150b5271e6a2e43d5151b3425a0d1c6398795ce4d"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "v6_in_prefix",
+          "sha256": "fe121225133cb10c44819a6e1e15ce8db30080b90fe971d2f98d294189d07019"
+        }
+      ],
+      "mutants": [
+        "ssrf-prefix-mask-off-by-one",
+        "ssrf-6to4-embedded-ipv4-not-decoded"
+      ],
+      "does_not_establish": "Table-driven tests over listed addresses, not an exhaustive check of the address space. The registry rows were transcribed by hand from IANA tables retrieved on one date. The drift lock covers the functions, not the IPV4_BLOCKED and IPV6_BLOCKED constants (the tests are the only guard on the rows). DNS rebinding, redirects and proxies are separate controls this claim does not cover."
+    },
+    {
+      "id": "policy-refresh-ordering",
+      "statement": "A periodic policy refresh that listed stored policies before an admin write cannot overwrite the newer admin reload: loads are ticketed, and an older ticket is discarded, in a deterministic interleaving test that races a kill-policy write against a stale refresh.",
+      "method": "test",
+      "artifacts": [
+        "src/policy/mod.rs",
+        "src/server/mod.rs",
+        "tests/approval_token_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact test_refresh_listing_before_kill_policy_cannot_overwrite_newer_admin_reload",
+      "covers": [
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::begin_load",
+          "sha256": "5a74ac12b25ae5f5b20492b820beaa14bfb958ee3793517cd0c393cf7b93d646"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::load_policies_if_newer",
+          "sha256": "3b860a4dccbbee01b2edd3c1d49bdbc0240a99257c5aee3f2d62363e8aead0e5"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "refresh_policies_after_list",
+          "sha256": "56adab1ff5935cdd86ee64c332772103600a834ebd3c0809e7a94a727ef28697"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::reload_policies",
+          "sha256": "09d865612c11111e1fc95b0800f7676492fe7cc4a20a4a6c85f08e0876ba9ecd"
+        }
+      ],
+      "mutants": [
+        "refresh-stale-load-overwrites-newer"
+      ],
+      "does_not_establish": "One scripted interleaving, not a model of all schedules. Does not cover multi-process races on shared storage, a lost write in storage itself, or other policy load paths that call load_policies directly (construction and tests)."
+    },
+    {
+      "id": "rate-limiter-vectors",
+      "statement": "The fixed-window rate limiter transition function reproduces, byte for byte, the committed trace fixture formal/vectors/rate_limiter_traces.json (cold start, sub-window lag, exact whole-window lag, two-window lag), and an invalid limiter (max 0 or window 0) denies without creating state.",
+      "method": "differential-vectors",
+      "artifacts": [
+        "src/policy/mod.rs",
+        "formal/vectors/rate_limiter_traces.json",
+        "formal/vectors/README.md"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact policy::tests::fixed_window_trace_fixture_is_generated_by_production_transition policy::tests::invalid_rate_limit_dimensions_deny_without_creating_state",
+      "covers": [
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "fixed_window_transition",
+          "sha256": "4c8f24aa779318b2a211a1291cfc24037d56a678964ea79bb97207781a94a142"
+        }
+      ],
+      "mutants": [
+        "rate-window-allows-one-past-max"
+      ],
+      "does_not_establish": "The fixture is generated by the same function it checks, so it pins current behaviour against silent change; it is not an independent specification. A govder consumer of the same fixture exists only on an unmerged govder branch, so no cross-repo agreement is established. The Instant-based adapter that feeds window_elapsed is not covered."
+    },
+    {
+      "id": "sb02-minted-scrub",
+      "statement": "A credential minted or refreshed during an action (OAuth2 refresh, Google service-account mint) is added to the scrub set, so an upstream that reflects it in headers or body does not leak it to the agent on the buffered and streamed paths; a minted secret shorter than the redaction floor causes the whole response to be withheld on both paths, in the named integration tests.",
+      "method": "test",
+      "artifacts": [
+        "src/egress.rs",
+        "tests/llm_proxy_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test llm_proxy_integration -- --exact sb02_buffered_oauth2_refreshed_token_reflected_is_scrubbed sb02_buffered_google_sa_minted_token_reflected_is_scrubbed sb02_streamed_oauth2_refreshed_token_reflected_is_scrubbed sb02_streamed_google_sa_minted_token_reflected_is_scrubbed sb02_buffered_short_minted_token_withholds_response sb02_streamed_short_minted_token_withholds_response sb02_streamed_compressed_short_minted_token_withholds_like_buffered sb02_streamed_compressed_response_still_persists_updated_credential",
+      "covers": [
+        {
+          "path": "src/egress.rs",
+          "symbol": "has_unredactable_secret",
+          "sha256": "deb5b08071dfcb15100b1b054538ea8c561771d8dffc4f3462102aaa28297a2d"
+        },
+        {
+          "path": "src/egress.rs",
+          "symbol": "confine_response",
+          "sha256": "2f214ad9a82ff772700452a2b034da9861b73a169002b67a49c86fef61fcfd6e"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "CredentialData::secret_material",
+          "sha256": "67151060ce2ff10aa5f24fc333457b6e47c69c05b6ac3d6ddaf248c134022be6"
+        }
+      ],
+      "mutants": [
+        "sb02-short-minted-secret-not-withheld",
+        "sb02-minted-access-token-not-scrubbed"
+      ],
+      "does_not_establish": "Mock plugins reflecting fixed token shapes; other reflection encodings and other credential types are not tested here. The drift lock does not cover the server dispatch code in src/server/mod.rs that extends the scrub set (the integration tests are its only guard). A plugin error path that echoes a minted secret is a documented residual in docs/dev/LIMITATIONS.md."
+    },
+    {
+      "id": "sb04-approval-key",
+      "statement": "Verified approver decisions use a dedicated approval key only: with the key unset, equal to the shared govder key, or equal after trimming whitespace, verified approvals are disabled unless the explicit shared-key escape is set, in the named unit tests.",
+      "method": "test",
+      "artifacts": [
+        "src/govder/mod.rs",
+        "src/web/api.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact govder::tests::approval_key_unset_or_equal_to_shared_key_disables_verified_approvals govder::tests::shared_key_escape_verifies_with_f_and_warns_at_every_startup",
+      "covers": [
+        {
+          "path": "src/govder/mod.rs",
+          "symbol": "GovderConfig::approval_verification_secret",
+          "sha256": "56d6d6b8660931e0d73481f3b41e00fd54ba3dac8ca6fdb8efdb65ea18757316"
+        },
+        {
+          "path": "src/govder/mod.rs",
+          "symbol": "GovderConfig::approval_key_is_distinct",
+          "sha256": "7593a6cab45db92edbd4c55f4537fcaebb262d689958dd1e6447662ab3e5aefd"
+        }
+      ],
+      "mutants": [
+        "sb04-shared-key-fallback-without-escape",
+        "sb04-equal-key-counts-as-distinct"
+      ],
+      "does_not_establish": "The unit tests cover the key-selection function. The 403 on the decision route (api_decide_approval) is covered by tests/web_smoke.rs in the rust job but not by this detector or the drift lock. Key strength, key distribution and whether the broker signs with the dedicated key are operational matters."
+    },
+    {
+      "id": "refinement-structural",
+      "statement": "formal/check-refinement.py checks source shape only: the Rust ExecutionBinding field list equals the Lean RequestBinding field list, and a fixed list of seams, strings and Lean theorem names are still present in the source. Register this as a structural gate, not a refinement proof.",
+      "method": "test",
+      "artifacts": [
+        "formal/check-refinement.py",
+        "formal/check-refinement.sh",
+        "src/formal_kernel.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "python3 formal/check-refinement.py",
+      "covers": [
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "*",
+          "sha256": "c3fea22a66e1ab11c719e5da5ae0d699e7aef81d5cc2c1527b8260606fe02882"
+        }
+      ],
+      "mutants": [
+        "refinement-binding-field-dropped"
+      ],
+      "does_not_establish": "Semantic refinement of Rust by the Lean model. It greps for strings and counts call sites; code can keep every string and still behave differently. The drift lock covers src/formal_kernel.rs only, while the script reads many other files."
+    },
+    {
+      "id": "lean-approval-execution",
+      "statement": "Model-level result: in the hand-written Lean model of the execution boundary, every reachable state records only properly authorized executions and never consumes the same approval binding twice (Approval.reachable_execution_is_proper and reachable_approval_consumption_is_one_shot), checked with lake build --wfail.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Approval/ExecutionSafety.lean",
+        "formal/lean/Vultrino/Approval/Model.lean",
+        "formal/lean/check-nanoda.sh"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Approval/ExecutionSafety.lean",
+          "symbol": "*",
+          "sha256": "92c9c6346acab8ba6c93407495a19769d4b6be88e9e832325b8f3282ac11d1a8"
+        }
+      ],
+      "mutants": [
+        "lean-approval-binding-not-consumed"
+      ],
+      "does_not_establish": "A property of the Lean model, not of the Rust code: the model is hand-written and not extracted from Rust, and the link is the structural refinement gate only. The detector runs lake build, not the independent nanda check that CI also runs. Only ExecutionSafety.lean is drift-locked, not Model.lean that it imports."
+    }
+  ]
+}

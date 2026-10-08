@@ -1,0 +1,452 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  # Re-checks main at least daily, so a regression that lands without a push (an expired
+  # image digest, a moved action tag, a runner image change) is found without waiting for the
+  # next commit. main-health reads the latest push AND scheduled runs. The scheduled run
+  # keeps every job, including the browser suite, so the daily result is the full one.
+  schedule:
+    - cron: '41 5 * * *'
+
+jobs:
+  # Decides whether the slow browser suite (about 20 minutes on this private repo) has to run.
+  # On pull requests it runs only when something it covers changed. On every other event (push to
+  # main, the daily schedule) it ALWAYS runs. If the diff cannot be computed the answer is
+  # "run it": the gate fails toward running the suite, never toward skipping it.
+  changes:
+    name: decide whether the browser suite runs
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.gate.outputs.web }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "web=true" >> "$GITHUB_OUTPUT"; echo "event $EVENT: browser suite always runs"; exit 0
+          fi
+          if ! files=$(git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA"); then
+            echo "web=true" >> "$GITHUB_OUTPUT"; echo "diff failed: running the browser suite"; exit 0
+          fi
+          printf '%s\n' "$files"
+          # What the suite covers or is generated from: the web tree (sources, assets, tests,
+          # playwright config), the generator, the packs that feed the generated artifacts and
+          # the Go generators for them, and this workflow itself.
+          if printf '%s\n' "$files" | grep -Eq '^(web/|scripts/build-web\.mjs$|packs/|app/cmd/orgtemplates-gen/|app/internal/orgtemplates/|\.github/workflows/ci\.yml$)'; then
+            echo "web=true" >> "$GITHUB_OUTPUT"; echo "browser suite: a covered path changed"
+          else
+            echo "web=false" >> "$GITHUB_OUTPUT"; echo "browser suite: skipped, no covered path changed"
+          fi
+
+  langchain-python:
+    name: LangChain Python SDK (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.14"]
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: python -m pip install '.[langchain,test]'
+      - run: python -m pytest -q
+
+  langchain-typescript:
+    name: LangChain TypeScript SDK (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 24]
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  frontend-browser:
+    name: frontend browser characterization (Playwright Chromium)
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # web/*.html is generated from web/src/ (plan 074) — edit the source, run
+      # scripts/build-web.mjs, commit the result; never hand-edit the served HTML
+      # directly. This step is the drift gate: it fails if committed HTML doesn't match
+      # what the generator produces right now. Dependency-free (built-ins only), so no
+      # npm ci is needed first.
+      - name: web generator drift check (edit web/src, never web/*.html)
+        working-directory: .
+        run: node scripts/build-web.mjs --check
+      - run: npm ci
+      - name: syntax-check production frontend scripts
+        run: |
+          for f in assets/api.js assets/app.js assets/demo.js assets/screens.js; do
+            node --check "$f"
+          done
+      - run: npx playwright install --with-deps chromium
+      - run: npm test
+
+  go:
+    name: go build + vet + test (default, oidc, pg)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    services:
+      # Throwaway Postgres so the durable session store test (store_pg_test.go, -tags pg) runs for
+      # REAL instead of self-skipping. Digest-pinned to the index digest per plan 010 (human tag in
+      # the comment). trust auth = no password -> no credential in this workflow; the container is
+      # ephemeral and torn down with the job.
+      postgres:
+        image: postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e  # postgres:17
+        env:
+          POSTGRES_DB: feir_os_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          # go-version-file is resolved from the repo root, so point at app/go.mod (go 1.25.5).
+          go-version-file: app/go.mod
+      # feir-os vendors github.com/govder-dev/govder/pkg/tenantassert plus gopkg.in/yaml.v3 (the
+      # org-pack document parser, app/internal/orgpack) into app/vendor. Because app/vendor
+      # exists, `go build` uses -mod=vendor automatically: no sibling govder checkout, no network
+      # fetch. Do NOT add a checkout of govder.
+      - name: build / vet / test (default, !oidc !pg)
+        run: |
+          go build ./...
+          go vet ./...
+          # -race: the whole suite is affordable (about a minute) and a data race in a test double
+          # (FakeBroker) once made TestHandleAgentsNoNPlusOne flaky; the detector now guards that class.
+          go test -race ./...
+      # Org-pack sanity (plan 103 §7). internal/orgpack's TestShippedPacksValidateClean already
+      # runs the same rules in the step above; this exercises the operator-facing CLI and its EXIT
+      # CODE too, because the runbook tells an operator to trust `orgpack validate`, not `go test`.
+      - name: orgpack validate packs/*
+        run: |
+          go build -o ../bin/orgpack ./cmd/orgpack
+          ../bin/orgpack validate ../packs/*/
+      # WHAT `orgpack validate` DOES NOT PROVE, stated where a reader of a green check will see it.
+      # Validation is static. The suites that APPLY a pack against real running planes and move real
+      # money — TestOrgPackE2E, TestOrgPackMoneyE2E, TestPaymentsSandboxMoneyE2E — live in the
+      # GOVDER repo's e2e/ directory, need five real binaries, and cannot run from this repo's CI.
+      # Plan 103 §10g found them running in no CI at all; govder's own workflow now names them and
+      # reports loudly when its harness is unarmed. Do not read this job as covering them.
+      - name: UNPROVEN — pack APPLY and the money path run in govder's e2e, not here
+        if: always()
+        run: |
+          {
+            echo "### :information_source: \`orgpack validate\` is static validation only"
+            echo
+            echo "Not proven by this job: applying a pack against real planes, a governed turn on each"
+            echo "harness type, the approval round-trip, or money executing end to end. Those are"
+            echo "\`TestOrgPackE2E\`, \`TestOrgPackMoneyE2E\` and \`TestPaymentsSandboxMoneyE2E\` in the"
+            echo "**govder** repository's \`e2e/\` directory (\`make e2e\` there is the documented"
+            echo "pre-release gate)."
+          } >> "$GITHUB_STEP_SUMMARY"
+      # oidc build tag: real OIDC establish/auth path (internal/broker/establish_oidc.go,
+      # internal/auth/oidc.go). The !oidc default is covered by the step above.
+      - name: build / vet / test -tags oidc
+        run: |
+          go build -tags oidc ./...
+          go vet -tags oidc ./...
+          go test -race -tags oidc ./...
+      # pg build tag: durable Postgres session store (internal/session/store_pg.go). The store
+      # test (store_pg_test.go) runs for REAL against the `postgres` service above — FEIR_OS_SESSION_TEST_DB
+      # is its DSN. The store auto-creates its table (createSessionsTable), so the DB just needs to exist.
+      - name: build / test -tags pg (durable Postgres session store)
+        env:
+          FEIR_OS_SESSION_TEST_DB: postgres://postgres@localhost:5432/feir_os_test?sslmode=disable
+        run: |
+          go build -tags pg ./...
+          go test -race -tags pg ./...
+
+  deploy-render:
+    name: kustomize render + verify-prod gate (no cluster)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: kubectl present
+        run: kubectl version --client
+      - name: render overlays/dev
+        run: kubectl kustomize deploy/k8s/overlays/dev > /dev/null
+      - name: render overlays/prod
+        run: kubectl kustomize deploy/k8s/overlays/prod > /dev/null
+      - name: verify-prod.sh (skeleton-aware)
+        run: |
+          set +e
+          out="$(deploy/k8s/verify-prod.sh 2>&1)"
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          echo "verify-prod exit=$rc"
+          if [ "$rc" -ge 2 ]; then exit "$rc"; fi
+          unexpected="$(printf '%s\n' "$out" | grep '^FAIL:' | grep -vF 'REPLACE_* placeholders' || true)"
+          if [ -n "$unexpected" ]; then printf '%s\n' "$unexpected"; exit 1; fi
+      # THE NETPOL PAIRING CLASS GATE (plan 103 §10g FIX 3.1). "A source-side egress rule cannot
+      # widen a destination's ingress" has caused THREE production outages in this deployment, and
+      # the symptom is a TIMEOUT, not a refusal, so it misdirects blame onto the destination. The
+      # checker for that class existed and was in NO CI — §10f's follow-up list called wiring it in
+      # "the follow-up that stops a fourth instance". Both overlays, exit code gating the step.
+      - name: verify-netpol-pairing.sh (overlays/dev + overlays/prod)
+        run: |
+          set +e
+          deploy/k8s/verify-netpol-pairing.sh deploy/k8s/overlays/dev
+          dev=$?
+          deploy/k8s/verify-netpol-pairing.sh deploy/k8s/overlays/prod
+          prod=$?
+          set -e
+          echo "verify-netpol-pairing dev=$dev prod=$prod"
+          [ "$dev" -eq 0 ] && [ "$prod" -eq 0 ]
+      # ...and the gate ON that gate. The checker used to print OK / exit 0 on a render where it had
+      # examined ZERO pairings, and it reported every matchExpressions selector as UNVERIFIABLE.
+      # Neither could be caught by running it against the two real overlays, where it passes: the
+      # fixture corpus in deploy/k8s/testdata/netpol-pairing/ is the only thing that exercises a
+      # FAILING path, and the real overlays contain zero matchExpressions selectors.
+      - name: verify-netpol-pairing-selftest.sh (the checker must FAIL when it should)
+        run: deploy/k8s/verify-netpol-pairing-selftest.sh
+      # Image-provenance logic (plan 103 §10e/§10g). The cluster half — PROBE S reading the
+      # `ai.feir.s8.source` label back out of a running kind cluster — cannot run here; this proves
+      # the tree resolution, the verdict rules (an UNSTAMPED image FAILS), and the worktree guard
+      # that stops a build silently taking the four plane images from the main checkouts.
+      - name: s8 provenance-selftest.sh (no cluster, no docker)
+        run: deploy/k8s/s8/provenance-selftest.sh
+      - name: provision-connectors-selftest.sh (no network, no credentials)
+        run: deploy/provision-connectors-selftest.sh
+      - name: docker compose config
+        run: |
+          found=0
+          for f in deploy/compose/docker-compose.yml; do
+            if [ -f "$f" ]; then found=1; docker compose -f "$f" config --quiet; fi
+          done
+          [ "$found" -eq 1 ] || echo "no compose file"
+      # WHAT THIS JOB DOES NOT PROVE. Everything above is a RENDER-time check. The S8 cluster gate
+      # (deploy/k8s/s8/probe.sh, 121 assertions across probes A–S) needs a live kind cluster with
+      # Calico, images built from five repos, and ~20 minutes — it cannot run on a hosted runner,
+      # and pretending otherwise with a self-skipping job is the failure mode this whole pass is
+      # about. It is stated here instead, in the run summary, so a green `ci` cannot be read as
+      # "the cluster posture is verified".
+      - name: UNPROVEN — the S8 cluster gate does not run in CI
+        if: always()
+        run: |
+          {
+            echo "### :information_source: Render-only — the S8 cluster gate did not run"
+            echo
+            echo "\`deploy/k8s/s8/probe.sh\` (probes A–S: L4 isolation, ticket forgery, metering flow,"
+            echo "runtime-edge identity, secret alignment, agents-zone DNS posture, pod-native"
+            echo "langchain/eve/hermes turns, exchange generation bounds, image provenance) requires a"
+            echo "live kind cluster with a NetworkPolicy-enforcing CNI and images built from five"
+            echo "repositories. It is a LOCAL gate, run by hand; see \`deploy/k8s/README.md\`."
+            echo
+            echo "This job proves the RENDERS and the render-time gates only."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  eve-isolated-node:
+    name: eve-isolated node suites (no live stack)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/eve-isolated
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          # No package.json and no dependencies under deploy/eve-isolated: these are
+          # built-in-only ES modules driven by `node --test`, so there is nothing to
+          # cache and no `npm ci` step. Node 22 is the version the suites are actually
+          # exercised on by hand and by selftest.sh; 20 has not been tried on them.
+          node-version: 22
+      # materialize-solo-social-drafts.test.mjs exercises orgpack against a
+      # temporary generated pack. The Go module is vendored, so this remains an
+      # offline gate and needs no dependency download.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: app/go.mod
+      # Syntax gate first, mirroring selftest.sh's `node --check` pass: a parse error in
+      # a module that only the LIVE stack loads (the coordinator bridges, the gateways,
+      # the controller) would otherwise reach a client before anything caught it.
+      - name: node --check every eve-isolated module
+        run: |
+          for f in *.mjs; do
+            case "$f" in *.test.mjs) continue ;; esac
+            node --check "$f"
+          done
+      # The suites that need NO Docker and no running stack. These are the 61 bridge
+      # tests (the whole Host/Origin/bearer/credential-file/conversation-handle safety
+      # story), the two gateway route classifiers, the runtime controller's heartbeat
+      # retention, and the Telegram relay. Before this job they ran only inside
+      # deploy/eve-isolated/selftest.sh, which is invoked by a human and by nothing in CI.
+      # controller.test.mjs mentions Docker but never shells out to it: it injects a fake
+      # Docker client and a fixture socket path, so it is safe on a bare runner.
+      - name: node --test (bridge, gateways, controller, relay)
+        run: |
+          node --test \
+            solo-coordinator-mcp.test.mjs \
+            solo-coordinator-http.test.mjs \
+            solo-gateway.test.mjs \
+            gateway.test.mjs \
+            controller.test.mjs \
+            solo-telegram-relay.test.mjs
+      # Separate step because this one DOES shell out, to `docker compose config` on
+      # solo-docker-compose.yml. It needs the Compose CLI but not a running container and
+      # not an image: the deploy-render job above already runs `docker compose config`, so
+      # availability on this runner is established rather than assumed. Kept apart from
+      # the step above so a Compose-side failure is never misread as a bridge regression.
+      - name: node --test solo-isolation.test.mjs (uses docker compose config)
+        run: node --test solo-isolation.test.mjs
+      # Solo marketing and optional Buffer draft handoff are fixture-backed and
+      # require no npm dependencies. The materializer uses the checked-in Go
+      # vendor tree; the runtime suite's compose check is `docker compose
+      # config` only. They never start Eve/the four planes or contact Buffer.
+      # Keep the filenames explicit so a new suite cannot disappear behind a glob.
+      - name: node --test Solo marketing and Buffer draft fixtures
+        env:
+          GOPROXY: off
+          GOFLAGS: -mod=vendor
+          FEIR_RUN_COMPOSE_CONFIG_TEST: "1"
+        run: |
+          node --test \
+            solo-workflow.test.mjs \
+            solo-publisher.test.mjs \
+            social-drafts.test.mjs \
+            materialize-solo-social-drafts.test.mjs \
+            solo-buffer-runtime.test.mjs
+      # WHAT THIS JOB DOES NOT PROVE. Every suite above is fixture-backed. The two
+      # defects that actually reached the client (the Solo gateway's missing child-to-lead
+      # callback route, and an agent capped at one model call per day) were invisible to
+      # all of them, because a fixture cannot reproduce a real coordinator or the
+      # enforcement plane. That gap is what
+      # deploy/eve-isolated/solo-coordinator-live.test.sh covers, and it needs an applied
+      # Solo run, so it cannot run here.
+      - name: UNPROVEN, no live coordinator and no enforcement plane
+        if: always()
+        run: |
+          {
+            echo "### :information_source: Fixture-backed only"
+            echo
+            echo "These suites drive a scripted fixture, never a real coordinator. The live"
+            echo "leg is \`deploy/eve-isolated/solo-coordinator-live.test.sh\`, which needs an"
+            echo "applied Solo run and is opt-in behind \`FEIR_SOLO_LIVE_E2E=1\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  shellcheck:
+    name: shellcheck deploy scripts (warning severity) + env-allowlist cross-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: shellcheck every deploy/ script
+        # The two -path prunes are VENDORED THIRD-PARTY BUILD INPUTS, not our scripts:
+        # deploy/images/hermes-agent/src is a `git archive` of the pinned upstream hermes commit
+        # (produced by prepare-vendor.sh) and carries upstream's own shell scripts. Both are
+        # .gitignore'd, so CI on a clean checkout never sees them — but a DEVELOPER who has run
+        # prepare-vendor.sh and then runs this exact command locally does, and gets a red result
+        # for someone else's code. Pruning them keeps the local run and the CI run identical,
+        # which is the only way this gate stays trusted.
+        run: |
+          find deploy \
+            -path 'deploy/images/hermes-agent/src' -prune -o \
+            -path 'deploy/images/eve-runtime/vendor' -prune -o \
+            -name '*.sh' -print0 | xargs -0 shellcheck -S warning
+          shellcheck -S warning scripts/merge-green.sh scripts/merge-green-selftest.sh
+      - name: merge-green.sh self-test (the merge gate must refuse when it should)
+        run: scripts/merge-green-selftest.sh
+      # start-all.sh sources deploy/.env WITHOUT `set -a` (so the public edge cannot inherit
+      # plane secrets) and hands each process only the vars in its own prefix block; the systemd
+      # path renders one env file per unit the same way. A var missing from the block that should
+      # carry it is NOT an error — it is invisible, and the process runs on its own default. This
+      # step cross-references both host paths against deploy/env-allowlist.conf, in both
+      # directions, plus .env.example and docs/operations/CONFIGURATION.md.
+      - name: env-allowlist cross-check (a dropped var is silent, so it has to be machine-checked)
+        run: deploy/check-env-allowlist.sh
+
+  app-image:
+    name: app image build-only (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [edge, broker]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      - name: build feir-os-${{ matrix.target }} (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: app/Dockerfile
+          push: false
+          tags: feir-os-${{ matrix.target }}:ci
+          build-args: |
+            TARGET=${{ matrix.target }}
+            TAGS=pg oidc
+          cache-from: type=gha,scope=feir-os-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=feir-os-${{ matrix.target }}
+
+  ci-required:
+    name: ci-required
+    if: always()
+    needs:
+      - changes
+      - langchain-python
+      - langchain-typescript
+      - frontend-browser
+      - go
+      - deploy-render
+      - eve-isolated-node
+      - shellcheck
+      - app-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: every required job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        # Every needed job must be "success". The ONE exception: frontend-browser may be
+        # "skipped", and only when the changes gate explicitly decided web == "false". A skip
+        # for any other reason (an upstream failure cascading, a cancelled run) still fails.
+        run: |
+          echo "$NEEDS" | jq -e '
+            .changes.outputs.web as $web
+            | to_entries
+            | all(.value.result == "success"
+                  or (.key == "frontend-browser" and .value.result == "skipped" and $web == "false"))'

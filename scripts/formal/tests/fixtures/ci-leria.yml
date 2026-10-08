@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  schedule:
+    - cron: '41 5 * * *'   # daily re-check of main; main-health reads this run
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  go:
+    name: build + vet + lint + test + conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod   # go 1.25.5
+      # `make lint` = python3 tools/lint_enums.py + --self-test (canonical enum contract).
+      # Deps (modernc.org/sqlite, pure-Go) fetch from the standard Go proxy; the Socket Firewall /
+      # GOPROXY shim (tools/goproxyshim) is a local-macOS-only wrapper, not used in CI.
+      # Test targets run with -count=1 (see Makefile) so results are never served from cache.
+      - run: make build
+      - run: make fmt-check
+      - run: make vet
+      - run: make lint
+      - run: make test
+      - run: make test-race
+      - run: make conformance
+
+  ci-required:
+    name: ci-required
+    if: always()
+    needs: [go]
+    runs-on: ubuntu-latest
+    steps:
+      - name: every required job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: echo "$NEEDS" | jq -e 'to_entries | all(.value.result == "success")'
