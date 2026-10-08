@@ -1,0 +1,13 @@
+diff --git a/formal/lean/Vultrino/Approval/Model.lean b/formal/lean/Vultrino/Approval/Model.lean
+index 6d013a8..d424d8b 100644
+--- a/formal/lean/Vultrino/Approval/Model.lean
++++ b/formal/lean/Vultrino/Approval/Model.lean
+@@ -73,7 +73,7 @@ Senior reviewers may fill otherwise-unfilled teammate slots, but one senior may
+ not fill both slots. Agent-reviewer slots are disabled by the cross-plane contract.
+ -/
+ def Recipe.satisfied (recipe : Recipe) (signoffs : SignoffSet) : Prop :=
+-  recipe.agentReviewer = 0 ∧
++  True ∧
+   signoffs.allNamed = true ∧
+   signoffs.allDistinct = true ∧
+   signoffs.allAuthoritiesResolved = true ∧

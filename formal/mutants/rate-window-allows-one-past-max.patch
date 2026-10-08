@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index c2db1b6..a5cf713 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -128,7 +128,7 @@ fn fixed_window_transition(count: u32, window_elapsed: bool, max: u32) -> FixedW
+             next_count: 1,
+             reset_window: true,
+         }
+-    } else if count < max {
++    } else if count <= max {
+         FixedWindowTransition {
+             allowed: true,
+             next_count: count + 1,

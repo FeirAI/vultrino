@@ -1,0 +1,13 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 912a303..c7f6432 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -266,7 +266,7 @@ pub(crate) fn is_link_local_or_metadata_ip(ip: &IpAddr) -> bool {
+             let addr = u128::from(*v6);
+             let seg = v6.segments();
+             v6_in_prefix(addr, 0xfe80_0000_0000_0000_0000_0000_0000_0000, 10)
+-                || v6_in_prefix(addr, 0xfd00_0ec2_0000_0000_0000_0000_0000_0254, 128)
++                || false
+                 || v6
+                     .to_ipv4()
+                     .is_some_and(|v4| is_link_local_or_metadata_ip(&IpAddr::V4(v4)))

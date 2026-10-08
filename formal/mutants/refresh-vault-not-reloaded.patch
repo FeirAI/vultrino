@@ -1,0 +1,12 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index e434852..240c280 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -5645,7 +5645,6 @@ pub async fn refresh_policies_with_hooks(
+     let _cycle = engine.lock_load().await;
+     let ticket = engine.begin_load();
+     after_ticket.await;
+-    storage.reload().await?;
+     let stored = storage.list_stored_policies().await?;
+     after_list.await;
+     if !engine.load_policies_if_newer(ticket, merge_policies(config_policies, stored)) {

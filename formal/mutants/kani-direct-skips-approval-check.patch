@@ -1,0 +1,14 @@
+diff --git a/src/formal_kernel.rs b/src/formal_kernel.rs
+index 77fbf66..a9c56be 100644
+--- a/src/formal_kernel.rs
++++ b/src/formal_kernel.rs
+@@ -99,9 +99,6 @@ impl ExecutionPermit {
+         if !policy_allows {
+             return Err(PermitError::PolicyDenied);
+         }
+-        if approval_required {
+-            return Err(PermitError::ApprovalRequired);
+-        }
+         Ok(Self {
+             binding,
+             basis: PermitBasis::Direct,

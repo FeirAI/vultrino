@@ -1,0 +1,14 @@
+diff --git a/src/govder/mod.rs b/src/govder/mod.rs
+index 62814ba..96906b0 100644
+--- a/src/govder/mod.rs
++++ b/src/govder/mod.rs
+@@ -110,8 +110,7 @@ impl GovderConfig {
+     pub fn approval_verification_secret(&self) -> Option<&str> {
+         match self.approval_assertion_secret.as_deref() {
+             Some(m) if self.approval_key_is_distinct() => Some(m),
+-            _ if self.allow_shared_approval_key => Some(&self.assertion_secret),
+-            _ => None,
++            _ => Some(&self.assertion_secret),
+         }
+     }
+ 

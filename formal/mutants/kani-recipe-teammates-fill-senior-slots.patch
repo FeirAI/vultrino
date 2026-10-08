@@ -1,0 +1,17 @@
+diff --git a/src/approval/mod.rs b/src/approval/mod.rs
+index 7f5f5db..6208a0c 100644
+--- a/src/approval/mod.rs
++++ b/src/approval/mod.rs
+@@ -2177,10 +2177,10 @@ fn recipe_satisfied(
+     if need_agent_reviewer > 0 {
+         return false;
+     }
+-    if avail_senior < need_senior {
++    if avail_senior.saturating_add(avail_teammate) < need_senior {
+         return false; // senior slots can ONLY be filled by seniors
+     }
+-    let leftover_senior = avail_senior - need_senior;
++    let leftover_senior = avail_senior.saturating_sub(need_senior);
+     if leftover_senior.saturating_add(avail_teammate) < need_teammate {
+         return false;
+     }

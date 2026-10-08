@@ -1,0 +1,1015 @@
+{
+  "schema": 1,
+  "$comment": "Register of formal and test evidence for vultrino. See docs/dev/FORMAL.md. Only a CI run counts as evidence of record.",
+  "overclaim_denylist": {
+    "phrases": [
+      "formally verified",
+      "proven secure",
+      "provably secure",
+      "fully verified",
+      "complete proof",
+      "proves the implementation",
+      "guaranteed secure",
+      "cannot be bypassed",
+      "impossible to bypass",
+      "end-to-end proof",
+      "proven correct",
+      "fully proven",
+      "mathematically proven",
+      "verified implementation",
+      "cannot leak",
+      "unbreakable",
+      "tamper-proof",
+      "refinement gate prove",
+      "gates prove enforcement",
+      "proves enforcement"
+    ],
+    "globs": [
+      "README.md",
+      "docs/**/*.md",
+      "formal/**/*.md"
+    ]
+  },
+  "mutants": {
+    "permit-direct-skips-approval-check": {
+      "tier": "fast"
+    },
+    "permit-authorize-skips-binding-check": {
+      "tier": "full"
+    },
+    "kani-direct-skips-approval-check": {
+      "tier": "full"
+    },
+    "kani-epoch-wraps": {
+      "tier": "full"
+    },
+    "recipe-agent-reviewer-guard-removed": {
+      "tier": "fast"
+    },
+    "kani-recipe-teammates-fill-senior-slots": {
+      "tier": "full"
+    },
+    "kani-recipe-zero-count-allowed": {
+      "tier": "full"
+    },
+    "kani-recipe-leftover-senior-ignored": {
+      "tier": "full"
+    },
+    "ssrf-prefix-mask-off-by-one": {
+      "tier": "fast"
+    },
+    "ssrf-6to4-embedded-ipv4-not-decoded": {
+      "tier": "full"
+    },
+    "refresh-stale-load-overwrites-newer": {
+      "tier": "fast"
+    },
+    "refresh-load-lock-removed": {
+      "tier": "full"
+    },
+    "rate-window-allows-one-past-max": {
+      "tier": "fast"
+    },
+    "sb02-short-minted-secret-not-withheld": {
+      "tier": "fast"
+    },
+    "sb02-minted-access-token-not-scrubbed": {
+      "tier": "full"
+    },
+    "sb04-shared-key-fallback-without-escape": {
+      "tier": "full"
+    },
+    "sb04-equal-key-counts-as-distinct": {
+      "tier": "fast"
+    },
+    "refinement-binding-field-dropped": {
+      "tier": "fast"
+    },
+    "lean-approval-freshness-check-dropped": {
+      "tier": "full"
+    },
+    "vectors-leftover-senior-ignored": {
+      "tier": "full"
+    },
+    "sweeps-zero-count-allowed": {
+      "tier": "full"
+    },
+    "greedy-leftover-senior-ignored": {
+      "tier": "full"
+    },
+    "stage1-closed-state-redecided": {
+      "tier": "full"
+    },
+    "stage1-blank-identity-accepted": {
+      "tier": "full"
+    },
+    "stage1-extreme-tier-not-forced": {
+      "tier": "fast"
+    },
+    "stage1-unknown-class-parsed": {
+      "tier": "full"
+    },
+    "stage1-unusable-credential-not-blocked": {
+      "tier": "full"
+    },
+    "roundtrip-blank-identity-accepted": {
+      "tier": "full"
+    },
+    "ssrf-metadata-v6-row-dropped": {
+      "tier": "full"
+    },
+    "ssrf-link-local-nat64-not-decoded": {
+      "tier": "full"
+    },
+    "internal-http-alibaba-metadata-admitted": {
+      "tier": "fast"
+    },
+    "internal-http-aws-v6-metadata-admitted": {
+      "tier": "full"
+    },
+    "refresh-vault-not-reloaded": {
+      "tier": "full"
+    },
+    "lean-authority-binding-equality-dropped": {
+      "tier": "full"
+    },
+    "lean-action-authority-label-guard-inverted": {
+      "tier": "full"
+    },
+    "lean-criticality-human-floor-direct-when-approvals-off": {
+      "tier": "full"
+    },
+    "lean-confinement-raw-credential-to-agent": {
+      "tier": "full"
+    },
+    "lean-confinement-retained-tail-one-short": {
+      "tier": "full"
+    },
+    "lean-method-caller-verb-accepted": {
+      "tier": "full"
+    },
+    "lean-startup-policy-hash-check-dropped": {
+      "tier": "full"
+    },
+    "lean-model-agent-reviewer-guard-dropped": {
+      "tier": "full"
+    }
+  },
+  "claims": [
+    {
+      "id": "permit-kernel-tests",
+      "statement": "The execution-permit constructor for the direct path refuses a policy denial and refuses an approval-required request, and a permit refuses a dispatch binding whose action differs from the one it was minted for, in the unit tests that exercise those two functions.",
+      "method": "test",
+      "artifacts": [
+        "src/formal_kernel.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact formal_kernel::tests::direct_permit_refuses_deny_and_approval_required formal_kernel::tests::exact_binding_prevents_action_substitution",
+      "covers": [
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "ExecutionPermit::direct",
+          "sha256": "14d153c362a4983d6f2c86b67c1aa6f3f679aabe276d24a09fc19a3744013d9e"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "ExecutionPermit::authorize",
+          "sha256": "07370676bc18906fecd7774845f7becd1dd187c4d142df29b636f1ea78fee616"
+        }
+      ],
+      "mutants": [
+        "permit-direct-skips-approval-check",
+        "permit-authorize-skips-binding-check"
+      ],
+      "does_not_establish": "Two example-based tests, not a proof. The binding test substitutes only the action field; a comparison that ignored another binding field would not be caught here. Says nothing about ExecutionPermit::approved, about the grant evidence it consumes, or about whether every dispatch site goes through a permit (the structural refinement gate checks only the dispatch seam count). Production does not constrain admission through this kernel: it mints the permit with literal arguments (direct(binding.clone(), true, false) and approved(binding.clone(), true, true, ...) in src/server/mod.rs), after the admission decision has already been made, and then calls authorize against the binding the permit was minted from. So this claim does not constrain the production admission decision or the dispatched payload. VUL-05 (a non-tautological permit kernel) is the open fix."
+    },
+    {
+      "id": "kani-permit-kernel",
+      "statement": "Kani bounded model checking (0.67.0, pure-kernel build without wasm plugins) exhausts the boolean inputs of ExecutionPermit::direct and shows it admits exactly when policy allows and approval is not required, and shows next_epoch never wraps (it returns None at u64::MAX). Each harness carries kani::cover statements that the CI vacuity gate requires to be satisfiable.",
+      "method": "kani",
+      "artifacts": [
+        "src/formal_kernel.rs",
+        "formal/run-kani.sh"
+      ],
+      "gates": [
+        "kani"
+      ],
+      "detector": "set -e; for h in formal_kernel::kani_proofs::direct_permit_truth_table_is_exact formal_kernel::kani_proofs::execution_epoch_never_wraps; do cargo kani --no-default-features --harness $h --exact; done",
+      "covers": [
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "ExecutionPermit::direct",
+          "sha256": "14d153c362a4983d6f2c86b67c1aa6f3f679aabe276d24a09fc19a3744013d9e"
+        },
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "next_epoch",
+          "sha256": "f8c56348027b56b2687e52d0931549cd5842659fa6f5cfa3dec5c0d89e7110ea"
+        }
+      ],
+      "mutants": [
+        "kani-direct-skips-approval-check",
+        "kani-epoch-wraps"
+      ],
+      "does_not_establish": "The vacuity (cover) check lives in formal/run-kani.sh, not in this detector, which checks only that the harnesses verify. Covers the pure functions only: not ExecutionPermit::approved, not the durable one-shot storage fence that uses the epoch, and nothing under the wasm-plugins feature (Kani cannot build it). Production does not constrain admission through this kernel: it mints the permit with literal arguments (direct(binding.clone(), true, false) and approved(binding.clone(), true, true, ...) in src/server/mod.rs), after the admission decision has already been made, and then calls authorize against the binding the permit was minted from. So this claim does not constrain the production admission decision or the dispatched payload. VUL-05 (a non-tautological permit kernel) is the open fix."
+    },
+    {
+      "id": "recipe-unit-tests",
+      "statement": "A recipe that requires an agent-reviewer term can never be satisfied even when fully signed, a recipe with an over-cap or overflowing count is unsatisfiable, and a senior sign-off on one aggregator key cannot fabricate several teammate slots, in the named unit tests.",
+      "method": "test",
+      "artifacts": [
+        "src/approval/mod.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::tests::recipe_with_agent_reviewer_term_is_unsatisfiable_even_when_fully_signed approval::tests::recipe_over_cap_or_overflow_count_is_unsatisfiable approval::tests::recipe_hard_sod_senior_cannot_fabricate_teammate_slots_via_one_key",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "class_fills_a_slot",
+          "sha256": "0bdcbd25fe72770869fb83e4c7efc13324c8f0a5cf3ff346d6d7254ff9c57433"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_well_formed",
+          "sha256": "14f21e8791f51c93676c9018ad11055ed6d52dc8f376bb1e2fda85f809eb4ac8"
+        }
+      ],
+      "mutants": [
+        "recipe-agent-reviewer-guard-removed"
+      ],
+      "does_not_establish": "Three example-based tests. They do not cover every recipe shape (see the Kani claims for bounded exhaustive coverage), the sign-off collection and deduplication code, or the match between these rules and govder's recipe evaluator."
+    },
+    {
+      "id": "kani-recipe-safety",
+      "statement": "Kani bounded model checking (0.67.0) over symbolic three-term recipes (4-iteration unwind), plus fixed empty, one-term and two-term malformed shapes in the malformed-recipe harness, shows: no recipe is satisfied with zero approvers, satisfaction never underfills a slot, malformed recipes are never satisfied, and the per-term cap prevents slot-need overflow.",
+      "method": "kani",
+      "artifacts": [
+        "src/approval/mod.rs",
+        "formal/run-kani.sh"
+      ],
+      "gates": [
+        "kani"
+      ],
+      "detector": "set -e; for h in approval::kani_recipe_proofs::zero_approvers_never_satisfy approval::kani_recipe_proofs::satisfaction_never_underfills_a_slot approval::kani_recipe_proofs::malformed_recipes_never_satisfy approval::kani_recipe_proofs::recipe_cap_prevents_need_overflow; do cargo kani --no-default-features --harness $h --exact; done",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_well_formed",
+          "sha256": "14f21e8791f51c93676c9018ad11055ed6d52dc8f376bb1e2fda85f809eb4ac8"
+        }
+      ],
+      "mutants": [
+        "kani-recipe-teammates-fill-senior-slots",
+        "kani-recipe-zero-count-allowed"
+      ],
+      "does_not_establish": "Recipes with more than three terms or sign-off counts beyond the harness bounds. The cover (vacuity) check is in formal/run-kani.sh, not in this detector. Says nothing about sign-off collection, identity deduplication or separation of duties."
+    },
+    {
+      "id": "kani-recipe-greedy",
+      "statement": "Kani bounded model checking (0.67.0) shows the greedy senior-first slot assignment in recipe_satisfied agrees with an exhaustive assignment search at the harness bound of 5, that satisfaction is monotone in the number of available approvers, and that class_fills_a_slot agrees with satisfaction.",
+      "method": "kani",
+      "artifacts": [
+        "src/approval/mod.rs",
+        "formal/run-kani.sh"
+      ],
+      "gates": [
+        "kani"
+      ],
+      "detector": "set -e; for h in approval::kani_recipe_proofs::greedy_matches_exhaustive_assignment_at_bound_5 approval::kani_recipe_proofs::satisfaction_is_monotone_in_availability approval::kani_recipe_proofs::class_slot_contribution_agrees_with_satisfaction; do cargo kani --no-default-features --harness $h --exact; done",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "class_fills_a_slot",
+          "sha256": "0bdcbd25fe72770869fb83e4c7efc13324c8f0a5cf3ff346d6d7254ff9c57433"
+        }
+      ],
+      "mutants": [
+        "kani-recipe-leftover-senior-ignored"
+      ],
+      "does_not_establish": "The agreement is for availability and recipe counts within the harness bound of 5, not for all u32 values. The cover (vacuity) check is in formal/run-kani.sh, not in this detector. The exhaustive reference is written in the same harness module, so a shared misreading of the intended rule would not be caught."
+    },
+    {
+      "id": "ssrf-special-purpose",
+      "statement": "The outbound-request address classifier blocks the first and last address of every IANA special-purpose registry row marked not globally reachable, as transcribed by hand into the test (plus 2001::/23 and multicast), and keeps the tested neighbouring addresses reachable, and it decodes IPv4 carried in IPv4-mapped, NAT64 and 6to4 IPv6 addresses before classifying, in the named unit tests.",
+      "method": "test",
+      "artifacts": [
+        "src/plugins/http.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact plugins::http::tests::test_sb22_special_purpose_ranges_blocked_and_neighbours_allowed plugins::http::tests::test_sb22_registry_blocks_first_and_last_address_blocked plugins::http::tests::test_sb22_wrapped_special_purpose_ipv4_stays_blocked plugins::http::tests::test_sb22_tables_are_well_formed plugins::http::tests::test_ssrf_blocks_nat64_and_6to4_embedded_private plugins::http::tests::test_ssrf_blocks_cgnat_range",
+      "covers": [
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "HttpPlugin::is_private_ip",
+          "sha256": "3bb8f57c7f5d01fdd26466173dfcc84ecb0dd752acc8b0bb1734bd286cd8e3a3"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "HttpPlugin::is_ipv4_mapped_private",
+          "sha256": "cf4b1cf92f6d471214f62e7c80181974954e4bac29f0c7cf828646acf4bd7cc6"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "embedded_v4",
+          "sha256": "f50176eebcbbbb35965b08611771b248761ac3bc9536c17d2a68eb19aa7ae87d"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "ipv4_is_special_purpose",
+          "sha256": "0af5036785f3f5a60f4bba5e625e14f11f2a35d5a03ad9be1b006b2acd6f2566"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "ipv6_is_special_purpose",
+          "sha256": "f9ae79887776e869dddb2b6c6b38f748b079939cfd9e02f2f09634a867d36ffa"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "v4_in_prefix",
+          "sha256": "168c4dc820ca81935396295150b5271e6a2e43d5151b3425a0d1c6398795ce4d"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "v6_in_prefix",
+          "sha256": "fe121225133cb10c44819a6e1e15ce8db30080b90fe971d2f98d294189d07019"
+        }
+      ],
+      "mutants": [
+        "ssrf-prefix-mask-off-by-one",
+        "ssrf-6to4-embedded-ipv4-not-decoded"
+      ],
+      "does_not_establish": "Table-driven tests over listed addresses, not an exhaustive check of the address space. The registry rows were transcribed by hand from IANA tables retrieved on one date. The drift lock covers the functions, not the IPV4_BLOCKED and IPV6_BLOCKED constants (the tests are the only guard on the rows). DNS rebinding, redirects and proxies are separate controls this claim does not cover."
+    },
+    {
+      "id": "policy-refresh-ordering",
+      "statement": "A periodic policy refresh that has already listed stored policies cannot overwrite a newer admin reload that carries a kill policy: both load paths take one in-process async load lock across ticket, vault re-read, list and apply (with a ticket compare as a second guard), in a scripted interleaving test that starts an admin write and reload inside the refresh window, waits 150 ms, and checks the admin reload has not finished and the kill policy survives. A second scripted interleaving (the refresh takes its ticket first, a local admin reload waits, then another process writes a kill policy to the same vault) checks that the refresh re-reads the vault and the kill policy becomes live.",
+      "method": "test",
+      "artifacts": [
+        "src/policy/mod.rs",
+        "src/server/mod.rs",
+        "tests/approval_token_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact test_refresh_listing_before_kill_policy_cannot_overwrite_newer_admin_reload test_refresh_taking_ticket_first_still_applies_cross_process_kill_policy",
+      "covers": [
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::lock_load",
+          "sha256": "cf893a631251d670d14453eee0feade8760846b35d573bfe4711772ba0243add"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::begin_load",
+          "sha256": "5a74ac12b25ae5f5b20492b820beaa14bfb958ee3793517cd0c393cf7b93d646"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::load_policies_if_newer",
+          "sha256": "3b860a4dccbbee01b2edd3c1d49bdbc0240a99257c5aee3f2d62363e8aead0e5"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "refresh_policies_once",
+          "sha256": "2e4d9abf5d5f703460882ac66e3e39564368255aec7172ade19dcd2b92ed6c17"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "refresh_policies_after_list",
+          "sha256": "56adab1ff5935cdd86ee64c332772103600a834ebd3c0809e7a94a727ef28697"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "refresh_policies_with_hooks",
+          "sha256": "97141188534a1340132d17b169db8849caabc94c78cd85414345e1e095ebc282"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::reload_policies",
+          "sha256": "09d865612c11111e1fc95b0800f7676492fe7cc4a20a4a6c85f08e0876ba9ecd"
+        }
+      ],
+      "mutants": [
+        "refresh-stale-load-overwrites-newer",
+        "refresh-load-lock-removed",
+        "refresh-vault-not-reloaded"
+      ],
+      "does_not_establish": "Two scripted interleavings, not a model of all schedules. The wait check relies on a 150 ms sleep: on a very slow machine a mutant could survive, but the unmutated code cannot fail it, because the admin reload is blocked on the lock. The lock is per process: another process's write becomes visible only on the next refresh tick, so cross-process visibility is bounded-staleness, not instant. Cross-process visibility in the second test is the same bounded staleness: the test writes before the refresh re-read, it does not show the write is seen if it lands after. Removing only the ticket compare (the second guard) is not detected by this test. Does not cover other policy load paths that call load_policies directly (construction and tests) or a lost write in storage itself."
+    },
+    {
+      "id": "rate-limiter-vectors",
+      "statement": "The fixed-window rate limiter transition function reproduces, byte for byte, the committed trace fixture formal/vectors/rate_limiter_traces.json (cold start, sub-window lag, exact whole-window lag, two-window lag), and an invalid limiter (max 0 or window 0) denies without creating state.",
+      "method": "test",
+      "artifacts": [
+        "src/policy/mod.rs",
+        "formal/vectors/rate_limiter_traces.json",
+        "formal/vectors/README.md"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact policy::tests::fixed_window_trace_fixture_is_generated_by_production_transition policy::tests::invalid_rate_limit_dimensions_deny_without_creating_state",
+      "covers": [
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "fixed_window_transition",
+          "sha256": "4c8f24aa779318b2a211a1291cfc24037d56a678964ea79bb97207781a94a142"
+        }
+      ],
+      "mutants": [
+        "rate-window-allows-one-past-max"
+      ],
+      "does_not_establish": "The fixture is generated by the same function it checks, so it pins current behaviour against silent change; it is not an independent specification. A govder consumer of the same fixture exists only on an unmerged govder branch, so no cross-repo agreement is established. The Instant-based adapter that feeds window_elapsed is not covered."
+    },
+    {
+      "id": "sb02-minted-scrub",
+      "statement": "A credential minted or refreshed during an action (OAuth2 refresh, Google service-account mint) is added to the scrub set, so an upstream that reflects it in headers or body does not leak it to the agent on the buffered and streamed paths; a minted secret shorter than the redaction floor causes the whole response to be withheld on both paths, in the named integration tests.",
+      "method": "test",
+      "artifacts": [
+        "src/egress.rs",
+        "tests/llm_proxy_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test llm_proxy_integration -- --exact sb02_buffered_oauth2_refreshed_token_reflected_is_scrubbed sb02_buffered_google_sa_minted_token_reflected_is_scrubbed sb02_streamed_oauth2_refreshed_token_reflected_is_scrubbed sb02_streamed_google_sa_minted_token_reflected_is_scrubbed sb02_buffered_short_minted_token_withholds_response sb02_streamed_short_minted_token_withholds_response sb02_streamed_compressed_short_minted_token_withholds_like_buffered sb02_streamed_compressed_response_still_persists_updated_credential",
+      "covers": [
+        {
+          "path": "src/egress.rs",
+          "symbol": "has_unredactable_secret",
+          "sha256": "deb5b08071dfcb15100b1b054538ea8c561771d8dffc4f3462102aaa28297a2d"
+        },
+        {
+          "path": "src/egress.rs",
+          "symbol": "confine_response",
+          "sha256": "2f214ad9a82ff772700452a2b034da9861b73a169002b67a49c86fef61fcfd6e"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "CredentialData::secret_material",
+          "sha256": "67151060ce2ff10aa5f24fc333457b6e47c69c05b6ac3d6ddaf248c134022be6"
+        }
+      ],
+      "mutants": [
+        "sb02-short-minted-secret-not-withheld",
+        "sb02-minted-access-token-not-scrubbed"
+      ],
+      "does_not_establish": "Mock plugins reflecting fixed token shapes; other reflection encodings and other credential types are not tested here. The drift lock does not cover the server dispatch code in src/server/mod.rs that extends the scrub set (the integration tests are its only guard). A plugin error path that echoes a minted secret is a documented residual in docs/dev/LIMITATIONS.md."
+    },
+    {
+      "id": "sb04-approval-key",
+      "statement": "Verified approver decisions use a dedicated approval key only: with the key unset, equal to the shared govder key, or equal after trimming whitespace, verified approvals are disabled unless the explicit shared-key escape is set, in the named unit tests.",
+      "method": "test",
+      "artifacts": [
+        "src/govder/mod.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact govder::tests::approval_key_unset_or_equal_to_shared_key_disables_verified_approvals govder::tests::shared_key_escape_verifies_with_f_and_warns_at_every_startup",
+      "covers": [
+        {
+          "path": "src/govder/mod.rs",
+          "symbol": "GovderConfig::approval_verification_secret",
+          "sha256": "56d6d6b8660931e0d73481f3b41e00fd54ba3dac8ca6fdb8efdb65ea18757316"
+        },
+        {
+          "path": "src/govder/mod.rs",
+          "symbol": "GovderConfig::approval_key_is_distinct",
+          "sha256": "7593a6cab45db92edbd4c55f4537fcaebb262d689958dd1e6447662ab3e5aefd"
+        }
+      ],
+      "mutants": [
+        "sb04-shared-key-fallback-without-escape",
+        "sb04-equal-key-counts-as-distinct"
+      ],
+      "does_not_establish": "The unit tests cover the key-selection function. They pad only the shared key; the dedicated key is trimmed at load by approval_assertion_secret_from_env, which is not drift-locked and not exercised here. The 403 on the decision route (api_decide_approval) has route-level tests in tests/web_smoke.rs that run in the rust job, but they are not registered, not run by this detector and not drift-locked. Key strength, key distribution and whether the broker signs with the dedicated key are operational matters."
+    },
+    {
+      "id": "refinement-structural",
+      "statement": "formal/check-refinement.py checks source shape only: the Rust ExecutionBinding field list equals the Lean RequestBinding field list, and a fixed list of seams, strings and Lean theorem names are still present in the source. Register this as a structural gate, not a refinement proof.",
+      "method": "test",
+      "artifacts": [
+        "formal/check-refinement.py",
+        "formal/check-refinement.sh",
+        "src/formal_kernel.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "python3 formal/check-refinement.py",
+      "covers": [
+        {
+          "path": "src/formal_kernel.rs",
+          "symbol": "*",
+          "sha256": "c3fea22a66e1ab11c719e5da5ae0d699e7aef81d5cc2c1527b8260606fe02882"
+        }
+      ],
+      "mutants": [
+        "refinement-binding-field-dropped"
+      ],
+      "does_not_establish": "Semantic refinement of Rust by the Lean model. It greps for strings and counts call sites; code can keep every string and still behave differently. The drift lock covers src/formal_kernel.rs only, while the script reads many other files."
+    },
+    {
+      "id": "lean-approval-execution",
+      "statement": "Model-level result: in the hand-written Lean model of the execution boundary, every reachable state records only properly authorized executions and never consumes the same approval binding twice (Approval.reachable_execution_is_proper and reachable_approval_consumption_is_one_shot), checked with lake build --wfail.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Approval/ExecutionSafety.lean",
+        "formal/lean/Vultrino/Approval/Model.lean",
+        "formal/lean/check-nanoda.sh"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Approval/ExecutionSafety.lean",
+          "symbol": "*",
+          "sha256": "92c9c6346acab8ba6c93407495a19769d4b6be88e9e832325b8f3282ac11d1a8"
+        },
+        {
+          "path": "formal/lean/Vultrino/Approval/Model.lean",
+          "symbol": "*",
+          "sha256": "839e7004e3ef32d46d4ef2c3d49f5d679b72a7a312f17e76a3666c817360ff58"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
+        }
+      ],
+      "mutants": [
+        "lean-approval-freshness-check-dropped"
+      ],
+      "does_not_establish": "A property of the Lean model, not of the Rust code: the model is hand-written and not extracted from Rust, and the link is the structural refinement gate only. The detector runs lake build, not the independent nanoda check that CI also runs. ExecutionSafety.lean, Model.lean and Types.lean are drift-locked. The one-shot theorem is stated over the consumed-binding list: it means at most one execution per approval binding only together with State.afterExecute recording every approved binding (a model change that stopped recording would keep the theorem true). reachable_execution_is_proper holds by construction (an Execution carries its permit, and proper_of_permit makes every Execution proper), so it shows nothing about the transition system. The one-shot theorem is per RequestBinding, which includes the execution epoch, and the Rust code mints a fresh epoch per claim, so this is not at most one execution per approval id."
+    },
+    {
+      "id": "recipe-shared-vectors",
+      "method": "differential-vectors",
+      "statement": "vultrino's recipe satisfaction function agrees with the committed shared vector file src/approval/testdata/recipe_vectors.json (byte-identical to govder internal/oversight/testdata/recipe_vectors.json; both sides pin its sha256), including the rows that are unrepresentable and the rows whose agent-reviewer terms must be unsatisfiable.",
+      "artifacts": [
+        "src/approval/recipe_conformance.rs",
+        "src/approval/testdata/recipe_vectors.json"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::recipe_conformance::vectors_satisfied_matches_the_shared_contract approval::recipe_conformance::vectors_unrepresentable_rows_really_are_unrepresentable approval::recipe_conformance::vectors_agent_reviewer_terms_are_unsatisfiable",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_well_formed",
+          "sha256": "14f21e8791f51c93676c9018ad11055ed6d52dc8f376bb1e2fda85f809eb4ac8"
+        }
+      ],
+      "mutants": [
+        "vectors-leftover-senior-ignored"
+      ],
+      "does_not_establish": "Agreement only on the committed vectors and on the sweep domain they were generated over. The govder half runs only in govder CI, not here: this claim shows vultrino matches the file, and the pinned hash shows the file did not change, not that govder currently matches it. Two implementations can agree and both be wrong (the exhaustive claims check correctness against an independent oracle over a bounded domain). Says nothing about sign-off collection or identity handling."
+    },
+    {
+      "id": "recipe-sweeps-exhaustive",
+      "method": "exhaustive",
+      "statement": "recipe_satisfied agrees with an independent maximum-matching oracle at every point of three committed sweeps (human axis, agent-reviewer simplex, cap cliff), senior-first greedy equals the oracle over the sweep domain, and the oracle itself is shown to discriminate a wrong implementation.",
+      "artifacts": [
+        "src/approval/recipe_conformance.rs",
+        "src/approval/testdata/recipe_vectors.json"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::recipe_conformance::sweep_human_axis_exhaustive approval::recipe_conformance::sweep_agent_reviewer_simplex_exhaustive approval::recipe_conformance::sweep_cap_cliff_exhaustive approval::recipe_conformance::greedy_senior_first_is_optimal approval::recipe_conformance::matching_oracle_is_discriminating",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_well_formed",
+          "sha256": "14f21e8791f51c93676c9018ad11055ed6d52dc8f376bb1e2fda85f809eb4ac8"
+        }
+      ],
+      "mutants": [
+        "sweeps-zero-count-allowed"
+      ],
+      "does_not_establish": "Only the sweep domains named in the vector file (small need and availability bounds plus the cap cliff). Not a proof for all counts. The oracle is a second hand-written implementation in the same test module, not an extracted specification. Sweeps check satisfaction, not sign-off collection."
+    },
+    {
+      "id": "recipe-greedy-optimal-real-cap",
+      "method": "exhaustive",
+      "statement": "At the real per-term cap of 64, the senior-first greedy rule in recipe_satisfied agrees with an independent split-search oracle on all 9,628,905 points of need (senior, teammate) with ns+nt <= 64 against availability 0..=65 plus u32::MAX for each class (no agent-reviewer slots), and the split-search oracle agrees with the unit matching oracle on the 4,500-point cube (need sum at most 8, availability 0..=9 per class).",
+      "artifacts": [
+        "src/approval/stage1_proofs.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::stage1_proofs::greedy_is_optimal_at_the_real_cap approval::stage1_proofs::split_search_oracle_agrees_with_the_unit_matching_oracle",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_satisfied",
+          "sha256": "161560582d624df1bb2522c14e335fedbb10eb0471c19a894892752a619fbec6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_needs",
+          "sha256": "3ba800beedd2f96ae9aa613dc68712f9ccb9f08c4a70c0d244465943f2edb17d"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "recipe_well_formed",
+          "sha256": "14f21e8791f51c93676c9018ad11055ed6d52dc8f376bb1e2fda85f809eb4ac8"
+        }
+      ],
+      "mutants": [
+        "greedy-leftover-senior-ignored"
+      ],
+      "does_not_establish": "Only the enumerated domain: a recipe with one senior term and one teammate term, no agent-reviewer slots (those are unsatisfiable by a fixed guard, covered by the vector claim). Availability above 65 is argued, not enumerated, to behave like 65; that argument and the finiteness of the recipe axis rest on recipe_well_formed's caps, which the Kani and vector claims cover, so this claim is a composition inside one plane. Recipes with several alternative terms are not enumerated here. The oracles are test-local code."
+    },
+    {
+      "id": "approval-lifecycle-table",
+      "method": "exhaustive",
+      "statement": "The approval decision transition accepts or rejects every one of 720 enumerated states (status, target, executed flag, veto window, approver kind, ttl expiry, identity shape) exactly as an independently written legality oracle says, including the guard order (a blank identity is refused before the ttl check).",
+      "artifacts": [
+        "src/approval/stage1_proofs.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::stage1_proofs::lifecycle_table_is_total_and_guard_order_holds approval::stage1_proofs::blank_identity_guard_runs_before_the_ttl_guard approval::stage1_proofs::an_unnamed_principal_fills_no_slot",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalRequest::transition",
+          "sha256": "99a3400485ee6c8f1170f77e85fe4eb229a2fc1b913a40c246db7e6b1aabb3b3"
+        }
+      ],
+      "mutants": [
+        "stage1-closed-state-redecided",
+        "stage1-blank-identity-accepted"
+      ],
+      "does_not_establish": "Only the 720 enumerated states, with three identity shapes and two approver kinds; no recipe-gated or multi-approver sequences (the property claim samples those). The oracle is hand-written in the test file. Says nothing about persistence, concurrency or the API layer that calls the transition. The detector also runs an_unnamed_principal_fills_no_slot, but approval_rule_satisfied and the bare-identity drop are not drift-locked and no mutant targets them, so that test is not part of this claim."
+    },
+    {
+      "id": "approval-wire-tables",
+      "method": "test",
+      "statement": "The closed wire and state decisions are enumerated over listed inputs: of ten listed risk-tier strings only Low, Medium and High (after trimming) do not force deny-on-any-deny (Extreme, blank, lower-case, upper-case and unknown spellings force it), of six listed approver-class strings only the three class names (after trimming) parse, the recipe decision-mode JSON decodes every listed shape to deny-on-any-deny except the one majority spelling, and the execution-state classifier matches its oracle over all 80 combinations of status, executed, failed and credential check.",
+      "artifacts": [
+        "src/approval/stage1_proofs.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::stage1_proofs::risk_tier_and_approver_class_wire_tables_fail_closed approval::stage1_proofs::recipe_decision_mode_json_shapes_fail_closed approval::stage1_proofs::execution_state_table_is_total_over_all_closed_axes",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "risk_tier_forces_deny_on_any_deny",
+          "sha256": "0299719bb33f7fe872728a41a115a71a40ae815c309144816329778d8d36b0f6"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApproverClass::parse_wire",
+          "sha256": "a7b99c732799336932fff81ae57c54769095a6e16bc9a086ba41d0e22172c01c"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "execution_state_at_decision",
+          "sha256": "a930b1947b65dfecf4d0c53870df0e25ff4590230922ed0038ffb8ea48935096"
+        }
+      ],
+      "mutants": [
+        "stage1-extreme-tier-not-forced",
+        "stage1-unknown-class-parsed",
+        "stage1-unusable-credential-not-blocked"
+      ],
+      "does_not_establish": "Listed spellings only (ten risk-tier strings, six class strings, nine JSON shapes), not every possible string. The execution-state oracle is a restatement of the same rules in test code. Does not show the callers use these functions on every path, nor the Lean model of execution."
+    },
+    {
+      "id": "approval-vault-roundtrip-property",
+      "method": "property",
+      "statement": "For 20,000 generated sequences of approve and deny decisions (numeric and recipe gated, several identity shapes including blank and aggregator-prefixed), every state produced by the real transition passes the vault shape check, survives a serde round trip unchanged, and passes the shape check again after decoding.",
+      "artifacts": [
+        "src/approval/stage1_proofs.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::stage1_proofs::reachable_approval_vault_roundtrip_preserves_invariants_20k",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalRequest::transition",
+          "sha256": "99a3400485ee6c8f1170f77e85fe4eb229a2fc1b913a40c246db7e6b1aabb3b3"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalRequest::validate_vault_shape",
+          "sha256": "2f75f2222359e3109382e8915e9e3bf9a67d30556e96cf909f9aea29f37f28da"
+        }
+      ],
+      "mutants": [
+        "roundtrip-blank-identity-accepted"
+      ],
+      "does_not_establish": "Random sampling with a fixed case count, not an exhaustive or symbolic check; decision sequences are at most 6 long with at most 3 required approvals. It checks that transition output satisfies validate_vault_shape, so a defect that both functions share would pass. Does not cover load-time handling of a tampered vault file beyond the shape check, nor state reached by paths other than approve and deny."
+    },
+    {
+      "id": "ssrf-link-local-config-check",
+      "method": "test",
+      "statement": "The config-time check on llm.provider_base rejects the link-local and cloud-metadata range in every listed spelling (dotted, decimal and hex IPv4, IPv4-mapped, IPv4-compatible, NAT64, 6to4, fe80::/10, the AWS IPv6 metadata address) and accepts the listed neighbouring addresses, through is_link_local_or_metadata_ip.",
+      "artifacts": [
+        "src/plugins/http.rs",
+        "src/capability/mod.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact capability::tests::test_llm_validate_ssrf_narrowed_to_link_local",
+      "covers": [
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "is_link_local_or_metadata_ip",
+          "sha256": "cdf4953522a4ff91be20a0d64f9623a8f9b044001c2f75a3ceece898ba9d3ef1"
+        },
+        {
+          "path": "src/capability/mod.rs",
+          "symbol": "Capability::validate",
+          "sha256": "511dada4c8fdd8d7739caa694e6ca9b7c713509e935aa968fdc3bee49ce4376e"
+        }
+      ],
+      "mutants": [
+        "ssrf-metadata-v6-row-dropped",
+        "ssrf-link-local-nat64-not-decoded"
+      ],
+      "does_not_establish": "One example-based test over listed spellings, not the address space. This is a config-time defence in depth; the execute-time classifier is covered by ssrf-special-purpose. Hostnames that resolve to metadata addresses (DNS), redirects and a provider_base changed after validation are not covered. Loopback and RFC1918 provider bases are deliberately allowed."
+    },
+    {
+      "id": "internal-http-allowlist",
+      "method": "test",
+      "statement": "On the listed addresses, the internal_http destination classifier admits the loopback, RFC1918, CGNAT and unique-local examples, refuses the link-local, documentation, multicast, broadcast, NAT64 and 6to4 examples and the Alibaba (100.100.100.200) and AWS IPv6 (fd00:ec2::254) metadata endpoints, and each admitted example is one the public-only http guard refuses.",
+      "artifacts": [
+        "src/plugins/internal_http.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact plugins::internal_http::tests::internal_address_space_is_an_allowlist_and_excludes_metadata",
+      "covers": [
+        {
+          "path": "src/plugins/internal_http.rs",
+          "symbol": "is_internal_destination_ip",
+          "sha256": "8dde411c196bf26ad228f37fe7741983c31deea25bbbdbed1c7b9acfad6efaa6"
+        }
+      ],
+      "mutants": [
+        "internal-http-alibaba-metadata-admitted",
+        "internal-http-aws-v6-metadata-admitted"
+      ],
+      "does_not_establish": "Listed addresses only, not an exhaustive check of the address space. Says nothing about hostname resolution, redirects or connect-time rebinding for internal_http, nor the allowlist configured per capability. Other cloud metadata endpoints not on the list are not tested."
+    },
+    {
+      "id": "lean-approval-authority",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): a broker-verified approval identity has exactly the tenant, approval id, outcome, subject, class, method, path, query, host and body digest that its evidence bound (verified_broker_identity_is_exact), evidence cannot validate any changed tuple (changed_binding_rejected), and a bare aggregator-key claim carries no independent-authentication witness while a verified broker claim is named.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Approval/Authority.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Approval.Authority --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Approval/Authority.lean",
+          "symbol": "*",
+          "sha256": "7cb612d3debb64b368207c6c96e6bb073fcf1e3450f9e872cb1503950d994115"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
+        }
+      ],
+      "mutants": [
+        "lean-authority-binding-equality-dropped"
+      ],
+      "does_not_establish": "These theorems unfold the definitions they are about (validFor requires binding equality, and independentlyAuthenticated is defined per evidence kind), so they pin those definitions against change rather than derive new facts. Nothing about the MAC primitive, the HTTP parser or the TTL clock source, which are trusted-computing-base assumptions. The one-positive-slot-per-key guard for aggregator claims is not modelled here, only that such claims are not independent. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-approval-action-authority",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): a canonical plugin verb shared by several business labels cannot open the weaker numeric approval path when no exact rule is found, production strict posture refuses an inconclusive recipe answer, and approval resume requires the same recipe authority and the same credential record revision as at open, with the opener still authorized for the record's current tenant.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Approval/ActionAuthority.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Approval.ActionAuthority --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Approval/ActionAuthority.lean",
+          "symbol": "*",
+          "sha256": "edb1c265d5e305b06e299c95760dc645674f1f62a2a0dc61a608c1fcafaebf44"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
+        }
+      ],
+      "mutants": [
+        "lean-action-authority-label-guard-inverted"
+      ],
+      "does_not_establish": "The model abstracts recipe, risk tier and credential record to numbers; it says nothing about how the Rust code parses or compares the real structures. Not a statement about govder's answer being correct, only about how vultrino reacts to each answer shape. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-approval-criticality",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): the critical-action gate never returns direct execution authority for a declared human-floor action, an ambiguous canonical verb, or an unavailable catalog, in production strict posture direct authority implies an exact reversible declaration, and an approval resumes only while the catalog authority class is unchanged and available.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Approval/Criticality.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Approval.Criticality --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Approval/Criticality.lean",
+          "symbol": "*",
+          "sha256": "6d33ceadfd0087433d325c9c2c792e196030c1b4ee5112600370ca156d844885"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
+        }
+      ],
+      "mutants": [
+        "lean-criticality-human-floor-direct-when-approvals-off"
+      ],
+      "does_not_establish": "Only criticality's contribution to the gate; policy, scope, recipe and permit checks are not modelled here. Says nothing about how the catalog resolution itself is computed. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-credential-confinement",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): in the model of the credential kernel every reachable raw-credential flow ends at the encrypted vault, the trusted injector or the authorized upstream, every public payload carries evidence that no declared secret byte-form occurs, accepted streaming chunks keep that true over the concatenated output, and retaining the last max_form_len - 1 released bytes is sufficient for the incremental boundary check.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Credentials/Confinement.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Credentials.Confinement --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Credentials/Confinement.lean",
+          "symbol": "*",
+          "sha256": "9f5381cee79455c7de2bdd053560b4d1127b19d53d16913ff5d2020cfd1e801a"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
+        }
+      ],
+      "mutants": [
+        "lean-confinement-raw-credential-to-agent",
+        "lean-confinement-retained-tail-one-short"
+      ],
+      "does_not_establish": "Only the declared secret forms: a transformation of a secret that is not in the declared list is not excluded. The sink list is the modelled operation vocabulary; a Rust path that does not go through it is outside the model. The bounded-tail result is about the algorithm, not the Rust StreamScrubber implementation. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-method-authority",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): a composed internal-HTTP method is always the operator's method and no caller-supplied method is accepted (successful_method_is_operator_method, caller_method_is_rejected).",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Action/MethodAuthority.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Action.MethodAuthority --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Action/MethodAuthority.lean",
+          "symbol": "*",
+          "sha256": "6e958082a959fcbb032d71dca6fcafcef44b682e6420be965021e673ad2d65c9"
+        }
+      ],
+      "mutants": [
+        "lean-method-caller-verb-accepted"
+      ],
+      "does_not_establish": "Nothing about how the operator method itself is validated at registration, or about the plugin's behaviour once the method is composed. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-startup-refusal",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): the production web startup decision starts only with strict catalog enforcement, a configured policy-hash key and, when workload exchange is enabled, a valid verifier, and refuses before listening if any of those is wrong.",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Configuration/Startup.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Configuration.Startup --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Configuration/Startup.lean",
+          "symbol": "*",
+          "sha256": "3d7729771b3f8b7a53fa0c6f24091c3de81ee62f70e6bbb131a72ad95b9fa6b3"
+        }
+      ],
+      "mutants": [
+        "lean-startup-policy-hash-check-dropped"
+      ],
+      "does_not_establish": "Only the decision function over three summarised inputs; whether the Rust startup code computes those inputs correctly, or calls the decision before binding the listener, is not established. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    },
+    {
+      "id": "lean-approval-recipe-model",
+      "statement": "Model-level result (Lean 4, hand-written model, not extracted from Rust): every supported recipe has no agent-reviewer term and at least one human slot for every risk tier, autonomy and irreversibility value (supported_recipe_satisfies_every_floor), and a recipe that requires an agent reviewer is unsatisfiable by any sign-off set (agent_reviewer_recipe_is_unsatisfiable).",
+      "method": "lean",
+      "artifacts": [
+        "formal/lean/Vultrino/Approval/Model.lean"
+      ],
+      "gates": [
+        "lean"
+      ],
+      "detector": "cd formal/lean && lake build Vultrino.Approval.Model --wfail",
+      "covers": [
+        {
+          "path": "formal/lean/Vultrino/Approval/Model.lean",
+          "symbol": "*",
+          "sha256": "839e7004e3ef32d46d4ef2c3d49f5d679b72a7a312f17e76a3666c817360ff58"
+        },
+        {
+          "path": "formal/lean/Vultrino/Types.lean",
+          "symbol": "*",
+          "sha256": "15c4c309b932fbc403652d77b7fdc4c23dcfaa08288670166a30e69b66377c2d"
+        }
+      ],
+      "mutants": [
+        "lean-model-agent-reviewer-guard-dropped"
+      ],
+      "does_not_establish": "supported_recipe_satisfies_every_floor follows from the definition of a supported recipe: its risk tier, autonomy and irreversibility arguments are unused, so it does not model a floor that depends on them. Nothing about the execution-boundary theorems in ExecutionSafety.lean (separate claim). Sign-off sets are abstract counts and flags, so how the Rust code derives named, distinct and resolved sign-offs is not covered. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+    }
+  ]
+}

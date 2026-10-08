@@ -1,0 +1,13 @@
+diff --git a/src/plugins/internal_http.rs b/src/plugins/internal_http.rs
+index a63ac74..59ec0ef 100644
+--- a/src/plugins/internal_http.rs
++++ b/src/plugins/internal_http.rs
+@@ -93,7 +93,7 @@ pub(crate) fn is_internal_destination_ip(ip: &IpAddr) -> bool {
+     match ip {
+         IpAddr::V4(v4) => {
+             let o = v4.octets();
+-            if o == [100, 100, 100, 200] {
++            if o == [100, 100, 100, 201] {
+                 // Alibaba Cloud metadata endpoint, inside the CGNAT range.
+                 return false;
+             }

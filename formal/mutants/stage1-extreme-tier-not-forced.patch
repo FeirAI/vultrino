@@ -1,0 +1,13 @@
+diff --git a/src/approval/mod.rs b/src/approval/mod.rs
+index 7f5f5db..41204a0 100644
+--- a/src/approval/mod.rs
++++ b/src/approval/mod.rs
+@@ -2133,7 +2133,7 @@ fn approval_rule_satisfied(rule: &ApprovalRule, signoffs: &[Signoff]) -> bool {
+ /// (govder could not resolve) or ANY unparseable value → treated as Extreme
+ /// (fail-closed).
+ fn risk_tier_forces_deny_on_any_deny(risk_tier: &str) -> bool {
+-    !matches!(risk_tier.trim(), "Low" | "Medium" | "High")
++    !matches!(risk_tier.trim(), "Low" | "Medium" | "High" | "Extreme")
+ }
+ 
+ /// Cross-plane cap on any single [`RecipeTerm::count`] AND the summed total per recipe

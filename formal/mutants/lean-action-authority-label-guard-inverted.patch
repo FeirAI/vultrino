@@ -1,0 +1,13 @@
+diff --git a/formal/lean/Vultrino/Approval/ActionAuthority.lean b/formal/lean/Vultrino/Approval/ActionAuthority.lean
+index 4e6c3ec..01794cb 100644
+--- a/formal/lean/Vultrino/Approval/ActionAuthority.lean
++++ b/formal/lean/Vultrino/Approval/ActionAuthority.lean
+@@ -33,7 +33,7 @@ def decideAuthority
+   match lookup with
+   | .authoritativeRule => .authoritativeRule
+   | .confirmedAbsent | .inconclusive =>
+-      if !presentedAsLabel && canonicalHasLabels then
++      if presentedAsLabel && canonicalHasLabels then
+         .refuse
+       else
+         .numericFallback

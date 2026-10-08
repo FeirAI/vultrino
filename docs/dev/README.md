@@ -51,6 +51,7 @@ credential broker:
 | [SECURITY.md](SECURITY.md) | Threat model, invariants, authn/authz, trust boundaries, and what Vultrino deliberately does **not** do. |
 | [INTEGRATION.md](INTEGRATION.md) | Standalone integration (the client-facing API), then the optional cross-plane composition contracts. |
 | [TESTING.md](TESTING.md) | Running the tests, formal gates (Lean / Kani / refinement), the four-plane e2e harness, and a contributing note. |
+| [FORMAL.md](FORMAL.md) | The formal and test evidence register (`formal/claims.json`): claims, mutants, drift-lock policy, and what each claim does not establish. |
 | [LIMITATIONS.md](LIMITATIONS.md) | The honest v1 limits, formal-verification bounds, non-goals, and deferred/documented-not-enforced items. |
 
 ## Project layout (Rust crate)

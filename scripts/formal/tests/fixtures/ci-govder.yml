@@ -1,0 +1,396 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * *'   # nightly ~07:00 UTC canary of the cross-plane harness
+
+jobs:
+  go:
+    name: build + vet + lint + test
+    runs-on: ubuntu-latest
+    # A real Postgres so the pgstore suite (principal index, installed-deny persistence,
+    # budget_state reconstruction, provision-record store) actually RUNS — it is the ONLY coverage of
+    # the durable-backing layer prod hard-requires. `make test` -> `go test ./...` picks up
+    # ./internal/pgstore with GOVDER_TEST_POSTGRES_URL set (below); pgstore's Open bootstraps its own
+    # schema idempotently, so no migration step is needed. With the env var SET, an unreachable DB now
+    # FAILS the suite (pgstore_test.go), never self-skips green.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        # Wait until Postgres accepts connections before any test step runs.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: govder
+      # THE CROSS-REPO ORG-PACK GATE (plan 103 §10g FIX 3.3).
+      #
+      # internal/connectors/orgpack_catalog_verify_test.go is the ONLY automated check that
+      # feir-os's four shipped org packs load through govder's real fail-closed loader. It used to
+      # resolve those packs from five hardcoded sibling worktrees — none of them the branch under
+      # test — and t.Skipf when none existed, so it ran nowhere and went green everywhere.
+      #
+      # The fallback is gone: the packs tree must be named, and under CI an unnamed tree is a
+      # FAILURE. These steps are what name it. The ref is chosen so a PR branch is verified against
+      # a same-named feir-os branch when one exists (that is what "the branch under test" means for
+      # a two-repo change), falling back to feir-os's default branch.
+      - name: Is the feir-os coordinate configured?
+        id: feiros
+        env:
+          FEIROS_REPO: ${{ vars.FEIROS_REPO }}
+        run: |
+          if [ -z "$FEIROS_REPO" ]; then
+            echo "armed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "armed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Checkout feir-os at the branch under test
+        if: steps.feiros.outputs.armed == 'true'
+        id: feiros_same_branch
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.FEIROS_REPO }}
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.SIBLING_REPOS_TOKEN }}
+          path: feir-os
+      - name: Checkout feir-os at its default branch (no same-named branch exists)
+        if: steps.feiros.outputs.armed == 'true' && steps.feiros_same_branch.outcome == 'failure'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.FEIROS_REPO }}
+          token: ${{ secrets.SIBLING_REPOS_TOKEN }}
+          path: feir-os
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: govder/go.mod   # go 1.25.0
+      # `make` and `python3` are preinstalled on ubuntu-latest. `make lint` runs the canonical
+      # enum-spelling linter (tools/lint_enums.py) + a read-only gofmt -l check. Deps fetch from
+      # the standard Go proxy — the Socket Firewall / GOPROXY shim is a local-macOS-only wrapper,
+      # not used in CI. Do NOT run `make fmt` or `make all` (they rewrite files).
+      - run: make build
+        working-directory: govder
+      - run: make vet
+        working-directory: govder
+      - run: make lint
+        working-directory: govder
+      # e2e/ is behind `//go:build e2e`, so `make vet` and `make test` never compile it. That is how
+      # TestOrgPackE2E and both money suites could rot unnoticed while every CI job stayed green
+      # (plan 103 §10g). This does NOT run them — that needs five real binaries, see the
+      # `e2e-four-plane` job — but it typechecks them on every push and PR, so a rename or a
+      # signature change in the planes breaks HERE instead of at release time.
+      - name: vet the e2e suites (tagged code CI would otherwise never compile)
+        run: go vet -tags e2e ./e2e/
+        working-directory: govder
+      - run: make test
+        working-directory: govder
+        env:
+          # Un-skips ./internal/pgstore against the postgres service above. superuser `postgres` has the
+          # CREATE privileges Open needs to bootstrap the schema. Explicitly SET ⇒ an unreachable DB
+          # fails (not skips) — see pgstore_test.go testPool.
+          GOVDER_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+          # When feir-os is checked out, the cross-repo pack gate RUNS against it. When it is not,
+          # `CI: ''` downgrades that gate from FAIL to an explicit SKIP — and the `WARNING, NOT RUN`
+          # step at the end of this job makes the loss visible instead of letting it read as coverage.
+          # Never remove one without the other.
+          GOVDER_ORGPACK_PACKS_DIR: ${{ steps.feiros.outputs.armed == 'true' && format('{0}/feir-os/packs', github.workspace) || '' }}
+          CI: ${{ steps.feiros.outputs.armed == 'true' && 'true' || '' }}
+      - run: make test-race
+        working-directory: govder
+        env:
+          GOVDER_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+          GOVDER_ORGPACK_PACKS_DIR: ${{ steps.feiros.outputs.armed == 'true' && format('{0}/feir-os/packs', github.workspace) || '' }}
+          CI: ${{ steps.feiros.outputs.armed == 'true' && 'true' || '' }}
+      # A SKIP IS NOT A PASS, and a green check mark next to a job that quietly skipped its only
+      # cross-repo gate is how §10g's findings survived. If the gate did not run, say so in the run
+      # summary and as a PR annotation, naming what is unproven. Set repo Variable
+      # REQUIRE_CROSS_REPO_GATES=1 to turn that from loud into fatal once feir-os is co-hostable.
+      - name: 'WARNING, NOT RUN: cross-repo org-pack loader gate (unproven)'
+        if: always() && steps.feiros.outputs.armed != 'true'
+        env:
+          REQUIRE: ${{ vars.REQUIRE_CROSS_REPO_GATES }}
+        run: |
+          msg="cross-repo org-pack gate DID NOT RUN (it is NOT part of this job's pass): vars.FEIROS_REPO is unset, so feir-os was not checked out. NOT PROVEN: that feir-os's shipped org packs load through govder's real fail-closed loader (mirror drift between app/internal/orgpack and internal/connectors is exactly what it exists to catch)."
+          echo "::warning title=Unproven invariant::$msg"
+          {
+            echo "### :warning: NOT RUN: cross-repo org-pack loader gate (unproven)"
+            echo
+            echo "$msg"
+            echo
+            echo "To arm: set repo Variable \`FEIROS_REPO\` to \`owner/name\` (plus Secret \`SIBLING_REPOS_TOKEN\` if private)."
+            echo "To make this fatal instead of a warning: set repo Variable \`REQUIRE_CROSS_REPO_GATES=1\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$REQUIRE" = "1" ]; then
+            echo "REQUIRE_CROSS_REPO_GATES=1 — treating the unproven gate as a failure." >&2
+            exit 1
+          fi
+
+  e2e-four-plane:
+    name: four-plane + org-pack + money e2e (heavy · non-blocking)
+    # NON-BLOCKING & HEAVY. Runs ONLY on the nightly schedule and manual dispatch — never
+    # on push/PR — so it can never block a merge. It boots all five REAL binaries
+    # (govder + the three siblings vultrino/averin/leria + feir-os), which are LOCAL-ONLY
+    # pre-open-source today. So this is a documented SKELETON. To ARM it, set repo Variables
+    # VULTRINO_REPO / AVERIN_REPO / LERIA_REPO / FEIROS_REPO to `owner/name` (the published
+    # remotes) and, if any is private, a repo Secret SIBLING_REPOS_TOKEN (a PAT with read access
+    # to them). Do NOT hardcode remotes here. Arming is blocked on CI hosting reality, not on code:
+    # none of the four planes + feir-os have a shared-org remote today (only vultrino has one,
+    # under a different owner) — an operator decision, not something this workflow can resolve.
+    #
+    # 2026-07-27 (plan 103 §10g FIX 3.2) — TWO DEFECTS FIXED HERE:
+    #   1. The run filter named three suites. TestOrgPackE2E (the whole org-pack program: the
+    #      7-step apply, a governed turn on all three harness types, the approval round-trip) and
+    #      BOTH money suites ran in NO CI on ANY trigger. They are in the filter now, and
+    #      e2e/coverage_wiring_test.go fails if a future suite is left out of it.
+    #   2. When unarmed, the gate printed a friendly echo and every later step was skipped, so the
+    #      job reported SUCCESS. A green check mark that proves nothing is worse than a red one: it
+    #      is read as coverage. The unarmed path now writes a run-summary block and a warning
+    #      annotation naming each unproven invariant, and repo Variable REQUIRE_CROSS_REPO_GATES=1
+    #      makes it fail outright.
+    #
+    # 2026-10-07 (formal-02 ci-honest): the arming condition is now a JOB-LEVEL `if:`. An unarmed
+    # job shows as SKIPPED in the Actions UI, never as a green job that did nothing. Setting repo
+    # Variable REQUIRE_CROSS_REPO_GATES=1 forces the job to run unarmed so the UNPROVEN step below
+    # fails it. (Arming itself is a separate, later increment.)
+    if: >-
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      ((vars.VULTRINO_REPO != '' && vars.AVERIN_REPO != '' && vars.LERIA_REPO != '' && vars.FEIROS_REPO != '') ||
+      vars.REQUIRE_CROSS_REPO_GATES == '1')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Gate — are the sibling repo coordinates configured?
+        id: gate
+        env:
+          VULTRINO_REPO: ${{ vars.VULTRINO_REPO }}
+          AVERIN_REPO: ${{ vars.AVERIN_REPO }}
+          LERIA_REPO: ${{ vars.LERIA_REPO }}
+          FEIROS_REPO: ${{ vars.FEIROS_REPO }}
+        run: |
+          if [ -z "$VULTRINO_REPO" ] || [ -z "$AVERIN_REPO" ] || [ -z "$LERIA_REPO" ] || [ -z "$FEIROS_REPO" ]; then
+            echo "armed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "armed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout govder (this repo)
+        if: steps.gate.outputs.armed == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: govder
+
+      - name: Checkout vultrino
+        if: steps.gate.outputs.armed == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.VULTRINO_REPO }}
+          token: ${{ secrets.SIBLING_REPOS_TOKEN }}
+          path: vultrino
+
+      - name: Checkout averin
+        if: steps.gate.outputs.armed == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.AVERIN_REPO }}
+          token: ${{ secrets.SIBLING_REPOS_TOKEN }}
+          path: averin
+
+      - name: Checkout leria
+        if: steps.gate.outputs.armed == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.LERIA_REPO }}
+          token: ${{ secrets.SIBLING_REPOS_TOKEN }}
+          path: leria
+
+      - name: Checkout feir-os
+        if: steps.gate.outputs.armed == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.FEIROS_REPO }}
+          token: ${{ secrets.SIBLING_REPOS_TOKEN }}
+          path: feir-os
+
+      - name: Set up Go
+        if: steps.gate.outputs.armed == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: govder/go.mod
+
+      # eve's floor is Node >= 24 (e2e/eve_e2e_test.go, eveMinNodeMajor). ubuntu-latest's default
+      # major is lower, and without this the eve legs SKIP — proving nothing while the job stays
+      # green. Installed explicitly rather than left to a runner-image default, because "how much
+      # of the suite ran" must not be decided by an image bump.
+      - name: Set up Node 24 (eve's floor)
+        if: steps.gate.outputs.armed == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install htpasswd (apache2-utils)
+        if: steps.gate.outputs.armed == 'true'
+        # cargo/rustc are preinstalled on ubuntu-latest (like make + python3 for the `go` job),
+        # so no rust-toolchain action is added. apache2-utils supplies `htpasswd`, which the
+        # harness uses once to seed vultrino's admin.json (it SKIPs without it) — see e2e/README.md.
+        run: sudo apt-get update && sudo apt-get install -y apache2-utils
+
+      - name: Run the e2e harness (four-plane + feir-os + connector + org pack + money)
+        if: steps.gate.outputs.armed == 'true'
+        working-directory: govder
+        # leg1/leg2 need outbound network to a public host (example.com) — GitHub-hosted
+        # runners have it. The five GOVDER_E2E_*_REPO envs redirect the harness (harness_test.go)
+        # from its local /Users/... defaults to these checkout dirs. The run filter is a prefix
+        # match, so it also catches TestFourPlaneE2E_Verified alongside the named suites.
+        #
+        # THE FILTER IS MACHINE-CHECKED. e2e/coverage_wiring_test.go reads this file, extracts this
+        # regex, and fails if any Test function in e2e/ is not matched by it — so a new suite
+        # cannot be added and left outside CI silently, which is precisely what happened to
+        # TestOrgPackE2E and both money suites.
+        env:
+          GOVDER_E2E_GOVDER_REPO: ${{ github.workspace }}/govder
+          GOVDER_E2E_VULTRINO_REPO: ${{ github.workspace }}/vultrino
+          GOVDER_E2E_AVERIN_REPO: ${{ github.workspace }}/averin
+          GOVDER_E2E_LERIA_REPO: ${{ github.workspace }}/leria
+          GOVDER_E2E_FEIROS_REPO: ${{ github.workspace }}/feir-os
+        run: |
+          set +e
+          go test -tags e2e ./e2e/ -run 'TestFourPlaneE2E|TestFourPlaneApprovalRecipeE2E|TestFourPlaneReparentE2E|TestFeirOSE2E|TestConnectorE2E|TestOrgPackE2E|TestOrgPackMoneyE2E|TestPaymentsSandboxMoneyE2E|TestOrgPackEveryShippedPackApplies|TestFourEyesPresetRoundTrip|TestHarnessBuildsTheTreeItsOwnCodeCameFrom|TestBuildProvenanceBannerNamesEveryPlane' -timeout 2400s -v > "$RUNNER_TEMP/e2e.log" 2>&1
+          rc=$?
+          # THE EXIT CODE IS CAPTURED DIRECTLY INTO A VARIABLE, never read through a pipe. A
+          # `go test | tee` pipeline reports tee's status, and that produced three separate false
+          # greens in plan 103. The log is printed afterwards instead.
+          echo "$rc" > "$RUNNER_TEMP/e2e.rc"
+          cat "$RUNNER_TEMP/e2e.log"
+          exit 0
+
+      # A SKIP is reported, not swallowed — but THIS JOB DOES NOT FAIL ON IT, and that is deliberate,
+      # not an oversight (corrected 2026-07-29; it previously claimed the opposite in this comment).
+      #
+      # This job never sets GOVDER_E2E_EVE_TEMPLATE (no eve toolchain/Node install step exists here),
+      # so the eve legs (TestConnectorE2E/leg_f, TestOrgPackE2E's eve turn) are STRUCTURALLY GUARANTEED
+      # to skip on every single run — nightly, on workflow_dispatch, forever, until someone wires an
+      # eve template checkout into this job. Failing the job on any skip, as written, would make it
+      # permanently red — which trains a reader to ignore it exactly as reliably as the previous
+      # permanently-green-despite-skips behavior trained them to trust it. Neither is the release gate.
+      #
+      # Plan 103 §7's ZERO-SKIP release gate is a SEPARATE, manual invocation (e2e/README.md — set
+      # GOVDER_E2E_EVE_TEMPLATE + GOVDER_E2E_EVE_NODE_BIN, then run the full -run filter with
+      # -timeout 1800s) that an operator runs before cutting a release. This job is a lighter,
+      # always-on nightly CANARY: it fails on a genuine test FAILURE (a real regression), and it
+      # WARNS on skips (below) because a skip is unproven, not passed — but it does not, and given its
+      # current wiring cannot honestly, enforce completeness. A killed run is a third, distinct case:
+      # neither this step nor a human reading it should read a non-zero `rc` from a run that never
+      # finished (e.g. an external `pkill`) as a real test failure — that is no evidence, not a fail.
+      - name: Verdict — exit code and skip census
+        if: always() && steps.gate.outputs.armed == 'true'
+        run: |
+          rc="$(cat "$RUNNER_TEMP/e2e.rc" 2>/dev/null || echo 99)"
+          skips="$(grep -c -- '--- SKIP' "$RUNNER_TEMP/e2e.log" 2>/dev/null || true)"
+          skips="${skips:-0}"
+          echo "e2e exit code: $rc; '--- SKIP' markers: $skips"
+          {
+            echo "### e2e verdict"
+            echo
+            echo "- exit code (measured directly, not through a pipe): \`$rc\`"
+            echo "- \`--- SKIP\` markers: \`$skips\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$skips" -gt 0 ]; then
+            echo "::warning title=e2e skips (this job does NOT fail on them)::$skips e2e leg(s) SKIPPED — they proved nothing, but this nightly canary does not gate on skip count (see the step's leading comment for why). The eve legs need GOVDER_E2E_EVE_TEMPLATE (and Node >= 24), never set in this job; the workload-exchange legs need python3 + cryptography. Plan 103 §7's ZERO-SKIP RELEASE GATE is a separate, manual invocation (e2e/README.md) — this green/red status is not that gate."
+            {
+              echo
+              echo "UNPROVEN legs (a skip is not a pass — and this job does not fail on it; run the plan 103 §7 release-gate invocation separately before cutting a release):"
+              echo '```'
+              grep -- '--- SKIP' "$RUNNER_TEMP/e2e.log" || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # rc alone decides the job's status: a real test FAILURE fails it, a SKIP does not (see
+          # above), and a KILLED run (no e2e.rc file at all — the `|| echo 99` above) reports 99, an
+          # exit code no `go test` process ever emits on its own, so it fails LOUD and distinctly from
+          # a real assertion failure rather than silently reading as "no failures observed."
+          exit "$rc"
+
+      # The unarmed path. Previously: a friendly echo, every later step skipped, job green.
+      # Only reachable when REQUIRE_CROSS_REPO_GATES=1 forced an unarmed run (the job-level `if:`
+      # skips an unarmed job otherwise), so it always fails.
+      - name: UNPROVEN — the e2e harness did not run
+        if: always() && steps.gate.outputs.armed != 'true'
+        env:
+          REQUIRE: ${{ vars.REQUIRE_CROSS_REPO_GATES }}
+        run: |
+          {
+            echo "### :warning: UNPROVEN — the cross-plane e2e harness did not run"
+            echo
+            echo "Sibling repo coordinates are not configured (\`vars.VULTRINO_REPO\` / \`AVERIN_REPO\` / \`LERIA_REPO\` / \`FEIROS_REPO\`), so no plane was checked out and **no e2e suite executed**."
+            echo
+            echo "This run was forced by REQUIRE_CROSS_REPO_GATES=1 and fails because nothing ran. NOT PROVEN by this build:"
+            echo "- the decide → meter → enforce → prove loop across all four planes (\`TestFourPlaneE2E\`, both tenant modes)"
+            echo "- the feir-os product layer on top of them (\`TestFeirOSE2E\`)"
+            echo "- the harness-connector wire path including the eve leg (\`TestConnectorE2E\`)"
+            echo "- the org-pack apply, a governed turn on all three harness types, and the approval round-trip (\`TestOrgPackE2E\`)"
+            echo "- money end to end: the gate holds, the denied refund never ran, an approval lands in the ledger, leria meters it (\`TestOrgPackMoneyE2E\`, \`TestPaymentsSandboxMoneyE2E\`)"
+            echo
+            echo "The standing substitute is the LOCAL gate \`make e2e\` in a govder checkout (see \`e2e/README.md\`). Run it before any release."
+            echo "To arm this job: set the four repo Variables above. To make this state fatal: set \`REQUIRE_CROSS_REPO_GATES=1\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning title=Unproven invariants::The four-plane / org-pack / money e2e harness did not run (sibling repo coordinates unset). REQUIRE_CROSS_REPO_GATES=1 forced this run, so it fails: see the run summary."
+          if [ "$REQUIRE" = "1" ]; then
+            echo "REQUIRE_CROSS_REPO_GATES=1 — treating the unrun harness as a failure." >&2
+            exit 1
+          fi
+
+  # Scheduled-only fuzz smoke: each existing Go fuzz target for 60s. Never on push/PR, to keep
+  # private-repo minutes low. A crash writes a testdata/fuzz corpus file, uploaded as an artifact.
+  # This is a smoke test (about 5 minutes of fuzzing in total), not a fuzzing campaign.
+  fuzz-smoke:
+    name: fuzz smoke (scheduled · 60s per target)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Fuzz each target for 60s
+        run: |
+          set -euo pipefail
+          # One -fuzz target per `go test` invocation (a Go restriction); -run '^$' skips unit tests.
+          fz() { echo "::group::$2"; go test -run '^$' -fuzz "^$2\$" -fuzztime=60s "$1"; echo "::endgroup::"; }
+          fz ./internal/connectors FuzzDecodeConfig
+          fz ./internal/enforce FuzzApprovalReceiverProcess
+          fz ./internal/runtime FuzzApprovalEventIDInjective
+          fz ./internal/runtime FuzzApprovalSignOffEventIDInjective
+          fz ./internal/runtime FuzzKillEventIDInjective
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashers
+          path: internal/**/testdata/fuzz/
+          if-no-files-found: ignore
+
+  # The ONLY check branch protection should require. Aggregates the PR-blocking jobs; the heavy
+  # scheduled jobs (e2e-four-plane, fuzz-smoke) are deliberately excluded.
+  ci-required:
+    name: ci-required
+    if: always()
+    needs: [go]
+    runs-on: ubuntu-latest
+    steps:
+      - name: every required job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: echo "$NEEDS" | jq -e 'to_entries | all(.value.result == "success")'
