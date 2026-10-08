@@ -171,6 +171,14 @@ those — checking **every** resolved IP, not just an IP literal. OAuth2 token U
 get the same guard and must be HTTPS. So a proxied request to `127.0.0.1` or a
 metadata endpoint is denied at the transport step.
 
+The authoritative list of blocked ranges is the `IPV4_BLOCKED` and `IPV6_BLOCKED`
+tables in `src/plugins/http.rs`; the prose above is a summary and the tables win if
+they differ. The config-time `llm.provider_base` check is narrower on purpose: it
+rejects only link-local and cloud-metadata addresses (including their IPv6,
+IPv4-mapped, NAT64 and 6to4 spellings) and allows loopback and RFC1918 so
+self-hosted model gateways work. The execute-time guard above still applies to every
+request.
+
 ## Google service accounts (`google_service_account`)
 
 The RFC 7523 JWT-bearer credential type (`src/plugins/google_sa.rs`) is admitted only
