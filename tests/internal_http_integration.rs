@@ -207,7 +207,8 @@ condition = {{ and = [
 }
 
 /// The SAME pinned destination, but with a deliberately PERMISSIVE policy
-/// (`url_match = "*"`, every verb). This isolates the plugin: any refusal under
+/// (an action-only Allow for every action and verb; it does not depend on the URL string, so
+/// a value that cannot be canonicalised still reaches the plugin). This isolates the plugin: any refusal under
 /// this config is the plugin's own doing, not the policy's. It is the config an
 /// operator must never ship — and the point is that even then, the caller cannot
 /// steer the destination.
@@ -231,7 +232,7 @@ default_action = "deny"
 
 [[policies.rules]]
 action = "allow"
-condition = {{ url_match = "*" }}
+condition = {{ action_match = "*" }}
 "#
     );
     Config::parse(&toml).expect("permissive config parses")
@@ -639,7 +640,7 @@ async fn http_plugin_still_refuses_loopback_metadata_and_clusterip() {
     let config = Config {
         policies: vec![
             vultrino::policy::Policy::allow_all("allow-http", "web-*").with_rule(
-                vultrino::policy::PolicyCondition::UrlMatch("*".to_string()),
+                vultrino::policy::PolicyCondition::Always,
                 vultrino::policy::PolicyAction::Allow,
             ),
         ],
@@ -749,7 +750,7 @@ async fn per_credential_path_prefix_pins_a_scoped_credential() {
 // (g) The PLUGIN is the refuser — proven with policy deliberately permissive
 // ===========================================================================
 
-/// Same attacks as (b)/(c), but under `url_match = "*"`: the policy would admit
+/// Same attacks as (b)/(c), but under an always-allow policy: the policy would admit
 /// them all, so every refusal below is produced by `internal_http` itself. This
 /// is the load-bearing proof that the destination is not caller-influenceable
 /// even on a badly authored policy.
@@ -865,17 +866,8 @@ async fn plugin_itself_refuses_every_steering_attempt_under_a_permissive_policy(
         .await
         .expect_err(&format!("must be refused: {params}"));
         eprintln!("PLUGIN-REFUSED {params} -> {err}");
-        // SB-03: a URL string that cannot be canonicalised never matches an
-        // Allow rule, so even this permissive `url_match = "*"` policy refuses it
-        // (default deny) before the plugin runs. That is a refusal too; the
-        // plugin's own reason is still required for every parseable value.
-        let policy_refused_unparseable = params
-            .get("url")
-            .and_then(|u| u.as_str())
-            .is_some_and(|u| vultrino::policy::canonical_url(u).is_none())
-            && err.contains("default action");
         assert!(
-            err.contains(want) || policy_refused_unparseable,
+            err.contains(want),
             "refusal for {params} must name '{want}', got: {err}"
         );
     }
@@ -916,7 +908,7 @@ async fn plugin_itself_refuses_every_steering_attempt_under_a_permissive_policy(
 async fn query_is_forwarded_and_is_part_of_the_policy_matched_string() {
     let (port, rec) = start_sandbox().await;
 
-    // Permissive policy (url_match "*"): both query forms reach the sandbox.
+    // Permissive policy (any URL, every verb): both query forms reach the sandbox.
     let (server, storage) = build_server(permissive_config(port)).await;
     let token = seed(
         &storage,
@@ -1130,14 +1122,8 @@ async fn a_path_that_normalization_would_rewrite_is_refused_before_it_executes()
     for (bad, outcome) in outcomes {
         let err = outcome.expect_err(&format!("must be refused: {bad:?}"));
         eprintln!("DIVERGENT-REFUSED {bad:?} -> {err}");
-        // SB-03: " /v1/ledger" is not a canonicalisable URL, so the permissive
-        // `url_match = "*"` Allow no longer matches it and policy refuses first.
-        let policy_refused_unparseable =
-            vultrino::policy::canonical_url(bad).is_none() && err.contains("default action");
         assert!(
-            err.contains("control character or space")
-                || err.contains("fragment")
-                || policy_refused_unparseable,
+            err.contains("control character or space") || err.contains("fragment"),
             "refusal for {bad:?} must name the reason, got: {err}"
         );
     }

@@ -846,13 +846,20 @@ impl HttpPlugin {
         }
 
         // SB-03: send the SAME canonical URL that policy evaluated
-        // (`crate::policy::canonical_url`). A UrlToken URL is excluded: its path
+        // (`crate::policy::effective_url`: canonical URL plus the caller's
+        // query map, merged in sorted order, so nothing is appended after
+        // evaluation). A URL that cannot be canonicalised is refused, never
+        // sent raw. A UrlToken URL is excluded: its path
         // now carries the secret, which must not be rewritten (policy judged
         // the placeholder form, whose host and scheme `substitute_url_token`
         // pinned above).
         let send_url = match cred_data {
             CredentialData::UrlToken { .. } => params.url.clone(),
-            _ => crate::policy::canonical_url(&params.url).unwrap_or_else(|| params.url.clone()),
+            _ => crate::policy::effective_url(&params.url, &params.query).ok_or_else(|| {
+                PluginError::InvalidParams(
+                    "URL cannot be canonicalised (policy could not judge it)".to_string(),
+                )
+            })?,
         };
 
         // Validate URL for SSRF before proceeding
@@ -878,17 +885,13 @@ impl HttpPlugin {
         // into the URL before signing (in deterministic order) so reqwest cannot
         // append unsigned parameters after the Authorization header is produced.
         let uses_aws_sigv4 = matches!(effective_cred, CredentialData::AwsSigV4 { .. });
-        if uses_aws_sigv4 && !params.query.is_empty() {
+        // The caller's query map is already part of `send_url`; SigV4 only
+        // re-sorts the pairs (and so re-encodes them) for its canonical request.
+        if uses_aws_sigv4 && validated_url.query().is_some() {
             let mut query = validated_url
                 .query_pairs()
                 .map(|(key, value)| (key.into_owned(), value.into_owned()))
                 .collect::<Vec<_>>();
-            query.extend(
-                params
-                    .query
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone())),
-            );
             query.sort();
             validated_url.set_query(None);
             validated_url.query_pairs_mut().extend_pairs(query);
@@ -948,7 +951,9 @@ impl HttpPlugin {
         }
 
         // Add query parameters
-        if !uses_aws_sigv4 && !params.query.is_empty() {
+        // (Already merged into the URL policy judged, except for UrlToken, whose
+        // URL is the substituted placeholder form.)
+        if matches!(cred_data, CredentialData::UrlToken { .. }) && !params.query.is_empty() {
             request = request.query(&params.query);
         }
 
@@ -1473,6 +1478,47 @@ mod tests {
             crate::policy::canonical_url(&raw).as_deref(),
             Some(request.url().as_str())
         );
+    }
+
+    /// SB-03: the caller's query map is part of the URL policy judged, and a
+    /// URL that cannot be canonicalised is refused instead of sent raw.
+    #[tokio::test]
+    async fn test_prepare_request_merges_query_and_refuses_uncanonical_urls() {
+        let plugin = HttpPlugin::new();
+        let cred_data = CredentialData::ApiKey {
+            key: Secret::new("k"),
+            header_name: "Authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        };
+        let mut query = HashMap::new();
+        query.insert("q".to_string(), "secret".to_string());
+        query.insert("a".to_string(), "1 2".to_string());
+        let params = HttpRequestParams {
+            method: "GET".to_string(),
+            url: "https://api.example.com/v1/search".to_string(),
+            headers: HashMap::new(),
+            query: query.clone(),
+            body: None,
+        };
+        let judged = crate::policy::effective_url(&params.url, &query).unwrap();
+        let (b, _) = plugin.prepare_request(params, &cred_data).await.unwrap();
+        let request = b.build().unwrap();
+        assert_eq!(request.url().as_str(), judged);
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.example.com/v1/search?a=1%202&q=secret"
+        );
+        for bad in ["https://u@api.example.com/x", "https://[::1"] {
+            let params = HttpRequestParams {
+                method: "GET".to_string(),
+                url: bad.to_string(),
+                headers: HashMap::new(),
+                query: HashMap::new(),
+                body: None,
+            };
+            let r = plugin.prepare_request(params, &cred_data).await;
+            assert!(matches!(r, Err(PluginError::InvalidParams(_))), "{bad}");
+        }
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ mod precedence;
 mod types;
 mod url_canon;
 
-pub use url_canon::{canonical_pattern, canonical_url, PatternWarning};
+pub use url_canon::{canonical_pattern, canonical_url, effective_url, policy_url, PatternWarning};
 
 pub use types::*;
 
@@ -468,19 +468,20 @@ impl PolicyEngine {
 
         // SB-03: a URL that cannot be canonicalised never matches an Allow rule
         // (see `evaluate_condition`) and is denied outright when a matching
-        // policy has a URL-sensitive Deny rule: a `UrlMatch` under a Deny rule,
-        // or under a `Not` in any rule. Otherwise an unparseable spelling could
+        // policy has a URL-sensitive Deny or Prompt rule: a `UrlMatch` under a
+        // Deny or Prompt rule, or under a `Not` in any rule. Otherwise an unparseable spelling could
         // slip past the very rule written to stop it.
         if let Some(raw) = input.url {
             if canonical_url(raw).is_none() {
                 if let Some(p) = matching_policies.iter().find(|p| {
                     p.rules.iter().any(|r| {
-                        (r.action == PolicyAction::Deny && contains_url_match(&r.condition))
+                        (matches!(r.action, PolicyAction::Deny | PolicyAction::Prompt)
+                            && contains_url_match(&r.condition))
                             || contains_negated_url_match(&r.condition, false)
                     })
                 }) {
                     return PolicyDecision::Deny(format!(
-                        "policy '{}': request URL cannot be canonicalised and the policy has a URL deny rule",
+                        "policy '{}': request URL cannot be canonicalised and the policy has a URL deny or prompt rule",
                         p.name
                     ));
                 }
@@ -835,6 +836,16 @@ fn warn_url_patterns(policy: &Policy) {
             PolicyCondition::UrlMatch(p) => {
                 let canon = canonical_pattern(p);
                 for w in &canon.warnings {
+                    // The refresh loop reloads the same policies every
+                    // interval: warn once per (policy, pattern, warning).
+                    static SEEN: std::sync::OnceLock<
+                        parking_lot::Mutex<std::collections::HashSet<String>>,
+                    > = std::sync::OnceLock::new();
+                    let key = format!("{}\u{0}{}\u{0}{:?}", policy.name, p, w);
+                    let first = SEEN.get_or_init(Default::default).lock().insert(key);
+                    if !first {
+                        continue;
+                    }
                     tracing::warn!(
                         policy = %policy.name,
                         pattern = %p,
@@ -918,6 +929,73 @@ mod tests {
     use serde::Serialize;
 
     const TRACE_TICKS_PER_SECOND: i64 = 1000;
+
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    fn url_policy(name: &str, pattern: &str) -> Policy {
+        let mut p = Policy::allow_all(name, "*");
+        p.rules = vec![PolicyRule {
+            condition: PolicyCondition::UrlMatch(pattern.to_string()),
+            action: PolicyAction::Deny,
+        }];
+        p
+    }
+
+    /// SB-03: add_policy, load_policies and load_policies_if_newer each log a
+    /// warning for a risky url_match pattern, and a reload of the same policy
+    /// does not repeat it.
+    #[test]
+    fn url_warnings_are_logged_at_every_load_path_once() {
+        let buf = LogBuf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            let e = PolicyEngine::new();
+            e.add_policy(url_policy("warn-add", "https://warn-add.example.com*"));
+            e.load_policies(vec![url_policy(
+                "warn-load",
+                "https://*.warn-load.example/x",
+            )]);
+            let t = e.begin_load();
+            assert!(e.load_policies_if_newer(
+                t,
+                vec![url_policy(
+                    "warn-newer",
+                    "https://warn-newer.example/a/../b/*"
+                )]
+            ));
+            // Same policy again: no second warning.
+            e.load_policies(vec![url_policy(
+                "warn-load",
+                "https://*.warn-load.example/x",
+            )]);
+            e.add_policy(url_policy("quiet", "https://quiet.example/*"));
+        });
+        let log = String::from_utf8(buf.0.lock().clone()).unwrap();
+        for name in ["warn-add", "warn-load", "warn-newer"] {
+            assert!(log.contains(name), "no warning for {name}: {log}");
+        }
+        assert_eq!(log.matches("policy=warn-load").count(), 1, "{log}");
+        assert!(!log.contains("quiet"), "{log}");
+    }
 
     #[derive(Debug, Clone, Copy, Serialize)]
     struct TraceState {

@@ -5,7 +5,7 @@
 
 use proptest::prelude::*;
 use vultrino::policy::{
-    Policy, PolicyAction, PolicyCondition, PolicyDecision, PolicyEngine, PolicyRule,
+    policy_url, Policy, PolicyAction, PolicyCondition, PolicyDecision, PolicyEngine, PolicyRule,
 };
 
 fn engine(rules: Vec<(PolicyCondition, PolicyAction)>, default: PolicyAction) -> PolicyEngine {
@@ -142,6 +142,133 @@ fn relative_paths_keep_working() {
     assert!(!is_deny(&decide(&e, "/v1/orders/9")));
 }
 
+#[test]
+fn host_prefix_still_matches_the_same_host_on_other_ports_and_trailing_dot() {
+    let e = engine(
+        vec![(
+            PolicyCondition::UrlMatch("https://api.example.com*".into()),
+            PolicyAction::Deny,
+        )],
+        PolicyAction::Allow,
+    );
+    for same_host in [
+        "https://api.example.com/x",
+        "https://api.example.com:8443/x",
+        "https://api.example.com./x",
+        "https://API.EXAMPLE.COM.:8443/x",
+        "https://api.example.com",
+    ] {
+        assert!(
+            is_deny(&decide(&e, same_host)),
+            "same host escaped: {same_host}"
+        );
+    }
+    for other in [
+        "https://api.example.com.evil.net/x",
+        "https://api.example.com0/x",
+        "https://api.example.coma/x",
+    ] {
+        assert!(!is_deny(&decide(&e, other)), "look-alike denied: {other}");
+    }
+}
+
+#[test]
+fn stray_percent_never_skips_a_prompt_rule() {
+    // A URL the parser accepts but that used to fail the fixed-point check.
+    let e = engine(
+        vec![(
+            PolicyCondition::UrlMatch("https://api.example.com/v1/refunds*".into()),
+            PolicyAction::Prompt,
+        )],
+        PolicyAction::Allow,
+    );
+    for u in [
+        "https://api.example.com/v1/refunds/%%%33%32%%36%35",
+        "https://api.example.com/v1/refunds/%",
+        "https://api.example.com/v1/refunds/%2",
+    ] {
+        assert!(
+            matches!(decide(&e, u), PolicyDecision::Prompt),
+            "prompt skipped for {u}: {:?}",
+            decide(&e, u)
+        );
+    }
+    // A URL that really cannot be parsed is not allowed past a Prompt rule.
+    assert!(!matches!(decide(&e, "https://[::1"), PolicyDecision::Allow));
+}
+
+#[test]
+fn userinfo_cannot_sidestep_a_deny_rule() {
+    let e = engine(
+        vec![(
+            PolicyCondition::UrlMatch("https://api.example.com/admin/*".into()),
+            PolicyAction::Deny,
+        )],
+        PolicyAction::Allow,
+    );
+    for u in [
+        "https://u@api.example.com/admin/x",
+        "https://u:p@API.example.com:443/admin/x",
+        "https://:p@api.example.com/admin/x",
+    ] {
+        assert!(
+            is_deny(&decide(&e, u)),
+            "userinfo evaded the deny rule: {u}"
+        );
+    }
+}
+
+#[test]
+fn query_map_is_judged_with_the_url() {
+    let e = engine(
+        vec![(
+            PolicyCondition::UrlMatch("https://api.example.com/v1/search?q=secret*".into()),
+            PolicyAction::Deny,
+        )],
+        PolicyAction::Allow,
+    );
+    let params = serde_json::json!({
+        "url": "https://api.example.com/v1/search",
+        "query": {"q": "secret"}
+    });
+    let judged = policy_url(&params).expect("url present");
+    assert_eq!(judged, "https://api.example.com/v1/search?q=secret");
+    assert!(is_deny(&decide(&e, &judged)));
+    // Sorted by key, so the string is independent of map order.
+    let two = serde_json::json!({"url": "https://h.example/p", "query": {"b": "2", "a": "1 x"}});
+    assert_eq!(policy_url(&two).unwrap(), "https://h.example/p?a=1%20x&b=2");
+    // No url: nothing to judge. Unparseable url: the empty string, which no
+    // rule can match.
+    assert_eq!(policy_url(&serde_json::json!({"query": {"a": "1"}})), None);
+    assert_eq!(
+        policy_url(&serde_json::json!({"url": "https://[::1"})).unwrap(),
+        ""
+    );
+}
+
+#[test]
+fn glob_pattern_and_scheme_only_pattern_keep_biting() {
+    // `?` in a glob host is a glob character, not a query delimiter.
+    let e = engine(
+        vec![(
+            PolicyCondition::UrlMatch("https://api?.example.com/v1/*/x".into()),
+            PolicyAction::Deny,
+        )],
+        PolicyAction::Allow,
+    );
+    assert!(is_deny(&decide(&e, "https://api1.example.com/v1/a/x")));
+    // An upper-case scheme-only pattern still matches every https URL.
+    let e = engine(
+        vec![(
+            PolicyCondition::UrlMatch("HTTPS://*".into()),
+            PolicyAction::Deny,
+        )],
+        PolicyAction::Allow,
+    );
+    assert!(is_deny(&decide(&e, "https://api.example.com/x")));
+    assert!(is_deny(&decide(&e, "HTTPS://API.EXAMPLE.COM/x")));
+}
+
 fn spell_host(host: &str, bits: &[bool]) -> String {
     host.chars()
         .enumerate()
@@ -173,7 +300,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     /// Every equivalent spelling of a URL gets the same decision as the plain
-    /// spelling, for Deny prefix, Allow glob and host-boundary prefix rules.
+    /// spelling, for Deny prefix and Allow prefix rules.
     #[test]
     fn equivalent_spellings_decide_identically(
         host_bits in proptest::collection::vec(any::<bool>(), 1..8),
@@ -218,9 +345,41 @@ proptest! {
         // A suffix that starts a new label or continues the name changes the host.
         let parsed = url::Url::parse(&url);
         if let Ok(u) = parsed {
-            if u.host_str() != Some("api.example.com") {
+            if u.host_str().map(|h| h.trim_end_matches('.')) != Some("api.example.com") {
                 prop_assert!(is_deny(&decide(&e, &url)), "look-alike admitted: {}", url);
             }
         }
+    }
+
+    /// Glob and host-boundary rules decide identically for equivalent spellings.
+    #[test]
+    fn glob_and_host_boundary_rules_decide_identically(
+        host_bits in proptest::collection::vec(any::<bool>(), 1..8),
+        path_bits in proptest::collection::vec(any::<bool>(), 1..8),
+        port in prop_oneof![Just(""), Just(":443")],
+        dot in prop_oneof![Just(""), Just(".")],
+        seg in prop_oneof![Just("a"), Just("b1"), Just("zz")],
+        tail in prop_oneof![Just("secret"), Just("other")],
+        frag in prop_oneof![Just(""), Just("#f")],
+    ) {
+        let rules = vec![
+            (PolicyCondition::UrlMatch("https://api.example.com/*/secret".into()), PolicyAction::Deny),
+            (PolicyCondition::UrlMatch("https://api.example.com*".into()), PolicyAction::Allow),
+        ];
+        let e = engine(rules, PolicyAction::Deny);
+        let plain = format!("https://api.example.com/{seg}/{tail}");
+        let host = spell_host("api.example.com", &host_bits);
+        let spelled = format!(
+            "HTTPS://{host}{dot}{port}/{}/{}{frag}",
+            spell_path(seg, &path_bits),
+            spell_path(tail, &path_bits)
+        );
+        prop_assert_eq!(
+            is_deny(&decide(&e, &plain)),
+            is_deny(&decide(&e, &spelled)),
+            "plain {} vs spelled {}", plain, spelled
+        );
+        // The glob Deny really fires on the secret tail (the test is not vacuous).
+        prop_assert_eq!(is_deny(&decide(&e, &plain)), tail == "secret");
     }
 }

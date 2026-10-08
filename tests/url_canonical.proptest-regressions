@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc dba449234a4e0075258e5877483fd28efb16f604b5b86ea4cddf2c42b1846359 # shrinks to host_bits = [false], path_bits = [false], port = "", dots = 0, frag = "", which = 0, seg = "v1"
 cc 6d8a5079dcfb419ce48341bae6736148bb7a6e1838ce6126e250df6ec3296129 # shrinks to suffix = "a"
+cc 1399cd8c70aca61becfe80ce6b58469acc60447ae1173e4c0198262a0c25c37a # shrinks to suffix = "."

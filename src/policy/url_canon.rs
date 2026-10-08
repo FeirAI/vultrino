@@ -53,6 +53,14 @@ fn normalize_percent(s: &str) -> String {
                 continue;
             }
         }
+        // A '%' that does not start a valid escape is encoded, so a URL the parser
+        // accepts always reaches a fixed point (a decoded unreserved character
+        // can never complete a new escape).
+        if bytes[i] == b'%' {
+            out.push_str("%25");
+            i += 1;
+            continue;
+        }
         // Non-escape bytes: copy the whole char (input is valid UTF-8).
         let ch = s[i..].chars().next().expect("in bounds");
         out.push(ch);
@@ -65,6 +73,16 @@ fn one_pass(raw: &str) -> Option<String> {
     if is_relative(raw) {
         let base = Url::parse(DUMMY_BASE).ok()?;
         let u = Url::options().base_url(Some(&base)).parse(raw).ok()?;
+        // A value such as "/\t/evil.com/x" becomes the scheme-relative
+        // "//evil.com/x" once the tab is stripped: policy must never judge a
+        // URL whose host it has discarded.
+        if u.host_str() != Some("relative.invalid")
+            || u.port().is_some()
+            || !u.username().is_empty()
+            || u.password().is_some()
+        {
+            return None;
+        }
         let mut s = u.path().to_string();
         if let Some(q) = u.query() {
             s.push('?');
@@ -73,7 +91,25 @@ fn one_pass(raw: &str) -> Option<String> {
         return Some(normalize_percent(&s));
     }
     let mut u = Url::parse(raw).ok()?;
+    // Userinfo is not part of the destination but reqwest turns it into a
+    // Basic header on the same host and path, so `https://u@host/admin` would
+    // sidestep a rule on `https://host/admin/*`. Refuse it.
+    if !u.username().is_empty() || u.password().is_some() {
+        return None;
+    }
     u.set_fragment(None);
+    // `host.` and `host` are the same destination (client-side DNS): drop the
+    // trailing dot so one spelling remains.
+    let trimmed = match u.host() {
+        Some(url::Host::Domain(h)) if h.ends_with('.') => Some(h.trim_end_matches('.').to_string()),
+        _ => None,
+    };
+    if let Some(h) = trimmed {
+        if h.is_empty() {
+            return None;
+        }
+        u.set_host(Some(&h)).ok()?;
+    }
     Some(normalize_percent(u.as_str()))
 }
 
@@ -125,6 +161,23 @@ fn host_part(s: &str) -> Option<&str> {
     Some(auth.rsplit_once('@').map(|x| x.1).unwrap_or(auth))
 }
 
+/// Comparison form used only to decide whether canonicalisation changed what a
+/// pattern means: percent escapes normalised, case folded, default ports and a
+/// trailing slash ignored. Anything else that differs (fragment, dot segments,
+/// backslashes, a moved `?`) is a meaning change.
+fn loose(s: &str) -> String {
+    let mut t = normalize_percent(s).to_ascii_lowercase();
+    for port in [":443", ":80"] {
+        t = t
+            .replace(&format!("{port}/"), "/")
+            .replace(&format!("{port}?"), "?");
+        if let Some(x) = t.strip_suffix(port) {
+            t = x.to_string();
+        }
+    }
+    t.trim_end_matches('/').to_string()
+}
+
 /// Canonicalise a policy pattern. Same two shapes as before: a trailing `*`
 /// makes a literal prefix, anything else is a glob (or an exact match).
 pub fn canonical_pattern(pattern: &str) -> CanonPattern {
@@ -140,9 +193,33 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
         Some(b) => (b, true),
         None => (pattern, false),
     };
-    // `*`, `https://*`, `http*` and similar: nothing to canonicalise.
-    if body.is_empty() || body.ends_with("://") || !(body.contains("://") || is_relative(body)) {
+    if body.is_empty() {
         return keep(pattern, warnings);
+    }
+    // Scheme only (`https://*`): lower-case it, the URL side is lower-case.
+    if let Some(scheme) = body.strip_suffix("://") {
+        if scheme
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'))
+        {
+            return keep(&pattern.to_ascii_lowercase(), warnings);
+        }
+    }
+    // No scheme and not a path: `*.example.com/*`, `*example.com*`, `http*`.
+    if !(body.contains("://") || is_relative(body)) {
+        if pattern != "*" && pattern.split('/').next().unwrap_or("").contains('*') {
+            warnings.push(PatternWarning::StarInHost);
+        }
+        return keep(pattern, warnings);
+    }
+    let rest = body.split_once("://").map(|x| x.1);
+    // A glob whose host part holds `?` would be reparsed as a query delimiter.
+    // Keep the old literal glob meaning and say so.
+    if let (false, Some(r)) = (prefix_mode, rest) {
+        let auth_end = r.find('/').unwrap_or(r.len());
+        if r[..auth_end].contains('?') {
+            return keep(pattern, vec![PatternWarning::Unparseable]);
+        }
     }
     let src = if prefix_mode {
         body.to_string()
@@ -159,52 +236,94 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
         if h.contains('*') {
             warnings.push(PatternWarning::StarInHost);
         }
-        if prefix_mode {
-            // `https://host*`: no `/` after the authority.
-            let rest = body.split_once("://").map(|x| x.1).unwrap_or("");
-            if !rest.contains('/') {
-                warnings.push(PatternWarning::StarAfterHost);
-            }
-        }
     }
-    // Meaning change: ignore case/port/percent rewrites by comparing the
-    // structure after resolving only those. A dot segment or an appended path
-    // shows up as a different segment list.
-    let segs = |s: &str| -> Vec<String> {
-        let after = s.split_once("://").map(|x| x.1).unwrap_or(s);
-        let path = after.find('/').map(|i| &after[i..]).unwrap_or("");
-        path.split(['?', '#'])
-            .next()
-            .unwrap_or("")
-            .split('/')
-            .map(|x| x.to_string())
-            .collect()
-    };
-    let before = segs(body);
-    let after = segs(&canon);
-    let host_only_prefix = prefix_mode && warnings.contains(&PatternWarning::StarAfterHost);
-    if !host_only_prefix && before.iter().any(|s| s == "." || s == "..") && before != after {
+    // `https://host*`: nothing after the authority. Matched with a host
+    // boundary (see `canonical_matches`).
+    let host_only = prefix_mode && rest.is_some_and(|r| !r.contains(['/', '?', '#']));
+    if host_only {
+        warnings.push(PatternWarning::StarAfterHost);
+    }
+    if loose(body) != loose(&canon) {
         warnings.push(PatternWarning::MeaningChanged);
     }
-    CanonPattern {
-        text: if prefix_mode {
-            format!("{canon}*")
-        } else {
-            canon
-        },
-        warnings,
-    }
+    let text = if host_only {
+        format!("{}*", canon.trim_end_matches('/'))
+    } else if prefix_mode {
+        format!("{canon}*")
+    } else {
+        canon
+    };
+    CanonPattern { text, warnings }
 }
 
 /// Match an already-canonical URL against an already-canonical pattern.
+///
+/// A prefix that stops right after a host (`https://api.example.com*`) is a
+/// host match: the prefix must be followed by a port, a path, a query or the
+/// end, never by more host characters (`api.example.com.evil.net`).
 pub fn canonical_matches(url: &str, pattern: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix('*') {
-        url.starts_with(prefix)
+        if !url.starts_with(prefix) {
+            return false;
+        }
+        let host_only = prefix
+            .split_once("://")
+            .is_some_and(|(_, r)| !r.is_empty() && !r.contains('/'));
+        if host_only {
+            let rest = &url[prefix.len()..];
+            return rest.is_empty() || rest.starts_with(['/', ':', '?']);
+        }
+        true
     } else if let Ok(glob) = glob::Pattern::new(pattern) {
         glob.matches(url)
     } else {
         url == pattern
     }
+}
+
+/// The URL that policy judges and the HTTP plugins send: the canonical form of
+/// `url` with the caller's `query` map merged in, sorted by key and encoded
+/// with percent-escapes. `None` when the base URL cannot be canonicalised.
+pub fn effective_url(
+    url: &str,
+    query: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let base = canonical_url(url)?;
+    if query.is_empty() {
+        return Some(base);
+    }
+    let mut pairs: Vec<_> = query.iter().collect();
+    pairs.sort();
+    let qs = pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let sep = if base.contains('?') { '&' } else { '?' };
+    canonical_url(&format!("{base}{sep}{qs}"))
+}
+
+/// The URL string policy evaluates for a request's params (`url` plus the
+/// `query` map). `None` when there is no `url`. A URL that cannot be
+/// canonicalised yields the empty string, which no rule can match and which the
+/// engine's unparseable pre-check treats as a deny trigger.
+pub fn policy_url(params: &serde_json::Value) -> Option<String> {
+    let raw = params.get("url")?.as_str()?;
+    let query = match params.get("query") {
+        Some(serde_json::Value::Object(m)) => m
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string()),
+                )
+            })
+            .collect(),
+        _ => std::collections::HashMap::new(),
+    };
+    Some(effective_url(raw, &query).unwrap_or_default())
 }
 
 /// `UrlMatch` semantics: canonicalise both sides, then match. A URL that cannot
@@ -277,6 +396,69 @@ mod tests {
     }
 
     #[test]
+    fn userinfo_and_hidden_hosts_are_not_canonicalisable() {
+        for bad in [
+            "https://u@api.example.com/x",
+            "https://u:p@api.example.com/x",
+            "/\t/evil.com/x",
+            "//evil.com/x",
+        ] {
+            assert_eq!(canonical_url(bad), None, "{bad}");
+        }
+        assert_eq!(
+            canonical_url("https://API.example.com.:8443/x").as_deref(),
+            Some("https://api.example.com:8443/x")
+        );
+    }
+
+    #[test]
+    fn stray_percent_reaches_a_fixed_point() {
+        let c = canonical_url("https://a.example/%%%33%32%%36%35").expect("parseable");
+        assert_eq!(canonical_url(&c).as_deref(), Some(c.as_str()));
+        assert_eq!(c, "https://a.example/%25%2532%2565");
+    }
+
+    #[test]
+    fn more_pattern_warnings() {
+        let w = |p: &str| canonical_pattern(p).warnings;
+        assert!(w("https://api.example.com/x#*").contains(&PatternWarning::MeaningChanged));
+        assert!(w("https://api.example.com/v1/%2e%2e/admin/*")
+            .contains(&PatternWarning::MeaningChanged));
+        assert!(w("https://api.example.com\\admin/*").contains(&PatternWarning::MeaningChanged));
+        assert!(w("*.example.com/*").contains(&PatternWarning::StarInHost));
+        assert!(w("*example.com*").contains(&PatternWarning::StarInHost));
+        assert!(!w("https://api?.example.com/v1/*/x").is_empty());
+        assert_eq!(canonical_pattern("HTTPS://*").text, "https://*");
+        assert_eq!(
+            canonical_pattern("https://api?.example.com/v1/*/x").text,
+            "https://api?.example.com/v1/*/x"
+        );
+    }
+
+    #[test]
+    fn host_boundary_matching() {
+        let p = canonical_pattern("https://api.example.com*").text;
+        assert_eq!(p, "https://api.example.com*");
+        for yes in [
+            "https://api.example.com/x",
+            "https://api.example.com:8443/x",
+            "https://api.example.com/?a=1",
+        ] {
+            assert!(canonical_matches(yes, &p), "{yes}");
+        }
+        for no in [
+            "https://api.example.com.evil.net/",
+            "https://api.example.coma/",
+        ] {
+            assert!(!canonical_matches(no, &p), "{no}");
+        }
+        assert!(!canonical_matches(
+            "https://h:84430/",
+            &canonical_pattern("https://h:8443*").text
+        ));
+    }
+
+    #[test]
     fn pattern_canonical_text() {
         assert_eq!(
             canonical_pattern("HTTPS://API.example.com:443/v1/%61*").text,
@@ -284,7 +466,7 @@ mod tests {
         );
         assert_eq!(
             canonical_pattern("https://api.example.com*").text,
-            "https://api.example.com/*"
+            "https://api.example.com*"
         );
         assert_eq!(
             canonical_pattern("https://api.example.com").text,

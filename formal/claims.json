@@ -1077,7 +1077,7 @@
         {
           "path": "src/plugins/http.rs",
           "symbol": "*",
-          "sha256": "bea6fa5db58c22c6294905b7b51e01d5497e81ebfc6d98d5a7932055bc1cecb7"
+          "sha256": "3b4033d22461b7c4ff89eb38a1dff6cfdd0b8595ef4dc6f86dda02648e3420d1"
         },
         {
           "path": "src/plugins/http/ssrf_spec.rs",
@@ -1117,7 +1117,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "494991803555398b629bf9ff79e2d70f8f9b4d65237c856fa797b5fe324bd8dc"
+          "sha256": "9d3c6390515ddf44e7f70bcb4436ccfb422d74e28363d0b9dd24fbbb26de6df0"
         },
         {
           "path": "src/policy/precedence.rs",
@@ -1138,7 +1138,7 @@
         "policy-precedence-lazy-kill-precheck-dropped",
         "policy-precedence-engine-kill-flag-ignored"
       ],
-      "does_not_establish": "Only the precedence step. Whether a rule matches (URL, method, time window, rate limit, spend cap, action label) is outside it, and the domain is bounded at 4 outcomes and 3 policy defaults for the pure and lazy functions and at two policies of 48 shapes for the engine test. The engine test uses only always-matching rules and a fixed credential, so it does not cover rate-limit charging order beyond the lazy-scan check that no weaker tier is asked, and the first matching rule within a tier is chosen by storage order. The oracles are test code. The engine hands the lazy function at most one outcome per call by design; the multi-outcome equivalence is shown for membership of tiers, which is all the scan can observe. Layered Allow-RateLimit rules are still first-match, not conjunctive. The engine default applies only when no policy matches, and is not applied on top of a matching policy's default. The tail is shown to deny by the mapping test, not shown unreachable from the engine (it is unreachable only because any matching policy has a default action)."
+      "does_not_establish": "Only the precedence step. Whether a rule matches (URL, method, time window, rate limit, spend cap, action label) is outside it, and the domain is bounded at 4 outcomes and 3 policy defaults for the pure and lazy functions and at two policies of 48 shapes for the engine test. The engine test uses only always-matching rules and a fixed credential, so it does not cover rate-limit charging order beyond the lazy-scan check that no weaker tier is asked, and the first matching rule within a tier is chosen by storage order. The oracles are test code. The engine hands the lazy function at most one outcome per call by design; the multi-outcome equivalence is shown for membership of tiers, which is all the scan can observe. Layered Allow-RateLimit rules are still first-match, not conjunctive. The engine default applies only when no policy matches, and is not applied on top of a matching policy's default. The tail is shown to deny by the mapping test, not shown unreachable from the engine (it is unreachable only because any matching policy has a default action). The engine runs an unparseable-URL pre-check before the kill tier: a halted principal whose request URL cannot be canonicalised, under a policy with a URL deny or prompt rule, gets the unparseable reason instead of the halt reason. The outcome is still Deny and the pre-check is outside this claim."
     },
     {
       "id": "kani-policy-precedence",
@@ -1206,19 +1206,20 @@
     },
     {
       "id": "url-match-canonical",
-      "statement": "UrlMatch is evaluated on a canonical form of the request URL (url crate parse: scheme and host lowercased, IDNA, default port dropped, dot segments resolved, fragment dropped, percent-encoding normalised so unreserved escapes are decoded) against a pattern canonicalised the same way. For generated equivalent spellings (host case, default port, dot segments, encoded unreserved characters, fragment) the engine decision equals the decision for the plain spelling under Deny-prefix, Allow-prefix and Allow-glob rules. A prefix pattern that ends in * directly after a host stops at the host boundary, so look-alike hosts (api.example.com.evil.net, api.example.com@evil.net) do not match. A URL that cannot be parsed never matches an Allow rule and is denied when a matching policy has a UrlMatch under a Deny rule or under a Not. The http and hmac plugins send the same canonical string (except UrlToken credentials, whose substituted path is left untouched). Risky patterns (star right after the host, star in the host, dot segments) log a load-time warning.",
+      "statement": "UrlMatch is evaluated on a canonical form of the request URL (url crate parse: scheme and host lowercased, IDNA, one trailing host dot dropped, default port dropped, dot segments resolved, fragment dropped, percent-encoding normalised so unreserved escapes are decoded and a stray % is encoded) with the caller's query map merged in sorted order, against a pattern canonicalised the same way. For generated equivalent spellings (host case, default port, trailing host dot, dot segments, encoded unreserved characters, fragment) the engine decision equals the decision for the plain spelling under Deny-prefix, Allow-prefix, Deny-glob and host-boundary-prefix rules. A prefix pattern that ends in * directly after a host matches that host on any port and path but not look-alike hosts (api.example.com.evil.net). A URL that cannot be canonicalised (including any URL with userinfo) never matches an Allow rule and is denied when a matching policy has a UrlMatch under a Deny or Prompt rule or under a Not. The http plugin sends the evaluated string and the hmac plugin sends the canonical base URL; both refuse a URL that cannot be canonicalised. Risky patterns (star right after the host, star in the host, canonicalisation changing the meaning) log a load-time warning once per policy and pattern.",
       "method": "property",
       "artifacts": [
-        "src/policy/url_canon.rs",
-        "src/policy/mod.rs",
-        "src/plugins/http.rs",
         "src/plugins/hmac.rs",
+        "src/plugins/http.rs",
+        "src/policy/mod.rs",
+        "src/policy/url_canon.rs",
+        "src/server/mod.rs",
         "tests/url_canonical.rs"
       ],
       "gates": [
         "rust"
       ],
-      "detector": "set -e; cargo test --locked --no-default-features --test url_canonical; cargo test --locked --no-default-features --lib -- policy::url_canon::tests plugins::http::tests::test_prepare_request_sends_the_canonical_url",
+      "detector": "set -e; cargo test --locked --no-default-features --test url_canonical; cargo test --locked --no-default-features --lib -- policy::url_canon::tests policy::tests::url_warnings plugins::http::tests::test_prepare_request_sends_the_canonical_url plugins::http::tests::test_prepare_request_merges_query plugins::hmac::tests::test_hmac_sends_the_canonical_url",
       "covers": [
         {
           "path": "src/policy/url_canon.rs",
@@ -1228,7 +1229,7 @@
         {
           "path": "src/policy/url_canon.rs",
           "symbol": "canonical_pattern",
-          "sha256": "2eb2df9b7563148f474681dba0a96b9756776078f3d66c486b920c30f3382cac"
+          "sha256": "a873679dd8a0253e89e486f1b1303695cdba808653da00d0d97422d0ca883ab0"
         },
         {
           "path": "src/policy/url_canon.rs",
@@ -1238,12 +1239,47 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "494991803555398b629bf9ff79e2d70f8f9b4d65237c856fa797b5fe324bd8dc"
+          "sha256": "9d3c6390515ddf44e7f70bcb4436ccfb422d74e28363d0b9dd24fbbb26de6df0"
         },
         {
           "path": "src/plugins/http.rs",
           "symbol": "HttpPlugin::prepare_request",
-          "sha256": "97eb60ef8582ac79cf850a5021e505e9a7ba6d663f42e82c78b789147a00538c"
+          "sha256": "c725168c350c1fc3b5ef1f2d7c05aab1f76eee3db05da3b3385cd5edfb838bfb"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "one_pass",
+          "sha256": "2702ea20b8483f43af2e2cb3b02fb64cc9c371a88fd56542e6e8ce8ee4dcdb3b"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "normalize_percent",
+          "sha256": "2837aa968bb5184c3965ea0f075f815601015fce3cf5e27d0521670c62221cb6"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "canonical_matches",
+          "sha256": "ed73d497bd9852256692082c2dad05e867d0a538850fc66c59c9799bb1163db6"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "effective_url",
+          "sha256": "a7c1baca214114072993ef4e6b5747b3abf3b8004bdc90795ee59163b534d84a"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "policy_url",
+          "sha256": "dd7ee2666f90ae2de5e0c1581d94e5d1134937260bc4d64d510880b463e09baf"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "warn_url_patterns",
+          "sha256": "3d77dcc45ac17a20f613e38603e5374a86cd06961e94956a4260571053797392"
+        },
+        {
+          "path": "src/plugins/hmac.rs",
+          "symbol": "HmacPlugin::canonical_send_url",
+          "sha256": "5269180b8c3da96ada7413fcf1272d621f96af491e38aa4aaf5950cde30f9862"
         }
       ],
       "mutants": [
@@ -1252,7 +1288,7 @@
         "url-canon-unparseable-deny-dropped",
         "url-canon-http-sends-raw"
       ],
-      "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or a trailing dot in the host differently is not modelled). Patterns with * inside the host, or glob patterns whose * crosses a / (a glob * matches /), can still match a different host: they only log a warning this release. Host-boundary coverage is for prefix patterns without a port or userinfo wildcard. Only the http and hmac plugins send the canonical URL; the wasm plugin egress, ssh and postgres plugins do not use params url. UrlToken requests are judged on the placeholder URL and sent with the secret substituted unmodified. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested."
+      "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or path case differently is not modelled). Patterns with * inside the host, or glob patterns whose * crosses a / (a glob * matches /), can still match a different host: they only log a warning this release. A glob whose host holds ? keeps literal glob meaning. Only the http and hmac plugins send the canonical URL; internal_http sends the url-crate composition of the raw path (differing only in unreserved percent escapes and hex case) after its own path allowlist ran on the raw path; the wasm plugin egress, ssh and postgres plugins do not use params url. The hmac plugin adds timestamp, recvWindow and signature after evaluation, and AWS SigV4 re-sorts query pairs for signing; those additions are not judged. UrlToken requests are judged on the placeholder URL and sent with the secret substituted unmodified. The query map is merged only when it is a JSON object. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested. The load-time warning is a log line and is not a refusal."
     }
   ]
 }

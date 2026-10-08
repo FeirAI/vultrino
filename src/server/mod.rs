@@ -1453,7 +1453,10 @@ impl VultrinoServer {
 
         // Evaluate policy (URL / method / rate limits / principal / spend). A
         // `Prompt` decision routes into the approval flow rather than failing.
-        let url = request.params.get("url").and_then(|v| v.as_str());
+        // SB-03: the URL policy judges is the canonical URL with the caller's
+        // `query` map merged in, the same string the HTTP plugins send.
+        let policy_url = crate::policy::policy_url(&request.params);
+        let url = policy_url.as_deref();
         let method = request.params.get("method").and_then(|v| v.as_str());
         // V4: the resolved principal (key/token id + agent label) for
         // principal_pattern matching.
@@ -3346,7 +3349,8 @@ impl VultrinoServer {
         // double-charge and could spuriously deny an already-approved action. A
         // `Prompt` is already satisfied (the human approved), so only `Deny`
         // blocks; the use token is left unconsumed when it does.
-        let url = approval.params.get("url").and_then(|v| v.as_str());
+        let policy_url = crate::policy::policy_url(&approval.params);
+        let url = policy_url.as_deref();
         let method = approval.params.get("method").and_then(|v| v.as_str());
         // Rebuild the principal (V4) and spend (V3) from the recorded approval so
         // per-agent denies and spend caps are re-evaluated at resume. Spend is
