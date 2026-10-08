@@ -251,6 +251,35 @@ fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
     )
 }
 
+/// True when `ip` is a link-local or cloud-metadata address, in any spelling the
+/// classifier decodes: IPv4 169.254.0.0/16, IPv6 fe80::/10, the AWS IPv6 metadata
+/// address fd00:ec2::254, and any of those carried inside an IPv4-mapped
+/// (::ffff:a.b.c.d), IPv4-compatible (::a.b.c.d), NAT64 (64:ff9b::/96) or 6to4
+/// (2002::/16) address. Used by the config-time `llm.provider_base` check, which
+/// deliberately allows loopback and RFC1918 (self-hosted gateways) but never
+/// metadata endpoints. The execute-time classifier [`HttpPlugin::is_private_ip`]
+/// remains the authoritative, broader control.
+pub(crate) fn is_link_local_or_metadata_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4_in_prefix(u32::from(*v4), 0xa9fe_0000, 16),
+        IpAddr::V6(v6) => {
+            let addr = u128::from(*v6);
+            let seg = v6.segments();
+            v6_in_prefix(addr, 0xfe80_0000_0000_0000_0000_0000_0000_0000, 10)
+                || v6_in_prefix(addr, 0xfd00_0ec2_0000_0000_0000_0000_0000_0254, 128)
+                || v6
+                    .to_ipv4()
+                    .is_some_and(|v4| is_link_local_or_metadata_ip(&IpAddr::V4(v4)))
+                || (seg[0] == 0x0064
+                    && seg[1] == 0xff9b
+                    && seg[2..6].iter().all(|s| *s == 0)
+                    && is_link_local_or_metadata_ip(&IpAddr::V4(embedded_v4(seg[6], seg[7]))))
+                || (seg[0] == 0x2002
+                    && is_link_local_or_metadata_ip(&IpAddr::V4(embedded_v4(seg[1], seg[2]))))
+        }
+    }
+}
+
 /// filter_public_addrs keeps only public IPs (drops a rebinding host's private
 /// connect-time answers) and fails closed when none remain. Split out so the SSRF
 /// filter is unit-testable without DNS.

@@ -36,6 +36,9 @@ enum Reply {
     Status(u16, String),
     Raw(u16, String),
     Delay(u64, Box<Reply>),
+    /// Hold the reply until the test releases it (or a 30s safety cap passes),
+    /// so a client timeout is the only thing that can end the request.
+    Hold(Arc<tokio::sync::Notify>, Box<Reply>),
 }
 
 type InvalidCase = (&'static str, Box<dyn Fn(&mut Value)>);
@@ -62,6 +65,10 @@ async fn graphql_stub(
             tokio::time::sleep(Duration::from_millis(milliseconds)).await;
             *reply
         }
+        Reply::Hold(release, reply) => {
+            let _ = tokio::time::timeout(Duration::from_secs(30), release.notified()).await;
+            *reply
+        }
         reply => reply,
     };
     match reply {
@@ -72,7 +79,9 @@ async fn graphql_stub(
                 axum::http::StatusCode::from_u16(status).expect("valid mock status");
             response
         }
-        Reply::Delay(..) => unreachable!("delayed replies are unwrapped above"),
+        Reply::Delay(..) | Reply::Hold(..) => {
+            unreachable!("delayed replies are unwrapped above")
+        }
     }
 }
 
@@ -921,10 +930,17 @@ async fn partial_read_matching_text_can_never_be_reported_as_success() {
 #[tokio::test]
 async fn timeout_after_reservation_remains_durably_blocked() {
     let fixture = Fixture::new().await;
+    // The timeout must only ever fire on the create call. The channel lookup is
+    // slowed on purpose so a loaded machine cannot flip the outcome, and the
+    // create reply is held until the end of the test instead of racing a sleep.
+    let release = Arc::new(tokio::sync::Notify::new());
     fixture.queue([
-        Reply::Json(channel_success(&fixture.pin("x"))),
         Reply::Delay(
-            100,
+            50,
+            Box::new(Reply::Json(channel_success(&fixture.pin("x")))),
+        ),
+        Reply::Hold(
+            release.clone(),
             Box::new(Reply::Json(json!({
                 "data": {"createPost": {"__typename": "PostActionSuccess", "post": {
                     "id": "late-post", "text": "hello", "status": "draft",
@@ -940,7 +956,7 @@ async fn timeout_after_reservation_remains_durably_blocked() {
         fixture.pins.clone(),
         fixture.storage.clone(),
     )
-    .with_request_timeout(Duration::from_millis(20));
+    .with_request_timeout(Duration::from_millis(1000));
     let params = fixture.params("x", "hello");
     let first = plugin
         .execute(fixture.request("draft_create", params.clone(), "credential-1", true))
@@ -967,6 +983,7 @@ async fn timeout_after_reservation_remains_durably_blocked() {
         .await;
     assert!(second.is_err());
     assert_eq!(fixture.count_query(CREATE_QUERY), create_count);
+    release.notify_one();
 }
 
 #[tokio::test]
