@@ -123,9 +123,17 @@ small safe-Rust enforcement kernel and machine-enforced choke points matching
 the model:
 
 - `ExecutionBinding` contains the same eight fields as `RequestBinding`;
-- a private, non-cloneable `ExecutionPermit` is minted only from a direct allow
-  or a persisted exact-binding `Granted` witness and is consumed to produce the
-  `Authorized<ActionPayload>` accepted by the only two dispatch variants;
+- a private, non-cloneable `ExecutionPermit` is minted only from an
+  `AdmissionWitness` (built by the pure admission gate from the policy engine's
+  `Evaluation` of that request: an Allow, or a Deny that observe mode lets run,
+  kept as its own kind) or from a persisted exact-binding `Granted` witness
+  together with the read-only `Evaluation` made at resume. `authorize`
+  recomputes seven binding fields from the payload it is handed and refuses a
+  mismatch, and the result is the `Authorized<ActionPayload>` accepted by the
+  only two dispatch variants. This does not make the gate inputs true (the
+  policy rules, the observe downgrade and the approval requirement are computed
+  outside the kernel), it does not recompute the rule digest from the payload,
+  and code that runs after `authorize` is not checked by the kernel;
 - approval claims derive the epoch-bound grant while holding the vault lock and
   refuse epoch overflow;
 - the approval JSON handler verifies any present broker assertion over the raw

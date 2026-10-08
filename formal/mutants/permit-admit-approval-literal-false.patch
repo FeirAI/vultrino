@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 98cc73a..272afa9 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -1663,7 +1663,7 @@ impl VultrinoServer {
+         // Deny (already returned above) is refused again here; only Allow, or
+         // a Deny that observe mode downgraded, yields the witness that mints a
+         // direct permit below.
+-        let admission = crate::formal_kernel::admit(evaluation, needs_approval);
++        let admission = crate::formal_kernel::admit(evaluation, false);
+         if matches!(
+             admission,
+             Err(crate::formal_kernel::PermitError::ApprovalRequired)

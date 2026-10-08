@@ -1,8 +1,8 @@
 diff --git a/src/formal_kernel.rs b/src/formal_kernel.rs
-index 77fbf66..2bf6e58 100644
+index 490798c..f9e443a 100644
 --- a/src/formal_kernel.rs
 +++ b/src/formal_kernel.rs
-@@ -55,7 +55,7 @@ pub fn digest_bytes(bytes: &[u8]) -> String {
+@@ -83,7 +83,7 @@ pub(crate) fn digest_params(params: &serde_json::Value) -> Option<String> {
  
  /// Advance the durable one-shot fence without wraparound.
  pub(crate) fn next_epoch(current: u64) -> Option<u64> {
@@ -10,4 +10,4 @@ index 77fbf66..2bf6e58 100644
 +    Some(current.wrapping_add(1))
  }
  
- /// Why an execution permit exists. Private so possession, not inspection, is
+ /// The kinds of policy decision the admission gate distinguishes.

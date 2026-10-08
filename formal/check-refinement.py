@@ -103,6 +103,29 @@ for signature in (
     if server.count(signature) < 2:
         fail(f"both dispatch variants are not permit-bound: missing {signature!r}")
 
+# VUL-05: permits are minted only from the admission gate's witness or the
+# grant plus the resume evaluation, at one site each, and authorize recomputes
+# the binding from the payload (it takes no binding argument).
+for hook, count in (
+    ("crate::formal_kernel::admit(evaluation, needs_approval)", 1),
+    ("crate::formal_kernel::ExecutionPermit::direct(", 1),
+    ("crate::formal_kernel::ExecutionPermit::approved(", 1),
+    ("permit.authorize(payload)", 2),
+    ("impl crate::formal_kernel::Dispatch for ActionPayload", 1),
+):
+    if server.count(hook) != count:
+        fail(f"permit mint or authorize site changed: {hook!r} appears {server.count(hook)} times, want {count}")
+if re.search(r"\.authorize\(\s*&", server):
+    fail("authorize must recompute the binding from the payload, not receive one")
+if not re.search(r"pub\(crate\) fn direct\(\s*witness: AdmissionWitness,", rust):
+    fail("the direct permit no longer consumes an AdmissionWitness")
+if not re.search(r"pub\(crate\) struct AdmissionWitness \{\n    kind: AdmissionKind,\n    subject: JudgedSubject,\n\}", rust):
+    fail("AdmissionWitness fields are no longer private")
+if not re.search(r"pub\(crate\) struct Evaluation \{\n    decision: PolicyDecision,\n    observe_downgrade: bool,\n    subject: Option<crate::formal_kernel::JudgedSubject>,\n\}", policy):
+    fail("policy Evaluation fields are no longer private")
+if policy.count("Evaluation {\n            decision") != 2:
+    fail("Evaluation must be built only by the two admission evaluation methods")
+
 if "wrapping_add(1)" in storage and "execution_epoch" in storage:
     fail("approval execution epoch may wrap")
 if "grant_witness_for_epoch(epoch)" not in storage:
@@ -242,7 +265,9 @@ strict_undeclared_refusal = server.find(
 criticality_force = server.find(
     "if irreversibility.automatically_requires_approval()", strict_undeclared_refusal
 )
-approval_branch = server.find("if needs_approval {", criticality_force)
+approval_branch = server.find(
+    "let admission = crate::formal_kernel::admit(evaluation, needs_approval);", criticality_force
+)
 if min(
     criticality_snapshot,
     unavailable_refusal,
@@ -329,7 +354,7 @@ resume_recipe = server.find("let current_gate_rule = self", resume_catalog)
 resume_recipe_guard = server.find(
     "if !legacy_unbound_recipe && !gate_rule_authority_current", resume_recipe
 )
-resume_policy = server.find("evaluate_readonly_full", resume_recipe_guard)
+resume_policy = server.find("evaluate_readonly_for_admission", resume_recipe_guard)
 resume_permit = server.find("ExecutionPermit::approved", resume_policy)
 if min(
     resume,
@@ -580,7 +605,9 @@ if abi_validation < 0 or plugin_copy < 0 or abi_validation > plugin_copy:
     fail("WASM ABI validation must happen before installation copies the module")
 
 required_kani_harnesses = (
-    "direct_permit_truth_table_is_exact",
+    "admission_gate_truth_table_is_exact",
+    "authorize_accepts_exactly_the_recomputed_binding",
+    "approved_gate_enforces_deny_and_window",
     "execution_epoch_never_wraps",
     "zero_approvers_never_satisfy",
     "satisfaction_never_underfills_a_slot",
@@ -611,4 +638,4 @@ if trace_sha256 != expected_trace_sha256:
         f"got {trace_sha256}, want {expected_trace_sha256}"
     )
 
-print("refinement check: structural source-shape checks passed (not a semantic refinement proof) (8 execution binding fields; exact-bound named broker approval authority; exact credential-revision/tenant continuity; credential-bound criticality with open-to-resume catalog continuity; conclusive production recipe authority with exact open-to-resume continuity; declared human-floor capabilities cannot dispatch directly; fail-closed canonical action aliases; operator-pinned internal HTTP method; startup-validated policy/workload secrets; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; 9 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")
+print("refinement check: structural source-shape checks passed (not a semantic refinement proof) (8 execution binding fields; exact-bound named broker approval authority; exact credential-revision/tenant continuity; credential-bound criticality with open-to-resume catalog continuity; conclusive production recipe authority with exact open-to-resume continuity; declared human-floor capabilities cannot dispatch directly; fail-closed canonical action aliases; operator-pinned internal HTTP method; startup-validated policy/workload secrets; disabled agent-reviewer recipes; 2 permit-bound dispatch variants; permits minted from an admission witness or a grant and authorized against a binding recomputed from the payload; 11 Kani harnesses; WASM/buffered+streaming egress/error/vault/limiter sinks confined; rate-trace sha256 pinned)")

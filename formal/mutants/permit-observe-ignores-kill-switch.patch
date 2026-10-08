@@ -1,0 +1,12 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 9196e29..b42538a 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -549,7 +549,6 @@ impl PolicyEngine {
+         let decision = self.evaluate_full(&input);
+         let observe_downgrade = matches!(decision, PolicyDecision::Deny(_))
+             && observe_tenant
+-            && !self.is_halted(&input)
+             && !self.has_resource_guard(&input);
+         Evaluation {
+             decision,
