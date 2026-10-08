@@ -189,9 +189,10 @@ noninterference. Honest scope:
   implementations correct.
 - **Operator-authored truth stays outside the model.** A truthful
   reversible/irreversible label, a correct Govder recipe, and a matching
-  workload-assertion signing key are operational assumptions — the gates prove
-  enforcement continuity of what the stores and verifiers report, not that the
-  external world matches those labels.
+  workload-assertion signing key are operational assumptions. The gates check
+  enforcement continuity of what the stores and verifiers report only in the
+  Lean model and as source shape (see above); they do not show that the external
+  world matches those labels.
 
 `./ci-local.sh` runs Lean + refinement + the Rust gates; it does **not** run
 Kani (install + toolchain cost). CI's separate `kani` job is the authoritative
@@ -212,9 +213,12 @@ kernels.
   Govder risk facts frozen at open. The parser/library default remains
   non-strict for compatibility with older stdio/embedded callers (new `vultrino
   init` files opt in); those callers must set
-  `require_declared_capabilities = true` for the same guarantee. Lean and the
-  refinement gate prove that the declared class plus recipe authority and their
-  open-to-resume continuity are enforced. They cannot establish that an operator
+  `require_declared_capabilities = true` for the same guarantee. Lean proves
+  decision tables about a hand-written model of that rule (the declared class plus
+  recipe authority and their open-to-resume continuity), and the refinement gate
+  (`formal/check-refinement.sh`) is a structural source-shape check that the code
+  still has the expected seams; neither proves the production code enforces the rule
+  end to end, which is covered by integration tests. They cannot establish that an operator
   truthfully labeled the real-world side effect reversible, that Govder's stored
   recipe is organizationally correct, or detect an external semantic change not
   reflected in either authority store; those remain explicit operational assumptions.
