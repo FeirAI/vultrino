@@ -33,7 +33,13 @@ e3e39e76d00b1677335db8e9a805c7b9480ea2f4dc9e33f0b93cd3a905128d73  iana-ipv4-spec
 
 They are the input to the SSRF classifier specification in
 `src/plugins/http/ssrf_spec.rs`. A normal test parses them and asserts the
-specification's registry tables equal the rows whose "Globally Reachable" cell is
-`False`. The extra policy ranges (multicast, 192.88.99.0/24, ::/96, fec0::/10,
-ff00::/8) are listed separately in that file. The snapshots are refreshed by hand;
+specification's registry tables equal the maximal rows whose "Globally Reachable"
+cell is `False`, less the IPv4-mapped row (decoded instead) and rows inside a
+policy range. The extra policy ranges (multicast, 192.88.99.0/24, ::/96, fec0::/10,
+ff00::/8) are listed separately in that file. The specification also blocks
+Teredo 2001::/32 and 64:ff9b:1::/48 by an explicit rule, and decodes NAT64 over
+64:ff9b::/32 rather than only the /96 well-known prefix, to match the shipped
+decode (this only over-blocks). Rows the registry marks globally reachable but
+that sit inside a blocked row (192.0.0.9/32, 192.0.0.10/32, and the reachable
+rows inside 2001::/23) are blocked on purpose. The snapshots are refreshed by hand;
 nothing re-fetches them, so a later registry change is not noticed automatically.

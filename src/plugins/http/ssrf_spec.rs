@@ -104,7 +104,9 @@ fn spec_v4(a: u32) -> bool {
 /// conservative superset of the /96 well-known prefix: the shipped decode does not
 /// check the middle 64 bits, which only over-blocks) and 6to4 (2002::/16) classify
 /// the embedded IPv4 address with `spec_v4`. Teredo (2001::/32) and 64:ff9b:1::/48
-/// are blocked outright by the registry table.
+/// are blocked outright by an explicit rule ahead of the decodes, so they stay
+/// blocked even if a registry refresh drops the table rows that hold them today
+/// (2001::/23 and 64:ff9b:1::/48).
 #[cfg(any(test, kani))]
 fn spec_v6(a: u128) -> bool {
     let mut i = 0;
@@ -120,6 +122,9 @@ fn spec_v6(a: u128) -> bool {
             return true;
         }
         j += 1;
+    }
+    if in6(a, [0x2001, 0, 0, 0, 0, 0, 0, 0], 32) || in6(a, [0x64, 0xff9b, 1, 0, 0, 0, 0, 0], 48) {
+        return true;
     }
     if in6(a, [0, 0, 0, 0, 0, 0xffff, 0, 0], 96) {
         return spec_v4(a as u32);
