@@ -21,7 +21,8 @@
       "unbreakable",
       "tamper-proof",
       "refinement gate prove",
-      "gates prove enforcement"
+      "gates prove enforcement",
+      "proves enforcement"
     ],
     "globs": [
       "README.md",
@@ -323,7 +324,7 @@
     },
     {
       "id": "ssrf-special-purpose",
-      "statement": "The outbound-request address classifier blocks every range in the IPv4 and IPv6 special-purpose tables (first and last address of each range) and keeps the tested neighbouring addresses reachable, and it decodes IPv4 carried in IPv4-mapped, NAT64 and 6to4 IPv6 addresses before classifying, in the named unit tests.",
+      "statement": "The outbound-request address classifier blocks the first and last address of every IANA special-purpose registry row marked not globally reachable, as transcribed by hand into the test (plus 2001::/23 and multicast), and keeps the tested neighbouring addresses reachable, and it decodes IPv4 carried in IPv4-mapped, NAT64 and 6to4 IPv6 addresses before classifying, in the named unit tests.",
       "method": "test",
       "artifacts": [
         "src/plugins/http.rs"
@@ -708,7 +709,7 @@
     },
     {
       "id": "approval-wire-tables",
-      "method": "exhaustive",
+      "method": "test",
       "statement": "The closed wire and state decisions are enumerated over listed inputs: of ten listed risk-tier strings only Low, Medium and High (after trimming) do not force deny-on-any-deny (Extreme, blank, lower-case, upper-case and unknown spellings force it), of six listed approver-class strings only the three class names (after trimming) parse, the recipe decision-mode JSON decodes every listed shape to deny-on-any-deny except the one majority spelling, and the execution-state classifier matches its oracle over all 80 combinations of status, executed, failed and credential check.",
       "artifacts": [
         "src/approval/stage1_proofs.rs"
@@ -849,7 +850,7 @@
       "mutants": [
         "lean-authority-binding-equality-dropped"
       ],
-      "does_not_establish": "Nothing about the MAC primitive, the HTTP parser or the TTL clock source, which are trusted-computing-base assumptions. The one-positive-slot-per-key guard for aggregator claims is not modelled here, only that such claims are not independent. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+      "does_not_establish": "These theorems unfold the definitions they are about (validFor requires binding equality, and independentlyAuthenticated is defined per evidence kind), so they pin those definitions against change rather than derive new facts. Nothing about the MAC primitive, the HTTP parser or the TTL clock source, which are trusted-computing-base assumptions. The one-positive-slot-per-key guard for aggregator claims is not modelled here, only that such claims are not independent. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
     },
     {
       "id": "lean-approval-action-authority",
@@ -1008,7 +1009,7 @@
       "mutants": [
         "lean-model-agent-reviewer-guard-dropped"
       ],
-      "does_not_establish": "Nothing about the execution-boundary theorems in ExecutionSafety.lean (separate claim). Sign-off sets are abstract counts and flags, so how the Rust code derives named, distinct and resolved sign-offs is not covered. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
+      "does_not_establish": "supported_recipe_satisfies_every_floor follows from the definition of a supported recipe: its risk tier, autonomy and irreversibility arguments are unused, so it does not model a floor that depends on them. Nothing about the execution-boundary theorems in ExecutionSafety.lean (separate claim). Sign-off sets are abstract counts and flags, so how the Rust code derives named, distinct and resolved sign-offs is not covered. A property of the Lean model of the decision, not of the Rust code: the model is hand-written, and the only link to the shipped code is the structural refinement gate and the tests. The detector runs lake build for this module, not the independent nanoda check that CI also runs. The mutant is a definition change under which the theorem is false (a counterexample was type-checked against the mutated model), not only a broken proof script."
     }
   ]
 }

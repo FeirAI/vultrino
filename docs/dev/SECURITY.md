@@ -278,9 +278,10 @@ every turn with `[llm_proxy] streaming_enabled = false`. See
   approval-open also requires a conclusive
   Govder answer, and resume requires the same normalized recipe plus authoritative
   risk/irreversibility facts; uncertainty or change refuses before permit issuance.
-  This proves enforcement and continuity of the stored declaration and received
-  Govder authority, not that an operator's declaration is semantically truthful
-  about the real-world side effect.
+  Integration tests cover this continuity of the stored declaration and received
+  Govder authority, and Lean checks it only for a hand-written model (see
+  [LIMITATIONS.md](LIMITATIONS.md)). Neither shows that an operator's declaration
+  is semantically truthful about the real-world side effect.
 - An outbox push with no URL or no signing secret is a hard config error
   (an unsigned/undeliverable outbox is rejected).
 - A halt label must be a literal id (no glob), so a halt can't deny a fleet.

@@ -27,12 +27,19 @@ evidence that is:
 - unable to satisfy any recipe containing a disabled agent-reviewer term, so
   in this model the Govder-only D4(c)/(d)/(e) reviewer checks are not bypassed at
   this consumer; and
-- restricted to a non-empty human-only recipe domain that
-  `supported_recipe_satisfies_every_floor` proves remains valid for every current
-  risk/autonomy/irreversibility floor; and
+- restricted to a non-empty human-only recipe domain
+  (`supported_recipe_satisfies_every_floor`, which follows from the definition of
+  a supported recipe; its risk/autonomy/irreversibility arguments are unused, so
+  it does not model a floor that depends on them); and
 - issued no later than execution, unexpired, and unconsumed. The separate
   `reachable_approval_consumption_is_one_shot` theorem proves that consumed
   exact-request bindings never repeat in any reachable trace.
+
+`reachable_execution_is_proper` holds by construction: an `Execution` carries
+its `ExecutionPermit`, and `Execution.proper_of_permit` makes every execution
+proper, so the induction shows nothing about the transition system beyond that.
+The one-shot theorem is per `RequestBinding`, which includes the execution
+epoch; it is not at most one execution per approval id.
 
 `Approval.Authority.verified_broker_identity_is_exact` proves that a broker
 identity accepted through the stronger JSON-decision path has the exact tenant,
