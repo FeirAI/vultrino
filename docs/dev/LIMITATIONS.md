@@ -180,7 +180,7 @@ noninterference. Honest scope:
 - **Kani (`formal/run-kani.sh`)** runs pure-kernel harnesses with
   `--no-default-features` (no `wasm-plugins` / wasmtime). Kani 0.67 ships rustc
   **1.93** nightly; the production default feature set pulls wasmtime **47**,
-  which declares rust-version **1.94**. So Kani does **not** verify the WASM
+  which declares rust-version **1.95**. So Kani does **not** verify the WASM
   plugin host, and a default-features build is outside that proof job.
 - **Refinement (`formal/check-refinement.sh`)** is a source-shape / choke-point
   gate (execution-binding fields, permit mint sites, WASM ABI-before-copy
@@ -189,9 +189,10 @@ noninterference. Honest scope:
   implementations correct.
 - **Operator-authored truth stays outside the model.** A truthful
   reversible/irreversible label, a correct Govder recipe, and a matching
-  workload-assertion signing key are operational assumptions — the gates prove
-  enforcement continuity of what the stores and verifiers report, not that the
-  external world matches those labels.
+  workload-assertion signing key are operational assumptions. The gates check
+  enforcement continuity of what the stores and verifiers report only in the
+  Lean model and as source shape (see above); they do not show that the external
+  world matches those labels.
 
 `./ci-local.sh` runs Lean + refinement + the Rust gates; it does **not** run
 Kani (install + toolchain cost). CI's separate `kani` job is the authoritative
@@ -212,9 +213,12 @@ kernels.
   Govder risk facts frozen at open. The parser/library default remains
   non-strict for compatibility with older stdio/embedded callers (new `vultrino
   init` files opt in); those callers must set
-  `require_declared_capabilities = true` for the same guarantee. Lean and the
-  refinement gate prove that the declared class plus recipe authority and their
-  open-to-resume continuity are enforced. They cannot establish that an operator
+  `require_declared_capabilities = true` for the same guarantee. Lean proves
+  decision tables about a hand-written model of that rule (the declared class plus
+  recipe authority and their open-to-resume continuity), and the refinement gate
+  (`formal/check-refinement.sh`) is a structural source-shape check that the code
+  still has the expected seams; neither proves the production code enforces the rule
+  end to end, which is covered by integration tests. They cannot establish that an operator
   truthfully labeled the real-world side effect reversible, that Govder's stored
   recipe is organizationally correct, or detect an external semantic change not
   reflected in either authority store; those remain explicit operational assumptions.
@@ -290,7 +294,7 @@ kernels.
 - Outbox push fan-out (today a single push subscriber; additional consumers poll).
 - A transactional storage layer for exactly-once idempotency.
 - A Kani toolchain that can verify the default `wasm-plugins` feature set (today
-  Kani 0.67’s rustc 1.93 cannot compile wasmtime 47’s rustc-1.94 MSRV — proofs
+  Kani 0.67’s rustc 1.93 cannot compile wasmtime 48’s rustc-1.95 MSRV — proofs
   stay on `--no-default-features`).
 - Migrating the Askama axum integration off `askama_axum = "0.4"` — crates.io’s
   `0.5.0+deprecated` is an empty hard-`compile_error!` stub; stay on 0.4 until a

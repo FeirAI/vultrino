@@ -228,6 +228,9 @@ mod kani_proofs {
         let approval_required: bool = kani::any();
         let admitted =
             ExecutionPermit::direct(fixed_binding(), policy_allows, approval_required).is_ok();
+        kani::cover!(admitted, "direct permit admitted");
+        kani::cover!(!admitted && !policy_allows, "denied by policy");
+        kani::cover!(!admitted && approval_required, "denied: approval required");
         assert_eq!(admitted, policy_allows && !approval_required);
     }
 
@@ -235,8 +238,14 @@ mod kani_proofs {
     fn execution_epoch_never_wraps() {
         let current: u64 = kani::any();
         match next_epoch(current) {
-            Some(next) => assert!(next > current),
-            None => assert_eq!(current, u64::MAX),
+            Some(next) => {
+                kani::cover!(true, "epoch advances");
+                assert!(next > current)
+            }
+            None => {
+                kani::cover!(true, "epoch saturates at u64::MAX");
+                assert_eq!(current, u64::MAX)
+            }
         }
     }
 }

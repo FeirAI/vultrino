@@ -39,7 +39,7 @@ Vultrino is a credential proxy that keeps raw credential fields out of the agent
 
 ### Requirements
 
-- Rust **1.94.0** (pinned in [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` installs it)
+- Rust **1.95.0** (pinned in [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` installs it)
 - No system OpenSSL packages — TLS uses **rustls**
 
 ### From Source
@@ -381,12 +381,18 @@ required to approve from Telegram/email.
 - Single-use/limited-use tokens are enforced **fail-closed** with a cross-process
   file lock, so a token can never drive more than `max_uses` executions even
   when the web and MCP servers run as separate processes sharing one vault.
-- Approved actions execute **at most once**: execution is claimed atomically, a
-  crashed mid-execution claim is auto-recovered after a timeout, and a transient
-  pre-execution failure (e.g. a plugin not yet loaded) is retried rather than
-  marked done.
-- An agent may only poll approvals created by the **same principal** (API key or
-  use token) that made the original request.
+- Approved actions are designed to execute **at most once**: execution is claimed
+  atomically (an `executed` flag, an epoch compare-and-swap, and a stale-claim
+  retake that finalizes rather than re-runs), a crashed mid-execution claim is
+  auto-recovered after a timeout, and a transient pre-execution failure (e.g. a
+  plugin not yet loaded) is retried rather than marked done. This is covered by
+  integration tests; it is not proved. The Lean model proves one-shot only for
+  its own abstract (approval, epoch) model.
+- An agent may only poll approvals it owns. Ownership means the same API key or use
+  token principal, or a caller with the same non-blank `agent_label` and equal
+  normalized tenants (a blank tenant counts as no tenant, so two untenanted callers
+  match, but an untenanted caller never matches a tenanted one). This lets an agent
+  keep polling after its use token is re-minted.
 - Set `public_base_url` to an **HTTPS** address so Telegram/email approve-deny
   links are confidential, and avoid running the web server at `DEBUG` log level
   in production (request URIs, which carry the link's capability token, are
