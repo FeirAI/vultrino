@@ -80,6 +80,11 @@ jobs:
       # stay out of production builds, see src/delegation/mod.rs). Both
       # invocations are required; this is the only gate that runs the second one.
       - run: cargo test --locked --features mock-govder
+      # The lib tests again without default features (no wasm-plugins). This is
+      # the build Kani and the formal detectors use; a test that only holds with
+      # the WASM runtime compiled in failed here unnoticed until this step
+      # existed (plugins::installer, found 2026-10-09).
+      - run: cargo test --locked --no-default-features --lib
       # Zero clippy warnings is a repo convention; -D warnings makes it a hard gate.
       - run: cargo clippy --locked --all-targets -- -D warnings
       # ...and the same gate over the feature-gated targets, which the line above does NOT
@@ -105,11 +110,20 @@ jobs:
   formal-fast:
     name: formal register and fast mutants
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # About 20 minutes with a warm cache; a cold dependency build (a Cargo.lock
+    # change, or a new cache key) adds several minutes. 30 was hit on main on
+    # 2026-10-08 (issue #47).
+    timeout-minutes: 60
     env:
       # One target dir under the workspace so rust-cache keeps the dependency
-      # build; the mutant scratch worktree reuses it.
+      # build; the mutant scratch worktree reuses it through --cargo-target-dir
+      # (kit v2 ignores the caller's CARGO_TARGET_DIR otherwise).
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # No debug info: smaller objects and faster links for every mutant build.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      # Stream the kit's per-mutant lines into the log as they happen, so a
+      # timeout still shows how far the run got.
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
@@ -119,7 +133,12 @@ jobs:
       - name: claims register checks
         run: python3 scripts/formal/check_claims.py
       - name: fast-tier mutants must be killed
-        run: python3 scripts/formal/check_mutants.py --tier fast --json formal-fast.json
+        env:
+          # Each mutant changes one function of the vultrino crate; incremental
+          # compilation rebuilds only what changed. Dependencies come from the
+          # cache either way.
+          CARGO_INCREMENTAL: "1"
+        run: python3 scripts/formal/check_mutants.py --tier fast --cargo-target-dir "$CARGO_TARGET_DIR" --json formal-fast.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -135,6 +154,8 @@ jobs:
     timeout-minutes: 180
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
@@ -162,7 +183,9 @@ jobs:
           lint: false
           use-mathlib-cache: false
       - name: all mutants must be killed
-        run: python3 scripts/formal/check_mutants.py --tier full --timeout 1500 --json formal-full.json
+        env:
+          CARGO_INCREMENTAL: "1"
+        run: python3 scripts/formal/check_mutants.py --tier full --timeout 1500 --cargo-target-dir "$CARGO_TARGET_DIR" --json formal-full.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -170,6 +193,19 @@ jobs:
           path: formal-full.json
           if-no-files-found: ignore
           retention-days: 90
+
+  iana-snapshot-drift:
+    name: IANA special-purpose registry snapshots match the live files (scheduled)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The SSRF classifier spec is transcribed from the CSV snapshots under
+      # formal/vectors/. A registry change fails this job (and so the scheduled
+      # run, which main-health reports); the tables are then refreshed by hand.
+      - name: compare committed CSV snapshots byte for byte with IANA
+        run: bash formal/vectors/check-iana-drift.sh
 
   ci-required:
     name: ci-required

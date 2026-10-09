@@ -41,5 +41,9 @@ Teredo 2001::/32 and 64:ff9b:1::/48 by an explicit rule, and decodes NAT64 over
 64:ff9b::/32 rather than only the /96 well-known prefix, to match the shipped
 decode (this only over-blocks). Rows the registry marks globally reachable but
 that sit inside a blocked row (192.0.0.9/32, 192.0.0.10/32, and the reachable
-rows inside 2001::/23) are blocked on purpose. The snapshots are refreshed by hand;
-nothing re-fetches them, so a later registry change is not noticed automatically.
+rows inside 2001::/23) are blocked on purpose. The snapshots are refreshed by hand.
+The scheduled `iana-snapshot-drift` CI job (daily, and on manual dispatch; not on
+pull requests) runs `formal/vectors/check-iana-drift.sh`, which downloads both
+files and compares them byte for byte with these copies; a difference or a
+download failure fails the job. Then refresh the snapshots, re-derive the spec
+tables and `IPV4_BLOCKED` / `IPV6_BLOCKED`, and update the hashes above.
