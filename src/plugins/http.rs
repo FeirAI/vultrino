@@ -744,13 +744,16 @@ impl HttpPlugin {
     /// appended unchanged, so a placeholder spelled in a query-map value stays
     /// literal (as before). Canonicalisation percent-encodes `{` and `}` in a
     /// path, so a literal `{credential}` there is judged as `%7Bcredential%7D`
-    /// and is substituted in that spelling. Because a caller-written
-    /// `%7Bcredential%7D` (or a half-encoded `%7Bcredential}` or
-    /// `{credential%7D`, any case) would canonicalise to the same text, such a
-    /// spelling is refused instead of substituted: the secret goes only where
-    /// the caller wrote the literal placeholder. Fails closed: no literal
-    /// placeholder, an encoded spelling, a URL that cannot be canonicalised, or
-    /// a substitution that changes the scheme or host (see
+    /// and is substituted in that spelling. Other text can canonicalise to the
+    /// same spelling (a caller-written `%7Bcredential%7D`, a half-encoded
+    /// `%7Bcredential}`, or `%7Bcr%65dential%7D`, whose unreserved escape is
+    /// decoded), so the request is refused when the URL with every literal
+    /// placeholder replaced still canonicalises to a placeholder spelling in
+    /// any letter case. The secret then goes only to text that canonicalises
+    /// from a literal placeholder (tested on the spellings in
+    /// `test_prepare_request_url_token_placeholder_spellings`). Fails closed:
+    /// no literal placeholder, another placeholder spelling, a URL that cannot
+    /// be canonicalised, or a substitution that changes the scheme or host (see
     /// `substitute_url_token`) is an error, and no error includes the secret.
     fn url_token_send_url(
         raw_url: &str,
@@ -765,21 +768,38 @@ impl HttpPlugin {
                 PLACEHOLDER
             )));
         }
-        let lower = raw_url.to_ascii_lowercase();
-        if ["%7bcredential%7d", "%7bcredential}", "{credential%7d"]
-            .iter()
-            .any(|encoded| lower.contains(encoded))
-        {
-            return Err(PluginError::InvalidParams(format!(
-                "UrlToken placeholder must be spelled literally as '{}', not percent-encoded",
-                PLACEHOLDER
-            )));
-        }
         let uncanonical = || {
             PluginError::InvalidParams(
                 "URL cannot be canonicalised (policy could not judge it)".to_string(),
             )
         };
+        // Every placeholder spelling in the canonical string must come from a
+        // literal `{credential}`. Canonicalise the URL with each literal
+        // replaced by `-` (unreserved, no URL structure, never part of a
+        // placeholder spelling): if the result still holds a spelling of the
+        // placeholder in any case (encoded, half-encoded, or with an escaped
+        // inner letter such as `%7Bcr%65dential%7D`, which canonicalisation
+        // decodes), other text would receive the secret, so refuse. Checking
+        // the canonical form, not the raw string, is what catches escapes that
+        // canonicalisation decodes, and a literal that canonicalisation drops
+        // (a dot segment, the fragment) cannot vouch for another spelling.
+        let without_literal = crate::policy::canonical_url(&raw_url.replace(PLACEHOLDER, "-"))
+            .ok_or_else(uncanonical)?
+            .to_ascii_lowercase();
+        if [
+            "%7bcredential%7d",
+            "%7bcredential}",
+            "{credential%7d",
+            "{credential}",
+        ]
+        .iter()
+        .any(|spelling| without_literal.contains(spelling))
+        {
+            return Err(PluginError::InvalidParams(format!(
+                "UrlToken placeholder must be spelled literally as '{}'; another part of the URL canonicalises to a spelling of it",
+                PLACEHOLDER
+            )));
+        }
         let base = crate::policy::canonical_url(raw_url).ok_or_else(uncanonical)?;
         let judged = crate::policy::effective_url(raw_url, query).ok_or_else(uncanonical)?;
         let merged_query = judged.strip_prefix(base.as_str()).ok_or_else(uncanonical)?;
@@ -1669,12 +1689,42 @@ mod tests {
             b.build().unwrap().url().as_str(),
             "https://api.example.com/tok-SECRET-123/x?k=%7Bcredential%7D"
         );
+        // A literal placeholder in both the path and the query is substituted in
+        // both places (the caller wrote both).
+        let (b, _) = plugin
+            .prepare_request(
+                send(
+                    "https://api.example.com/bot{credential}/x?t={credential}",
+                    HashMap::new(),
+                ),
+                &cred_data,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            b.build().unwrap().url().as_str(),
+            "https://api.example.com/bottok-SECRET-123/x?t=tok-SECRET-123"
+        );
+        // Every other spelling that canonicalises to the placeholder is
+        // refused: fully or half encoded, an escaped inner letter (unreserved
+        // escapes are decoded by canonicalisation), in the path or the query,
+        // and also when the literal placeholder itself is dropped by
+        // canonicalisation (dot segment, fragment) so that a count of
+        // placeholders would still match.
         for refused in [
             "https://api.example.com/bot%7Bcredential%7D/x",
             "https://api.example.com/bot{credential}/%7bcredential%7d",
             "https://api.example.com/bot{credential}/%7Bcredential}",
             "https://api.example.com/bot{credential}/{credential%7D",
             "https://api.example.com/bot{credential}/x?y=%7Bcredential%7D",
+            "https://api.example.com/bot{credential}/%7Bcr%65dential%7D",
+            "https://api.example.com/bot{credential}/{cr%65dential}",
+            "https://api.example.com/bot{credential}/x?y=%7Bcr%65dential%7D",
+            "https://api.example.com/bot{credential}/x?y={cr%65dential}",
+            "https://api.example.com/bot{credential}/%7B%63redential%7D",
+            "https://api.example.com/bot{credential}/x?y=%7B%63R%65DENTIAL%7D",
+            "https://api.example.com/{credential}/../%7Bcr%65dential%7D",
+            "https://api.example.com/x/%7Bcr%65dential%7D#{credential}",
         ] {
             let r = plugin
                 .prepare_request(send(refused, HashMap::new()), &cred_data)
