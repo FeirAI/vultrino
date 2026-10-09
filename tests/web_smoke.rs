@@ -8122,7 +8122,7 @@ async fn stored_rate_limit_policy_with_non_deny_default_is_refused_on_load() {
             PolicyAction::Allow,
         );
         p.id = "legacy-rate-id".to_string();
-        p.default_action = default.clone();
+        p.default_action = default;
         assert!(
             p.validate().is_err(),
             "the admin API would refuse this shape"
