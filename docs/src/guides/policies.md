@@ -94,9 +94,18 @@ condition = { url_match = "https://api.github.com/user" }
 # Wildcard pattern
 condition = { url_match = "https://api.github.com/repos/*" }
 
-# Multiple paths
-condition = { url_match = "https://api.github.com/{user,repos,gists}/*" }
+# Multiple paths: one url_match per path inside an `or`
+condition = { or = [
+  { url_match = "https://api.github.com/user/*" },
+  { url_match = "https://api.github.com/repos/*" },
+  { url_match = "https://api.github.com/gists/*" }
+]}
 ```
+
+A `url_match` glob supports `*`, `?` and `[...]`, and a glob `*` also matches
+`/`. There is no `{a,b}` alternation: braces are literal characters, so a pattern
+such as `https://api.github.com/{user,repos}/*` matches no request (and logs no
+warning). Use an `or` of separate `url_match` conditions instead.
 
 ### Method Match
 

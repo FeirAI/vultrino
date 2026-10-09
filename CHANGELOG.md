@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `cargo test --no-default-features --lib` passes: the WASM ABI install test now runs only with `wasm-plugins`, and a twin test pins that a build without the feature refuses every WASM install before anything is copied. CI runs this command in the `rust` job.
+
 ### Changed
 
+- For `UrlToken` credentials the `http` plugin now sends the judged canonical URL (including the merged `query` map) with the secret in place of the literal `{credential}` placeholder. Before, it sent the raw URL with the token substituted and let the client append the `query` map afterwards, so the bytes sent could differ from the judged string in spelling (escapes, hex case, trailing host dot, query order). A placeholder spelled percent-encoded (`%7Bcredential%7D`) or half-encoded in the URL is now refused instead of being sent literally.
+- A policy that fails validation when it is loaded from the vault (for example a `RateLimit` policy saved with an allow or prompt default before that was refused) now logs a WARNING once per process. It is still enforced as written.
+- The scheme-prefix patterns `http*` and `https*` no longer log the star-in-host warning. Other scheme-less prefixes (`internal*`, `api*`) still do: they match no canonical `http(s)` URL.
+- Reported with the permit-kernel change below: an approval whose stored action has no `.` now fails closed at resume with a binding mismatch, because the action is dispatched as `http.<action>`. Approvals opened by `prepare_execution` always store a dotted action.
 - argon2 0.5.3 to 0.6.0. In the tested cases the vault master key is unchanged: tests/argon2_kat.rs opens vault files and AES-GCM blobs written by 0.5.3 and checks that new vaults persist the same cost parameters. These are fixed cases, not every password, salt or cost setting. One input now behaves differently: a salt longer than 48 bytes, which 0.5.3 rejected, is accepted; vultrino only creates 16-byte salts. Replaces Dependabot PR #32.
 
 ### Added
