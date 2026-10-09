@@ -383,8 +383,8 @@ default keeps working as written: when its Allow-`RateLimit` rule is exhausted a
 no other rule matches, the request falls through to that default and is allowed
 (or prompted). This is fail-open for that policy until it is fixed. Re-save such a
 policy through the admin API (which validates) or change its default to deny.
-Whether a later release refuses such a policy on load, or coerces its default to
-deny, is an open owner decision.
+Refusing such a policy when it is loaded is decided for phase 3 and not built;
+until then the warning is the only signal.
 
 ## URL policy matching: what canonical matching does not cover
 
@@ -394,9 +394,12 @@ treats an encoded slash or a different case in the path as the same resource as
 another spelling is outside it. A trailing dot on the host is removed by
 canonicalisation, because it names the same destination in DNS. A glob pattern
 (no trailing `*`) with `*` in the host part can still match a different host,
-because a glob `*` also matches `/`; this release only logs a warning (the
-log line says the pattern will be refused in a future release, which is not yet
-decided). On an Allow rule such a pattern can allow a request to another host.
+because a glob `*` also matches `/`; this release only logs a warning. The
+log line says the pattern will be refused in a future release, but what is
+decided (for phase 3, not built) is refusing warned patterns on Deny and Prompt
+rules when a policy is written. Allow rules are not part of that decision, so on
+an Allow rule such a pattern can allow a request to another host and stays
+warned only.
 A glob whose host part holds `?`
 keeps its old literal glob meaning and is not canonicalised (warned). Patterns
 are canonicalised when they are matched, not rewritten in storage, so the admin
@@ -432,7 +435,9 @@ JSON text, and the `http` and `hmac` plugins refuse such a map. A prefix that
 ends in `*` inside a host (`https://api.*`, `https://10.0.0*`) is matched as
 the one host the URL parser reads from it (`api`, `10.0.0.0`) and is warned, so
 a deny rule of that shape no longer matches longer host names or other
-addresses and denies less than before. A pattern without a trailing `*` (an
+addresses and denies less than before (refusing such a pattern on Deny and
+Prompt rules when a policy is written is decided for phase 3, not built). A
+pattern without a trailing `*` (an
 exact URL or a glob that ends in a path) must match the query too: a deny rule
 on `https://host/admin` does not match `https://host/admin?x=1`, whether the
 query is in `url` or in the `query` map. The meaning-change warning compares

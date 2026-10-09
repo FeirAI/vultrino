@@ -212,8 +212,11 @@ parsed never matches an Allow rule and is denied when a matching policy has a
 inside the host (also without a scheme, except a prefix of `http://` or
 `https://` such as `http*`), or where canonicalisation changes the meaning (dot
 segments, encoded dots, a fragment, a backslash, a `*` that cuts a percent escape
-short). They are only warned today; whether a later release refuses them is
-an open decision, and the log line says they will be. There is no `{a,b}`
+short). They are only warned today. Refusing warned patterns on deny and
+prompt rules when a policy is written is decided for phase 3 and not built. That
+decision does not cover allow rules, so a warned pattern on an allow rule (for
+example a `*` in the host, which can match another host) stays a warning,
+although the log line says every warned pattern will be refused. There is no `{a,b}`
 alternation in a glob; braces are literal. A policy loaded from the vault that
 fails validation (for example a `RateLimit` policy with a non-deny default) is
 logged as a WARNING but still enforced as written. The `http` plugin sends the
