@@ -61,7 +61,17 @@ pub fn sign_tenant_assertion(
     body: &[u8],
     exp: DateTime<Utc>,
 ) -> String {
-    sign_tenant_assertion_with_jti(secret, tenant, &new_jti(), method, path, query, host, body, exp)
+    sign_tenant_assertion_with_jti(
+        secret,
+        tenant,
+        &new_jti(),
+        method,
+        path,
+        query,
+        host,
+        body,
+        exp,
+    )
 }
 
 /// [`sign_tenant_assertion`] with a caller-chosen jti, so the golden vectors can pin the
@@ -177,7 +187,9 @@ pub fn verify_tenant_assertion(
         return Err(TenantAssertionError::Malformed);
     }
 
-    let payload = assertion_payload(parts[0], parts[1], parts[2], method, path, query, host, body);
+    let payload = assertion_payload(
+        parts[0], parts[1], parts[2], method, path, query, host, body,
+    );
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .map_err(|_| TenantAssertionError::Malformed)?;
     mac.update(payload.as_bytes());
@@ -470,7 +482,11 @@ mod tests {
                 (want, got) => failures.push(format!("{id}: want {want}, got {got:?}")),
             }
         }
-        assert!(failures.is_empty(), "vector mismatches:\n{}", failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "vector mismatches:\n{}",
+            failures.join("\n")
+        );
     }
     /// vectors/approval-assertion.v1.json is owned by feir-os (the broker signs the approval
     /// decision with M) and copied here byte for byte. vultrino's verifier on
@@ -510,7 +526,11 @@ mod tests {
                 (want, got) => failures.push(format!("{id}: want {want}, got {got:?}")),
             }
         }
-        assert!(failures.is_empty(), "vector mismatches:\n{}", failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "vector mismatches:\n{}",
+            failures.join("\n")
+        );
     }
 
     /// The shipped Rust signer reproduces the reference payload and header value for every
@@ -556,7 +576,11 @@ mod tests {
             }
         }
         assert!(n >= 40, "only {n} sign vectors ran");
-        assert!(failures.is_empty(), "sign mismatches:\n{}", failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "sign mismatches:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]
@@ -570,9 +594,31 @@ mod tests {
     fn zero_max_ttl_still_has_a_ceiling() {
         let now = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
         let ceiling = chrono::Duration::from_std(DEFAULT_MAX_TTL).unwrap();
-        let far = sign_tenant_assertion("k", "acme", "GET", "/x", "", "h", b"", now + ceiling + chrono::Duration::seconds(1));
+        let far = sign_tenant_assertion(
+            "k",
+            "acme",
+            "GET",
+            "/x",
+            "",
+            "h",
+            b"",
+            now + ceiling + chrono::Duration::seconds(1),
+        );
         let near = sign_tenant_assertion("k", "acme", "GET", "/x", "", "h", b"", now + ceiling);
-        let v = |a: &str| verify_tenant_assertion(a, "k", "acme", "GET", "/x", "", "h", b"", now, Duration::ZERO);
+        let v = |a: &str| {
+            verify_tenant_assertion(
+                a,
+                "k",
+                "acme",
+                "GET",
+                "/x",
+                "",
+                "h",
+                b"",
+                now,
+                Duration::ZERO,
+            )
+        };
         assert_eq!(v(&far), Err(TenantAssertionError::ExcessiveTtl));
         assert_eq!(v(&near), Ok(()));
     }
@@ -626,5 +672,3 @@ mod tests {
         }
     }
 }
-
-

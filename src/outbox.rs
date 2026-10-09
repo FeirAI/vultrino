@@ -774,7 +774,11 @@ mod tests {
                     accepted += 1;
                     assert_eq!(got, want, "{}", v["id"]);
                 }
-                _ => assert_ne!(got, want, "{}: the producer emitted a rejected value", v["id"]),
+                _ => assert_ne!(
+                    got, want,
+                    "{}: the producer emitted a rejected value",
+                    v["id"]
+                ),
             }
         }
         assert!(accepted >= 30, "only {accepted} accept vectors");

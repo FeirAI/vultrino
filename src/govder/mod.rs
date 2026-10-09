@@ -1074,7 +1074,10 @@ mod tests {
                     .get("X-Govder-Tenant-Assertion")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
-                let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+                let host = headers
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
                 match super::verify_tenant_assertion(
                     a,
                     "shared-f",
@@ -1101,7 +1104,10 @@ mod tests {
             .signed_json("acme", "GET", "/v1/delegation/grants", "q=a b", None)
             .await
             .unwrap();
-        assert_eq!(resp.status().as_u16(), 200, "the transmitted path and query must be the signed ones");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "the transmitted path and query must be the signed ones"
+        );
     }
 }
-
