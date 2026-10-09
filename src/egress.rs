@@ -465,6 +465,22 @@ pub(crate) fn diagnostic_may_contain_secret(
     contains
 }
 
+/// SB-02: the scrub set for one action's response. It is the credential's own
+/// secret material captured before dispatch, plus the material of any credential
+/// minted or refreshed during the action (OAuth2 refresh, Google service-account
+/// token mint), which the pre-dispatch capture cannot contain. Both the buffered
+/// and the streamed dispatch path call this before anything is confined, so an
+/// upstream that reflects the new token cannot leak it to the agent.
+pub(crate) fn scrub_set_with_minted(
+    mut secret_material: Vec<Zeroizing<String>>,
+    minted: Option<&crate::CredentialData>,
+) -> Vec<Zeroizing<String>> {
+    if let Some(updated) = minted {
+        secret_material.extend(updated.secret_material());
+    }
+    secret_material
+}
+
 /// Convert a raw connector response into the only buffered response type the
 /// server is allowed to release to a low sink.
 pub(crate) fn confine_response(

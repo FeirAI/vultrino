@@ -348,6 +348,7 @@ impl PolicyEngine {
     /// Add a policy
     pub fn add_policy(&self, policy: Policy) {
         warn_url_patterns(&policy);
+        warn_invalid_policy(&policy);
         let mut policies = self.policies.write();
         policies.push(policy);
     }
@@ -395,6 +396,7 @@ impl PolicyEngine {
         }
         *applied = ticket;
         policies.iter().for_each(warn_url_patterns);
+        policies.iter().for_each(warn_invalid_policy);
         let mut p = self.policies.write();
         *p = policies;
         true
@@ -405,6 +407,7 @@ impl PolicyEngine {
     /// [`Self::load_policies_if_newer`] instead.
     pub fn load_policies(&self, policies: Vec<Policy>) {
         policies.iter().for_each(warn_url_patterns);
+        policies.iter().for_each(warn_invalid_policy);
         let mut p = self.policies.write();
         *p = policies;
     }
@@ -984,6 +987,30 @@ fn warn_url_patterns(policy: &Policy) {
     }
 }
 
+/// Log a policy that fails [`Policy::validate`] when it is loaded. The create and
+/// replace routes and the config loader validate, but policies read back from the
+/// vault are not re-validated, so a policy stored before a rule existed (for
+/// example a `RateLimit` policy whose default action is not deny) still loads.
+/// This is a warning only: the policy is enforced as written until it is fixed
+/// and saved again. Warns once per policy and error, because the refresh loop
+/// reloads the same policies every interval.
+fn warn_invalid_policy(policy: &Policy) {
+    let Err(error) = policy.validate() else {
+        return;
+    };
+    static SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let key = format!("{}\u{0}{}\u{0}{}", policy.id, policy.name, error);
+    if SEEN.get_or_init(Default::default).lock().insert(key) {
+        tracing::warn!(
+            policy = %policy.name,
+            policy_id = %policy.id,
+            error = %error,
+            "loaded policy fails validation; it is enforced as written until it is fixed and saved again"
+        );
+    }
+}
+
 /// Extracts a [`SpendAttempt`] from a request's params for `SpendCap` evaluation
 /// (V3). Matched by action + credential globs; reads the amount from a JSON
 /// pointer (an integer in minor units) and the asset from a literal or a second
@@ -1112,6 +1139,52 @@ mod tests {
         }
         assert_eq!(log.matches("policy=warn-load").count(), 1, "{log}");
         assert!(!log.contains("quiet"), "{log}");
+    }
+
+    /// A policy that fails validation (here a RateLimit policy whose default is
+    /// allow, as an older vault could hold) is logged at add_policy,
+    /// load_policies and load_policies_if_newer, once per policy, and is still
+    /// loaded as written.
+    #[test]
+    fn invalid_policies_are_warned_at_every_load_path_once() {
+        fn rate_limited(id: &str) -> Policy {
+            let mut p = Policy::deny_all(id, "*").with_rule(
+                PolicyCondition::RateLimit {
+                    max: 1,
+                    window_secs: 3600,
+                },
+                PolicyAction::Allow,
+            );
+            p.id = id.to_string();
+            p.default_action = PolicyAction::Allow;
+            assert!(p.validate().is_err());
+            p
+        }
+        let buf = LogBuf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            let e = PolicyEngine::new();
+            e.add_policy(rate_limited("invalid-add"));
+            e.load_policies(vec![rate_limited("invalid-load")]);
+            let t = e.begin_load();
+            assert!(e.load_policies_if_newer(t, vec![rate_limited("invalid-newer")]));
+            assert_eq!(e.list_policies().len(), 1, "still loaded as written");
+            // Same policy again: no second warning.
+            e.load_policies(vec![rate_limited("invalid-load")]);
+            e.add_policy(Policy::deny_all("valid-quiet", "*"));
+        });
+        let log = String::from_utf8(buf.0.lock().clone()).unwrap();
+        for name in ["invalid-add", "invalid-load", "invalid-newer"] {
+            assert!(
+                log.contains(&format!("policy={name}")) && log.contains("fails validation"),
+                "no validation warning for {name}: {log}"
+            );
+        }
+        assert_eq!(log.matches("policy=invalid-load ").count(), 1, "{log}");
+        assert!(!log.contains("valid-quiet"), "{log}");
     }
 
     #[derive(Debug, Clone, Copy, Serialize)]
