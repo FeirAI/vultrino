@@ -1693,7 +1693,6 @@ async fn list_credentials(
     Ok(())
 }
 
-/// Remove a credential
 /// `vultrino policy deny-default <id>`: the offline fix for a stored policy the
 /// servers refuse to load (P3-FLOORS). It only tightens: default_action becomes
 /// deny and the rules are kept.
@@ -1708,6 +1707,7 @@ async fn policy_deny_default(config: Config, id: String) -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// Remove a credential
 async fn remove_credential(
     config: Config,
     alias: String,

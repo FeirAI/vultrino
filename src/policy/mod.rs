@@ -989,8 +989,9 @@ fn pattern_warning_reason(w: &PatternWarning, canonical: &str) -> String {
 /// Deny or Prompt rule whose `url_match` pattern [`canonical_pattern`] warns
 /// about, at any depth of the rule's condition (P3-FLOORS). Such a rule can
 /// match less than it reads, so a deny or an approval gate would silently not
-/// apply. Allow rules are not refused (a warned allow pattern can only allow
-/// less than it reads, and stays a load-time warning), and policies already
+/// apply. Allow rules are not refused and stay a load-time warning (a warned
+/// allow pattern usually allows less than it reads, but under `not` it can allow
+/// more: an Allow on `not: url_match https://*.example.com/*` allows every URL), and policies already
 /// stored keep loading with a warning ([`warn_url_patterns`]).
 pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
     for (i, rule) in policy.rules.iter().enumerate() {

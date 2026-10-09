@@ -254,7 +254,9 @@ only in a vault written before this was refused) is **refused on load**:
 `vultrino web` and `vultrino serve --mcp` do not start, and the error names the
 policy and the fix; the CLI commands that load policies fail the same way; a
 reload after an admin write returns an error and leaves the live set unchanged;
-the periodic refresh logs an ERROR and keeps the live set. Fix it offline with
+the periodic refresh logs an ERROR and keeps the live set (so a later halt kill
+policy is not applied by that process, and `halt` reports `policy_active=false`,
+until the refused policy is fixed). Fix it offline with
 `vultrino policy deny-default <id>` (sets `default_action = "deny"` and keeps the
 rules), then start again.
 

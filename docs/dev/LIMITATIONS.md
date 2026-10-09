@@ -386,7 +386,9 @@ loads from the vault; the engine's own `add_policy`, `load_policies` and
 is not covered. A process already running when an older binary writes such a
 policy keeps its last good set (the refresh refuses the new set as a whole), so a
 later valid change in the same vault is not picked up until the refused policy is
-fixed. The fix, `vultrino policy deny-default <id>`, only tightens the policy.
+fixed. That includes the kill policy `halt_agent` stores: the halt response then
+reports `policy_active=false` and a long-running `serve --mcp` process does not apply
+it (token revocation still applies) until the refused policy is fixed. The fix, `vultrino policy deny-default <id>`, only tightens the policy.
 
 ## URL policy matching: what canonical matching does not cover
 
