@@ -8159,5 +8159,39 @@ async fn stored_rate_limit_policy_with_non_deny_default_is_refused_on_load() {
                 .any(|q| q.id == "legacy-rate-id"),
             "the periodic refresh must not apply a refused policy ({default:?})"
         );
+
+        // The long-running servers' startup load treats the refusal as fatal.
+        let startup = server.load_stored_policies_at_startup().await;
+        assert!(
+            startup.is_err_and(|e| e.to_string().contains("legacy-rate-id")),
+            "startup must fail and name the policy"
+        );
+
+        // The named fix: `vultrino policy deny-default <id>` sets the default to
+        // deny, keeps the rules, and the policy then loads.
+        assert!(
+            vultrino::policy::set_stored_policy_default_deny(&*storage, "legacy-rate-id")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !vultrino::policy::set_stored_policy_default_deny(&*storage, "legacy-rate-id")
+                .await
+                .unwrap()
+        );
+        server.load_stored_policies_at_startup().await.unwrap();
+        let loaded = server
+            .policy_engine()
+            .list_policies()
+            .into_iter()
+            .find(|q| q.id == "legacy-rate-id")
+            .expect("the fixed policy loads");
+        assert_eq!(loaded.default_action, PolicyAction::Deny);
+        assert_eq!(loaded.rules.len(), 1, "the fix keeps the rules");
+        assert!(
+            vultrino::policy::set_stored_policy_default_deny(&*storage, "no-such-policy")
+                .await
+                .is_err()
+        );
     }
 }

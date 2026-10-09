@@ -947,44 +947,166 @@ fn contains_negated_url_match(c: &PolicyCondition, negated: bool) -> bool {
     }
 }
 
-/// Log a WARNING for each `UrlMatch` pattern whose canonical form changes its
-/// meaning or that is risky (host wildcard, `*` right after the host). They
-/// are only warned: refusing warned patterns on deny and prompt rules when a
-/// policy is written is planned for phase 3.
-fn warn_url_patterns(policy: &Policy) {
-    fn walk(c: &PolicyCondition, policy: &Policy) {
-        match c {
-            PolicyCondition::UrlMatch(p) => {
-                let canon = canonical_pattern(p);
-                for w in &canon.warnings {
-                    // The refresh loop reloads the same policies every
-                    // interval: warn once per (policy, pattern, warning).
-                    static SEEN: std::sync::OnceLock<
-                        parking_lot::Mutex<std::collections::HashSet<String>>,
-                    > = std::sync::OnceLock::new();
-                    let key = format!("{}\u{0}{}\u{0}{:?}", policy.name, p, w);
-                    let first = SEEN.get_or_init(Default::default).lock().insert(key);
-                    if !first {
-                        continue;
-                    }
-                    tracing::warn!(
-                        policy = %policy.name,
-                        pattern = %p,
-                        canonical = %canon.text,
-                        warning = ?w,
-                        "url_match pattern is risky or changes meaning under canonical matching; it is only warned (refusing warned patterns on deny and prompt rules is planned for phase 3)"
-                    );
-                }
-            }
-            PolicyCondition::And(v) | PolicyCondition::Or(v) => {
-                v.iter().for_each(|x| walk(x, policy))
-            }
-            PolicyCondition::Not(b) => walk(b, policy),
-            _ => {}
+/// The first `url_match` pattern in a condition tree that [`canonical_pattern`]
+/// warns about, at any depth (`and`, `or`, `not`), with its warnings.
+fn first_warned_url_pattern(c: &PolicyCondition) -> Option<(&str, url_canon::CanonPattern)> {
+    match c {
+        PolicyCondition::UrlMatch(p) => {
+            let canon = canonical_pattern(p);
+            (!canon.warnings.is_empty()).then_some((p.as_str(), canon))
+        }
+        PolicyCondition::And(v) | PolicyCondition::Or(v) => {
+            v.iter().find_map(first_warned_url_pattern)
+        }
+        PolicyCondition::Not(b) => first_warned_url_pattern(b),
+        _ => None,
+    }
+}
+
+/// What a pattern warning means, and how to write the rule instead.
+fn pattern_warning_reason(w: &PatternWarning, canonical: &str) -> String {
+    match w {
+        PatternWarning::StarAfterHost => "the pattern ends in * right after or inside a host, so it \
+            matches only the one host the parser reads from it (https://api.* matches no host \
+            api.example.com); write the host and a path, such as https://api.example.com/*"
+            .to_string(),
+        PatternWarning::StarInHost => "the pattern has * in its host: in a pattern that ends in * an \
+            earlier * is literal and matches no real host, and in a glob it matches only inside the \
+            host; name each host in its own rule"
+            .to_string(),
+        PatternWarning::MeaningChanged => format!(
+            "canonical matching changes what the pattern means (dot segments, a fragment, a \
+             backslash or a * that cuts a percent escape); it is matched as {canonical}, write that \
+             form or the URL you mean"
+        ),
+        PatternWarning::Unparseable => "the pattern is not a parseable URL or path and is compared \
+            as literal text"
+            .to_string(),
+    }
+}
+
+/// Refuse, when a policy is WRITTEN (the admin API create and replace routes), a
+/// Deny or Prompt rule whose `url_match` pattern [`canonical_pattern`] warns
+/// about, at any depth of the rule's condition (P3-FLOORS). Such a rule can
+/// match less than it reads, so a deny or an approval gate would silently not
+/// apply. Allow rules are not refused (a warned allow pattern can only allow
+/// less than it reads, and stays a load-time warning), and policies already
+/// stored keep loading with a warning ([`warn_url_patterns`]).
+pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
+    for (i, rule) in policy.rules.iter().enumerate() {
+        let action = match rule.action {
+            PolicyAction::Deny => "deny",
+            PolicyAction::Prompt => "prompt",
+            PolicyAction::Allow => continue,
+        };
+        if let Some((pattern, canon)) = first_warned_url_pattern(&rule.condition) {
+            let reasons: Vec<String> = canon
+                .warnings
+                .iter()
+                .map(|w| pattern_warning_reason(w, &canon.text))
+                .collect();
+            return Err(format!(
+                "policy '{}': rule {} ({}) has url_match pattern '{}', which is refused on deny and \
+                 prompt rules: {}",
+                policy.name,
+                i,
+                action,
+                pattern,
+                reasons.join("; ")
+            ));
         }
     }
+    Ok(())
+}
+
+/// Refuse to load stored policies that [`Policy::stored_load_refusal`] rejects.
+/// The error names every refused policy and the fix. Callers that load from the
+/// vault (`VultrinoServer::reload_policies`, the periodic refresh) call this
+/// before they apply anything, so a refused set never replaces the live one.
+pub fn refuse_unloadable_stored_policies(stored: &[Policy]) -> Result<(), String> {
+    let refusals: Vec<String> = stored
+        .iter()
+        .filter_map(Policy::stored_load_refusal)
+        .collect();
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(refusals.join("; "))
+    }
+}
+
+/// The offline fix for a stored policy refused on load: set its default action to
+/// deny, keeping its rules (`vultrino policy deny-default <id>`). Returns whether
+/// the stored policy changed. Only tightens: a deny default can only turn an
+/// unmatched request into a denial.
+pub async fn set_stored_policy_default_deny(
+    storage: &dyn crate::storage::StorageBackend,
+    id: &str,
+) -> Result<bool, crate::VultrinoError> {
+    let Some(mut policy) = storage.get_policy(id).await? else {
+        return Err(crate::VultrinoError::InvalidRequest(format!(
+            "no stored policy with id '{id}'"
+        )));
+    };
+    if policy.default_action == PolicyAction::Deny {
+        return Ok(false);
+    }
+    policy.default_action = PolicyAction::Deny;
+    storage.store_policy(&policy).await?;
+    Ok(true)
+}
+
+/// Log, once per process, every warned `url_match` pattern of a policy as it
+/// enters the engine. On a deny or prompt rule the line says the admin API now
+/// refuses such a pattern when a policy is written and that this policy is still
+/// enforced as written (it was stored before); on an allow rule it says the
+/// pattern is only warned.
+fn warn_url_patterns(policy: &Policy) {
     for r in &policy.rules {
-        walk(&r.condition, policy);
+        let refused_on_write = matches!(r.action, PolicyAction::Deny | PolicyAction::Prompt);
+        let mut stack = vec![&r.condition];
+        while let Some(c) = stack.pop() {
+            match c {
+                PolicyCondition::UrlMatch(p) => {
+                    let canon = canonical_pattern(p);
+                    for w in &canon.warnings {
+                        // The refresh loop reloads the same policies every
+                        // interval: warn once per (policy, pattern, warning, rule kind).
+                        static SEEN: std::sync::OnceLock<
+                            parking_lot::Mutex<std::collections::HashSet<String>>,
+                        > = std::sync::OnceLock::new();
+                        let key = format!(
+                            "{}\u{0}{}\u{0}{:?}\u{0}{}",
+                            policy.name, p, w, refused_on_write
+                        );
+                        let first = SEEN.get_or_init(Default::default).lock().insert(key);
+                        if !first {
+                            continue;
+                        }
+                        if refused_on_write {
+                            tracing::warn!(
+                                policy = %policy.name,
+                                pattern = %p,
+                                canonical = %canon.text,
+                                warning = ?w,
+                                "url_match pattern on a deny or prompt rule is risky or changes meaning under canonical matching; the admin API refuses such a pattern when a policy is written, and this stored policy is still enforced as written until it is saved again with a fixed pattern"
+                            );
+                        } else {
+                            tracing::warn!(
+                                policy = %policy.name,
+                                pattern = %p,
+                                canonical = %canon.text,
+                                warning = ?w,
+                                "url_match pattern on an allow rule is risky or changes meaning under canonical matching; it is only warned (allow rules are not refused)"
+                            );
+                        }
+                    }
+                }
+                PolicyCondition::And(v) | PolicyCondition::Or(v) => stack.extend(v.iter()),
+                PolicyCondition::Not(b) => stack.push(b),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1133,20 +1255,34 @@ mod tests {
                 "https://*.warn-load.example/x",
             )]);
             e.add_policy(url_policy("quiet", "https://quiet.example/*"));
+            let mut allow = url_policy("warn-allow", "https://*.warn-allow.example/*");
+            allow.rules[0].action = PolicyAction::Allow;
+            e.add_policy(allow);
         });
         let log = String::from_utf8(buf.0.lock().clone()).unwrap();
-        for name in ["warn-add", "warn-load", "warn-newer"] {
+        for name in ["warn-add", "warn-load", "warn-newer", "warn-allow"] {
             assert!(log.contains(name), "no warning for {name}: {log}");
         }
         assert_eq!(log.matches("policy=warn-load").count(), 1, "{log}");
         assert!(!log.contains("quiet"), "{log}");
-        // The line says only what is decided: warned now, refusal on deny and
-        // prompt rules planned for phase 3 (allow rules are not part of it).
+        // The line says what is built: on a deny or prompt rule the admin API now
+        // refuses the pattern when a policy is written, and this stored policy is
+        // still enforced as written; an allow rule is only warned.
         assert!(!log.contains("future release"), "{log}");
-        assert!(log.contains("only warned"), "{log}");
+        assert!(!log.contains("not enforced"), "{log}");
+        let deny_line = log.lines().find(|l| l.contains("policy=warn-add")).unwrap();
         assert!(
-            log.contains("on deny and prompt rules is planned for phase 3"),
-            "{log}"
+            deny_line.contains("refuses such a pattern when a policy is written")
+                && deny_line.contains("still enforced as written"),
+            "{deny_line}"
+        );
+        let allow_line = log
+            .lines()
+            .find(|l| l.contains("policy=warn-allow"))
+            .unwrap();
+        assert!(
+            allow_line.contains("only warned (allow rules are not refused)"),
+            "{allow_line}"
         );
     }
 
