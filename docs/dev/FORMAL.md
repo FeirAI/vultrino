@@ -19,7 +19,8 @@ and limits).
 - the file does not match the schema, or a claim id repeats;
 - a listed artifact path does not exist, or a gate is not a CI job id;
 - `ci-required` does not need exactly the unconditional jobs (the scheduled
-  `formal-nightly` job has an `if:` and is deliberately outside it);
+  `formal-nightly` and `iana-snapshot-drift` jobs have an `if:` and are
+  deliberately outside it);
 - the sha256 of a covered function no longer matches (the drift lock);
 - a mutant id has no patch file;
 - a phrase from `overclaim_denylist` appears in `README.md`, `docs/**/*.md` or

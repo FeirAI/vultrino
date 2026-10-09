@@ -121,8 +121,8 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       # No debug info: smaller objects and faster links for every mutant build.
       CARGO_PROFILE_DEV_DEBUG: "0"
-      # Stream the kit's per-mutant lines into the log as they happen, so a
-      # timeout still shows how far the run got.
+      # Print the kit's baseline lines as they happen (per-mutant results come
+      # at the end), so a timeout still shows how far the run got.
       PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
