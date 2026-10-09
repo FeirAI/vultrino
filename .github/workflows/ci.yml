@@ -132,6 +132,8 @@ jobs:
         run: python3 -m unittest discover -s scripts/formal/tests
       - name: claims register checks
         run: python3 scripts/formal/check_claims.py
+      - name: golden vector pins (vectors.lock)
+        run: python3 scripts/vectors/check_vectors_lock.py
       - name: fast-tier mutants must be killed
         env:
           # Each mutant changes one function of the vultrino crate; incremental

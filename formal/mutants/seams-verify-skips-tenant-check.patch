@@ -1,0 +1,14 @@
+diff --git a/src/govder/tenant_assert.rs b/src/govder/tenant_assert.rs
+index bf657a9..7443dc6 100644
+--- a/src/govder/tenant_assert.rs
++++ b/src/govder/tenant_assert.rs
+@@ -198,9 +198,6 @@ pub fn verify_tenant_assertion(
+     if u64::try_from(remaining).map_err(|_| TenantAssertionError::Malformed)? > ceiling.as_secs() {
+         return Err(TenantAssertionError::ExcessiveTtl);
+     }
+-    if tenant.as_slice() != expected_tenant.as_bytes() {
+-        return Err(TenantAssertionError::WrongTenant);
+-    }
+     Ok(())
+ }
+ 
