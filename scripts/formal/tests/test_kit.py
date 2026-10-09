@@ -649,7 +649,7 @@ class MutantRunner(unittest.TestCase):
             "schema": 1,
             "claims": [{
                 "id": "c1", "statement": "s", "method": "test", "artifacts": [], "gates": ["go"],
-                "detector": detector_ok, "covers": [{"path": "target.txt", "symbol": "*", "sha256": ""}],
+                "detector": detector_ok, "detector_kind": "custom", "covers": [{"path": "target.txt", "symbol": "*", "sha256": ""}],
                 "mutants": ["kills", "survives", "noapply"], "does_not_establish": "n",
             }],
             "mutants": {"kills": {"tier": "fast"}, "survives": {"tier": "fast"}, "noapply": {"tier": "full"}},
@@ -774,7 +774,7 @@ class MutantRunner(unittest.TestCase):
             "schema": 1,
             "claims": [{
                 "id": "c1", "statement": "s", "method": "test", "artifacts": [], "gates": ["go"],
-                "detector": "sh gate.sh", "covers": [{"path": "target.txt", "symbol": "*", "sha256": ""}],
+                "detector": "sh gate.sh", "detector_kind": "custom", "covers": [{"path": "target.txt", "symbol": "*", "sha256": ""}],
                 "mutants": ["equiv", "real"], "does_not_establish": "n",
             }],
         }, indent=2) + "\n")
@@ -802,8 +802,9 @@ class MutantRunner(unittest.TestCase):
         def extra(c):
             c["claims"][0]["mutants"] = ["a-creates", "b-probe"]
             c["mutants"] = {
-                "a-creates": {"detector": "if test -f new.txt; then echo x >> target.txt; exit 1; fi; grep -q ok target.txt"},
-                "b-probe": {"detector": "test ! -f new.txt && grep -q ok target.txt"},
+                "a-creates": {"detector": "if test -f new.txt; then echo x >> target.txt; exit 1; fi; grep -q ok target.txt",
+                              "detector_kind": "custom"},
+                "b-probe": {"detector": "test ! -f new.txt && grep -q ok target.txt", "detector_kind": "custom"},
             }
         d = self.build(extra=extra)
         (d / "target.txt").write_text("ok\nmut\n")
@@ -825,6 +826,515 @@ class MutantRunner(unittest.TestCase):
         code, out = self.go(d, tier="full")
         self.assertIn("killed    a-creates", out)
         self.assertIn("SURVIVED  b-probe", out)
+
+
+# ---------------------------------------------------------------------------
+# kit v2
+# ---------------------------------------------------------------------------
+
+RS_ITEMS = r"""
+use std::net::Ipv4Addr;
+
+pub const VERSION: u32 = 3;
+
+/// blocked ranges
+pub(crate) static IPV4_BLOCKED: &[(Ipv4Addr, u8, &str)] = &[
+    (Ipv4Addr::new(10, 0, 0, 0), 8, "private; rfc1918 {a}"),
+    // a comment; with a semicolon ] and a bracket
+    (Ipv4Addr::new(127, 0, 0, 0), 8, "loopback ]"),
+    (Ipv4Addr::new(169, 254, 0, 0), 16, "link-local;"),
+];
+
+const TABLE: [[u8; 2]; 2] = [
+    [1, 2],
+    [3, 4],
+];
+
+pub type Verdict = Result<(), String>;
+
+const fn helper() -> u32 { 1 }
+
+const _: () = ();
+
+pub fn classify(x: u32) -> u32 {
+    const LOCAL: u32 = 9;
+    x + LOCAL
+}
+
+mod inner {
+    pub const LIMIT: usize = 5;
+}
+
+struct S;
+impl S {
+    const WIDTH: usize = 4;
+}
+"""
+
+
+class RustItems(unittest.TestCase):
+    def test_multiline_table_with_brackets_braces_and_strings(self):
+        t = src_of("a.rs", RS_ITEMS, "IPV4_BLOCKED")
+        self.assertTrue(t.startswith("pub(crate) static IPV4_BLOCKED"))
+        self.assertTrue(t.rstrip().endswith("];"))
+        self.assertIn("link-local;", t)
+        self.assertNotIn("TABLE", t)
+
+    def test_names_and_kinds(self):
+        self.assertIn("5", src_of("a.rs", RS_ITEMS, "LIMIT"))
+        self.assertIn("5", src_of("a.rs", RS_ITEMS, "inner::LIMIT"))
+        self.assertIn("5", src_of("a.rs", RS_ITEMS, "const LIMIT"))
+        self.assertIn("4", src_of("a.rs", RS_ITEMS, "S::WIDTH"))
+        self.assertEqual(src_of("a.rs", RS_ITEMS, "static IPV4_BLOCKED"), src_of("a.rs", RS_ITEMS, "IPV4_BLOCKED"))
+        self.assertEqual(src_of("a.rs", RS_ITEMS, "type Verdict"), "pub type Verdict = Result<(), String>;")
+        self.assertEqual(src_of("a.rs", RS_ITEMS, "const VERSION"), "pub const VERSION: u32 = 3;")
+        self.assertIn("[3, 4]", src_of("a.rs", RS_ITEMS, "TABLE"))
+
+    def test_const_fn_and_underscore_const_are_not_items_and_fns_still_work(self):
+        self.assertIn("{ 1 }", src_of("a.rs", RS_ITEMS, "helper"))
+        with self.assertRaises(fk.KitError):
+            src_of("a.rs", RS_ITEMS, "const helper")
+        with self.assertRaises(fk.KitError):
+            src_of("a.rs", RS_ITEMS, "_")
+        self.assertIn("LOCAL", src_of("a.rs", RS_ITEMS, "classify"))
+
+    def test_local_const_inside_a_fn_is_not_addressable(self):
+        with self.assertRaises(fk.KitError):
+            src_of("a.rs", RS_ITEMS, "LOCAL")
+
+    def test_hash_binds_to_the_table_only(self):
+        base = fk.hash_text(src_of("a.rs", RS_ITEMS, "IPV4_BLOCKED"))
+        other = RS_ITEMS.replace("pub const VERSION: u32 = 3;", "pub const VERSION: u32 = 4;")
+        self.assertEqual(base, fk.hash_text(src_of("a.rs", other, "IPV4_BLOCKED")))
+        mutated = RS_ITEMS.replace("(Ipv4Addr::new(127, 0, 0, 0), 8, \"loopback ]\"),\n", "")
+        self.assertNotEqual(base, fk.hash_text(src_of("a.rs", mutated, "IPV4_BLOCKED")))
+        # a changed string inside the table is also caught
+        self.assertNotEqual(base, fk.hash_text(src_of("a.rs", RS_ITEMS.replace("loopback ]", "loopback"), "IPV4_BLOCKED")))
+
+    def test_unterminated_item_is_an_error(self):
+        with self.assertRaises(fk.KitError):
+            src_of("a.rs", "const A: [u8; 2] = [1, 2\n", "A")
+
+
+class DocsTable(unittest.TestCase):
+    def setUp(self):
+        self.d, self.git = make_repo({
+            "p.go": GO_FILE, ".github/workflows/ci.yml": CI_OK, "formal/mutants/add-sub.patch": "",
+            "docs/dev/FORMAL.md": "# Formal\n\nintro\n\n<!-- formal-claims:begin -->\nhand written\n<!-- formal-claims:end -->\n\ntail\n",
+        })
+        self.claims = self.d / "formal" / "claims.json"
+        c = base_claims()
+        c["claims"][0]["statement"] = "Add | returns\nthe sum."
+        c["claims"][0]["evidence_run"] = "123"
+        self.claims.write_text(json.dumps(c, indent=2) + "\n")
+        cc.run_all(self.d, self.claims, do_relock=True)
+        self.doc = self.d / "docs" / "dev" / "FORMAL.md"
+
+    def rows(self):
+        rep, _ = cc.run_all(self.d, self.claims)
+        return [(c, ok, m) for c, ok, m in rep.rows if c.startswith("docs table")]
+
+    def test_hand_written_region_fails_then_render_passes(self):
+        (_, ok, msg), = self.rows()
+        self.assertFalse(ok)
+        self.assertIn("--render-docs", msg)
+        self.assertIn("rewrote", cc.render_docs(self.d, self.claims, self.doc))
+        (_, ok, msg), = self.rows()
+        self.assertTrue(ok, msg)
+        text = self.doc.read_text()
+        self.assertIn("| `add-sum` | test | Add \\| returns the sum. | Overflow behaviour. | `go` | 123 |", text)
+        self.assertTrue(text.startswith("# Formal\n\nintro\n"))
+        self.assertTrue(text.endswith("\n\ntail\n"))
+        self.assertNotIn("hand written", text)
+        self.assertIn("is up to date", cc.render_docs(self.d, self.claims, self.doc))
+
+    def test_drift_hint_names_a_non_default_claims_file(self):
+        other = self.d / "formal" / "kit-claims.json"
+        other.write_text(self.claims.read_text())
+        rep, _ = cc.run_all(self.d, other)
+        msg, = [m for c, ok, m in rep.rows if c.startswith("docs table") and not ok]
+        self.assertIn("check_claims.py --claims formal/kit-claims.json --render-docs docs/dev/FORMAL.md", msg)
+        (_, ok, msg), = self.rows()
+        self.assertIn("check_claims.py --render-docs docs/dev/FORMAL.md", msg)
+
+    def test_claim_change_makes_docs_drift(self):
+        cc.render_docs(self.d, self.claims, self.doc)
+        c = json.loads(self.claims.read_text())
+        c["claims"][0]["does_not_establish"] = "Something else."
+        self.claims.write_text(json.dumps(c, indent=2) + "\n")
+        (_, ok, _), = self.rows()
+        self.assertFalse(ok)
+
+    def test_hand_edit_inside_region_fails(self):
+        cc.render_docs(self.d, self.claims, self.doc)
+        self.doc.write_text(self.doc.read_text().replace("Overflow behaviour.", "Nothing at all."))
+        (_, ok, _), = self.rows()
+        self.assertFalse(ok)
+
+    def test_edit_outside_region_is_fine(self):
+        cc.render_docs(self.d, self.claims, self.doc)
+        self.doc.write_text(self.doc.read_text().replace("intro", "different intro"))
+        (_, ok, _), = self.rows()
+        self.assertTrue(ok)
+
+    def test_no_markers_is_a_warning_not_a_failure(self):
+        self.doc.write_text("# Formal\n")
+        (_, ok, msg), = self.rows()
+        self.assertTrue(ok)
+        self.assertIn("WARNING", msg)
+        with self.assertRaises(fk.KitError):
+            cc.render_docs(self.d, self.claims, self.doc)
+
+    def test_missing_file_is_a_warning(self):
+        self.doc.unlink()
+        (_, ok, msg), = self.rows()
+        self.assertTrue(ok)
+        self.assertIn("WARNING", msg)
+
+    def test_broken_markers_fail(self):
+        for text in ("<!-- formal-claims:begin -->\nx\n", "<!-- formal-claims:end -->\n<!-- formal-claims:begin -->\n",
+                     "<!-- formal-claims:begin -->\n<!-- formal-claims:end -->\n<!-- formal-claims:begin -->\n<!-- formal-claims:end -->\n"):
+            self.doc.write_text(text)
+            (_, ok, _), = self.rows()
+            self.assertFalse(ok, text)
+
+    def test_formal_docs_key_selects_files(self):
+        c = json.loads(self.claims.read_text())
+        c["formal_docs"] = ["other.md"]
+        self.claims.write_text(json.dumps(c, indent=2) + "\n")
+        (name, ok, msg), = self.rows()
+        self.assertEqual(name, "docs table other.md")
+        # a file named explicitly must exist: deleting it cannot quietly turn the check off
+        self.assertFalse(ok)
+        self.assertIn("does not exist", msg)
+
+    def test_formal_docs_key_makes_missing_markers_a_failure(self):
+        c = json.loads(self.claims.read_text())
+        c["formal_docs"] = ["docs/dev/FORMAL.md"]
+        self.claims.write_text(json.dumps(c, indent=2) + "\n")
+        cc.render_docs(self.d, self.claims, self.doc)
+        (_, ok, msg), = self.rows()
+        self.assertTrue(ok, msg)
+        self.doc.write_text("# Formal\n\nthe table was removed together with its markers\n")
+        (_, ok, msg), = self.rows()
+        self.assertFalse(ok)
+        self.assertIn("no <!-- formal-claims:begin --> markers", msg)
+
+    def test_cli_render_docs(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = cc.main(["--root", str(self.d), "--render-docs", str(self.doc)])
+        self.assertEqual(code, 0, buf.getvalue())
+        self.assertIn("claims.json", self.doc.read_text())
+
+
+class CiRequiredAlways(unittest.TestCase):
+    def check(self, ci_required_block):
+        wf = "name: ci\non: push\njobs:\n  go:\n    runs-on: x\n  ci-required:\n" + ci_required_block
+        d, _ = make_repo({"p.go": GO_FILE, ".github/workflows/ci.yml": wf, "formal/mutants/add-sub.patch": ""})
+        (d / "formal").mkdir(exist_ok=True)
+        (d / "formal" / "claims.json").write_text(json.dumps(base_claims()))
+        rep, _ = cc.run_all(d, d / "formal" / "claims.json")
+        return [m for c, ok, m in rep.rows if c == "ci-required" and not ok], \
+               [m for c, ok, m in rep.rows if c == "ci-required" and ok]
+
+    def test_always_passes(self):
+        for cond in ("always()", "${{ always() }}", "'!cancelled()'", "\"always()\"", "\"${{ always() }}\"",
+                     "'${{ !cancelled() }}'"):
+            bad, good = self.check("    if: %s\n    needs: [go]\n    runs-on: x\n" % cond)
+            self.assertEqual(bad, [], cond)
+
+    def test_missing_if_fails_open_and_says_why(self):
+        bad, _ = self.check("    needs: [go]\n    runs-on: x\n")
+        self.assertEqual(len(bad), 1)
+        self.assertIn("fails open", bad[0])
+
+    def test_other_conditions_fail(self):
+        # a quoted 'always()' inside ${{ }} is a string literal, not a status call: GitHub prepends success()
+        for cond in ("success()", "github.event_name == 'push'", "always() && false", "${{ 'always()' }}",
+                     "\"${{ '!cancelled()' }}\""):
+            bad, _ = self.check("    if: %s\n    needs: [go]\n    runs-on: x\n" % cond)
+            self.assertTrue(any("not an always-run" in m for m in bad), cond)
+
+    def test_fixture_workflows_have_it(self):
+        fx = Path(__file__).resolve().parent / "fixtures"
+        for f in sorted(fx.glob("ci-*.yml")):
+            jobs = fk.parse_workflow_jobs(f.read_text(), f.name)
+            self.assertTrue(cc._always_runs(jobs["ci-required"].if_expr), f.name)
+
+
+class Vacuity(unittest.TestCase):
+    CARGO_OK = "running 3 tests\ntest a ... ok\ntest result: ok. 3 passed; 0 failed; 0 ignored\n"
+    CARGO_EMPTY = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored\n"
+    GO_OK = "ok  \texample.com/p\t0.012s\n"
+
+    def test_cargo(self):
+        v = cm.vacuity_problem
+        self.assertIsNone(v("auto", "cargo test", self.CARGO_OK))
+        self.assertIsNone(v("cargo", "x", self.CARGO_OK))
+        # one empty binary plus one real one is fine; the filter matched somewhere
+        self.assertIsNone(v("auto", "cargo test foo", self.CARGO_EMPTY + self.CARGO_OK))
+        self.assertIn("matched nothing", v("auto", "cargo test foo", self.CARGO_EMPTY + self.CARGO_EMPTY))
+        self.assertIn("0 tests", v("cargo", "x", "running 0 tests\nrunning 0 tests\n"))
+        self.assertIn("no test passed", v("cargo", "x", "running 2 tests\ntest result: ok. 0 passed; 0 failed; 2 ignored\n"))
+        self.assertIn("no 'running", v("cargo", "x", "Compiling x\nFinished\n"))
+        self.assertIn("running 1 test", "running 1 test") and self.assertIsNone(
+            v("auto", "x", "running 1 test\ntest result: ok. 1 passed; 0 failed\n"))
+
+    def test_go(self):
+        v = cm.vacuity_problem
+        self.assertIsNone(v("auto", "go test ./...", self.GO_OK))
+        self.assertIsNone(v("go", "go test -v ./...", "=== RUN   TestA\n--- PASS: TestA (0.00s)\nPASS\nok  \tp\t0.1s\n"))
+        self.assertIsNotNone(v("auto", "go test -run X ./...", "ok  \tp\t0.1s [no tests to run]\n"))
+        self.assertIsNotNone(v("go", "go test ./...", "?   \tp\t[no test files]\n"))
+        self.assertIn("no '=== RUN'", v("go", "go test -v -run Nope ./p", "testing: warning: no tests to run\nPASS\nok  \tp\t0.1s [no tests to run]\n"))
+        # a filter that matches in one package while others print 'no tests to run' still ran a test
+        self.assertIsNone(v("go", "go test -run TestA ./...", "ok  \tp1\t0.1s\nok  \tp2\t0.1s [no tests to run]\n"))
+        # -cover puts coverage text before the marker (real go 1.25 output)
+        cover = "ok  \texample.com/p\t0.590s\tcoverage: 0.0% of statements [no tests to run]\n"
+        self.assertIn("ran no test", v("auto", "go test -cover ./p -run TestNope", cover))
+        self.assertIsNone(v("auto", "go test -cover ./p -run TestA", "ok  \texample.com/p\t0.5s\tcoverage: 80.0% of statements\n"))
+        self.assertIn("ran no test", v("auto", "go test ./p -run X", "ok  \tp\t(cached)\tcoverage: 0.0% of statements [no tests to run]\n"))
+        # -v with a subtest filter that matches no subtest: the parent prints --- PASS, the package line says no tests
+        sub = ("=== RUN   TestAdd\n--- PASS: TestAdd (0.00s)\ntesting: warning: no tests to run\nPASS\n"
+               "ok  \texample.com/p\t0.7s [no tests to run]\n")
+        self.assertIn("ran no test", v("auto", "go test -v -run TestAdd/nosuch ./p", sub))
+
+    def test_unknown_output_must_opt_out(self):
+        v = cm.vacuity_problem
+        self.assertIn("custom", v("auto", "make proofs", "all good\n"))
+        self.assertIsNone(v("custom", "make proofs", "all good\n"))
+        self.assertIsNone(v("custom", "cargo test nothing", self.CARGO_EMPTY))
+
+
+class V2MutantRunner(MutantRunner):
+    """Reuses MutantRunner.build/go; only the new tests run here (the inherited ones are skipped by name)."""
+
+    def build(self, detector_ok="grep -q ok target.txt", extra=None, kind="custom"):
+        def ex(c):
+            c["claims"][0]["detector_kind"] = kind
+            if extra:
+                extra(c)
+        return MutantRunner.build(self, detector_ok=detector_ok, extra=ex)
+
+    def test_baseline_that_runs_no_cargo_test_fails(self):
+        d = self.build(detector_ok="echo 'running 0 tests'; echo 'test result: ok. 0 passed; 0 failed'", kind="auto")
+        code, out = self.go(d, tier="full", only="kills")
+        self.assertEqual(code, 1)
+        self.assertIn("vacuous detector", out)
+        self.assertIn("baseline failed", out)
+        self.assertNotIn("killed", out)
+
+    def test_baseline_go_no_tests_to_run_fails(self):
+        d = self.build(detector_ok="printf 'ok  \\tp\\t0.1s [no tests to run]\\n'", kind="auto")
+        code, out = self.go(d, tier="full", only="kills")
+        self.assertEqual(code, 1)
+        self.assertIn("vacuous detector", out)
+
+    def test_custom_opts_out_and_real_tests_pass(self):
+        d = self.build(detector_ok="echo 'running 0 tests'; grep -q ok target.txt", kind="custom")
+        code, out = self.go(d, tier="full", only="kills")
+        self.assertEqual(code, 0, out)
+        d = self.build(detector_ok="echo 'running 2 tests'; echo 'test result: ok. 2 passed; 0 failed'; grep -q ok target.txt",
+                       kind="auto")
+        code, out = self.go(d, tier="full", only="kills")
+        self.assertEqual(code, 0, out)
+
+    def test_mutant_detector_override_does_not_inherit_a_custom_claim_kind(self):
+        # the claim is custom (a proof), the mutant overrides with a cargo test whose filter matches nothing
+        def extra(c):
+            c["mutants"]["kills"]["detector"] = ("echo 'running 0 tests'; "
+                                                 "echo 'test result: ok. 0 passed; 0 failed; 0 ignored; 3 filtered out'")
+        d = self.build(extra=extra)
+        code, out = self.go(d, tier="full", only="kills")
+        self.assertEqual(code, 1, out)
+        self.assertIn("vacuous detector", out)
+        self.assertIn("baseline failed", out)
+        specs, errs = fk.resolve_mutants(json.loads((d / "formal" / "claims.json").read_text()))
+        self.assertEqual(errs, [])
+        kinds = {s.id: s.kind for s in specs}
+        self.assertEqual(kinds["kills"], "auto")     # own detector: guard applies
+        self.assertEqual(kinds["survives"], "custom")  # claim's detector: claim's kind
+
+    def test_mutant_detector_override_with_its_own_custom_kind_passes(self):
+        def extra(c):
+            c["mutants"]["kills"].update(detector="echo checked; grep -q ok target.txt", detector_kind="custom")
+        d = self.build(extra=extra)
+        code, out = self.go(d, tier="full", only="kills")
+        self.assertEqual(code, 0, out)
+        self.assertIn("killed    kills", out)
+
+    def test_unrecognised_detector_without_opt_out_fails_baseline(self):
+        d = self.build(kind="auto")
+        code, out = self.go(d, tier="full", only="kills")
+        self.assertEqual(code, 1)
+        self.assertIn("detector_kind", out)
+
+    def test_baseline_edit_of_a_tracked_file_does_not_contaminate_mutants(self):
+        # baseline appends to other.txt; the 'survives' patch edits other.txt and only applies to the pristine tree
+        d = self.build(detector_ok="echo junk >> other.txt; echo gen > generated.txt; grep -q ok target.txt")
+        code, out = self.go(d, tier="full", only="survives")
+        self.assertIn("SURVIVED  survives", out)
+        self.assertNotIn("does not apply", out)
+        self.assertIn("baseline detector changed the scratch tree", out)
+
+    def test_detector_edit_after_a_mutant_does_not_leak_into_the_next(self):
+        def extra(c):
+            c["claims"][0]["mutants"] = ["kills", "survives"]
+            c["mutants"] = {"kills": {"tier": "fast"},
+                            "survives": {"tier": "fast", "detector_kind": "custom",
+                                         "detector": "test ! -f junk.txt && test \"$(cat other.txt)\" = y && grep -q ok target.txt"}}
+            c["mutants"]["survives"]["detector"] = "test ! -f junk.txt && grep -q ok target.txt"
+        d = self.build(detector_ok="echo junk > junk.txt; echo stuff >> other.txt; grep -q ok target.txt", extra=extra)
+        code, out = self.go(d, tier="fast")
+        # junk.txt is created by the claim detector of 'kills' (a mutant run) and must be gone for 'survives'
+        self.assertIn("SURVIVED  survives", out)
+
+    def test_cache_dirs_are_kept_everything_else_untracked_goes(self):
+        def extra(c):
+            c["scratch_cache_dirs"] = ["cache"]
+            c["claims"][0]["mutants"] = ["kills", "survives"]
+            c["mutants"] = {"kills": {"tier": "fast"},
+                            "survives": {"tier": "fast", "detector_kind": "custom",
+                                         "detector": "test -f cache/x && test ! -f other.gen && grep -q ok target.txt"}}
+        d = self.build(detector_ok="mkdir -p cache; echo c > cache/x; echo g > other.gen; grep -q ok target.txt", extra=extra)
+        code, out = self.go(d, tier="fast")
+        self.assertIn("SURVIVED  survives", out, out)
+
+    def test_cargo_target_dir_is_private_not_the_callers(self):
+        old = os.environ.get("CARGO_TARGET_DIR")
+        os.environ["CARGO_TARGET_DIR"] = "/outer/shared-target"
+        try:
+            d = self.build(detector_ok="case \"$CARGO_TARGET_DIR\" in /outer/*) exit 1;; esac; test -n \"$CARGO_TARGET_DIR\" && grep -q ok target.txt")
+            code, out = self.go(d, tier="full", only="kills")
+        finally:
+            if old is None:
+                del os.environ["CARGO_TARGET_DIR"]
+            else:
+                os.environ["CARGO_TARGET_DIR"] = old
+        self.assertEqual(code, 0, out)
+        self.assertIn("cargo target dir", out)
+        import re as _re
+        tdir = _re.search(r"cargo target dir (\S+)", out).group(1)
+        self.assertFalse(Path(tdir).exists(), "the private target dir is removed afterwards")
+
+    def test_cargo_target_dir_option_is_honoured_and_kept(self):
+        tdir = Path(tempfile.mkdtemp(prefix="kit-tgt-"))
+        _TEMP_DIRS.append(tdir)
+        d = self.build(detector_ok="test \"$CARGO_TARGET_DIR\" = '%s' && grep -q ok target.txt" % tdir.resolve())
+        code, out = self.go(d, tier="full", only="kills", cargo_target_dir=tdir)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(tdir.exists())
+
+    def test_scratch_that_is_a_file_is_rejected(self):
+        d = self.build()
+        f = d.parent / ("file-%s" % d.name)
+        f.write_text("x")
+        code, out = self.go(d, tier="full", scratch=f)
+        self.assertEqual(code, 2)
+        self.assertIn("is a file", out)
+        f.unlink()
+
+    def test_detector_that_stages_or_commits_does_not_contaminate(self):
+        # the baseline detector stages, then commits, an edit to other.txt; the 'survives' patch only applies to
+        # the pristine other.txt, and its detector fails if the junk line leaked
+        for det in ("echo junk >> other.txt; git add other.txt; grep -q ok target.txt",
+                    "echo junk >> other.txt; git -c user.name=t -c user.email=t@t commit -qam junk; grep -q ok target.txt"):
+            def extra(c):
+                c["claims"][0]["mutants"] = ["kills", "survives"]
+                c["mutants"] = {"kills": {"tier": "fast"},
+                                "survives": {"tier": "fast", "detector": "! grep -q junk other.txt && grep -q ok target.txt",
+                                             "detector_kind": "custom"}}
+            d = self.build(detector_ok=det, extra=extra)
+            code, out = self.go(d, tier="fast")
+            self.assertIn("killed    kills", out, out)
+            self.assertIn("SURVIVED  survives", out, out)
+            self.assertNotIn("does not apply", out)
+
+    def test_nested_repository_left_by_a_detector_is_removed(self):
+        def extra(c):
+            c["claims"][0]["mutants"] = ["kills", "survives"]
+            c["mutants"] = {"kills": {"tier": "fast"},
+                            "survives": {"tier": "fast", "detector": "test ! -e dep/z && grep -q ok target.txt",
+                                         "detector_kind": "custom"}}
+        d = self.build(detector_ok="mkdir -p dep && git -C dep init -q && echo z > dep/z; grep -q ok target.txt",
+                       extra=extra)
+        code, out = self.go(d, tier="fast")
+        self.assertIn("SURVIVED  survives", out, out)
+
+    def test_unremovable_leftover_aborts_and_json_says_exit_2(self):
+        parent = Path(tempfile.mkdtemp(prefix="kit-ro-"))
+        _TEMP_DIRS.append(parent)
+        d = self.build(detector_ok="mkdir -p ro && touch ro/f && chmod 555 ro; grep -q ok target.txt")
+        rep = parent / "r.json"
+        try:
+            code, out = self.go(d, tier="full", only="kills", scratch=parent / "wt", json_path=rep)
+        finally:
+            for ro in parent.glob("wt/ro"):
+                ro.chmod(0o755)
+            subprocess.run(["git", "worktree", "prune"], cwd=str(d), check=False)
+        self.assertEqual(code, 2, out)
+        self.assertIn("could not restore the scratch tree after the baseline run", out)
+        self.assertEqual(json.loads(rep.read_text())["exit"], 2)
+
+    def test_patch_created_file_in_a_cache_dir_aborts(self):
+        def extra(c):
+            c["scratch_cache_dirs"] = ["cache"]
+            c["claims"][0]["mutants"] = ["kills"]
+            c["mutants"] = {"kills": {"tier": "fast"}}
+        d = self.build(extra=extra)
+        (d / "target.txt").write_text("bad\n")
+        (d / "cache").mkdir()
+        (d / "cache" / "new.txt").write_text("created\n")
+        subprocess.run(["git", "add", "-N", "cache/new.txt"], cwd=str(d), check=True)
+        patch = subprocess.run(["git", "diff"], cwd=str(d), capture_output=True, text=True, check=True).stdout
+        subprocess.run(["git", "reset", "-q", "cache/new.txt"], cwd=str(d), check=True)
+        shutil.rmtree(d / "cache")
+        subprocess.run(["git", "checkout", "--", "."], cwd=str(d), check=True)
+        (d / "formal" / "mutants" / "kills.patch").write_text(patch)
+        subprocess.run(["git", "add", "-A"], cwd=str(d), check=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "m"],
+                       cwd=str(d), check=True)
+        code, out = self.go(d, tier="fast")
+        self.assertEqual(code, 1, out)
+        self.assertIn("survived in a scratch_cache_dirs entry", out)
+
+    def test_private_target_never_removes_an_existing_directory(self):
+        parent = Path(tempfile.mkdtemp(prefix="kit-sib-"))
+        _TEMP_DIRS.append(parent)
+        sib = parent / "wt-cargo-target"
+        sib.mkdir()
+        (sib / "keep").write_text("mine")
+        d = self.build()
+        code, out = self.go(d, tier="full", only="kills", scratch=parent / "wt")
+        self.assertEqual(code, 0, out)
+        self.assertTrue((sib / "keep").exists())
+        self.assertEqual(sorted(p.name for p in parent.iterdir()), ["wt-cargo-target"], "own target dir not removed")
+
+    def test_compile_break_kill_is_flagged(self):
+        d = self.build(detector_ok="grep -q ok target.txt || { echo 'error[E0425]: cannot find value'; exit 101; }")
+        code, out = self.go(d, tier="full", only="kills")
+        self.assertEqual(code, 0, out)
+        self.assertIn("looks like a build failure", out)
+
+
+for _name in [n for n in dir(MutantRunner) if n.startswith("test_")]:
+    setattr(V2MutantRunner, _name, None)  # inherited tests already run in MutantRunner
+
+
+class KitVersion(unittest.TestCase):
+    def test_version(self):
+        self.assertEqual(fk.KIT_VERSION, "2")
+        import io
+        from contextlib import redirect_stdout
+        d, _ = make_repo({"x": "1"})
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cc.main(["--root", str(d), "--claims", str(d / "nope.json")])
+        self.assertIn("formal kit v2", buf.getvalue())
+
 
 
 if __name__ == "__main__":
