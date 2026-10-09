@@ -1,0 +1,15 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 434672c..68272e9 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -783,9 +783,7 @@ impl HttpPlugin {
+         // the canonical form, not the raw string, is what catches escapes that
+         // canonicalisation decodes, and a literal that canonicalisation drops
+         // (a dot segment, the fragment) cannot vouch for another spelling.
+-        let without_literal = crate::policy::canonical_url(&raw_url.replace(PLACEHOLDER, "-"))
+-            .ok_or_else(uncanonical)?
+-            .to_ascii_lowercase();
++        let without_literal = raw_url.replace(PLACEHOLDER, "-").to_ascii_lowercase();
+         if [
+             "%7bcredential%7d",
+             "%7bcredential}",

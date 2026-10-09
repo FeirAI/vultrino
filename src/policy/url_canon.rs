@@ -359,6 +359,30 @@ pub fn url_matches(raw_url: &str, raw_pattern: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Pins a documented residual (LIMITATIONS.md, url-match-canonical
+    /// does_not_establish): a glob `*` also matches `/`, so a `*` in the host
+    /// part can match a request to another host. The pattern is warned, not
+    /// refused, and on an Allow rule this allows that other host.
+    #[test]
+    fn star_in_host_glob_can_match_another_host_residual() {
+        for pattern in ["https://*.example.com/x", "*.example.com/x"] {
+            assert!(
+                canonical_pattern(pattern)
+                    .warnings
+                    .contains(&PatternWarning::StarInHost),
+                "{pattern}"
+            );
+            assert!(
+                url_matches("https://api.example.com/x", pattern),
+                "{pattern}"
+            );
+            assert!(
+                url_matches("https://evil.net/a.example.com/x", pattern),
+                "{pattern}"
+            );
+        }
+    }
+
     #[test]
     fn canonical_form_examples() {
         for (raw, want) in [

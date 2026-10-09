@@ -212,13 +212,14 @@ parsed never matches an Allow rule and is denied when a matching policy has a
 inside the host (also without a scheme, except a prefix of `http://` or
 `https://` such as `http*`), or where canonicalisation changes the meaning (dot
 segments, encoded dots, a fragment, a backslash, a `*` that cuts a percent escape
-short); these will be refused in the next release. There is no `{a,b}`
+short). They are only warned today; whether a later release refuses them is
+an open decision, and the log line says they will be. There is no `{a,b}`
 alternation in a glob; braces are literal. A policy loaded from the vault that
 fails validation (for example a `RateLimit` policy with a non-deny default) is
 logged as a WARNING but still enforced as written. The `http` plugin sends the
 evaluated string and refuses a URL that cannot be canonicalised; for a
 `UrlToken` credential it sends the evaluated string with the secret in place of
-the literal `{credential}` and refuses a percent-encoded spelling of it. The `hmac` plugin sends the canonical URL and adds only
+the literal `{credential}` and refuses a URL in which other text canonicalises to a spelling of it (such as `%7Bcredential%7D` or `%7Bcr%65dential%7D`). The `hmac` plugin sends the canonical URL and adds only
 `timestamp`, `recvWindow` and `signature` to the evaluated query pairs. See the
 limits in `docs/dev/LIMITATIONS.md`.
 

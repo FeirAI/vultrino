@@ -26,6 +26,15 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 - **No cumulative spend / budget state.** SpendCap is **per-action and stateless**
   only — there is no ledger. Windowed budgets are a metering-plane concern returned
   as a pushed `Deny` policy.
+- **Every vault write rewrites the whole vault.** A write (a policy PUT or
+  delete, a credential, role, API-key or use-token change, an approval decision)
+  takes the cross-process file lock, decrypts the whole vault file, applies the
+  change, re-encrypts the whole file and renames it into place. The latency of a
+  write therefore grows with the size of the vault (credentials, use tokens,
+  approvals, policies), and writes are serialised. On a slow or emulated CI host
+  a policy PUT has taken longer than govder's 10 second client timeout.
+  Incremental vault writes (or a write-ahead log) are not built; measuring on
+  native hardware and choosing a design is phase-3 work.
 - **Policy propagation across processes is bounded-staleness, not instant.** An
   admin policy push is synchronous on the web process but reaches the MCP server /
   other replicas only on the periodic refresh (`POLICY_REFRESH_SECS = 5`). For an
@@ -382,14 +391,18 @@ treats an encoded slash or a different case in the path as the same resource as
 another spelling is outside it. A trailing dot on the host is removed by
 canonicalisation, because it names the same destination in DNS. A glob pattern
 (no trailing `*`) with `*` in the host part can still match a different host,
-because a glob `*` also matches `/`; this release only logs a warning and
-the pattern will be refused in a later release. A glob whose host part holds `?`
+because a glob `*` also matches `/`; this release only logs a warning (the
+log line says the pattern will be refused in a future release, which is not yet
+decided). On an Allow rule such a pattern can allow a request to another host.
+A glob whose host part holds `?`
 keeps its old literal glob meaning and is not canonicalised (warned). Patterns
 are canonicalised when they are matched, not rewritten in storage, so the admin
 API still shows the text the operator wrote. A `UrlToken` credential is judged
 on its placeholder URL and sent as that judged string with the secret in place of
-the literal `{credential}`; a percent-encoded or half-encoded spelling of the
-placeholder in the URL is refused. The secret is inserted as is, and the `url`
+the literal `{credential}`. A URL in which other text canonicalises to a
+spelling of the placeholder (percent-encoded, half-encoded, or with an escaped
+inner letter such as `%7Bcr%65dential%7D`, in any letter case) is refused; this
+is tested on a list of spellings, not proved for every URL. The secret is inserted as is, and the `url`
 crate percent-encodes only what it must, so a secret that contains `/`, `?` or
 `#` changes the path or query that is sent; the substitution is checked only for
 an unchanged scheme and host. A `url_match` glob has no `{a,b}` alternation: the
