@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index b4e5a1b..41310c3 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -958,7 +958,7 @@ fn first_warned_url_pattern(c: &PolicyCondition) -> Option<(&str, url_canon::Can
+         PolicyCondition::And(v) | PolicyCondition::Or(v) => {
+             v.iter().find_map(first_warned_url_pattern)
+         }
+-        PolicyCondition::Not(b) => first_warned_url_pattern(b),
++        PolicyCondition::Not(_) => None,
+         _ => None,
+     }
+ }

@@ -1,13 +1,13 @@
 diff --git a/src/policy/mod.rs b/src/policy/mod.rs
-index 85e88a6..9205d6b 100644
+index b4e5a1b..99041b2 100644
 --- a/src/policy/mod.rs
 +++ b/src/policy/mod.rs
-@@ -972,7 +972,7 @@ fn warn_url_patterns(policy: &Policy) {
-                         pattern = %p,
-                         canonical = %canon.text,
-                         warning = ?w,
--                        "url_match pattern is risky or changes meaning under canonical matching; it is only warned (refusing warned patterns on deny and prompt rules is planned for phase 3)"
-+                        "url_match pattern is risky or changes meaning under canonical matching; it will be refused in a future release"
-                     );
-                 }
-             }
+@@ -1089,7 +1089,7 @@ fn warn_url_patterns(policy: &Policy) {
+                                 pattern = %p,
+                                 canonical = %canon.text,
+                                 warning = ?w,
+-                                "url_match pattern on a deny or prompt rule is risky or changes meaning under canonical matching; the admin API refuses such a pattern when a policy is written, and this stored policy is still enforced as written until it is saved again with a fixed pattern"
++                                "url_match pattern on a deny or prompt rule is risky or changes meaning under canonical matching; this policy is refused and not enforced"
+                             );
+                         } else {
+                             tracing::warn!(

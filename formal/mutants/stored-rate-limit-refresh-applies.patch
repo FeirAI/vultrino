@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 41a3569..22b9908 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -5715,7 +5715,7 @@ pub async fn refresh_policies_with_hooks(
+     storage.reload().await?;
+     let stored = storage.list_stored_policies().await?;
+     after_list.await;
+-    if let Err(refusal) = crate::policy::refuse_unloadable_stored_policies(&stored) {
++    if let Err(refusal) = crate::policy::refuse_unloadable_stored_policies(&stored[..0]) {
+         // P3-FLOORS: never apply a set that holds a refused stored policy. The live
+         // set stays as it is; logged once per distinct refusal per process.
+         static SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =

@@ -1,0 +1,13 @@
+diff --git a/src/policy/types.rs b/src/policy/types.rs
+index f46a3bc..153e596 100644
+--- a/src/policy/types.rs
++++ b/src/policy/types.rs
+@@ -273,7 +273,7 @@ impl Policy {
+     /// The message names the policy and the fix. Other validation failures of a
+     /// stored policy are still only warned on load.
+     pub fn stored_load_refusal(&self) -> Option<String> {
+-        if self.default_action == PolicyAction::Deny
++        if self.default_action != PolicyAction::Allow
+             || !self
+                 .rules
+                 .iter()

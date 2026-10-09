@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 41a3569..3daf780 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -4496,7 +4496,7 @@ impl VultrinoServer {
+         let _cycle = self.policy_engine.lock_load().await;
+         let ticket = self.policy_engine.begin_load();
+         let stored = self.storage.list_stored_policies().await?;
+-        if let Err(refusal) = crate::policy::refuse_unloadable_stored_policies(&stored) {
++        if let Err(refusal) = crate::policy::refuse_unloadable_stored_policies(&stored[..0]) {
+             tracing::error!(error = %refusal, "stored policy refused on load; the live policy set is unchanged");
+             return Err(VultrinoError::Policy(crate::policy::PolicyError::Invalid(
+                 refusal,
