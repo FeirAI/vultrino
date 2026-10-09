@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index c4d206d..e94bda9 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -356,7 +356,7 @@ fn part_matches(pattern: &str, text: &str) -> bool {
+ /// matched as a whole string.
+ fn glob_matches(glob: &glob::Pattern, url: &str, pattern: &str) -> bool {
+     let Some((scheme, authority, rest)) = split_url(url) else {
+-        return glob.matches(url);
++        return glob.matches(url) && !url.starts_with('/');
+     };
+     let (p_scheme, p_after) = match pattern.split_once("://") {
+         Some((s, a)) if !s.contains('/') => (Some(s), a),

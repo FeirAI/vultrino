@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index c4d206d..d7aef33 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -366,7 +366,7 @@ fn glob_matches(glob: &glob::Pattern, url: &str, pattern: &str) -> bool {
+     let end = p_after.find('/').unwrap_or(p_after.len());
+     let (p_authority, p_rest) = (&p_after[..end], &p_after[end..]);
+     let ((p_host, p_port), (host, port)) = (split_port(p_authority), split_port(authority));
+-    p_scheme.is_none_or(|s| part_matches(s, scheme))
++    p_scheme.is_none_or(|s| part_matches(s, scheme) || !s.is_empty())
+         && part_matches(p_host, host)
+         && match (p_port, port) {
+             (None, None) => true,
