@@ -1,0 +1,419 @@
+{
+ "format": "feir.approval-assertion",
+ "version": 1,
+ "owner": "feir-os",
+ "wire_format": "feir.tenant-assertion v1",
+ "generator": "scripts/vectors/gen_approval_assertion.py (independent Python reference, stdlib only)",
+ "spec": [
+  "Wire format: the tenant assertion (feir.tenant-assertion v1, vectors/tenant-assertion.v1.json) in X-Govder-Tenant-Assertion, keyed with M (VULTRINO_APPROVAL_ASSERTION_SECRET), never with F.",
+  "Request: POST /api/v1/approvals/<id>/decision, no query, where <id> is the approval id path-escaped once (Go url.PathEscape: every byte outside [A-Za-z0-9-._~] and outside the sub-delimiters $&+:=@ is %XX with uppercase hex). The signed path is that single-escaped path, exactly as transmitted.",
+  "Body: Go encoding/json of {approve, approver, approver_class (omitted when empty), note} with keys sorted, compact, '<' '>' '&' U+2028 U+2029 escaped as \\u003c \\u003e \\u0026 \\u2028 \\u2029. The MAC binds these exact bytes, so the approver subject and class cannot change after signing.",
+  "vultrino verifies against the raw request-target it received (OriginalUri), the Host header, the exact body, the tenant of the tenant-scoped admin key (expected_tenant) and a TTL ceiling of min(assertion_ttl, 300 s)."
+ ],
+ "consumers": [
+  "feir-os app/internal/planes Vultrino.DecideApproval (producer: the request it transmits)",
+  "vultrino src/govder/tenant_assert.rs verify_tenant_assertion (verifier on POST /api/v1/approvals/{id}/decision)"
+ ],
+ "reasons": {
+  "bad_mac": "no accepted key produces the MAC for the received request",
+  "wrong_tenant": "the assertion names a tenant other than the admin key's"
+ },
+ "vectors": [
+  {
+   "id": "approve-senior",
+   "note": "a senior approves",
+   "decision": {
+    "tenant": "acme",
+    "approval_id": "appr_01HZX4K9",
+    "approve": true,
+    "note": "refund ok",
+    "approver": "sub-alice",
+    "approver_class": "senior"
+   },
+   "signed_request": {
+    "method": "POST",
+    "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+    "query": "",
+    "host": "vultrino.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6InJlZnVuZCBvayJ9"
+   },
+   "sign": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "jti": "0123456789abcdef",
+    "exp": 1767322060
+   },
+   "assertion": "YWNtZQ.1767322060.0123456789abcdef.CmybClAjMDbEqYJJyVnTQQA-IYkDb9JeRTXLfQBNSM4",
+   "verify": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "expected_tenant": "acme",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+     "query": "",
+     "host": "vultrino.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6InJlZnVuZCBvayJ9"
+    }
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "deny-no-class",
+   "note": "a denial without a class omits approver_class",
+   "decision": {
+    "tenant": "acme",
+    "approval_id": "appr_01HZX4K9",
+    "approve": false,
+    "note": "not now",
+    "approver": "sub-bob",
+    "approver_class": ""
+   },
+   "signed_request": {
+    "method": "POST",
+    "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+    "query": "",
+    "host": "vultrino.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjpmYWxzZSwiYXBwcm92ZXIiOiJzdWItYm9iIiwibm90ZSI6Im5vdCBub3cifQ=="
+   },
+   "sign": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "jti": "fedcba9876543210",
+    "exp": 1767322060
+   },
+   "assertion": "YWNtZQ.1767322060.fedcba9876543210.adT0H_xr52TjwxoNxhAZgtaYpIzcQN3ir9SvGuiFd4Q",
+   "verify": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "expected_tenant": "acme",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+     "query": "",
+     "host": "vultrino.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjpmYWxzZSwiYXBwcm92ZXIiOiJzdWItYm9iIiwibm90ZSI6Im5vdCBub3cifQ=="
+    }
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "html-and-unicode-note",
+   "note": "Go escapes <>& and U+2028 in the body; non-ASCII stays UTF-8",
+   "decision": {
+    "tenant": "acme",
+    "approval_id": "appr_01HZX4K9",
+    "approve": true,
+    "note": "ok <b>&</b> caf\u00e9\u2028done",
+    "approver": "sub-alice",
+    "approver_class": "teammate"
+   },
+   "signed_request": {
+    "method": "POST",
+    "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+    "query": "",
+    "host": "vultrino.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoidGVhbW1hdGUiLCJub3RlIjoib2sgXHUwMDNjYlx1MDAzZVx1MDAyNlx1MDAzYy9iXHUwMDNlIGNhZsOpXHUyMDI4ZG9uZSJ9"
+   },
+   "sign": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "jti": "00112233445566aa",
+    "exp": 1767322060
+   },
+   "assertion": "YWNtZQ.1767322060.00112233445566aa.kC-JlkRTnoCq2ngomLTuU15IrKZhrkk1iGT-jcH2sJA",
+   "verify": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "expected_tenant": "acme",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+     "query": "",
+     "host": "vultrino.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoidGVhbW1hdGUiLCJub3RlIjoib2sgXHUwMDNjYlx1MDAzZVx1MDAyNlx1MDAzYy9iXHUwMDNlIGNhZsOpXHUyMDI4ZG9uZSJ9"
+    }
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "id-needs-escaping",
+   "note": "an id with '/' and a space is escaped once: %2F and %20",
+   "decision": {
+    "tenant": "acme",
+    "approval_id": "appr/with slash",
+    "approve": true,
+    "note": "",
+    "approver": "sub-alice",
+    "approver_class": "senior"
+   },
+   "signed_request": {
+    "method": "POST",
+    "path": "/api/v1/approvals/appr%2Fwith%20slash/decision",
+    "query": "",
+    "host": "vultrino.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6IiJ9"
+   },
+   "sign": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "jti": "a1a1a1a1a1a1a1a1",
+    "exp": 1767322060
+   },
+   "assertion": "YWNtZQ.1767322060.a1a1a1a1a1a1a1a1.ilRMVLHgH53cHdIe0icbzbeeVXjiKsJ4gHEPBkCHAgQ",
+   "verify": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "expected_tenant": "acme",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr%2Fwith%20slash/decision",
+     "query": "",
+     "host": "vultrino.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6IiJ9"
+    }
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "signed-with-F",
+   "note": "a decision signed with the shared key F instead of M",
+   "decision": {
+    "tenant": "acme",
+    "approval_id": "appr_01HZX4K9",
+    "approve": true,
+    "note": "",
+    "approver": "sub-alice",
+    "approver_class": "senior"
+   },
+   "signed_request": {
+    "method": "POST",
+    "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+    "query": "",
+    "host": "vultrino.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6IiJ9"
+   },
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "jti": "b2b2b2b2b2b2b2b2",
+    "exp": 1767322060
+   },
+   "assertion": "YWNtZQ.1767322060.b2b2b2b2b2b2b2b2.EfCRCeMEKZjFoWpvfONvPW1ENu4bE79s3EyqH-knZ74",
+   "verify": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "expected_tenant": "acme",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+     "query": "",
+     "host": "vultrino.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6IiJ9"
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "approver-swapped",
+   "note": "the approver subject changed after signing",
+   "decision": {
+    "tenant": "acme",
+    "approval_id": "appr_01HZX4K9",
+    "approve": true,
+    "note": "",
+    "approver": "sub-alice",
+    "approver_class": "senior"
+   },
+   "signed_request": {
+    "method": "POST",
+    "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+    "query": "",
+    "host": "vultrino.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6IiJ9"
+   },
+   "sign": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "jti": "c3c3c3c3c3c3c3c3",
+    "exp": 1767322060
+   },
+   "assertion": "YWNtZQ.1767322060.c3c3c3c3c3c3c3c3.CdHrmbG3jxYxZ6PRAUTnz9bqJKZWRndLFEJIzkYdKbY",
+   "verify": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "expected_tenant": "acme",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+     "query": "",
+     "host": "vultrino.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1tYWxsb3J5IiwiYXBwcm92ZXJfY2xhc3MiOiJzZW5pb3IiLCJub3RlIjoiIn0="
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "class-added",
+   "note": "a class added after signing a class-less decision",
+   "decision": {
+    "tenant": "acme",
+    "approval_id": "appr_01HZX4K9",
+    "approve": true,
+    "note": "",
+    "approver": "sub-bob",
+    "approver_class": ""
+   },
+   "signed_request": {
+    "method": "POST",
+    "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+    "query": "",
+    "host": "vultrino.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1ib2IiLCJub3RlIjoiIn0="
+   },
+   "sign": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "jti": "d4d4d4d4d4d4d4d4",
+    "exp": 1767322060
+   },
+   "assertion": "YWNtZQ.1767322060.d4d4d4d4d4d4d4d4.IShRkXjmjvk2EtDtun_LXlwBkjV9rusxSNSFLHhd1Cw",
+   "verify": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "expected_tenant": "acme",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+     "query": "",
+     "host": "vultrino.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1ib2IiLCJhcHByb3Zlcl9jbGFzcyI6InNlbmlvciIsIm5vdGUiOiIifQ=="
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "id-swapped",
+   "note": "the decision replayed onto another approval",
+   "decision": {
+    "tenant": "acme",
+    "approval_id": "appr_01HZX4K9",
+    "approve": true,
+    "note": "",
+    "approver": "sub-alice",
+    "approver_class": "senior"
+   },
+   "signed_request": {
+    "method": "POST",
+    "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+    "query": "",
+    "host": "vultrino.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6IiJ9"
+   },
+   "sign": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "jti": "e5e5e5e5e5e5e5e5",
+    "exp": 1767322060
+   },
+   "assertion": "YWNtZQ.1767322060.e5e5e5e5e5e5e5e5.fOaYcxBZEVbfKzYOINisXHqXhgYiWcQYT7aDc-wySC8",
+   "verify": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "expected_tenant": "acme",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr_OTHER/decision",
+     "query": "",
+     "host": "vultrino.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6IiJ9"
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "id-double-escaped",
+   "note": "the id escaped twice on the wire (%252F): a different path",
+   "decision": {
+    "tenant": "acme",
+    "approval_id": "appr/with slash",
+    "approve": true,
+    "note": "",
+    "approver": "sub-alice",
+    "approver_class": "senior"
+   },
+   "signed_request": {
+    "method": "POST",
+    "path": "/api/v1/approvals/appr%2Fwith%20slash/decision",
+    "query": "",
+    "host": "vultrino.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6IiJ9"
+   },
+   "sign": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "jti": "f6f6f6f6f6f6f6f6",
+    "exp": 1767322060
+   },
+   "assertion": "YWNtZQ.1767322060.f6f6f6f6f6f6f6f6.SqgmkBjSmH02-jhvk5Qm3sizIBm3DfkeL9HEdY9RAT4",
+   "verify": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "expected_tenant": "acme",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr%252Fwith%2520slash/decision",
+     "query": "",
+     "host": "vultrino.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6IiJ9"
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "wrong-tenant",
+   "note": "the tenant-scoped admin key belongs to another tenant",
+   "decision": {
+    "tenant": "acme",
+    "approval_id": "appr_01HZX4K9",
+    "approve": true,
+    "note": "",
+    "approver": "sub-alice",
+    "approver_class": "senior"
+   },
+   "signed_request": {
+    "method": "POST",
+    "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+    "query": "",
+    "host": "vultrino.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6IiJ9"
+   },
+   "sign": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "jti": "0707070707070707",
+    "exp": 1767322060
+   },
+   "assertion": "YWNtZQ.1767322060.0707070707070707.gasSbCEww4hPBZ6Sdtf0UXi7raIx6wQZP77fFKQRQB4",
+   "verify": {
+    "key": "approval-assertion-vector-key-M-0001",
+    "expected_tenant": "other",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr_01HZX4K9/decision",
+     "query": "",
+     "host": "vultrino.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsImFwcHJvdmVyX2NsYXNzIjoic2VuaW9yIiwibm90ZSI6IiJ9"
+    }
+   },
+   "expect": "reject",
+   "reason": "wrong_tenant"
+  }
+ ]
+}

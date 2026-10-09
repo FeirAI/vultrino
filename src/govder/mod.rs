@@ -623,12 +623,15 @@ impl GovderClient {
         let exp = chrono::Utc::now()
             + chrono::Duration::from_std(self.cfg.assertion_ttl)
                 .unwrap_or(chrono::Duration::seconds(90));
+        // Sign the path and query EXACTLY as they go on the wire: the URL after `join` and
+        // `set_query` (which may percent-encode or, with a base path, prefix them), not the
+        // caller's strings. govder binds the raw request-target it receives (SB-21).
         let assertion = sign_tenant_assertion(
             &self.cfg.assertion_secret,
             tenant,
             method,
-            path,
-            query,
+            url.path(),
+            url.query().unwrap_or(""),
             &self.host,
             body.unwrap_or_default(),
             exp,
@@ -1053,4 +1056,52 @@ mod tests {
             Some("m")
         );
     }
+    /// SB-21 signer half: the outbound client signs the path and query EXACTLY as it puts them
+    /// on the wire. A mock govder verifies against the raw request-target it received (as
+    /// govder does); a base URL with a path prefix and a query the URL parser re-encodes both
+    /// changed the transmitted bytes while the old signer signed the caller's strings.
+    #[tokio::test]
+    async fn outbound_assertion_binds_the_transmitted_path_and_query() {
+        use axum::{extract::OriginalUri, http::StatusCode, routing::any, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().fallback(any(
+            |OriginalUri(uri): OriginalUri,
+             method: axum::http::Method,
+             headers: axum::http::HeaderMap,
+             body: axum::body::Bytes| async move {
+                let a = headers
+                    .get("X-Govder-Tenant-Assertion")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+                match super::verify_tenant_assertion(
+                    a,
+                    "shared-f",
+                    "acme",
+                    method.as_str(),
+                    uri.path(),
+                    uri.query().unwrap_or(""),
+                    host,
+                    &body,
+                    chrono::Utc::now(),
+                    Duration::from_secs(300),
+                ) {
+                    Ok(()) => StatusCode::OK,
+                    Err(_) => StatusCode::UNAUTHORIZED,
+                }
+            },
+        ));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut c = cfg(None, false);
+        c.base_url = format!("http://{addr}/gw/");
+        let client = super::GovderClient::new(c).unwrap();
+        let resp = client
+            .signed_json("acme", "GET", "/v1/delegation/grants", "q=a b", None)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "the transmitted path and query must be the signed ones");
+    }
 }
+
