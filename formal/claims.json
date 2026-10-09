@@ -1983,6 +1983,7 @@
         "seams-exp-leading-plus",
         "seams-outbound-signs-caller-path"
       ],
+      "evidence_run": "37989336057",
       "does_not_establish": "Not key alignment between planes and not replay resistance (the verifier is pure). Examples chosen by the reference's author, not all inputs; govder's Go signer is checked against the same vectors in govder's own claim, not here."
     },
     {
@@ -2007,6 +2008,7 @@
       "mutants": [
         "seams-verify-skips-tenant-check"
       ],
+      "evidence_run": "37989336057",
       "does_not_establish": "Not that the approval route calls this verifier with M, the right tenant and the received request-target (a wiring property of the route, tested elsewhere), not the producer (feir-os's claim), and not who the approver really is."
     },
     {
@@ -2032,6 +2034,7 @@
       "mutants": [
         "seams-outbox-sign-uppercase-hex"
       ],
+      "evidence_run": "37989336057",
       "does_not_establish": "Not key alignment, not that the signed body is the one delivered (delivery_body and the outbox store are separate), and not the consumers, which are claims in leria and govder."
     }
   ]
