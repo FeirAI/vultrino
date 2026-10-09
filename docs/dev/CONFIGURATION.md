@@ -203,7 +203,16 @@ pattern is a glob. A prefix that ends in `*` directly after a host
 port, a path, a query or the end, so it matches the same host on any port but no
 longer matches `api.example.com.evil.net`. A prefix that stops inside a host
 (`https://api.*`, `https://10.0.0*`) is a host match of the host the parser
-reads from it (`api`, `10.0.0.0`), so it matches less than before. A pattern
+reads from it (`api`, `10.0.0.0`), so it matches less than before. A glob is
+matched part by part against a URL with a host: its scheme against the scheme,
+its host against the host, its port against the port (no port matches only the
+default port) and the rest against the path and query. A `*`, `?` or `[...]` in
+the scheme or host therefore stays in that part, on every rule polarity: it
+never matches `/`, `?`, `#`, `@` or the port, so `https://*.example.com/x` no
+longer matches `https://evil.net/a.example.com/x`. A glob without a scheme that
+starts with `*` (`*.example.com/x`) is read with any scheme; any other glob
+without a scheme matches no URL with a host. In the path and query a glob `*`
+still matches `/` and `?`. A pattern
 without a trailing `*` must match the merged query as well. A URL that cannot be
 parsed never matches an Allow rule and is denied when a matching policy has a
 `url_match` under a deny or prompt rule or under a `not`. Path-only values
@@ -212,11 +221,10 @@ parsed never matches an Allow rule and is denied when a matching policy has a
 inside the host (also without a scheme, except a prefix of `http://` or
 `https://` such as `http*`), or where canonicalisation changes the meaning (dot
 segments, encoded dots, a fragment, a backslash, a `*` that cuts a percent escape
-short). They are only warned today. Refusing warned patterns on deny and
-prompt rules when a policy is written is decided for phase 3 and not built. That
-decision does not cover allow rules, so a warned pattern on an allow rule (for
-example a `*` in the host, which can match another host) stays a warning,
-although the log line says every warned pattern will be refused. There is no `{a,b}`
+short). They are only warned today, and the log line says so. Refusing warned
+patterns on deny and prompt rules when a policy is written is decided for phase
+3 and not built. That decision does not cover allow rules, so a warned pattern
+on an allow rule stays a warning. There is no `{a,b}`
 alternation in a glob; braces are literal. A policy loaded from the vault that
 fails validation (for example a `RateLimit` policy with a non-deny default) is
 logged as a WARNING but still enforced as written. The `http` plugin sends the

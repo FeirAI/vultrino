@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index c4d206d..8512268 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -371,7 +371,7 @@ fn glob_matches(glob: &glob::Pattern, url: &str, pattern: &str) -> bool {
+         && match (p_port, port) {
+             (None, None) => true,
+             (Some(pp), Some(p)) => part_matches(pp, p),
+-            _ => false,
++            _ => true,
+         }
+         && part_matches(p_rest, rest)
+ }

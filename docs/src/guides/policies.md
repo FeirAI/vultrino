@@ -102,8 +102,13 @@ condition = { or = [
 ]}
 ```
 
-A `url_match` glob supports `*`, `?` and `[...]`, and a glob `*` also matches
-`/`. There is no `{a,b}` alternation: braces are literal characters, so a pattern
+A `url_match` glob supports `*`, `?` and `[...]`. It is matched part by part:
+a wildcard in the scheme or host stays in that part (never a `/`, `?` or the
+port), so `https://*.example.com/x` matches `https://api.example.com/x` but not
+`https://evil.net/a.example.com/x`. In the path and query a glob `*` also
+matches `/`. A glob without a port matches only the default port. A pattern
+that ends in `*` is a literal prefix instead, so a `*` earlier in it is a plain
+character. There is no `{a,b}` alternation: braces are literal characters, so a pattern
 such as `https://api.github.com/{user,repos}/*` matches no request (and logs no
 warning). Use an `or` of separate `url_match` conditions instead.
 

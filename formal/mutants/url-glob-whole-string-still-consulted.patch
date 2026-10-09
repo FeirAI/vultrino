@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index c4d206d..ed89567 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -299,7 +299,7 @@ pub fn canonical_matches(url: &str, pattern: &str) -> bool {
+         }
+         true
+     } else if let Ok(glob) = glob::Pattern::new(pattern) {
+-        glob_matches(&glob, url, pattern)
++        glob.matches(url) || glob_matches(&glob, url, pattern)
+     } else {
+         url == pattern
+     }

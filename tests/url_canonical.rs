@@ -269,6 +269,25 @@ fn glob_pattern_and_scheme_only_pattern_keep_biting() {
     assert!(is_deny(&decide(&e, "HTTPS://API.EXAMPLE.COM/x")));
 }
 
+/// A wildcard in the host of a glob matches only within the host, under an
+/// Allow, a Deny and a Prompt rule: another host whose path or query carries
+/// the pattern's host is never matched.
+#[test]
+fn star_in_host_glob_is_host_only_on_every_polarity() {
+    let pattern = || PolicyCondition::UrlMatch("https://*.example.com/x".into());
+    let own = "https://api.example.com/x";
+    let other = "https://evil.net/a.example.com/x";
+    let e = engine(vec![(pattern(), PolicyAction::Allow)], PolicyAction::Deny);
+    assert!(matches!(decide(&e, own), PolicyDecision::Allow));
+    assert!(is_deny(&decide(&e, other)), "Allow rule admitted {other}");
+    let e = engine(vec![(pattern(), PolicyAction::Deny)], PolicyAction::Allow);
+    assert!(is_deny(&decide(&e, own)));
+    assert!(matches!(decide(&e, other), PolicyDecision::Allow));
+    let e = engine(vec![(pattern(), PolicyAction::Prompt)], PolicyAction::Allow);
+    assert!(matches!(decide(&e, own), PolicyDecision::Prompt));
+    assert!(matches!(decide(&e, other), PolicyDecision::Allow));
+}
+
 fn spell_host(host: &str, bits: &[bool]) -> String {
     host.chars()
         .enumerate()
@@ -349,6 +368,35 @@ proptest! {
                 prop_assert!(is_deny(&decide(&e, &url)), "look-alike admitted: {}", url);
             }
         }
+    }
+
+    /// Whatever the other host, port and the place that carries the pattern's
+    /// host, a glob with `*` in the host never matches a URL on another host:
+    /// an Allow rule (default deny) denies it and a Deny rule (default allow)
+    /// does not fire. The pattern's own host is matched under both.
+    #[test]
+    fn star_in_host_glob_never_matches_another_host(
+        other in "[a-z]{1,8}\\.(net|org|com)",
+        label in "[a-z0-9]{1,8}",
+        port in prop_oneof![Just(""), Just(":8443")],
+        carrier in prop_oneof![Just("/"), Just("/?q="), Just("/a/"), Just("/a%2F"), Just("/u@")],
+        pattern in prop_oneof![
+            Just("https://*.example.com/x"),
+            Just("*.example.com/x"),
+            Just("*://*.example.com/x"),
+            Just("https://*.example.com/*/x"),
+        ],
+    ) {
+        let path = if pattern.ends_with("/*/x") { "/b/x" } else { "/x" };
+        let own = format!("https://{label}.example.com{path}");
+        let foreign = format!("https://{other}{port}{carrier}{label}.example.com{path}");
+        let rule = || PolicyCondition::UrlMatch(pattern.into());
+        let allow = engine(vec![(rule(), PolicyAction::Allow)], PolicyAction::Deny);
+        prop_assert!(!is_deny(&decide(&allow, &own)), "{} not matched by {}", own, pattern);
+        prop_assert!(is_deny(&decide(&allow, &foreign)), "{} admitted {}", pattern, foreign);
+        let deny = engine(vec![(rule(), PolicyAction::Deny)], PolicyAction::Allow);
+        prop_assert!(is_deny(&decide(&deny, &own)), "{} not matched by {}", own, pattern);
+        prop_assert!(!is_deny(&decide(&deny, &foreign)), "{} matched {}", pattern, foreign);
     }
 
     /// Glob and host-boundary rules decide identically for equivalent spellings.

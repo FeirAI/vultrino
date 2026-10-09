@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index c4d206d..eebd58f 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -327,7 +327,7 @@ fn split_port(authority: &str) -> (&str, Option<&str>) {
+     let mut at = None;
+     for (i, c) in authority.char_indices() {
+         match c {
+-            '[' => depth += 1,
++            '[' => depth += 0,
+             ']' => depth = depth.saturating_sub(1),
+             ':' if depth == 0 => at = Some(i),
+             _ => {}

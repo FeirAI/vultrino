@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `url_match` globs (patterns without a trailing `*`) are matched part by part against a URL with a host: scheme, host, port, then path and query. A `*`, `?` or `[...]` in the scheme or host no longer matches `/`, `?`, `#`, `@` or the port, on Allow, Deny and Prompt rules alike. Before, `https://*.example.com/x` matched `https://evil.net/a.example.com/x`, and `*://api.example.com/x` (which logged no warning) matched `https://evil.net/?q=://api.example.com/x`, so an Allow rule could allow another host. Deny and Prompt globs match less as a result: a glob without a port (`https://*/admin`) no longer matches a non-default port, and a glob without a scheme matches a URL with a host only when it starts with `*`. Tested on listed patterns and a property test, not proved for every pattern.
+- The load-time `url_match` warning no longer says warned patterns "will be refused in a future release". It says they are only warned and that refusing them on deny and prompt rules is planned for phase 3, which is what is decided.
 - `cargo test --no-default-features --lib` passes: the WASM ABI install test now runs only with `wasm-plugins`, and a twin test pins that a build without the feature refuses every WASM install before anything is copied. CI runs this command in the `rust` job.
 
 ### Changed
