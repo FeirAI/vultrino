@@ -129,15 +129,18 @@ pub fn canonical_url(raw: &str) -> Option<String> {
     }
 }
 
-/// Why a pattern deserves a load-time warning. Refused in a future release.
+/// Why a pattern deserves a load-time warning. Warned only: refusing warned
+/// patterns on deny and prompt rules when a policy is written is planned for
+/// phase 3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternWarning {
     /// The pattern ends in `*` right after a host (no `/`): it used to match
     /// look-alike hosts such as `api.example.com.evil.net`. It now stops at the
     /// host boundary.
     StarAfterHost,
-    /// `*` inside the host part. A glob `*` also matches `/`, so such a pattern
-    /// can match a different host.
+    /// `*` inside the host part. In a glob it matches any run of host
+    /// characters (dots included) but never leaves the host; in a prefix
+    /// pattern it is not a host wildcard (see `canonical_matches`).
     StarInHost,
     /// Canonicalisation changed what the pattern means (dot segments resolved, a
     /// path appended, ...). Pure case, default-port and percent-encoding
@@ -280,7 +283,8 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
 ///
 /// A prefix that stops right after a host (`https://api.example.com*`) is a
 /// host match: the prefix must be followed by a port, a path, a query or the
-/// end, never by more host characters (`api.example.com.evil.net`).
+/// end, never by more host characters (`api.example.com.evil.net`). A glob is
+/// matched part by part (see `glob_matches`).
 pub fn canonical_matches(url: &str, pattern: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix('*') {
         if !url.starts_with(prefix) {
@@ -295,10 +299,81 @@ pub fn canonical_matches(url: &str, pattern: &str) -> bool {
         }
         true
     } else if let Ok(glob) = glob::Pattern::new(pattern) {
-        glob.matches(url)
+        glob_matches(&glob, url, pattern)
     } else {
         url == pattern
     }
+}
+
+/// `scheme://authority` and the rest of a URL, or `None` when it has no
+/// authority (a path-only URL).
+fn split_url(url: &str) -> Option<(&str, &str, &str)> {
+    let (scheme, after) = url.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    Some((scheme, &after[..end], &after[end..]))
+}
+
+/// Host and port of an authority, split at the last `:` outside `[...]` (an
+/// IPv6 literal in a URL, a character class in a pattern).
+fn split_port(authority: &str) -> (&str, Option<&str>) {
+    let mut depth = 0usize;
+    let mut at = None;
+    for (i, c) in authority.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => at = Some(i),
+            _ => {}
+        }
+    }
+    match at {
+        Some(i) => (&authority[..i], Some(&authority[i + 1..])),
+        None => (authority, None),
+    }
+}
+
+fn part_matches(pattern: &str, text: &str) -> bool {
+    glob::Pattern::new(pattern).is_ok_and(|g| g.matches(text))
+}
+
+/// Glob matching on the parts of a URL. A URL with an authority is matched
+/// part by part: the pattern's scheme against the scheme, its host against the
+/// host, its port against the port (no port matches only no port), and the
+/// rest against the path and query. A wildcard in the scheme or host therefore
+/// matches only within that part: never `/`, `?`, `#`, `@` or the port (a
+/// canonical authority holds no `@`, userinfo is refused). A pattern without a
+/// scheme that starts with `*` (`*.example.com/x`) is read with any scheme and
+/// its text up to the first `/` as host and port; any other pattern without a
+/// scheme matches no URL with an authority. A wildcard in the rest still
+/// matches `/` and `?`. A path-only URL has no host to cross into and is
+/// matched as a whole string.
+fn glob_matches(glob: &glob::Pattern, url: &str, pattern: &str) -> bool {
+    let Some((scheme, authority, rest)) = split_url(url) else {
+        return glob.matches(url);
+    };
+    let (p_scheme, p_after) = match pattern.split_once("://") {
+        Some((s, a)) if !s.contains('/') => (Some(s), a),
+        _ if pattern.starts_with('*') => (None, pattern),
+        _ => return false,
+    };
+    let end = p_after.find('/').unwrap_or(p_after.len());
+    let (p_authority, p_rest) = (&p_after[..end], &p_after[end..]);
+    let ((p_host, p_port), (host, port)) = (split_port(p_authority), split_port(authority));
+    p_scheme.is_none_or(|s| part_matches(s, scheme))
+        && part_matches(p_host, host)
+        && match (p_port, port) {
+            (None, None) => true,
+            (Some(pp), Some(p)) => part_matches(pp, p),
+            _ => false,
+        }
+        && part_matches(p_rest, rest)
 }
 
 /// The URL that policy judges and the HTTP plugins send: the canonical form of
@@ -359,12 +434,11 @@ pub fn url_matches(raw_url: &str, raw_pattern: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Pins a documented residual (LIMITATIONS.md, url-match-canonical
-    /// does_not_establish): a glob `*` also matches `/`, so a `*` in the host
-    /// part can match a request to another host. The pattern is warned, not
-    /// refused, and on an Allow rule this allows that other host.
+    /// A wildcard in the scheme or host of a glob matches only within that
+    /// part: never `/`, `?`, `#`, `@` or a port. A `*` in the host used to also
+    /// match `/`, so `https://*.example.com/x` matched a request to evil.net.
     #[test]
-    fn star_in_host_glob_can_match_another_host_residual() {
+    fn glob_wildcard_stays_in_its_component() {
         for pattern in ["https://*.example.com/x", "*.example.com/x"] {
             assert!(
                 canonical_pattern(pattern)
@@ -377,10 +451,77 @@ mod tests {
                 "{pattern}"
             );
             assert!(
-                url_matches("https://evil.net/a.example.com/x", pattern),
+                url_matches("https://a.b.example.com/x", pattern),
                 "{pattern}"
             );
+            for other in [
+                "https://evil.net/a.example.com/x",
+                "https://evil.net/?q=a.example.com/x",
+                "https://evil.net/a%23.example.com/x",
+                "https://evil.net/u@a.example.com/x",
+                "https://evil.net:8443/a.example.com/x",
+                "https://api.example.com:8443/x",
+                "https://u@api.example.com/x",
+            ] {
+                assert!(!url_matches(other, pattern), "{pattern} matched {other}");
+            }
         }
+        // The scheme-less form is read with any scheme.
+        assert!(url_matches("http://api.example.com/x", "*.example.com/x"));
+        assert!(!url_matches(
+            "http://api.example.com/x",
+            "https://*.example.com/x"
+        ));
+        // A `*` in the scheme stays in the scheme (this pattern logs no warning).
+        let p = "*://api.example.com/x";
+        assert!(canonical_pattern(p).warnings.is_empty());
+        assert!(url_matches("https://api.example.com/x", p));
+        assert!(!url_matches("https://evil.net/?q=://api.example.com/x", p));
+        // A `*` in the host never takes the port; the port is its own part.
+        assert!(!url_matches(
+            "https://api.example.com:8443/x",
+            "https://api.*/x"
+        ));
+        assert!(url_matches(
+            "https://api.example.com:8443/x",
+            "https://api.*:*/x"
+        ));
+        assert!(url_matches("https://api.example.com/x", "https://api.*/x"));
+        // A `?` in the host is one host character, not a `/`.
+        assert!(url_matches(
+            "https://api1.example.com/v1/a/x",
+            "https://api?.example.com/v1/*/x"
+        ));
+        assert!(!url_matches(
+            "https://api/.example.com/v1/a/x",
+            "https://api?.example.com/v1/*/x"
+        ));
+        // An IPv6 host is one host part: `*` matches it, not its port.
+        assert!(url_matches("https://[::1]/admin", "https://*/admin"));
+        assert!(!url_matches("https://[::1]:8080/admin", "https://*/admin"));
+        assert!(url_matches("https://[::1]:8080/admin", "https://*:*/admin"));
+        // A `*` in the path or query still matches `/` and `?`.
+        assert!(url_matches(
+            "https://api.example.com/v1/a/b/x",
+            "https://api.example.com/v1/*/x"
+        ));
+        assert!(url_matches(
+            "https://api.example.com/v1/a?b=/x",
+            "https://api.example.com/v1/*/x"
+        ));
+        // A path-only URL has no host to cross into: matched as a whole string.
+        assert!(url_matches("/v1/a/b/x", "/v1/*/x"));
+        assert!(url_matches("/admin/x", "*/admin/x"));
+        // A scheme-less pattern that does not start with `*` names no scheme
+        // and matches no absolute URL.
+        assert!(!url_matches(
+            "https://api.example.com/x",
+            "api.example.com/x"
+        ));
+        assert!(!url_matches(
+            "https://api.example.com/x",
+            "ht*.example.com/x"
+        ));
     }
 
     #[test]
@@ -444,8 +585,9 @@ mod tests {
     }
 
     /// A trailing-star prefix of `http://` or `https://` (`http*`) has no host
-    /// part, so it is not reported as a star in the host (which is planned to be
-    /// refused). It matches by scheme only. Any other scheme-less prefix keeps
+    /// part, so it is not reported as a star in the host (refusing warned
+    /// patterns on deny and prompt rules is planned for phase 3). It matches by
+    /// scheme only. Any other scheme-less prefix keeps
     /// the warning: it matches no canonical http(s) URL, so a Deny or Prompt
     /// rule on it is dead and the warning is the only sign of that.
     #[test]

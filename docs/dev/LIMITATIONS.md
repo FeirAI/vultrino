@@ -393,15 +393,28 @@ This does not model what an upstream server does with the bytes: a server that
 treats an encoded slash or a different case in the path as the same resource as
 another spelling is outside it. A trailing dot on the host is removed by
 canonicalisation, because it names the same destination in DNS. A glob pattern
-(no trailing `*`) with `*` in the host part can still match a different host,
-because a glob `*` also matches `/`; this release only logs a warning. The
-log line says the pattern will be refused in a future release, but what is
-decided (for phase 3, not built) is refusing warned patterns on Deny and Prompt
-rules when a policy is written. Allow rules are not part of that decision, so on
-an Allow rule such a pattern can allow a request to another host and stays
-warned only.
+(no trailing `*`) is matched part by part against a URL with a host: scheme,
+host, port and the rest (path and query), so a wildcard in the scheme or host
+stays in that part on every rule polarity. Inside the host it still matches
+any run of host characters, dots included: `https://*.example.com/x` also
+matches `a.b.example.com`, and `https://api.example.com*/x` matches
+`api.example.com.evil.net`. A glob without a port matches only a URL without
+one (the default port), so a Deny or Prompt glob such as `https://*/admin`
+no longer matches `https://h:8443/admin` and denies less than before; write the
+port (`https://*:*/admin`) to cover other ports. A glob without a scheme is read
+with any scheme only when it starts with `*` (`*.example.com/x`); any other
+glob without a scheme (`ht*.example.com/x`) matches no URL with a host. A
+wildcard in the path or query still matches `/` and `?`, and a path-only URL is
+matched as one string. These rules are shown on the tested patterns and a
+property test over generated other-host URLs, not proved for every pattern. In
+a prefix pattern (trailing `*`) an earlier `*` is literal, so
+`https://*.example.com/*` matches no real host: a Deny or Prompt rule written
+that way is dead, and the star-in-host warning is the only sign. Risky
+patterns are only warned; what is decided (for phase 3, not built) is refusing
+warned patterns on Deny and Prompt rules when a policy is written. Allow rules
+are not part of that decision.
 A glob whose host part holds `?`
-keeps its old literal glob meaning and is not canonicalised (warned). Patterns
+is not canonicalised (warned); that `?` matches one host character. Patterns
 are canonicalised when they are matched, not rewritten in storage, so the admin
 API still shows the text the operator wrote. A `UrlToken` credential is judged
 on its placeholder URL and sent as that judged string with the secret in place of

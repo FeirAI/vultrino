@@ -948,8 +948,9 @@ fn contains_negated_url_match(c: &PolicyCondition, negated: bool) -> bool {
 }
 
 /// Log a WARNING for each `UrlMatch` pattern whose canonical form changes its
-/// meaning or that is risky (host wildcard, `*` right after the host). These
-/// are refused in a future release.
+/// meaning or that is risky (host wildcard, `*` right after the host). They
+/// are only warned: refusing warned patterns on deny and prompt rules when a
+/// policy is written is planned for phase 3.
 fn warn_url_patterns(policy: &Policy) {
     fn walk(c: &PolicyCondition, policy: &Policy) {
         match c {
@@ -971,7 +972,7 @@ fn warn_url_patterns(policy: &Policy) {
                         pattern = %p,
                         canonical = %canon.text,
                         warning = ?w,
-                        "url_match pattern is risky or changes meaning under canonical matching; it will be refused in a future release"
+                        "url_match pattern is risky or changes meaning under canonical matching; it is only warned (refusing warned patterns on deny and prompt rules is planned for phase 3)"
                     );
                 }
             }
@@ -1139,6 +1140,14 @@ mod tests {
         }
         assert_eq!(log.matches("policy=warn-load").count(), 1, "{log}");
         assert!(!log.contains("quiet"), "{log}");
+        // The line says only what is decided: warned now, refusal on deny and
+        // prompt rules planned for phase 3 (allow rules are not part of it).
+        assert!(!log.contains("future release"), "{log}");
+        assert!(log.contains("only warned"), "{log}");
+        assert!(
+            log.contains("on deny and prompt rules is planned for phase 3"),
+            "{log}"
+        );
     }
 
     /// A policy that fails validation (here a RateLimit policy whose default is
