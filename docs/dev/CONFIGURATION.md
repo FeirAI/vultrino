@@ -221,13 +221,19 @@ parsed never matches an Allow rule and is denied when a matching policy has a
 inside the host (also without a scheme, except a prefix of `http://` or
 `https://` such as `http*`), or where canonicalisation changes the meaning (dot
 segments, encoded dots, a fragment, a backslash, a `*` that cuts a percent escape
-short). They are only warned today, and the log line says so. Refusing warned
-patterns on deny and prompt rules when a policy is written is decided for phase
-3 and not built. That decision does not cover allow rules, so a warned pattern
-on an allow rule stays a warning. There is no `{a,b}`
-alternation in a glob; braces are literal. A policy loaded from the vault that
-fails validation (for example a `RateLimit` policy with a non-deny default) is
-logged as a WARNING but still enforced as written. The `http` plugin sends the
+short), or that are not a parseable URL or path. The admin API
+(`POST` and `PUT /api/v1/policies`) refuses a policy with 400 (`invalid_policy`,
+naming the rule and the pattern) when a deny or prompt rule has such a pattern
+anywhere in its condition (inside `and`, `or` or `not` too). Allow rules are not
+refused: a warned pattern on an allow rule stays a warning. Config load is not
+an admin write: a warned pattern in a `[[policies]]` rule is only warned there.
+A policy already stored in the vault with such a deny or prompt pattern keeps
+loading; its warning line says the admin API now refuses the pattern and that
+the stored policy is enforced as written until it is saved again. There is no
+`{a,b}` alternation in a glob; braces are literal. A policy loaded from the
+vault that fails validation is logged as a WARNING and still enforced as
+written, except a `RateLimit` policy with a non-deny default, which is refused
+on load (below). The `http` plugin sends the
 evaluated string and refuses a URL that cannot be canonicalised; for a
 `UrlToken` credential it sends the evaluated string with the secret in place of
 the literal `{credential}` and refuses a URL in which other text canonicalises to a spelling of it (such as `%7Bcredential%7D` or `%7Bcr%65dential%7D`). The `hmac` plugin sends the canonical URL and adds only
@@ -242,8 +248,17 @@ policy must be `default_action = "deny"`.
 contains a `RateLimit` at any depth must be `default_action = "deny"`, because an
 exhausted Allow-`RateLimit` rule falls through to the policy default when no other
 rule matches. Another matching allow rule still allows an over-limit request, so
-put the `RateLimit` inside an `and` with the conditions it limits. Policies
-already stored in the vault are not re-validated on load.
+put the `RateLimit` inside an `and` with the conditions it limits. A policy
+stored in the vault with a `RateLimit` and an allow or prompt default (possible
+only in a vault written before this was refused) is **refused on load**:
+`vultrino web` and `vultrino serve --mcp` do not start, and the error names the
+policy and the fix; the CLI commands that load policies fail the same way; a
+reload after an admin write returns an error and leaves the live set unchanged;
+the periodic refresh logs an ERROR and keeps the live set (so a later halt kill
+policy is not applied by that process, and `halt` reports `policy_active=false`,
+until the refused policy is fixed). Fix it offline with
+`vultrino policy deny-default <id>` (sets `default_action = "deny"` and keeps the
+rules), then start again.
 
 ### `[[spend_extractors]]` — read the amount for a SpendCap (V3)
 

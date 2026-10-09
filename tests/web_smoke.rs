@@ -7975,3 +7975,223 @@ async fn test_a4_denial_reports_not_applicable_execution_state() {
     assert_eq!(body["status"], "denied");
     assert_eq!(body["execution_state"], "not_applicable");
 }
+
+/// P3-FLOORS (a): the admin policy write (POST and PUT /api/v1/policies) refuses a
+/// Deny or Prompt rule whose url_match pattern the canonical matcher only warned
+/// about, at any depth of the rule's condition, with a 400 that names the pattern.
+/// Allow rules with the same patterns are still accepted (warned at load only), and
+/// a refused write stores nothing.
+#[tokio::test]
+async fn admin_policy_write_refuses_warned_deny_and_prompt_url_patterns() {
+    let (router, storage, _server, key) = build_admin_router().await;
+    let warned = [
+        // star in the host of a prefix pattern: the earlier * is literal, dead rule
+        "https://*.example.com/*",
+        // star in the host of a glob
+        "https://*.example.com/x",
+        // prefix that ends right after (or inside) a host
+        "https://api.example.com*",
+        "https://api.*",
+        // dot segments: canonicalisation changes the meaning
+        "https://api.example.com/a/../admin/*",
+        // a star that cuts a percent escape
+        "https://api.example.com/v1/%2*",
+        // a host holding ? in a glob: not parseable, compared literally
+        "https://api?.example.com/v1/*/x",
+        // scheme-less prefix that is not a scheme prefix
+        "internal*",
+    ];
+    let conditions = |p: &str| {
+        vec![
+            serde_json::json!({ "url_match": p }),
+            serde_json::json!({ "and": [ { "action_match": "money.refund" }, { "url_match": p }, { "method_match": ["POST"] } ] }),
+            serde_json::json!({ "or": [ { "method_match": ["DELETE"] }, { "url_match": p } ] }),
+            serde_json::json!({ "not": { "url_match": p } }),
+        ]
+    };
+    for p in warned {
+        for action in ["deny", "prompt"] {
+            for (i, cond) in conditions(p).into_iter().enumerate() {
+                let body = serde_json::json!({
+                    "name": format!("warned-{action}-{i}"),
+                    "credential_pattern": "cred-*",
+                    "default_action": "deny",
+                    "rules": [ { "condition": cond, "action": action } ],
+                });
+                for (method, uri) in [
+                    ("POST", "/api/v1/policies".to_string()),
+                    ("PUT", format!("/api/v1/policies/warned-{i}")),
+                ] {
+                    let resp = router
+                        .clone()
+                        .oneshot(admin_req(method, &uri, &key, body.clone()))
+                        .await
+                        .unwrap();
+                    let status = resp.status();
+                    let text = body_string(resp).await;
+                    assert_eq!(
+                        status,
+                        StatusCode::BAD_REQUEST,
+                        "{method} {action} rule {i} on {p:?} must be refused: {text}"
+                    );
+                    assert!(
+                        text.contains("invalid_policy") && text.contains("url_match"),
+                        "{text}"
+                    );
+                }
+            }
+        }
+        // The same pattern on an Allow rule is only warned (a load-time log line).
+        let allow = serde_json::json!({
+            "name": "warned-allow",
+            "credential_pattern": "cred-*",
+            "default_action": "deny",
+            "rules": [ { "condition": { "url_match": p }, "action": "allow" } ],
+        });
+        let resp = router
+            .clone()
+            .oneshot(admin_req("POST", "/api/v1/policies", &key, allow))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "an allow rule on {p:?} is not refused"
+        );
+    }
+    let refused_left_behind = storage
+        .list_stored_policies()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.name != "warned-allow")
+        .count();
+    assert_eq!(refused_left_behind, 0, "a refused write must store nothing");
+
+    // Clean Deny and Prompt patterns, including govder's compiled Prompt shape, are stored.
+    for (action, p) in [
+        ("deny", "https://api.example.com/admin/*"),
+        ("prompt", "https://api.payments.example/v1/refunds"),
+        ("prompt", "/v1/refunds"),
+        ("deny", "https://*"),
+        (
+            "prompt",
+            "https://api.telegram.org/bot{credential}/sendMessage",
+        ),
+        ("deny", "*://api.example.com/x"),
+    ] {
+        let body = serde_json::json!({
+            "name": format!("clean-{action}"),
+            "credential_pattern": "cred-*",
+            "default_action": "deny",
+            "rules": [ { "condition": { "and": [ { "action_match": "money.refund" }, { "url_match": p }, { "method_match": ["POST"] } ] }, "action": action } ],
+        });
+        let resp = router
+            .clone()
+            .oneshot(admin_req("POST", "/api/v1/policies", &key, body))
+            .await
+            .unwrap();
+        let status = resp.status();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "clean {action} pattern {p:?}: {}",
+            body_string(resp).await
+        );
+    }
+}
+
+/// P3-FLOORS (b): a RateLimit policy stored with a non-deny default (possible only in
+/// a vault written before the admin API validated it, simulated here by writing the
+/// store directly) is refused when the server loads stored policies: the reload
+/// returns an error naming the policy and the fix and the engine does not take it,
+/// and the periodic refresh does not apply it either.
+#[tokio::test]
+async fn stored_rate_limit_policy_with_non_deny_default_is_refused_on_load() {
+    use vultrino::policy::{Policy, PolicyAction, PolicyCondition};
+    for default in [PolicyAction::Allow, PolicyAction::Prompt] {
+        let (_router, storage, server, _key) = build_admin_router().await;
+        let mut p = Policy::deny_all("legacy-rate", "cred-*").with_rule(
+            PolicyCondition::And(vec![
+                PolicyCondition::UrlMatch("https://api.example.com/v1/*".into()),
+                PolicyCondition::RateLimit {
+                    max: 5,
+                    window_secs: 60,
+                },
+            ]),
+            PolicyAction::Allow,
+        );
+        p.id = "legacy-rate-id".to_string();
+        p.default_action = default;
+        assert!(
+            p.validate().is_err(),
+            "the admin API would refuse this shape"
+        );
+        storage.store_policy(&p).await.unwrap();
+
+        let err = server.reload_policies().await.expect_err(
+            "a stored RateLimit policy with a non-deny default must be refused on load",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("legacy-rate")
+                && msg.contains("legacy-rate-id")
+                && msg.contains("default_action"),
+            "the error names the policy and the fix: {msg}"
+        );
+        assert!(
+            !server
+                .policy_engine()
+                .list_policies()
+                .iter()
+                .any(|q| q.id == "legacy-rate-id"),
+            "the refused policy must not be enforced as written"
+        );
+
+        let engine = vultrino::policy::PolicyEngine::new();
+        vultrino::server::refresh_policies_once(&storage, &engine, &[])
+            .await
+            .ok();
+        assert!(
+            !engine
+                .list_policies()
+                .iter()
+                .any(|q| q.id == "legacy-rate-id"),
+            "the periodic refresh must not apply a refused policy ({default:?})"
+        );
+
+        // The long-running servers' startup load treats the refusal as fatal.
+        let startup = server.load_stored_policies_at_startup().await;
+        assert!(
+            startup.is_err_and(|e| e.to_string().contains("legacy-rate-id")),
+            "startup must fail and name the policy"
+        );
+
+        // The named fix: `vultrino policy deny-default <id>` sets the default to
+        // deny, keeps the rules, and the policy then loads.
+        assert!(
+            vultrino::policy::set_stored_policy_default_deny(&*storage, "legacy-rate-id")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !vultrino::policy::set_stored_policy_default_deny(&*storage, "legacy-rate-id")
+                .await
+                .unwrap()
+        );
+        server.load_stored_policies_at_startup().await.unwrap();
+        let loaded = server
+            .policy_engine()
+            .list_policies()
+            .into_iter()
+            .find(|q| q.id == "legacy-rate-id")
+            .expect("the fixed policy loads");
+        assert_eq!(loaded.default_action, PolicyAction::Deny);
+        assert_eq!(loaded.rules.len(), 1, "the fix keeps the rules");
+        assert!(
+            vultrino::policy::set_stored_policy_default_deny(&*storage, "no-such-policy")
+                .await
+                .is_err()
+        );
+    }
+}

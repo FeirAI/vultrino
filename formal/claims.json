@@ -322,6 +322,33 @@
     "url-canon-warning-overclaims-refusal": {
       "tier": "fast"
     },
+    "policy-write-warned-prompt-accepted": {
+      "tier": "full"
+    },
+    "policy-write-warned-not-unchecked": {
+      "tier": "full"
+    },
+    "policy-write-warned-check-skipped": {
+      "tier": "fast"
+    },
+    "policy-write-allow-refused": {
+      "tier": "full"
+    },
+    "stored-rate-limit-prompt-default-loads": {
+      "tier": "full"
+    },
+    "stored-rate-limit-nested-missed": {
+      "tier": "full"
+    },
+    "stored-rate-limit-reload-applies": {
+      "tier": "full"
+    },
+    "stored-rate-limit-refresh-applies": {
+      "tier": "full"
+    },
+    "stored-rate-limit-startup-warns-only": {
+      "tier": "fast"
+    },
     "seams-jti-uppercase-accepted": {
       "tier": "fast"
     },
@@ -764,12 +791,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "refresh_policies_with_hooks",
-          "sha256": "97141188534a1340132d17b169db8849caabc94c78cd85414345e1e095ebc282"
+          "sha256": "e62bf7026315c708a10c8b2f0b3e8e1075b2de95c9d487218e3fb9bbe645e096"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::reload_policies",
-          "sha256": "09d865612c11111e1fc95b0800f7676492fe7cc4a20a4a6c85f08e0876ba9ecd"
+          "sha256": "2870fb21edfd5a176b76c8ea52cb48cfcf3f819790a1900250603e3a67d103a8"
         }
       ],
       "mutants": [
@@ -1581,11 +1608,11 @@
         "rate-limit-default-deny-validation-removed",
         "policy-invalid-warning-dropped-on-refresh"
       ],
-      "does_not_establish": "Validation refuses only at config load and on the admin API. A policy read back from the vault is checked when it is loaded but only logged, not refused or changed, so a stored RateLimit policy with a non-deny default keeps allowing over-limit requests at that default until it is fixed and saved again; the warning is a log line, once per policy id, name and error in each process. Refusing such a stored policy on load is decided for phase 3 and not built. The engine itself does not validate, so a policy added through PolicyEngine::add_policy without validation is not refused. Example tests over a few condition shapes. Layered rate limits remain first-match. Default deny makes an over-limit request a denial only when no other rule matches it: the exhausted rule falls through to the other deny, prompt and allow rules of every matching policy first, so another allow rule (in this or another matching policy) still allows the request, and a rule whose only condition is a RateLimit allows every request on the credential until it is spent."
+      "does_not_establish": "Validation refuses only at config load and on the admin API. The engine's own load paths (add_policy, load_policies, load_policies_if_newer) only log a failing policy, once per policy id, name and error in each process; the refusal of a stored RateLimit policy with a non-deny default happens one layer up, where the server loads from the vault, and is the claim stored-rate-limit-refused-on-load. The engine itself does not validate, so a policy added through PolicyEngine::add_policy without validation is not refused. Example tests over a few condition shapes. Layered rate limits remain first-match. Default deny makes an over-limit request a denial only when no other rule matches it: the exhausted rule falls through to the other deny, prompt and allow rules of every matching policy first, so another allow rule (in this or another matching policy) still allows the request, and a rule whose only condition is a RateLimit allows every request on the credential until it is spent."
     },
     {
       "id": "url-match-canonical",
-      "statement": "UrlMatch is evaluated on a canonical form of the request URL (url crate parse: scheme and host lowercased, IDNA, one trailing host dot dropped, default port dropped, dot segments resolved, fragment dropped, percent-encoding normalised so unreserved escapes are decoded and a stray % is encoded) with the caller's query map merged in sorted order, against a pattern canonicalised the same way. For generated equivalent spellings (host case, default port, trailing host dot, dot segments, encoded unreserved characters, fragment) the engine decision equals the decision for the plain spelling under Deny-prefix, Allow-prefix, Deny-glob and host-boundary-prefix rules. A prefix pattern that ends in * directly after a host matches that host on any port and path but not look-alike hosts (api.example.com.evil.net). A URL that cannot be canonicalised (including any URL with userinfo) never matches an Allow rule and is denied when a matching policy has a UrlMatch under a Deny or Prompt rule or under a Not. The http plugin sends the evaluated string and the hmac plugin sends the canonical base URL; both refuse a URL that cannot be canonicalised. For a UrlToken credential the http plugin sends the evaluated string with the secret in place of the literal {credential} placeholder and refuses the request when the URL with every literal {credential} replaced still canonicalises to a spelling of the placeholder in any letter case (percent-encoded, half-encoded, or with an escaped inner letter such as %7Bcr%65dential%7D), in the named unit tests. Risky patterns (star right after the host, star in the host, canonicalisation changing the meaning) log a load-time warning once per policy and pattern, and the line says the pattern is only warned and that refusal on deny and prompt rules is planned for phase 3; a scheme-less prefix that is a prefix of http:// or https:// (http*) is not reported as a star in the host, and any other scheme-less prefix (internal*) still is.",
+      "statement": "UrlMatch is evaluated on a canonical form of the request URL (url crate parse: scheme and host lowercased, IDNA, one trailing host dot dropped, default port dropped, dot segments resolved, fragment dropped, percent-encoding normalised so unreserved escapes are decoded and a stray % is encoded) with the caller's query map merged in sorted order, against a pattern canonicalised the same way. For generated equivalent spellings (host case, default port, trailing host dot, dot segments, encoded unreserved characters, fragment) the engine decision equals the decision for the plain spelling under Deny-prefix, Allow-prefix, Deny-glob and host-boundary-prefix rules. A prefix pattern that ends in * directly after a host matches that host on any port and path but not look-alike hosts (api.example.com.evil.net). A URL that cannot be canonicalised (including any URL with userinfo) never matches an Allow rule and is denied when a matching policy has a UrlMatch under a Deny or Prompt rule or under a Not. The http plugin sends the evaluated string and the hmac plugin sends the canonical base URL; both refuse a URL that cannot be canonicalised. For a UrlToken credential the http plugin sends the evaluated string with the secret in place of the literal {credential} placeholder and refuses the request when the URL with every literal {credential} replaced still canonicalises to a spelling of the placeholder in any letter case (percent-encoded, half-encoded, or with an escaped inner letter such as %7Bcr%65dential%7D), in the named unit tests. Risky patterns (star right after the host, star in the host, canonicalisation changing the meaning) log a load-time warning once per policy, pattern and rule kind; on a deny or prompt rule the line says the admin API refuses such a pattern when a policy is written and that this stored policy is still enforced as written, and on an allow rule it says the pattern is only warned; a scheme-less prefix that is a prefix of http:// or https:// (http*) is not reported as a star in the host, and any other scheme-less prefix (internal*) still is.",
       "method": "property",
       "artifacts": [
         "src/plugins/hmac.rs",
@@ -1654,7 +1681,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "warn_url_patterns",
-          "sha256": "b5da2533f6dec7e8e209bf2bdf79c041f93f46c7b468a75c71f7f128e305ef82"
+          "sha256": "ac57d3497fcbecc4d082e9bee39b82432abcad7c7bf0b66e4572a520de51b587"
         },
         {
           "path": "src/plugins/hmac.rs",
@@ -1716,7 +1743,7 @@
         "url-canon-scheme-prefix-exemption-too-broad",
         "url-canon-warning-overclaims-refusal"
       ],
-      "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or path case differently is not modelled). How a glob is matched part by part (scheme, host, port, rest) is the url-glob-part-wise claim, with its own limits; a glob * in the path or query still matches / and ?. Warned patterns only log a warning: refusing warned patterns on Deny and Prompt rules when a policy is written is decided for phase 3 and not built, and Allow rules are not part of that decision. A glob whose host holds ? is not canonicalised. Only the http and hmac plugins send the canonical URL; internal_http sends the url-crate composition of the raw path and runs its own path allowlists on that composed path, so what it sends can differ from the evaluated form in percent-escape spelling (unreserved escapes, hex case, and the form encoding of the query map, such as + for a space); the wasm plugin egress, ssh and postgres plugins do not use params url. The hmac plugin adds timestamp, recvWindow and signature after evaluation, and AWS SigV4 re-sorts query pairs for signing; those additions are not judged. For UrlToken requests the sent bytes equal the evaluated string apart from the secret on the tested URLs only, and the refusal of other placeholder spellings is shown on the listed spellings only. The secret is inserted as is, and the url crate percent-encodes only the characters it must, so a secret holding /, ? or # changes the path or query that is sent (the substitution is checked for scheme and host only); a {credential} in a query-map value stays literal. The query map is merged only when it is a JSON object (a value that is not a string is judged as its JSON text; the http and hmac plugins refuse such a map). A prefix that ends in * inside a host (https://api.*, https://10.0.0*) is matched as the one host the parser reads from it, so a deny rule of that shape denies less than before (warned; refusing it on Deny and Prompt rules at policy write time is decided for phase 3, not built). A pattern without a trailing * must match the query too, so a deny rule on an exact URL does not match the same URL with a query. The meaning-change warning compares against a loose normal form and is shown on examples only; it can miss a change. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested. The load-time warning is a log line and is not a refusal. The server call sites that build the judged URL (policy_url at request time and at approval resume) are not covered by the detector."
+      "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or path case differently is not modelled). How a glob is matched part by part (scheme, host, port, rest) is the url-glob-part-wise claim, with its own limits; a glob * in the path or query still matches / and ?. Warned patterns only log a warning at load; the admin-API refusal of warned patterns on Deny and Prompt rules is the claim policy-write-refuses-warned-deny-prompt-patterns, and Allow rules are not refused. A glob whose host holds ? is not canonicalised. Only the http and hmac plugins send the canonical URL; internal_http sends the url-crate composition of the raw path and runs its own path allowlists on that composed path, so what it sends can differ from the evaluated form in percent-escape spelling (unreserved escapes, hex case, and the form encoding of the query map, such as + for a space); the wasm plugin egress, ssh and postgres plugins do not use params url. The hmac plugin adds timestamp, recvWindow and signature after evaluation, and AWS SigV4 re-sorts query pairs for signing; those additions are not judged. For UrlToken requests the sent bytes equal the evaluated string apart from the secret on the tested URLs only, and the refusal of other placeholder spellings is shown on the listed spellings only. The secret is inserted as is, and the url crate percent-encodes only the characters it must, so a secret holding /, ? or # changes the path or query that is sent (the substitution is checked for scheme and host only); a {credential} in a query-map value stays literal. The query map is merged only when it is a JSON object (a value that is not a string is judged as its JSON text; the http and hmac plugins refuse such a map). A prefix that ends in * inside a host (https://api.*, https://10.0.0*) is matched as the one host the parser reads from it, so a deny rule of that shape denies less than before (warned; refused on Deny and Prompt rules at admin-API write time, see policy-write-refuses-warned-deny-prompt-patterns; one already stored still loads). A pattern without a trailing * must match the query too, so a deny rule on an exact URL does not match the same URL with a query. The meaning-change warning compares against a loose normal form and is shown on examples only; it can miss a change. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested. The load-time warning is a log line and is not a refusal. The server call sites that build the judged URL (policy_url at request time and at approval resume) are not covered by the detector."
     },
     {
       "id": "url-glob-part-wise",
@@ -1766,7 +1793,7 @@
         "url-glob-port-split-ignores-brackets",
         "url-glob-path-only-unmatched"
       ],
-      "does_not_establish": "Shown on the listed patterns and on 512 generated cases per run, not proved for every pattern or URL. Inside the host a wildcard still matches any run of host characters, dots included: https://*.example.com/x matches a.b.example.com and https://api.example.com*/x matches api.example.com.evil.net. Deny and Prompt globs match less than before: a glob without a port no longer matches a non-default port (https://*/admin misses https://h:8443/admin), and a glob without a scheme that does not start with * (ht*.example.com/x), which matched through the scheme before, now matches no URL with a host. A glob character class that spans a part boundary (a / or a : inside [...]) matches nothing, and the glob syntax reads an IPv6 literal written in a pattern host as a character class, not as that host. In a prefix pattern (trailing *) an earlier * is literal, so https://*.example.com/* matches no real host and a Deny or Prompt rule of that shape is dead (warned only; refusing warned Deny and Prompt patterns at policy write time is decided for phase 3 and not built). A wildcard in the path or query still matches / and ?. The matcher assumes a canonical URL (no userinfo, no fragment); canonicalisation and what the plugins send are the url-match-canonical claim."
+      "does_not_establish": "Shown on the listed patterns and on 512 generated cases per run, not proved for every pattern or URL. Inside the host a wildcard still matches any run of host characters, dots included: https://*.example.com/x matches a.b.example.com and https://api.example.com*/x matches api.example.com.evil.net. Deny and Prompt globs match less than before: a glob without a port no longer matches a non-default port (https://*/admin misses https://h:8443/admin), and a glob without a scheme that does not start with * (ht*.example.com/x), which matched through the scheme before, now matches no URL with a host. A glob character class that spans a part boundary (a / or a : inside [...]) matches nothing, and the glob syntax reads an IPv6 literal written in a pattern host as a character class, not as that host. In a prefix pattern (trailing *) an earlier * is literal, so https://*.example.com/* matches no real host and a Deny or Prompt rule of that shape is dead (warned at load; the admin API refuses it on a Deny or Prompt rule when a policy is written, but one already stored or in the config file still loads). A wildcard in the path or query still matches / and ?. The matcher assumes a canonical URL (no userinfo, no fragment); canonicalisation and what the plugins send are the url-match-canonical claim."
     },
     {
       "id": "argon2-kdf-known-answer",
@@ -1803,6 +1830,118 @@
         "argon2-default-time-cost-changed"
       ],
       "does_not_establish": "Only the fixed cases above, not every password, salt or cost setting, so a different argon2 release could still differ elsewhere. The fixtures were generated by this repository with 0.5.3, they are not the published Argon2 test vectors and not a check against another implementation. It covers the master-key KDF only: admin passwords use bcrypt and API keys use SHA-256, neither is touched. It does not show the AES-GCM layer, the vault file format or key rotation (rekey) are correct, and the Lean and Kani artifacts do not model the KDF. The KDF output length is pinned to 32 bytes explicitly, and the test would not notice a later change that stores a different length elsewhere. Salts shorter than 8 bytes are rejected by argon2 and are not exercised. Key equality is inferred from AES-GCM authentication succeeding under the derived key; the key bytes are not compared directly. Salts longer than 48 bytes behave differently: 0.5.3 rejected them (its PHC salt string holds at most 64 Base64 characters) and 0.6 accepts them; vultrino generates 16-byte salts, so no vault written by 0.5.3 carries one, and this case is not tested."
+    },
+    {
+      "id": "policy-write-refuses-warned-deny-prompt-patterns",
+      "statement": "The admin policy write (POST and PUT /api/v1/policies, through build_policy) answers 400 invalid_policy, naming the rule and the pattern, and stores nothing, when a deny or prompt rule has a url_match pattern that canonical_pattern warns about, at the top level of the rule's condition or inside and, or or not. Shown on 8 warned patterns (star in the host of a prefix and of a glob, a prefix ending right after and inside a host, dot segments, a star that cuts a percent escape, a host holding ?, a scheme-less prefix) x deny and prompt x 4 condition shapes x both routes. The same patterns on an allow rule are stored (201), and clean deny and prompt patterns in govder's compiled shape (and of action_match, url_match, method_match, including a relative path, https://*, a {credential} placeholder and *://host/x) are stored.",
+      "method": "test",
+      "artifacts": [
+        "src/policy/mod.rs",
+        "src/web/api.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test web_smoke -- --exact admin_policy_write_refuses_warned_deny_and_prompt_url_patterns",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "refuse_warned_url_patterns",
+          "sha256": "8ac4feba30f947245ce971d061e07b07f1ba4ee289cec28401f6edc719a50639"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "first_warned_url_pattern",
+          "sha256": "ab36cd802121068371e7e7cd2f7b8732c70a02c85a80f5e06995798b636f08aa"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "build_policy",
+          "sha256": "5c97e981ff02fcdb266ac21faaf6b3d35ddf9d1da80a3d2b5df044344dc31335"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "canonical_pattern",
+          "sha256": "f9aaf6eab1f4dfd63e2e680428d7e31a1ebe2ebf123dab529bf3e0165f278eb4"
+        }
+      ],
+      "mutants": [
+        "policy-write-warned-prompt-accepted",
+        "policy-write-warned-not-unchecked",
+        "policy-write-warned-check-skipped",
+        "policy-write-allow-refused"
+      ],
+      "does_not_establish": "The refusal is as good as canonical_pattern's warnings: a pattern that matches less than it reads but draws no warning (a {a,b} glob, a glob without a port that misses a non-default port, an exact URL that misses a query) is accepted. Policies already stored keep loading with a warning and are enforced as written; config-file [[policies]] are only warned; the engine's add_policy and load paths do not refuse. Allow rules are not refused. A rule whose url_match sits under not is refused too, although a dead pattern under not denies more, not less. Shown on the listed patterns and shapes, not every pattern. Which deployed vaults hold such a stored policy is not checked."
+    },
+    {
+      "id": "stored-rate-limit-refused-on-load",
+      "statement": "A RateLimit policy (RateLimit at any depth) stored with an allow or prompt default is refused where the server loads stored policies: VultrinoServer::reload_policies returns PolicyError::Invalid naming the policy name, its id and the fix (vultrino policy deny-default <id>) and leaves the live set unchanged; the periodic refresh (refresh_policies_once) does not apply the set; load_stored_policies_at_startup returns the error, and `vultrino web` exits non-zero with that message on stderr instead of starting. `vultrino policy deny-default <id>` sets the stored default to deny and keeps the rules, after which the policy loads; it reports no change on a second run and an error for an unknown id.",
+      "method": "test",
+      "artifacts": [
+        "src/policy/types.rs",
+        "src/policy/mod.rs",
+        "src/server/mod.rs",
+        "src/main.rs",
+        "tests/web_smoke.rs",
+        "tests/startup_security_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "set -e; cargo test --locked --no-default-features --test web_smoke -- --exact stored_rate_limit_policy_with_non_deny_default_is_refused_on_load; cargo test --locked --no-default-features --test startup_security_integration -- --exact web_refuses_to_start_with_a_stored_rate_limit_policy_that_does_not_default_deny",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/policy/types.rs",
+          "symbol": "Policy::stored_load_refusal",
+          "sha256": "c3f07cff6cd26df96cd2ff0a5411d207b2fc7e84be7afb4c5dc4ae14c0a7241f"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "refuse_unloadable_stored_policies",
+          "sha256": "496df0784749ebd696a7bbecd1df72467a8498d7911f5a7685eb6fa7002cf468"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "set_stored_policy_default_deny",
+          "sha256": "3a33eb2a946000bcd8cbca0f5255c8f13ed7a04b59b4c544e162ffa82cb8b6d5"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::reload_policies",
+          "sha256": "2870fb21edfd5a176b76c8ea52cb48cfcf3f819790a1900250603e3a67d103a8"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::load_stored_policies_at_startup",
+          "sha256": "f7a84eacb5e74281df05fd246aff641261d7ac03a97a07e855b52e4f93812f9e"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "refresh_policies_with_hooks",
+          "sha256": "e62bf7026315c708a10c8b2f0b3e8e1075b2de95c9d487218e3fb9bbe645e096"
+        },
+        {
+          "path": "src/main.rs",
+          "symbol": "run_web_server",
+          "sha256": "f05e6ee2e764770d908b28440cb33235c109d26a5be00264440926b99f29110b"
+        },
+        {
+          "path": "src/main.rs",
+          "symbol": "policy_deny_default",
+          "sha256": "0fccf029c279765e459f68353067d46f4ac084a2b1acff22201e86515d71b658"
+        }
+      ],
+      "mutants": [
+        "stored-rate-limit-prompt-default-loads",
+        "stored-rate-limit-nested-missed",
+        "stored-rate-limit-reload-applies",
+        "stored-rate-limit-refresh-applies",
+        "stored-rate-limit-startup-warns-only"
+      ],
+      "does_not_establish": "Only that one shape is refused: a stored policy failing another validation rule (nested SpendCap, zero RateLimit dimension, degenerate TimeWindow) is still only warned and enforced as written. The engine's own add_policy and load paths do not refuse. The `vultrino serve --mcp` startup calls the same load_stored_policies_at_startup but is not run by a test. A running process that meets such a policy written by an older binary keeps its last good set and also stops picking up later valid changes in that vault until it is fixed. A reload after an admin write answers 500 reload_error while a refused policy is stored. Whether any deployed vault holds such a policy is not checked. The refusal does not change what a deny default means: an exhausted RateLimit still falls through to the other rules of every matching policy first."
     },
     {
       "id": "tenant-assertion-differential-vectors",
