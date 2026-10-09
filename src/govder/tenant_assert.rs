@@ -342,4 +342,70 @@ mod tests {
             Err(TenantAssertionError::BadMac | TenantAssertionError::Malformed)
         ));
     }
+    // ===== golden vectors (vectors/tenant-assertion.v1.json, owned by govder) =====
+
+    fn load_tenant_assertion_vectors() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vectors")
+            .join("tenant-assertion.v1.json");
+        let raw = std::fs::read(&path).expect("read vectors/tenant-assertion.v1.json");
+        let v: serde_json::Value = serde_json::from_slice(&raw).expect("decode vectors");
+        assert_eq!(v["format"], "feir.tenant-assertion");
+        assert_eq!(v["version"], 1);
+        v
+    }
+
+    fn vb64(s: &serde_json::Value) -> Vec<u8> {
+        use base64::engine::general_purpose::STANDARD;
+        STANDARD
+            .decode(s.as_str().expect("body_b64 is a string"))
+            .expect("body_b64 decodes")
+    }
+
+    /// The shipped verifier gives the reference verdict (and reason) on every vector.
+    #[test]
+    fn verify_agrees_with_golden_vectors() {
+        let file = load_tenant_assertion_vectors();
+        let vectors = file["vectors"].as_array().expect("vectors array");
+        assert!(vectors.len() >= 100, "vector file too small");
+        let mut failures = Vec::new();
+        for v in vectors {
+            let id = v["id"].as_str().unwrap();
+            let ver = &v["verify"];
+            let req = &ver["request"];
+            let now = DateTime::<Utc>::from_timestamp(ver["now"].as_i64().unwrap(), 0).unwrap();
+            let got = verify_tenant_assertion(
+                v["assertion"].as_str().unwrap(),
+                ver["key"].as_str().unwrap(),
+                ver["expected_tenant"].as_str().unwrap(),
+                req["method"].as_str().unwrap(),
+                req["path"].as_str().unwrap(),
+                req["query"].as_str().unwrap(),
+                req["host"].as_str().unwrap(),
+                &vb64(&req["body_b64"]),
+                now,
+                Duration::from_secs(ver["max_ttl_s"].as_u64().unwrap()),
+            );
+            let want_reason = match v["reason"].as_str() {
+                Some("malformed") => Some(TenantAssertionError::Malformed),
+                Some("bad_mac") => Some(TenantAssertionError::BadMac),
+                Some("expired") => Some(TenantAssertionError::Expired),
+                Some("ttl") => Some(TenantAssertionError::ExcessiveTtl),
+                _ => None,
+            };
+            match (v["expect"].as_str().unwrap(), got) {
+                ("accept", Ok(())) => {}
+                ("reject", Err(e)) => {
+                    if let Some(want) = want_reason {
+                        if e != want {
+                            failures.push(format!("{id}: want {want:?}, got {e:?}"));
+                        }
+                    }
+                }
+                (want, got) => failures.push(format!("{id}: want {want}, got {got:?}")),
+            }
+        }
+        assert!(failures.is_empty(), "vector mismatches:\n{}", failures.join("\n"));
+    }
 }
+
