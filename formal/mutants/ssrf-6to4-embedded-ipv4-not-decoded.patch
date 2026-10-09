@@ -1,9 +1,9 @@
 diff --git a/src/plugins/http.rs b/src/plugins/http.rs
-index 912a303..f464396 100644
+index 53fb5cf..45fdea9 100644
 --- a/src/plugins/http.rs
 +++ b/src/plugins/http.rs
-@@ -745,9 +745,6 @@ impl HttpPlugin {
-                 // bits; decode + recurse so an internal IPv4 can't be reached via NAT64.
+@@ -806,9 +806,6 @@ impl HttpPlugin {
+                 // can't be reached via NAT64.
                  || (seg[0] == 0x0064 && seg[1] == 0xff9b
                      && Self::is_private_ip(&IpAddr::V4(embedded_v4(seg[6], seg[7]))))
 -                // 6to4 2002::/16 - embedded IPv4 in segments [1..=2]; decode + recurse.

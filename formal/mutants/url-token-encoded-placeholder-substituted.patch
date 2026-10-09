@@ -1,0 +1,13 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 53fb5cf..ece2f27 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -768,7 +768,7 @@ impl HttpPlugin {
+         let lower = raw_url.to_ascii_lowercase();
+         if ["%7bcredential%7d", "%7bcredential}", "{credential%7d"]
+             .iter()
+-            .any(|encoded| lower.contains(encoded))
++            .any(|encoded| lower.contains(encoded) && false)
+         {
+             return Err(PluginError::InvalidParams(format!(
+                 "UrlToken placeholder must be spelled literally as '{}', not percent-encoded",
