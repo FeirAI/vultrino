@@ -243,7 +243,14 @@ is confined to its own tenant:
 ```
 
 A write hot-reloads the engine on the web process. An invalid `credential_pattern`
-glob → `400 invalid_policy`; a misconfigured SpendCap → `400`. A `kill: true`
+glob → `400 invalid_policy`; a misconfigured SpendCap or a `RateLimit` policy
+whose default is not deny → `400`; a `deny` or `prompt` rule whose `url_match`
+pattern (at any depth of its condition) draws a canonical-matching warning (`*`
+right after or inside a host, `*` in the host, a meaning change, an unparseable
+pattern) → `400 invalid_policy` naming the rule and the pattern (allow rules are
+not refused). If a reload after the write meets a stored policy refused on load
+(a `RateLimit` policy with a non-deny default), the write answers an error and
+the live set is unchanged (see CONFIGURATION.md). A `kill: true`
 policy short-circuits ahead of any allow rule. Each write emits a `policy.changed`
 event.
 

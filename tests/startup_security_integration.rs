@@ -85,3 +85,108 @@ fn enabled_exchange_refuses_to_start_without_valid_verifier() {
         );
     }
 }
+
+/// P3-FLOORS: `vultrino web` refuses to start when the vault holds a RateLimit
+/// policy whose default action is not deny, and the error names the policy and
+/// the fix; `vultrino policy deny-default <id>` then repairs it offline (the
+/// default becomes deny, the rules are kept).
+#[test]
+fn web_refuses_to_start_with_a_stored_rate_limit_policy_that_does_not_default_deny() {
+    use std::time::{Duration, Instant};
+    use vultrino::policy::{Policy, PolicyAction, PolicyCondition};
+    use vultrino::storage::{FileStorage, StorageBackend};
+
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault.enc");
+    let config = dir.path().join("vultrino.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[storage]\nbackend = \"file\"\n[storage.file]\npath = \"{}\"\n",
+            vault.display()
+        ),
+    )
+    .unwrap();
+    let password = "startup-refusal-test-password";
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let storage = FileStorage::new(&vault, &secrecy::SecretString::from(password))
+            .await
+            .unwrap();
+        let mut p = Policy::deny_all("legacy-rate", "cred-*").with_rule(
+            PolicyCondition::And(vec![
+                PolicyCondition::UrlMatch("https://api.example.com/v1/*".into()),
+                PolicyCondition::RateLimit {
+                    max: 5,
+                    window_secs: 60,
+                },
+            ]),
+            PolicyAction::Allow,
+        );
+        p.id = "legacy-rate-startup".to_string();
+        p.default_action = PolicyAction::Allow;
+        storage.store_policy(&p).await.unwrap();
+    });
+
+    let mut child = web_command(&config)
+        .env("HOME", dir.path())
+        .env("VULTRINO_PASSWORD", password)
+        .env(
+            "VULTRINO_POLICY_HASH_SECRET",
+            "01234567890123456789012345678901",
+        )
+        .env("VULTRINO_ADMIN_USERNAME", "admin")
+        .env("VULTRINO_ADMIN_PASSWORD", "startup-refusal-admin-password")
+        .env_remove("VULTRINO_WORKLOAD_EXCHANGE_ENABLED")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("`vultrino web` started (still running after 60s) with a refused stored policy in the vault");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!status.success(), "startup must fail: {stderr}");
+    assert!(
+        stderr.contains("legacy-rate-startup")
+            && stderr.contains("vultrino policy deny-default legacy-rate-startup"),
+        "the startup error names the policy and the fix: {stderr}"
+    );
+
+    let fix = Command::new(env!("CARGO_BIN_EXE_vultrino"))
+        .arg("--config")
+        .arg(&config)
+        .args(["policy", "deny-default", "legacy-rate-startup"])
+        .env("HOME", dir.path())
+        .env("VULTRINO_PASSWORD", password)
+        .output()
+        .unwrap();
+    assert!(
+        fix.status.success(),
+        "deny-default failed: {}",
+        String::from_utf8_lossy(&fix.stderr)
+    );
+    rt.block_on(async {
+        let storage = FileStorage::new(&vault, &secrecy::SecretString::from(password))
+            .await
+            .unwrap();
+        let p = storage
+            .get_policy("legacy-rate-startup")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.default_action, PolicyAction::Deny);
+        assert_eq!(p.rules.len(), 1, "the fix keeps the rules");
+        assert!(p.stored_load_refusal().is_none());
+    });
+}

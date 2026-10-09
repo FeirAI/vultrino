@@ -262,6 +262,41 @@ impl Policy {
     }
 }
 
+impl Policy {
+    /// Why a policy read back from the vault must not be loaded, or `None`.
+    ///
+    /// A stored policy that uses a `RateLimit` at any depth with a default action
+    /// other than `deny` is refused on load (P3-FLOORS): an exhausted limit falls
+    /// through to the policy default, so under an allow or prompt default the limit
+    /// does not limit. The admin API and config load already refuse that shape
+    /// ([`Policy::validate`]), so only a vault written before they did can hold one.
+    /// The message names the policy and the fix. Other validation failures of a
+    /// stored policy are still only warned on load.
+    pub fn stored_load_refusal(&self) -> Option<String> {
+        if self.default_action == PolicyAction::Deny
+            || !self
+                .rules
+                .iter()
+                .any(|r| condition_contains_rate_limit(&r.condition))
+        {
+            return None;
+        }
+        let default = match self.default_action {
+            PolicyAction::Allow => "allow",
+            PolicyAction::Prompt => "prompt",
+            PolicyAction::Deny => "deny",
+        };
+        Some(format!(
+            "stored policy '{name}' (id {id}) has a RateLimit condition and default_action = \"{default}\": \
+             an exhausted limit falls through to the policy default, so the limit would not limit, and \
+             vultrino refuses to load it. Fix: run `vultrino policy deny-default {id}` (sets \
+             default_action = \"deny\" in the vault and keeps the rules), or delete it, then start again",
+            name = self.name,
+            id = self.id,
+        ))
+    }
+}
+
 /// Whether a condition tree contains a `RateLimit` at any depth.
 fn condition_contains_rate_limit(c: &PolicyCondition) -> bool {
     match c {

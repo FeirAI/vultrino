@@ -112,6 +112,15 @@ character. There is no `{a,b}` alternation: braces are literal characters, so a 
 such as `https://api.github.com/{user,repos}/*` matches no request (and logs no
 warning). Use an `or` of separate `url_match` conditions instead.
 
+Vultrino logs a warning at load for a risky pattern: `*` right after or inside
+a host (`https://api.example.com*`, `https://api.*`), `*` in the host, a pattern
+whose meaning canonical matching changes (dot segments, a `*` that cuts a
+percent escape), or one that is not a parseable URL or path. When a policy is
+written through the admin API, a `deny` or `prompt` rule with such a pattern
+is refused (400), because the rule can match less than it reads; write the host
+and a path instead (`https://api.example.com/*`), one rule per host. An `allow`
+rule with such a pattern is accepted with the warning.
+
 ### Method Match
 
 Restrict to specific HTTP methods:

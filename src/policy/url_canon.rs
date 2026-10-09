@@ -129,9 +129,10 @@ pub fn canonical_url(raw: &str) -> Option<String> {
     }
 }
 
-/// Why a pattern deserves a load-time warning. Warned only: refusing warned
-/// patterns on deny and prompt rules when a policy is written is planned for
-/// phase 3.
+/// Why a pattern deserves a load-time warning. The admin API refuses any of
+/// these on a deny or prompt rule when a policy is written
+/// (`policy::refuse_warned_url_patterns`); allow rules, config-file policies and
+/// policies already stored are only warned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternWarning {
     /// The pattern ends in `*` right after a host (no `/`): it used to match
@@ -585,8 +586,8 @@ mod tests {
     }
 
     /// A trailing-star prefix of `http://` or `https://` (`http*`) has no host
-    /// part, so it is not reported as a star in the host (refusing warned
-    /// patterns on deny and prompt rules is planned for phase 3). It matches by
+    /// part, so it is not reported as a star in the host (a warned pattern is
+    /// refused on deny and prompt rules when a policy is written). It matches by
     /// scheme only. Any other scheme-less prefix keeps
     /// the warning: it matches no canonical http(s) URL, so a Deny or Prompt
     /// rule on it is dead and the warning is the only sign of that.

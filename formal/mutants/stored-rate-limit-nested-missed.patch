@@ -1,0 +1,13 @@
+diff --git a/src/policy/types.rs b/src/policy/types.rs
+index f46a3bc..89bcf89 100644
+--- a/src/policy/types.rs
++++ b/src/policy/types.rs
+@@ -277,7 +277,7 @@ impl Policy {
+             || !self
+                 .rules
+                 .iter()
+-                .any(|r| condition_contains_rate_limit(&r.condition))
++                .any(|r| matches!(r.condition, PolicyCondition::RateLimit { .. }))
+         {
+             return None;
+         }

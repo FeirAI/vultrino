@@ -373,18 +373,22 @@ remaining per-replica multiplication, which is inherent to in-process counters.)
 
 ## RateLimit policies stored before the default-deny rule
 
-`Policy::validate` now refuses a policy with a `RateLimit` condition unless its
+`Policy::validate` refuses a policy with a `RateLimit` condition unless its
 `default_action` is deny (config load and admin API). A policy read back from the
-vault is checked when it enters the engine (`add_policy`, `load_policies`,
-`load_policies_if_newer`, so at startup and on every refresh), but a failure is
-only logged as a WARNING (once per policy id, name and error in each process); the
-policy is not refused or changed. So one saved earlier with an allow or prompt
-default keeps working as written: when its Allow-`RateLimit` rule is exhausted and
-no other rule matches, the request falls through to that default and is allowed
-(or prompted). This is fail-open for that policy until it is fixed. Re-save such a
-policy through the admin API (which validates) or change its default to deny.
-Refusing such a policy when it is loaded is decided for phase 3 and not built;
-until then the warning is the only signal.
+vault with that shape is refused when the server loads stored policies
+(`VultrinoServer::reload_policies`, the periodic refresh, and the startup load of
+`vultrino web` and `vultrino serve --mcp`, which then do not start). The refusal
+covers only that shape: a stored policy failing another validation rule (a nested
+`SpendCap`, a zero `RateLimit` dimension, a degenerate `TimeWindow`) is still only
+logged as a WARNING and enforced as written. The check runs where the server
+loads from the vault; the engine's own `add_policy`, `load_policies` and
+`load_policies_if_newer` still only warn, so code that feeds the engine directly
+is not covered. A process already running when an older binary writes such a
+policy keeps its last good set (the refresh refuses the new set as a whole), so a
+later valid change in the same vault is not picked up until the refused policy is
+fixed. That includes the kill policy `halt_agent` stores: the halt response then
+reports `policy_active=false` and a long-running `serve --mcp` process does not apply
+it (token revocation still applies) until the refused policy is fixed. The fix, `vultrino policy deny-default <id>`, only tightens the policy.
 
 ## URL policy matching: what canonical matching does not cover
 
@@ -409,10 +413,14 @@ matched as one string. These rules are shown on the tested patterns and a
 property test over generated other-host URLs, not proved for every pattern. In
 a prefix pattern (trailing `*`) an earlier `*` is literal, so
 `https://*.example.com/*` matches no real host: a Deny or Prompt rule written
-that way is dead, and the star-in-host warning is the only sign. Risky
-patterns are only warned; what is decided (for phase 3, not built) is refusing
-warned patterns on Deny and Prompt rules when a policy is written. Allow rules
-are not part of that decision.
+that way is dead. The admin API refuses such a pattern (and every other
+warned pattern) on a Deny or Prompt rule when a policy is written; a policy
+already stored that way still loads and is enforced as written (the warning is
+then the only sign), and so does one in the config file (config load warns
+only). Allow rules are not refused. The refusal is as good as the warnings: a
+pattern that matches less than it reads but logs no warning (a `{a,b}` glob, a
+glob without a port that misses a non-default port, an exact URL that misses a
+query) is not refused.
 A glob whose host part holds `?`
 is not canonicalised (warned); that `?` matches one host character. Patterns
 are canonicalised when they are matched, not rewritten in storage, so the admin
@@ -448,8 +456,9 @@ JSON text, and the `http` and `hmac` plugins refuse such a map. A prefix that
 ends in `*` inside a host (`https://api.*`, `https://10.0.0*`) is matched as
 the one host the URL parser reads from it (`api`, `10.0.0.0`) and is warned, so
 a deny rule of that shape no longer matches longer host names or other
-addresses and denies less than before (refusing such a pattern on Deny and
-Prompt rules when a policy is written is decided for phase 3, not built). A
+addresses and denies less than before (the admin API now refuses such a pattern
+on Deny and Prompt rules when a policy is written; one already stored still
+loads). A
 pattern without a trailing `*` (an
 exact URL or a glob that ends in a path) must match the query too: a deny rule
 on `https://host/admin` does not match `https://host/admin?x=1`, whether the

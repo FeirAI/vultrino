@@ -13,18 +13,18 @@ index 66c3d0c..0edae45 100644
          policies.iter().for_each(warn_url_patterns);
          policies.iter().for_each(warn_invalid_policy);
 diff --git a/src/server/mod.rs b/src/server/mod.rs
-index ca12992..5531608 100644
+index 41a3569..7aa7cce 100644
 --- a/src/server/mod.rs
 +++ b/src/server/mod.rs
-@@ -4488,7 +4488,6 @@ impl VultrinoServer {
+@@ -4493,7 +4493,6 @@ impl VultrinoServer {
          // Ticket first (after the caller's storage write), then list, then a
          // compare-and-swap apply: a concurrent periodic refresh that listed
          // before this write can no longer overwrite this newer set.
 -        let _cycle = self.policy_engine.lock_load().await;
          let ticket = self.policy_engine.begin_load();
          let stored = self.storage.list_stored_policies().await?;
-         self.policy_engine
-@@ -5682,7 +5681,6 @@ pub async fn refresh_policies_with_hooks(
+         if let Err(refusal) = crate::policy::refuse_unloadable_stored_policies(&stored) {
+@@ -5709,7 +5708,6 @@ pub async fn refresh_policies_with_hooks(
      // ticket order equals list-read order. The ticket compare stays as a second
      // guard. Visibility of another process's write is still bounded by the
      // refresh interval: this lock is per process.

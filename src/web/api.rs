@@ -2234,6 +2234,10 @@ fn build_policy(req: PolicyUpsertRequest, forced_id: Option<String>) -> Result<P
     policy.kill = req.kill;
     // Reject misconfigured spend caps (nested / no caps / not fail-closed).
     policy.validate()?;
+    // P3-FLOORS: refuse a Deny or Prompt rule whose url_match pattern the
+    // canonical matcher warns about (it can match less than it reads). Policies
+    // already stored are not affected; they keep loading with a warning.
+    crate::policy::refuse_warned_url_patterns(&policy)?;
     Ok(policy)
 }
 
@@ -2260,6 +2264,14 @@ async fn store_and_reload_policy(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 serde_json::json!({"code": "reload_error", "error": format!("engine reload failed; the new policy was rolled back: {}", e)}),
+            );
+        }
+        if let crate::VultrinoError::Policy(crate::policy::PolicyError::Invalid(refusal)) = &e {
+            // A stored policy is refused on load (P3-FLOORS): no refresh will apply
+            // the set until that policy is fixed, so do not promise one.
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"code": "reload_error", "error": format!("policy stored, but the live policy set is unchanged because a stored policy is refused on load: {}", refusal)}),
             );
         }
         return (
