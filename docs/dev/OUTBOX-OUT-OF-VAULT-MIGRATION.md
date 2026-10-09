@@ -17,7 +17,7 @@ SQLite plan is SUPERSEDED — D2 note). Scope: vultrino storage layer (`src/stor
   vault commit, and reconciling undrained intents on startup. (Not pure-reconcile.)
 - **D2 = encrypt the outbox store** with the existing master key, fresh nonce per write — the event
   metadata never sits in plaintext. IMPLEMENTATION NOTE: realized NOT as SQLite/per-row but as a
-  separate `outbox.enc` file reusing the vault's proven AES-256-GCM whole-cache serialize+encrypt +
+  separate `outbox.enc` file reusing the vault's existing AES-256-GCM whole-cache serialize+encrypt +
   fd-lock + tmp+atomic-rename+fsync machinery (no new dep on the secrets plane; `OUTBOX_FILE_VERSION=1`
   envelope). "Encrypt the log" (D2's intent) is fully met; "per-row" was a recommendation, not a
   locked requirement. The §3 SQLite schema below is SUPERSEDED by this choice. Trade-off: append is
@@ -203,7 +203,7 @@ a vault written by a **newer** binary (`found > supported`), so:
 
 Per the §12 plan: gate vultrino capacity on an **aged-vault admitted-LLM load test** — measure
 append-event p99 and `list_events_after` p99 against a vault aged to N days of events, BEFORE vs AFTER, to
-prove the O(vault-size) term is gone. Target: append/poll latency flat as the event backlog grows.
+show the O(vault-size) term is gone under that load. Target: append/poll latency flat as the event backlog grows.
 
 ## 8. Relationship to the interim self-contained wins (shipped separately)
 

@@ -209,11 +209,20 @@ parsed never matches an Allow rule and is denied when a matching policy has a
 `url_match` under a deny or prompt rule or under a `not`. Path-only values
 (`/v1/refunds`) are canonicalised the same way. At load, vultrino logs a WARNING
 (once per policy and pattern) for patterns with `*` right after the host, `*`
-inside the host (also without a scheme), or where canonicalisation changes the
-meaning (dot segments, encoded dots, a fragment, a backslash, a `*` that cuts a
-percent escape short); these will be refused in the next release. The `http`
-plugin sends the evaluated string and refuses a URL that cannot be
-canonicalised. The `hmac` plugin sends the canonical URL and adds only
+inside the host (also without a scheme, except a prefix of `http://` or
+`https://` such as `http*`), or where canonicalisation changes the meaning (dot
+segments, encoded dots, a fragment, a backslash, a `*` that cuts a percent escape
+short). They are only warned today. Refusing warned patterns on deny and
+prompt rules when a policy is written is decided for phase 3 and not built. That
+decision does not cover allow rules, so a warned pattern on an allow rule (for
+example a `*` in the host, which can match another host) stays a warning,
+although the log line says every warned pattern will be refused. There is no `{a,b}`
+alternation in a glob; braces are literal. A policy loaded from the vault that
+fails validation (for example a `RateLimit` policy with a non-deny default) is
+logged as a WARNING but still enforced as written. The `http` plugin sends the
+evaluated string and refuses a URL that cannot be canonicalised; for a
+`UrlToken` credential it sends the evaluated string with the secret in place of
+the literal `{credential}` and refuses a URL in which other text canonicalises to a spelling of it (such as `%7Bcredential%7D` or `%7Bcr%65dential%7D`). The `hmac` plugin sends the canonical URL and adds only
 `timestamp`, `recvWindow` and `signature` to the evaluated query pairs. See the
 limits in `docs/dev/LIMITATIONS.md`.
 

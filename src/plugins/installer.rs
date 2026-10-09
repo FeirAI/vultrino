@@ -599,12 +599,11 @@ mod tests {
         assert_eq!(PluginInstaller::default_plugins_dir_for(None), expected);
     }
 
-    #[tokio::test]
-    async fn abi_v1_is_rejected_before_any_installed_directory_is_created() {
-        let source = tempfile::tempdir().unwrap();
-        let installed = tempfile::tempdir().unwrap();
+    /// Writes a local plugin source whose module exports ABI v1 (the version
+    /// that carried plaintext credentials into the guest).
+    fn write_abi_v1_plugin_source(dir: &std::path::Path) {
         std::fs::write(
-            source.path().join("plugin.toml"),
+            dir.join("plugin.toml"),
             r#"
 [plugin]
 name = "legacy-abi"
@@ -615,7 +614,7 @@ wasm_module = "legacy.wasm"
         )
         .unwrap();
         std::fs::write(
-            source.path().join("legacy.wasm"),
+            dir.join("legacy.wasm"),
             br#"(module
               (memory (export "memory") 1)
               (func (export "vultrino_plugin_version") (result i32) (i32.const 1))
@@ -624,6 +623,17 @@ wasm_module = "legacy.wasm"
               (func (export "vultrino_execute") (param i32 i32) (result i64) (i64.const 0)))"#,
         )
         .unwrap();
+    }
+
+    // The ABI check needs the WASM runtime, so this test exists only in builds
+    // with `wasm-plugins` (the default). Without the feature every WASM install
+    // is refused earlier, which the twin test below pins.
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn abi_v1_is_rejected_before_any_installed_directory_is_created() {
+        let source = tempfile::tempdir().unwrap();
+        let installed = tempfile::tempdir().unwrap();
+        write_abi_v1_plugin_source(source.path());
 
         let installer = PluginInstaller::new(installed.path().to_path_buf());
         let error = installer
@@ -635,6 +645,33 @@ wasm_module = "legacy.wasm"
         assert!(
             !installed.path().join("legacy-abi").exists(),
             "an incompatible module must not appear installed"
+        );
+    }
+
+    // Without the WASM runtime (`--no-default-features`, the build Kani uses) no
+    // module can be validated, so every WASM install is refused before anything is
+    // copied into the installed-plugin directory.
+    #[cfg(not(feature = "wasm-plugins"))]
+    #[tokio::test]
+    async fn wasm_install_is_refused_without_the_runtime_before_any_installed_directory_is_created()
+    {
+        let source = tempfile::tempdir().unwrap();
+        let installed = tempfile::tempdir().unwrap();
+        write_abi_v1_plugin_source(source.path());
+
+        let installer = PluginInstaller::new(installed.path().to_path_buf());
+        let error = installer
+            .install(source.path().to_str().unwrap())
+            .await
+            .expect_err("a build without wasm-plugins must refuse WASM installs")
+            .to_string();
+        assert!(
+            error.contains("compiled without the wasm-plugins feature"),
+            "{error}"
+        );
+        assert!(
+            !installed.path().join("legacy-abi").exists(),
+            "a refused plugin must not appear installed"
         );
     }
 }

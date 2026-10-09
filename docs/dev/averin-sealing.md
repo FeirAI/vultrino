@@ -122,7 +122,7 @@ the use token fail-closed "just before the side effect… the point of no return
   the "fail-open sink" the integration note describes as the default posture.
 - **(C) Asynchronous.** After the consume, **`tokio::spawn` the seal** and let
   `plugin.execute` proceed without waiting. Closes the *visibility* gap (the same
-  gap plan 085 closes) but NOT the synchronous consume-before-act proof: a crash
+  gap plan 085 closes) but NOT the synchronous consume-before-act ordering: a crash
   or averin outage between the act and the seal leaves the action done with no
   receipt.
 
@@ -259,7 +259,7 @@ raw params = encrypted + time-boxed + erasable disclosure**. When the async
 production build lands (per the go/no-go), keep this two-tier split — never seal
 raw params into the permanent body, and honor the retention window.
 
-## 6. What the spike proves (and the honest capstone gap)
+## 6. What the spike showed (and the honest capstone gap)
 
 The spike (flag ON) drives a real `vut_`-authenticated `/execute` and shows, via
 `GET /v2/export` from a **real** averin, a sealed `use` record carrying
@@ -317,10 +317,10 @@ bound.
 ## 9. Measured results (spike, flag ON, `tests/averin_spike.rs`)
 
 Against a REAL averin-server (in-memory store + ledger, broker + resource
-enabled), driven by the seal-client. Both tests pass — which, because averin
-`400`s a wrong PoP preimage, is itself the byte-exactness proof that
-`src/averin/pop.rs` reproduces averin's grant + use PoP and params-commitment
-exactly.
+enabled), driven by the seal-client. Both tests pass. Because averin
+`400`s a wrong PoP preimage, that is evidence that `src/averin/pop.rs` reproduces
+averin's grant + use PoP and params-commitment byte for byte for the inputs these
+tests use; it is not a proof over all inputs.
 
 **Sealed use record (`sealed_use_record_appears_in_averin_export`).** A
 `vut_`-keyed `seal_grant` → `POST /v2/grants` then `seal_use` → `POST /v2/use`
@@ -338,8 +338,9 @@ produced a sealed use receipt `use-fcd47ff2-…` present in `GET /v2/export`. Th
 - `ok: false`, because the spike created **no checkpoint** (`"no checkpoints: a
   non-empty run must be checkpoint-committed"`). Checkpointing is a separate
   periodic averin operation, not part of the per-use seal; the individual grant
-  and use records are nonetheless sealed and individually proven
-  (`records_proven: 2/2`). A real deployment checkpoints on averin's cadence.
+  and use records are nonetheless sealed, and averin's verifier accepted each one
+  (it reports `records_proven: 2/2`). A real deployment checkpoints on averin's
+  cadence.
 
 **Added `/execute` latency (`measure_added_execute_latency`, N=50, localhost +
 in-memory averin — a FLOOR):**
@@ -614,10 +615,10 @@ seals fail-open (documented behavior, not a bug).
 
 ### Honest enqueue latency
 
-The durable enqueue is O(1) in retained events — proven by an in-tree
-growing-backlog benchmark that holds append p99 flat from 10 to 100k retained
-records, not merely assumed. That O(1) *shape* is a portable, hardware-independent
-property of the append-only journal design. The **absolute** per-append latency is
+The durable enqueue measured as O(1) in retained events: an in-tree
+growing-backlog benchmark holds append p99 flat from 10 to 100k retained
+records. That is a measurement over that range, not a proof. The O(1) *shape*
+follows from the append-only journal design and does not depend on hardware. The **absolute** per-append latency is
 not: it is a property of the deployment target's storage stack. On the stated
 production target (Linux + NVMe), a single synchronous per-append `fdatasync` is
 typically sub-millisecond, comfortably inside a p99 ≤ 5 ms budget. On a busy

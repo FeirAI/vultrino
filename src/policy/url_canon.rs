@@ -218,7 +218,16 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
     }
     // No scheme and not a path: `*.example.com/*`, `*example.com*`, `http*`.
     if !(body.contains("://") || is_relative(body)) {
-        if pattern != "*" && pattern.split('/').next().unwrap_or("").contains('*') {
+        // A prefix of `http://` or `https://` (`http*`, `https*`) has no host
+        // part: a canonical URL starts with its lower-case scheme, so such a
+        // prefix can only match there and its `*` is not in a host. Any other
+        // body keeps the warning: `internal*`, `evil*` or `HTTP*` match no
+        // canonical http(s) URL at all, so a Deny or Prompt rule on one is dead,
+        // and the warning is the only sign of that.
+        let scheme_prefix =
+            prefix_mode && ["http://", "https://"].iter().any(|s| s.starts_with(body));
+        if pattern != "*" && !scheme_prefix && pattern.split('/').next().unwrap_or("").contains('*')
+        {
             warnings.push(PatternWarning::StarInHost);
         }
         return keep(pattern, warnings);
@@ -350,6 +359,30 @@ pub fn url_matches(raw_url: &str, raw_pattern: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Pins a documented residual (LIMITATIONS.md, url-match-canonical
+    /// does_not_establish): a glob `*` also matches `/`, so a `*` in the host
+    /// part can match a request to another host. The pattern is warned, not
+    /// refused, and on an Allow rule this allows that other host.
+    #[test]
+    fn star_in_host_glob_can_match_another_host_residual() {
+        for pattern in ["https://*.example.com/x", "*.example.com/x"] {
+            assert!(
+                canonical_pattern(pattern)
+                    .warnings
+                    .contains(&PatternWarning::StarInHost),
+                "{pattern}"
+            );
+            assert!(
+                url_matches("https://api.example.com/x", pattern),
+                "{pattern}"
+            );
+            assert!(
+                url_matches("https://evil.net/a.example.com/x", pattern),
+                "{pattern}"
+            );
+        }
+    }
+
     #[test]
     fn canonical_form_examples() {
         for (raw, want) in [
@@ -408,6 +441,67 @@ mod tests {
         ] {
             assert!(w(quiet).is_empty(), "{quiet}: {:?}", w(quiet));
         }
+    }
+
+    /// A trailing-star prefix of `http://` or `https://` (`http*`) has no host
+    /// part, so it is not reported as a star in the host (which is planned to be
+    /// refused). It matches by scheme only. Any other scheme-less prefix keeps
+    /// the warning: it matches no canonical http(s) URL, so a Deny or Prompt
+    /// rule on it is dead and the warning is the only sign of that.
+    #[test]
+    fn scheme_prefix_star_is_not_a_star_in_the_host() {
+        let w = |p: &str| canonical_pattern(p).warnings;
+        for quiet in ["h*", "http*", "https*", "https:*"] {
+            assert!(w(quiet).is_empty(), "{quiet}: {:?}", w(quiet));
+        }
+        assert!(url_matches("https://api.example.com/x", "http*"));
+        assert!(url_matches("http://api.example.com/x", "http*"));
+        assert!(!url_matches("http://api.example.com/x", "https*"));
+        // A prefix that is not the start of an http(s) scheme never matches a
+        // canonical http(s) URL: it keeps its warning.
+        for dead in ["internal*", "evil*", "localhost*", "api*", "ftp*"] {
+            assert!(
+                !url_matches("https://internal.example.com/x", dead),
+                "{dead}"
+            );
+        }
+        // Host characters before the star are still a star in the host.
+        for warned in [
+            "*.example.com/*",
+            "*example.com*",
+            "api.*",
+            "http*.example.com/*",
+            "HTTP*",
+            "internal*",
+            "evil*",
+            "localhost*",
+            "ftp*",
+        ] {
+            assert!(
+                w(warned).contains(&PatternWarning::StarInHost),
+                "{warned}: {:?}",
+                w(warned)
+            );
+        }
+    }
+
+    /// docs/src/guides/policies.md: a `url_match` glob has no `{a,b}`
+    /// alternation. The braces are literal (percent-encoded in canonical form),
+    /// so such a pattern matches none of the paths it seems to list.
+    #[test]
+    fn brace_alternation_is_literal_not_a_glob_feature() {
+        let pat = "https://api.github.com/{user,repos,gists}/*";
+        for url in [
+            "https://api.github.com/user/x",
+            "https://api.github.com/repos/a/b",
+            "https://api.github.com/gists/1",
+        ] {
+            assert!(!url_matches(url, pat), "{url}");
+        }
+        assert_eq!(
+            canonical_pattern(pat).text,
+            "https://api.github.com/%7Buser,repos,gists%7D/*"
+        );
     }
 
     #[test]

@@ -181,7 +181,10 @@ const IPV4_BLOCKED: [(u32, u8); 15] = [
 /// reachable, plus multicast, the deprecated site-local and IPv4-compatible blocks,
 /// Teredo, and the NAT64 local-use prefix. Not listed because they are decoded and
 /// classified by their embedded IPv4 instead: ::ffff:0:0/96 (IPv4-mapped),
-/// 64:ff9b::/96 (NAT64) and 2002::/16 (6to4). 2001::/23 is blocked whole (it holds
+/// 64:ff9b::/32 (NAT64; the decode takes the low 32 bits of any address in the /32
+/// and ignores the middle 64 bits, so it covers more than the 64:ff9b::/96
+/// well-known prefix, which only over-blocks; 64:ff9b:1::/48 is blocked outright by
+/// this table first) and 2002::/16 (6to4). 2001::/23 is blocked whole (it holds
 /// Teredo 2001::/32); that also blocks a few globally reachable anycast and
 /// AS112 sub-ranges, which is the safe direction.
 /// Source: https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
@@ -733,6 +736,78 @@ impl HttpPlugin {
         Ok(substituted)
     }
 
+    /// The URL a `UrlToken` request sends: the string policy judged
+    /// (`crate::policy::effective_url` of the placeholder URL and the caller's
+    /// query map) with the secret put in place of the placeholder, so the bytes
+    /// sent differ from the judged string only by the secret. Only the part that
+    /// comes from the request URL is substituted; the merged query map is
+    /// appended unchanged, so a placeholder spelled in a query-map value stays
+    /// literal (as before). Canonicalisation percent-encodes `{` and `}` in a
+    /// path, so a literal `{credential}` there is judged as `%7Bcredential%7D`
+    /// and is substituted in that spelling. Other text can canonicalise to the
+    /// same spelling (a caller-written `%7Bcredential%7D`, a half-encoded
+    /// `%7Bcredential}`, or `%7Bcr%65dential%7D`, whose unreserved escape is
+    /// decoded), so the request is refused when the URL with every literal
+    /// placeholder replaced still canonicalises to a placeholder spelling in
+    /// any letter case. The secret then goes only to text that canonicalises
+    /// from a literal placeholder (tested on the spellings in
+    /// `test_prepare_request_url_token_placeholder_spellings`). Fails closed:
+    /// no literal placeholder, another placeholder spelling, a URL that cannot
+    /// be canonicalised, or a substitution that changes the scheme or host (see
+    /// `substitute_url_token`) is an error, and no error includes the secret.
+    fn url_token_send_url(
+        raw_url: &str,
+        query: &HashMap<String, String>,
+        token: &Secret,
+    ) -> Result<String, PluginError> {
+        const PLACEHOLDER: &str = "{credential}";
+        const PLACEHOLDER_IN_PATH: &str = "%7Bcredential%7D";
+        if !raw_url.contains(PLACEHOLDER) {
+            return Err(PluginError::InvalidParams(format!(
+                "UrlToken credential requires a '{}' placeholder in the request URL",
+                PLACEHOLDER
+            )));
+        }
+        let uncanonical = || {
+            PluginError::InvalidParams(
+                "URL cannot be canonicalised (policy could not judge it)".to_string(),
+            )
+        };
+        // Every placeholder spelling in the canonical string must come from a
+        // literal `{credential}`. Canonicalise the URL with each literal
+        // replaced by `-` (unreserved, no URL structure, never part of a
+        // placeholder spelling): if the result still holds a spelling of the
+        // placeholder in any case (encoded, half-encoded, or with an escaped
+        // inner letter such as `%7Bcr%65dential%7D`, which canonicalisation
+        // decodes), other text would receive the secret, so refuse. Checking
+        // the canonical form, not the raw string, is what catches escapes that
+        // canonicalisation decodes, and a literal that canonicalisation drops
+        // (a dot segment, the fragment) cannot vouch for another spelling.
+        let without_literal = crate::policy::canonical_url(&raw_url.replace(PLACEHOLDER, "-"))
+            .ok_or_else(uncanonical)?
+            .to_ascii_lowercase();
+        if [
+            "%7bcredential%7d",
+            "%7bcredential}",
+            "{credential%7d",
+            "{credential}",
+        ]
+        .iter()
+        .any(|spelling| without_literal.contains(spelling))
+        {
+            return Err(PluginError::InvalidParams(format!(
+                "UrlToken placeholder must be spelled literally as '{}'; another part of the URL canonicalises to a spelling of it",
+                PLACEHOLDER
+            )));
+        }
+        let base = crate::policy::canonical_url(raw_url).ok_or_else(uncanonical)?;
+        let judged = crate::policy::effective_url(raw_url, query).ok_or_else(uncanonical)?;
+        let merged_query = judged.strip_prefix(base.as_str()).ok_or_else(uncanonical)?;
+        let base = base.replace(PLACEHOLDER_IN_PATH, PLACEHOLDER);
+        let substituted = Self::substitute_url_token(&base, token)?;
+        Ok(format!("{substituted}{merged_query}"))
+    }
+
     /// Check if an IP address is private/internal (SSRF protection). `pub(crate)` so
     /// every SSRF check (the connect-time resolver here, the HMAC plugin's literal
     /// guard, etc.) shares ONE classifier — including the IPv4-mapped-IPv6 case
@@ -745,8 +820,10 @@ impl HttpPlugin {
                 ipv6_is_special_purpose(u128::from(*ipv6))
                 // IPv4-mapped addresses - check the IPv4 portion
                 || Self::is_ipv4_mapped_private(ipv6)
-                // NAT64 well-known prefix 64:ff9b::/96 - embedded IPv4 in the low 32
-                // bits; decode + recurse so an internal IPv4 can't be reached via NAT64.
+                // NAT64: any address in 64:ff9b::/32 (not only the /96 well-known
+                // prefix; the middle 64 bits are not checked, which only over-blocks).
+                // Decode the low 32 bits as IPv4 and recurse so an internal IPv4
+                // can't be reached via NAT64.
                 || (seg[0] == 0x0064 && seg[1] == 0xff9b
                     && Self::is_private_ip(&IpAddr::V4(embedded_v4(seg[6], seg[7]))))
                 // 6to4 2002::/16 - embedded IPv4 in segments [1..=2]; decode + recurse.
@@ -831,30 +908,22 @@ impl HttpPlugin {
     /// drift from the buffered one and forget a guard.
     async fn prepare_request(
         &self,
-        mut params: HttpRequestParams,
+        params: HttpRequestParams,
         cred_data: &CredentialData,
     ) -> Result<(reqwest::RequestBuilder, Option<CredentialData>), PluginError> {
-        // UrlToken credentials substitute the secret into the URL PATH before
-        // anything else runs, so the SSRF host check just below (and the DNS-
-        // resolving SsrfGuardResolver at connect time) validate the REAL
-        // destination (e.g. api.telegram.org), not the `{credential}` placeholder.
-        // `substitute_url_token` itself guards against the substitution smuggling
-        // a different scheme/host past the checks that already ran on the
-        // placeholder URL (request-time url_glob policy, upstream of this plugin).
-        if let CredentialData::UrlToken { token } = cred_data {
-            params.url = Self::substitute_url_token(&params.url, token)?;
-        }
-
         // SB-03: send the SAME canonical URL that policy evaluated
         // (`crate::policy::effective_url`: canonical URL plus the caller's
         // query map, merged in sorted order, so nothing is appended after
         // evaluation). A URL that cannot be canonicalised is refused, never
-        // sent raw. A UrlToken URL is excluded: its path
-        // now carries the secret, which must not be rewritten (policy judged
-        // the placeholder form, whose host and scheme `substitute_url_token`
-        // pinned above).
+        // sent raw. For a UrlToken credential policy judged the placeholder
+        // form; `url_token_send_url` puts the secret into that judged string,
+        // so the bytes sent differ from it only by the secret, and the SSRF host
+        // check just below (and the DNS-resolving SsrfGuardResolver at connect
+        // time) validate the REAL destination (e.g. api.telegram.org).
         let send_url = match cred_data {
-            CredentialData::UrlToken { .. } => params.url.clone(),
+            CredentialData::UrlToken { token } => {
+                Self::url_token_send_url(&params.url, &params.query, token)?
+            }
             _ => crate::policy::effective_url(&params.url, &params.query).ok_or_else(|| {
                 PluginError::InvalidParams(
                     "URL cannot be canonicalised (policy could not judge it)".to_string(),
@@ -950,12 +1019,8 @@ impl HttpPlugin {
             request = request.header(key, value);
         }
 
-        // Add query parameters
-        // (Already merged into the URL policy judged, except for UrlToken, whose
-        // URL is the substituted placeholder form.)
-        if matches!(cred_data, CredentialData::UrlToken { .. }) && !params.query.is_empty() {
-            request = request.query(&params.query);
-        }
+        // Query parameters are already merged into the URL policy judged (for
+        // every credential type, UrlToken included), so none are added here.
 
         // Add body
         if params.body.is_some() {
@@ -1537,6 +1602,139 @@ mod tests {
 
         let result = plugin.prepare_request(params, &cred_data).await;
         assert!(matches!(result, Err(PluginError::InvalidParams(_))));
+    }
+
+    /// SB-03, UrlToken: the URL sent is the string policy judged (canonical URL
+    /// plus the merged query map) with only the placeholder replaced by the
+    /// secret. Covers a request with both an inline query and a query map whose
+    /// key sorts before the inline key (the map is appended after it).
+    #[tokio::test]
+    async fn test_prepare_request_url_token_sends_the_judged_url_with_the_secret() {
+        let plugin = HttpPlugin::new();
+        let token = "123456:ABC-DEF";
+        let cred_data = CredentialData::UrlToken {
+            token: Secret::new(token),
+        };
+        let mut query = HashMap::new();
+        query.insert("z".to_string(), "last".to_string());
+        query.insert("chat_id".to_string(), "4 2".to_string());
+        let url = "HTTPS://API.Telegram.ORG./bot{credential}/send%4Dessage?parse_mode=%7e#frag";
+        let judged = crate::policy::effective_url(url, &query).unwrap();
+        assert_eq!(
+            judged,
+            "https://api.telegram.org/bot%7Bcredential%7D/sendMessage?parse_mode=~&chat_id=4%202&z=last"
+        );
+        let params = HttpRequestParams {
+            method: "POST".to_string(),
+            url: url.to_string(),
+            headers: HashMap::new(),
+            query,
+            body: None,
+        };
+        let (b, _) = plugin.prepare_request(params, &cred_data).await.unwrap();
+        let request = b.build().unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            judged.replace("%7Bcredential%7D", token)
+        );
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.telegram.org/bot123456:ABC-DEF/sendMessage?parse_mode=~&chat_id=4%202&z=last"
+        );
+    }
+
+    /// Which spellings of the placeholder are substituted: the literal
+    /// `{credential}` in the path or the inline query is; a placeholder in a
+    /// query-map value stays literal; a percent-encoded or half-encoded spelling
+    /// in the URL is refused, so the secret never lands where the caller did not
+    /// write the literal placeholder. No error carries the secret.
+    #[tokio::test]
+    async fn test_prepare_request_url_token_placeholder_spellings() {
+        let plugin = HttpPlugin::new();
+        let token = "tok-SECRET-123";
+        let cred_data = CredentialData::UrlToken {
+            token: Secret::new(token),
+        };
+        let send = |url: &str, query: HashMap<String, String>| HttpRequestParams {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            headers: HashMap::new(),
+            query,
+            body: None,
+        };
+        let (b, _) = plugin
+            .prepare_request(
+                send(
+                    "https://api.example.com/x?token={credential}",
+                    HashMap::new(),
+                ),
+                &cred_data,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            b.build().unwrap().url().as_str(),
+            "https://api.example.com/x?token=tok-SECRET-123"
+        );
+        let mut query = HashMap::new();
+        query.insert("k".to_string(), "{credential}".to_string());
+        let (b, _) = plugin
+            .prepare_request(
+                send("https://api.example.com/{credential}/x", query),
+                &cred_data,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            b.build().unwrap().url().as_str(),
+            "https://api.example.com/tok-SECRET-123/x?k=%7Bcredential%7D"
+        );
+        // A literal placeholder in both the path and the query is substituted in
+        // both places (the caller wrote both).
+        let (b, _) = plugin
+            .prepare_request(
+                send(
+                    "https://api.example.com/bot{credential}/x?t={credential}",
+                    HashMap::new(),
+                ),
+                &cred_data,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            b.build().unwrap().url().as_str(),
+            "https://api.example.com/bottok-SECRET-123/x?t=tok-SECRET-123"
+        );
+        // Every other spelling that canonicalises to the placeholder is
+        // refused: fully or half encoded, an escaped inner letter (unreserved
+        // escapes are decoded by canonicalisation), in the path or the query,
+        // and also when the literal placeholder itself is dropped by
+        // canonicalisation (dot segment, fragment) so that a count of
+        // placeholders would still match.
+        for refused in [
+            "https://api.example.com/bot%7Bcredential%7D/x",
+            "https://api.example.com/bot{credential}/%7bcredential%7d",
+            "https://api.example.com/bot{credential}/%7Bcredential}",
+            "https://api.example.com/bot{credential}/{credential%7D",
+            "https://api.example.com/bot{credential}/x?y=%7Bcredential%7D",
+            "https://api.example.com/bot{credential}/%7Bcr%65dential%7D",
+            "https://api.example.com/bot{credential}/{cr%65dential}",
+            "https://api.example.com/bot{credential}/x?y=%7Bcr%65dential%7D",
+            "https://api.example.com/bot{credential}/x?y={cr%65dential}",
+            "https://api.example.com/bot{credential}/%7B%63redential%7D",
+            "https://api.example.com/bot{credential}/x?y=%7B%63R%65DENTIAL%7D",
+            "https://api.example.com/{credential}/../%7Bcr%65dential%7D",
+            "https://api.example.com/x/%7Bcr%65dential%7D#{credential}",
+        ] {
+            let r = plugin
+                .prepare_request(send(refused, HashMap::new()), &cred_data)
+                .await;
+            match r {
+                Err(PluginError::InvalidParams(e)) => assert!(!e.contains(token), "{e}"),
+                Err(e) => panic!("{refused}: wrong error {e}"),
+                Ok(_) => panic!("{refused}: an encoded placeholder spelling was sent"),
+            }
+        }
     }
 
     // SSRF Protection Tests

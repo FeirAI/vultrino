@@ -14,8 +14,10 @@ bash check-nanoda.sh
 
 ## What is proved
 
-`Approval.reachable_execution_is_proper` proves, by induction over every
-reachable execution trace, that a recorded side effect is policy-allowed. If
+`Approval.reachable_execution_is_proper` states, for every reachable execution
+trace, that a recorded side effect is policy-allowed; it holds by construction
+(see the paragraph after this list), so it pins the definitions rather than
+deriving a property of the transition system. If
 the request requires approval, execution additionally carries persisted
 evidence that is:
 
@@ -48,7 +50,9 @@ body digest covered by its evidence. `changed_binding_rejected` proves that the
 same evidence cannot validate any changed tuple. The model deliberately gives
 plain bearer-key identity claims no independent-authentication witness, matching
 the Rust rule that unsigned `agg:<key>:` identities can contribute at most one
-positive recipe slot per key.
+positive recipe slot per key. These `Authority` theorems follow directly from
+the definitions they are about: they pin those definitions against change and do
+not derive a property of a transition system or of the Rust code.
 
 `Approval.ActionAuthority.canonical_alias_without_rule_is_refused` and its
 inconclusive twin prove the V-A7 namespace partition: when a caller erases a

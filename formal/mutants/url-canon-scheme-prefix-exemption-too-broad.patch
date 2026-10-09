@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index 1d3a932..7d7ef61 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -225,7 +225,7 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
+         // canonical http(s) URL at all, so a Deny or Prompt rule on one is dead,
+         // and the warning is the only sign of that.
+         let scheme_prefix =
+-            prefix_mode && ["http://", "https://"].iter().any(|s| s.starts_with(body));
++            prefix_mode && body.bytes().all(|c| c.is_ascii_lowercase() || c == b':');
+         if pattern != "*" && !scheme_prefix && pattern.split('/').next().unwrap_or("").contains('*')
+         {
+             warnings.push(PatternWarning::StarInHost);

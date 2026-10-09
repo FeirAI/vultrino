@@ -2,8 +2,9 @@
 """Validate formal/claims.json against the repository (see README.md).
 
 Checks: schema and unique ids, artifact paths, gate job ids, ci-required
-equality, drift-lock hashes (covers), mutant patch files, overclaim denylist.
-Exit status is non-zero on any failure.
+equality and its always-run condition, drift-lock hashes (covers), mutant patch
+files, overclaim denylist, generated claims table in the docs. `--render-docs
+PATH` rewrites that table. Exit status is non-zero on any failure.
 """
 from __future__ import annotations
 
@@ -74,6 +75,15 @@ def check_gates(parsed, wf_errors, data: dict, rep: Report) -> None:
                 rep.fail("gate %s" % g, "claim %s: no job with this id in .github/workflows" % c["id"])
 
 
+def _always_runs(expr: str) -> bool:
+    # YAML quoting comes off first; quotes left inside the expression make a string literal, and
+    # `${{ 'always()' }}` calls no status function, so GitHub prepends success() and it fails open
+    e = fk._unquote(expr.strip())
+    if e.startswith("${{") and e.endswith("}}"):
+        e = e[3:-2]
+    return "".join(e.split()) in ("always()", "!cancelled()")
+
+
 def check_ci_required(parsed, wf_errors, data: dict, rep: Report) -> None:
     holders = [rel for rel, jobs in parsed.items() if "ci-required" in jobs]
     if wf_errors and not holders:
@@ -96,6 +106,12 @@ def check_ci_required(parsed, wf_errors, data: dict, rep: Report) -> None:
     if gate.needs is None:
         rep.fail("ci-required", "%s: ci-required has no needs" % rel)
         return
+    if not gate.has_if:
+        problems.append("ci-required has no job-level if: always(); when a needed job fails, the aggregator is "
+                        "skipped and GitHub counts a skipped required check as passing, so the merge gate fails open")
+    elif not _always_runs(gate.if_expr):
+        problems.append("ci-required if: %r is not an always-run condition (use always()); a failed or skipped "
+                        "dependency could skip the aggregator into a non-failure" % gate.if_expr)
     cond = {e["job"]: e["reason"] for e in data.get("ci_required_conditional", [])}
     for j in cond:
         if j in exempt:
@@ -332,6 +348,101 @@ def check_denylist(root: Path, data: dict, claims_rel: str, rep: Report) -> None
         rep.ok("overclaim denylist", "%d file(s) scanned, %d phrase(s)" % (scanned, len(phrases)))
 
 
+# ---- generated claims table ----------------------------------------------
+
+DOCS_BEGIN = "<!-- formal-claims:begin -->"
+DOCS_END = "<!-- formal-claims:end -->"
+
+
+def _cell(text: str) -> str:
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
+def render_table(data: dict, claims_rel: str) -> str:
+    """Markdown table generated from the claims, in claims order. Deterministic."""
+    lines = ["<!-- Generated from %s by scripts/formal/check_claims.py --render-docs; do not edit by hand. -->"
+             % claims_rel, "",
+             "| id | method | statement | does not establish | gates | evidence run |",
+             "|---|---|---|---|---|---|"]
+    for c in data.get("claims", []):
+        ev = c.get("evidence_run")
+        lines.append("| %s | %s | %s | %s | %s | %s |" % (
+            "`%s`" % _cell(c["id"]), _cell(c["method"]), _cell(c["statement"]), _cell(c["does_not_establish"]),
+            ", ".join("`%s`" % _cell(g) for g in c.get("gates", [])), _cell(ev) if ev else "none recorded"))
+    return "\n".join(lines)
+
+
+def _region(text: str):
+    """(begin_end_idx, end_start_idx) of the generated region, None when no marker, or raise KitError."""
+    nb, ne = text.count(DOCS_BEGIN), text.count(DOCS_END)
+    if nb == 0 and ne == 0:
+        return None
+    if nb != 1 or ne != 1:
+        raise fk.KitError("expected exactly one %s and one %s, found %d and %d" % (DOCS_BEGIN, DOCS_END, nb, ne))
+    b, e = text.index(DOCS_BEGIN), text.index(DOCS_END)
+    if e < b:
+        raise fk.KitError("%s comes before %s" % (DOCS_END, DOCS_BEGIN))
+    return b + len(DOCS_BEGIN), e
+
+
+def render_docs_text(text: str, table: str) -> Optional[str]:
+    """text with the region replaced by the table, or None when the file has no markers."""
+    r = _region(text.replace("\r\n", "\n"))
+    if r is None:
+        return None
+    t = text.replace("\r\n", "\n")
+    return t[: r[0]] + "\n" + table + "\n" + t[r[1] :]
+
+
+def render_docs(root: Path, claims_path: Path, doc: Path) -> str:
+    """Rewrite the region in doc (path relative to cwd or absolute). Returns a status line."""
+    data = fk.load_claims(claims_path)
+    errs = fk.validate_schema(data)
+    if errs:
+        raise fk.KitError("claims invalid: " + "; ".join(errs[:3]))
+    try:
+        rel = claims_path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        rel = claims_path.name
+    if not doc.is_file():
+        raise fk.KitError("%s does not exist" % doc)
+    text = doc.read_text(encoding="utf-8")
+    new = render_docs_text(text, render_table(data, rel))
+    if new is None:
+        raise fk.KitError("%s has no %s ... %s markers; add them where the table belongs" % (doc, DOCS_BEGIN, DOCS_END))
+    if new == text.replace("\r\n", "\n"):
+        return "%s is up to date" % doc
+    doc.write_text(new, encoding="utf-8")
+    return "rewrote the claims table in %s" % doc
+
+
+def check_docs(root: Path, data: dict, claims_rel: str, rep: Report) -> None:
+    table = render_table(data, claims_rel)
+    # a file named in formal_docs must exist and carry the markers, so removing them cannot quietly turn the
+    # check off; the default file only warns (a repo that has not adopted the table yet)
+    explicit = bool(data.get("formal_docs"))
+    missing = rep.fail if explicit else rep.warn
+    for rel in data.get("formal_docs") or fk.DEFAULT_DOCS:
+        p = root / rel
+        name = "docs table %s" % rel
+        if not p.is_file():
+            missing(name, "file does not exist, so no generated table is checked")
+            continue
+        try:
+            new = render_docs_text(p.read_text(encoding="utf-8"), table)
+        except fk.KitError as e:
+            rep.fail(name, str(e))
+            continue
+        if new is None:
+            missing(name, "no %s markers; the claims table in this file is not checked" % DOCS_BEGIN)
+        elif new == p.read_text(encoding="utf-8").replace("\r\n", "\n"):
+            rep.ok(name, "matches claims.json")
+        else:
+            claims_arg = "" if claims_rel == "formal/claims.json" else " --claims %s" % claims_rel
+            rep.fail(name, "the generated claims table differs from claims.json; run "
+                           "python3 scripts/formal/check_claims.py%s --render-docs %s and commit" % (claims_arg, rel))
+
+
 def run_detectors(root: Path, data: dict, rep: Report, timeout: int) -> None:
     for c in data.get("claims", []):
         try:
@@ -376,6 +487,7 @@ def run_all(root: Path, claims_path: Path, do_relock: bool = False, only: Option
     except ValueError:
         claims_rel = ""
     check_denylist(root, data, claims_rel, rep)
+    check_docs(root, data, claims_rel or "formal/claims.json", rep)
     if detectors:
         run_detectors(root, data, rep, timeout)
     return rep, changes
@@ -390,9 +502,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="with --relock, restrict to this cover (repeatable)")
     ap.add_argument("--run-detectors", action="store_true", help="also run every claim detector on this tree")
     ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--render-docs", metavar="PATH",
+                    help="rewrite the region between the formal-claims markers in PATH from the claims, then exit")
+    ap.add_argument("--version", action="version", version="formal kit %s" % fk.KIT_VERSION)
     a = ap.parse_args(argv)
     root = Path(a.root).resolve() if a.root else fk.git_toplevel(Path.cwd())
     claims = Path(a.claims) if a.claims else root / "formal" / "claims.json"
+    if a.render_docs:
+        try:
+            print(render_docs(root, claims, Path(a.render_docs)))
+            return 0
+        except fk.KitError as e:
+            print("ERROR  %s" % e)
+            return 2
+    print("formal kit v%s" % fk.KIT_VERSION)
     rep, changes = run_all(root, claims, a.relock, a.symbol or None, a.run_detectors, a.timeout)
     for c in changes:
         print(c)

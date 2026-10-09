@@ -63,6 +63,26 @@ run_harness() {
   echo "run-kani.sh: $path OK ($sat of $total covers satisfied)"
 }
 
+# `run-kani.sh --harness PATH [--harness PATH ...]` runs only the named
+# harnesses, each through the same vacuity gate. The claim detectors in
+# formal/claims.json use this form, so a mutant that makes a harness vacuous
+# (unsatisfiable covers) is caught by the detector, not only by the full run.
+if [ "$#" -gt 0 ]; then
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" != "--harness" ] || [ "$#" -lt 2 ] || [ -z "$2" ]; then
+      echo "usage: run-kani.sh [--harness PATH]..." >&2
+      exit 2
+    fi
+    if ! grep -qxF "run_harness $2" formal/run-kani.sh; then
+      echo "run-kani.sh: $2 is not a listed harness" >&2
+      exit 2
+    fi
+    run_harness "$2"
+    shift 2
+  done
+  exit 0
+fi
+
 run_harness formal_kernel::kani_proofs::admission_gate_truth_table_is_exact
 run_harness formal_kernel::kani_proofs::authorize_accepts_exactly_the_recomputed_binding
 run_harness formal_kernel::kani_proofs::approved_gate_enforces_deny_and_window

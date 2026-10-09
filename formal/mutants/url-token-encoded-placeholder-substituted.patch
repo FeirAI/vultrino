@@ -1,0 +1,13 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 434672c..75b5d9c 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -793,7 +793,7 @@ impl HttpPlugin {
+             "{credential}",
+         ]
+         .iter()
+-        .any(|spelling| without_literal.contains(spelling))
++        .any(|spelling| without_literal.contains(spelling) && false)
+         {
+             return Err(PluginError::InvalidParams(format!(
+                 "UrlToken placeholder must be spelled literally as '{}'; another part of the URL canonicalises to a spelling of it",

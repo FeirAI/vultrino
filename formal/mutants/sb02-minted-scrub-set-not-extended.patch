@@ -1,0 +1,15 @@
+diff --git a/src/egress.rs b/src/egress.rs
+index d521102..0656a35 100644
+--- a/src/egress.rs
++++ b/src/egress.rs
+@@ -475,9 +475,7 @@ pub(crate) fn scrub_set_with_minted(
+     mut secret_material: Vec<Zeroizing<String>>,
+     minted: Option<&crate::CredentialData>,
+ ) -> Vec<Zeroizing<String>> {
+-    if let Some(updated) = minted {
+-        secret_material.extend(updated.secret_material());
+-    }
++    let _ = minted;
+     secret_material
+ }
+ 

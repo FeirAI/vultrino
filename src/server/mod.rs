@@ -2605,10 +2605,8 @@ impl VultrinoServer {
         // Google service-account token mint) was not in the pre-dispatch capture.
         // Add its forms before anything is confined, so an upstream that reflects
         // the new Authorization header cannot leak it to the agent.
-        let mut secret_material = secret_material;
-        if let Some(updated) = response.updated_credential() {
-            secret_material.extend(updated.secret_material());
-        }
+        let secret_material =
+            crate::egress::scrub_set_with_minted(secret_material, response.updated_credential());
         let response = crate::egress::confine_response(
             response,
             &secret_material,
@@ -2969,10 +2967,8 @@ impl VultrinoServer {
         // before any header or body byte reaches the agent. Extend the scrub set
         // with its forms (headers, terminal placeholder and body scrubber below
         // all use `secret_material`).
-        let mut secret_material = secret_material;
-        if let Some(updated) = streaming.updated_credential() {
-            secret_material.extend(updated.secret_material());
-        }
+        let secret_material =
+            crate::egress::scrub_set_with_minted(secret_material, streaming.updated_credential());
 
         // Persist any credential update (e.g. OAuth2 refresh), known before the body
         // streams, identical to the buffered path. Done before ANY withhold below

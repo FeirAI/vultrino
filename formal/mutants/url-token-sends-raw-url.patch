@@ -1,0 +1,16 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 53fb5cf..fd2fa2c 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -783,9 +783,8 @@ impl HttpPlugin {
+         let base = crate::policy::canonical_url(raw_url).ok_or_else(uncanonical)?;
+         let judged = crate::policy::effective_url(raw_url, query).ok_or_else(uncanonical)?;
+         let merged_query = judged.strip_prefix(base.as_str()).ok_or_else(uncanonical)?;
+-        let base = base.replace(PLACEHOLDER_IN_PATH, PLACEHOLDER);
+-        let substituted = Self::substitute_url_token(&base, token)?;
+-        Ok(format!("{substituted}{merged_query}"))
++        let _ = (base, merged_query);
++        Self::substitute_url_token(raw_url, token)
+     }
+ 
+     /// Check if an IP address is private/internal (SSRF protection). `pub(crate)` so

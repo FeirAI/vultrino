@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+KIT_VERSION = "2"
 SCHEMA_VERSION = 1
 METHODS = (
     "lean", "kani", "tla", "aeneas", "exhaustive", "differential-vectors",
@@ -280,6 +281,11 @@ _RS_FN = re.compile(
     r"(?:pub(?:[ \t]*\([^)\n]*\))?[ \t]+)?"
     r"(?:(?:default|const|async|unsafe|safe|extern(?:[ \t]+\"[^\"\n]*\")?)[ \t]+)*"
     r"fn[ \t]+(?:r#)?([^\W\d]\w*)", re.M)
+_RS_ITEM = re.compile(
+    r"^[ \t]*(?:#\[[^\]\n]*\][ \t]*)*"
+    r"(?:pub(?:[ \t]*\([^)\n]*\))?[ \t]+)?"
+    r"(?:(?P<kw1>const|static)[ \t]+(?:mut[ \t]+)?(?:r#)?(?P<n1>[^\W\d]\w*)(?=[ \t]*:)"
+    r"|(?P<kw2>type)[ \t]+(?:r#)?(?P<n2>[^\W\d]\w*)(?=[ \t]*(?:<|=|;|:|where\b)))", re.M)
 _RS_IMPL = re.compile(r"^[ \t]*(?:#\[[^\]\n]*\][ \t]*)*(?:unsafe[ \t]+)?impl\b", re.M)
 _RS_TRAIT = re.compile(
     r"^[ \t]*(?:#\[[^\]\n]*\][ \t]*)*(?:pub(?:[ \t]*\([^)\n]*\))?[ \t]+)?(?:unsafe[ \t]+)?(?:auto[ \t]+)?trait[ \t]+([^\W\d]\w*)", re.M)
@@ -319,6 +325,24 @@ def _rs_scan_to_brace(masked: str, pos: int) -> Tuple[int, str]:
             return i, c
         i += 1
     raise KitError("no body or terminator found from line %d" % _line_of(masked, pos))
+
+
+def _rs_item_end(masked: str, pos: int) -> int:
+    """End (exclusive) of a const/static/type item: the first `;` at bracket,
+    brace and paren depth 0, so multi-line array, table and struct literals are
+    stepped over. Strings and comments are already masked."""
+    depth = 0
+    for i in range(pos, len(masked)):
+        c = masked[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth < 0:
+                raise KitError("unbalanced brackets in item at line %d" % _line_of(masked, pos))
+        elif c == ";" and depth == 0:
+            return i + 1
+    raise KitError("item starting at line %d has no terminating ';'" % _line_of(masked, pos))
 
 
 def _strip_angle_prefix(s: str) -> str:
@@ -406,9 +430,19 @@ def find_rust_decls(text: str) -> List[Decl]:
         pos, ch = _rs_scan_to_brace(masked, m.end())
         end = match_brace(masked, pos) + 1 if ch == "{" else pos + 1
         fns.append((m.start(), end, name))
+    entries = [(s0, e0, n0, "fn") for s0, e0, n0 in fns]
+    for m in _RS_ITEM.finditer(masked):
+        kw = m.group("kw1") or m.group("kw2")
+        name = m.group("n1") or m.group("n2")
+        if kw == "const" and name == "_":
+            continue
+        if any(s2 < m.start() < e2 for s2, e2, _ in fns):
+            continue  # local const/static/type inside a fn body: covered by the fn's hash
+        entries.append((m.start(), _rs_item_end(masked, m.end()), name, kw))
+    entries.sort()
     decls = []
-    for start, end, name in fns:
-        if any(s2 < start and start < e2 for s2, e2, _ in fns):
+    for start, end, name, kw in entries:
+        if kw == "fn" and any(s2 < start and start < e2 for s2, e2, _ in fns):
             continue  # nested fn: covered by the enclosing fn's hash
         inside = [c for c in containers if c[3] < start < c[4]]
         inside.sort(key=lambda c: c[3])
@@ -416,7 +450,7 @@ def find_rust_decls(text: str) -> List[Decl]:
         label = name
         in_item = any(c[0] in ("impl", "trait") for c in inside)
         if not in_item:
-            names.add("fn " + name)
+            names.add(kw + " " + name)
             chain0 = [c[1] for c in inside if c[0] == "mod"]
             names.add("::".join(["crate"] + chain0 + [name]))
         if inside:
@@ -745,9 +779,12 @@ def load_workflows(root: Path) -> Tuple[Dict[str, Dict[str, Job]], Dict[str, str
 # claims.json
 # ---------------------------------------------------------------------------
 
-TOP_KEYS = {"schema", "$comment", "overclaim_denylist", "ci_required_exempt", "ci_required_conditional", "mutants", "claims"}
+TOP_KEYS = {"schema", "$comment", "overclaim_denylist", "ci_required_exempt", "ci_required_conditional", "mutants", "claims",
+            "formal_docs", "scratch_cache_dirs"}
 CLAIM_KEYS = {"id", "statement", "method", "artifacts", "gates", "detector", "covers", "mutants",
-              "evidence_run", "does_not_establish", "$comment"}
+              "evidence_run", "does_not_establish", "detector_kind", "$comment"}
+DETECTOR_KINDS = ("auto", "cargo", "go", "custom")
+DEFAULT_DOCS = ["docs/dev/FORMAL.md"]
 
 
 def load_claims(path: Path) -> dict:
@@ -824,6 +861,8 @@ def validate_schema(data: dict) -> List[str]:
                     errs.append("%s: covers[%d] must be {path, symbol, sha256} strings" % (where, ci))
                 elif not _safe_rel(e["path"]) or not e["symbol"]:
                     errs.append("%s: covers[%d] has an unsafe path or empty symbol" % (where, ci))
+        if "detector_kind" in c and c["detector_kind"] not in DETECTOR_KINDS:
+            errs.append("%s: detector_kind must be one of %s" % (where, ", ".join(DETECTOR_KINDS)))
         ev = c.get("evidence_run")
         if ev is not None and not (isinstance(ev, int) and not isinstance(ev, bool)) and not (isinstance(ev, str) and ev.isdigit()):
             errs.append("%s: evidence_run must be a GitHub run id (digits)" % where)
@@ -842,6 +881,10 @@ def validate_schema(data: dict) -> List[str]:
             not isinstance(e, dict) or set(e) != {"job", "reason"} or not isinstance(e["job"], str)
             or not isinstance(e["reason"], str) or not e["reason"].strip() for e in cc):
         errs.append("ci_required_conditional must be a list of {job, reason} with a non-empty reason")
+    for key in ("formal_docs", "scratch_cache_dirs"):
+        v = data.get(key, [])
+        if not isinstance(v, list) or not all(isinstance(x, str) and _safe_rel(x) for x in v):
+            errs.append("%s must be a list of relative paths inside the repo" % key)
     mm = data.get("mutants", {})
     if not isinstance(mm, dict):
         errs.append("mutants must be a map {id: {tier, claim, detector?}}")
@@ -849,13 +892,15 @@ def validate_schema(data: dict) -> List[str]:
         for mid, e in mm.items():
             if not MUTANT_ID_RE.match(mid):
                 errs.append("bad mutant id %r in mutants map" % mid)
-            if not isinstance(e, dict) or set(e) - {"tier", "claim", "detector"}:
-                errs.append("mutants[%s] must be an object with tier/claim/detector" % mid)
+            if not isinstance(e, dict) or set(e) - {"tier", "claim", "detector", "detector_kind"}:
+                errs.append("mutants[%s] must be an object with tier/claim/detector/detector_kind" % mid)
                 continue
             if "tier" in e and e["tier"] not in TIERS:
                 errs.append("mutants[%s].tier must be fast or full" % mid)
             if "detector" in e and (not isinstance(e["detector"], str) or not e["detector"].strip()):
                 errs.append("mutants[%s].detector must be a non-empty string" % mid)
+            if "detector_kind" in e and e["detector_kind"] not in DETECTOR_KINDS:
+                errs.append("mutants[%s].detector_kind must be one of %s" % (mid, ", ".join(DETECTOR_KINDS)))
             if "claim" in e and not isinstance(e["claim"], str):
                 errs.append("mutants[%s].claim must be a claim id" % mid)
     return errs
@@ -867,6 +912,7 @@ class MutantSpec:
     tier: str
     claim: str
     detector: str
+    kind: str = "auto"
 
 
 def resolve_mutants(data: dict) -> Tuple[List[MutantSpec], List[str]]:
@@ -899,7 +945,10 @@ def resolve_mutants(data: dict) -> Tuple[List[MutantSpec], List[str]]:
         if cl not in claims:
             continue
         det = e.get("detector") or claims[cl].get("detector", "")
-        specs.append(MutantSpec(mid, e.get("tier", "full"), cl, det))
+        # the kind describes the command that runs: a mutant with its own detector does not inherit the
+        # claim's kind (a custom proof claim would otherwise exempt an overriding `cargo test` from the guard)
+        kind = e.get("detector_kind") or ("auto" if e.get("detector") else claims[cl].get("detector_kind", "auto"))
+        specs.append(MutantSpec(mid, e.get("tier", "full"), cl, det, kind))
     return specs, errs
 
 

@@ -173,9 +173,11 @@ metadata endpoint is denied at the transport step.
 
 The authoritative list of ranges the HTTP plugin's guard blocks is the
 `IPV4_BLOCKED` and `IPV6_BLOCKED` tables in `src/plugins/http.rs`, plus the IPv4
-address carried inside an IPv4-mapped (`::ffff:0:0/96`), NAT64 (`64:ff9b::/96`) or
-6to4 (`2002::/16`) address, which the guard decodes and checks as IPv4. The prose
-above is a summary; the code wins if they differ.
+address carried inside an IPv4-mapped (`::ffff:0:0/96`), NAT64 or 6to4 (`2002::/16`)
+address, which the guard decodes and checks as IPv4. The NAT64 decode applies to all of
+`64:ff9b::/32`, not only the `64:ff9b::/96` well-known prefix (it ignores the middle 64
+bits, which only blocks more). The prose above is a summary; the code wins if they
+differ.
 
 The config-time `llm.provider_base` check is narrower on purpose. It looks only at an
 IP-literal host and rejects link-local addresses (`169.254.0.0/16`, `fe80::/10`) and

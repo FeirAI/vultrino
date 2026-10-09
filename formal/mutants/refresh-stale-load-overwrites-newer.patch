@@ -1,8 +1,8 @@
 diff --git a/src/policy/mod.rs b/src/policy/mod.rs
-index 7838e78..a97f104 100644
+index 66c3d0c..0edae45 100644
 --- a/src/policy/mod.rs
 +++ b/src/policy/mod.rs
-@@ -313,9 +313,6 @@ impl PolicyEngine {
+@@ -391,9 +391,6 @@ impl PolicyEngine {
      /// compare and the swap happen under one lock, so concurrent loads serialize.
      pub fn load_policies_if_newer(&self, ticket: u64, policies: Vec<Policy>) -> bool {
          let mut applied = self.applied_load_ticket.lock();
@@ -11,12 +11,12 @@ index 7838e78..a97f104 100644
 -        }
          *applied = ticket;
          policies.iter().for_each(warn_url_patterns);
-         let mut p = self.policies.write();
+         policies.iter().for_each(warn_invalid_policy);
 diff --git a/src/server/mod.rs b/src/server/mod.rs
-index e434852..a67f176 100644
+index ca12992..5531608 100644
 --- a/src/server/mod.rs
 +++ b/src/server/mod.rs
-@@ -4448,7 +4448,6 @@ impl VultrinoServer {
+@@ -4488,7 +4488,6 @@ impl VultrinoServer {
          // Ticket first (after the caller's storage write), then list, then a
          // compare-and-swap apply: a concurrent periodic refresh that listed
          // before this write can no longer overwrite this newer set.
@@ -24,7 +24,7 @@ index e434852..a67f176 100644
          let ticket = self.policy_engine.begin_load();
          let stored = self.storage.list_stored_policies().await?;
          self.policy_engine
-@@ -5642,7 +5641,6 @@ pub async fn refresh_policies_with_hooks(
+@@ -5682,7 +5681,6 @@ pub async fn refresh_policies_with_hooks(
      // ticket order equals list-read order. The ticket compare stays as a second
      // guard. Visibility of another process's write is still bounded by the
      // refresh interval: this lock is per process.
