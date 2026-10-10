@@ -509,7 +509,7 @@ if (
 for hook in (
     "tenant.as_slice() != expected_tenant.as_bytes()",
     "remaining < 0",
-    "max_ttl.as_secs()",
+    "max_ttl.is_zero()",
     "mac.verify_slice(&supplied_mac)",
 ):
     if hook not in tenant_assert:
