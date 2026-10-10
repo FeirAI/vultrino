@@ -4777,6 +4777,10 @@ pub fn policy_refresh_interval() -> std::time::Duration {
             }
         },
     };
+    if secs != POLICY_REFRESH_SECS {
+        warn!(secs, default = POLICY_REFRESH_SECS,
+            "VULTRINO_POLICY_REFRESH_SECS is not the default: ordinary (non-kill) policy changes reach this process only every {secs}s; kill policies are fenced from the vault and do not wait for it");
+    }
     std::time::Duration::from_secs(secs)
 }
 

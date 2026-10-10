@@ -2083,6 +2083,26 @@
           "path": "src/server/mod.rs",
           "symbol": "KillFenceAck::read",
           "sha256": "a197afbdd55a97c98b61e8902d6b4bf9b376a9d6f607bb6e08b51148ee02f5f6"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "StorageBackend for FileStorage::kill_fence_check",
+          "sha256": "3825cf36b9464249f40d3f1e17c5b376035038a4169e9e5da2ddafb57ab0a1e2"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "StorageBackend for FileStorage::claim_approval_for_execution",
+          "sha256": "73f9009b299a4290c67263e0b27dc6ec12eca660cfd5b63067fb6ffaefe35ba6"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "StorageBackend for FileStorage::store_policy",
+          "sha256": "814b50801aa832600312fd3426ab3ad7fee0bc4f57556f65e816e966a1b682e8"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::locked_read",
+          "sha256": "5ab058f76784e35b895eb29fb20216cfd8d788f7322a4f33eaf95cb597eff8e2"
         }
       ],
       "mutants": [
@@ -2091,7 +2111,7 @@
         "kill-fence-dispatch-never-refuses",
         "kill-fence-ack-live-without-readback"
       ],
-      "does_not_establish": "Several hosts (the vault is one file under one cross-process lock; a network storage backend answers the default fail-closed 'unsupported'), calls already past the fence into the plugin when the kill lands (the fence is the last check before the dispatch call, not a recall), MCP, /execute and /llm entry points individually (they reach the shared execute_gated, execute_gated_streaming and resume_approved paths the tests drive; a new path that bypasses them is not covered), a halt that writes no kill policy, a kill epoch snapshot older than the durable value (conservatively refuses), or any CI run. Example-based tests over in-process servers and a counting plugin, not a proof; the model is govder formal/tla/KillFence.tla."
+      "does_not_establish": "Rollout safety of the one-way vault format: STORAGE_VERSION 9 makes an older binary refuse the vault on open, but an older process already running keeps its loaded engine and is refused only where it takes the vault lock, so a vk_ API-key or LLM-proxy call on it can still dispatch after Contained; every process sharing the vault must be stopped (and the vault backed up) before the fence build starts. Kill marks are keyed by policy id (a re-stored id with a narrower pattern overwrites its mark). Dispatch lock contention is not measured. Also: Several hosts (the vault is one file under one cross-process lock; a network storage backend answers the default fail-closed 'unsupported'), calls already past the fence into the plugin when the kill lands (the fence is the last check before the dispatch call, not a recall), MCP, /execute and /llm entry points individually (they reach the shared execute_gated, execute_gated_streaming and resume_approved paths the tests drive; a new path that bypasses them is not covered), a halt that writes no kill policy, a kill epoch snapshot older than the durable value (conservatively refuses), or any CI run. Example-based tests over in-process servers and a counting plugin, not a proof; the model is govder formal/tla/KillFence.tla."
     }
   ]
 }
