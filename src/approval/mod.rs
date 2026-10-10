@@ -1064,6 +1064,13 @@ pub struct ApprovalRequest {
     /// rather than overwriting the re-taker's outcome.
     #[serde(default)]
     pub execution_epoch: u64,
+    /// The vault's kill epoch when this request was admitted (P3-KILL), stamped by the
+    /// server at open from a snapshot taken before its policy evaluation. The kill fence
+    /// refuses to claim or dispatch it once a kill matching its principal was stored at a
+    /// later epoch, even after that kill is lifted. `None` (opened before this field
+    /// existed) is checked as 0, so any later kill refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kill_epoch_at_open: Option<u64>,
 }
 
 /// The tenant partition primitive (V11/R4): whether an admin acting in tenant
@@ -1084,6 +1091,24 @@ pub fn tenant_may_act(acting: Option<&str>, resource_tenant: Option<&str>) -> bo
 }
 
 impl ApprovalRequest {
+    /// The principal this approval runs as for policy and kill matching (V4): the
+    /// explicit principal id stamped at open (falling back to the requester's, for
+    /// approvals persisted before `principal_id` existed), with the agent label and the
+    /// workload identity snapshotted at open. `None` for a principal-less request.
+    /// Resume evaluation and the kill fence both use it, so they match the same subject.
+    pub fn policy_principal(&self) -> Option<crate::policy::Principal> {
+        self.principal_id
+            .as_ref()
+            .or(self.requester.principal_id.as_ref())
+            .map(|id| crate::policy::Principal {
+                id: id.clone(),
+                agent_label: self.agent_label.clone(),
+                // Owner does not affect policy matching (only SoD, at decide time).
+                owner: None,
+                workload_id: self.workload_id.clone(),
+            })
+    }
+
     /// Open a new pending request. Returns the request plus the **plaintext**
     /// decision token (only its hash is stored on the request).
     pub fn open(params: NewApproval) -> (ApprovalRequest, String) {
@@ -1147,6 +1172,7 @@ impl ApprovalRequest {
             result_body: None,
             result_error: None,
             execution_epoch: 0,
+            kill_epoch_at_open: None,
         };
 
         (request, decision_token)

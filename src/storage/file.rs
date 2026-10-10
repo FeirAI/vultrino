@@ -47,7 +47,11 @@ const STALE_EXECUTING_SECS: i64 = 120;
 /// v6 (connector M1): adds the `capabilities` map (named-MCP-tool definitions).
 /// `#[serde(default)]`, so a v6 binary reads older vaults; an older binary is
 /// refused a v6 vault rather than silently dropping capabilities on its next write.
-const STORAGE_VERSION: u32 = 8; // v8: durable provider-native draft mappings
+///
+/// v9 (P3-KILL): adds the `kill_fence` state (kill epoch + per-policy marks). An older
+/// binary is refused a v9 vault, so it can neither drop the marks on a write nor keep
+/// dispatching without the fence beside processes that run it.
+const STORAGE_VERSION: u32 = 9; // v9: durable kill fence (epoch + marks)
 
 /// A reservation older than this (seconds) is assumed orphaned by a crashed
 /// request and may be re-reserved, so a single failed admin call can't block a
@@ -480,6 +484,10 @@ struct StorageCache {
     /// merges these with the static config policies into the live engine.
     #[serde(default)]
     policies: HashMap<String, Policy>,
+    /// The durable kill fence (P3-KILL): the kill epoch and the per-kill-policy marks,
+    /// written in the same locked mutation as the kill policy and kept after a delete.
+    #[serde(default)]
+    kill_fence: crate::policy::KillFenceState,
     /// Capabilities (named-MCP-tool definitions) pushed via the admin API
     /// (connector M1), keyed by capability id. The MCP server reads these to
     /// expose per-principal named tools. They carry no secret (a credential_ref
@@ -1132,6 +1140,35 @@ impl FileStorage {
             RuntimeFlavor::CurrentThread => self.locked_mutate_blocking(f),
             _ => tokio::task::block_in_place(|| self.locked_mutate_blocking(f)),
         }
+    }
+
+    /// Read the authoritative on-disk state under the cross-process lock and apply
+    /// `f` to it, without writing (P3-KILL: the kill fence). Like
+    /// [`Self::locked_mutate`], and unlike the read-cache [`Self::reload`], it always
+    /// re-reads and decrypts the file under the lock and never trusts the
+    /// `(mtime, len)` change token, so a kill committed by any process before this
+    /// read is seen. The fresh state also refreshes this process's cache.
+    async fn locked_read<T>(&self, f: impl FnOnce(&StorageCache) -> T) -> Result<T, StorageError> {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        match Handle::current().runtime_flavor() {
+            RuntimeFlavor::CurrentThread => self.locked_read_blocking(f),
+            _ => tokio::task::block_in_place(|| self.locked_read_blocking(f)),
+        }
+    }
+
+    /// The blocking body of [`Self::locked_read`].
+    fn locked_read_blocking<T>(
+        &self,
+        f: impl FnOnce(&StorageCache) -> T,
+    ) -> Result<T, StorageError> {
+        let mut flock = self.lock_file_exclusive()?;
+        let _guard = flock.write().map_err(StorageError::Io)?;
+        let cache = self.read_cache_from_disk_sync()?;
+        let out = f(&cache);
+        *self.cache.write() = cache;
+        *self.last_loaded.lock() = self.file_change_token();
+        Ok(out)
+        // `_guard` dropped here releases the lock.
     }
 
     /// Acquire the exclusive cross-process advisory lock on the sidecar `.lock`
@@ -2204,6 +2241,35 @@ impl StorageBackend for FileStorage {
             {
                 Ok(None)
             } else {
+                // P3-KILL, the claim-time kill fence: read with the policies and the
+                // kill marks in this same locked read-modify-write. A fresh claim of an
+                // approval whose agent is halted, or was killed after the approval was
+                // admitted (even if lifted since), is refused and finalized terminally:
+                // nothing ran and it never will. A stale re-take is left to its own
+                // terminal path below (its crashed attempt may already have run).
+                if !(approval.executing && stale) {
+                    let principal = approval.policy_principal();
+                    let verdict = crate::policy::kill_fence_verdict(
+                        cache.policies.values(),
+                        &cache.kill_fence,
+                        &crate::policy::KillFenceQuery {
+                            credential_alias: &approval.credential,
+                            principal: principal.as_ref(),
+                            admitted_epoch: approval.kill_epoch_at_open.unwrap_or(0),
+                        },
+                    );
+                    if let Some(reason) = verdict.refusal_reason() {
+                        tracing::warn!(approval_id = %id, %reason,
+                            "kill fence refused the approval claim; finalized without running");
+                        approval.executed = true;
+                        approval.executing = false;
+                        approval.executing_since = None;
+                        approval.result_status = None;
+                        approval.result_body = None;
+                        approval.result_error = Some(reason);
+                        return Ok(None);
+                    }
+                }
                 // Stage 1 V2, and it runs BEFORE the epoch is advanced or
                 // `executing` is set, so a refusal leaves the record untouched:
                 // re-derive the grant from the PERSISTED sign-off set under this
@@ -2465,8 +2531,37 @@ impl StorageBackend for FileStorage {
     async fn store_policy(&self, policy: &Policy) -> Result<(), StorageError> {
         let policy = policy.clone();
         self.locked_mutate(move |cache| {
+            // P3-KILL: a kill policy bumps the kill epoch and marks its id in the SAME
+            // locked write, so the fence sees the policy and its epoch together.
+            cache.kill_fence.record_store(&policy);
             cache.policies.insert(policy.id.clone(), policy);
             Ok(())
+        })
+        .await
+    }
+
+    async fn kill_fence_epoch(&self) -> u64 {
+        self.cache.read().kill_fence.epoch
+    }
+
+    async fn kill_fence_check(
+        &self,
+        query: &crate::policy::KillFenceQuery<'_>,
+    ) -> Result<crate::policy::KillFenceVerdict, StorageError> {
+        self.locked_read(|cache| {
+            crate::policy::kill_fence_verdict(cache.policies.values(), &cache.kill_fence, query)
+        })
+        .await
+    }
+
+    async fn kill_fence_ack(&self, policy_id: &str) -> Result<Option<u64>, StorageError> {
+        self.locked_read(|cache| {
+            cache
+                .policies
+                .get(policy_id)
+                .filter(|p| p.kill)
+                .and(cache.kill_fence.marks.get(policy_id))
+                .map(|m| m.epoch)
         })
         .await
     }

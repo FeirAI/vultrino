@@ -838,6 +838,39 @@ pub trait StorageBackend: Send + Sync {
         Err(StorageError::PolicyNotFound(id.to_string()))
     }
 
+    // ==================== Kill fence (P3-KILL) ====================
+    //
+    // A kill policy store also bumps the vault's kill epoch and marks the policy id
+    // (kept after a delete), in the same locked mutation. The fence reads them, with
+    // the stored kill policies, from the vault under its cross-process lock, so it
+    // never depends on a process's in-memory engine. See `crate::policy::kill_fence`.
+
+    /// The vault's kill epoch as this process last loaded it: a snapshot that is at
+    /// most the durable value, so work admitted under it is refused by every later
+    /// kill (and, if the snapshot is stale, conservatively by a slightly earlier one).
+    /// Default 0 (every kill refuses).
+    async fn kill_fence_epoch(&self) -> u64 {
+        0
+    }
+
+    /// Read the vault under its cross-process lock and judge the kill fence for this
+    /// work. The default refuses to answer (fail closed: the caller does not dispatch).
+    async fn kill_fence_check(
+        &self,
+        _query: &crate::policy::KillFenceQuery<'_>,
+    ) -> Result<crate::policy::KillFenceVerdict, StorageError> {
+        Err(StorageError::Unavailable(
+            "the kill fence is not supported by this storage backend".to_string(),
+        ))
+    }
+
+    /// Under the vault lock: the kill epoch at which the stored kill policy `policy_id`
+    /// was last stored, or `None` when no stored kill policy has that id. This is the
+    /// fence acknowledgement the halt and kill-policy writes return.
+    async fn kill_fence_ack(&self, _policy_id: &str) -> Result<Option<u64>, StorageError> {
+        Ok(None)
+    }
+
     // ==================== Capability Storage (connector M1) ====================
     //
     // Capabilities are named-MCP-tool definitions (a tool name + action + vault
