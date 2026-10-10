@@ -543,3 +543,22 @@ async fn kill_landing_after_a_live_call_evaluated_blocks_its_dispatch() {
     );
     assert!(out.is_err(), "{out:?}");
 }
+
+/// govder confirms a kill leg only on this acknowledgement: a halt reports the fence live
+/// with a positive epoch (read back from the vault under its lock), and a policy id that is
+/// not a stored kill policy reads back not live.
+#[tokio::test]
+async fn halt_acknowledges_the_fence_live_and_an_unstored_kill_does_not() {
+    let p = pair().await;
+    let halted = p.a.halt_agent(AGENT).await.unwrap();
+    assert!(halted.kill_fence.live, "{halted:?}");
+    assert!(halted.kill_fence.epoch >= 1, "{halted:?}");
+    let missing = vultrino::server::KillFenceAck::read(p.storage_b.as_ref(), "no-such-kill").await;
+    assert!(!missing.live && missing.epoch == 0, "{missing:?}");
+    let other =
+        vultrino::server::KillFenceAck::read(p.storage_b.as_ref(), &halted.deny_policy_id).await;
+    assert!(
+        other.live,
+        "a second process reads the same durable fence: {other:?}"
+    );
+}
