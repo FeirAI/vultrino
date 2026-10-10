@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "repo": "vultrino",
+  "files": [
+    {
+      "file": "approval-assertion.v1.json",
+      "owner": "feir-os",
+      "sha256": "738c1919956760369c68342814234c5bba2edf0b1e6a7f7a998559970bfdd809"
+    },
+    {
+      "file": "outbox-signature.v1.json",
+      "owner": "vultrino",
+      "sha256": "bc64756514343fde45c2f373beaf67449bc7354c89755f16fae052b202d4fb54"
+    },
+    {
+      "file": "tenant-assertion.v1.json",
+      "owner": "govder",
+      "sha256": "3f623a4e2fa45144d0dae27265dd725769d6d9bb59122b7611ff6a3eb8193084"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+diff --git a/src/govder/tenant_assert.rs b/src/govder/tenant_assert.rs
+index bf657a9..aa6874d 100644
+--- a/src/govder/tenant_assert.rs
++++ b/src/govder/tenant_assert.rs
+@@ -31,7 +31,7 @@ pub enum TenantAssertionError {
+ /// lowercase hex characters. Every signer emits it and every verifier enforces it; before
+ /// 2026-10 this verifier also accepted uppercase hex digits and govder accepted any jti.
+ pub fn valid_jti(jti: &str) -> bool {
+-    jti.len() == 16 && jti.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
++    jti.len() == 16 && jti.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+ }
+ 
+ /// The TTL ceiling applied when the configured maximum is zero. A zero maximum is a
