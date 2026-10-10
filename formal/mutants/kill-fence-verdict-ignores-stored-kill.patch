@@ -1,0 +1,12 @@
+diff --git a/src/policy/kill_fence.rs b/src/policy/kill_fence.rs
+index 418784d..a4ff68f 100644
+--- a/src/policy/kill_fence.rs
++++ b/src/policy/kill_fence.rs
+@@ -133,6 +133,7 @@ pub fn kill_fence_verdict<'p>(
+         .into_iter()
+         .filter(|p| {
+             p.kill
++                && false
+                 && credential_matches(&p.credential_pattern, query.credential_alias)
+                 && principal_matches(p.principal_pattern.as_deref(), query.principal)
+         })

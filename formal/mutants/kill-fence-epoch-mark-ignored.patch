@@ -1,0 +1,13 @@
+diff --git a/src/policy/kill_fence.rs b/src/policy/kill_fence.rs
+index 418784d..6b05e6c 100644
+--- a/src/policy/kill_fence.rs
++++ b/src/policy/kill_fence.rs
+@@ -146,7 +146,7 @@ pub fn kill_fence_verdict<'p>(
+     }
+     // BTreeMap order: the first matching mark by policy id.
+     for (id, mark) in &state.marks {
+-        if mark.epoch > query.admitted_epoch
++        if mark.epoch > u64::MAX
+             && credential_matches(&mark.credential_pattern, query.credential_alias)
+             && principal_matches(mark.principal_pattern.as_deref(), query.principal)
+         {
