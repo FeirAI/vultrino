@@ -2250,6 +2250,11 @@
           "path": "src/web/api.rs",
           "symbol": "api_decide_approval",
           "sha256": "bbc2225b19bbb3d5abb125fd79834b9ff2a3d6fe6e2a8262d4414b400a604cb9"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalRequest::transition",
+          "sha256": "99a3400485ee6c8f1170f77e85fe4eb229a2fc1b913a40c246db7e6b1aabb3b3"
         }
       ],
       "mutants": [
