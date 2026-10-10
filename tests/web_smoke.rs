@@ -3393,7 +3393,8 @@ async fn test_json_decision_sod_is_on_by_default_with_verified_approver_identiti
 
     // XV-10: NOTHING is written for separation of duty. With verified approver identities
     // (a distinct VULTRINO_APPROVAL_ASSERTION_SECRET, which the binary passes as `true`) the
-    // default resolves to enforced, so this is the same hard-SoD behaviour with no explicit flag.
+    // default resolves to enforced. The same-key 409 below is independent of the flag (it also
+    // fires with SoD off); the default's own route effect is the self-approval test further down.
     let mut sod_config = Config::default();
     assert!(!sod_config.approval.enforce_separation_of_duty);
     sod_config.approval.apply_sod_default(true);
