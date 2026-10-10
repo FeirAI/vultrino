@@ -399,6 +399,9 @@
     },
     "pop-commit-nonce-uppercase-accepted": {
       "tier": "full"
+    },
+    "tenant-ttl-subsecond-reads-as-unset": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -2018,7 +2021,7 @@
         {
           "path": "src/govder/tenant_assert.rs",
           "symbol": "verify_tenant_assertion",
-          "sha256": "df09c00b60b7681939b7ab8a5b001363e1f9d64f8662aabdd1bad1a7e1b91156"
+          "sha256": "3c0509ea70f34a81b6bf23dc546ae60d62c5d91088ce4594316cf7be39eab766"
         },
         {
           "path": "src/govder/mod.rs",
@@ -2050,7 +2053,7 @@
         {
           "path": "src/govder/tenant_assert.rs",
           "symbol": "verify_tenant_assertion",
-          "sha256": "df09c00b60b7681939b7ab8a5b001363e1f9d64f8662aabdd1bad1a7e1b91156"
+          "sha256": "3c0509ea70f34a81b6bf23dc546ae60d62c5d91088ce4594316cf7be39eab766"
         }
       ],
       "mutants": [
@@ -2316,6 +2319,30 @@
         "pop-commit-nonce-uppercase-accepted"
       ],
       "does_not_establish": "Only the listed inputs and only the input domain (vultrino never commits under another). Copy identity with averin's file is checked only by the local --peer run of check_vectors_lock.py, not by CI. It does not show the nonce is random or that the commitment hides a value."
+    },
+    {
+      "id": "tenant-assertion-subsecond-ttl-parity",
+      "statement": "vultrino's tenant-assertion verifier treats only a zero max TTL as 'use the default ceiling' and a positive sub-second max TTL as a ceiling of its whole seconds (0), the same as govder's Go verifier (pkg/tenantassert.Verify): with a 500 ms ceiling an assertion expiring this second verifies and one expiring a second or a minute later is refused ExcessiveTtl, never widened to the five minute default.",
+      "method": "test",
+      "artifacts": [
+        "src/govder/tenant_assert.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- govder::tenant_assert::tests::sub_second_max_ttl_is_a_ceiling_of_zero_seconds_like_govder",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/govder/tenant_assert.rs",
+          "symbol": "verify_tenant_assertion",
+          "sha256": "3c0509ea70f34a81b6bf23dc546ae60d62c5d91088ce4594316cf7be39eab766"
+        }
+      ],
+      "mutants": [
+        "tenant-ttl-subsecond-reads-as-unset"
+      ],
+      "does_not_establish": "Only the ceiling arithmetic on a 500 ms value and three expiry offsets, in this repository's tests; govder pins the same behaviour in its own test, and the two are not compared by a shared vector (the shared vectors carry whole-second ceilings only). Not what ceiling the web route passes (govder.assertion_ttl capped by the broker maximum)."
     }
   ]
 }
