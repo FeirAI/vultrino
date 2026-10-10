@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -431,6 +432,8 @@ def make_repo(files, mutants=None):
     return d, git
 
 
+M_PATCH = "--- a/m.txt\n+++ b/m.txt\n@@ -1 +1 @@\n-x\n+y\n"
+
 CI_OK = ("name: ci\non: push\njobs:\n  go:\n    runs-on: x\n  nightly:\n    if: github.event_name == 'schedule'\n"
          "    runs-on: x\n  ci-required:\n    if: always()\n    needs: [go]\n    runs-on: x\n")
 
@@ -456,7 +459,7 @@ class ClaimsChecks(unittest.TestCase):
     def setUp(self):
         self.d, self.git = make_repo({
             "p.go": GO_FILE, ".github/workflows/ci.yml": CI_OK, "docs/a.md": "plain text\n",
-            "formal/mutants/add-sub.patch": "",
+            "m.txt": "x\n", "formal/mutants/add-sub.patch": M_PATCH,
         })
         self.claims = self.d / "formal" / "claims.json"
         self.claims.write_text(json.dumps(base_claims(), indent=2) + "\n")
@@ -919,7 +922,7 @@ class RustItems(unittest.TestCase):
 class DocsTable(unittest.TestCase):
     def setUp(self):
         self.d, self.git = make_repo({
-            "p.go": GO_FILE, ".github/workflows/ci.yml": CI_OK, "formal/mutants/add-sub.patch": "",
+            "p.go": GO_FILE, ".github/workflows/ci.yml": CI_OK, "m.txt": "x\n", "formal/mutants/add-sub.patch": M_PATCH,
             "docs/dev/FORMAL.md": "# Formal\n\nintro\n\n<!-- formal-claims:begin -->\nhand written\n<!-- formal-claims:end -->\n\ntail\n",
         })
         self.claims = self.d / "formal" / "claims.json"
@@ -1033,7 +1036,7 @@ class DocsTable(unittest.TestCase):
 class CiRequiredAlways(unittest.TestCase):
     def check(self, ci_required_block):
         wf = "name: ci\non: push\njobs:\n  go:\n    runs-on: x\n  ci-required:\n" + ci_required_block
-        d, _ = make_repo({"p.go": GO_FILE, ".github/workflows/ci.yml": wf, "formal/mutants/add-sub.patch": ""})
+        d, _ = make_repo({"p.go": GO_FILE, ".github/workflows/ci.yml": wf, "m.txt": "x\n", "formal/mutants/add-sub.patch": M_PATCH})
         (d / "formal").mkdir(exist_ok=True)
         (d / "formal" / "claims.json").write_text(json.dumps(base_claims()))
         rep, _ = cc.run_all(d, d / "formal" / "claims.json")
@@ -1324,9 +1327,47 @@ for _name in [n for n in dir(MutantRunner) if n.startswith("test_")]:
     setattr(V2MutantRunner, _name, None)  # inherited tests already run in MutantRunner
 
 
+class StalePatch(unittest.TestCase):
+    """v2.1: every registered mutant patch must apply to the current tree (no build)."""
+
+    def setUp(self):
+        self.d, self.git = make_repo({
+            "p.go": GO_FILE, ".github/workflows/ci.yml": CI_OK, "m.txt": "x\n",
+            "formal/mutants/add-sub.patch": M_PATCH,
+        })
+        self.claims = self.d / "formal" / "claims.json"
+        self.claims.write_text(json.dumps(base_claims(), indent=2) + "\n")
+
+    def mutant_rows(self):
+        rep, _ = cc.run_all(self.d, self.claims, do_relock=True)
+        return [(ok, m) for c, ok, m in rep.rows if c.startswith("mutant add-sub")]
+
+    def test_applying_patch_passes(self):
+        self.assertEqual([ok for ok, _ in self.mutant_rows()], [True])
+
+    def test_stale_patch_fails_with_regenerate_hint(self):
+        (self.d / "m.txt").write_text("changed\n")
+        rows = self.mutant_rows()
+        self.assertEqual([ok for ok, _ in rows], [False])
+        self.assertIn("does not apply", rows[0][1])
+        self.assertIn("regenerate", rows[0][1])
+
+    def test_patch_shared_by_two_claims_is_checked_once(self):
+        d = base_claims()
+        d["claims"].append(dict(d["claims"][0], id="other"))
+        self.claims.write_text(json.dumps(d))
+        self.assertEqual(len(self.mutant_rows()), 1)
+
+    def test_mutated_tree_env_skips_the_check(self):
+        (self.d / "m.txt").write_text("y\n")  # the patch is already applied, as inside check_mutants
+        with mock.patch.dict(os.environ, {"FORMAL_KIT_MUTATED_TREE": "1"}):
+            self.assertEqual([ok for ok, _ in self.mutant_rows()], [True])
+        self.assertEqual([ok for ok, _ in self.mutant_rows()], [False])
+
+
 class KitVersion(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(fk.KIT_VERSION, "2")
+        self.assertEqual(fk.KIT_VERSION, "2.1")
         import io
         from contextlib import redirect_stdout
         d, _ = make_repo({"x": "1"})

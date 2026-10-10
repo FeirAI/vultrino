@@ -216,17 +216,37 @@ def relock(claims_path: Path, results: List[CoverResult], only: Optional[List[st
             for r in changes]
 
 
+MUTATED_TREE_ENV = "FORMAL_KIT_MUTATED_TREE"
+
+
 def check_mutants_files(root: Path, data: dict, rep: Report) -> None:
+    # Under check_mutants.py the tree is deliberately mutated (the patch is already applied), so a
+    # detector that runs this checker must not be killed by "patch does not apply"; the runner has
+    # already proved the patch applied to the unmutated tree.
+    mutated = os.environ.get(MUTATED_TREE_ENV) == "1"
     specs, errs = fk.resolve_mutants(data)
     for e in errs:
         rep.fail("mutants", e)
     referenced: Set[str] = set()
+    applied: Set[str] = set()
     for c in data.get("claims", []):
         for m in c.get("mutants", []):
             referenced.add(m)
             p = root / "formal" / "mutants" / (m + ".patch")
             if p.is_file():
-                rep.ok("mutant %s" % m, c["id"])
+                if m in applied:
+                    continue
+                applied.add(m)
+                if mutated:
+                    rep.ok("mutant %s" % m, c["id"])
+                    continue
+                chk = subprocess.run(["git", "apply", "--check", str(p)], cwd=str(root), capture_output=True,
+                                     text=True, encoding="utf-8", errors="replace")
+                if chk.returncode == 0:
+                    rep.ok("mutant %s" % m, c["id"])
+                else:
+                    rep.fail("mutant %s" % m, "claim %s: formal/mutants/%s.patch does not apply to the current tree "
+                             "(stale after a source change; regenerate it): %s" % (c["id"], m, chk.stderr.strip()[:300]))
             else:
                 rep.fail("mutant %s" % m, "claim %s: formal/mutants/%s.patch is missing" % (c["id"], m))
     d = root / "formal" / "mutants"
