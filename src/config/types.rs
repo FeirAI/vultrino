@@ -663,7 +663,9 @@ pub struct RawApprovalConfig {
     #[serde(default)]
     pub reauth_interval_secs: Option<u64>,
     /// Hard-reject self-approvals (separation of duty) rather than only recording
-    /// them (V5).
+    /// them (V5). Unset: ON when approver identities are verified (a distinct
+    /// `VULTRINO_APPROVAL_ASSERTION_SECRET`), OFF otherwise (dev); see
+    /// `ApprovalConfig::apply_sod_default`. An explicit value always wins.
     #[serde(default)]
     pub enforce_separation_of_duty: Option<bool>,
     /// Distinct approvers a dual-control request requires (V12 M-of-N; default 2).
@@ -827,6 +829,7 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
             // window in `needs_reauth`.)
             reauth_interval_secs: raw.reauth_interval_secs.filter(|&s| s > 0),
             enforce_separation_of_duty: raw.enforce_separation_of_duty.unwrap_or(false),
+            sod_explicit: raw.enforce_separation_of_duty.is_some(),
             dual_control_approvers: raw.dual_control_approvers.filter(|m| *m >= 2).unwrap_or(2),
         })
     }
@@ -1294,6 +1297,19 @@ action = "deny"
         assert!(Config::parse(&format!("[approvals]\nenabled = false\n{tg}")).is_ok());
         // No notifier at all → identity not required.
         assert!(Config::parse("[approvals]\nenabled = true").is_ok());
+    }
+
+    #[test]
+    fn test_sod_explicit_is_recorded_from_the_config() {
+        let unset = Config::parse("[approvals]\nenabled = true").unwrap();
+        assert!(!unset.approval.sod_explicit);
+        assert!(!unset.approval.enforce_separation_of_duty);
+        let off = Config::parse("[approvals]\nenabled = true\nenforce_separation_of_duty = false")
+            .unwrap();
+        assert!(off.approval.sod_explicit && !off.approval.enforce_separation_of_duty);
+        let on = Config::parse("[approvals]\nenabled = true\nenforce_separation_of_duty = true")
+            .unwrap();
+        assert!(on.approval.sod_explicit && on.approval.enforce_separation_of_duty);
     }
 
     #[test]

@@ -2879,12 +2879,43 @@ pub struct ApprovalConfig {
     /// When true, a self-approval (approver == requesting agent) is **rejected**
     /// at decision time (V5); otherwise it is recorded + logged but allowed.
     pub enforce_separation_of_duty: bool,
+    /// True when `[approvals] enforce_separation_of_duty` was written in the config (either value).
+    /// An explicit setting always wins over the verified-approver default
+    /// ([`ApprovalConfig::apply_sod_default`]).
+    pub sod_explicit: bool,
     /// Number of distinct approvers a dual-control request requires (V12 M-of-N).
     /// Defaults to 2; only takes effect for requests flagged `dual_control`.
     pub dual_control_approvers: u32,
 }
 
 impl ApprovalConfig {
+    /// Resolve the separation-of-duty posture once the approver-identity posture is known.
+    ///
+    /// Separation of duty ("the approver must not be the requester") is only meaningful when the
+    /// approver identity is authenticated. With a distinct `VULTRINO_APPROVAL_ASSERTION_SECRET`
+    /// the identity is the broker's signed assertion of an IdP subject, so enforcement is ON BY
+    /// DEFAULT; an operator who writes `enforce_separation_of_duty` in `[approvals]` keeps that
+    /// value, either way. Without verified approver identities (dev mode: an identity is whatever
+    /// was typed into a login form) the default stays off, because blocking a self-approval of an
+    /// unauthenticated name would stop nothing and break single-person development.
+    ///
+    /// Returns the one-line posture to log at startup.
+    pub fn apply_sod_default(&mut self, approver_identities_verified: bool) -> &'static str {
+        match (self.sod_explicit, approver_identities_verified) {
+            (true, true) if !self.enforce_separation_of_duty => {
+                "separation of duty is explicitly OFF while approver identities are verified: a requester can approve its own request"
+            }
+            (true, _) => "separation of duty follows the explicit [approvals] setting",
+            (false, true) => {
+                self.enforce_separation_of_duty = true;
+                "separation of duty is ON by default (approver identities are verified)"
+            }
+            (false, false) => {
+                "separation of duty is OFF by default (no verified approver identities: dev mode)"
+            }
+        }
+    }
+
     /// The startup warning to print when approvals are DISABLED, or `None` when they
     /// are on.
     ///
@@ -5122,6 +5153,36 @@ mod finding_6a_startup_warning_tests {
                  tell what breaks or how to fix it.\nwarning: {w}"
             );
         }
+    }
+
+    #[test]
+    fn sod_defaults_on_only_with_verified_approver_identities() {
+        // Verified approver identities, nothing written in the config: ON.
+        let mut cfg = ApprovalConfig::default();
+        let line = cfg.apply_sod_default(true);
+        assert!(cfg.enforce_separation_of_duty, "{line}");
+        // No verified identities (dev mode): OFF, and it says so.
+        let mut dev = ApprovalConfig::default();
+        let line = dev.apply_sod_default(false);
+        assert!(!dev.enforce_separation_of_duty);
+        assert!(line.contains("OFF by default"), "{line}");
+        // An explicit false wins over the verified default, and the log line warns.
+        let mut off = ApprovalConfig {
+            sod_explicit: true,
+            enforce_separation_of_duty: false,
+            ..Default::default()
+        };
+        let line = off.apply_sod_default(true);
+        assert!(!off.enforce_separation_of_duty);
+        assert!(line.contains("explicitly OFF"), "{line}");
+        // An explicit true holds without verified identities.
+        let mut on = ApprovalConfig {
+            sod_explicit: true,
+            enforce_separation_of_duty: true,
+            ..Default::default()
+        };
+        on.apply_sod_default(false);
+        assert!(on.enforce_separation_of_duty);
     }
 
     #[test]

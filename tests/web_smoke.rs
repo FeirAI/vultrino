@@ -3371,6 +3371,129 @@ async fn test_json_decision_hard_sod_blocks_same_key_second_signoff() {
     );
 }
 
+#[tokio::test]
+async fn test_json_decision_sod_is_on_by_default_with_verified_approver_identities() {
+    // XV-10 twin of the explicit-flag test above. #2: under hard separation-of-duty, a SINGLE aggregator key must not satisfy a
+    // dual-control (M-of-N) threshold by inventing two distinct operator names.
+    // The first sign-off records `agg:<key-id>:alice`; the second from the same key
+    // (`agg:<key-id>:bob`) is rejected 409 before it can satisfy threshold 2.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let seed = AuthManager::new();
+    let (key, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some("team-a".to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    // XV-10: NOTHING is written for separation of duty. With verified approver identities
+    // (a distinct VULTRINO_APPROVAL_ASSERTION_SECRET, which the binary passes as `true`) the
+    // default resolves to enforced, so this is the same hard-SoD behaviour with no explicit flag.
+    let mut sod_config = Config::default();
+    assert!(!sod_config.approval.enforce_separation_of_duty);
+    sod_config.approval.apply_sod_default(true);
+    assert!(sod_config.approval.enforce_separation_of_duty);
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        sod_config,
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    // A dual-control (2-of-N) approval tagged to the acting tenant.
+    let (approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo::local(),
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: Some("team-a".to_string()),
+        workload_id: None,
+        preview: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: true,
+        criticality: vultrino::approval::CriticalityClass::High,
+        trusted_irreversible: None,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 2,
+        approval_rule: None,
+    });
+    let id = approval.id.clone();
+    storage.store_approval(&approval).await.unwrap();
+
+    // First sign-off as "alice" → 200, still awaiting a second distinct approver.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        body["status"], "pending",
+        "one of two sign-offs: still open"
+    );
+    assert_eq!(body["approvals_received"], 1);
+
+    // Second sign-off as a DIFFERENT operator name but the SAME aggregator key →
+    // 409. The key cannot fabricate the second distinct approver under hard SoD.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "bob@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "the same aggregator key cannot satisfy M-of-N with a second invented name",
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "separation_of_duty");
+
+    // The approval is still pending (not granted by the single key).
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(
+        stored.signoffs().len(),
+        1,
+        "the second same-key sign-off was not recorded"
+    );
+}
+
 /// Build a tenant-scoped, hard-SoD router + a stored dual-control (2-of-N)
 /// approval, returning (router, storage, key, approval-id). Shared by the same-key
 /// M-of-N regression tests.

@@ -602,6 +602,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(govder) = config.govder.as_ref() {
         govder.log_approval_key_posture();
     }
+    // Separation of duty defaults ON when approver identities are verified, OFF in dev; an
+    // explicit `[approvals] enforce_separation_of_duty` always wins. Say which one is running.
+    {
+        let verified = config
+            .govder
+            .as_ref()
+            .is_some_and(|g| g.approver_identities_verified());
+        let posture = config.approval.apply_sod_default(verified);
+        if config.approval.enabled {
+            tracing::info!("{posture}");
+        }
+    }
     // averin seal-client API key (plan 086): env-only so a config dump never
     // carries it. Only consulted when `[averin] enabled = true`.
     config.averin.api_key = std::env::var("AVERIN_API_KEY")

@@ -115,6 +115,14 @@ impl GovderConfig {
         }
     }
 
+    /// True when approver identities are VERIFIED: a dedicated, distinct approver-identity key is
+    /// configured, so a decision's approver is the broker's signed assertion of an authenticated
+    /// subject, not a typed-in name. Drives the separation-of-duty default
+    /// (`ApprovalConfig::apply_sod_default`). The shared-key dev escape does not count.
+    pub fn approver_identities_verified(&self) -> bool {
+        self.approval_key_is_distinct()
+    }
+
     /// True when the dedicated approver-identity key is configured and distinct.
     /// The dedicated key is always trimmed on load while the shared key is not,
     /// so compare against the trimmed shared key: a copy of F that differs only
@@ -1018,6 +1026,16 @@ mod tests {
         tracing::subscriber::with_default(sub, || c.log_approval_key_posture());
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         out
+    }
+
+    #[test]
+    fn approver_identities_are_verified_only_with_a_distinct_key() {
+        assert!(!cfg(None, false).approver_identities_verified());
+        assert!(!cfg(Some("shared-f"), false).approver_identities_verified());
+        assert!(cfg(Some("m"), false).approver_identities_verified());
+        // The shared-key dev escape is not verification.
+        assert!(!cfg(None, true).approver_identities_verified());
+        assert!(!cfg(Some("shared-f"), true).approver_identities_verified());
     }
 
     #[test]
