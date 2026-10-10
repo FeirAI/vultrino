@@ -402,6 +402,12 @@
     },
     "tenant-ttl-subsecond-reads-as-unset": {
       "tier": "full"
+    },
+    "xv10-sod-default-ignores-verified": {
+      "tier": "fast"
+    },
+    "xv10-sod-explicit-false-overridden": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -2343,6 +2349,39 @@
         "tenant-ttl-subsecond-reads-as-unset"
       ],
       "does_not_establish": "Only the ceiling arithmetic on a 500 ms value and three expiry offsets, in this repository's tests; govder pins the same behaviour in its own test, and the two are not compared by a shared vector (the shared vectors carry whole-second ceilings only). Not what ceiling the web route passes (govder.assertion_ttl capped by the broker maximum)."
+    },
+    {
+      "id": "sod-default-with-verified-approvers",
+      "statement": "With a distinct approver-identity key configured (verified approver identities) and nothing written for enforce_separation_of_duty, separation of duty resolves to enforced, and a second sign-off from the same aggregator key is refused 409 separation_of_duty by the decision route with no explicit flag; an explicit false in [approvals] keeps it off and the startup line says so; without verified identities (dev mode) the default stays off and the startup line says so; an explicit true holds in every case.",
+      "method": "test",
+      "artifacts": [
+        "src/approval/mod.rs",
+        "src/config/types.rs",
+        "src/govder/mod.rs",
+        "src/main.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::tests::sod_defaults_on_only_with_verified_approver_identities govder::tests::approver_identities_are_verified_only_with_a_distinct_key config::types::tests::test_sod_explicit_is_recorded_from_the_config && cargo test --locked --no-default-features --test web_smoke -- --exact test_json_decision_sod_is_on_by_default_with_verified_approver_identities",
+      "covers": [
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalConfig::apply_sod_default",
+          "sha256": "ae56e42fa8e81d14f4839b95b3fd0e4ae963101752b959dfbc1dcc809a7e7d99"
+        },
+        {
+          "path": "src/govder/mod.rs",
+          "symbol": "GovderConfig::approver_identities_verified",
+          "sha256": "9252067f169716a3a6ab547790c297d527511a5354cf088334bb6527d5884b5a"
+        }
+      ],
+      "mutants": [
+        "xv10-sod-default-ignores-verified",
+        "xv10-sod-explicit-false-overridden"
+      ],
+      "does_not_establish": "That main.rs calls apply_sod_default with the live key posture before serving (a wiring line, covered by the four-plane e2e self-approval leg, not by this detector or a drift lock); that the approver identity is authenticated (the broker signs only under a real IdP; the dev escape VULTRINO_ALLOW_SHARED_APPROVAL_KEY and FEIR_OS_ALLOW_DEV_VERIFIED_APPROVERS are documented dev/test postures that weaken it); that requester and approver are compared on the same identity namespace (an owner that differs from the approver's IdP subject is not a self-approval); and nothing about [approvals] enabled."
     }
   ]
 }

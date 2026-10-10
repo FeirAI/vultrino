@@ -55,7 +55,7 @@ ttl_secs = 3600                                   # default Medium-class total w
 public_base_url = "https://vultrino.example.com"  # base for approve/deny links
 oob_approver_identity = "oncall@example.com"      # REQUIRED with a notifier (V5): identity OOB links are bound to
 reauth_interval_secs = 900                         # optional continuous re-auth (V5)
-enforce_separation_of_duty = false                 # hard-reject self-approvals (V5)
+enforce_separation_of_duty = true                  # hard-reject self-approvals (V5); unset = on when approver identities are verified, off in dev
 dual_control_approvers = 2                          # distinct approvers for dual control (V12)
 
 [approvals.telegram]                              # inline Approve / Deny buttons

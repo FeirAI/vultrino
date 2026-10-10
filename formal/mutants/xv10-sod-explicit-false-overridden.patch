@@ -1,0 +1,12 @@
+diff --git a/src/approval/mod.rs b/src/approval/mod.rs
+index 64cce28..19a59f3 100644
+--- a/src/approval/mod.rs
++++ b/src/approval/mod.rs
+@@ -2903,6 +2903,7 @@ impl ApprovalConfig {
+     pub fn apply_sod_default(&mut self, approver_identities_verified: bool) -> &'static str {
+         match (self.sod_explicit, approver_identities_verified) {
+             (true, true) if !self.enforce_separation_of_duty => {
++                self.enforce_separation_of_duty = true;
+                 "separation of duty is explicitly OFF while approver identities are verified: a requester can approve its own request"
+             }
+             (true, _) => "separation of duty follows the explicit [approvals] setting",

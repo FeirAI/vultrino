@@ -405,7 +405,12 @@ ttl_secs                    = 3600   # default 3600 — a CEILING, not a promise
 public_base_url             = "https://vultrino.example.com"  # for approve/deny links
 oob_approver_identity       = "oncall@example.com"  # REQUIRED if a notifier is set
 reauth_interval_secs        = 900    # continuous re-auth window, seconds (optional; 0/absent = off)
-enforce_separation_of_duty  = false  # hard-reject self-approvals (default false: record only)
+# enforce_separation_of_duty: hard-reject self-approvals. UNSET (recommended): ON when approver
+# identities are verified (a distinct VULTRINO_APPROVAL_ASSERTION_SECRET is set, so the broker
+# signs the decider), OFF otherwise (dev mode: record only). An explicit true/false always wins;
+# an explicit false with verified identities logs that a requester can approve its own request.
+# The startup log says which posture is running.
+enforce_separation_of_duty  = true
 dual_control_approvers      = 2      # distinct approvers for a dual-control request (min/default 2)
 
 [approvals.telegram]
