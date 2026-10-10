@@ -1,0 +1,12 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 41a3569..c3f0b65 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -4515,7 +4515,6 @@ impl VultrinoServer {
+     pub async fn load_stored_policies_at_startup(&self) -> Result<(), VultrinoError> {
+         match self.reload_policies().await {
+             Ok(()) => Ok(()),
+-            Err(e @ VultrinoError::Policy(crate::policy::PolicyError::Invalid(_))) => Err(e),
+             Err(e) => {
+                 warn!(error = %e, "failed to load stored policies at startup; the periodic refresh retries");
+                 Ok(())

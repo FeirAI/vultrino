@@ -309,6 +309,23 @@ enum Commands {
         #[command(subcommand)]
         command: ApprovalCommands,
     },
+
+    /// Repair stored (admin-API-managed) policies offline, without a running server
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCommands {
+    /// Set a stored policy's default_action to "deny", keeping its rules. This is
+    /// the fix for a stored RateLimit policy that the servers refuse to load
+    /// because its default is allow or prompt.
+    DenyDefault {
+        /// Stored policy id (the startup error names it)
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -808,6 +825,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 revoke_use_token(config, id).await?;
             }
         },
+        Commands::Policy { command } => match command {
+            PolicyCommands::DenyDefault { id } => {
+                policy_deny_default(config, id).await?;
+            }
+        },
         Commands::Approval { command } => match command {
             ApprovalCommands::List { format } => {
                 list_approvals(config, format).await?;
@@ -1140,10 +1162,9 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
         eprintln!("Warning: Failed to load plugins: {}", e);
     }
     // Merge admin-API-managed policies into the engine (V1) so this process
-    // enforces the same policy set govder pushed to the web server.
-    if let Err(e) = server.reload_policies().await {
-        eprintln!("Warning: Failed to load stored policies: {}", e);
-    }
+    // enforces the same policy set govder pushed to the web server. A stored
+    // policy refused on load (P3-FLOORS) stops the start; other failures warn.
+    server.load_stored_policies_at_startup().await?;
     // The admin API runs on the web process; refresh periodically so policies
     // pushed there (e.g. an emergency Deny) propagate to this MCP process.
     tokio::spawn(vultrino::server::refresh_policies_periodically(
@@ -1243,10 +1264,9 @@ async fn run_web_server(
     if let Err(e) = exec_server.load_plugins().await {
         warn!("Failed to load plugins: {}", e);
     }
-    // Merge admin-API-managed policies into the engine (V1).
-    if let Err(e) = exec_server.reload_policies().await {
-        warn!("Failed to load stored policies: {}", e);
-    }
+    // Merge admin-API-managed policies into the engine (V1). A stored policy
+    // refused on load (P3-FLOORS) stops the start; other failures warn.
+    exec_server.load_stored_policies_at_startup().await?;
     let exec_server = Arc::new(exec_server);
     // Refresh periodically so policies pushed by another writer (HA replica /
     // external process) propagate here too. The process serving the admin API
@@ -1670,6 +1690,20 @@ async fn list_credentials(
         }
     }
 
+    Ok(())
+}
+
+/// `vultrino policy deny-default <id>`: the offline fix for a stored policy the
+/// servers refuse to load (P3-FLOORS). It only tightens: default_action becomes
+/// deny and the rules are kept.
+async fn policy_deny_default(config: Config, id: String) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = init_storage(&config).await?;
+    let changed = vultrino::policy::set_stored_policy_default_deny(&*storage, &id).await?;
+    if changed {
+        println!("Policy {id}: default_action set to \"deny\" (rules kept).");
+    } else {
+        println!("Policy {id}: default_action was already \"deny\"; nothing changed.");
+    }
     Ok(())
 }
 

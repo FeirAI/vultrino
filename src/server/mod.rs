@@ -4683,6 +4683,11 @@ impl VultrinoServer {
     /// and after every admin policy mutation so a runtime push takes effect
     /// without a restart. Config policies remain declarative/code-managed; the
     /// admin API only adds, edits, or removes *stored* policies (by id).
+    ///
+    /// A stored RateLimit policy whose default action is not deny is REFUSED
+    /// (P3-FLOORS, [`crate::policy::Policy::stored_load_refusal`]): this returns
+    /// `VultrinoError::Policy(PolicyError::Invalid)` naming the policy and the fix,
+    /// and the live set is left unchanged.
     pub async fn reload_policies(&self) -> Result<(), VultrinoError> {
         // Ticket first (after the caller's storage write), then list, then a
         // compare-and-swap apply: a concurrent periodic refresh that listed
@@ -4690,9 +4695,31 @@ impl VultrinoServer {
         let _cycle = self.policy_engine.lock_load().await;
         let ticket = self.policy_engine.begin_load();
         let stored = self.storage.list_stored_policies().await?;
+        if let Err(refusal) = crate::policy::refuse_unloadable_stored_policies(&stored) {
+            tracing::error!(error = %refusal, "stored policy refused on load; the live policy set is unchanged");
+            return Err(VultrinoError::Policy(crate::policy::PolicyError::Invalid(
+                refusal,
+            )));
+        }
         self.policy_engine
             .load_policies_if_newer(ticket, merge_policies(&self.config.policies, stored));
         Ok(())
+    }
+
+    /// The startup load of stored policies for the long-running servers (`web`,
+    /// `serve --mcp`). A stored policy refused on load (see [`Self::reload_policies`])
+    /// is a startup ERROR: the caller must not start. Any other failure keeps the
+    /// historic behaviour (logged, the server starts with the config policies and
+    /// the periodic refresh retries).
+    pub async fn load_stored_policies_at_startup(&self) -> Result<(), VultrinoError> {
+        match self.reload_policies().await {
+            Ok(()) => Ok(()),
+            Err(e @ VultrinoError::Policy(crate::policy::PolicyError::Invalid(_))) => Err(e),
+            Err(e) => {
+                warn!(error = %e, "failed to load stored policies at startup; the periodic refresh retries");
+                Ok(())
+            }
+        }
     }
 
     /// Get the server configuration
@@ -5908,6 +5935,20 @@ pub async fn refresh_policies_with_hooks(
     storage.reload().await?;
     let stored = storage.list_stored_policies().await?;
     after_list.await;
+    if let Err(refusal) = crate::policy::refuse_unloadable_stored_policies(&stored) {
+        // P3-FLOORS: never apply a set that holds a refused stored policy. The live
+        // set stays as it is; logged once per distinct refusal per process.
+        static SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        if SEEN
+            .get_or_init(Default::default)
+            .lock()
+            .insert(refusal.clone())
+        {
+            tracing::error!(error = %refusal, "periodic policy refresh refused a stored policy; the live policy set is unchanged");
+        }
+        return Ok(());
+    }
     if !engine.load_policies_if_newer(ticket, merge_policies(config_policies, stored)) {
         tracing::debug!("periodic policy refresh superseded by a newer load; discarded");
     }

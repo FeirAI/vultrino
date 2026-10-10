@@ -1,0 +1,3803 @@
+{
+ "format": "feir.tenant-assertion",
+ "version": 1,
+ "owner": "govder",
+ "generator": "scripts/vectors/gen_tenant_assertion.py (independent Python reference, stdlib only)",
+ "spec": [
+  "Header X-Govder-Tenant-Assertion: <seg0>.<seg1>.<seg2>.<mac> (exactly four segments split on '.').",
+  "seg0 = base64url without padding of the tenant's UTF-8 bytes, canonical (no '=', zero trailing bits). The tenant is non-empty, valid UTF-8, and has no byte below 0x20 and no 0x7f.",
+  "seg1 = expiry, unix seconds, canonical decimal: ^[1-9][0-9]{0,18}$ and at most 2^63-1. No sign, no leading zero.",
+  "seg2 = jti: ^[0-9a-f]{16}$ (64 bits from a CSPRNG, lowercase hex). Every signer emits it and every verifier enforces it.",
+  "mac = base64url without padding of HMAC-SHA256(key, payload), canonical (43 characters).",
+  "payload = seg0 '.' seg1 '.' seg2 LF ascii_upper(method) LF path LF query LF ascii_lower(host) LF base64url_nopad(sha256(body)).",
+  "ascii_upper and ascii_lower change only the ASCII letters A-Z and a-z; every other byte is kept.",
+  "path is the path of the request-target EXACTLY as transmitted: percent-encoding kept byte for byte (no decoding, no re-encoding, no case change of hex digits, no dot-segment removal). A signer signs the path it puts on the wire; a verifier uses the raw path it received.",
+  "query is the raw query as transmitted, without the '?' (empty when absent).",
+  "host is the Host header value (authority), compared after ascii_lower.",
+  "verify.expected_tenant is the tenant a verifier that is told which tenant to expect (vultrino) is configured with; govder derives the tenant and must return exactly the vector's tenant on accept.",
+  "A verifier rejects unless: the grammar above holds, the MAC matches one accepted key (constant-time), now <= exp, and exp - now <= max_ttl_s. A max TTL of zero or less is a configuration error: the verifier applies its default ceiling, never no ceiling.",
+  "Replay is verifier policy and not in these vectors: govder consumes (seg0, jti) until exp; vultrino's approval route relies on the one-way approval transition."
+ ],
+ "consumers": [
+  "govder pkg/tenantassert (Go signer and verifier) and internal/httpx (verifier middleware)",
+  "vultrino src/govder/tenant_assert.rs (Rust signer and verifier)",
+  "feir-os app/internal/crypto (LocalSigner, KMSSigner) over the vendored pkg/tenantassert"
+ ],
+ "reasons": {
+  "malformed": "a grammar rule failed",
+  "bad_mac": "no accepted key produces the MAC",
+  "expired": "now > exp",
+  "ttl": "exp - now > max_ttl_s",
+  "any": "any reject reason"
+ },
+ "vectors": [
+  {
+   "id": "get-basic",
+   "note": "plain GET, no query, empty body",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "0123456789abcdef",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/registry/agents",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.0123456789abcdef\nGET\n/v1/registry/agents\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.0123456789abcdef.RdVNOIXFMD_je0Wa8hwIx6LrTQgXvXRKn8CHYTJhT9k",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/registry/agents",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "post-json-body",
+   "note": "POST with a JSON body bound by its digest",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "fedcba9876543210",
+    "exp": 1767322090,
+    "method": "POST",
+    "path": "/v1/connectors/agents/agent-7/provision",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsIm5vdGUiOiJvayJ9"
+   },
+   "payload": "YWNtZQ.1767322090.fedcba9876543210\nPOST\n/v1/connectors/agents/agent-7/provision\n\ngovder.internal:8080\nkzPLwpEUIAoMWvwAlFJgLMpupECbmUH8g_lbeWNwiV8",
+   "assertion": "YWNtZQ.1767322090.fedcba9876543210.4TpeQACJEva-BP22rkyxFWfg2uv08VtoWTRmkcnVxSo",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "POST",
+     "path": "/v1/connectors/agents/agent-7/provision",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsIm5vdGUiOiJvayJ9"
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "query-raw",
+   "note": "query string bound raw",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "00000000000000ff",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/oversight/gates/rule",
+    "query": "agent_id=a1&action_class=money.refund",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.00000000000000ff\nGET\n/v1/oversight/gates/rule\nagent_id=a1&action_class=money.refund\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.00000000000000ff.bdAvHus96Jyog8OL-34de-JDPf1qW1zEVRkNdiCL5vE",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/oversight/gates/rule",
+     "query": "agent_id=a1&action_class=money.refund",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "query-percent-kept",
+   "note": "percent-encoding in the query is kept as sent",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "1111111111111111",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/registry/agents",
+    "query": "q=two%20words&x=%2F",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.1111111111111111\nGET\n/v1/registry/agents\nq=two%20words&x=%2F\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.1111111111111111.pUE1P-TMpyOKlJ-NrRML4tIZnP_GnfktQwWDQ5ZwLas",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/registry/agents",
+     "query": "q=two%20words&x=%2F",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "method-lowercase-signed",
+   "note": "the signer's method is ASCII-uppercased in the payload",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "2222222222222222",
+    "exp": 1767322090,
+    "method": "post",
+    "path": "/v1/x",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": "e30="
+   },
+   "payload": "YWNtZQ.1767322090.2222222222222222\nPOST\n/v1/x\n\ngovder.internal:8080\nRBNvo1WzZ4oRRq0W9-hknpT7T8If536DEMBg9hyq_4o",
+   "assertion": "YWNtZQ.1767322090.2222222222222222.DdDtgi_v9RsclflzJ-ISkqkgW6hUvKVyr7_4RdvWk7I",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "POST",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": "e30="
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "host-mixed-case",
+   "note": "host is ASCII-lowercased on both sides",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "3333333333333333",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/x",
+    "query": "",
+    "host": "GovDer.Internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.3333333333333333\nGET\n/v1/x\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.3333333333333333.H4TeaUKJqKrWZNUk0LLACxv1_1GHwC32PLdhkjxFogU",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "GOVDER.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "host-non-ascii-kept",
+   "note": "ascii_lower keeps non-ASCII: U+212A KELVIN SIGN is not lowered to k",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "4444444444444444",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/x",
+    "query": "",
+    "host": "\u212a.example:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.4444444444444444\nGET\n/v1/x\n\n\u212a.example:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.4444444444444444.Ympy1fNWwcPs6Y_9gCMBxTQpVZRB53nF-M5TgB5KCPQ",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "\u212a.example:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "path-pct2f-raw",
+   "note": "an id containing '/' travels as %2F and is signed raw (GVF-11)",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "5555555555555555",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/connectors/agents/team%2Fa/budget",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.5555555555555555\nGET\n/v1/connectors/agents/team%2Fa/budget\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.5555555555555555.1D8dFZobgLIXGqHt1Y9CSzeKVkY4FMuGsWbab9GrClc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/connectors/agents/team%2Fa/budget",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "path-pct20-raw",
+   "note": "an id containing a space travels as %20 and is signed raw (XV-07)",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "6666666666666666",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/connectors/agents/a%20b",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.6666666666666666\nGET\n/v1/connectors/agents/a%20b\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.6666666666666666.ZzLfjIlIDlhwJQ9X7wNoifvZPV1GKrXyp-KH55w0Kn8",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/connectors/agents/a%20b",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "path-pct-lowercase-hex",
+   "note": "lowercase hex digits in a percent-escape are kept as sent",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "7777777777777777",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/connectors/agents/a%2fb",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.7777777777777777\nGET\n/v1/connectors/agents/a%2fb\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.7777777777777777.Z5kFLkFjKg-EhfTBosVQAIiAgJ8kcgapDf-_aHvVwrE",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/connectors/agents/a%2fb",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "approval-decision-route",
+   "note": "the approval decision route as the broker signs it",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "8888888888888888",
+    "exp": 1767322090,
+    "method": "POST",
+    "path": "/api/v1/approvals/appr_01HZX/decision",
+    "query": "",
+    "host": "vultrino.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsIm5vdGUiOiJvayJ9"
+   },
+   "payload": "YWNtZQ.1767322090.8888888888888888\nPOST\n/api/v1/approvals/appr_01HZX/decision\n\nvultrino.internal:8080\nkzPLwpEUIAoMWvwAlFJgLMpupECbmUH8g_lbeWNwiV8",
+   "assertion": "YWNtZQ.1767322090.8888888888888888.7cVyp7lDt1zQay-0q0ki5w8tTWIbQdQ1IyPwkDPxgLk",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr_01HZX/decision",
+     "query": "",
+     "host": "vultrino.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsIm5vdGUiOiJvayJ9"
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "tenant-unicode",
+   "note": "a non-ASCII UTF-8 tenant",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "caf\u00e9-\u00fc",
+    "jti": "9999999999999999",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/x",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "Y2Fmw6ktw7w.1767322090.9999999999999999\nGET\n/v1/x\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "Y2Fmw6ktw7w.1767322090.9999999999999999.SlFkip0PthXBKsQqUvUZHjVCSbjnh-JyKsgBNyHQCKY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "caf\u00e9-\u00fc",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "caf\u00e9-\u00fc"
+  },
+  {
+   "id": "body-binary",
+   "note": "arbitrary body bytes",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "aaaaaaaaaaaaaaaa",
+    "exp": 1767322090,
+    "method": "PUT",
+    "path": "/v1/x",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": "AP8KLg=="
+   },
+   "payload": "YWNtZQ.1767322090.aaaaaaaaaaaaaaaa\nPUT\n/v1/x\n\ngovder.internal:8080\nhCULfW9H7r4o7FJb4WHUnas_THsoQBZKWDUzr5D6PD0",
+   "assertion": "YWNtZQ.1767322090.aaaaaaaaaaaaaaaa.hOdW_7_JjIi-gZ2Pzs3vYlVusGjPzMlyV55Ylmgl9Ys",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "PUT",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": "AP8KLg=="
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "exp-equals-now",
+   "note": "now == exp is still valid",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "bbbbbbbbbbbbbbbb",
+    "exp": 1767322000,
+    "method": "GET",
+    "path": "/v1/x",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322000.bbbbbbbbbbbbbbbb\nGET\n/v1/x\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322000.bbbbbbbbbbbbbbbb.P_3645Zy7y-daGKcy-fehelYeb1iJpQNU9G5eZEjWRM",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "ttl-equals-max",
+   "note": "exp - now == max TTL is still valid",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "cccccccccccccccc",
+    "exp": 1767322300,
+    "method": "GET",
+    "path": "/v1/x",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322300.cccccccccccccccc\nGET\n/v1/x\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322300.cccccccccccccccc.MiJ21ZCurQxQV-jvbHG4XSW1lMEWqofioUSAqgmhhaM",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "acme"
+  },
+  {
+   "id": "path-decoded-vs-raw",
+   "note": "signed over the DECODED path, sent raw with %2F: different paths",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "dddddddddddddddd",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/connectors/agents/team/a/budget",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.dddddddddddddddd\nGET\n/v1/connectors/agents/team/a/budget\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.dddddddddddddddd.cLSZUDX1LX9IPpoQqMJi2eY8iTPtB6Hx2X1QV_KhXzA",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/connectors/agents/team%2Fa/budget",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "path-double-escaped",
+   "note": "signed single-escaped, sent double-escaped (%252F): different paths",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "eeeeeeeeeeeeeeee",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/connectors/agents/a%2Fb",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.eeeeeeeeeeeeeeee\nGET\n/v1/connectors/agents/a%2Fb\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.eeeeeeeeeeeeeeee.t9YvNycY8eTt3ny7FNI7lQ0DGt__H4zpsp_xzqxm19Q",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/connectors/agents/a%252Fb",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "path-pct-case-differs",
+   "note": "%2f and %2F are different bytes",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "ffffffffffffffff",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/connectors/agents/a%2fb",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.ffffffffffffffff\nGET\n/v1/connectors/agents/a%2fb\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.ffffffffffffffff.N0yxPEe_El-7NM_ilSNZ3DKh_YnxCL_PPkCtCgnTE_A",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/connectors/agents/a%2Fb",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "path-dot-segment",
+   "note": "dot segments are not removed",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "0f0f0f0f0f0f0f0f",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/x/../y",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.0f0f0f0f0f0f0f0f\nGET\n/v1/x/../y\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.0f0f0f0f0f0f0f0f.K2-woFrYMu7tmnBgfY_29NrctoUJJ2eaD3nyW8IQQzc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/y",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "query-differs",
+   "note": "a different query",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "1010101010101010",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/x",
+    "query": "a=1",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.1010101010101010\nGET\n/v1/x\na=1\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.1010101010101010.aUoAawsTC9U5DGpT7jNGlk07HIsrhTJ71zM3KGDxJDU",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "a=2",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "body-differs",
+   "note": "a swapped body",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "1212121212121212",
+    "exp": 1767322090,
+    "method": "POST",
+    "path": "/api/v1/approvals/appr_1/decision",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1hbGljZSIsIm5vdGUiOiJvayJ9"
+   },
+   "payload": "YWNtZQ.1767322090.1212121212121212\nPOST\n/api/v1/approvals/appr_1/decision\n\ngovder.internal:8080\nkzPLwpEUIAoMWvwAlFJgLMpupECbmUH8g_lbeWNwiV8",
+   "assertion": "YWNtZQ.1767322090.1212121212121212.FJVQ6odHH6CAKZZhQPzkjB-R6EhG9b1J464sa9fNRXY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "POST",
+     "path": "/api/v1/approvals/appr_1/decision",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": "eyJhcHByb3ZlIjp0cnVlLCJhcHByb3ZlciI6InN1Yi1tYWxsb3J5Iiwibm90ZSI6Im9rIn0="
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "method-differs",
+   "note": "a different method",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "1313131313131313",
+    "exp": 1767322090,
+    "method": "POST",
+    "path": "/v1/x",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.1313131313131313\nPOST\n/v1/x\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.1313131313131313.d97tY1eOgwLpAO4EOTx1tE4M5MAP4nUybjMkAWjY04k",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "DELETE",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "host-differs",
+   "note": "a different host",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "1414141414141414",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/x",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.1414141414141414\nGET\n/v1/x\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.1414141414141414.X_Fyrc6I8Gn9Xx5siQbu9Hb4JXeD7XgYq_6kxfSVkaA",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "elsewhere.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "wrong-key",
+   "note": "signed with a key the verifier does not hold",
+   "sign": {
+    "key": "tenant-assertion-vector-key-other",
+    "tenant": "acme",
+    "jti": "1515151515151515",
+    "exp": 1767322090,
+    "method": "GET",
+    "path": "/v1/x",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322090.1515151515151515\nGET\n/v1/x\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322090.1515151515151515.weieoi92xRfGcXx5p5hstMh9ot0R8f7_hl5KbjeRf3c",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "expired-by-one-second",
+   "note": "now == exp + 1",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "1616161616161616",
+    "exp": 1767321999,
+    "method": "GET",
+    "path": "/v1/x",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767321999.1616161616161616\nGET\n/v1/x\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767321999.1616161616161616.thIXHc3c795NxdYBPQ0hJtz6FWcc_fZQ3j6zVc4oqdM",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "expired"
+  },
+  {
+   "id": "ttl-exceeds-max",
+   "note": "exp - now == max TTL + 1",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "acme",
+    "jti": "1717171717171717",
+    "exp": 1767322301,
+    "method": "GET",
+    "path": "/v1/x",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "YWNtZQ.1767322301.1717171717171717\nGET\n/v1/x\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "YWNtZQ.1767322301.1717171717171717.pLybUx0JYcD1Rc-bc2kxpylhM7PkLCHjVvSmkw2Ephw",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "ttl"
+  },
+  {
+   "id": "jti-uppercase-hex",
+   "note": "jti grammar is ^[0-9a-f]{16}$",
+   "assertion": "YWNtZQ.1767322090.0123456789ABCDEF.Fv7VfRNfmWvBz6QnoKlz8bGpFlLhfsBe2OwI1J2gsfg",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "jti-15-chars",
+   "note": "jti grammar is ^[0-9a-f]{16}$",
+   "assertion": "YWNtZQ.1767322090.0123456789abcde.KFCZ4-Hq4RY3zPovhqg20zRy8bnMUJdO1A14DWPdG-M",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "jti-17-chars",
+   "note": "jti grammar is ^[0-9a-f]{16}$",
+   "assertion": "YWNtZQ.1767322090.0123456789abcdef0.RUdmgrMTsF_O9iJFcfyAxMeSDp0G5tRnB6gzOerUf38",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "jti-32-hex",
+   "note": "jti grammar is ^[0-9a-f]{16}$",
+   "assertion": "YWNtZQ.1767322090.0123456789abcdef0123456789abcdef.99QLbo7SSXv4CQI2izKgn_vnQfZxnbyU9eJrpzcSzzg",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "jti-non-hex",
+   "note": "jti grammar is ^[0-9a-f]{16}$",
+   "assertion": "YWNtZQ.1767322090.jti-1-zzzzzzzzzz.2lYEPfSrQAQSKp1AhQ0tBn_y71hGHL9vjnk4PY_CwzQ",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "jti-empty",
+   "note": "jti grammar is ^[0-9a-f]{16}$",
+   "assertion": "YWNtZQ.1767322090..WRt109Xp_6Qnvusp7w-a1p0uz5iFIDpUrX_8kxbC0K8",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "exp-leading-plus",
+   "note": "exp grammar has no sign",
+   "assertion": "YWNtZQ.+1767322090.0123456789abcdef.nOmi5qQ3wOwMzgXfo8uR-CsbvCvHA9tm-47QtdgwM7M",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "exp-leading-zero",
+   "note": "exp grammar has no leading zero",
+   "assertion": "YWNtZQ.01767322090.0123456789abcdef.3SmCZDsqXSExROpKheEzj3wrrCSx-J03NS_elJhVYco",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "exp-negative",
+   "note": "exp grammar has no sign",
+   "assertion": "YWNtZQ.-5.0123456789abcdef.Nvrtl_177XsFx6OF6Z7KSCOEWMw3jcoR8WH9aSoXDTs",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "exp-overflow",
+   "note": "exp above 2^63-1",
+   "assertion": "YWNtZQ.9223372036854775808.0123456789abcdef.BpHeArH0i0YLy9NtaL2xOuMVrvlKaKluJ8KJO-f4c5E",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "tenant-empty",
+   "note": "an empty tenant segment",
+   "assertion": ".1767322090.0123456789abcdef.0frHL5P0xV4dcXU_BWaIe8Ua3tcMMmAWpOthJwdfehY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "tenant-control-byte",
+   "note": "a C0 control byte in the tenant",
+   "assertion": "YWMBbWU.1767322090.0123456789abcdef.OqOJVmwuGQz8omlYkgdLg_DnJVHTIAEmkmpVTdkTQ6E",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "tenant-del-byte",
+   "note": "DEL in the tenant",
+   "assertion": "YWNtZX8.1767322090.0123456789abcdef.bccgrNvQAx_EWmR4WrvsVKJbykASIkTWRTN9bH_ugd4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "tenant-invalid-utf8",
+   "note": "the tenant bytes are not UTF-8",
+   "assertion": "YWP_bWU.1767322090.0123456789abcdef._gHY2qe4CMqnfUXAOERRl8oG2O8ZFxDOtB33-fcZdL4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "tenant-noncanonical-b64",
+   "note": "nonzero trailing bits in seg0",
+   "assertion": "YWNtZR.1767322090.0123456789abcdef.EHEEoqx2V-LD6QeDBqFvpsQE9UL9FUEQUFBVBd3A2Rs",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "tenant-padded-b64",
+   "note": "padding in seg0",
+   "assertion": "YWNtZQ==.1767322090.0123456789abcdef.3vPO45KYq4lq9OscVkXbHydiCnPvzZ1dHKvpM5pRUKg",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "tenant-std-b64-alphabet",
+   "note": "standard-alphabet '+' in seg0",
+   "assertion": "a+8.1767322090.0123456789abcdef.1PLElvgNth76bIlUhDmpcQE1ZbHwlwHr0_VyIUnVULc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "mac-padded",
+   "note": "padding after the MAC",
+   "assertion": "YWNtZQ.1767322090.0123456789abcdef.GrVyusVMWuu_5dmX3DhmIjpTm30_EA-1Zm8ho48IYEo=",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "mac-noncanonical",
+   "note": "nonzero trailing bits in the MAC",
+   "assertion": "YWNtZQ.1767322090.0123456789abcdef.GrVyusVMWuu_5dmX3DhmIjpTm30_EA-1Zm8ho48IYEp",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "three-segments",
+   "note": "a segment missing",
+   "assertion": "YWNtZQ.1767322090.GrVyusVMWuu_5dmX3DhmIjpTm30_EA-1Zm8ho48IYEo",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "five-segments",
+   "note": "an extra segment",
+   "assertion": "YWNtZQ.1767322090.0123456789abcdef.GrVyusVMWuu_5dmX3DhmIjpTm30_EA-1Zm8ho48IYEo.x",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "empty-assertion",
+   "note": "an empty header value",
+   "assertion": "",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "acme",
+    "request": {
+     "method": "GET",
+     "path": "/v1/x",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "corpus-00",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "zg-oekcgvur",
+    "jti": "caa699c7dd04c9ce",
+    "exp": 1767322244,
+    "method": "POST",
+    "path": "/qqvt8yy4",
+    "query": "3zm21m-7r=93xvm5",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "emctb2VrY2d2dXI.1767322244.caa699c7dd04c9ce\nPOST\n/qqvt8yy4\n3zm21m-7r=93xvm5\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "emctb2VrY2d2dXI.1767322244.caa699c7dd04c9ce.9v_aKYHSSePKRK1QEIhm3bnSbJWZCLanE_o2FNNRBQ4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "zg-oekcgvur",
+    "request": {
+     "method": "POST",
+     "path": "/qqvt8yy4",
+     "query": "3zm21m-7r=93xvm5",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "zg-oekcgvur"
+  },
+  {
+   "id": "corpus-00-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 69",
+   "assertion": "emctb2VrY2d2dXI.1767322244.caa699c7dd04c9ce.9v_aKYHSSePKRK1QEIhm3bnSbuWZCLanE_o2FNNRBQ4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "zg-oekcgvur",
+    "request": {
+     "method": "POST",
+     "path": "/qqvt8yy4",
+     "query": "3zm21m-7r=93xvm5",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-01",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "rmudz-n\u4e2d",
+    "jti": "03c2b54c9dadf9d7",
+    "exp": 1767322031,
+    "method": "DELETE",
+    "path": "/6mb6w8-xf%E2%82%ACu/bayv7gms7/i-%20/yt%41no",
+    "query": "",
+    "host": "127.0.0.1:8081",
+    "body_b64": "Z7IfIgu7XJN8LNDculOtgrI="
+   },
+   "payload": "cm11ZHotbuS4rQ.1767322031.03c2b54c9dadf9d7\nDELETE\n/6mb6w8-xf%E2%82%ACu/bayv7gms7/i-%20/yt%41no\n\n127.0.0.1:8081\nNzVUIEV8I3HbocVJ3puw-TCeoeF6HocRf5w-wP0bP48",
+   "assertion": "cm11ZHotbuS4rQ.1767322031.03c2b54c9dadf9d7.Qe0PiBJ3lGvHPyqqUXKdQpfMDCfbrmivITuYa3nig-U",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "rmudz-n\u4e2d",
+    "request": {
+     "method": "DELETE",
+     "path": "/6mb6w8-xf%E2%82%ACu/bayv7gms7/i-%20/yt%41no",
+     "query": "",
+     "host": "127.0.0.1:8081",
+     "body_b64": "Z7IfIgu7XJN8LNDculOtgrI="
+    }
+   },
+   "expect": "accept",
+   "tenant": "rmudz-n\u4e2d"
+  },
+  {
+   "id": "corpus-01-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 19",
+   "assertion": "cm11ZHotbuS4rQ.1767T22031.03c2b54c9dadf9d7.Qe0PiBJ3lGvHPyqqUXKdQpfMDCfbrmivITuYa3nig-U",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "rmudz-n\u4e2d",
+    "request": {
+     "method": "DELETE",
+     "path": "/6mb6w8-xf%E2%82%ACu/bayv7gms7/i-%20/yt%41no",
+     "query": "",
+     "host": "127.0.0.1:8081",
+     "body_b64": "Z7IfIgu7XJN8LNDculOtgrI="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-02",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "toszog",
+    "jti": "4285490c86a931e9",
+    "exp": 1767322111,
+    "method": "PATCH",
+    "path": "/6",
+    "query": "p4y=5bzd33p8cg&9e2smv6.%2f9=73rv6l.%2fx.&vzkc2j-609%20b=aoaf",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "dG9zem9n.1767322111.4285490c86a931e9\nPATCH\n/6\np4y=5bzd33p8cg&9e2smv6.%2f9=73rv6l.%2fx.&vzkc2j-609%20b=aoaf\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "dG9zem9n.1767322111.4285490c86a931e9.BxXv1TIcEqOgIqhDoOuc347YAvppzUyjLndCkZIJLt0",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "toszog",
+    "request": {
+     "method": "PATCH",
+     "path": "/6",
+     "query": "p4y=5bzd33p8cg&9e2smv6.%2f9=73rv6l.%2fx.&vzkc2j-609%20b=aoaf",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "toszog"
+  },
+  {
+   "id": "corpus-02-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 14",
+   "assertion": "dG9zem9n.17673s2111.4285490c86a931e9.BxXv1TIcEqOgIqhDoOuc347YAvppzUyjLndCkZIJLt0",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "toszog",
+    "request": {
+     "method": "PATCH",
+     "path": "/6",
+     "query": "p4y=5bzd33p8cg&9e2smv6.%2f9=73rv6l.%2fx.&vzkc2j-609%20b=aoaf",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-03",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "ioj",
+    "jti": "1ad20bec6342b449",
+    "exp": 1767322108,
+    "method": "PUT",
+    "path": "/m8jnt-0pi",
+    "query": "",
+    "host": "127.0.0.1:8081",
+    "body_b64": ""
+   },
+   "payload": "aW9q.1767322108.1ad20bec6342b449\nPUT\n/m8jnt-0pi\n\n127.0.0.1:8081\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "aW9q.1767322108.1ad20bec6342b449.asRqtCecpWHkCWerixg-IAmfV3whotHd5vPls1asw10",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "ioj",
+    "request": {
+     "method": "PUT",
+     "path": "/m8jnt-0pi",
+     "query": "",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "ioj"
+  },
+  {
+   "id": "corpus-03-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 12",
+   "assertion": "aW9q.1767322D08.1ad20bec6342b449.asRqtCecpWHkCWerixg-IAmfV3whotHd5vPls1asw10",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "ioj",
+    "request": {
+     "method": "PUT",
+     "path": "/m8jnt-0pi",
+     "query": "",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-04",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "lvj",
+    "jti": "2a413cb38d9bbc01",
+    "exp": 1767322055,
+    "method": "DELETE",
+    "path": "/5d/0tm_-i/c-5..nat/7v.icr/pz",
+    "query": "p7bji=q4qwag8zsa",
+    "host": "Vultrino.Internal",
+    "body_b64": "ijgkRZd11wxvY5eXgGfB921XDYEhbze0PchJ4QqKHFWFVawCjQH7Db2G8ZuKEPdez+9aQpO4SMDbDqRWzsCQaw=="
+   },
+   "payload": "bHZq.1767322055.2a413cb38d9bbc01\nDELETE\n/5d/0tm_-i/c-5..nat/7v.icr/pz\np7bji=q4qwag8zsa\nvultrino.internal\nkak-K95SD5GiPX7Yhh5xvlZIb74rRplme-4qYALZ1pI",
+   "assertion": "bHZq.1767322055.2a413cb38d9bbc01.XfSjg7HLSw2QjDoWMcMMZuDz7mmNjGWMbiY-9KAK3s4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "lvj",
+    "request": {
+     "method": "DELETE",
+     "path": "/5d/0tm_-i/c-5..nat/7v.icr/pz",
+     "query": "p7bji=q4qwag8zsa",
+     "host": "Vultrino.Internal",
+     "body_b64": "ijgkRZd11wxvY5eXgGfB921XDYEhbze0PchJ4QqKHFWFVawCjQH7Db2G8ZuKEPdez+9aQpO4SMDbDqRWzsCQaw=="
+    }
+   },
+   "expect": "accept",
+   "tenant": "lvj"
+  },
+  {
+   "id": "corpus-04-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 55",
+   "assertion": "bHZq.1767322055.2a413cb38d9bbc01.XfSjg7HLSw2QjDoWMcMMZu.z7mmNjGWMbiY-9KAK3s4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "lvj",
+    "request": {
+     "method": "DELETE",
+     "path": "/5d/0tm_-i/c-5..nat/7v.icr/pz",
+     "query": "p7bji=q4qwag8zsa",
+     "host": "Vultrino.Internal",
+     "body_b64": "ijgkRZd11wxvY5eXgGfB921XDYEhbze0PchJ4QqKHFWFVawCjQH7Db2G8ZuKEPdez+9aQpO4SMDbDqRWzsCQaw=="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-05",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "vwnchgnk\ud83d\ude00",
+    "jti": "1eecb4f904778e90",
+    "exp": 1767322203,
+    "method": "GET",
+    "path": "/gxso_/-12",
+    "query": ".wgm%E2%82%ACncq=iex&er=8cig0fjz5%2Fw_cd&c.gohx=z13.gt%25jmu",
+    "host": "govder.internal:8080",
+    "body_b64": "tZsszWBA3Pa+20pP4ws6+u0="
+   },
+   "payload": "dnduY2hnbmvwn5iA.1767322203.1eecb4f904778e90\nGET\n/gxso_/-12\n.wgm%E2%82%ACncq=iex&er=8cig0fjz5%2Fw_cd&c.gohx=z13.gt%25jmu\ngovder.internal:8080\ndEQwtGtuo1gb5EA9H4Mx95DOcEhOfS2la6iIWjVRWG8",
+   "assertion": "dnduY2hnbmvwn5iA.1767322203.1eecb4f904778e90.f3cQIktoxD0C-YEfVDAy7spqfPl0MUO9BD0T2JqaRe4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "vwnchgnk\ud83d\ude00",
+    "request": {
+     "method": "GET",
+     "path": "/gxso_/-12",
+     "query": ".wgm%E2%82%ACncq=iex&er=8cig0fjz5%2Fw_cd&c.gohx=z13.gt%25jmu",
+     "host": "govder.internal:8080",
+     "body_b64": "tZsszWBA3Pa+20pP4ws6+u0="
+    }
+   },
+   "expect": "accept",
+   "tenant": "vwnchgnk\ud83d\ude00"
+  },
+  {
+   "id": "corpus-05-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 53",
+   "assertion": "dnduY2hnbmvwn5iA.1767322203.1eecb4f904778e90.f3cQIktoVD0C-YEfVDAy7spqfPl0MUO9BD0T2JqaRe4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "vwnchgnk\ud83d\ude00",
+    "request": {
+     "method": "GET",
+     "path": "/gxso_/-12",
+     "query": ".wgm%E2%82%ACncq=iex&er=8cig0fjz5%2Fw_cd&c.gohx=z13.gt%25jmu",
+     "host": "govder.internal:8080",
+     "body_b64": "tZsszWBA3Pa+20pP4ws6+u0="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-06",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "vtvy-y",
+    "jti": "cf4361a54d75883e",
+    "exp": 1767322017,
+    "method": "get",
+    "path": "/7rmi4m6wq/vn%25l/-ne55/jw57%E2%82%AC1s9/p",
+    "query": "kyq=6c7%2F1og&ey9g.=6s&5hu..ahm%3A=2%2fm",
+    "host": "Vultrino.Internal",
+    "body_b64": "b8MZ"
+   },
+   "payload": "dnR2eS15.1767322017.cf4361a54d75883e\nGET\n/7rmi4m6wq/vn%25l/-ne55/jw57%E2%82%AC1s9/p\nkyq=6c7%2F1og&ey9g.=6s&5hu..ahm%3A=2%2fm\nvultrino.internal\n1gusXzTRJe7mg0Oa5cXJjugW3MJZ8JayI6eX4UWd154",
+   "assertion": "dnR2eS15.1767322017.cf4361a54d75883e.-79AllnpHjF4Hs_9wxlY_mu0hHZE-J0hkQU0JYWOMKs",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "vtvy-y",
+    "request": {
+     "method": "GET",
+     "path": "/7rmi4m6wq/vn%25l/-ne55/jw57%E2%82%AC1s9/p",
+     "query": "kyq=6c7%2F1og&ey9g.=6s&5hu..ahm%3A=2%2fm",
+     "host": "Vultrino.Internal",
+     "body_b64": "b8MZ"
+    }
+   },
+   "expect": "accept",
+   "tenant": "vtvy-y"
+  },
+  {
+   "id": "corpus-06-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 68",
+   "assertion": "dnR2eS15.1767322017.cf4361a54d75883e.-79AllnpHjF4Hs_9wxlY_mu0hHZE-J0qkQU0JYWOMKs",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "vtvy-y",
+    "request": {
+     "method": "GET",
+     "path": "/7rmi4m6wq/vn%25l/-ne55/jw57%E2%82%AC1s9/p",
+     "query": "kyq=6c7%2F1og&ey9g.=6s&5hu..ahm%3A=2%2fm",
+     "host": "Vultrino.Internal",
+     "body_b64": "b8MZ"
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-07",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "gex-b",
+    "jti": "b6a7fb4cde0af999",
+    "exp": 1767322084,
+    "method": "Post",
+    "path": "/r/8dswwc%E2%82%AC",
+    "query": "j=bkz0h",
+    "host": "[::1]:9443",
+    "body_b64": "tYlGi/nScXKGmYh9ThKwXxs="
+   },
+   "payload": "Z2V4LWI.1767322084.b6a7fb4cde0af999\nPOST\n/r/8dswwc%E2%82%AC\nj=bkz0h\n[::1]:9443\nB_LI_Tb_ooSlIQIsfNO5IvcG3MEXtjdOL6rzOgcBMEM",
+   "assertion": "Z2V4LWI.1767322084.b6a7fb4cde0af999.FyJ6rLjI94kmkIr45jjd8L8QC_TlrDPYQiwfzXWT3TY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "gex-b",
+    "request": {
+     "method": "POST",
+     "path": "/r/8dswwc%E2%82%AC",
+     "query": "j=bkz0h",
+     "host": "[::1]:9443",
+     "body_b64": "tYlGi/nScXKGmYh9ThKwXxs="
+    }
+   },
+   "expect": "accept",
+   "tenant": "gex-b"
+  },
+  {
+   "id": "corpus-07-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 67",
+   "assertion": "Z2V4LWI.1767322084.b6a7fb4cde0af999.FyJ6rLjI94kmkIr45jjd8L8QC_TlrDPDQiwfzXWT3TY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "gex-b",
+    "request": {
+     "method": "POST",
+     "path": "/r/8dswwc%E2%82%AC",
+     "query": "j=bkz0h",
+     "host": "[::1]:9443",
+     "body_b64": "tYlGi/nScXKGmYh9ThKwXxs="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-08",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "qsgiwud",
+    "jti": "89c9c179f6b35968",
+    "exp": 1767322125,
+    "method": "GET",
+    "path": "/6gh",
+    "query": "",
+    "host": "[::1]:9443",
+    "body_b64": ""
+   },
+   "payload": "cXNnaXd1ZA.1767322125.89c9c179f6b35968\nGET\n/6gh\n\n[::1]:9443\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "cXNnaXd1ZA.1767322125.89c9c179f6b35968.2LXlW-Zns11nhGRTV4MrFAQmy_udyqvygF32wayx9oI",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "qsgiwud",
+    "request": {
+     "method": "GET",
+     "path": "/6gh",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "qsgiwud"
+  },
+  {
+   "id": "corpus-08-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 10",
+   "assertion": "cXNnaXd1ZAf1767322125.89c9c179f6b35968.2LXlW-Zns11nhGRTV4MrFAQmy_udyqvygF32wayx9oI",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "qsgiwud",
+    "request": {
+     "method": "GET",
+     "path": "/6gh",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-09",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "ge",
+    "jti": "0d1253ca28ff00fd",
+    "exp": 1767322090,
+    "method": "get",
+    "path": "/_gqiy8b4i9%2Fgu8u/4gnyi",
+    "query": "",
+    "host": "[::1]:9443",
+    "body_b64": "xj7cAMIJp1+cvigDG1e1M/OYownySDjrCK1FhUcNNczL5au5k+e7yCuA8l+9c3gRboiFSvFafWw+1RfGpGyWSg=="
+   },
+   "payload": "Z2U.1767322090.0d1253ca28ff00fd\nGET\n/_gqiy8b4i9%2Fgu8u/4gnyi\n\n[::1]:9443\nC8jorHEny8UQIIHAVXVuw-tyIFmTYVA2UgJBy5KiiQg",
+   "assertion": "Z2U.1767322090.0d1253ca28ff00fd.MQ4aL6m3lQ-am-A8gQD8GVTAJCJcWEb5fQFkfcpeXy8",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "ge",
+    "request": {
+     "method": "GET",
+     "path": "/_gqiy8b4i9%2Fgu8u/4gnyi",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": "xj7cAMIJp1+cvigDG1e1M/OYownySDjrCK1FhUcNNczL5au5k+e7yCuA8l+9c3gRboiFSvFafWw+1RfGpGyWSg=="
+    }
+   },
+   "expect": "accept",
+   "tenant": "ge"
+  },
+  {
+   "id": "corpus-09-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 32",
+   "assertion": "Z2U.1767322090.0d1253ca28ff00fd.TQ4aL6m3lQ-am-A8gQD8GVTAJCJcWEb5fQFkfcpeXy8",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "ge",
+    "request": {
+     "method": "GET",
+     "path": "/_gqiy8b4i9%2Fgu8u/4gnyi",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": "xj7cAMIJp1+cvigDG1e1M/OYownySDjrCK1FhUcNNczL5au5k+e7yCuA8l+9c3gRboiFSvFafWw+1RfGpGyWSg=="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-10",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "xzswbeg",
+    "jti": "acc1839b2925c932",
+    "exp": 1767322027,
+    "method": "get",
+    "path": "/sp",
+    "query": "w7=x_ise&ifj_6ql4%E2%82%AC_6=yeg964&0qd%E2%82%ACw=z-f",
+    "host": "Vultrino.Internal",
+    "body_b64": ""
+   },
+   "payload": "eHpzd2JlZw.1767322027.acc1839b2925c932\nGET\n/sp\nw7=x_ise&ifj_6ql4%E2%82%AC_6=yeg964&0qd%E2%82%ACw=z-f\nvultrino.internal\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "eHpzd2JlZw.1767322027.acc1839b2925c932.dwVYhgNzmVqEcTSp_i4-ButhiTQ4JzTdL1RvxYC2kg0",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "xzswbeg",
+    "request": {
+     "method": "GET",
+     "path": "/sp",
+     "query": "w7=x_ise&ifj_6ql4%E2%82%AC_6=yeg964&0qd%E2%82%ACw=z-f",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "xzswbeg"
+  },
+  {
+   "id": "corpus-10-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 50",
+   "assertion": "eHpzd2JlZw.1767322027.acc1839b2925c932.dwVYhgNzmVqQcTSp_i4-ButhiTQ4JzTdL1RvxYC2kg0",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "xzswbeg",
+    "request": {
+     "method": "GET",
+     "path": "/sp",
+     "query": "w7=x_ise&ifj_6ql4%E2%82%AC_6=yeg964&0qd%E2%82%ACw=z-f",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-11",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "iaisjk",
+    "jti": "3cc7d0ba5f6b81f2",
+    "exp": 1767322029,
+    "method": "DELETE",
+    "path": "/va4k.t_f7/0d45a_/9bg",
+    "query": "",
+    "host": "[::1]:9443",
+    "body_b64": ""
+   },
+   "payload": "aWFpc2pr.1767322029.3cc7d0ba5f6b81f2\nDELETE\n/va4k.t_f7/0d45a_/9bg\n\n[::1]:9443\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "aWFpc2pr.1767322029.3cc7d0ba5f6b81f2.SEV8tu21dJQp2YYrStsifeoMRjeUI8RaB8obAX0zPVg",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "iaisjk",
+    "request": {
+     "method": "DELETE",
+     "path": "/va4k.t_f7/0d45a_/9bg",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "iaisjk"
+  },
+  {
+   "id": "corpus-11-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 14",
+   "assertion": "aWFpc2pr.17673I2029.3cc7d0ba5f6b81f2.SEV8tu21dJQp2YYrStsifeoMRjeUI8RaB8obAX0zPVg",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "iaisjk",
+    "request": {
+     "method": "DELETE",
+     "path": "/va4k.t_f7/0d45a_/9bg",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-12",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "tuhhame",
+    "jti": "df152b3b36e7d477",
+    "exp": 1767322254,
+    "method": "DELETE",
+    "path": "/tq-q/9/755702gh%2F",
+    "query": "h4%2Fd=gby3r8&zgnl5nii=pxqi3-z&v0f4lk42=-wn-",
+    "host": "[::1]:9443",
+    "body_b64": "RksDewCbxt8eiPxKqXNdr434e9QTyDkpRDiBpJzxYRjs44n9WxcmgSE+RCJNBeyME2S4WMJIuE0oyVewxBUKww=="
+   },
+   "payload": "dHVoaGFtZQ.1767322254.df152b3b36e7d477\nDELETE\n/tq-q/9/755702gh%2F\nh4%2Fd=gby3r8&zgnl5nii=pxqi3-z&v0f4lk42=-wn-\n[::1]:9443\nGpLlhFRSti6Q8j7UnDnqdq_MPNWlf4LEA8KNAJiHlC0",
+   "assertion": "dHVoaGFtZQ.1767322254.df152b3b36e7d477.bZgplRJdtNJBawfG7si7oDKMWdNjal9h5MFyZo8tpdc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "tuhhame",
+    "request": {
+     "method": "DELETE",
+     "path": "/tq-q/9/755702gh%2F",
+     "query": "h4%2Fd=gby3r8&zgnl5nii=pxqi3-z&v0f4lk42=-wn-",
+     "host": "[::1]:9443",
+     "body_b64": "RksDewCbxt8eiPxKqXNdr434e9QTyDkpRDiBpJzxYRjs44n9WxcmgSE+RCJNBeyME2S4WMJIuE0oyVewxBUKww=="
+    }
+   },
+   "expect": "accept",
+   "tenant": "tuhhame"
+  },
+  {
+   "id": "corpus-12-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 34",
+   "assertion": "dHVoaGFtZQ.1767322254.df152b3b36e7k477.bZgplRJdtNJBawfG7si7oDKMWdNjal9h5MFyZo8tpdc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "tuhhame",
+    "request": {
+     "method": "DELETE",
+     "path": "/tq-q/9/755702gh%2F",
+     "query": "h4%2Fd=gby3r8&zgnl5nii=pxqi3-z&v0f4lk42=-wn-",
+     "host": "[::1]:9443",
+     "body_b64": "RksDewCbxt8eiPxKqXNdr434e9QTyDkpRDiBpJzxYRjs44n9WxcmgSE+RCJNBeyME2S4WMJIuE0oyVewxBUKww=="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-13",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "tn",
+    "jti": "5823299bf5a5e1fa",
+    "exp": 1767322006,
+    "method": "POST",
+    "path": "/foun6177%25dz/kk%2Fus",
+    "query": "xuv3xsj=hs_5cppw1%E2%82%ACi&k3wzjz40=hgrvnp&3j2pf6=ar5w2ui7",
+    "host": "127.0.0.1:8081",
+    "body_b64": "BQYaeP5RgXTV+gSaVvT8L87jqDM2KoxT50U7CSEF2xkvLNDab+sgl/76SkqVd8tJKF1IlB8Em1DKcRVst1h+7A=="
+   },
+   "payload": "dG4.1767322006.5823299bf5a5e1fa\nPOST\n/foun6177%25dz/kk%2Fus\nxuv3xsj=hs_5cppw1%E2%82%ACi&k3wzjz40=hgrvnp&3j2pf6=ar5w2ui7\n127.0.0.1:8081\n6d1b60ANRxQVMx11cn4c3a2-oeY240p3McgZFmc2IIk",
+   "assertion": "dG4.1767322006.5823299bf5a5e1fa.aXGqAbOYcH89QvxuYW2sge_xiZxiJsErc6K-fEuq-Fc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "tn",
+    "request": {
+     "method": "POST",
+     "path": "/foun6177%25dz/kk%2Fus",
+     "query": "xuv3xsj=hs_5cppw1%E2%82%ACi&k3wzjz40=hgrvnp&3j2pf6=ar5w2ui7",
+     "host": "127.0.0.1:8081",
+     "body_b64": "BQYaeP5RgXTV+gSaVvT8L87jqDM2KoxT50U7CSEF2xkvLNDab+sgl/76SkqVd8tJKF1IlB8Em1DKcRVst1h+7A=="
+    }
+   },
+   "expect": "accept",
+   "tenant": "tn"
+  },
+  {
+   "id": "corpus-13-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 58",
+   "assertion": "dG4.1767322006.5823299bf5a5e1fa.aXGqAbOYcH89QvxuYW2sge_xiZYiJsErc6K-fEuq-Fc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "tn",
+    "request": {
+     "method": "POST",
+     "path": "/foun6177%25dz/kk%2Fus",
+     "query": "xuv3xsj=hs_5cppw1%E2%82%ACi&k3wzjz40=hgrvnp&3j2pf6=ar5w2ui7",
+     "host": "127.0.0.1:8081",
+     "body_b64": "BQYaeP5RgXTV+gSaVvT8L87jqDM2KoxT50U7CSEF2xkvLNDab+sgl/76SkqVd8tJKF1IlB8Em1DKcRVst1h+7A=="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-14",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "x",
+    "jti": "f0937d0038917f7f",
+    "exp": 1767322078,
+    "method": "DELETE",
+    "path": "/oeq4d9fr/om%25n7h8/8apo0gk58h/7e3",
+    "query": "",
+    "host": "Vultrino.Internal",
+    "body_b64": ""
+   },
+   "payload": "eA.1767322078.f0937d0038917f7f\nDELETE\n/oeq4d9fr/om%25n7h8/8apo0gk58h/7e3\n\nvultrino.internal\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "eA.1767322078.f0937d0038917f7f.MN_F0_LqK-B4zJ1NdFEGWY9DzRGYsLwXiDW3sC3m-rE",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "x",
+    "request": {
+     "method": "DELETE",
+     "path": "/oeq4d9fr/om%25n7h8/8apo0gk58h/7e3",
+     "query": "",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "x"
+  },
+  {
+   "id": "corpus-14-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 43",
+   "assertion": "eA.1767322078.f0937d0038917f7f.MN_F0_LqK-B4-J1NdFEGWY9DzRGYsLwXiDW3sC3m-rE",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "x",
+    "request": {
+     "method": "DELETE",
+     "path": "/oeq4d9fr/om%25n7h8/8apo0gk58h/7e3",
+     "query": "",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-15",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "r-uyxqga",
+    "jti": "94280dea63758f38",
+    "exp": 1767322070,
+    "method": "PUT",
+    "path": "/l41vv5a%2Fwvlf/i7l1pl0wxz%2541u",
+    "query": "f=qda",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "ci11eXhxZ2E.1767322070.94280dea63758f38\nPUT\n/l41vv5a%2Fwvlf/i7l1pl0wxz%2541u\nf=qda\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "ci11eXhxZ2E.1767322070.94280dea63758f38.UU_oW8mvx6eK5lxRYa5XS5m_cPXniaKE7EoxiX5vbYQ",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "r-uyxqga",
+    "request": {
+     "method": "PUT",
+     "path": "/l41vv5a%2Fwvlf/i7l1pl0wxz%2541u",
+     "query": "f=qda",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "r-uyxqga"
+  },
+  {
+   "id": "corpus-15-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 28",
+   "assertion": "ci11eXhxZ2E.1767322070.942803ea63758f38.UU_oW8mvx6eK5lxRYa5XS5m_cPXniaKE7EoxiX5vbYQ",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "r-uyxqga",
+    "request": {
+     "method": "PUT",
+     "path": "/l41vv5a%2Fwvlf/i7l1pl0wxz%2541u",
+     "query": "f=qda",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-16",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "lvxdsp",
+    "jti": "cde4700eca9d9e67",
+    "exp": 1767322062,
+    "method": "get",
+    "path": "/1xvebqy/i1s%2f.j/rd3s-%25",
+    "query": "",
+    "host": "Vultrino.Internal",
+    "body_b64": ""
+   },
+   "payload": "bHZ4ZHNw.1767322062.cde4700eca9d9e67\nGET\n/1xvebqy/i1s%2f.j/rd3s-%25\n\nvultrino.internal\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "bHZ4ZHNw.1767322062.cde4700eca9d9e67.EQ-I4PX47qxu-I1YUriU9hiTBT0q_zKqnTJbwzbeIh0",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "lvxdsp",
+    "request": {
+     "method": "GET",
+     "path": "/1xvebqy/i1s%2f.j/rd3s-%25",
+     "query": "",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "lvxdsp"
+  },
+  {
+   "id": "corpus-16-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 20",
+   "assertion": "bHZ4ZHNw.1767322062..de4700eca9d9e67.EQ-I4PX47qxu-I1YUriU9hiTBT0q_zKqnTJbwzbeIh0",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "lvxdsp",
+    "request": {
+     "method": "GET",
+     "path": "/1xvebqy/i1s%2f.j/rd3s-%25",
+     "query": "",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-17",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "-iaontjdxfu",
+    "jti": "135222841ccb1c00",
+    "exp": 1767322265,
+    "method": "Post",
+    "path": "/5u%25qb8/r5gu2dd/7lfrtoa4",
+    "query": "",
+    "host": "[::1]:9443",
+    "body_b64": "uGerYM5rcf4D+nFiuSVblbKbkj2ibWwvRAmRFxmKg5FDdDhJ/5yUjZ4ONo77b6TInsEjcPJwx87CPYyo7pmicA=="
+   },
+   "payload": "LWlhb250amR4ZnU.1767322265.135222841ccb1c00\nPOST\n/5u%25qb8/r5gu2dd/7lfrtoa4\n\n[::1]:9443\n0zsj-EPfPj0Lns-hBQHijD_CFFOaOOBAUVAoAhPSYoI",
+   "assertion": "LWlhb250amR4ZnU.1767322265.135222841ccb1c00.z3a2-ZRWVIJUd7-FEJ_eb_Ix9wjCG7A1CjrRSAJ2ZRg",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "-iaontjdxfu",
+    "request": {
+     "method": "POST",
+     "path": "/5u%25qb8/r5gu2dd/7lfrtoa4",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": "uGerYM5rcf4D+nFiuSVblbKbkj2ibWwvRAmRFxmKg5FDdDhJ/5yUjZ4ONo77b6TInsEjcPJwx87CPYyo7pmicA=="
+    }
+   },
+   "expect": "accept",
+   "tenant": "-iaontjdxfu"
+  },
+  {
+   "id": "corpus-17-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 70",
+   "assertion": "LWlhb250amR4ZnU.1767322265.135222841ccb1c00.z3a2-ZRWVIJUd7-FEJ_eb_Ix9wDCG7A1CjrRSAJ2ZRg",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "-iaontjdxfu",
+    "request": {
+     "method": "POST",
+     "path": "/5u%25qb8/r5gu2dd/7lfrtoa4",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": "uGerYM5rcf4D+nFiuSVblbKbkj2ibWwvRAmRFxmKg5FDdDhJ/5yUjZ4ONo77b6TInsEjcPJwx87CPYyo7pmicA=="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-18",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "flwhkob",
+    "jti": "804af15ee47ce1bf",
+    "exp": 1767322298,
+    "method": "GET",
+    "path": "/pcl%252qn",
+    "query": "-kue5om=0g-d&n=ehy-we",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "Zmx3aGtvYg.1767322298.804af15ee47ce1bf\nGET\n/pcl%252qn\n-kue5om=0g-d&n=ehy-we\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "Zmx3aGtvYg.1767322298.804af15ee47ce1bf.MUYoJK_VqJODCuUKcK3dIBxTg3meRFbhdtESBsBOlHk",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "flwhkob",
+    "request": {
+     "method": "GET",
+     "path": "/pcl%252qn",
+     "query": "-kue5om=0g-d&n=ehy-we",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "flwhkob"
+  },
+  {
+   "id": "corpus-18-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 41",
+   "assertion": "Zmx3aGtvYg.1767322298.804af15ee47ce1bf.MUWoJK_VqJODCuUKcK3dIBxTg3meRFbhdtESBsBOlHk",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "flwhkob",
+    "request": {
+     "method": "GET",
+     "path": "/pcl%252qn",
+     "query": "-kue5om=0g-d&n=ehy-we",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-19",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "-bubspyxnewb",
+    "jti": "0d3ec1fea610f8d7",
+    "exp": 1767322191,
+    "method": "DELETE",
+    "path": "/8rdlz_narx%E2%82%ACmbjq/2j%2F02/6lkxece0u%3A1z",
+    "query": "",
+    "host": "Vultrino.Internal",
+    "body_b64": ""
+   },
+   "payload": "LWJ1YnNweXhuZXdi.1767322191.0d3ec1fea610f8d7\nDELETE\n/8rdlz_narx%E2%82%ACmbjq/2j%2F02/6lkxece0u%3A1z\n\nvultrino.internal\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "LWJ1YnNweXhuZXdi.1767322191.0d3ec1fea610f8d7.t7CC_TIILe-mw-wUnEZApOCNEO20uGjb4DjWbO1ZoGg",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "-bubspyxnewb",
+    "request": {
+     "method": "DELETE",
+     "path": "/8rdlz_narx%E2%82%ACmbjq/2j%2F02/6lkxece0u%3A1z",
+     "query": "",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "-bubspyxnewb"
+  },
+  {
+   "id": "corpus-19-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 53",
+   "assertion": "LWJ1YnNweXhuZXdi.1767322191.0d3ec1fea610f8d7.t7CC_TII1e-mw-wUnEZApOCNEO20uGjb4DjWbO1ZoGg",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "-bubspyxnewb",
+    "request": {
+     "method": "DELETE",
+     "path": "/8rdlz_narx%E2%82%ACmbjq/2j%2F02/6lkxece0u%3A1z",
+     "query": "",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-20",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "w-",
+    "jti": "06ea8535a2306880",
+    "exp": 1767322256,
+    "method": "GET",
+    "path": "/ax%3Am4h8/ggf",
+    "query": "",
+    "host": "[::1]:9443",
+    "body_b64": ""
+   },
+   "payload": "dy0.1767322256.06ea8535a2306880\nGET\n/ax%3Am4h8/ggf\n\n[::1]:9443\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "dy0.1767322256.06ea8535a2306880.DK6g3oKMTALdHQSLbE-hlItJTwMRHfpxiVrwhuLpBFc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "w-",
+    "request": {
+     "method": "GET",
+     "path": "/ax%3Am4h8/ggf",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "w-"
+  },
+  {
+   "id": "corpus-20-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 42",
+   "assertion": "dy0.1767322256.06ea8535a2306880.DK6g3oKMTAUdHQSLbE-hlItJTwMRHfpxiVrwhuLpBFc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "w-",
+    "request": {
+     "method": "GET",
+     "path": "/ax%3Am4h8/ggf",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-21",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "bay\u4e2d",
+    "jti": "fab97c3ebf8df140",
+    "exp": 1767322089,
+    "method": "GET",
+    "path": "/q9y17jigfr%25/e%417-",
+    "query": "7ugzmxw_7o=i7wvy&7o563=6k2a8.rzvq%20to",
+    "host": "govder.internal:8080",
+    "body_b64": "p0Ea"
+   },
+   "payload": "YmF55Lit.1767322089.fab97c3ebf8df140\nGET\n/q9y17jigfr%25/e%417-\n7ugzmxw_7o=i7wvy&7o563=6k2a8.rzvq%20to\ngovder.internal:8080\nQiAYuio_OnjEajAz0gfOs6LTn3K8DCHJRQ6dJalseIk",
+   "assertion": "YmF55Lit.1767322089.fab97c3ebf8df140.DuTFQVXx4kewax001p__ua1vjZWL_xMycV_-JKbNjvo",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "bay\u4e2d",
+    "request": {
+     "method": "GET",
+     "path": "/q9y17jigfr%25/e%417-",
+     "query": "7ugzmxw_7o=i7wvy&7o563=6k2a8.rzvq%20to",
+     "host": "govder.internal:8080",
+     "body_b64": "p0Ea"
+    }
+   },
+   "expect": "accept",
+   "tenant": "bay\u4e2d"
+  },
+  {
+   "id": "corpus-21-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 31",
+   "assertion": "YmF55Lit.1767322089.fab97c3ebf8Ff140.DuTFQVXx4kewax001p__ua1vjZWL_xMycV_-JKbNjvo",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "bay\u4e2d",
+    "request": {
+     "method": "GET",
+     "path": "/q9y17jigfr%25/e%417-",
+     "query": "7ugzmxw_7o=i7wvy&7o563=6k2a8.rzvq%20to",
+     "host": "govder.internal:8080",
+     "body_b64": "p0Ea"
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-22",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "lvndee",
+    "jti": "5655242bd12ec7f7",
+    "exp": 1767322072,
+    "method": "GET",
+    "path": "/gfev0mpv4%E2%82%ACby/4mzgs/6-65_uf74%413e/rtb.utjm9/ps2mxv",
+    "query": "s_5b6gdpw6=j%2Fe9&mdsfw=1kqi&tfs3ut1yfb=k.ji3stf5g",
+    "host": "[::1]:9443",
+    "body_b64": ""
+   },
+   "payload": "bHZuZGVl.1767322072.5655242bd12ec7f7\nGET\n/gfev0mpv4%E2%82%ACby/4mzgs/6-65_uf74%413e/rtb.utjm9/ps2mxv\ns_5b6gdpw6=j%2Fe9&mdsfw=1kqi&tfs3ut1yfb=k.ji3stf5g\n[::1]:9443\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "bHZuZGVl.1767322072.5655242bd12ec7f7.A0-Pi8o1289gMeNxLPpjnAkw1HK7Zpzq7VMzW2hXqqU",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "lvndee",
+    "request": {
+     "method": "GET",
+     "path": "/gfev0mpv4%E2%82%ACby/4mzgs/6-65_uf74%413e/rtb.utjm9/ps2mxv",
+     "query": "s_5b6gdpw6=j%2Fe9&mdsfw=1kqi&tfs3ut1yfb=k.ji3stf5g",
+     "host": "[::1]:9443",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "lvndee"
+  },
+  {
+   "id": "corpus-22-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 18",
+   "assertion": "bHZuZGVl.176732207e.5655242bd12ec7f7.A0-Pi8o1289gMeNxLPpjnAkw1HK7Zpzq7VMzW2hXqqU",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "lvndee",
+    "request": {
+     "method": "GET",
+     "path": "/gfev0mpv4%E2%82%ACby/4mzgs/6-65_uf74%413e/rtb.utjm9/ps2mxv",
+     "query": "s_5b6gdpw6=j%2Fe9&mdsfw=1kqi&tfs3ut1yfb=k.ji3stf5g",
+     "host": "[::1]:9443",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-23",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "hwqohenf",
+    "jti": "5330d9b8bdfe11a8",
+    "exp": 1767322238,
+    "method": "PATCH",
+    "path": "/79s",
+    "query": "wx5be42-0%2535e=s2v09i%25&j4.h.=03l.418lzh",
+    "host": "Vultrino.Internal",
+    "body_b64": "iU0TpKaZp2cYI2UQn4CovxYc11U/EWObLa/13J0rymfCYJjSd8Mk0e3FdwPARCUy9/XEWHmbn9FVRs5H+CCfvw=="
+   },
+   "payload": "aHdxb2hlbmY.1767322238.5330d9b8bdfe11a8\nPATCH\n/79s\nwx5be42-0%2535e=s2v09i%25&j4.h.=03l.418lzh\nvultrino.internal\nrpELkMPnLovb4qPfblhYxJ2RlnCFskqqIZPn1_CUb_A",
+   "assertion": "aHdxb2hlbmY.1767322238.5330d9b8bdfe11a8.RKc7kXN2qRLDbIfEbt6qiC9I1Tq2s8ifrxt8AKQQM38",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "hwqohenf",
+    "request": {
+     "method": "PATCH",
+     "path": "/79s",
+     "query": "wx5be42-0%2535e=s2v09i%25&j4.h.=03l.418lzh",
+     "host": "Vultrino.Internal",
+     "body_b64": "iU0TpKaZp2cYI2UQn4CovxYc11U/EWObLa/13J0rymfCYJjSd8Mk0e3FdwPARCUy9/XEWHmbn9FVRs5H+CCfvw=="
+    }
+   },
+   "expect": "accept",
+   "tenant": "hwqohenf"
+  },
+  {
+   "id": "corpus-23-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 14",
+   "assertion": "aHdxb2hlbmY.17J7322238.5330d9b8bdfe11a8.RKc7kXN2qRLDbIfEbt6qiC9I1Tq2s8ifrxt8AKQQM38",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "hwqohenf",
+    "request": {
+     "method": "PATCH",
+     "path": "/79s",
+     "query": "wx5be42-0%2535e=s2v09i%25&j4.h.=03l.418lzh",
+     "host": "Vultrino.Internal",
+     "body_b64": "iU0TpKaZp2cYI2UQn4CovxYc11U/EWObLa/13J0rymfCYJjSd8Mk0e3FdwPARCUy9/XEWHmbn9FVRs5H+CCfvw=="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-24",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "ikhsxkqjoi",
+    "jti": "4150085c289cd6eb",
+    "exp": 1767322106,
+    "method": "PATCH",
+    "path": "/0fxv5%25",
+    "query": "95vd0-hulj=dq&42__l%41qp=m1m&5exki=.bv",
+    "host": "127.0.0.1:8081",
+    "body_b64": ""
+   },
+   "payload": "aWtoc3hrcWpvaQ.1767322106.4150085c289cd6eb\nPATCH\n/0fxv5%25\n95vd0-hulj=dq&42__l%41qp=m1m&5exki=.bv\n127.0.0.1:8081\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "aWtoc3hrcWpvaQ.1767322106.4150085c289cd6eb.whwJeBLasJ_iIKP3gXBY8oEdu4oXtf0kOecXqznTjvM",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "ikhsxkqjoi",
+    "request": {
+     "method": "PATCH",
+     "path": "/0fxv5%25",
+     "query": "95vd0-hulj=dq&42__l%41qp=m1m&5exki=.bv",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "ikhsxkqjoi"
+  },
+  {
+   "id": "corpus-24-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 31",
+   "assertion": "aWtoc3hrcWpvaQ.1767322106.41500I5c289cd6eb.whwJeBLasJ_iIKP3gXBY8oEdu4oXtf0kOecXqznTjvM",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "ikhsxkqjoi",
+    "request": {
+     "method": "PATCH",
+     "path": "/0fxv5%25",
+     "query": "95vd0-hulj=dq&42__l%41qp=m1m&5exki=.bv",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-25",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "vxdcp",
+    "jti": "4de13f311eb8ef32",
+    "exp": 1767322071,
+    "method": "Post",
+    "path": "/08u6qz",
+    "query": "",
+    "host": "[::1]:9443",
+    "body_b64": ""
+   },
+   "payload": "dnhkY3A.1767322071.4de13f311eb8ef32\nPOST\n/08u6qz\n\n[::1]:9443\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "dnhkY3A.1767322071.4de13f311eb8ef32.XYGX5dESgVIveOuodxhp-sI-lJTLstvPMlq8Ny77ZdY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "vxdcp",
+    "request": {
+     "method": "POST",
+     "path": "/08u6qz",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "vxdcp"
+  },
+  {
+   "id": "corpus-25-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 38",
+   "assertion": "dnhkY3A.1767322071.4de13f311eb8ef32.XYLX5dESgVIveOuodxhp-sI-lJTLstvPMlq8Ny77ZdY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "vxdcp",
+    "request": {
+     "method": "POST",
+     "path": "/08u6qz",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-26",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "orp",
+    "jti": "4dd3a5893c9b4760",
+    "exp": 1767322264,
+    "method": "get",
+    "path": "/keox/hxggyns%3Av-z/517f/37l/nyqosl4-f",
+    "query": "rcq.dj%209d.=3qk5is39nc&g%3Age=ht9uff%414e&-=ef_k.uza-5",
+    "host": "127.0.0.1:8081",
+    "body_b64": "ki0IHgLNK6EbXPjue5PUHWs="
+   },
+   "payload": "b3Jw.1767322264.4dd3a5893c9b4760\nGET\n/keox/hxggyns%3Av-z/517f/37l/nyqosl4-f\nrcq.dj%209d.=3qk5is39nc&g%3Age=ht9uff%414e&-=ef_k.uza-5\n127.0.0.1:8081\nBPkF3-9HYENFrq6S10VNWIMvIAu0MTlB1BPvBeBmDGg",
+   "assertion": "b3Jw.1767322264.4dd3a5893c9b4760.s1iP1gY9HRGV6qKnnoN8HK2SIUp2XgIBBLCOEEdxcQQ",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "orp",
+    "request": {
+     "method": "GET",
+     "path": "/keox/hxggyns%3Av-z/517f/37l/nyqosl4-f",
+     "query": "rcq.dj%209d.=3qk5is39nc&g%3Age=ht9uff%414e&-=ef_k.uza-5",
+     "host": "127.0.0.1:8081",
+     "body_b64": "ki0IHgLNK6EbXPjue5PUHWs="
+    }
+   },
+   "expect": "accept",
+   "tenant": "orp"
+  },
+  {
+   "id": "corpus-26-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 39",
+   "assertion": "b3Jw.1767322264.4dd3a5893c9b4760.s1iP1ge9HRGV6qKnnoN8HK2SIUp2XgIBBLCOEEdxcQQ",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "orp",
+    "request": {
+     "method": "GET",
+     "path": "/keox/hxggyns%3Av-z/517f/37l/nyqosl4-f",
+     "query": "rcq.dj%209d.=3qk5is39nc&g%3Age=ht9uff%414e&-=ef_k.uza-5",
+     "host": "127.0.0.1:8081",
+     "body_b64": "ki0IHgLNK6EbXPjue5PUHWs="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-27",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "uloodicsls",
+    "jti": "e73284815d4e9834",
+    "exp": 1767322071,
+    "method": "PATCH",
+    "path": "/ub-s_",
+    "query": "io=p69w&76qb8-tx=icvv4vyvic",
+    "host": "govder.internal:8080",
+    "body_b64": "Iwa+hR15Dz8sWxPltPrnkUbWM+LeO1YPparjPDgInmxKshGAp5L3udhtY+aFUgLvFon2xL2k6o2zpObVhzRZbg=="
+   },
+   "payload": "dWxvb2RpY3Nscw.1767322071.e73284815d4e9834\nPATCH\n/ub-s_\nio=p69w&76qb8-tx=icvv4vyvic\ngovder.internal:8080\n0djX0JKpLPW_Wsfo9fBd-edvOP6gsote7iG0PktKUTc",
+   "assertion": "dWxvb2RpY3Nscw.1767322071.e73284815d4e9834.NxOxsGq_-Yr1mA0aZ_U8jaxbUT62n1eSUAb1F4GDG3E",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "uloodicsls",
+    "request": {
+     "method": "PATCH",
+     "path": "/ub-s_",
+     "query": "io=p69w&76qb8-tx=icvv4vyvic",
+     "host": "govder.internal:8080",
+     "body_b64": "Iwa+hR15Dz8sWxPltPrnkUbWM+LeO1YPparjPDgInmxKshGAp5L3udhtY+aFUgLvFon2xL2k6o2zpObVhzRZbg=="
+    }
+   },
+   "expect": "accept",
+   "tenant": "uloodicsls"
+  },
+  {
+   "id": "corpus-27-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 81",
+   "assertion": "dWxvb2RpY3Nscw.1767322071.e73284815d4e9834.NxOxsGq_-Yr1mA0aZ_U8jaxbUT62n1eSUAb1F4dDG3E",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "uloodicsls",
+    "request": {
+     "method": "PATCH",
+     "path": "/ub-s_",
+     "query": "io=p69w&76qb8-tx=icvv4vyvic",
+     "host": "govder.internal:8080",
+     "body_b64": "Iwa+hR15Dz8sWxPltPrnkUbWM+LeO1YPparjPDgInmxKshGAp5L3udhtY+aFUgLvFon2xL2k6o2zpObVhzRZbg=="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-28",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "nbdxqx",
+    "jti": "0d0397a37c0af359",
+    "exp": 1767322024,
+    "method": "GET",
+    "path": "/6eqxj6wk/iaxxi%2037j0/1rc/zqhabixm/4q2hcjk7ly%2fm1i.",
+    "query": "k.d4a_2=29gj8d&upij0r9k=xdmvyfp%E2%82%AC752c&i1r%41db=tewy8h7k%E2%82%AC_fwr",
+    "host": "127.0.0.1:8081",
+    "body_b64": "lZh2G0nWk9M/gPFvksKsRwQZW03iH37gEwOsBnrL60hNozcZsS0fVueQghu+r+3dgFOjoxy8LgCqBrdsl/Lf4g=="
+   },
+   "payload": "bmJkeHF4.1767322024.0d0397a37c0af359\nGET\n/6eqxj6wk/iaxxi%2037j0/1rc/zqhabixm/4q2hcjk7ly%2fm1i.\nk.d4a_2=29gj8d&upij0r9k=xdmvyfp%E2%82%AC752c&i1r%41db=tewy8h7k%E2%82%AC_fwr\n127.0.0.1:8081\nGjN0tJEPmfj79OYJP213L4VMvIOm5RTwGcOlhtrpkVo",
+   "assertion": "bmJkeHF4.1767322024.0d0397a37c0af359.vu6ZEI5T0riQBIcYk2F_ETmheAdjb6OVOIJjHK7tt0E",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "nbdxqx",
+    "request": {
+     "method": "GET",
+     "path": "/6eqxj6wk/iaxxi%2037j0/1rc/zqhabixm/4q2hcjk7ly%2fm1i.",
+     "query": "k.d4a_2=29gj8d&upij0r9k=xdmvyfp%E2%82%AC752c&i1r%41db=tewy8h7k%E2%82%AC_fwr",
+     "host": "127.0.0.1:8081",
+     "body_b64": "lZh2G0nWk9M/gPFvksKsRwQZW03iH37gEwOsBnrL60hNozcZsS0fVueQghu+r+3dgFOjoxy8LgCqBrdsl/Lf4g=="
+    }
+   },
+   "expect": "accept",
+   "tenant": "nbdxqx"
+  },
+  {
+   "id": "corpus-28-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 15",
+   "assertion": "bmJkeHF4.176732O024.0d0397a37c0af359.vu6ZEI5T0riQBIcYk2F_ETmheAdjb6OVOIJjHK7tt0E",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "nbdxqx",
+    "request": {
+     "method": "GET",
+     "path": "/6eqxj6wk/iaxxi%2037j0/1rc/zqhabixm/4q2hcjk7ly%2fm1i.",
+     "query": "k.d4a_2=29gj8d&upij0r9k=xdmvyfp%E2%82%AC752c&i1r%41db=tewy8h7k%E2%82%AC_fwr",
+     "host": "127.0.0.1:8081",
+     "body_b64": "lZh2G0nWk9M/gPFvksKsRwQZW03iH37gEwOsBnrL60hNozcZsS0fVueQghu+r+3dgFOjoxy8LgCqBrdsl/Lf4g=="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-29",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "fhoaeydxxl\u00e9",
+    "jti": "b134a144a5f3483b",
+    "exp": 1767322132,
+    "method": "PATCH",
+    "path": "/l9ybf",
+    "query": "",
+    "host": "[::1]:9443",
+    "body_b64": "z/43"
+   },
+   "payload": "ZmhvYWV5ZHh4bMOp.1767322132.b134a144a5f3483b\nPATCH\n/l9ybf\n\n[::1]:9443\n7RBlTanjYnwBndxoEfdfOIyZ9424czxHCTkTUn_9ExQ",
+   "assertion": "ZmhvYWV5ZHh4bMOp.1767322132.b134a144a5f3483b.stFIRHj6zkqhyTWGL3vModqnBazjtqQAmxWe9t8bfzY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "fhoaeydxxl\u00e9",
+    "request": {
+     "method": "PATCH",
+     "path": "/l9ybf",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": "z/43"
+    }
+   },
+   "expect": "accept",
+   "tenant": "fhoaeydxxl\u00e9"
+  },
+  {
+   "id": "corpus-29-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 42",
+   "assertion": "ZmhvYWV5ZHh4bMOp.1767322132.b134a144a5f348-b.stFIRHj6zkqhyTWGL3vModqnBazjtqQAmxWe9t8bfzY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "fhoaeydxxl\u00e9",
+    "request": {
+     "method": "PATCH",
+     "path": "/l9ybf",
+     "query": "",
+     "host": "[::1]:9443",
+     "body_b64": "z/43"
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-30",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "trsogtgkccd",
+    "jti": "a394b2cd3e089a90",
+    "exp": 1767322153,
+    "method": "get",
+    "path": "/sh9l2awk7/dmy-ht/9f%20ldl/xf8hz%E2%82%AC/ee7g.mb9l%41t4_.",
+    "query": "",
+    "host": "127.0.0.1:8081",
+    "body_b64": ""
+   },
+   "payload": "dHJzb2d0Z2tjY2Q.1767322153.a394b2cd3e089a90\nGET\n/sh9l2awk7/dmy-ht/9f%20ldl/xf8hz%E2%82%AC/ee7g.mb9l%41t4_.\n\n127.0.0.1:8081\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "dHJzb2d0Z2tjY2Q.1767322153.a394b2cd3e089a90.6GOOCimYGX6kHtZNzARcJcCQemSfRbvJqjonm0tHrkc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "trsogtgkccd",
+    "request": {
+     "method": "GET",
+     "path": "/sh9l2awk7/dmy-ht/9f%20ldl/xf8hz%E2%82%AC/ee7g.mb9l%41t4_.",
+     "query": "",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "trsogtgkccd"
+  },
+  {
+   "id": "corpus-30-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 7",
+   "assertion": "dHJzb2d7Z2tjY2Q.1767322153.a394b2cd3e089a90.6GOOCimYGX6kHtZNzARcJcCQemSfRbvJqjonm0tHrkc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "trsogtgkccd",
+    "request": {
+     "method": "GET",
+     "path": "/sh9l2awk7/dmy-ht/9f%20ldl/xf8hz%E2%82%AC/ee7g.mb9l%41t4_.",
+     "query": "",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-31",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "gqvjlz\u00e9",
+    "jti": "0f8acb9fc3758521",
+    "exp": 1767322037,
+    "method": "PUT",
+    "path": "/t%E2%82%AC8",
+    "query": "a1nq7=kk09tkp8_",
+    "host": "[::1]:9443",
+    "body_b64": "V90D"
+   },
+   "payload": "Z3F2amx6w6k.1767322037.0f8acb9fc3758521\nPUT\n/t%E2%82%AC8\na1nq7=kk09tkp8_\n[::1]:9443\nE73qveZqRgpWweZwlIAgK5Hg6ht6VrUigwIxcbDhhkQ",
+   "assertion": "Z3F2amx6w6k.1767322037.0f8acb9fc3758521.WmHXaJdaf44WxIM28G3f5A0UDHVtxowza8O3E0iOPP8",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "gqvjlz\u00e9",
+    "request": {
+     "method": "PUT",
+     "path": "/t%E2%82%AC8",
+     "query": "a1nq7=kk09tkp8_",
+     "host": "[::1]:9443",
+     "body_b64": "V90D"
+    }
+   },
+   "expect": "accept",
+   "tenant": "gqvjlz\u00e9"
+  },
+  {
+   "id": "corpus-31-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 10",
+   "assertion": "Z3F2amx6w6v.1767322037.0f8acb9fc3758521.WmHXaJdaf44WxIM28G3f5A0UDHVtxowza8O3E0iOPP8",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "gqvjlz\u00e9",
+    "request": {
+     "method": "PUT",
+     "path": "/t%E2%82%AC8",
+     "query": "a1nq7=kk09tkp8_",
+     "host": "[::1]:9443",
+     "body_b64": "V90D"
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-32",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "iumcvd",
+    "jti": "b04fc27cde00396e",
+    "exp": 1767322257,
+    "method": "PUT",
+    "path": "/w590mw6qkf/2f/03f/3t8yp_%20",
+    "query": "",
+    "host": "Vultrino.Internal",
+    "body_b64": ""
+   },
+   "payload": "aXVtY3Zk.1767322257.b04fc27cde00396e\nPUT\n/w590mw6qkf/2f/03f/3t8yp_%20\n\nvultrino.internal\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "aXVtY3Zk.1767322257.b04fc27cde00396e.mNbTCMoeDAQv2sVrAxlH08cPR4tnGMJXz6p2QO89gZ4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "iumcvd",
+    "request": {
+     "method": "PUT",
+     "path": "/w590mw6qkf/2f/03f/3t8yp_%20",
+     "query": "",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "iumcvd"
+  },
+  {
+   "id": "corpus-32-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 40",
+   "assertion": "aXVtY3Zk.1767322257.b04fc27cde00396e.mNbwCMoeDAQv2sVrAxlH08cPR4tnGMJXz6p2QO89gZ4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "iumcvd",
+    "request": {
+     "method": "PUT",
+     "path": "/w590mw6qkf/2f/03f/3t8yp_%20",
+     "query": "",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-33",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "xg",
+    "jti": "4e909de39e6f0ded",
+    "exp": 1767322190,
+    "method": "PUT",
+    "path": "/1cer/z/4f9wuzd",
+    "query": "hf=8r1qhz4og%E2%82%AC",
+    "host": "[::1]:9443",
+    "body_b64": "Qoon394tcjAh6r9nxT9cCeI="
+   },
+   "payload": "eGc.1767322190.4e909de39e6f0ded\nPUT\n/1cer/z/4f9wuzd\nhf=8r1qhz4og%E2%82%AC\n[::1]:9443\nPQmCa55O8lGGARoKTr1oc_3mRredkMuHI3-465DSqnw",
+   "assertion": "eGc.1767322190.4e909de39e6f0ded.NqcKckibzjI3mQqzXcNyI2M-lDT_0ILmV1BJof97bwY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "xg",
+    "request": {
+     "method": "PUT",
+     "path": "/1cer/z/4f9wuzd",
+     "query": "hf=8r1qhz4og%E2%82%AC",
+     "host": "[::1]:9443",
+     "body_b64": "Qoon394tcjAh6r9nxT9cCeI="
+    }
+   },
+   "expect": "accept",
+   "tenant": "xg"
+  },
+  {
+   "id": "corpus-33-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 46",
+   "assertion": "eGc.1767322190.4e909de39e6f0ded.NqcKckibzjI3mQhzXcNyI2M-lDT_0ILmV1BJof97bwY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "xg",
+    "request": {
+     "method": "PUT",
+     "path": "/1cer/z/4f9wuzd",
+     "query": "hf=8r1qhz4og%E2%82%AC",
+     "host": "[::1]:9443",
+     "body_b64": "Qoon394tcjAh6r9nxT9cCeI="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-34",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "h-aaevxe",
+    "jti": "f69cace362e04da0",
+    "exp": 1767322043,
+    "method": "get",
+    "path": "/3l%2fd3eg/5ijaf0krte/-d9i62%3A2v/71.xhd%41hk/lu6%E2%82%AC_f",
+    "query": "t_kxggathb%2Froi=8gwsi%E2%82%ACy7v&zkrqh=uzi%25d4j-&zkqo2e_3%3Aft=05",
+    "host": "[::1]:9443",
+    "body_b64": "E6cNFkZC3uhzvhMke/1LZlA="
+   },
+   "payload": "aC1hYWV2eGU.1767322043.f69cace362e04da0\nGET\n/3l%2fd3eg/5ijaf0krte/-d9i62%3A2v/71.xhd%41hk/lu6%E2%82%AC_f\nt_kxggathb%2Froi=8gwsi%E2%82%ACy7v&zkrqh=uzi%25d4j-&zkqo2e_3%3Aft=05\n[::1]:9443\nUZu-HapRhimq1SqzmK9UcpEvZDsN_aQmBJ14p1B3QMs",
+   "assertion": "aC1hYWV2eGU.1767322043.f69cace362e04da0.q7REjZKZCec-mVVDUJtFDMhEjsaLjfPcjZRH-N8rr8A",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "h-aaevxe",
+    "request": {
+     "method": "GET",
+     "path": "/3l%2fd3eg/5ijaf0krte/-d9i62%3A2v/71.xhd%41hk/lu6%E2%82%AC_f",
+     "query": "t_kxggathb%2Froi=8gwsi%E2%82%ACy7v&zkrqh=uzi%25d4j-&zkqo2e_3%3Aft=05",
+     "host": "[::1]:9443",
+     "body_b64": "E6cNFkZC3uhzvhMke/1LZlA="
+    }
+   },
+   "expect": "accept",
+   "tenant": "h-aaevxe"
+  },
+  {
+   "id": "corpus-34-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 46",
+   "assertion": "aC1hYWV2eGU.1767322043.f69cace362e04da0.q7REjZJZCec-mVVDUJtFDMhEjsaLjfPcjZRH-N8rr8A",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "h-aaevxe",
+    "request": {
+     "method": "GET",
+     "path": "/3l%2fd3eg/5ijaf0krte/-d9i62%3A2v/71.xhd%41hk/lu6%E2%82%AC_f",
+     "query": "t_kxggathb%2Froi=8gwsi%E2%82%ACy7v&zkrqh=uzi%25d4j-&zkqo2e_3%3Aft=05",
+     "host": "[::1]:9443",
+     "body_b64": "E6cNFkZC3uhzvhMke/1LZlA="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-35",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "c",
+    "jti": "16e9a2cc424a8363",
+    "exp": 1767322043,
+    "method": "DELETE",
+    "path": "/gttac%E2%82%ACrf3/rjucxudej/m2r2e4bw%2f",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "Yw.1767322043.16e9a2cc424a8363\nDELETE\n/gttac%E2%82%ACrf3/rjucxudej/m2r2e4bw%2f\n\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "Yw.1767322043.16e9a2cc424a8363.m4opocPevmwBySncl0yb18GCpuXu_lkVF3urjAK6PHY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "c",
+    "request": {
+     "method": "DELETE",
+     "path": "/gttac%E2%82%ACrf3/rjucxudej/m2r2e4bw%2f",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "c"
+  },
+  {
+   "id": "corpus-35-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 20",
+   "assertion": "Yw.1767322043.16e9a2xc424a8363.m4opocPevmwBySncl0yb18GCpuXu_lkVF3urjAK6PHY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "c",
+    "request": {
+     "method": "DELETE",
+     "path": "/gttac%E2%82%ACrf3/rjucxudej/m2r2e4bw%2f",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-36",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "mxxhfd\u00e9",
+    "jti": "ad84ab529b00a91f",
+    "exp": 1767322234,
+    "method": "PATCH",
+    "path": "/m/f%E2%82%ACn6/ogs1v%25nvp/mtz3k9t/7h0ddho2mc%41",
+    "query": "",
+    "host": "127.0.0.1:8081",
+    "body_b64": ""
+   },
+   "payload": "bXh4aGZkw6k.1767322234.ad84ab529b00a91f\nPATCH\n/m/f%E2%82%ACn6/ogs1v%25nvp/mtz3k9t/7h0ddho2mc%41\n\n127.0.0.1:8081\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "bXh4aGZkw6k.1767322234.ad84ab529b00a91f.oczJSckxGk-q4Nw6apiV5oIZjLrly4ePOJjkYMduEqI",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "mxxhfd\u00e9",
+    "request": {
+     "method": "PATCH",
+     "path": "/m/f%E2%82%ACn6/ogs1v%25nvp/mtz3k9t/7h0ddho2mc%41",
+     "query": "",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "mxxhfd\u00e9"
+  },
+  {
+   "id": "corpus-36-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 72",
+   "assertion": "bXh4aGZkw6k.1767322234.ad84ab529b00a91f.oczJSckxGk-q4Nw6apiV5oIZjLrly4ePNJjkYMduEqI",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "mxxhfd\u00e9",
+    "request": {
+     "method": "PATCH",
+     "path": "/m/f%E2%82%ACn6/ogs1v%25nvp/mtz3k9t/7h0ddho2mc%41",
+     "query": "",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-37",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "zcwdahkdednu\u4e2d",
+    "jti": "65b3722ba71bde35",
+    "exp": 1767322002,
+    "method": "GET",
+    "path": "/_1e1/fi_m/f.hhtrjps8/q11o6iq/84v6yfi26",
+    "query": "9=dfj%3A&f.bq=xky",
+    "host": "[::1]:9443",
+    "body_b64": "UlalUwK96A2GQDIRuBZZCdU="
+   },
+   "payload": "emN3ZGFoa2RlZG515Lit.1767322002.65b3722ba71bde35\nGET\n/_1e1/fi_m/f.hhtrjps8/q11o6iq/84v6yfi26\n9=dfj%3A&f.bq=xky\n[::1]:9443\nafrZc-2ByCQM-mF2LFdZMGU449XzMkgVggg-64lXN54",
+   "assertion": "emN3ZGFoa2RlZG515Lit.1767322002.65b3722ba71bde35.iWQTwRtKmnNOSyZBELAWJOPE_YD-FA66TqJHB9Aro7A",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "zcwdahkdednu\u4e2d",
+    "request": {
+     "method": "GET",
+     "path": "/_1e1/fi_m/f.hhtrjps8/q11o6iq/84v6yfi26",
+     "query": "9=dfj%3A&f.bq=xky",
+     "host": "[::1]:9443",
+     "body_b64": "UlalUwK96A2GQDIRuBZZCdU="
+    }
+   },
+   "expect": "accept",
+   "tenant": "zcwdahkdednu\u4e2d"
+  },
+  {
+   "id": "corpus-37-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 54",
+   "assertion": "emN3ZGFoa2RlZG515Lit.1767322002.65b3722ba71bde35.iWQTwktKmnNOSyZBELAWJOPE_YD-FA66TqJHB9Aro7A",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "zcwdahkdednu\u4e2d",
+    "request": {
+     "method": "GET",
+     "path": "/_1e1/fi_m/f.hhtrjps8/q11o6iq/84v6yfi26",
+     "query": "9=dfj%3A&f.bq=xky",
+     "host": "[::1]:9443",
+     "body_b64": "UlalUwK96A2GQDIRuBZZCdU="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-38",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "lmdsdi-zzzgd",
+    "jti": "e958ed4adee626ed",
+    "exp": 1767322282,
+    "method": "Post",
+    "path": "/59/hf9v4u0.%2fuhh./nt2s61nsbz%2f",
+    "query": "su.s7=xmex%3Aqq&k=oy&7ay50w6u=5-52f4jv",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "bG1kc2RpLXp6emdk.1767322282.e958ed4adee626ed\nPOST\n/59/hf9v4u0.%2fuhh./nt2s61nsbz%2f\nsu.s7=xmex%3Aqq&k=oy&7ay50w6u=5-52f4jv\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "bG1kc2RpLXp6emdk.1767322282.e958ed4adee626ed.XDzdLVjsBPWchxogIt7HmloTmJc2ghy3UnDqHRkFYbc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "lmdsdi-zzzgd",
+    "request": {
+     "method": "POST",
+     "path": "/59/hf9v4u0.%2fuhh./nt2s61nsbz%2f",
+     "query": "su.s7=xmex%3Aqq&k=oy&7ay50w6u=5-52f4jv",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "lmdsdi-zzzgd"
+  },
+  {
+   "id": "corpus-38-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 86",
+   "assertion": "bG1kc2RpLXp6emdk.1767322282.e958ed4adee626ed.XDzdLVjsBPWchxogIt7HmloTmJc2ghy3UnDqHRkFYRc",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "lmdsdi-zzzgd",
+    "request": {
+     "method": "POST",
+     "path": "/59/hf9v4u0.%2fuhh./nt2s61nsbz%2f",
+     "query": "su.s7=xmex%3Aqq&k=oy&7ay50w6u=5-52f4jv",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-39",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "lavoraqsi",
+    "jti": "27b26ce4c865ff79",
+    "exp": 1767322127,
+    "method": "PUT",
+    "path": "/c1mgstyq_/enbi99l%E2%82%ACsnhf",
+    "query": "",
+    "host": "127.0.0.1:8081",
+    "body_b64": ""
+   },
+   "payload": "bGF2b3JhcXNp.1767322127.27b26ce4c865ff79\nPUT\n/c1mgstyq_/enbi99l%E2%82%ACsnhf\n\n127.0.0.1:8081\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "bGF2b3JhcXNp.1767322127.27b26ce4c865ff79.0GRUBksY8GaDEJ93LyaU2fGLfFm2U3fezbU0lVMJrI0",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "lavoraqsi",
+    "request": {
+     "method": "PUT",
+     "path": "/c1mgstyq_/enbi99l%E2%82%ACsnhf",
+     "query": "",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "lavoraqsi"
+  },
+  {
+   "id": "corpus-39-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 28",
+   "assertion": "bGF2b3JhcXNp.1767322127.27b2gce4c865ff79.0GRUBksY8GaDEJ93LyaU2fGLfFm2U3fezbU0lVMJrI0",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "lavoraqsi",
+    "request": {
+     "method": "PUT",
+     "path": "/c1mgstyq_/enbi99l%E2%82%ACsnhf",
+     "query": "",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-40",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "glbtifs",
+    "jti": "fd9ce4aa550e91bb",
+    "exp": 1767322094,
+    "method": "POST",
+    "path": "/7%41-a/.s0%25op.l/py_wigg6%2f",
+    "query": "fh3-p=qbi0",
+    "host": "govder.internal:8080",
+    "body_b64": ""
+   },
+   "payload": "Z2xidGlmcw.1767322094.fd9ce4aa550e91bb\nPOST\n/7%41-a/.s0%25op.l/py_wigg6%2f\nfh3-p=qbi0\ngovder.internal:8080\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "Z2xidGlmcw.1767322094.fd9ce4aa550e91bb.H53-bYQz-b3fQQ6_mXdD-qLKVxnEas9ASTNtiz092Bs",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "glbtifs",
+    "request": {
+     "method": "POST",
+     "path": "/7%41-a/.s0%25op.l/py_wigg6%2f",
+     "query": "fh3-p=qbi0",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "glbtifs"
+  },
+  {
+   "id": "corpus-40-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 43",
+   "assertion": "Z2xidGlmcw.1767322094.fd9ce4aa550e91bb.H53-8YQz-b3fQQ6_mXdD-qLKVxnEas9ASTNtiz092Bs",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "glbtifs",
+    "request": {
+     "method": "POST",
+     "path": "/7%41-a/.s0%25op.l/py_wigg6%2f",
+     "query": "fh3-p=qbi0",
+     "host": "govder.internal:8080",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-41",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "qficglagg",
+    "jti": "d61ea837704937ab",
+    "exp": 1767322206,
+    "method": "get",
+    "path": "/-vk%E2%82%AC/o6dv/jaly1y6",
+    "query": "v799=k_4hh1fyi",
+    "host": "127.0.0.1:8081",
+    "body_b64": ""
+   },
+   "payload": "cWZpY2dsYWdn.1767322206.d61ea837704937ab\nGET\n/-vk%E2%82%AC/o6dv/jaly1y6\nv799=k_4hh1fyi\n127.0.0.1:8081\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "cWZpY2dsYWdn.1767322206.d61ea837704937ab.oL68elACWls3Yc4eJBdp-XAkerHq0JvmQl_9zZx3Nhk",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "qficglagg",
+    "request": {
+     "method": "GET",
+     "path": "/-vk%E2%82%AC/o6dv/jaly1y6",
+     "query": "v799=k_4hh1fyi",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "qficglagg"
+  },
+  {
+   "id": "corpus-41-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 64",
+   "assertion": "cWZpY2dsYWdn.1767322206.d61ea837704937ab.oL68elACWls3Yc4eJBdp-XAyerHq0JvmQl_9zZx3Nhk",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "qficglagg",
+    "request": {
+     "method": "GET",
+     "path": "/-vk%E2%82%AC/o6dv/jaly1y6",
+     "query": "v799=k_4hh1fyi",
+     "host": "127.0.0.1:8081",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-42",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "oshvggqndyv\u00e9",
+    "jti": "bd1a157d4a0a7d28",
+    "exp": 1767322012,
+    "method": "get",
+    "path": "/gun_odu%E2%82%ACeg",
+    "query": "-zqsc=ws5wqrbwf",
+    "host": "[::1]:9443",
+    "body_b64": "hlTKfdSnueYG2e/dc/xgHMcOvunwu7by4yNP4ysgpxqkHcjFedPq/laOgl334mCcA1aIOX7zY3jDvDrwsc/MNA=="
+   },
+   "payload": "b3NodmdncW5keXbDqQ.1767322012.bd1a157d4a0a7d28\nGET\n/gun_odu%E2%82%ACeg\n-zqsc=ws5wqrbwf\n[::1]:9443\nu5rckhUk7ouVfglC0Ikoh5TreKnYlMTCBakpVas8Byc",
+   "assertion": "b3NodmdncW5keXbDqQ.1767322012.bd1a157d4a0a7d28.nUiyCxPN3aguls16g255NDLK6T5yNhWyDb193sy7Fdw",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "oshvggqndyv\u00e9",
+    "request": {
+     "method": "GET",
+     "path": "/gun_odu%E2%82%ACeg",
+     "query": "-zqsc=ws5wqrbwf",
+     "host": "[::1]:9443",
+     "body_b64": "hlTKfdSnueYG2e/dc/xgHMcOvunwu7by4yNP4ysgpxqkHcjFedPq/laOgl334mCcA1aIOX7zY3jDvDrwsc/MNA=="
+    }
+   },
+   "expect": "accept",
+   "tenant": "oshvggqndyv\u00e9"
+  },
+  {
+   "id": "corpus-42-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 59",
+   "assertion": "b3NodmdncW5keXbDqQ.1767322012.bd1a157d4a0a7d28.nUiyCxPN3agues16g255NDLK6T5yNhWyDb193sy7Fdw",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "oshvggqndyv\u00e9",
+    "request": {
+     "method": "GET",
+     "path": "/gun_odu%E2%82%ACeg",
+     "query": "-zqsc=ws5wqrbwf",
+     "host": "[::1]:9443",
+     "body_b64": "hlTKfdSnueYG2e/dc/xgHMcOvunwu7by4yNP4ysgpxqkHcjFedPq/laOgl334mCcA1aIOX7zY3jDvDrwsc/MNA=="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-43",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "cilvbryaumq",
+    "jti": "ef1f983f31b3ea29",
+    "exp": 1767322274,
+    "method": "GET",
+    "path": "/i/u683/x/lcm830%41f2",
+    "query": "va3yat_sb=u86y%202",
+    "host": "[::1]:9443",
+    "body_b64": "N4mf20/0RpL488nrQLH0lm/oS+1rk+2OYkRKQLtc0FAS6eXrMKo3a6nDtmb43OggaRI4Tw76qAF97PaWARLuaQ=="
+   },
+   "payload": "Y2lsdmJyeWF1bXE.1767322274.ef1f983f31b3ea29\nGET\n/i/u683/x/lcm830%41f2\nva3yat_sb=u86y%202\n[::1]:9443\n7B6LT5l_DLfpLMrAl0xo2651y54hESY8qa43mT3dp9I",
+   "assertion": "Y2lsdmJyeWF1bXE.1767322274.ef1f983f31b3ea29.oocpu1NHLCVg1VlvgZBIdCkRt8tlS8t5NG-iRlePc_8",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "cilvbryaumq",
+    "request": {
+     "method": "GET",
+     "path": "/i/u683/x/lcm830%41f2",
+     "query": "va3yat_sb=u86y%202",
+     "host": "[::1]:9443",
+     "body_b64": "N4mf20/0RpL488nrQLH0lm/oS+1rk+2OYkRKQLtc0FAS6eXrMKo3a6nDtmb43OggaRI4Tw76qAF97PaWARLuaQ=="
+    }
+   },
+   "expect": "accept",
+   "tenant": "cilvbryaumq"
+  },
+  {
+   "id": "corpus-43-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 81",
+   "assertion": "Y2lsdmJyeWF1bXE.1767322274.ef1f983f31b3ea29.oocpu1NHLCVg1VlvgZBIdCkRt8tlS8t5NG-iRIePc_8",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "cilvbryaumq",
+    "request": {
+     "method": "GET",
+     "path": "/i/u683/x/lcm830%41f2",
+     "query": "va3yat_sb=u86y%202",
+     "host": "[::1]:9443",
+     "body_b64": "N4mf20/0RpL488nrQLH0lm/oS+1rk+2OYkRKQLtc0FAS6eXrMKo3a6nDtmb43OggaRI4Tw76qAF97PaWARLuaQ=="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-44",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "pw",
+    "jti": "4de5757d9ae41271",
+    "exp": 1767322083,
+    "method": "PATCH",
+    "path": "/4.-fq%20zh2/m7atqz/7ip41gio3%2fg/ukvdr38%253gs",
+    "query": "yh4w5%2f5=gydv%25ty&s0ha31k0=cnxcjk31n",
+    "host": "[::1]:9443",
+    "body_b64": "wp6Sb/Hr+U/iFc/gYse+5mY="
+   },
+   "payload": "cHc.1767322083.4de5757d9ae41271\nPATCH\n/4.-fq%20zh2/m7atqz/7ip41gio3%2fg/ukvdr38%253gs\nyh4w5%2f5=gydv%25ty&s0ha31k0=cnxcjk31n\n[::1]:9443\nSxKgHjP7GG-sG-XmLKX1fPlAWSvAbD62_jnqF8SgadY",
+   "assertion": "cHc.1767322083.4de5757d9ae41271.RGO7jSkQwhYxJptSD9z1-Hx1fKZpOVKAg48PNMqXFe4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "pw",
+    "request": {
+     "method": "PATCH",
+     "path": "/4.-fq%20zh2/m7atqz/7ip41gio3%2fg/ukvdr38%253gs",
+     "query": "yh4w5%2f5=gydv%25ty&s0ha31k0=cnxcjk31n",
+     "host": "[::1]:9443",
+     "body_b64": "wp6Sb/Hr+U/iFc/gYse+5mY="
+    }
+   },
+   "expect": "accept",
+   "tenant": "pw"
+  },
+  {
+   "id": "corpus-44-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 73",
+   "assertion": "cHc.1767322083.4de5757d9ae41271.RGO7jSkQwhYxJptSD9z1-Hx1fKZpOVKAg48PNMqXFT4",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "pw",
+    "request": {
+     "method": "PATCH",
+     "path": "/4.-fq%20zh2/m7atqz/7ip41gio3%2fg/ukvdr38%253gs",
+     "query": "yh4w5%2f5=gydv%25ty&s0ha31k0=cnxcjk31n",
+     "host": "[::1]:9443",
+     "body_b64": "wp6Sb/Hr+U/iFc/gYse+5mY="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-45",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "buf-",
+    "jti": "84119d3d3bd2c5bb",
+    "exp": 1767322066,
+    "method": "get",
+    "path": "/ri63c5",
+    "query": "",
+    "host": "govder.internal:8080",
+    "body_b64": "wHHNtDwOsWBKdyQXT5ePJuI="
+   },
+   "payload": "YnVmLQ.1767322066.84119d3d3bd2c5bb\nGET\n/ri63c5\n\ngovder.internal:8080\nXpIDM5uGrsIBwh2LjfD9Xo_o1YWlciDRerwFhSbamQ0",
+   "assertion": "YnVmLQ.1767322066.84119d3d3bd2c5bb.Xpj6QWVDd74ny1qxH7q1lfbCu41WlY6FMd3mC7trDwI",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "buf-",
+    "request": {
+     "method": "GET",
+     "path": "/ri63c5",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": "wHHNtDwOsWBKdyQXT5ePJuI="
+    }
+   },
+   "expect": "accept",
+   "tenant": "buf-"
+  },
+  {
+   "id": "corpus-45-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 13",
+   "assertion": "YnVmLQ.1767329066.84119d3d3bd2c5bb.Xpj6QWVDd74ny1qxH7q1lfbCu41WlY6FMd3mC7trDwI",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "buf-",
+    "request": {
+     "method": "GET",
+     "path": "/ri63c5",
+     "query": "",
+     "host": "govder.internal:8080",
+     "body_b64": "wHHNtDwOsWBKdyQXT5ePJuI="
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-46",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "cgsea",
+    "jti": "ffa849d1191c3d04",
+    "exp": 1767322137,
+    "method": "DELETE",
+    "path": "/ws-bdi/6rp/ke36mida20",
+    "query": "4hl13%2F9=2wtx&k7n=v7-hipz_w&1_.%20md=qhzwapo%E2%82%ACy",
+    "host": "Vultrino.Internal",
+    "body_b64": ""
+   },
+   "payload": "Y2dzZWE.1767322137.ffa849d1191c3d04\nDELETE\n/ws-bdi/6rp/ke36mida20\n4hl13%2F9=2wtx&k7n=v7-hipz_w&1_.%20md=qhzwapo%E2%82%ACy\nvultrino.internal\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+   "assertion": "Y2dzZWE.1767322137.ffa849d1191c3d04.ixG_QWfgrrlaZ7W247xrK668enInfywYe4cvPPBZbKw",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "cgsea",
+    "request": {
+     "method": "DELETE",
+     "path": "/ws-bdi/6rp/ke36mida20",
+     "query": "4hl13%2F9=2wtx&k7n=v7-hipz_w&1_.%20md=qhzwapo%E2%82%ACy",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "accept",
+   "tenant": "cgsea"
+  },
+  {
+   "id": "corpus-46-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 5",
+   "assertion": "Y2dzZeE.1767322137.ffa849d1191c3d04.ixG_QWfgrrlaZ7W247xrK668enInfywYe4cvPPBZbKw",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "cgsea",
+    "request": {
+     "method": "DELETE",
+     "path": "/ws-bdi/6rp/ke36mida20",
+     "query": "4hl13%2F9=2wtx&k7n=v7-hipz_w&1_.%20md=qhzwapo%E2%82%ACy",
+     "host": "Vultrino.Internal",
+     "body_b64": ""
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  },
+  {
+   "id": "corpus-47",
+   "note": "seeded corpus: accept",
+   "sign": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "tenant": "rmg",
+    "jti": "26b5bc319d17910a",
+    "exp": 1767322117,
+    "method": "PATCH",
+    "path": "/wikx122sa0/tc5kja9/uc5ta.u/02di76gj/dw",
+    "query": "xmy=ikupr%20&gi-ytt%3A67=.7m0xo%25qm5e&m4_wo5nc2x=n52xczm",
+    "host": "[::1]:9443",
+    "body_b64": "ejZq"
+   },
+   "payload": "cm1n.1767322117.26b5bc319d17910a\nPATCH\n/wikx122sa0/tc5kja9/uc5ta.u/02di76gj/dw\nxmy=ikupr%20&gi-ytt%3A67=.7m0xo%25qm5e&m4_wo5nc2x=n52xczm\n[::1]:9443\nGiI2X1PYZzVpZ8IHZ86T2yOR-SwY6gOJ-aCVZafeCmM",
+   "assertion": "cm1n.1767322117.26b5bc319d17910a.u-oGDRC0kbrU737_5zH3MxgVaJgSmp1ENdI6-QKtfZY",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "rmg",
+    "request": {
+     "method": "PATCH",
+     "path": "/wikx122sa0/tc5kja9/uc5ta.u/02di76gj/dw",
+     "query": "xmy=ikupr%20&gi-ytt%3A67=.7m0xo%25qm5e&m4_wo5nc2x=n52xczm",
+     "host": "[::1]:9443",
+     "body_b64": "ejZq"
+    }
+   },
+   "expect": "accept",
+   "tenant": "rmg"
+  },
+  {
+   "id": "corpus-47-mutant",
+   "note": "seeded corpus: one character of the accepted assertion changed at offset 75",
+   "assertion": "cm1n.1767322117.26b5bc319d17910a.u-oGDRC0kbrU737_5zH3MxgVaJgSmp1ENdI6-QKtfZy",
+   "verify": {
+    "key": "tenant-assertion-vector-key-F-0001",
+    "now": 1767322000,
+    "max_ttl_s": 300,
+    "expected_tenant": "rmg",
+    "request": {
+     "method": "PATCH",
+     "path": "/wikx122sa0/tc5kja9/uc5ta.u/02di76gj/dw",
+     "query": "xmy=ikupr%20&gi-ytt%3A67=.7m0xo%25qm5e&m4_wo5nc2x=n52xczm",
+     "host": "[::1]:9443",
+     "body_b64": "ejZq"
+    }
+   },
+   "expect": "reject",
+   "reason": "any"
+  }
+ ]
+}

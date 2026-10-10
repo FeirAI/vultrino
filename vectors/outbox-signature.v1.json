@@ -1,0 +1,751 @@
+{
+ "format": "feir.outbox-signature",
+ "version": 1,
+ "owner": "vultrino",
+ "header": "Govder-Signature",
+ "generator": "scripts/vectors/gen_outbox_signature.py (independent Python reference, stdlib only)",
+ "spec": [
+  "Header (push) or page field (poll): Govder-Signature = 'sha256=' + 64 lowercase hex characters of HMAC-SHA256(key, body).",
+  "body is the EXACT delivery body bytes: for a push, the HTTP request body; for a poll page, the raw bytes of the event's 'body' JSON value as they appear in the page (a consumer must not re-marshal it).",
+  "The delivery body carries 'sequence' and 'subject' itself (src/outbox.rs delivery_body), so the per-event ordering metadata is inside the signed bytes. The page's next_cursor is not signed.",
+  "A verifier accepts iff the value is exactly 'sha256=' followed by 64 characters of [0-9a-f] and equals the HMAC under one accepted key (constant-time compare). Uppercase hex, another prefix, surrounding whitespace, or any other length is malformed and rejected."
+ ],
+ "consumers": [
+  "vultrino src/outbox.rs sign_body (producer)",
+  "leria internal/gatewaypoll (meter feed, A/K) via internal/outbox VerifyBodyAny",
+  "govder internal/enforce ApprovalReceiver.VerifySignature (approval webhook, E) and internal/runtime verifyOutboxSig (activity feed)"
+ ],
+ "vectors": [
+  {
+   "id": "meter-observed",
+   "note": "a meter.observed delivery body (relationship A/K)",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "sha256=f54dd7649a03cf1753717e8682d6dc212b49371552c527b7892db12513a091d3",
+   "expect": "accept"
+  },
+  {
+   "id": "approval-decided",
+   "note": "an approval delivery body (relationship E)",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNloiLCJldmVudCI6ImFwcHJvdmFsLmRlY2lkZWQiLCJwYXlsb2FkIjp7ImFwcHJvdmFsX2lkIjoiYXBwcl8wMUhaWCIsImFwcHJvdmVyIjoidmVyaWZpZWQ6c3ViLWFsaWNlIiwib3V0Y29tZSI6ImFwcHJvdmVkIiwidGVuYW50IjoiYWNtZSJ9LCJzZXF1ZW5jZSI6NDMsInN1YmplY3QiOiJhcHByb3ZhbDphcHByXzAxSFpYIn0=",
+   "signature": "sha256=1965a22dbda1cb698daa0ce1ca1cfd3af916621bae9a464452ea743aabd2fcf4",
+   "expect": "accept"
+  },
+  {
+   "id": "unicode-body",
+   "note": "UTF-8 body bytes are signed as they are",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJldmVudCI6Im1ldGVyLm9ic2VydmVkIiwicGF5bG9hZCI6eyJwcmluY2lwYWwiOiJjYWbDqSDkuK0g8J+YgCJ9LCJzZXF1ZW5jZSI6Nywic3ViamVjdCI6InMifQ==",
+   "signature": "sha256=4417a4b106e6b8ad1e96668627e04e12af8f32246df5b7d5484a6b40783ac9b9",
+   "expect": "accept"
+  },
+  {
+   "id": "empty-body",
+   "note": "the empty body",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "accept"
+  },
+  {
+   "id": "binary-body",
+   "note": "arbitrary bytes",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "AP8KDSI=",
+   "signature": "sha256=6861c2f3b9c0e39aea7ddc703b46e730de9504c32f04245a04e119ee581d1ebc",
+   "expect": "accept"
+  },
+  {
+   "id": "uppercase-hex",
+   "note": "uppercase hex digits are malformed",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "sha256=F54DD7649A03CF1753717E8682D6DC212B49371552C527B7892DB12513A091D3",
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "prefix-uppercase",
+   "note": "the prefix is lowercase",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "SHA256=f54dd7649a03cf1753717e8682d6dc212b49371552c527b7892db12513a091d3",
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "prefix-colon",
+   "note": "'sha256:' is not the prefix",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "sha256:f54dd7649a03cf1753717e8682d6dc212b49371552c527b7892db12513a091d3",
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "no-prefix",
+   "note": "bare hex",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "f54dd7649a03cf1753717e8682d6dc212b49371552c527b7892db12513a091d3",
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "leading-space",
+   "note": "surrounding whitespace is not trimmed",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": " sha256=f54dd7649a03cf1753717e8682d6dc212b49371552c527b7892db12513a091d3",
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "trailing-newline",
+   "note": "surrounding whitespace is not trimmed",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "sha256=f54dd7649a03cf1753717e8682d6dc212b49371552c527b7892db12513a091d3\n",
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "hex-63",
+   "note": "one hex digit short",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "sha256=f54dd7649a03cf1753717e8682d6dc212b49371552c527b7892db12513a091d",
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "hex-65",
+   "note": "one hex digit extra",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "sha256=f54dd7649a03cf1753717e8682d6dc212b49371552c527b7892db12513a091d30",
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "empty-signature",
+   "note": "no signature",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "",
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "prefix-only",
+   "note": "prefix without digest",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "sha256=",
+   "expect": "reject",
+   "reason": "malformed"
+  },
+  {
+   "id": "wrong-key",
+   "note": "signed with another key",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "sha256=725b1c34075af0157d0da64768fafa07eb083547d0076c58c2d22b07013e2b29",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "body-one-byte",
+   "note": "the sequence in the body changed 42 -> 43",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Mywic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQ==",
+   "signature": "sha256=f54dd7649a03cf1753717e8682d6dc212b49371552c527b7892db12513a091d3",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "body-trailing-newline",
+   "note": "a byte appended to the body",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTZaIiwiZXZlbnQiOiJtZXRlci5vYnNlcnZlZCIsInBheWxvYWQiOnsiYW1vdW50IjoxLCJhc3NldCI6ImFwaS1jYWxscyIsImNvbmZpZGVuY2UiOiJsb3ciLCJjb3JyZWxhdGlvbl9pZCI6InJlcS0wMSIsImNvc3Rfc291cmNlIjoiZ2F0ZXdheS1vYnNlcnZlZCIsImRpbXMiOnsiY3JlZGVudGlhbCI6Im9wZW5haSIsIm1vZGVsIjoiZ3B0LTUuNC1taW5pIiwidGVuYW50IjoiYWNtZSJ9LCJldmVudF9pZCI6InJlcS0wMSIsIm9jY3VycmVkX2F0IjoiMjAyNi0wMS0wMlQwMzowNDowNVoiLCJwcmluY2lwYWwiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNlcXVlbmNlIjo0Miwic3ViamVjdCI6ImFnZW50OmFjbWUvc3VwcG9ydC1ib3QifQo=",
+   "signature": "sha256=f54dd7649a03cf1753717e8682d6dc212b49371552c527b7892db12513a091d3",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-00",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "1g==",
+   "signature": "sha256=b1ded96851200f26769742b76493bb40af85ae1c07e21edaef631e62604dbbc2",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-00-mutant",
+   "note": "seeded corpus: one hex digit changed at 66",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "1g==",
+   "signature": "sha256=b1ded96851200f26769742b76493bb40af85ae1c07e21edaef631e626042bbc2",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-01",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "FTGqpol20w==",
+   "signature": "sha256=bbfc742c54108a2deccba12616e697e548b2298855bfd69077b4c74a6bc9996c",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-01-mutant",
+   "note": "seeded corpus: one hex digit changed at 36",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "FTGqpol20w==",
+   "signature": "sha256=bbfc742c54108a2deccba12616e691e548b2298855bfd69077b4c74a6bc9996c",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-02",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "7q34yqpCQldN7PiJY2N41qTk/gjfh3dnM3NuMJKG2UXR",
+   "signature": "sha256=a5fe67e75b6c2457d9e29f83d77896b4fa2f6da06bce81c6e50e44085718a10a",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-02-mutant",
+   "note": "seeded corpus: one hex digit changed at 50",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "7q34yqpCQldN7PiJY2N41qTk/gjfh3dnM3NuMJKG2UXR",
+   "signature": "sha256=a5fe67e75b6c2457d9e29f83d77896b4fa2f6da06bcd81c6e50e44085718a10a",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-03",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "dlxXMHxp0he+NuZ6i5WpWm75iGOgGMnQah8ZaJ0DY22CrIDa39AzB/GD9VimiZFeFUi4rtwsUYrGBAFgz1WHrRoz5Uvy/MOehfwVHqIjz5NlPPNfCRPHYej3u01MO/vfWzQ6UWOriY45fGeyHyILu1yTfCzQ3LpT",
+   "signature": "sha256=96abff2399d69c378d76012bbae3b345d8d841508b6a1f990c605b0ed0269c7a",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-03-mutant",
+   "note": "seeded corpus: one hex digit changed at 14",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "dlxXMHxp0he+NuZ6i5WpWm75iGOgGMnQah8ZaJ0DY22CrIDa39AzB/GD9VimiZFeFUi4rtwsUYrGBAFgz1WHrRoz5Uvy/MOehfwVHqIjz5NlPPNfCRPHYej3u01MO/vfWzQ6UWOriY45fGeyHyILu1yTfCzQ3LpT",
+   "signature": "sha256=96abff2299d69c378d76012bbae3b345d8d841508b6a1f990c605b0ed0269c7a",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-04",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "yCZdnHGUzulxMIGchkL7hR4A2oOZHOVNqyCxPXph+HGcfAZlD+R1tL10PIoIGnqrzfvT+Hvr453GjxNw2aRJMVaD1JgrsyM6+49ghHREwORXrIEsmBYBIP5fXZrJoK+fyFZk7yoIs9JzJMu7kIK4a49lTEI5Bj/1",
+   "signature": "sha256=2b8f79d242ebdcdf4632c9bd2b4344d11da5e2da4069535834e73c687f0706f2",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-04-mutant",
+   "note": "seeded corpus: one hex digit changed at 7",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "yCZdnHGUzulxMIGchkL7hR4A2oOZHOVNqyCxPXph+HGcfAZlD+R1tL10PIoIGnqrzfvT+Hvr453GjxNw2aRJMVaD1JgrsyM6+49ghHREwORXrIEsmBYBIP5fXZrJoK+fyFZk7yoIs9JzJMu7kIK4a49lTEI5Bj/1",
+   "signature": "sha256=4b8f79d242ebdcdf4632c9bd2b4344d11da5e2da4069535834e73c687f0706f2",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-05",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-05-mutant",
+   "note": "seeded corpus: one hex digit changed at 17",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d94807ee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-06",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "9NoV08A/tfOgwjcdWSdHdUrQjmMaVh+B1DHPiiU1T5FpPiDduXcanTY6Nv2ZwhiCByFYr0hJd40qdp0afL8PZydZa/Dhx00wls6QIN9AdQjJ/5Pn13yZmag2n+37Ak2bAvzFUOKHVuybINK/C8epR37qED5n2t+C",
+   "signature": "sha256=ee9c9024296d4d08122f77bc7efcb25f28dca071c9ae0658a171bd94e68f43ce",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-06-mutant",
+   "note": "seeded corpus: one hex digit changed at 49",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "9NoV08A/tfOgwjcdWSdHdUrQjmMaVh+B1DHPiiU1T5FpPiDduXcanTY6Nv2ZwhiCByFYr0hJd40qdp0afL8PZydZa/Dhx00wls6QIN9AdQjJ/5Pn13yZmag2n+37Ak2bAvzFUOKHVuybINK/C8epR37qED5n2t+C",
+   "signature": "sha256=ee9c9024296d4d08122f77bc7efcb25f28dca071c91e0658a171bd94e68f43ce",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-07",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "PYTrBp4n4Q==",
+   "signature": "sha256=a7526ee2e9c3e9ba0f6f7f356e9722158c7546ca954a2b36b104e6a85829cf9a",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-07-mutant",
+   "note": "seeded corpus: one hex digit changed at 23",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "PYTrBp4n4Q==",
+   "signature": "sha256=a7526ee2e9c3e9babf6f7f356e9722158c7546ca954a2b36b104e6a85829cf9a",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-08",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "lUF4tdBCwA==",
+   "signature": "sha256=6055cfff6abba82cd8ec34a8500e5d350d25eb9ca8d1d6eebb171ff68c8876f8",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-08-mutant",
+   "note": "seeded corpus: one hex digit changed at 51",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "lUF4tdBCwA==",
+   "signature": "sha256=6055cfff6abba82cd8ec34a8500e5d350d25eb9ca8d1a6eebb171ff68c8876f8",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-09",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-09-mutant",
+   "note": "seeded corpus: one hex digit changed at 20",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee99cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-10",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "S//IvwF3h+5dloo4JEWXddcMb2OXl4BnwfdtVw2BIW83",
+   "signature": "sha256=b485455414e297dc3d8c7bba2c7643e0dbd9fb77edb229a0e7d002a0cd27f426",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-10-mutant",
+   "note": "seeded corpus: one hex digit changed at 37",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "S//IvwF3h+5dloo4JEWXddcMb2OXl4BnwfdtVw2BIW83",
+   "signature": "sha256=b485455414e297dc3d8c7bba2c7643c0dbd9fb77edb229a0e7d002a0cd27f426",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-11",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "4QqKHFWFVQ==",
+   "signature": "sha256=5c915bd642cbcc14011686cb34bba9937d7a04b62813fe2e9d039d8c39e7a862",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-11-mutant",
+   "note": "seeded corpus: one hex digit changed at 8",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "4QqKHFWFVQ==",
+   "signature": "sha256=58915bd642cbcc14011686cb34bba9937d7a04b62813fe2e9d039d8c39e7a862",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-12",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-12-mutant",
+   "note": "seeded corpus: one hex digit changed at 13",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9dc480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-13",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "8ZuKEPdez+9aQpO4SMDbDqRWzsCQa9Ibbn5w3Kres20SOPs3bVYMNpkEHgohQBuk/19LOpaUeS2Rbbdx01KMWoA539SYs6RZ/NbjG7mgMhjEv9pk6jUJQCjCpCAQ9V6QkMwQ7esQRPyLoYGICyAbaBclzWR+LdUS",
+   "signature": "sha256=35e92aa258a689c437077f9f216677d9632c455cbceb9feb8ce9b76a65223f69",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-13-mutant",
+   "note": "seeded corpus: one hex digit changed at 52",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "8ZuKEPdez+9aQpO4SMDbDqRWzsCQa9Ibbn5w3Kres20SOPs3bVYMNpkEHgohQBuk/19LOpaUeS2Rbbdx01KMWoA539SYs6RZ/NbjG7mgMhjEv9pk6jUJQCjCpCAQ9V6QkMwQ7esQRPyLoYGICyAbaBclzWR+LdUS",
+   "signature": "sha256=35e92aa258a689c437077f9f216677d9632c455cbceb99eb8ce9b76a65223f69",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-14",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-14-mutant",
+   "note": "seeded corpus: one hex digit changed at 13",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d5480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-15",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-15-mutant",
+   "note": "seeded corpus: one hex digit changed at 19",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480feb79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-16",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "Hw==",
+   "signature": "sha256=1154eec986452a769738f3da71f655a27ff9c8c276937627db8e676d5767eccf",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-16-mutant",
+   "note": "seeded corpus: one hex digit changed at 54",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "Hw==",
+   "signature": "sha256=1154eec986452a769738f3da71f655a27ff9c8c276937629db8e676d5767eccf",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-17",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "Z2/Gd8LWqg==",
+   "signature": "sha256=0b7832a9d53b8fa06b1181f554559622678f462d0d8f15f5046ff4d84f759e37",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-17-mutant",
+   "note": "seeded corpus: one hex digit changed at 20",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "Z2/Gd8LWqg==",
+   "signature": "sha256=0b7832a9d53b84a06b1181f554559622678f462d0d8f15f5046ff4d84f759e37",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-18",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "2A==",
+   "signature": "sha256=868ef2471420708a8453b18ab3835285f0c0dd851716b61f22defe1f2676bd48",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-18-mutant",
+   "note": "seeded corpus: one hex digit changed at 66",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "2A==",
+   "signature": "sha256=868ef2471420708a8453b18ab3835285f0c0dd851716b61f22defe1f2677bd48",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-19",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "MQ==",
+   "signature": "sha256=e6a4f590e644d56cf301ee2794c020213805ee7be08341bae657383a02f99912",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-19-mutant",
+   "note": "seeded corpus: one hex digit changed at 47",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "MQ==",
+   "signature": "sha256=e6a4f590e644d56cf301ee2794c020213805ee7b108341bae657383a02f99912",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-20",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "tZsszWBA3Pa+20pP4ws6+u3IZWsrXaia6KvD08RSk03P",
+   "signature": "sha256=6ce9860f76536a132737c6670e8fd10ee88ac331b7cecb6e383aa59392781b5f",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-20-mutant",
+   "note": "seeded corpus: one hex digit changed at 41",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "tZsszWBA3Pa+20pP4ws6+u3IZWsrXaia6KvD08RSk03P",
+   "signature": "sha256=6ce9860f76536a132737c6670e8fd10ee83ac331b7cecb6e383aa59392781b5f",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-21",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "ng==",
+   "signature": "sha256=e0f454bddd4c88ef346c2d5521fe9b2cfbc37a1d707a4ba0cbce7184823c8d87",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-21-mutant",
+   "note": "seeded corpus: one hex digit changed at 67",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "ng==",
+   "signature": "sha256=e0f454bddd4c88ef346c2d5521fe9b2cfbc37a1d707a4ba0cbce7184823ccd87",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-22",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "gg==",
+   "signature": "sha256=dca47b990d7a5b272a7d09dd8a50e98b7c32525e53cdc6dfcfeb8377d236f52f",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-22-mutant",
+   "note": "seeded corpus: one hex digit changed at 52",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "gg==",
+   "signature": "sha256=dca47b990d7a5b272a7d09dd8a50e98b7c32525e53cdc4dfcfeb8377d236f52f",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-23",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "Yh1V2LE3Y7l6PS7XuEeTNhHA5N7gfsF907A0JlqsoH6FTeimdcdsSbaPBag9b2LVmO2E6t0vK2LpQej/JIMLhFWuGteiZW3eO72lGda3TPkSYIwayuTRmL//7x2DtEppvf/jcX0c3lH2sqOamAOc/NgfMCeGjd7l",
+   "signature": "sha256=a9129778b31bb0caddb24976ecf7c915ba19e036c463b452024928ca1196c705",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-23-mutant",
+   "note": "seeded corpus: one hex digit changed at 14",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "Yh1V2LE3Y7l6PS7XuEeTNhHA5N7gfsF907A0JlqsoH6FTeimdcdsSbaPBag9b2LVmO2E6t0vK2LpQej/JIMLhFWuGteiZW3eO72lGda3TPkSYIwayuTRmL//7x2DtEppvf/jcX0c3lH2sqOamAOc/NgfMCeGjd7l",
+   "signature": "sha256=a9129770b31bb0caddb24976ecf7c915ba19e036c463b452024928ca1196c705",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-24",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "EP85KDPm1kP0WW/DGQiImputu4dSzUY3Ibrm1g304d62",
+   "signature": "sha256=861b8652a5a6755d417db6b63a1a208baad382937bfbacb4f36c3afb02e61384",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-24-mutant",
+   "note": "seeded corpus: one hex digit changed at 25",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "EP85KDPm1kP0WW/DGQiImputu4dSzUY3Ibrm1g304d62",
+   "signature": "sha256=861b8652a5a6755d410db6b63a1a208baad382937bfbacb4f36c3afb02e61384",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-25",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "rFBUiw9LWg==",
+   "signature": "sha256=4c80438738a9a8013f493dd97fb5a51160a86ad6a35e5a5cde5406327ff9cc95",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-25-mutant",
+   "note": "seeded corpus: one hex digit changed at 51",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "rFBUiw9LWg==",
+   "signature": "sha256=4c80438738a9a8013f493dd97fb5a51160a86ad6a35eba5cde5406327ff9cc95",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-26",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-26-mutant",
+   "note": "seeded corpus: one hex digit changed at 32",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3ca6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-27",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-27-mutant",
+   "note": "seeded corpus: one hex digit changed at 8",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=ae9e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-28",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-28-mutant",
+   "note": "seeded corpus: one hex digit changed at 7",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=289e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-29",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "Tw==",
+   "signature": "sha256=880e8585179955302bc94e7d3023ee15314aef0d98b3c8436dbfa976cb76193e",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-29-mutant",
+   "note": "seeded corpus: one hex digit changed at 10",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "Tw==",
+   "signature": "sha256=880b8585179955302bc94e7d3023ee15314aef0d98b3c8436dbfa976cb76193e",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-30",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "oA==",
+   "signature": "sha256=a4a12a6120b9d329e7dada2b3a2e93d4809cf969ce4f1f8bc4aa59f55bd89e85",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-30-mutant",
+   "note": "seeded corpus: one hex digit changed at 58",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "oA==",
+   "signature": "sha256=a4a12a6120b9d329e7dada2b3a2e93d4809cf969ce4f1f8bc4a659f55bd89e85",
+   "expect": "reject",
+   "reason": "bad_mac"
+  },
+  {
+   "id": "corpus-31",
+   "note": "seeded corpus: accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca8c4793d3c1f64c8",
+   "expect": "accept"
+  },
+  {
+   "id": "corpus-31-mutant",
+   "note": "seeded corpus: one hex digit changed at 57",
+   "key": "outbox-signature-vector-key-A-0001",
+   "body_b64": "",
+   "signature": "sha256=a89e9d9480fee79cbe80490d3aa6b9fb49cb96557565fcbca874793d3c1f64c8",
+   "expect": "reject",
+   "reason": "bad_mac"
+  }
+ ],
+ "pages": [
+  {
+   "id": "page-raw-bytes",
+   "note": "the body is signed as it appears (spaces, escaped unicode, unsorted keys): accept",
+   "key": "outbox-signature-vector-key-A-0001",
+   "page_b64": "eyJldmVudHMiOlt7ImJvZHkiOnsgInNlcXVlbmNlIjogOSwgInN1YmplY3QiOiAiYWdlbnQ6YWNtZS94IiwgImV2ZW50IjogIm1ldGVyLm9ic2VydmVkIiwgInBheWxvYWQiOiB7InByaW5jaXBhbCI6ICJjYWZcdTAwZTkifSB9LCJzaWduYXR1cmUiOiJzaGEyNTY9OGFjNDVjYmYwZDFlMzAyMTYwMGRlMDYxZmExZjUwYjE2NmE1ZTg3NDVhNzc2ODY3YWYxOTM2ZTI0OWE3MmFmYSJ9XSwibmV4dF9jdXJzb3IiOjl9",
+   "expect": [
+    "accept"
+   ]
+  },
+  {
+   "id": "page-remarshaled-signature",
+   "note": "signed over a re-marshaled form of the body, not its bytes: reject",
+   "key": "outbox-signature-vector-key-A-0001",
+   "page_b64": "eyJldmVudHMiOlt7ImJvZHkiOnsgInNlcXVlbmNlIjogOSwgInN1YmplY3QiOiAiYWdlbnQ6YWNtZS94IiwgImV2ZW50IjogIm1ldGVyLm9ic2VydmVkIiwgInBheWxvYWQiOiB7InByaW5jaXBhbCI6ICJjYWZcdTAwZTkifSB9LCJzaWduYXR1cmUiOiJzaGEyNTY9ZmU0ZDkyMDQ1ODFlYjQzYTVkZDc0MmQ5NGQxNWZhMzBiNTg2YTgzMzA5ZGM5ODg1YjRiMmY1ODY2ZTEyNjI5OCJ9XSwibmV4dF9jdXJzb3IiOjl9",
+   "expect": [
+    "reject"
+   ]
+  },
+  {
+   "id": "page-two-events",
+   "note": "two events: accept, then a tampered one: reject",
+   "key": "outbox-signature-vector-key-A-0001",
+   "page_b64": "eyJldmVudHMiOlt7ImJvZHkiOnsiY3JlYXRlZF9hdCI6IjIwMjYtMDEtMDJUMDM6MDQ6MDUuMTIzNDU2WiIsImV2ZW50IjoibWV0ZXIub2JzZXJ2ZWQiLCJwYXlsb2FkIjp7ImFtb3VudCI6MSwiYXNzZXQiOiJhcGktY2FsbHMiLCJjb25maWRlbmNlIjoibG93IiwiY29ycmVsYXRpb25faWQiOiJyZXEtMDEiLCJjb3N0X3NvdXJjZSI6ImdhdGV3YXktb2JzZXJ2ZWQiLCJkaW1zIjp7ImNyZWRlbnRpYWwiOiJvcGVuYWkiLCJtb2RlbCI6ImdwdC01LjQtbWluaSIsInRlbmFudCI6ImFjbWUifSwiZXZlbnRfaWQiOiJyZXEtMDEiLCJvY2N1cnJlZF9hdCI6IjIwMjYtMDEtMDJUMDM6MDQ6MDVaIiwicHJpbmNpcGFsIjoiYWdlbnQ6YWNtZS9zdXBwb3J0LWJvdCJ9LCJzZXF1ZW5jZSI6NDIsInN1YmplY3QiOiJhZ2VudDphY21lL3N1cHBvcnQtYm90In0sInNpZ25hdHVyZSI6InNoYTI1Nj1mNTRkZDc2NDlhMDNjZjE3NTM3MTdlODY4MmQ2ZGMyMTJiNDkzNzE1NTJjNTI3Yjc4OTJkYjEyNTEzYTA5MWQzIn0seyJib2R5Ijp7ImNyZWF0ZWRfYXQiOiIyMDI2LTAxLTAyVDAzOjA0OjA2WiIsImV2ZW50IjoiYXBwcm92YWwuZGVjaWRlZCIsInBheWxvYWQiOnsiYXBwcm92YWxfaWQiOiJhcHByXzAxSFpYIiwiYXBwcm92ZXIiOiJ2ZXJpZmllZDpzdWItYWxpY2UiLCJvdXRjb21lIjoiYXBwcm92ZWQiLCJ0ZW5hbnQiOiJhY21lIn0sInNlcXVlbmNlIjo0Mywic3ViamVjdCI6ImFwcHJvdmFsOmFwcHJfMDFIWlgifSwic2lnbmF0dXJlIjoic2hhMjU2PWY1NGRkNzY0OWEwM2NmMTc1MzcxN2U4NjgyZDZkYzIxMmI0OTM3MTU1MmM1MjdiNzg5MmRiMTI1MTNhMDkxZDMifV0sIm5leHRfY3Vyc29yIjo5fQ==",
+   "expect": [
+    "accept",
+    "reject"
+   ]
+  }
+ ]
+}

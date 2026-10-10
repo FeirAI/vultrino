@@ -1,0 +1,15 @@
+diff --git a/src/govder/mod.rs b/src/govder/mod.rs
+index fbebb96..fb9e9a1 100644
+--- a/src/govder/mod.rs
++++ b/src/govder/mod.rs
+@@ -630,8 +630,8 @@ impl GovderClient {
+             &self.cfg.assertion_secret,
+             tenant,
+             method,
+-            url.path(),
+-            url.query().unwrap_or(""),
++            path,
++            query,
+             &self.host,
+             body.unwrap_or_default(),
+             exp,

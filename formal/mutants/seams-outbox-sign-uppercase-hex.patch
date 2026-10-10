@@ -1,0 +1,13 @@
+diff --git a/src/outbox.rs b/src/outbox.rs
+index 3d7cc9d..249edeb 100644
+--- a/src/outbox.rs
++++ b/src/outbox.rs
+@@ -686,7 +686,7 @@ pub fn sign_body(secret: &str, body: &[u8]) -> String {
+     let mut mac =
+         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+     mac.update(body);
+-    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
++    format!("sha256={}", hex::encode_upper(mac.finalize().into_bytes()))
+ }
+ 
+ /// Configuration for the signed delivery outbox (V9). `Debug` is hand-written to
