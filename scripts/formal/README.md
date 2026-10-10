@@ -1,6 +1,6 @@
-# Formal kit (version 2)
+# Formal kit (version 2.1)
 
-`KIT_VERSION = "2"` in `formal_kit.py`; both scripts print it and accept `--version`. Changes from v1 are listed at the end.
+`KIT_VERSION = "2.1"` in `formal_kit.py`; both scripts print it and accept `--version`. Changes from v1 are listed at the end.
 
 Shared tooling that keeps a repository's formal-verification claims honest.
 Python 3 standard library only (tests pass on 3.9, 3.12 and 3.14). Each repo vendors a copy into
@@ -153,3 +153,4 @@ Symbol extractor (Go and Rust only; other file types may only use symbol `*`):
 * Schema stays `1`; new optional keys: `formal_docs`, `scratch_cache_dirs`, claim/mutant `detector_kind`. When adding the table markers, also set `formal_docs` so that losing the file or its markers fails instead of warning.
 * A mutant with its own `detector` that is not a cargo or go test needs `"detector_kind": "custom"` in its own `mutants` map entry; the claim's `custom` does not carry over. averin: the Kani-override mutants `m9-b64-one-byte-tail` and `m10-b64-two-byte-tail` (`bash formal/run-kani.sh --harness ...`) must declare it when averin vendors v2.
 * Residual limits (accepted): the vacuity guard reads output text and can be satisfied by a detector that prints a cargo-looking line (use review, not trust), and it proves only that some test ran, not that every named test did; a vacuous-kill check compares cover hashes only and cannot tell a trivial in-symbol edit from a semantic one; compile-break detection is a heuristic warning; cfg twins with identical signatures stay addressable only through `*`.
+* v2.1: `check_claims.py` runs `git apply --check` for every registered mutant patch against the current tree (no build, so `formal-fast` catches a patch made stale by a source change on the PR that changes it). `check_mutants.py` sets `FORMAL_KIT_MUTATED_TREE=1` for mutated detector runs so a detector that runs `check_claims.py` inside the mutated tree is not killed by its own already-applied patch.

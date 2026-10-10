@@ -289,7 +289,7 @@ def run(root: Path, claims_path: Path, tier: str = "full", only: Optional[str] =
                 touched = before != cover_hashes(s.claim)
                 neutralize_drift_lock(scratch, claims_rel)
                 t0 = time.time()
-                st, rc, tail = run_detector(s.detector, scratch, timeout, env)
+                st, rc, tail = run_detector(s.detector, scratch, timeout, dict(env, FORMAL_KIT_MUTATED_TREE="1"))
                 row["seconds"] = round(time.time() - t0, 1)
                 # full restore after every mutant run: tracked files back to HEAD (undoes the patch and any
                 # edit the detector made), untracked and ignored files removed (a file the patch created, or

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-KIT_VERSION = "2"
+KIT_VERSION = "2.1"
 SCHEMA_VERSION = 1
 METHODS = (
     "lean", "kani", "tla", "aeneas", "exhaustive", "differential-vectors",
