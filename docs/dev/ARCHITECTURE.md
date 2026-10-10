@@ -231,7 +231,9 @@ A delegate agent can also decide via a `vap_` token at
 floors (irreversible => human-only, Medium risk => veto window); the sign-off
 records `approver_kind = delegate-agent` plus a `delegation_grant_ref`.
 Self-approval (separation of duty) is recorded and, if
-`enforce_separation_of_duty`, rejected.
+`enforce_separation_of_duty`, rejected. Unset, the setting defaults to ON when approver identities
+are verified (a distinct `VULTRINO_APPROVAL_ASSERTION_SECRET`) and OFF in dev mode, where an
+identity is a typed-in name; an explicit value always wins.
 
 ### Halt / kill switch (`halt_agent`, V6)
 
