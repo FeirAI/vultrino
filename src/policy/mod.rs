@@ -7,9 +7,14 @@
 //! - Time windows
 //! - Rate limits
 
+pub mod kill_fence;
 mod precedence;
 mod types;
 mod url_canon;
+
+pub use kill_fence::{
+    kill_fence_verdict, KillFenceQuery, KillFenceState, KillFenceVerdict, KillMark,
+};
 
 pub use url_canon::{canonical_pattern, canonical_url, effective_url, policy_url, PatternWarning};
 

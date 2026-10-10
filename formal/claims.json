@@ -363,6 +363,18 @@
     },
     "seams-outbox-sign-uppercase-hex": {
       "tier": "full"
+    },
+    "kill-fence-verdict-ignores-stored-kill": {
+      "tier": "fast"
+    },
+    "kill-fence-epoch-mark-ignored": {
+      "tier": "full"
+    },
+    "kill-fence-dispatch-never-refuses": {
+      "tier": "full"
+    },
+    "kill-fence-ack-live-without-readback": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -515,12 +527,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "177059684cc7fb4d951f5c1419765349ae1ee01eeafbc6148b2576451bdd7dff"
+          "sha256": "ece06d2c2987a99a7d9a2a53d5defa976f2304858e328b73265f956e073f74b1"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "c4bbf0a5a5dc74e073cd55a84ca269ddb6dad86abcdfd339f9431ab7ae8257e7"
+          "sha256": "ef1e0bb08feb54218255dcb6c94959607d9a8fbdb8faffa9651cf4bc8b301a0e"
         },
         {
           "path": "src/server/mod.rs",
@@ -1926,7 +1938,7 @@
         {
           "path": "src/main.rs",
           "symbol": "run_web_server",
-          "sha256": "f05e6ee2e764770d908b28440cb33235c109d26a5be00264440926b99f29110b"
+          "sha256": "801726ec90b0c88d2a366686dc62ab37dcf72d3d1aaec8b47b66a243dca477f6"
         },
         {
           "path": "src/main.rs",
@@ -2036,6 +2048,70 @@
       ],
       "evidence_run": "37989336057",
       "does_not_establish": "Not key alignment, not that the signed body is the one delivered (delivery_body and the outbox store are separate), and not the consumers, which are claims in leria and govder."
+    },
+    {
+      "id": "kill-fence-before-dispatch",
+      "statement": "A stored kill policy (or one stored after the work was admitted, even if lifted since) refuses a plugin dispatch, a streamed dispatch, an approval claim and an approval open, read from the vault under its cross-process lock immediately before the dispatch and independent of the process's in-memory policy engine: with two VultrinoServers over one vault standing in for two processes, an agent halted through one is not dispatched by the other (approval resume through the decision path, live call, streamed call), an approval claimed on the other process is refused and finalized, an approval opened before a kill does not run after the lift while a later one does, an approval cannot be opened for a halted agent, a kill that lands after a resume or live call has evaluated still blocks its dispatch, an engine that missed the kill in the same process is overruled, and a kill policy write acknowledges the fence live with epoch >= 1 only when it reads back from the vault. The unkilled controls on the same fixture dispatch.",
+      "method": "test",
+      "artifacts": [
+        "src/policy/kill_fence.rs",
+        "src/server/mod.rs",
+        "src/storage/file.rs",
+        "tests/kill_fence_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test kill_fence_integration && cargo test --locked --no-default-features --lib policy::kill_fence",
+      "covers": [
+        {
+          "path": "src/policy/kill_fence.rs",
+          "symbol": "kill_fence_verdict",
+          "sha256": "ecd624271ba7ea32152da53fcec2f9ba8f5db1dfc3b98b4ee7dcd191d88ecf3f"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::kill_fence_before_dispatch",
+          "sha256": "11675da4166f8995fc9c650e79db70adc3262b8b8482f4d6c88e35222e14d4bd"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::kill_fence_refuses_open",
+          "sha256": "352037fd74f5a2ca24a76c021615ca7a297ef04cc70b6109e341d178eb6b895c"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "KillFenceAck::read",
+          "sha256": "a197afbdd55a97c98b61e8902d6b4bf9b376a9d6f607bb6e08b51148ee02f5f6"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "StorageBackend for FileStorage::kill_fence_check",
+          "sha256": "3825cf36b9464249f40d3f1e17c5b376035038a4169e9e5da2ddafb57ab0a1e2"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "StorageBackend for FileStorage::claim_approval_for_execution",
+          "sha256": "73f9009b299a4290c67263e0b27dc6ec12eca660cfd5b63067fb6ffaefe35ba6"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "StorageBackend for FileStorage::store_policy",
+          "sha256": "814b50801aa832600312fd3426ab3ad7fee0bc4f57556f65e816e966a1b682e8"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::locked_read",
+          "sha256": "5ab058f76784e35b895eb29fb20216cfd8d788f7322a4f33eaf95cb597eff8e2"
+        }
+      ],
+      "mutants": [
+        "kill-fence-verdict-ignores-stored-kill",
+        "kill-fence-epoch-mark-ignored",
+        "kill-fence-dispatch-never-refuses",
+        "kill-fence-ack-live-without-readback"
+      ],
+      "does_not_establish": "Rollout safety of the one-way vault format: STORAGE_VERSION 9 makes an older binary refuse the vault on open, but an older process already running keeps its loaded engine and is refused only where it takes the vault lock, so a vk_ API-key or LLM-proxy call on it can still dispatch after Contained; every process sharing the vault must be stopped (and the vault backed up) before the fence build starts. Kill marks are keyed by policy id (a re-stored id with a narrower pattern overwrites its mark). Dispatch lock contention is not measured. Also: Several hosts (the vault is one file under one cross-process lock; a network storage backend answers the default fail-closed 'unsupported'), calls already past the fence into the plugin when the kill lands (the fence is the last check before the dispatch call, not a recall), MCP, /execute and /llm entry points individually (they reach the shared execute_gated, execute_gated_streaming and resume_approved paths the tests drive; a new path that bypasses them is not covered), a halt that writes no kill policy, a kill epoch snapshot older than the durable value (conservatively refuses), or any CI run. Example-based tests over in-process servers and a counting plugin, not a proof; the model is govder formal/tla/KillFence.tla."
     }
   ]
 }

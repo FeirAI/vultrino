@@ -192,7 +192,7 @@ Merge is config-first, then stored, and **never dedups by id** — dropping a st
 
 A write through the admin API hot-reloads the engine **synchronously on the web
 process**. Other processes sharing the vault (the MCP server, a second replica)
-pick it up on a periodic refresh (`POLICY_REFRESH_SECS = 5`). So policy
+pick it up on a periodic refresh (`POLICY_REFRESH_SECS = 5`, settable with `VULTRINO_POLICY_REFRESH_SECS`). So policy
 propagation is **bounded-staleness, not instant**. For an *immediate* kill, revoke
 the use token — that is storage-authoritative and re-checked under the lock on
 every gated call in every process.
@@ -325,11 +325,17 @@ The default backend is an **encrypted file vault**:
   holding the cache (credentials, roles, API keys, use tokens, approvals, stored
   policies, and idempotency records; since v7 the signed outbox lives OUTSIDE the
   vault in its own encrypted file).
-- **Format version:** `STORAGE_VERSION = 7`. A vault whose recorded version is
+- **Format version:** `STORAGE_VERSION = 9`. A vault whose recorded version is
   **greater** than the binary understands is **refused** (`check_version`). A
   newer binary reads older vaults (new fields use `#[serde(default)]`), but the
   first write upgrades the on-disk format — after which an older binary sharing the
   same vault is refused. **Upgrade all processes before writing.**
+  The v9 bump (durable kill fence) is one-way: back up the vault first, and stop
+  EVERY vultrino process sharing it before starting the fence build. A pre-v9
+  process that is still running keeps its loaded engine and does not know the
+  fence, so it can dispatch (notably `vk_` API-key and LLM-proxy calls, which take
+  no vault lock) after govder reports Contained; it is refused only where it takes
+  the vault lock. Rolling back to a pre-v9 build needs the vault backup.
 - **Cross-process safety:** every read-modify-write takes an **exclusive
   `fd-lock`** on a lock file, so the `web`, `mcp`, and CLI processes can share one
   vault. Monotonic outbox sequences, token consumption, approval decisions, and

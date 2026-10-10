@@ -38,7 +38,24 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 - **Policy propagation across processes is bounded-staleness, not instant.** An
   admin policy push is synchronous on the web process but reaches the MCP server /
   other replicas only on the periodic refresh (`POLICY_REFRESH_SECS = 5`). For an
-  immediate kill, revoke the use token (storage-authoritative).
+  immediate kill, revoke the use token (storage-authoritative). Kill policies are
+  additionally fenced from the vault before every dispatch (P3-KILL), so they do not
+  wait for the refresh; ordinary Deny policies do, and `VULTRINO_POLICY_REFRESH_SECS`
+  (1 to 86400) stretches that wait up to a day.
+- **Kill fence: one-way vault format and a mixed-build window.** The fence stores its
+  epoch in the vault (`STORAGE_VERSION` 9); an older binary refuses a v9 vault, so
+  back up the vault before the first fence start. Stop every vultrino process sharing
+  the vault before starting the fence build: an older process already running is not
+  fenced and can still dispatch after govder reports Contained (the model's
+  `KillFence_mixed_builds` counterexample), most plainly on lock-free `vk_` API-key and
+  LLM-proxy calls.
+- **Kill fence cost.** Every dispatch, including `vk_` and streamed LLM-proxy calls that
+  were lock-free before, now takes the exclusive cross-process vault lock and decrypts
+  the vault, so dispatches across processes serialize. Not measured.
+- **Kill marks are keyed by policy id.** Re-storing a kill policy id with a narrower
+  or retargeted pattern overwrites its mark, so work admitted before the original kill
+  and no longer matched can run after a later lift. govder's ids are per-target; an
+  admin-edited kill policy is not covered.
 - **At-most-once execution sacrifices automatic recovery after an ambiguous
   crash.** Reserve → operate → complete are not one external transaction. If a
   worker disappears after claiming an approved action, a stale claim is finalized

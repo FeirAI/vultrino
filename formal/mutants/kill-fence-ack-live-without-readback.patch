@@ -1,0 +1,25 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index b887170..de1793d 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -236,16 +236,10 @@ impl KillFenceAck {
+     pub async fn read(storage: &dyn StorageBackend, policy_id: &str) -> Self {
+         match storage.kill_fence_ack(policy_id).await {
+             Ok(Some(epoch)) => KillFenceAck { live: true, epoch },
+-            Ok(None) => {
+-                warn!(
+-                    policy_id,
+-                    "kill policy did not read back from the vault; fence not live"
+-                );
+-                KillFenceAck {
+-                    live: false,
+-                    epoch: 0,
+-                }
+-            }
++            Ok(None) => KillFenceAck {
++                live: true,
++                epoch: 1,
++            },
+             Err(error) => {
+                 warn!(policy_id, %error, "kill fence could not be read back; fence not live");
+                 KillFenceAck {

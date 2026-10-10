@@ -69,6 +69,7 @@ fn direct_payload(params: serde_json::Value) -> ActionPayload {
         approved_execution: false,
         evidence_action: "mock.echo".to_string(),
         evidence_required: false,
+        kill_fence: Default::default(),
     }
 }
 
@@ -349,6 +350,7 @@ fn approved_payload(
         approved_execution: true,
         evidence_action: "mock.echo".to_string(),
         evidence_required: false,
+        kill_fence: Default::default(),
     }
 }
 

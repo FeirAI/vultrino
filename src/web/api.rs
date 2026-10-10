@@ -2304,9 +2304,19 @@ async fn store_and_reload_policy(
     // hash is keyed by the server secret (same function the list uses) so the two
     // paths produce the same value; empty when no secret is configured.
     let mut body = serde_json::to_value(policy).unwrap_or_default();
+    // P3-KILL: a kill policy is also the durable kill fence; acknowledge it only once
+    // it reads back from the vault under its lock (govder confirms W3 on this).
+    let kill_fence = if policy.kill {
+        Some(crate::server::KillFenceAck::read(state.storage.as_ref(), &policy.id).await)
+    } else {
+        None
+    };
     if let Some(obj) = body.as_object_mut() {
         let content_hash = policy_content_hash(policy, state.config.policy_hash_secret.as_deref());
         obj.insert("content_hash".to_string(), serde_json::json!(content_hash));
+        if let Some(ack) = kill_fence {
+            obj.insert("kill_fence".to_string(), serde_json::json!(ack));
+        }
     }
     (status, body)
 }

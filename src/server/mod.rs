@@ -214,6 +214,57 @@ pub struct HaltOutcome {
     pub in_flight: Vec<crate::session::SessionEntry>,
     /// How many abort callbacks were fired.
     pub callbacks_fired: usize,
+    /// The durable kill fence acknowledgement (P3-KILL): `live` once the halt kill
+    /// policy reads back from the vault under its lock, which is what every vultrino
+    /// process sharing the vault checks immediately before a dispatch.
+    pub kill_fence: KillFenceAck,
+}
+
+/// The kill fence acknowledgement a kill policy write returns (P3-KILL). `live` is
+/// true only when the stored kill policy was read back from the vault under its
+/// cross-process lock; `epoch` is the kill epoch that store produced (0 when not
+/// live). govder confirms a kill leg only on `live == true` with `epoch >= 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct KillFenceAck {
+    pub live: bool,
+    pub epoch: u64,
+}
+
+impl KillFenceAck {
+    /// Read the acknowledgement for the stored kill policy `policy_id`. Never fails:
+    /// an unreadable fence is reported as not live (govder then retries the leg).
+    pub async fn read(storage: &dyn StorageBackend, policy_id: &str) -> Self {
+        match storage.kill_fence_ack(policy_id).await {
+            Ok(Some(epoch)) => KillFenceAck { live: true, epoch },
+            Ok(None) => {
+                warn!(
+                    policy_id,
+                    "kill policy did not read back from the vault; fence not live"
+                );
+                KillFenceAck {
+                    live: false,
+                    epoch: 0,
+                }
+            }
+            Err(error) => {
+                warn!(policy_id, %error, "kill fence could not be read back; fence not live");
+                KillFenceAck {
+                    live: false,
+                    epoch: 0,
+                }
+            }
+        }
+    }
+}
+
+/// Who a dispatch runs as, for the kill fence (P3-KILL): the principal its policy
+/// evaluation matched, the vault kill epoch it was admitted under, and its tenant
+/// (for the refusal event only).
+#[derive(Debug, Clone, Default)]
+struct KillFenceSubject {
+    principal: Option<crate::policy::Principal>,
+    admitted_epoch: u64,
+    tenant: Option<String>,
 }
 
 /// Authentication context for a (possibly approval-gated) execution.
@@ -475,6 +526,9 @@ struct ActionPayload {
     /// binding. When true, a committed Averin use receipt is a precondition of
     /// plugin dispatch, independent of the ordinary Observe posture.
     evidence_required: bool,
+    /// The kill fence subject (P3-KILL), checked against the vault immediately
+    /// before the plugin call. Not part of the permit binding: it can only refuse.
+    kill_fence: KillFenceSubject,
 }
 
 impl crate::formal_kernel::Dispatch for ActionPayload {
@@ -1513,6 +1567,10 @@ impl VultrinoServer {
         // records what it judged (credential, principal, params digest) and,
         // for a Deny, whether V11 observe mode lets the request run (never for a
         // kill switch or a SpendCap/RateLimit guard).
+        // P3-KILL: the kill epoch this request is admitted under, snapshotted BEFORE
+        // the policy evaluation (a cache value, at most the vault's): any kill stored
+        // after it refuses this work at open, claim and dispatch.
+        let admitted_epoch = self.storage.kill_fence_epoch().await;
         let evaluation = self.policy_engine.evaluate_for_admission(
             &crate::policy::AdmissionQuery {
                 credential_alias: &credential.alias,
@@ -1862,6 +1920,20 @@ impl VultrinoServer {
             approval.authoritative_risk_tier = authoritative_risk_tier;
             approval.authoritative_irreversible = authoritative_irreversible;
 
+            // P3-KILL: never open an approval for a halted agent, nor for one killed
+            // after this request was admitted. Read from the vault under its lock: a
+            // halt through another process may not be in this process's engine yet.
+            // Before the bearer reservation, so a refusal burns no use.
+            self.kill_fence_refuses_open(
+                &credential.alias,
+                &full_action,
+                principal.as_ref(),
+                principal_tenant.as_deref(),
+                admitted_epoch,
+            )
+            .await?;
+            approval.kill_epoch_at_open = Some(admitted_epoch);
+
             // Convert the short-lived bearer authority into this frozen durable
             // request now. The use is reserved before the approval is published,
             // so one-use capacity cannot be replayed into a second approval while
@@ -1937,6 +2009,11 @@ impl VultrinoServer {
             approved_execution: false,
             evidence_action: request.action.clone(),
             evidence_required,
+            kill_fence: KillFenceSubject {
+                principal: principal.clone(),
+                admitted_epoch,
+                tenant: principal_tenant.clone(),
+            },
         };
         let authorized = permit.authorize(payload).map_err(|_| {
             VultrinoError::PolicyDenied(
@@ -2328,6 +2405,103 @@ impl VultrinoServer {
         }
     }
 
+    /// P3-KILL, the kill fence immediately before a plugin dispatch: read the vault
+    /// under its cross-process lock and refuse when a stored kill policy matches the
+    /// subject, or one was stored after the epoch it was admitted under. A refusal is
+    /// terminal and not committed (nothing ran); an unreadable vault refuses too, as
+    /// retryable. Begun exact-use evidence is completed as an error.
+    async fn kill_fence_before_dispatch(
+        &self,
+        credential_alias: &str,
+        full_action: &str,
+        subject: &KillFenceSubject,
+        exact_evidence: Option<&(
+            Arc<crate::averin::AverinClient>,
+            crate::averin::ExactUseEvidence,
+        )>,
+    ) -> Result<(), RunError> {
+        let verdict = self
+            .storage
+            .kill_fence_check(&crate::policy::KillFenceQuery {
+                credential_alias,
+                principal: subject.principal.as_ref(),
+                admitted_epoch: subject.admitted_epoch,
+            })
+            .await;
+        let refusal = match verdict {
+            Ok(v) => match v.refusal_reason() {
+                None => return Ok(()),
+                Some(reason) => RunError::terminal(VultrinoError::PolicyDenied(reason)),
+            },
+            Err(error) => RunError::retryable(VultrinoError::PolicyUnavailable(format!(
+                "the kill fence could not be read from the vault; nothing ran: {error}"
+            ))),
+        };
+        if let Some((av, evidence)) = exact_evidence {
+            if let Err(seal_error) = av.complete_exact_use(evidence, "error").await {
+                warn!(error = %seal_error, "kill fence refused a dispatch and D8 failure-outcome evidence also failed");
+            }
+        }
+        if !refusal.retryable {
+            self.record_unauthorized_attempt();
+            self.emit_policy_denied(
+                subject
+                    .principal
+                    .as_ref()
+                    .and_then(|p| p.agent_label.as_deref()),
+                subject.principal.as_ref().map(|p| p.id.as_str()),
+                credential_alias,
+                full_action,
+                subject.tenant.as_deref(),
+                &refusal.error.to_string(),
+                "kill_fence",
+            )
+            .await;
+        }
+        Err(refusal)
+    }
+
+    /// P3-KILL, the kill fence at approval open (see [`Self::kill_fence_before_dispatch`]).
+    async fn kill_fence_refuses_open(
+        &self,
+        credential_alias: &str,
+        full_action: &str,
+        principal: Option<&crate::policy::Principal>,
+        tenant: Option<&str>,
+        admitted_epoch: u64,
+    ) -> Result<(), VultrinoError> {
+        let verdict = self
+            .storage
+            .kill_fence_check(&crate::policy::KillFenceQuery {
+                credential_alias,
+                principal,
+                admitted_epoch,
+            })
+            .await
+            .map_err(|error| {
+                VultrinoError::PolicyUnavailable(format!(
+                    "the kill fence could not be read from the vault; no approval was opened: {error}"
+                ))
+            })?;
+        let Some(reason) = verdict.refusal_reason() else {
+            return Ok(());
+        };
+        self.record_unauthorized_attempt();
+        self.emit_policy_denied(
+            principal.and_then(|p| p.agent_label.as_deref()),
+            principal.map(|p| p.id.as_str()),
+            credential_alias,
+            full_action,
+            tenant,
+            &reason,
+            "kill_fence",
+        )
+        .await;
+        Err(VultrinoError::PolicyDenied(format!(
+            "{reason}; no approval was opened"
+        )))
+    }
+
     /// Run a plugin action against a resolved credential.
     ///
     /// This is the shared core invoked both by the immediate path
@@ -2358,6 +2532,7 @@ impl VultrinoServer {
             approved_execution,
             evidence_action,
             evidence_required,
+            kill_fence,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
         let action_name = action_name.as_str();
@@ -2542,6 +2717,17 @@ impl VultrinoServer {
             }
         }
 
+        // P3-KILL, the kill fence: the last await before the plugin call. Nothing
+        // awaits between this vault read and `plugin.execute`, so a kill committed
+        // before this read refuses the dispatch on every path (live calls and every
+        // approval resume) and on every process sharing the vault.
+        self.kill_fence_before_dispatch(
+            &credential_alias,
+            &full_action,
+            &kill_fence,
+            exact_evidence.as_ref(),
+        )
+        .await?;
         let plugin_request = crate::plugins::PluginRequest {
             credential,
             action: action_name.to_string(),
@@ -2769,6 +2955,7 @@ impl VultrinoServer {
             approved_execution,
             evidence_action,
             evidence_required,
+            kill_fence,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
         let action_name = action_name.as_str();
@@ -2934,6 +3121,15 @@ impl VultrinoServer {
             }
         }
 
+        // P3-KILL, the kill fence: the last await before the upstream stream opens
+        // (see the buffered tail).
+        self.kill_fence_before_dispatch(
+            &credential_alias,
+            &full_action,
+            &kill_fence,
+            exact_evidence.as_ref(),
+        )
+        .await?;
         let plugin_request = crate::plugins::PluginRequest {
             credential,
             action: action_name.to_string(),
@@ -3425,17 +3621,9 @@ impl VultrinoServer {
         // any limit is re-consumed.
         context.agent_label = approval.agent_label.clone();
         context.api_key_id = principal_id.clone();
-        let principal = principal_id.map(|id| crate::policy::Principal {
-            id,
-            agent_label: approval.agent_label.clone(),
-            // Owner doesn't affect policy matching (only SoD, computed at decide
-            // time on the requester record), so it isn't needed for the resume gate.
-            owner: None,
-            // V10/R6: re-thread the resolved workload identity snapshotted at open,
-            // so a principal_pattern Deny targeting an SVID/OIDC subject re-fires on
-            // resume too.
-            workload_id: approval.workload_id.clone(),
-        });
+        // The principal snapshotted at open (V4; V10/R6 workload identity included),
+        // the SAME subject the claim-time kill fence matched (P3-KILL).
+        let principal = approval.policy_principal();
         // Spend was checked read-only at resume; it was checked (per-action,
         // stateless — there is no ledger after R1) when the approval opened. The
         // read-only resume re-enforces only hard deny gates and never re-charges,
@@ -3530,6 +3718,11 @@ impl VultrinoServer {
             use_token_id: None,
             evidence_subject_id: Some(format!("approval:{}:{}", approval.id, execution_epoch)),
             approved_execution: true,
+            kill_fence: KillFenceSubject {
+                principal: principal.clone(),
+                admitted_epoch: approval.kill_epoch_at_open.unwrap_or(0),
+                tenant: approval.tenant.clone(),
+            },
             evidence_action: approval
                 .action_label
                 .clone()
@@ -4381,6 +4574,9 @@ impl VultrinoServer {
         let deny_policy_id = format!("halt:{}", label);
         let policy = crate::policy::Policy::kill_switch(deny_policy_id.clone(), label);
         self.storage.store_policy(&policy).await?;
+        // P3-KILL: the stored kill policy is the durable fence every process reads
+        // before a dispatch. Acknowledge it only once it reads back under the lock.
+        let kill_fence = KillFenceAck::read(self.storage.as_ref(), &deny_policy_id).await;
         let policy_active = match self.reload_policies().await {
             Ok(()) => true,
             Err(e) => {
@@ -4438,6 +4634,8 @@ impl VultrinoServer {
             in_flight = in_flight.len(),
             callbacks = callbacks.len(),
             policy_active,
+            kill_fence_live = kill_fence.live,
+            kill_epoch = kill_fence.epoch,
             "agent halted"
         );
 
@@ -4448,6 +4646,7 @@ impl VultrinoServer {
             policy_active,
             in_flight,
             callbacks_fired: callbacks.len(),
+            kill_fence,
         })
     }
 
@@ -4559,6 +4758,31 @@ fn cap_result_body(body: &[u8]) -> String {
 
 /// Default interval for the background policy refresh on long-running servers.
 pub const POLICY_REFRESH_SECS: u64 = 5;
+
+/// The periodic policy refresh interval: `VULTRINO_POLICY_REFRESH_SECS` (whole
+/// seconds, 1 to 86400) or [`POLICY_REFRESH_SECS`]. A policy change written through
+/// another process reaches this process's engine within one interval. Kill
+/// containment does not depend on it: the kill fence reads the vault before every
+/// dispatch (P3-KILL). An unparseable or out-of-range value falls back to the
+/// default with a warning.
+pub fn policy_refresh_interval() -> std::time::Duration {
+    let secs = match std::env::var("VULTRINO_POLICY_REFRESH_SECS") {
+        Err(_) => POLICY_REFRESH_SECS,
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(s) if (1..=86_400).contains(&s) => s,
+            _ => {
+                warn!(value = %raw, default = POLICY_REFRESH_SECS,
+                    "VULTRINO_POLICY_REFRESH_SECS must be whole seconds from 1 to 86400; using the default");
+                POLICY_REFRESH_SECS
+            }
+        },
+    };
+    if secs != POLICY_REFRESH_SECS {
+        warn!(secs, default = POLICY_REFRESH_SECS,
+            "VULTRINO_POLICY_REFRESH_SECS is not the default: ordinary (non-kill) policy changes reach this process only every {secs}s; kill policies are fenced from the vault and do not wait for it");
+    }
+    std::time::Duration::from_secs(secs)
+}
 
 /// Default interval for the background approval SLA sweep (V5).
 pub const APPROVAL_SWEEP_SECS: u64 = 15;

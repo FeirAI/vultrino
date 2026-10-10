@@ -1171,7 +1171,7 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
         server.storage().clone(),
         server.policy_engine().clone(),
         config_policies,
-        std::time::Duration::from_secs(vultrino::server::POLICY_REFRESH_SECS),
+        vultrino::server::policy_refresh_interval(),
     ));
     // vk_ API-key / role revocation is storage-authoritative, but this process built
     // its AuthManager once at startup. Refresh it on the same cadence as policies so a
@@ -1275,7 +1275,7 @@ async fn run_web_server(
         exec_server.storage().clone(),
         exec_server.policy_engine().clone(),
         config.policies.clone(),
-        std::time::Duration::from_secs(vultrino::server::POLICY_REFRESH_SECS),
+        vultrino::server::policy_refresh_interval(),
     ));
     // Drive approval escalation/expiry (V5) for requests nobody is polling.
     if config.approval.enabled {
