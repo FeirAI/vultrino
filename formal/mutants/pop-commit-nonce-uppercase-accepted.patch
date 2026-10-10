@@ -1,0 +1,13 @@
+diff --git a/src/averin/pop.rs b/src/averin/pop.rs
+index fe2a54f..57b6935 100644
+--- a/src/averin/pop.rs
++++ b/src/averin/pop.rs
+@@ -230,7 +230,7 @@ pub fn use_pop_challenge(
+ pub fn params_commitment(params: &[u8], params_nonce_hex: &str) -> Result<String, PopError> {
+     // Exactly 64 LOWERCASE hex characters, as averin's FFI requires (hex::decode alone also
+     // accepts uppercase, which averin would refuse after vultrino signed over it).
+-    if params_nonce_hex.bytes().any(|b| b.is_ascii_uppercase()) {
++    if false {
+         return Err(PopError::BadParamsNonce);
+     }
+     let nonce = hex::decode(params_nonce_hex).map_err(|_| PopError::BadParamsNonce)?;

@@ -8058,13 +8058,67 @@ async fn admin_policy_write_refuses_warned_deny_and_prompt_url_patterns() {
             StatusCode::CREATED,
             "an allow rule on {p:?} is not refused"
         );
+        // Wave-1 close-out: an Allow rule whose warned pattern sits under an odd
+        // number of `not` allows every URL a dead pattern misses, so it is refused;
+        // under an even number (or none) it is stored.
+        let refused_allow_shapes = [
+            serde_json::json!({ "not": { "url_match": p } }),
+            serde_json::json!({ "not": { "not": { "not": { "url_match": p } } } }),
+            serde_json::json!({ "and": [ { "action_match": "http.get" }, { "not": { "url_match": p } } ] }),
+            serde_json::json!({ "or": [ { "method_match": ["GET"] }, { "not": { "url_match": p } } ] }),
+        ];
+        for (i, cond) in refused_allow_shapes.into_iter().enumerate() {
+            let body = serde_json::json!({
+                "name": format!("warned-allow-neg-{i}"),
+                "credential_pattern": "cred-*",
+                "default_action": "deny",
+                "rules": [ { "condition": cond, "action": "allow" } ],
+            });
+            for (method, uri) in [
+                ("POST", "/api/v1/policies".to_string()),
+                ("PUT", format!("/api/v1/policies/warned-allow-neg-{i}")),
+            ] {
+                let resp = router
+                    .clone()
+                    .oneshot(admin_req(method, &uri, &key, body.clone()))
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let text = body_string(resp).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{method} allow shape {i} on {p:?} under an odd not must be refused: {text}"
+                );
+                assert!(
+                    text.contains("invalid_policy") && text.contains("url_match"),
+                    "{text}"
+                );
+            }
+        }
+        let even = serde_json::json!({
+            "name": "warned-allow-double-not",
+            "credential_pattern": "cred-*",
+            "default_action": "deny",
+            "rules": [ { "condition": { "not": { "not": { "url_match": p } } }, "action": "allow" } ],
+        });
+        let resp = router
+            .clone()
+            .oneshot(admin_req("POST", "/api/v1/policies", &key, even))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "an allow rule on {p:?} under an even number of not is not refused"
+        );
     }
     let refused_left_behind = storage
         .list_stored_policies()
         .await
         .unwrap()
         .into_iter()
-        .filter(|p| p.name != "warned-allow")
+        .filter(|p| !p.name.starts_with("warned-allow"))
         .count();
     assert_eq!(refused_left_behind, 0, "a refused write must store nothing");
 
@@ -8192,6 +8246,320 @@ async fn stored_rate_limit_policy_with_non_deny_default_is_refused_on_load() {
             vultrino::policy::set_stored_policy_default_deny(&*storage, "no-such-policy")
                 .await
                 .is_err()
+        );
+    }
+}
+
+/// A cloneable log sink for the reject-reason test below.
+#[derive(Clone, Default)]
+struct RejectLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for RejectLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RejectLog {
+    type Writer = RejectLog;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Wave-1 close-out, route level: every way a signed approval decision can be refused
+/// (a tampered body, another tenant's assertion, an expired one, one past the TTL
+/// ceiling, a malformed header) answers the same opaque 401 `invalid_tenant_assertion`
+/// (the caller learns nothing about which check failed), records no sign-off, and the
+/// operator log names the specific reason the verifier gave.
+#[tokio::test]
+async fn test_approval_decision_route_refuses_every_assertion_failure_opaquely_and_logs_the_reason()
+{
+    let log = RejectLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (router, storage, key, id) =
+        build_hard_sod_recipe_fixture("team-a", two_teammate_rule(), "High").await;
+    let uri = format!("/api/v1/approvals/{id}/decision");
+    let alice = serde_json::json!({
+        "approve": true,
+        "approver": "sub-alice",
+        "approver_class": "teammate",
+    });
+    let alice_bytes = serde_json::to_vec(&alice).unwrap();
+    let sign = |tenant: &str, exp: chrono::DateTime<chrono::Utc>, body: &[u8]| {
+        vultrino::govder::sign_tenant_assertion(
+            TEST_BROKER_ASSERTION_SECRET,
+            tenant,
+            "POST",
+            &format!("/api/v1/approvals/{id}/decision"),
+            "",
+            TEST_VULTRINO_HOST,
+            body,
+            exp,
+        )
+    };
+    let soon = chrono::Utc::now() + chrono::Duration::seconds(60);
+    let tampered = serde_json::to_vec(&serde_json::json!({
+        "approve": true,
+        "approver": "sub-mallory",
+        "approver_class": "teammate",
+    }))
+    .unwrap();
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "tampered body",
+            sign("team-a", soon, &tampered),
+            "does not match the request",
+        ),
+        (
+            "wrong tenant",
+            sign("team-b", soon, &alice_bytes),
+            "names a different tenant",
+        ),
+        (
+            "expired",
+            sign(
+                "team-a",
+                chrono::Utc::now() - chrono::Duration::seconds(30),
+                &alice_bytes,
+            ),
+            "expired",
+        ),
+        (
+            "past the ttl ceiling",
+            sign(
+                "team-a",
+                chrono::Utc::now() + chrono::Duration::seconds(3600),
+                &alice_bytes,
+            ),
+            "exceeds the verifier TTL bound",
+        ),
+        (
+            "malformed",
+            "not-an-assertion".to_string(),
+            "malformed tenant assertion",
+        ),
+    ];
+    for (name, assertion, reason) in cases {
+        let req = Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .header("host", TEST_VULTRINO_HOST)
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .header("x-govder-tenant-assertion", assertion)
+            .body(Body::from(alice_bytes.clone()))
+            .unwrap();
+        let response = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{name}");
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["code"], "invalid_tenant_assertion", "{name}");
+        assert_eq!(
+            body["error"], "Invalid broker tenant assertion",
+            "{name}: the caller sees one opaque message, never the reason"
+        );
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains(reason),
+            "{name}: the operator log must carry the verifier's reason {reason:?}: {logged}"
+        );
+        assert!(
+            storage
+                .get_approval(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .signoffs()
+                .is_empty(),
+            "{name}: a refused assertion records no sign-off"
+        );
+    }
+}
+
+/// Wave-1 close-out (W3 leg of the kill triad): the admin policy write route answers a
+/// kill policy with the durable kill fence acknowledgement govder confirms on
+/// (`kill_fence.live` with `epoch >= 1`, read back from the vault), on both POST and
+/// PUT, with a higher epoch for the replace; a policy that is not a kill policy carries
+/// no acknowledgement.
+#[tokio::test]
+async fn admin_policy_write_acknowledges_the_kill_fence_on_post_and_put() {
+    let (router, storage, _server, key) = build_admin_router().await;
+    let kill_body = |name: &str| {
+        serde_json::json!({
+            "name": name,
+            "credential_pattern": "*",
+            "principal_pattern": "agent-w3",
+            "default_action": "deny",
+            "kill": true,
+            "rules": [],
+        })
+    };
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/policies",
+            &key,
+            kill_body("halt:agent-w3"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(created["kill_fence"]["live"], true, "{created}");
+    let first = created["kill_fence"]["epoch"].as_u64().unwrap();
+    assert!(first >= 1, "{created}");
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        storage.kill_fence_ack(&id).await.unwrap(),
+        Some(first),
+        "the acknowledged epoch is the stored mark"
+    );
+
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "PUT",
+            &format!("/api/v1/policies/{id}"),
+            &key,
+            kill_body("halt:agent-w3"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let replaced: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(replaced["kill_fence"]["live"], true, "{replaced}");
+    assert!(
+        replaced["kill_fence"]["epoch"].as_u64().unwrap() > first,
+        "a replace is a new kill store and raises the epoch: {replaced}"
+    );
+
+    // Not a kill policy: no acknowledgement field.
+    let plain = serde_json::json!({
+        "name": "not-a-kill",
+        "credential_pattern": "cred-*",
+        "default_action": "deny",
+        "rules": [],
+    });
+    let resp = router
+        .clone()
+        .oneshot(admin_req("POST", "/api/v1/policies", &key, plain.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(body.get("kill_fence").is_none(), "{body}");
+    let pid = body["id"].as_str().unwrap();
+    let resp = router
+        .oneshot(admin_req(
+            "PUT",
+            &format!("/api/v1/policies/{pid}"),
+            &key,
+            plain,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(body.get("kill_fence").is_none(), "{body}");
+}
+
+/// Wave-1 close-out (XV-07, replay half): vultrino keeps no jti store for approval
+/// decisions because replaying a captured signed decision is a no-op, shown here by
+/// resending the EXACT captured request (same assertion, same body, same jti) while
+/// its assertion is still inside its TTL: first while the approval is open (the
+/// replayed sign-off must not fill a second recipe slot) and then after it is decided
+/// (the replay is answered as an idempotent replay and changes nothing).
+#[tokio::test]
+async fn test_replaying_a_captured_signed_decision_within_its_ttl_has_no_second_effect() {
+    let (router, storage, key, id) =
+        build_hard_sod_recipe_fixture("team-a", two_teammate_rule(), "High").await;
+    let uri = format!("/api/v1/approvals/{id}/decision");
+    let capture = |subject: &str| {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "approve": true,
+            "approver": subject,
+            "approver_class": "teammate",
+        }))
+        .unwrap();
+        let assertion = vultrino::govder::sign_tenant_assertion(
+            TEST_BROKER_ASSERTION_SECRET,
+            "team-a",
+            "POST",
+            &uri,
+            "",
+            TEST_VULTRINO_HOST,
+            &body,
+            chrono::Utc::now() + chrono::Duration::seconds(60),
+        );
+        (assertion, body)
+    };
+    let send = |captured: &(String, Vec<u8>)| {
+        Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .header("host", TEST_VULTRINO_HOST)
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .header("x-govder-tenant-assertion", captured.0.clone())
+            .body(Body::from(captured.1.clone()))
+            .unwrap()
+    };
+    let state = || async {
+        let a = storage.get_approval(&id).await.unwrap().unwrap();
+        (
+            a.status(),
+            a.signoffs()
+                .iter()
+                .map(|s| (s.approver_identity.clone(), s.approve))
+                .collect::<Vec<_>>(),
+            a.executed,
+        )
+    };
+
+    let alice = capture("sub-alice");
+    let bob = capture("sub-bob");
+
+    let first = router.clone().oneshot(send(&alice)).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let after_alice = state().await;
+    assert_eq!(after_alice.0, vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(after_alice.1.len(), 1);
+
+    // Replay while open: refused or answered, but never a second slot.
+    let replay = router.clone().oneshot(send(&alice)).await.unwrap();
+    assert_ne!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        state().await,
+        after_alice,
+        "a replayed sign-off must not fill a second recipe slot"
+    );
+
+    let second = router.clone().oneshot(send(&bob)).await.unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let decided = state().await;
+    assert_eq!(decided.0, vultrino::approval::ApprovalStatus::Approved);
+    assert_eq!(decided.1.len(), 2);
+
+    // Replay of either captured decision after the approval is decided.
+    for captured in [&alice, &bob, &alice] {
+        let resp = router.clone().oneshot(send(captured)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["idempotent_replay"], true, "{body}");
+        assert_eq!(
+            state().await,
+            decided,
+            "a replay after the decision changed the approval"
         );
     }
 }

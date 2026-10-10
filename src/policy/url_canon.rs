@@ -131,8 +131,9 @@ pub fn canonical_url(raw: &str) -> Option<String> {
 
 /// Why a pattern deserves a load-time warning. The admin API refuses any of
 /// these on a deny or prompt rule when a policy is written
-/// (`policy::refuse_warned_url_patterns`); allow rules, config-file policies and
-/// policies already stored are only warned.
+/// (`policy::refuse_warned_url_patterns`), and on an allow rule when it sits under
+/// an odd number of `not`; other allow rules, config-file policies and policies
+/// already stored are only warned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternWarning {
     /// The pattern ends in `*` right after a host (no `/`): it used to match

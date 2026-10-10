@@ -56,6 +56,12 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   or retargeted pattern overwrites its mark, so work admitted before the original kill
   and no longer matched can run after a later lift. govder's ids are per-target; an
   admin-edited kill policy is not covered.
+- **Kill marks are never garbage-collected.** Each kill policy id keeps its mark
+  (id, patterns, epoch) in the vault for as long as the vault exists, and the kill
+  epoch only rises; lifting a kill (deleting the policy) does not remove its mark.
+  The vault, and so the work done under its exclusive lock on every dispatch, grows
+  with the number of distinct kill policy ids ever stored. The marks are small, but
+  the growth is unbounded and unmeasured; collecting them is wave-3 work (P3-VAULT).
 - **At-most-once execution sacrifices automatic recovery after an ambiguous
   crash.** Reserve → operate → complete are not one external transaction. If a
   worker disappears after claiming an approved action, a stale claim is finalized
@@ -434,7 +440,9 @@ that way is dead. The admin API refuses such a pattern (and every other
 warned pattern) on a Deny or Prompt rule when a policy is written; a policy
 already stored that way still loads and is enforced as written (the warning is
 then the only sign), and so does one in the config file (config load warns
-only). Allow rules are not refused. The refusal is as good as the warnings: a
+only). An Allow rule is refused only when the warned pattern sits under an odd
+number of `not` (there a dead pattern allows every URL); any other Allow rule is
+stored and warned. The refusal is as good as the warnings: a
 pattern that matches less than it reads but logs no warning (a `{a,b}` glob, a
 glob without a port that misses a non-default port, an exact URL that misses a
 query) is not refused.

@@ -202,7 +202,9 @@ pub fn verify_tenant_assertion(
     if remaining < 0 {
         return Err(TenantAssertionError::Expired);
     }
-    let ceiling = if max_ttl.as_secs() == 0 {
+    // Only a ZERO ceiling means "use the default" (govder's Verify does the same); a positive
+    // sub-second ceiling is a ceiling of its whole seconds, 0, not an unset one.
+    let ceiling = if max_ttl.is_zero() {
         DEFAULT_MAX_TTL
     } else {
         max_ttl
@@ -588,6 +590,42 @@ mod tests {
         for _ in 0..64 {
             assert!(valid_jti(&new_jti()));
         }
+    }
+
+    /// Parity with govder's Go verifier (pkg/tenantassert.Verify): only a ZERO ceiling
+    /// means "use the default"; a positive sub-second ceiling is a ceiling of its whole
+    /// seconds (0), so only an assertion expiring this second verifies. Treating it as
+    /// "unset" would widen a deliberate 500 ms ceiling to five minutes.
+    #[test]
+    fn sub_second_max_ttl_is_a_ceiling_of_zero_seconds_like_govder() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let v = |exp_in: i64| {
+            let a = sign_tenant_assertion(
+                "k",
+                "acme",
+                "GET",
+                "/x",
+                "",
+                "h",
+                b"",
+                now + chrono::Duration::seconds(exp_in),
+            );
+            verify_tenant_assertion(
+                &a,
+                "k",
+                "acme",
+                "GET",
+                "/x",
+                "",
+                "h",
+                b"",
+                now,
+                Duration::from_millis(500),
+            )
+        };
+        assert_eq!(v(0), Ok(()));
+        assert_eq!(v(1), Err(TenantAssertionError::ExcessiveTtl));
+        assert_eq!(v(60), Err(TenantAssertionError::ExcessiveTtl));
     }
 
     #[test]

@@ -134,6 +134,10 @@ jobs:
         run: python3 scripts/formal/check_claims.py
       - name: golden vector pins (vectors.lock)
         run: python3 scripts/vectors/check_vectors_lock.py
+      # The outbox-signature vectors come from an independent Python reference; the committed file
+      # must be exactly what the generator prints.
+      - name: outbox-signature vector generator reproduces the committed file
+        run: python3 scripts/vectors/gen_outbox_signature.py | cmp - vectors/outbox-signature.v1.json
       - name: fast-tier mutants must be killed
         env:
           # Each mutant changes one function of the vultrino crate; incremental

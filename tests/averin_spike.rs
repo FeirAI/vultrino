@@ -344,7 +344,8 @@ async fn durable_worker_shape_accepts_bounded_reuse_sequence_and_dedups_retry() 
                 &params_commitment,
                 &credential_binding,
                 nonce,
-            );
+            )
+            .unwrap();
             let use_sig = keypair.sign_b64(&challenge);
             serde_json::json!({
                 "idempotency_key": format!("{token_id}:use:{request_id}"),

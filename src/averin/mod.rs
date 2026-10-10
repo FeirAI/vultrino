@@ -422,7 +422,8 @@ pub(crate) fn build_use_pop(
         &params_commitment,
         &credential_binding,
         nonce,
-    );
+    )
+    .map_err(AverinError::Pop)?;
     let use_sig = keypair.sign_b64(&challenge);
     Ok(UsePop {
         params_commitment,

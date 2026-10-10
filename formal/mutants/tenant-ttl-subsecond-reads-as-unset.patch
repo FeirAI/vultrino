@@ -1,0 +1,13 @@
+diff --git a/src/govder/tenant_assert.rs b/src/govder/tenant_assert.rs
+index 3a54e61..4fe8e41 100644
+--- a/src/govder/tenant_assert.rs
++++ b/src/govder/tenant_assert.rs
+@@ -204,7 +204,7 @@ pub fn verify_tenant_assertion(
+     }
+     // Only a ZERO ceiling means "use the default" (govder's Verify does the same); a positive
+     // sub-second ceiling is a ceiling of its whole seconds, 0, not an unset one.
+-    let ceiling = if max_ttl.is_zero() {
++    let ceiling = if max_ttl.as_secs() == 0 {
+         DEFAULT_MAX_TTL
+     } else {
+         max_ttl

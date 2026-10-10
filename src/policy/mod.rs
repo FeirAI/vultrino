@@ -968,6 +968,25 @@ fn first_warned_url_pattern(c: &PolicyCondition) -> Option<(&str, url_canon::Can
     }
 }
 
+/// Like [`first_warned_url_pattern`], but only a pattern that sits under an odd
+/// number of `not` (so a dead pattern makes the negation true for every URL).
+fn first_negated_warned_url_pattern(
+    c: &PolicyCondition,
+    negated: bool,
+) -> Option<(&str, url_canon::CanonPattern)> {
+    match c {
+        PolicyCondition::UrlMatch(p) if negated => {
+            let canon = canonical_pattern(p);
+            (!canon.warnings.is_empty()).then_some((p.as_str(), canon))
+        }
+        PolicyCondition::And(v) | PolicyCondition::Or(v) => v
+            .iter()
+            .find_map(|x| first_negated_warned_url_pattern(x, negated)),
+        PolicyCondition::Not(b) => first_negated_warned_url_pattern(b, !negated),
+        _ => None,
+    }
+}
+
 /// What a pattern warning means, and how to write the rule instead.
 fn pattern_warning_reason(w: &PatternWarning, canonical: &str) -> String {
     match w {
@@ -994,18 +1013,24 @@ fn pattern_warning_reason(w: &PatternWarning, canonical: &str) -> String {
 /// Deny or Prompt rule whose `url_match` pattern [`canonical_pattern`] warns
 /// about, at any depth of the rule's condition (P3-FLOORS). Such a rule can
 /// match less than it reads, so a deny or an approval gate would silently not
-/// apply. Allow rules are not refused and stay a load-time warning (a warned
-/// allow pattern usually allows less than it reads, but under `not` it can allow
-/// more: an Allow on `not: url_match https://*.example.com/*` allows every URL), and policies already
+/// apply. An Allow rule is refused only when the warned pattern sits under an odd
+/// number of `not` (a warned allow pattern usually allows less than it reads, but
+/// under `not` it allows more: an Allow on `not: url_match https://*.example.com/*`
+/// allows every URL); other Allow rules stay a load-time warning. Policies already
 /// stored keep loading with a warning ([`warn_url_patterns`]).
 pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
     for (i, rule) in policy.rules.iter().enumerate() {
-        let action = match rule.action {
-            PolicyAction::Deny => "deny",
-            PolicyAction::Prompt => "prompt",
-            PolicyAction::Allow => continue,
+        // An Allow rule is refused only when the warned pattern sits under an odd
+        // number of `not`: there a dead pattern allows every URL (wave-1 close-out).
+        let (action, found) = match rule.action {
+            PolicyAction::Deny => ("deny", first_warned_url_pattern(&rule.condition)),
+            PolicyAction::Prompt => ("prompt", first_warned_url_pattern(&rule.condition)),
+            PolicyAction::Allow => (
+                "allow",
+                first_negated_warned_url_pattern(&rule.condition, false),
+            ),
         };
-        if let Some((pattern, canon)) = first_warned_url_pattern(&rule.condition) {
+        if let Some((pattern, canon)) = found {
             let reasons: Vec<String> = canon
                 .warnings
                 .iter()
@@ -1013,7 +1038,7 @@ pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
                 .collect();
             return Err(format!(
                 "policy '{}': rule {} ({}) has url_match pattern '{}', which is refused on deny and \
-                 prompt rules: {}",
+                 prompt rules, and on allow rules under an odd number of not: {}",
                 policy.name,
                 i,
                 action,
@@ -1103,7 +1128,7 @@ fn warn_url_patterns(policy: &Policy) {
                                 pattern = %p,
                                 canonical = %canon.text,
                                 warning = ?w,
-                                "url_match pattern on an allow rule is risky or changes meaning under canonical matching; it is only warned (allow rules are not refused)"
+                                "url_match pattern on an allow rule is risky or changes meaning under canonical matching; it is only warned (an allow rule is refused at write only under an odd number of not)"
                             );
                         }
                     }
@@ -1287,7 +1312,9 @@ mod tests {
             .find(|l| l.contains("policy=warn-allow"))
             .unwrap();
         assert!(
-            allow_line.contains("only warned (allow rules are not refused)"),
+            allow_line.contains(
+                "only warned (an allow rule is refused at write only under an odd number of not)"
+            ),
             "{allow_line}"
         );
     }

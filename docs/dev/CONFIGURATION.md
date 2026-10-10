@@ -225,8 +225,10 @@ segments, encoded dots, a fragment, a backslash, a `*` that cuts a percent escap
 short), or that are not a parseable URL or path. The admin API
 (`POST` and `PUT /api/v1/policies`) refuses a policy with 400 (`invalid_policy`,
 naming the rule and the pattern) when a deny or prompt rule has such a pattern
-anywhere in its condition (inside `and`, `or` or `not` too). Allow rules are not
-refused: a warned pattern on an allow rule stays a warning. Config load is not
+anywhere in its condition (inside `and`, `or` or `not` too). An allow rule is
+refused only when the warned pattern sits under an odd number of `not` (a dead
+pattern there allows every URL); any other warned pattern on an allow rule stays a
+warning. Config load is not
 an admin write: a warned pattern in a `[[policies]]` rule is only warned there.
 A policy already stored in the vault with such a deny or prompt pattern keeps
 loading; its warning line says the admin API now refuses the pattern and that

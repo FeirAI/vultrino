@@ -375,6 +375,33 @@
     },
     "kill-fence-ack-live-without-readback": {
       "tier": "full"
+    },
+    "policy-write-allow-negation-ignored": {
+      "tier": "full"
+    },
+    "policy-write-allow-not-parity-ignored": {
+      "tier": "full"
+    },
+    "policy-refresh-interval-cap-removed": {
+      "tier": "full"
+    },
+    "approval-decision-reject-reason-exposed": {
+      "tier": "full"
+    },
+    "approval-replay-recorded-signoff-recounted": {
+      "tier": "full"
+    },
+    "approval-replay-after-decision-not-idempotent": {
+      "tier": "full"
+    },
+    "pop-lp-length-truncates": {
+      "tier": "full"
+    },
+    "pop-commit-nonce-uppercase-accepted": {
+      "tier": "full"
+    },
+    "tenant-ttl-subsecond-reads-as-unset": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -1693,7 +1720,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "warn_url_patterns",
-          "sha256": "ac57d3497fcbecc4d082e9bee39b82432abcad7c7bf0b66e4572a520de51b587"
+          "sha256": "69f3a75941b10a13155f3085dc25675101cf981ffdc358224d94e1a5e5b47cb2"
         },
         {
           "path": "src/plugins/hmac.rs",
@@ -1845,7 +1872,7 @@
     },
     {
       "id": "policy-write-refuses-warned-deny-prompt-patterns",
-      "statement": "The admin policy write (POST and PUT /api/v1/policies, through build_policy) answers 400 invalid_policy, naming the rule and the pattern, and stores nothing, when a deny or prompt rule has a url_match pattern that canonical_pattern warns about, at the top level of the rule's condition or inside and, or or not. Shown on 8 warned patterns (star in the host of a prefix and of a glob, a prefix ending right after and inside a host, dot segments, a star that cuts a percent escape, a host holding ?, a scheme-less prefix) x deny and prompt x 4 condition shapes x both routes. The same patterns on an allow rule are stored (201), and clean deny and prompt patterns in govder's compiled shape (and of action_match, url_match, method_match, including a relative path, https://*, a {credential} placeholder and *://host/x) are stored.",
+      "statement": "The admin policy write (POST and PUT /api/v1/policies, through build_policy) answers 400 invalid_policy, naming the rule and the pattern, and stores nothing, when a deny or prompt rule has a url_match pattern that canonical_pattern warns about, at the top level of the rule's condition or inside and, or or not. Shown on 8 warned patterns (star in the host of a prefix and of a glob, a prefix ending right after and inside a host, dot segments, a star that cuts a percent escape, a host holding ?, a scheme-less prefix) x deny and prompt x 4 condition shapes x both routes. The same patterns on an allow rule are stored (201) unless the warned pattern sits under an odd number of not (not, not not not, inside and or or), where a dead pattern would allow every URL: that is refused 400 on both routes and stored nothing, while two nots store. Clean deny and prompt patterns in govder's compiled shape (and of action_match, url_match, method_match, including a relative path, https://*, a {credential} placeholder and *://host/x) are stored.",
       "method": "test",
       "artifacts": [
         "src/policy/mod.rs",
@@ -1861,12 +1888,17 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "refuse_warned_url_patterns",
-          "sha256": "8ac4feba30f947245ce971d061e07b07f1ba4ee289cec28401f6edc719a50639"
+          "sha256": "0c744a5e29bbd44c54b68623705abd800a9e991b05ca6d5631da22a95fc54413"
         },
         {
           "path": "src/policy/mod.rs",
           "symbol": "first_warned_url_pattern",
           "sha256": "ab36cd802121068371e7e7cd2f7b8732c70a02c85a80f5e06995798b636f08aa"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "first_negated_warned_url_pattern",
+          "sha256": "260624186e23fe7b0082a833b8a00417f97e8c4dcedce9e0a1bde6b13e1cb9b8"
         },
         {
           "path": "src/web/api.rs",
@@ -1883,13 +1915,15 @@
         "policy-write-warned-prompt-accepted",
         "policy-write-warned-not-unchecked",
         "policy-write-warned-check-skipped",
-        "policy-write-allow-refused"
+        "policy-write-allow-refused",
+        "policy-write-allow-negation-ignored",
+        "policy-write-allow-not-parity-ignored"
       ],
-      "does_not_establish": "The refusal is as good as canonical_pattern's warnings: a pattern that matches less than it reads but draws no warning (a {a,b} glob, a glob without a port that misses a non-default port, an exact URL that misses a query) is accepted. Policies already stored keep loading with a warning and are enforced as written; config-file [[policies]] are only warned; the engine's add_policy and load paths do not refuse. Allow rules are not refused. A rule whose url_match sits under not is refused too, although a dead pattern under not denies more, not less. Shown on the listed patterns and shapes, not every pattern. Which deployed vaults hold such a stored policy is not checked."
+      "does_not_establish": "The refusal is as good as canonical_pattern's warnings: a pattern that matches less than it reads but draws no warning (a {a,b} glob, a glob without a port that misses a non-default port, an exact URL that misses a query) is accepted. Policies already stored keep loading with a warning and are enforced as written; config-file [[policies]] are only warned; the engine's add_policy and load paths do not refuse. An allow rule is refused only under an odd number of not; any other warned allow pattern is stored and only warned. A deny or prompt rule whose url_match sits under not is refused too, although a dead pattern under not denies more, not less. Shown on the listed patterns and shapes, not every pattern. Which deployed vaults hold such a stored policy is not checked."
     },
     {
       "id": "stored-rate-limit-refused-on-load",
-      "statement": "A RateLimit policy (RateLimit at any depth) stored with an allow or prompt default is refused where the server loads stored policies: VultrinoServer::reload_policies returns PolicyError::Invalid naming the policy name, its id and the fix (vultrino policy deny-default <id>) and leaves the live set unchanged; the periodic refresh (refresh_policies_once) does not apply the set; load_stored_policies_at_startup returns the error, and `vultrino web` exits non-zero with that message on stderr instead of starting. `vultrino policy deny-default <id>` sets the stored default to deny and keeps the rules, after which the policy loads; it reports no change on a second run and an error for an unknown id.",
+      "statement": "A RateLimit policy (RateLimit at any depth) stored with an allow or prompt default is refused where the server loads stored policies: VultrinoServer::reload_policies returns PolicyError::Invalid naming the policy name, its id and the fix (vultrino policy deny-default <id>) and leaves the live set unchanged; the periodic refresh (refresh_policies_once) does not apply the set; load_stored_policies_at_startup returns the error, and `vultrino web` and `vultrino serve --mcp` (both start paths that load stored policies) exit non-zero with that message on stderr instead of starting. `vultrino policy deny-default <id>` sets the stored default to deny and keeps the rules, after which the policy loads; it reports no change on a second run and an error for an unknown id.",
       "method": "test",
       "artifacts": [
         "src/policy/types.rs",
@@ -1902,7 +1936,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "set -e; cargo test --locked --no-default-features --test web_smoke -- --exact stored_rate_limit_policy_with_non_deny_default_is_refused_on_load; cargo test --locked --no-default-features --test startup_security_integration -- --exact web_refuses_to_start_with_a_stored_rate_limit_policy_that_does_not_default_deny",
+      "detector": "set -e; cargo test --locked --no-default-features --test web_smoke -- --exact stored_rate_limit_policy_with_non_deny_default_is_refused_on_load; cargo test --locked --no-default-features --test startup_security_integration -- --exact web_refuses_to_start_with_a_stored_rate_limit_policy_that_does_not_default_deny; cargo test --locked --no-default-features --test startup_security_integration -- --exact serve_mcp_refuses_to_start_with_a_stored_rate_limit_policy_that_does_not_default_deny",
       "detector_kind": "cargo",
       "covers": [
         {
@@ -1944,6 +1978,11 @@
           "path": "src/main.rs",
           "symbol": "policy_deny_default",
           "sha256": "0fccf029c279765e459f68353067d46f4ac084a2b1acff22201e86515d71b658"
+        },
+        {
+          "path": "src/main.rs",
+          "symbol": "run_mcp_server",
+          "sha256": "9cca123afa27f04a4b0da83752183d3e697e6eea8fff57a621f96f6fc6d3e728"
         }
       ],
       "mutants": [
@@ -1953,7 +1992,7 @@
         "stored-rate-limit-refresh-applies",
         "stored-rate-limit-startup-warns-only"
       ],
-      "does_not_establish": "Only that one shape is refused: a stored policy failing another validation rule (nested SpendCap, zero RateLimit dimension, degenerate TimeWindow) is still only warned and enforced as written. The engine's own add_policy and load paths do not refuse. The `vultrino serve --mcp` startup calls the same load_stored_policies_at_startup but is not run by a test. A running process that meets such a policy written by an older binary keeps its last good set and also stops picking up later valid changes in that vault until it is fixed. A reload after an admin write answers 500 reload_error while a refused policy is stored. Whether any deployed vault holds such a policy is not checked. The refusal does not change what a deny default means: an exhausted RateLimit still falls through to the other rules of every matching policy first."
+      "does_not_establish": "Only that one shape is refused: a stored policy failing another validation rule (nested SpendCap, zero RateLimit dimension, degenerate TimeWindow) is still only warned and enforced as written. The engine's own add_policy and load paths do not refuse. The serve --mcp refusal is shown by one test with a stdin closed at start (a non-zero exit naming the policy), not by an MCP session. A running process that meets such a policy written by an older binary keeps its last good set and also stops picking up later valid changes in that vault until it is fixed. A reload after an admin write answers 500 reload_error while a refused policy is stored. Whether any deployed vault holds such a policy is not checked. The refusal does not change what a deny default means: an exhausted RateLimit still falls through to the other rules of every matching policy first."
     },
     {
       "id": "tenant-assertion-differential-vectors",
@@ -1982,7 +2021,7 @@
         {
           "path": "src/govder/tenant_assert.rs",
           "symbol": "verify_tenant_assertion",
-          "sha256": "df09c00b60b7681939b7ab8a5b001363e1f9d64f8662aabdd1bad1a7e1b91156"
+          "sha256": "3c0509ea70f34a81b6bf23dc546ae60d62c5d91088ce4594316cf7be39eab766"
         },
         {
           "path": "src/govder/mod.rs",
@@ -2014,7 +2053,7 @@
         {
           "path": "src/govder/tenant_assert.rs",
           "symbol": "verify_tenant_assertion",
-          "sha256": "df09c00b60b7681939b7ab8a5b001363e1f9d64f8662aabdd1bad1a7e1b91156"
+          "sha256": "3c0509ea70f34a81b6bf23dc546ae60d62c5d91088ce4594316cf7be39eab766"
         }
       ],
       "mutants": [
@@ -2051,18 +2090,19 @@
     },
     {
       "id": "kill-fence-before-dispatch",
-      "statement": "A stored kill policy (or one stored after the work was admitted, even if lifted since) refuses a plugin dispatch, a streamed dispatch, an approval claim and an approval open, read from the vault under its cross-process lock immediately before the dispatch and independent of the process's in-memory policy engine: with two VultrinoServers over one vault standing in for two processes, an agent halted through one is not dispatched by the other (approval resume through the decision path, live call, streamed call), an approval claimed on the other process is refused and finalized, an approval opened before a kill does not run after the lift while a later one does, an approval cannot be opened for a halted agent, a kill that lands after a resume or live call has evaluated still blocks its dispatch, an engine that missed the kill in the same process is overruled, and a kill policy write acknowledges the fence live with epoch >= 1 only when it reads back from the vault. The unkilled controls on the same fixture dispatch.",
+      "statement": "A stored kill policy (or one stored after the work was admitted, even if lifted since) refuses a plugin dispatch, a streamed dispatch, an approval claim and an approval open, read from the vault under its cross-process lock immediately before the dispatch and independent of the process's in-memory policy engine: with two VultrinoServers over one vault standing in for two processes, an agent halted through one is not dispatched by the other (approval resume through the decision path, live call, streamed call), an approval claimed on the other process is refused and finalized, an approval opened before a kill does not run after the lift while a later one does, an approval cannot be opened for a halted agent, a kill that lands after a resume or live call has evaluated still blocks its dispatch, an engine that missed the kill in the same process is overruled, and a kill policy write through the admin route acknowledges the fence live with epoch >= 1 only when it reads back from the vault, on POST and on PUT (a replace raises the epoch; a policy that is not a kill carries no acknowledgement). The unkilled controls on the same fixture dispatch.",
       "method": "test",
       "artifacts": [
         "src/policy/kill_fence.rs",
         "src/server/mod.rs",
         "src/storage/file.rs",
-        "tests/kill_fence_integration.rs"
+        "tests/kill_fence_integration.rs",
+        "tests/web_smoke.rs"
       ],
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --test kill_fence_integration && cargo test --locked --no-default-features --lib policy::kill_fence",
+      "detector": "cargo test --locked --no-default-features --test kill_fence_integration && cargo test --locked --no-default-features --lib policy::kill_fence && cargo test --locked --no-default-features --test web_smoke -- --exact admin_policy_write_acknowledges_the_kill_fence_on_post_and_put",
       "covers": [
         {
           "path": "src/policy/kill_fence.rs",
@@ -2078,6 +2118,26 @@
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::kill_fence_refuses_open",
           "sha256": "352037fd74f5a2ca24a76c021615ca7a297ef04cc70b6109e341d178eb6b895c"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::resume_approved",
+          "sha256": "ef1e0bb08feb54218255dcb6c94959607d9a8fbdb8faffa9651cf4bc8b301a0e"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action_streaming",
+          "sha256": "d606ca2f97c875b77887f69016d15323aa9cb8a444fd8d9ec02a3a816148762b"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action",
+          "sha256": "0e32c230ad5ef4a55817a90f0d0e05b23b4447873cbead8df62fba5e8887ed3d"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::prepare_execution",
+          "sha256": "ece06d2c2987a99a7d9a2a53d5defa976f2304858e328b73265f956e073f74b1"
         },
         {
           "path": "src/server/mod.rs",
@@ -2111,7 +2171,178 @@
         "kill-fence-dispatch-never-refuses",
         "kill-fence-ack-live-without-readback"
       ],
-      "does_not_establish": "Rollout safety of the one-way vault format: STORAGE_VERSION 9 makes an older binary refuse the vault on open, but an older process already running keeps its loaded engine and is refused only where it takes the vault lock, so a vk_ API-key or LLM-proxy call on it can still dispatch after Contained; every process sharing the vault must be stopped (and the vault backed up) before the fence build starts. Kill marks are keyed by policy id (a re-stored id with a narrower pattern overwrites its mark). Dispatch lock contention is not measured. Also: Several hosts (the vault is one file under one cross-process lock; a network storage backend answers the default fail-closed 'unsupported'), calls already past the fence into the plugin when the kill lands (the fence is the last check before the dispatch call, not a recall), MCP, /execute and /llm entry points individually (they reach the shared execute_gated, execute_gated_streaming and resume_approved paths the tests drive; a new path that bypasses them is not covered), a halt that writes no kill policy, a kill epoch snapshot older than the durable value (conservatively refuses), or any CI run. Example-based tests over in-process servers and a counting plugin, not a proof; the model is govder formal/tla/KillFence.tla."
+      "does_not_establish": "Rollout safety of the one-way vault format: STORAGE_VERSION 9 makes an older binary refuse the vault on open, but an older process already running keeps its loaded engine and is refused only where it takes the vault lock, so a vk_ API-key or LLM-proxy call on it can still dispatch after Contained; every process sharing the vault must be stopped (and the vault backed up) before the fence build starts. Kill marks are keyed by policy id (a re-stored id with a narrower pattern overwrites its mark). Dispatch lock contention is not measured. Also: Several hosts (the vault is one file under one cross-process lock; a network storage backend answers the default fail-closed 'unsupported'), a dispatch whose fence vault read preceded the kill policy's vault write (the fence is the last check before the dispatch call, not a recall, so work already past that read runs), MCP, /execute and /llm entry points individually (they reach the shared execute_gated, execute_gated_streaming and resume_approved paths the tests drive; a new path that bypasses them is not covered), a halt that writes no kill policy, a kill epoch snapshot older than the durable value (conservatively refuses), or any CI run. Example-based tests over in-process servers and a counting plugin, not a proof; the model is govder formal/tla/KillFence.tla. Kill marks are never garbage-collected (the vault grows with the number of distinct kill policy ids ever stored; collecting them is wave-3 work, see LIMITATIONS).",
+      "evidence_run": "38048104085"
+    },
+    {
+      "id": "policy-refresh-interval-parse",
+      "statement": "VULTRINO_POLICY_REFRESH_SECS is accepted only as whole seconds from 1 to 86400 (surrounding whitespace allowed): 0, 86401, negative, fractional, suffixed, hex, empty and overflowing values fall back to the 5 second default, an accepted value sets the refresh interval, and the 'applied within the refresh window' message of a failed post-write reload quotes the effective interval, not the compiled default.",
+      "method": "test",
+      "artifacts": [
+        "src/server/mod.rs",
+        "src/web/api.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- server::tests::policy_refresh_interval_parses_and_caps_and_the_message_quotes_it",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "parse_policy_refresh_secs",
+          "sha256": "580b06934b7768e1d45d167ea6187167701cc42e638c712545f68d37e693dea0"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "policy_refresh_secs",
+          "sha256": "350e48ce32d5890b1b7aff488663c24d7a774483afc2fcbe9b4e6181f9ae2ae6"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "policy_refresh_interval",
+          "sha256": "94ddbbb58cfbf41b0259142704a542247a4a5ac6542e5a3888565648d7a79f39"
+        }
+      ],
+      "mutants": [
+        "policy-refresh-interval-cap-removed"
+      ],
+      "does_not_establish": "Only the parse and the effective-value accessors, on the listed inputs. It does not show the refresh loop ticks at that interval, that a running process re-reads the variable (it is read at startup), or that every message quotes it (only the reload_error message does)."
+    },
+    {
+      "id": "approval-decision-route-refuses-opaquely",
+      "statement": "POST /api/v1/approvals/{id}/decision answers every refused broker assertion (tampered body, another tenant, expired, past the verifier TTL ceiling, malformed header) with the same 401 invalid_tenant_assertion and the single message 'Invalid broker tenant assertion', records no sign-off, and writes the verifier's specific reason to the operator log.",
+      "method": "test",
+      "artifacts": [
+        "src/web/api.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test web_smoke -- --exact test_approval_decision_route_refuses_every_assertion_failure_opaquely_and_logs_the_reason",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_decide_approval",
+          "sha256": "bbc2225b19bbb3d5abb125fd79834b9ff2a3d6fe6e2a8262d4414b400a604cb9"
+        }
+      ],
+      "mutants": [
+        "approval-decision-reject-reason-exposed"
+      ],
+      "does_not_establish": "Only the five listed failure shapes. Missing or duplicate assertion headers, an unconfigured approval secret (403 verified_approvals_disabled, a different and deliberately specific answer) and a wrong admin key are other branches and are not covered here. The log assertion relies on the test's tracing subscriber capturing the warning."
+    },
+    {
+      "id": "approval-decision-replay-is-noop",
+      "statement": "Replaying a captured signed approval decision (the exact request, same assertion, body and jti) while its assertion is still inside its TTL has no second effect: while the approval is open the replay does not fill a second recipe slot, and after the approval is decided it is answered 200 idempotent_replay and changes no status, sign-off or execution record. Vultrino therefore keeps no jti store for approval decisions: the dedup is the approval's own sign-off distinctness plus the decided-state idempotency check.",
+      "method": "test",
+      "artifacts": [
+        "src/web/api.rs",
+        "src/approval/mod.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test web_smoke -- --exact test_replaying_a_captured_signed_decision_within_its_ttl_has_no_second_effect",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_decide_approval",
+          "sha256": "bbc2225b19bbb3d5abb125fd79834b9ff2a3d6fe6e2a8262d4414b400a604cb9"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalRequest::transition",
+          "sha256": "99a3400485ee6c8f1170f77e85fe4eb229a2fc1b913a40c246db7e6b1aabb3b3"
+        }
+      ],
+      "mutants": [
+        "approval-replay-recorded-signoff-recounted",
+        "approval-replay-after-decision-not-idempotent"
+      ],
+      "does_not_establish": "Only the shown shape: one two-teammate recipe, the same approver replayed. It does not cover a replay by a different party who captured the assertion and is bound to the same approver identity (the assertion binds the approver), a replay after the assertion's TTL (refused by expiry, tested in the verifier vectors), a replay of a deny against an approved request, or a decision made after the approval expired. The no-op argument depends on sign-off distinctness; a future change that lets one identity sign twice would reopen it."
+    },
+    {
+      "id": "pop-length-framing-exact",
+      "statement": "The use PoP and params commitment length prefix (LP, uint32 big-endian) is exact or refused: every length that fits in 32 bits frames as itself and every longer length is refused with an error, never truncated to n mod 2^32 (so two different field sequences cannot share a preimage through a wrapped length).",
+      "method": "test",
+      "artifacts": [
+        "src/averin/pop.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- averin::pop::tests::lp_length_prefix_is_exact_or_refused",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/averin/pop.rs",
+          "symbol": "lp_len",
+          "sha256": "6ddc25fcb81ab2c2d7b86397be65b2881245770fa3b56299c8deb9efc39d93cd"
+        },
+        {
+          "path": "src/averin/pop.rs",
+          "symbol": "lp",
+          "sha256": "b480260b897f0158c0fe3e8d632432b22c7b12dd5b84987b64fa082f8a2e4a61"
+        }
+      ],
+      "mutants": [
+        "pop-lp-length-truncates"
+      ],
+      "does_not_establish": "The boundary is tested on the length function (0, 1, 255, 256, 65535, 65536, 2^32 - 2, 2^32 - 1 and several values at and above 2^32) and one framing example; no 4 GiB field is built, so the refusal inside lp is shown by construction of the same function, not by an oversized input. A bounded test, not a Kani proof or an exhaustive check over all lengths. The grant PoP v2 preimage has its own checked framing (lp_v2) and is not covered here."
+    },
+    {
+      "id": "params-commitment-vectors-match-reference",
+      "statement": "vultrino's params_commitment (src/averin/pop.rs) reproduces every input-domain vector of vectors/params-commitment.v1.json, a byte-identical copy of averin's file pinned in vectors.lock, which is produced by an independent Python reference and also checked against averin's own commit::commit, and refuses every nonce string the file lists as rejected (wrong length, not hex, uppercase or mixed case hex, odd length, 0x prefix).",
+      "method": "differential-vectors",
+      "artifacts": [
+        "vectors/params-commitment.v1.json",
+        "src/averin/pop.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- averin::pop::tests::params_commitment_matches_the_cross_language_golden_vectors",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/averin/pop.rs",
+          "symbol": "params_commitment",
+          "sha256": "65e2f1baeda88bfa2578c59f6f38295ebd2807af980f60ca46d946fe99dd8071"
+        }
+      ],
+      "mutants": [
+        "pop-commit-nonce-uppercase-accepted"
+      ],
+      "does_not_establish": "Only the listed inputs and only the input domain (vultrino never commits under another). Copy identity with averin's file is checked only by the local --peer run of check_vectors_lock.py, not by CI. It does not show the nonce is random or that the commitment hides a value."
+    },
+    {
+      "id": "tenant-assertion-subsecond-ttl-parity",
+      "statement": "vultrino's tenant-assertion verifier treats only a zero max TTL as 'use the default ceiling' and a positive sub-second max TTL as a ceiling of its whole seconds (0), the same as govder's Go verifier (pkg/tenantassert.Verify): with a 500 ms ceiling an assertion expiring this second verifies and one expiring a second or a minute later is refused ExcessiveTtl, never widened to the five minute default.",
+      "method": "test",
+      "artifacts": [
+        "src/govder/tenant_assert.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- govder::tenant_assert::tests::sub_second_max_ttl_is_a_ceiling_of_zero_seconds_like_govder",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/govder/tenant_assert.rs",
+          "symbol": "verify_tenant_assertion",
+          "sha256": "3c0509ea70f34a81b6bf23dc546ae60d62c5d91088ce4594316cf7be39eab766"
+        }
+      ],
+      "mutants": [
+        "tenant-ttl-subsecond-reads-as-unset"
+      ],
+      "does_not_establish": "Only the ceiling arithmetic on a 500 ms value and three expiry offsets, in this repository's tests; govder pins the same behaviour in its own test, and the two are not compared by a shared vector (the shared vectors carry whole-second ceilings only). Not what ceiling the web route passes (govder.assertion_ttl capped by the broker maximum)."
     }
   ]
 }

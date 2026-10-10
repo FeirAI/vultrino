@@ -1,0 +1,13 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index 1e3909b..34fc4f8 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -1365,7 +1365,7 @@ pub async fn api_decide_approval(
+             .signoffs()
+             .iter()
+             .any(|s| s.approver_identity.eq_ignore_ascii_case(&approver));
+-        if same_outcome && approver_already_signed {
++        if same_outcome && approver_already_signed && false {
+             return (
+                 StatusCode::OK,
+                 Json(serde_json::json!({
