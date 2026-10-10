@@ -3494,6 +3494,123 @@ async fn test_json_decision_sod_is_on_by_default_with_verified_approver_identiti
     );
 }
 
+/// Route outcome of a requester-equals-approver decision under a given SoD posture:
+/// `Some(true)` = refused 409 approval_not_decidable with nothing written,
+/// `Some(false)` = recorded with 200.
+async fn self_approval_outcome(default_verified: bool, explicit_false: bool) -> bool {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let seed = AuthManager::new();
+    let (key, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some("team-a".to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    let mut cfg = Config::default();
+    if explicit_false {
+        cfg.approval.sod_explicit = true;
+        cfg.approval.enforce_separation_of_duty = false;
+    }
+    cfg.approval.apply_sod_default(default_verified);
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        cfg,
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    // Single-approver request whose requester principal name is the approver.
+    let mut requester = RequesterInfo::local();
+    requester.principal_name = Some("alice@example.com".to_string());
+    let (approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester,
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: Some("team-a".to_string()),
+        workload_id: None,
+        preview: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::High,
+        trusted_irreversible: None,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+        approval_rule: None,
+    });
+    let id = approval.id.clone();
+    storage.store_approval(&approval).await.unwrap();
+
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    if status == StatusCode::CONFLICT {
+        assert_eq!(body["code"], "approval_not_decidable");
+        assert_eq!(
+            stored.signoffs().len(),
+            0,
+            "a refused self-approval writes nothing"
+        );
+        true
+    } else {
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored.signoffs().len(), 1, "the self-approval was recorded");
+        false
+    }
+}
+
+#[tokio::test]
+async fn test_json_decision_self_approval_follows_the_sod_default() {
+    // XV-10: the default's route effect. Requester == approver is refused with the
+    // default on (verified identities, nothing written), and recorded when an
+    // explicit false keeps it off. This, not the same-key guard, is what the flag buys.
+    assert!(
+        self_approval_outcome(true, false).await,
+        "default on: self-approval refused"
+    );
+    assert!(
+        !self_approval_outcome(true, true).await,
+        "explicit false: self-approval recorded"
+    );
+    assert!(
+        !self_approval_outcome(false, false).await,
+        "dev (unverified identities): default off, self-approval recorded"
+    );
+}
+
 /// Build a tenant-scoped, hard-SoD router + a stored dual-control (2-of-N)
 /// approval, returning (router, storage, key, approval-id). Shared by the same-key
 /// M-of-N regression tests.
