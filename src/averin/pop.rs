@@ -77,10 +77,20 @@ impl PopKeypair {
     }
 }
 
-/// Append `LP(b) = uint32_be(len(b)) ‖ b` (RCP §9 length-prefix).
-fn lp(out: &mut Vec<u8>, b: &[u8]) {
-    out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+/// The `uint32_be` length prefix of `LP`, or `None` when `n` does not fit in 32 bits.
+/// A truncating cast here would frame a 2^32 + k byte field as a k byte one, so two
+/// different field sequences could share a preimage (VUL-15).
+fn lp_len(n: usize) -> Option<u32> {
+    u32::try_from(n).ok()
+}
+
+/// Append `LP(b) = uint32_be(len(b)) ‖ b` (RCP §9 length-prefix); a field of 2^32 bytes
+/// or more is refused, never framed with a truncated length.
+fn lp(out: &mut Vec<u8>, b: &[u8]) -> Result<(), PopError> {
+    let len = lp_len(b.len()).ok_or(PopError::LpFieldTooLong)?;
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(b);
+    Ok(())
 }
 
 /// Fully resolved brokered issuance subject. `issued_at`/`request_expires_at`
@@ -197,7 +207,7 @@ pub fn use_pop_challenge(
     params_commitment: &str,
     credential_binding: &str,
     nonce: &str,
-) -> [u8; 32] {
+) -> Result<[u8; 32], PopError> {
     let mut pre = Vec::new();
     for part in [
         USE_POP_TAG,
@@ -208,9 +218,9 @@ pub fn use_pop_challenge(
         credential_binding,
         nonce,
     ] {
-        lp(&mut pre, part.as_bytes());
+        lp(&mut pre, part.as_bytes())?;
     }
-    Sha256::digest(&pre).into()
+    Ok(Sha256::digest(&pre).into())
 }
 
 /// The params hiding commitment (`core/src/commit.rs`):
@@ -218,15 +228,20 @@ pub fn use_pop_challenge(
 /// where `nonce32` is the hex-decoded `params_nonce` (64 lowercase hex chars =
 /// 32 bytes) and `value` is the raw `params` bytes.
 pub fn params_commitment(params: &[u8], params_nonce_hex: &str) -> Result<String, PopError> {
+    // Exactly 64 LOWERCASE hex characters, as averin's FFI requires (hex::decode alone also
+    // accepts uppercase, which averin would refuse after vultrino signed over it).
+    if params_nonce_hex.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(PopError::BadParamsNonce);
+    }
     let nonce = hex::decode(params_nonce_hex).map_err(|_| PopError::BadParamsNonce)?;
     if nonce.len() != 32 {
         return Err(PopError::BadParamsNonce);
     }
     let mut pre = Vec::new();
-    lp(&mut pre, COMMIT_TAG.as_bytes());
-    lp(&mut pre, COMMIT_DOMAIN_INPUT.as_bytes());
-    lp(&mut pre, &nonce);
-    lp(&mut pre, params);
+    lp(&mut pre, COMMIT_TAG.as_bytes())?;
+    lp(&mut pre, COMMIT_DOMAIN_INPUT.as_bytes())?;
+    lp(&mut pre, &nonce)?;
+    lp(&mut pre, params)?;
     Ok(format!("sha256:{}", hex::encode(Sha256::digest(&pre))))
 }
 
@@ -262,6 +277,8 @@ pub enum PopError {
     MalformedCapability,
     #[error("grant PoP v2 field exceeds the 32-bit length framing limit")]
     GrantFieldTooLong,
+    #[error("PoP field exceeds the 32-bit length framing limit")]
+    LpFieldTooLong,
 }
 
 #[cfg(test)]
@@ -273,7 +290,7 @@ mod tests {
     // A byte drift in the LP4 digest breaks this test.
     #[test]
     fn use_pop_challenge_ascii_matches_golden() {
-        let d = use_pop_challenge("g", "r", "a", "pc", "cb", "n");
+        let d = use_pop_challenge("g", "r", "a", "pc", "cb", "n").unwrap();
         assert_eq!(
             hex::encode(d),
             "ea55b822189110918d850f1b64582311c844fd75b8e3ee6cbe9ff509b4c40a1d"
@@ -282,7 +299,7 @@ mod tests {
 
     #[test]
     fn use_pop_challenge_multibyte_matches_golden() {
-        let d = use_pop_challenge("café", "資源", "🔑", "pc", "cb", "n");
+        let d = use_pop_challenge("café", "資源", "🔑", "pc", "cb", "n").unwrap();
         assert_eq!(
             hex::encode(d),
             "3f274a9c975514017ea1e324db94dc1fc018ded8bd733e26eddd113250672889"
@@ -388,6 +405,66 @@ mod tests {
         assert_eq!(c.len(), "sha256:".len() + 64);
         // deterministic
         assert_eq!(c, params_commitment(b"{\"q\":1}", &nonce).unwrap());
+    }
+
+    /// VUL-15: the length prefix is exact or refused. Every length that fits in 32 bits
+    /// frames as itself; every length that does not is refused, never wrapped to
+    /// `n mod 2^32` (a 2^32 + k byte field would otherwise frame as a k byte one).
+    #[test]
+    fn lp_length_prefix_is_exact_or_refused() {
+        let max = u32::MAX as u64;
+        for n in [0u64, 1, 2, 255, 256, 65_535, 65_536, max - 1, max] {
+            assert_eq!(lp_len(n as usize), Some(n as u32), "{n}");
+        }
+        #[cfg(target_pointer_width = "64")]
+        for n in [
+            max + 1,
+            max + 2,
+            2 * (max + 1),
+            (max + 1) + 5,
+            u64::MAX / 2,
+            usize::MAX as u64,
+        ] {
+            assert_eq!(lp_len(n as usize), None, "{n} must be refused, not wrapped");
+        }
+        // The framing itself: prefix is the big-endian length, then the bytes.
+        let mut out = Vec::new();
+        lp(&mut out, b"abc").unwrap();
+        assert_eq!(out, [0, 0, 0, 3, b'a', b'b', b'c']);
+    }
+
+    /// Cross-language golden vectors for `params_commitment`: vendored from averin
+    /// (vectors/params-commitment.v1.json, pinned in vectors.lock, produced by an
+    /// independent Python reference). Every `input` entry must reproduce; every
+    /// rejected nonce string must be refused.
+    #[test]
+    fn params_commitment_matches_the_cross_language_golden_vectors() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vectors")
+            .join("params-commitment.v1.json");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut checked = 0;
+        for c in v["vectors"].as_array().unwrap() {
+            if c["domain"] != "input" {
+                continue; // vultrino only ever commits under the input domain
+            }
+            let value = hex::decode(c["value_hex"].as_str().unwrap()).unwrap();
+            let got = params_commitment(&value, c["nonce_hex"].as_str().unwrap()).unwrap();
+            assert_eq!(got, c["expect"].as_str().unwrap(), "{}", c["id"]);
+            checked += 1;
+        }
+        assert!(checked >= 8, "too few input vectors: {checked}");
+        let rejects = v["reject_nonce_hex"].as_array().unwrap();
+        assert!(rejects.len() >= 8);
+        for r in rejects {
+            assert_eq!(
+                params_commitment(b"x", r["nonce_hex"].as_str().unwrap()),
+                Err(PopError::BadParamsNonce),
+                "{}",
+                r["id"]
+            );
+        }
     }
 
     #[test]

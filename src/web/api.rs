@@ -2276,7 +2276,7 @@ async fn store_and_reload_policy(
         }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({"code": "reload_error", "error": format!("policy stored but the immediate engine reload failed; it will be applied within the policy refresh window (~{}s): {}", crate::server::POLICY_REFRESH_SECS, e)}),
+            serde_json::json!({"code": "reload_error", "error": format!("policy stored but the immediate engine reload failed; it will be applied within the policy refresh window (~{}s): {}", crate::server::policy_refresh_secs(), e)}),
         );
     }
     // V9: emit a policy-change event to the signed outbox.

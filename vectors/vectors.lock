@@ -13,6 +13,11 @@
       "sha256": "bc64756514343fde45c2f373beaf67449bc7354c89755f16fae052b202d4fb54"
     },
     {
+      "file": "params-commitment.v1.json",
+      "owner": "averin",
+      "sha256": "f443a8bf5b1968c50180d724250bb7ac4c6512bb0f2f984a7e4fc9f334d7eb8b"
+    },
+    {
       "file": "tenant-assertion.v1.json",
       "owner": "govder",
       "sha256": "3f623a4e2fa45144d0dae27265dd725769d6d9bb59122b7611ff6a3eb8193084"

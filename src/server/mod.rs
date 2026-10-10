@@ -4768,9 +4768,9 @@ pub const POLICY_REFRESH_SECS: u64 = 5;
 pub fn policy_refresh_interval() -> std::time::Duration {
     let secs = match std::env::var("VULTRINO_POLICY_REFRESH_SECS") {
         Err(_) => POLICY_REFRESH_SECS,
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(s) if (1..=86_400).contains(&s) => s,
-            _ => {
+        Ok(raw) => match parse_policy_refresh_secs(&raw) {
+            Some(s) => s,
+            None => {
                 warn!(value = %raw, default = POLICY_REFRESH_SECS,
                     "VULTRINO_POLICY_REFRESH_SECS must be whole seconds from 1 to 86400; using the default");
                 POLICY_REFRESH_SECS
@@ -4782,6 +4782,24 @@ pub fn policy_refresh_interval() -> std::time::Duration {
             "VULTRINO_POLICY_REFRESH_SECS is not the default: ordinary (non-kill) policy changes reach this process only every {secs}s; kill policies are fenced from the vault and do not wait for it");
     }
     std::time::Duration::from_secs(secs)
+}
+
+/// The effective refresh interval in whole seconds, without the startup warnings of
+/// [`policy_refresh_interval`]. Error messages that promise "applied within the
+/// refresh window" quote this, not the compiled default.
+pub fn policy_refresh_secs() -> u64 {
+    std::env::var("VULTRINO_POLICY_REFRESH_SECS")
+        .ok()
+        .and_then(|raw| parse_policy_refresh_secs(&raw))
+        .unwrap_or(POLICY_REFRESH_SECS)
+}
+
+/// Whole seconds from 1 to 86400 (surrounding whitespace allowed), else `None`.
+fn parse_policy_refresh_secs(raw: &str) -> Option<u64> {
+    match raw.trim().parse::<u64>() {
+        Ok(s) if (1..=86_400).contains(&s) => Some(s),
+        _ => None,
+    }
 }
 
 /// Default interval for the background approval SLA sweep (V5).
@@ -6061,6 +6079,44 @@ mod permit_binding_tests;
 
 #[cfg(test)]
 mod tests {
+    /// Wave-1 close-out: the policy refresh interval parses whole seconds in 1..=86400
+    /// only, and the "applied within the refresh window" message quotes the effective
+    /// interval, not the compiled default.
+    #[test]
+    fn policy_refresh_interval_parses_and_caps_and_the_message_quotes_it() {
+        for (raw, want) in [
+            ("1", Some(1)),
+            ("5", Some(5)),
+            (" 7 ", Some(7)),
+            ("86400", Some(86_400)),
+            ("0", None),
+            ("86401", None),
+            ("-3", None),
+            ("1.5", None),
+            ("5s", None),
+            ("0x10", None),
+            ("", None),
+            ("99999999999999999999999", None),
+        ] {
+            assert_eq!(super::parse_policy_refresh_secs(raw), want, "{raw:?}");
+        }
+        // No other test reads this variable, so setting it here cannot race.
+        std::env::set_var("VULTRINO_POLICY_REFRESH_SECS", "30");
+        assert_eq!(super::policy_refresh_secs(), 30);
+        assert_eq!(
+            super::policy_refresh_interval(),
+            std::time::Duration::from_secs(30)
+        );
+        std::env::set_var("VULTRINO_POLICY_REFRESH_SECS", "0");
+        assert_eq!(super::policy_refresh_secs(), super::POLICY_REFRESH_SECS);
+        assert_eq!(
+            super::policy_refresh_interval(),
+            std::time::Duration::from_secs(super::POLICY_REFRESH_SECS)
+        );
+        std::env::remove_var("VULTRINO_POLICY_REFRESH_SECS");
+        assert_eq!(super::policy_refresh_secs(), super::POLICY_REFRESH_SECS);
+    }
+
     use super::*;
 
     #[derive(Default)]
@@ -8133,7 +8189,8 @@ mod averin_worker_tests {
             &params_commitment,
             &credential_binding,
             &nonce,
-        );
+        )
+        .unwrap();
 
         let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
         let recomputed_sig = keypair.sign_b64(&challenge);
@@ -8351,7 +8408,8 @@ mod averin_worker_tests {
             &params_commitment,
             &credential_binding,
             &nonce,
-        );
+        )
+        .unwrap();
 
         let keypair = crate::averin::pop::PopKeypair::from_seed_bytes(&entry.pop_seed);
         let recomputed_sig = keypair.sign_b64(&challenge);

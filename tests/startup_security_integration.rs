@@ -190,3 +190,63 @@ fn web_refuses_to_start_with_a_stored_rate_limit_policy_that_does_not_default_de
         assert!(p.stored_load_refusal().is_none());
     });
 }
+
+/// Wave-1 close-out: `vultrino serve --mcp` is the second start path that loads stored
+/// policies, and it refuses a stored RateLimit policy with a non-deny default the same
+/// way `vultrino web` does (a refused set never starts a process with a weaker set).
+#[test]
+fn serve_mcp_refuses_to_start_with_a_stored_rate_limit_policy_that_does_not_default_deny() {
+    use vultrino::policy::{Policy, PolicyAction, PolicyCondition};
+    use vultrino::storage::{FileStorage, StorageBackend};
+
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault.enc");
+    let config = dir.path().join("vultrino.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[storage]\nbackend = \"file\"\n[storage.file]\npath = \"{}\"\n",
+            vault.display()
+        ),
+    )
+    .unwrap();
+    let password = "startup-refusal-mcp-test-password";
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let storage = FileStorage::new(&vault, &secrecy::SecretString::from(password))
+            .await
+            .unwrap();
+        let mut p = Policy::deny_all("legacy-rate-mcp", "cred-*").with_rule(
+            PolicyCondition::And(vec![
+                PolicyCondition::UrlMatch("https://api.example.com/v1/*".into()),
+                PolicyCondition::RateLimit {
+                    max: 5,
+                    window_secs: 60,
+                },
+            ]),
+            PolicyAction::Allow,
+        );
+        p.id = "legacy-rate-mcp-id".to_string();
+        p.default_action = PolicyAction::Allow;
+        storage.store_policy(&p).await.unwrap();
+    });
+
+    // stdin is closed: a process that did start would read EOF and exit cleanly, so a
+    // non-zero exit naming the policy can only be the startup refusal.
+    let output = Command::new(env!("CARGO_BIN_EXE_vultrino"))
+        .arg("--config")
+        .arg(&config)
+        .args(["serve", "--mcp"])
+        .env("HOME", dir.path())
+        .env("VULTRINO_PASSWORD", password)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "startup must fail: {stderr}");
+    assert!(
+        stderr.contains("legacy-rate-mcp-id")
+            && stderr.contains("vultrino policy deny-default legacy-rate-mcp-id"),
+        "the startup error names the policy and the fix: {stderr}"
+    );
+}
