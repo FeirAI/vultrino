@@ -3992,6 +3992,36 @@ mod tests {
     }
 
     #[test]
+    fn sod_defaults_on_only_with_verified_approver_identities() {
+        // Verified approver identities, nothing written in the config: ON.
+        let mut cfg = ApprovalConfig::default();
+        let line = cfg.apply_sod_default(true);
+        assert!(cfg.enforce_separation_of_duty, "{line}");
+        // No verified identities (dev mode): OFF, and it says so.
+        let mut dev = ApprovalConfig::default();
+        let line = dev.apply_sod_default(false);
+        assert!(!dev.enforce_separation_of_duty);
+        assert!(line.contains("OFF by default"), "{line}");
+        // An explicit false wins over the verified default, and the log line warns.
+        let mut off = ApprovalConfig {
+            sod_explicit: true,
+            enforce_separation_of_duty: false,
+            ..Default::default()
+        };
+        let line = off.apply_sod_default(true);
+        assert!(!off.enforce_separation_of_duty);
+        assert!(line.contains("explicitly OFF"), "{line}");
+        // An explicit true holds without verified identities.
+        let mut on = ApprovalConfig {
+            sod_explicit: true,
+            enforce_separation_of_duty: true,
+            ..Default::default()
+        };
+        on.apply_sod_default(false);
+        assert!(on.enforce_separation_of_duty);
+    }
+
+    #[test]
     fn test_sla_windows_per_class() {
         let mut cfg = ApprovalConfig {
             ttl_secs: 7200,
@@ -5153,36 +5183,6 @@ mod finding_6a_startup_warning_tests {
                  tell what breaks or how to fix it.\nwarning: {w}"
             );
         }
-    }
-
-    #[test]
-    fn sod_defaults_on_only_with_verified_approver_identities() {
-        // Verified approver identities, nothing written in the config: ON.
-        let mut cfg = ApprovalConfig::default();
-        let line = cfg.apply_sod_default(true);
-        assert!(cfg.enforce_separation_of_duty, "{line}");
-        // No verified identities (dev mode): OFF, and it says so.
-        let mut dev = ApprovalConfig::default();
-        let line = dev.apply_sod_default(false);
-        assert!(!dev.enforce_separation_of_duty);
-        assert!(line.contains("OFF by default"), "{line}");
-        // An explicit false wins over the verified default, and the log line warns.
-        let mut off = ApprovalConfig {
-            sod_explicit: true,
-            enforce_separation_of_duty: false,
-            ..Default::default()
-        };
-        let line = off.apply_sod_default(true);
-        assert!(!off.enforce_separation_of_duty);
-        assert!(line.contains("explicitly OFF"), "{line}");
-        // An explicit true holds without verified identities.
-        let mut on = ApprovalConfig {
-            sod_explicit: true,
-            enforce_separation_of_duty: true,
-            ..Default::default()
-        };
-        on.apply_sod_default(false);
-        assert!(on.enforce_separation_of_duty);
     }
 
     #[test]
