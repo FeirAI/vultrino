@@ -1,0 +1,13 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index 1e3909b..0335a31 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -1260,7 +1260,7 @@ pub async fn api_decide_approval(
+             return error_response(
+                 StatusCode::UNAUTHORIZED,
+                 "invalid_tenant_assertion",
+-                "Invalid broker tenant assertion",
++                &format!("Invalid broker tenant assertion: {error}"),
+             );
+         }
+         true

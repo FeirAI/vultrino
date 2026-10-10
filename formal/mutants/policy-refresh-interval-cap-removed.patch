@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 4b9c8c9..32a9c57 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -4797,7 +4797,7 @@ pub fn policy_refresh_secs() -> u64 {
+ /// Whole seconds from 1 to 86400 (surrounding whitespace allowed), else `None`.
+ fn parse_policy_refresh_secs(raw: &str) -> Option<u64> {
+     match raw.trim().parse::<u64>() {
+-        Ok(s) if (1..=86_400).contains(&s) => Some(s),
++        Ok(s) if s >= 1 => Some(s),
+         _ => None,
+     }
+ }

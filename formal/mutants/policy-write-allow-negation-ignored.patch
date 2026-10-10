@@ -1,5 +1,5 @@
 diff --git a/src/policy/mod.rs b/src/policy/mod.rs
-index fd81f06..8576c54 100644
+index fd81f06..1ab3c1e 100644
 --- a/src/policy/mod.rs
 +++ b/src/policy/mod.rs
 @@ -1025,10 +1025,7 @@ pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
@@ -10,7 +10,7 @@ index fd81f06..8576c54 100644
 -                "allow",
 -                first_negated_warned_url_pattern(&rule.condition, false),
 -            ),
-+            PolicyAction::Allow => ("allow", first_warned_url_pattern(&rule.condition)),
++            PolicyAction::Allow => ("allow", None),
          };
          if let Some((pattern, canon)) = found {
              let reasons: Vec<String> = canon

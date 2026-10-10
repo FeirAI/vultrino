@@ -1,0 +1,13 @@
+diff --git a/src/averin/pop.rs b/src/averin/pop.rs
+index fe2a54f..dcba0a4 100644
+--- a/src/averin/pop.rs
++++ b/src/averin/pop.rs
+@@ -81,7 +81,7 @@ impl PopKeypair {
+ /// A truncating cast here would frame a 2^32 + k byte field as a k byte one, so two
+ /// different field sequences could share a preimage (VUL-15).
+ fn lp_len(n: usize) -> Option<u32> {
+-    u32::try_from(n).ok()
++    Some(n as u32)
+ }
+ 
+ /// Append `LP(b) = uint32_be(len(b)) ‖ b` (RCP §9 length-prefix); a field of 2^32 bytes
