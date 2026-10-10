@@ -1,0 +1,12 @@
+diff --git a/src/approval/mod.rs b/src/approval/mod.rs
+index 5d4edc4..f3ce04b 100644
+--- a/src/approval/mod.rs
++++ b/src/approval/mod.rs
+@@ -2907,7 +2907,6 @@ impl ApprovalConfig {
+             }
+             (true, _) => "separation of duty follows the explicit [approvals] setting",
+             (false, true) => {
+-                self.enforce_separation_of_duty = true;
+                 "separation of duty is ON by default (approver identities are verified)"
+             }
+             (false, false) => {
