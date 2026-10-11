@@ -7,9 +7,9 @@ mod averin_queue;
 mod file;
 mod outbox_model;
 mod outbox_store;
-mod vault_log;
 mod popkey_store;
 mod social;
+mod vault_log;
 
 pub use averin_deadletter::{AverinDeadLetterStore, QuarantineRecord, QuarantineStatus};
 pub use averin_queue::AverinQueue;

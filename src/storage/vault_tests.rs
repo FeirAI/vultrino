@@ -10,7 +10,9 @@ use tempfile::tempdir;
 const PW: &str = "pw";
 
 async fn open(path: &Path) -> FileStorage {
-    FileStorage::new(path, &SecretString::from(PW)).await.unwrap()
+    FileStorage::new(path, &SecretString::from(PW))
+        .await
+        .unwrap()
 }
 
 fn token(i: usize) -> UseToken {
@@ -70,7 +72,8 @@ async fn write_cost_does_not_grow_with_unrelated_records() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.enc");
         let s = open(&path).await;
-        s.verify_replay.store(false, std::sync::atomic::Ordering::Relaxed);
+        s.verify_replay
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         s.set_compact_min_bytes(u64::MAX);
         for i in 0..n {
             s.store_use_token(&token(i)).await.unwrap();
@@ -78,12 +81,21 @@ async fn write_cost_does_not_grow_with_unrelated_records() {
         let snapshot_before = std::fs::read(&path).unwrap();
         let lines_before = wal_lines(&path);
         let a = s.io_stats();
-        s.store_policy(&Policy::allow_all("probe", "probe-*")).await.unwrap();
+        s.store_policy(&Policy::allow_all("probe", "probe-*"))
+            .await
+            .unwrap();
         let d = s.io_stats().since(a);
-        assert_eq!(d.records_written, 1, "n={n}: exactly the one changed record");
+        assert_eq!(
+            d.records_written, 1,
+            "n={n}: exactly the one changed record"
+        );
         assert_eq!(d.decrypts, 0, "n={n}: a write decrypts nothing");
         assert_eq!(d.bytes_decrypted, 0, "n={n}");
-        assert_eq!(wal_lines(&path), lines_before + 1, "n={n}: one log line appended");
+        assert_eq!(
+            wal_lines(&path),
+            lines_before + 1,
+            "n={n}: one log line appended"
+        );
         assert_eq!(
             snapshot_before,
             std::fs::read(&path).unwrap(),
@@ -91,7 +103,10 @@ async fn write_cost_does_not_grow_with_unrelated_records() {
         );
         measured.push(d.bytes_written);
     }
-    let (lo, hi) = (*measured.iter().min().unwrap(), *measured.iter().max().unwrap());
+    let (lo, hi) = (
+        *measured.iter().min().unwrap(),
+        *measured.iter().max().unwrap(),
+    );
     assert!(
         hi <= lo + 16,
         "bytes written per write must not depend on vault size: {measured:?}"
@@ -105,7 +120,8 @@ async fn a_provision_burst_costs_its_own_writes_not_the_vault_size() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.enc");
         let s = open(&path).await;
-        s.verify_replay.store(false, std::sync::atomic::Ordering::Relaxed);
+        s.verify_replay
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         s.set_compact_min_bytes(u64::MAX);
         for i in 0..n {
             s.store_use_token(&token(i)).await.unwrap();
@@ -166,8 +182,15 @@ async fn an_aborted_mutation_rolls_back_memory_and_writes_nothing() {
         .await;
     assert!(err.is_err());
     assert_eq!(s.io_stats().since(a).bytes_written, 0, "nothing committed");
-    assert!(s.get_use_token(&t.id).await.unwrap().is_some(), "the removed token is back");
-    assert_eq!(s.list_use_tokens().await.unwrap().len(), 1, "the inserted token is gone");
+    assert!(
+        s.get_use_token(&t.id).await.unwrap().is_some(),
+        "the removed token is back"
+    );
+    assert_eq!(
+        s.list_use_tokens().await.unwrap().len(),
+        1,
+        "the inserted token is gone"
+    );
     let s2 = open(&path).await;
     assert_eq!(s2.list_use_tokens().await.unwrap().len(), 1);
 }
@@ -184,10 +207,17 @@ async fn an_unchanged_vault_fence_read_decrypts_nothing() {
     }
     let a = s.io_stats();
     for _ in 0..5 {
-        assert!(s.kill_fence_check(&q("gh-main", 0)).await.unwrap().is_clear());
+        assert!(s
+            .kill_fence_check(&q("gh-main", 0))
+            .await
+            .unwrap()
+            .is_clear());
     }
     let d = s.io_stats().since(a);
-    assert_eq!((d.decrypts, d.bytes_decrypted, d.bytes_written, d.fsyncs), (0, 0, 0, 0));
+    assert_eq!(
+        (d.decrypts, d.bytes_decrypted, d.bytes_written, d.fsyncs),
+        (0, 0, 0, 0)
+    );
 }
 
 #[tokio::test]
@@ -233,7 +263,11 @@ async fn the_fence_sees_another_handles_kill_and_its_lift_without_a_reload() {
     ));
     // Work admitted after the kill is clear.
     let now_epoch = a.kill_fence_epoch().await;
-    assert!(b.kill_fence_check(&q("gh-main", now_epoch)).await.unwrap().is_clear());
+    assert!(b
+        .kill_fence_check(&q("gh-main", now_epoch))
+        .await
+        .unwrap()
+        .is_clear());
 }
 
 #[tokio::test]
@@ -249,12 +283,18 @@ async fn fence_reads_hold_the_lock_shared_so_dispatches_do_not_serialize() {
     let (tx, rx) = std::sync::mpsc::channel();
     let s2 = std::sync::Arc::clone(&s);
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let v = rt.block_on(s2.kill_fence_check(&q("gh-main", 0))).unwrap();
         tx.send(v.is_clear()).unwrap();
     });
     let got = rx.recv_timeout(std::time::Duration::from_secs(10));
-    assert_eq!(got, Ok(true), "a fence read must not wait behind a shared holder");
+    assert_eq!(
+        got,
+        Ok(true),
+        "a fence read must not wait behind a shared holder"
+    );
     drop(guard);
 }
 
@@ -271,16 +311,22 @@ async fn a_writer_still_excludes_fence_readers() {
     let (tx, rx) = std::sync::mpsc::channel();
     let s2 = std::sync::Arc::clone(&s);
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let v = rt.block_on(s2.kill_fence_check(&q("gh-main", 0))).unwrap();
         tx.send(v.is_clear()).unwrap();
     });
     assert!(
-        rx.recv_timeout(std::time::Duration::from_millis(400)).is_err(),
+        rx.recv_timeout(std::time::Duration::from_millis(400))
+            .is_err(),
         "a fence read must wait while a writer holds the lock"
     );
     drop(guard);
-    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)), Ok(true));
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)),
+        Ok(true)
+    );
 }
 
 #[tokio::test]
@@ -291,7 +337,11 @@ async fn another_handles_compaction_is_picked_up_by_the_fence() {
     let b = open(&path).await;
     a.store_policy(&kill("k-pre", "gh-*")).await.unwrap();
     a.compact().await.unwrap();
-    assert!(b.kill_fence_check(&q("gh-main", 0)).await.unwrap().is_clear() == false);
+    assert!(!b
+        .kill_fence_check(&q("gh-main", 0))
+        .await
+        .unwrap()
+        .is_clear());
     a.store_policy(&kill("k-post", "slack-*")).await.unwrap();
     assert!(matches!(
         b.kill_fence_check(&q("slack-bot", 0)).await.unwrap(),
@@ -303,11 +353,20 @@ async fn another_handles_compaction_is_picked_up_by_the_fence() {
 
 /// The state a crash test checks: every acknowledged record, plus the kill fence.
 async fn assert_acknowledged(s: &FileStorage, cred_alias: &str, tokens: &[String], epoch: u64) {
-    assert!(s.get_by_alias(cred_alias).await.unwrap().is_some(), "committed credential lost");
+    assert!(
+        s.get_by_alias(cred_alias).await.unwrap().is_some(),
+        "committed credential lost"
+    );
     for t in tokens {
-        assert!(s.get_use_token(t).await.unwrap().is_some(), "committed token {t} lost");
+        assert!(
+            s.get_use_token(t).await.unwrap().is_some(),
+            "committed token {t} lost"
+        );
     }
-    assert!(s.kill_fence_epoch().await >= epoch, "committed kill epoch lost");
+    assert!(
+        s.kill_fence_epoch().await >= epoch,
+        "committed kill epoch lost"
+    );
 }
 
 async fn build_base(path: &Path) -> (String, Vec<String>, u64) {
@@ -334,11 +393,21 @@ async fn assert_kill_all_or_nothing(s: &FileStorage, base_epoch: u64) {
         .await
         .unwrap();
     if stored {
-        assert_eq!(epoch, base_epoch + 1, "policy present but epoch not bumped: torn write");
+        assert_eq!(
+            epoch,
+            base_epoch + 1,
+            "policy present but epoch not bumped: torn write"
+        );
         assert!(matches!(marked, KillFenceVerdict::Halted { .. }));
     } else {
-        assert_eq!(epoch, base_epoch, "epoch bumped without the policy: torn write");
-        assert!(marked.is_clear(), "mark without policy: torn write ({marked:?})");
+        assert_eq!(
+            epoch, base_epoch,
+            "epoch bumped without the policy: torn write"
+        );
+        assert!(
+            marked.is_clear(),
+            "mark without policy: torn write ({marked:?})"
+        );
     }
 }
 
@@ -346,7 +415,12 @@ async fn assert_kill_all_or_nothing(s: &FileStorage, base_epoch: u64) {
 async fn a_crash_at_each_append_step_loses_no_committed_write_and_tears_no_record() {
     // Steps: before the append; half a line written; whole line written, not fsynced; fsynced
     // with the acknowledgement lost. The 4th is a durable write the caller never heard about.
-    for step in ["wal.before_append", "wal.torn", "wal.after_write", "wal.after_fsync"] {
+    for step in [
+        "wal.before_append",
+        "wal.torn",
+        "wal.after_write",
+        "wal.after_fsync",
+    ] {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.enc");
         let (alias, tokens, epoch) = build_base(&path).await;
@@ -355,7 +429,10 @@ async fn a_crash_at_each_append_step_loses_no_committed_write_and_tears_no_recor
             s.set_compact_min_bytes(u64::MAX);
             *s.fault.lock() = Some(step.to_string());
             let r = s.store_policy(&kill("w-kill", "w-target")).await;
-            assert!(r.is_err(), "{step}: the injected crash surfaces as an error");
+            assert!(
+                r.is_err(),
+                "{step}: the injected crash surfaces as an error"
+            );
             // The process dies here: drop the handle without any cleanup.
         }
         let s = open(&path).await;
@@ -365,12 +442,18 @@ async fn a_crash_at_each_append_step_loses_no_committed_write_and_tears_no_recor
         s.store(&cred("after-crash")).await.unwrap();
         drop(s);
         let s = open(&path).await;
-        assert!(s.get_by_alias("after-crash").await.unwrap().is_some(), "{step}");
+        assert!(
+            s.get_by_alias("after-crash").await.unwrap().is_some(),
+            "{step}"
+        );
         assert_acknowledged(&s, &alias, &tokens, epoch).await;
         assert_kill_all_or_nothing(&s, epoch).await;
         // A torn tail is repaired by the next writer: the log is whole lines only.
         let bytes = std::fs::read(path.with_extension("wal")).unwrap();
-        assert!(bytes.is_empty() || bytes.ends_with(b"\n"), "{step}: log ends mid-line");
+        assert!(
+            bytes.is_empty() || bytes.ends_with(b"\n"),
+            "{step}: log ends mid-line"
+        );
     }
 }
 
@@ -387,10 +470,21 @@ async fn a_torn_tail_is_only_present_after_the_torn_step_and_is_never_applied() 
         assert!(s.store_policy(&kill("w-kill", "w-target")).await.is_err());
     }
     let bytes = std::fs::read(path.with_extension("wal")).unwrap();
-    assert!(!bytes.ends_with(b"\n"), "the injected tear leaves an unterminated tail");
+    assert!(
+        !bytes.ends_with(b"\n"),
+        "the injected tear leaves an unterminated tail"
+    );
     // A READER (fence check) ignores the tail and does not modify the file.
-    assert!(reader.kill_fence_check(&q("w-target", epoch)).await.unwrap().is_clear());
-    assert_eq!(std::fs::read(path.with_extension("wal")).unwrap(), bytes, "a read never repairs");
+    assert!(reader
+        .kill_fence_check(&q("w-target", epoch))
+        .await
+        .unwrap()
+        .is_clear());
+    assert_eq!(
+        std::fs::read(path.with_extension("wal")).unwrap(),
+        bytes,
+        "a read never repairs"
+    );
     // The next WRITE truncates the tail first.
     reader.store(&cred("next")).await.unwrap();
     let after = std::fs::read(path.with_extension("wal")).unwrap();
@@ -398,7 +492,10 @@ async fn a_torn_tail_is_only_present_after_the_torn_step_and_is_never_applied() 
     drop(reader);
     let s = open(&path).await;
     assert!(s.get_by_alias("next").await.unwrap().is_some());
-    assert!(s.get_policy("w-kill").await.unwrap().is_none(), "the torn write never appears");
+    assert!(
+        s.get_policy("w-kill").await.unwrap().is_none(),
+        "the torn write never appears"
+    );
 }
 
 #[tokio::test]
@@ -424,10 +521,23 @@ async fn a_crash_at_each_compaction_step_loses_nothing_and_leaves_a_usable_vault
         drop(s);
         let s = open(&path).await;
         assert_acknowledged(&s, &alias, &tokens, epoch).await;
-        assert!(s.get_by_alias("post-compact-crash").await.unwrap().is_some(), "{step}");
-        assert_eq!(wal_lines(&path), 0, "{step}: a finished compaction leaves an empty log");
         assert!(
-            s.kill_fence_check(&q("base-x", 0)).await.unwrap().is_clear() == false,
+            s.get_by_alias("post-compact-crash")
+                .await
+                .unwrap()
+                .is_some(),
+            "{step}"
+        );
+        assert_eq!(
+            wal_lines(&path),
+            0,
+            "{step}: a finished compaction leaves an empty log"
+        );
+        assert!(
+            !s.kill_fence_check(&q("base-x", 0))
+                .await
+                .unwrap()
+                .is_clear(),
             "{step}: the stored kill still halts after compaction"
         );
     }
@@ -462,7 +572,8 @@ async fn automatic_compaction_bounds_the_log_and_loses_nothing() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.enc");
     let s = open(&path).await;
-    s.verify_replay.store(false, std::sync::atomic::Ordering::Relaxed);
+    s.verify_replay
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     s.set_compact_min_bytes(4 * 1024);
     let mut ids = Vec::new();
     let mut max_wal = 0u64;
@@ -470,7 +581,11 @@ async fn automatic_compaction_bounds_the_log_and_loses_nothing() {
         let t = token(i);
         ids.push(t.id.clone());
         s.store_use_token(&t).await.unwrap();
-        max_wal = max_wal.max(std::fs::metadata(path.with_extension("wal")).map(|m| m.len()).unwrap_or(0));
+        max_wal = max_wal.max(
+            std::fs::metadata(path.with_extension("wal"))
+                .map(|m| m.len())
+                .unwrap_or(0),
+        );
     }
     let snap = std::fs::metadata(&path).unwrap().len();
     assert!(
@@ -496,7 +611,10 @@ async fn a_corrupt_or_reordered_log_record_fails_the_open_closed() {
     }
     let wal = path.with_extension("wal");
     let good = std::fs::read(&wal).unwrap();
-    let lines: Vec<&[u8]> = good.split(|b| *b == b'\n').filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&[u8]> = good
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
     assert_eq!(lines.len(), 3);
     // Missing middle record (gap).
     let mut gap = Vec::new();
@@ -505,7 +623,12 @@ async fn a_corrupt_or_reordered_log_record_fails_the_open_closed() {
     gap.extend_from_slice(lines[2]);
     gap.push(b'\n');
     std::fs::write(&wal, &gap).unwrap();
-    assert!(FileStorage::new(&path, &SecretString::from(PW)).await.is_err(), "gap");
+    assert!(
+        FileStorage::new(&path, &SecretString::from(PW))
+            .await
+            .is_err(),
+        "gap"
+    );
     // Swapped records (reorder).
     let mut swapped = Vec::new();
     for i in [1usize, 0, 2] {
@@ -513,13 +636,23 @@ async fn a_corrupt_or_reordered_log_record_fails_the_open_closed() {
         swapped.push(b'\n');
     }
     std::fs::write(&wal, &swapped).unwrap();
-    assert!(FileStorage::new(&path, &SecretString::from(PW)).await.is_err(), "reorder");
+    assert!(
+        FileStorage::new(&path, &SecretString::from(PW))
+            .await
+            .is_err(),
+        "reorder"
+    );
     // A flipped byte inside a terminated record (tamper / bit rot) fails authentication.
     let mut flipped = good.clone();
     let mid = lines[1].as_ptr() as usize - good.as_ptr() as usize + lines[1].len() / 2;
     flipped[mid] = if flipped[mid] == b'A' { b'B' } else { b'A' };
     std::fs::write(&wal, &flipped).unwrap();
-    assert!(FileStorage::new(&path, &SecretString::from(PW)).await.is_err(), "flip");
+    assert!(
+        FileStorage::new(&path, &SecretString::from(PW))
+            .await
+            .is_err(),
+        "flip"
+    );
     // Restored: opens.
     std::fs::write(&wal, &good).unwrap();
     let s = open(&path).await;
@@ -537,13 +670,22 @@ async fn rekey_folds_the_log_and_the_old_key_log_is_never_decrypted() {
         assert!(wal_lines(&path) > 0);
         s.rekey(&SecretString::from("new-pw")).await.unwrap();
     }
-    assert!(FileStorage::new(&path, &SecretString::from(PW)).await.is_err(), "old password");
-    let s = FileStorage::new(&path, &SecretString::from("new-pw")).await.unwrap();
+    assert!(
+        FileStorage::new(&path, &SecretString::from(PW))
+            .await
+            .is_err(),
+        "old password"
+    );
+    let s = FileStorage::new(&path, &SecretString::from("new-pw"))
+        .await
+        .unwrap();
     assert!(s.get_by_alias("pre").await.unwrap().is_some());
     assert_eq!(s.kill_fence_epoch().await, 1);
     s.store(&cred("post")).await.unwrap();
     drop(s);
-    let s = FileStorage::new(&path, &SecretString::from("new-pw")).await.unwrap();
+    let s = FileStorage::new(&path, &SecretString::from("new-pw"))
+        .await
+        .unwrap();
     assert!(s.get_by_alias("post").await.unwrap().is_some());
     assert!(s.get_by_alias("pre").await.unwrap().is_some());
 }
@@ -560,11 +702,15 @@ async fn a_crash_between_the_rekey_rename_and_the_log_reset_leaves_a_vault_that_
     }
     // Old-key records remain in the log but are all at or below the snapshot's applied_seq.
     assert!(wal_lines(&path) > 0);
-    let s = FileStorage::new(&path, &SecretString::from("new-pw")).await.unwrap();
+    let s = FileStorage::new(&path, &SecretString::from("new-pw"))
+        .await
+        .unwrap();
     assert!(s.get_by_alias("pre").await.unwrap().is_some());
     s.store(&cred("post")).await.unwrap();
     drop(s);
-    let s = FileStorage::new(&path, &SecretString::from("new-pw")).await.unwrap();
+    let s = FileStorage::new(&path, &SecretString::from("new-pw"))
+        .await
+        .unwrap();
     assert!(s.get_by_alias("post").await.unwrap().is_some());
 }
 
@@ -591,10 +737,18 @@ async fn gc_drops_a_lifted_old_mark_and_never_lowers_the_epoch() {
     drop(s);
     let s = open(&path).await;
     assert_eq!(s.kill_fence_epoch().await, 1);
-    assert_eq!(s.gc_vault_at(now_plus_hours(48)).await.unwrap().2, 0, "nothing left to drop");
+    assert_eq!(
+        s.gc_vault_at(now_plus_hours(48)).await.unwrap().2,
+        0,
+        "nothing left to drop"
+    );
     // Work admitted at the current epoch is clear; a new kill still works and refuses work
     // admitted before it.
-    assert!(s.kill_fence_check(&q("gh-main", 1)).await.unwrap().is_clear());
+    assert!(s
+        .kill_fence_check(&q("gh-main", 1))
+        .await
+        .unwrap()
+        .is_clear());
     s.store_policy(&kill("k2", "gh-*")).await.unwrap();
     assert!(matches!(
         s.kill_fence_check(&q("gh-main", 1)).await.unwrap(),
@@ -647,7 +801,8 @@ async fn gc_keeps_a_mark_that_a_live_approval_still_depends_on() {
     );
     // Once the approval is finished (denied), the mark is collectable.
     let mut done = s.get_approval("appr_live").await.unwrap().unwrap();
-    done.deny(crate::approval::Decision::new("test", "bob@corp")).unwrap();
+    done.deny(crate::approval::Decision::new("test", "bob@corp"))
+        .unwrap();
     assert_eq!(done.status(), ApprovalStatus::Denied);
     s.update_approval(&done).await.unwrap();
     assert_eq!(s.gc_vault_at(now_plus_hours(48)).await.unwrap().2, 1);
@@ -697,7 +852,8 @@ fn fixture_dir() -> PathBuf {
 #[tokio::test]
 async fn a_real_v9_vault_migrates_with_a_backup_and_keeps_everything() {
     let exp: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(fixture_dir().join("expected.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(fixture_dir().join("expected.json")).unwrap())
+            .unwrap();
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.enc");
     let original = std::fs::read(fixture_dir().join("vault.enc")).unwrap();
@@ -710,15 +866,27 @@ async fn a_real_v9_vault_migrates_with_a_backup_and_keeps_everything() {
 
     // Everything the v9 build wrote is there.
     for a in exp["aliases"].as_array().unwrap() {
-        assert!(s.get_by_alias(a.as_str().unwrap()).await.unwrap().is_some(), "{a}");
+        assert!(
+            s.get_by_alias(a.as_str().unwrap()).await.unwrap().is_some(),
+            "{a}"
+        );
     }
     for t in exp["token_ids"].as_array().unwrap() {
-        assert!(s.get_use_token(t.as_str().unwrap()).await.unwrap().is_some(), "{t}");
+        assert!(
+            s.get_use_token(t.as_str().unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "{t}"
+        );
     }
     let pols = s.list_stored_policies().await.unwrap();
     assert_eq!(pols.len(), 2, "the allow policy and the live kill");
     assert!(pols.iter().any(|p| p.id == "kill-live" && p.kill));
-    assert_eq!(s.kill_fence_epoch().await, exp["kill_epoch"].as_u64().unwrap());
+    assert_eq!(
+        s.kill_fence_epoch().await,
+        exp["kill_epoch"].as_u64().unwrap()
+    );
     // The lifted kill's mark survived the migration and still refuses pre-kill work.
     assert!(matches!(
         s.kill_fence_check(&q("slack-bot", 0)).await.unwrap(),
@@ -729,22 +897,39 @@ async fn a_real_v9_vault_migrates_with_a_backup_and_keeps_everything() {
     let migrated: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(migrated["version"], 10);
-    assert_eq!(std::fs::read(path.with_extension("v9.bak")).unwrap(), original);
+    assert_eq!(
+        std::fs::read(path.with_extension("v9.bak")).unwrap(),
+        original
+    );
     // Old marks were stamped so GC can age them, from the migration time.
     assert_eq!(s.gc_vault_at(now_plus_hours(1)).await.unwrap().2, 0);
-    assert_eq!(s.gc_vault_at(now_plus_hours(25)).await.unwrap().2, 1, "the lifted mark ages out");
+    assert_eq!(
+        s.gc_vault_at(now_plus_hours(25)).await.unwrap().2,
+        1,
+        "the lifted mark ages out"
+    );
     let marks: Vec<String> = s
         .locked_read(|c| c.kill_fence.marks.keys().cloned().collect())
         .await
         .unwrap();
-    assert_eq!(marks, vec!["kill-live".to_string()], "only the stored kill keeps its mark");
-    assert!(s.get_policy("kill-live").await.unwrap().is_some(), "the stored kill is untouched by GC");
+    assert_eq!(
+        marks,
+        vec!["kill-live".to_string()],
+        "only the stored kill keeps its mark"
+    );
+    assert!(
+        s.get_policy("kill-live").await.unwrap().is_some(),
+        "the stored kill is untouched by GC"
+    );
     drop(s);
 
     // A second open does not migrate again and never overwrites the backup.
     std::fs::write(path.with_extension("v9.bak"), b"sentinel").unwrap();
     let s = FileStorage::new(&path, &pw).await.unwrap();
-    assert_eq!(std::fs::read(path.with_extension("v9.bak")).unwrap(), b"sentinel");
+    assert_eq!(
+        std::fs::read(path.with_extension("v9.bak")).unwrap(),
+        b"sentinel"
+    );
     s.store(&cred("after-migration")).await.unwrap();
     drop(s);
     let s = FileStorage::new(&path, &pw).await.unwrap();
@@ -755,10 +940,15 @@ async fn a_real_v9_vault_migrates_with_a_backup_and_keeps_everything() {
 #[tokio::test]
 async fn a_crash_during_migration_leaves_the_v9_vault_intact_and_re_migrates() {
     let exp: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(fixture_dir().join("expected.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(fixture_dir().join("expected.json")).unwrap())
+            .unwrap();
     let pw = SecretString::from(exp["password"].as_str().unwrap());
     let original = std::fs::read(fixture_dir().join("vault.enc")).unwrap();
-    for step in ["compact.after_snapshot_tmp", "compact.after_snapshot_rename", "compact.after_wal_tmp"] {
+    for step in [
+        "compact.after_snapshot_tmp",
+        "compact.after_snapshot_rename",
+        "compact.after_wal_tmp",
+    ] {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.enc");
         std::fs::write(&path, &original).unwrap();
@@ -766,7 +956,8 @@ async fn a_crash_during_migration_leaves_the_v9_vault_intact_and_re_migrates() {
         {
             let content = std::fs::read_to_string(&path).unwrap();
             let sf: StorageFile = serde_json::from_str(&content).unwrap();
-            let salt = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &sf.salt).unwrap();
+            let salt = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &sf.salt)
+                .unwrap();
             let key = Arc::new(derive_key(&pw, &salt, sf.kdf).unwrap());
             let st = FileStorage {
                 path: path.clone(),
@@ -787,10 +978,21 @@ async fn a_crash_during_migration_leaves_the_v9_vault_intact_and_re_migrates() {
         // Whatever the crash left, the next open recovers every record.
         let s = FileStorage::new(&path, &pw).await.unwrap();
         for a in exp["aliases"].as_array().unwrap() {
-            assert!(s.get_by_alias(a.as_str().unwrap()).await.unwrap().is_some(), "{step}: {a}");
+            assert!(
+                s.get_by_alias(a.as_str().unwrap()).await.unwrap().is_some(),
+                "{step}: {a}"
+            );
         }
-        assert_eq!(s.kill_fence_epoch().await, exp["kill_epoch"].as_u64().unwrap(), "{step}");
-        assert_eq!(std::fs::read(path.with_extension("v9.bak")).unwrap(), original, "{step}");
+        assert_eq!(
+            s.kill_fence_epoch().await,
+            exp["kill_epoch"].as_u64().unwrap(),
+            "{step}"
+        );
+        assert_eq!(
+            std::fs::read(path.with_extension("v9.bak")).unwrap(),
+            original,
+            "{step}"
+        );
     }
 }
 
@@ -803,8 +1005,15 @@ async fn a_v9_build_would_be_refused_a_v10_vault() {
     open(&path).await;
     let header: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(header["version"], 10);
-    assert!(10 > 9, "v9 supports up to 9, so a version-10 file is refused by it");
-    assert!(check_version(11).is_err(), "and this build refuses a newer one in turn");
+    // The v9 build's gate is `found <= 9`; this file carries a larger number.
+    assert!(
+        header["version"].as_u64().unwrap() > 9,
+        "a v9 build refuses a version above 9"
+    );
+    assert!(
+        check_version(11).is_err(),
+        "and this build refuses a newer one in turn"
+    );
 }
 
 #[tokio::test]
@@ -814,7 +1023,8 @@ async fn an_older_build_rewriting_the_snapshot_under_a_running_process_is_refuse
     let s = open(&path).await;
     s.store(&cred("a")).await.unwrap();
     // Simulate a v9 process atomically replacing the vault file (whole-file rewrite, version 9).
-    let mut header: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut header: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     header["version"] = serde_json::json!(9);
     let tmp = path.with_extension("old.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&header).unwrap()).unwrap();

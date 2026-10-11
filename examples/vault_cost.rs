@@ -27,7 +27,7 @@ fn token(i: usize) -> UseToken {
 }
 
 fn kill_policy(i: usize) -> Policy {
-    let mut p = Policy::allow_all(&format!("kill-{i}"), &format!("agent-{i}-*"));
+    let mut p = Policy::allow_all(format!("kill-{i}"), format!("agent-{i}-*"));
     p.id = format!("kill-pol-{i}");
     p.kill = true;
     p
@@ -60,7 +60,7 @@ async fn measure(n: usize, k: usize) -> Row {
         s.store_use_token(&token(i)).await.unwrap();
         build_writes += 1;
         if i % 10 == 0 {
-            s.store_policy(&Policy::allow_all(&format!("p{i}"), "gh-*"))
+            s.store_policy(&Policy::allow_all(format!("p{i}"), "gh-*"))
                 .await
                 .unwrap();
             build_writes += 1;
@@ -162,7 +162,17 @@ async fn main() {
     }
     println!(
         "{:>6} {:>5} | {:>10} {:>8} {:>10} {:>5} | {:>10} {:>10} {:>5} | {:>12} {:>12}",
-        "tokens", "marks", "wr_bytes", "wr_recs", "wr_decrypt", "fsync", "fence_dec", "fence_dcnt", "", "prov40_bytes", "prov40_dec"
+        "tokens",
+        "marks",
+        "wr_bytes",
+        "wr_recs",
+        "wr_decrypt",
+        "fsync",
+        "fence_dec",
+        "fence_dcnt",
+        "",
+        "prov40_bytes",
+        "prov40_dec"
     );
     println!("build_B/write = average bytes written per write while building the vault (incl. compaction); foreign_dec = plaintext bytes a second handle decrypts for one fence check right after another handle wrote one record");
     for r in &rows {

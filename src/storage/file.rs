@@ -5,10 +5,10 @@
 use super::averin_deadletter::AverinDeadLetterStore;
 use super::averin_queue::AverinQueue;
 use super::outbox_store::OutboxStore;
-use super::vault_log::{encode_record, parse_log, Op, ParsedLog, Tracked, KILL_MARKS};
 #[cfg(test)]
 use super::popkey_store::PopKeyEntry;
 use super::popkey_store::PopKeyStore;
+use super::vault_log::{encode_record, parse_log, Op, ParsedLog, Tracked, KILL_MARKS};
 #[cfg(test)]
 use super::DraftReceipt;
 use super::{
@@ -993,7 +993,8 @@ fn dead_marks(cache: &StorageCache, now: DateTime<Utc>) -> Vec<String> {
         .values()
         .filter(|a| {
             a.executing
-                || (!a.executed && !matches!(a.status(), ApprovalStatus::Denied | ApprovalStatus::Expired))
+                || (!a.executed
+                    && !matches!(a.status(), ApprovalStatus::Denied | ApprovalStatus::Expired))
         })
         .map(|a| a.kill_epoch_at_open.unwrap_or(0));
     crate::policy::dead_kill_marks(
@@ -1621,7 +1622,9 @@ impl FileStorage {
                 .sync_all()?;
         }
         use std::sync::atomic::Ordering::Relaxed;
-        self.io.bytes_written.fetch_add(content.len() as u64, Relaxed);
+        self.io
+            .bytes_written
+            .fetch_add(content.len() as u64, Relaxed);
         self.io.fsyncs.fetch_add(1, Relaxed);
         self.io
             .records_written
@@ -1668,11 +1671,7 @@ impl FileStorage {
     /// Fold the log into a fresh snapshot and start an empty log. Caller holds the exclusive lock
     /// and `cache` is current. Crash safety: the snapshot is stamped with the last sequence it
     /// contains, so a crash before the log is reset leaves records that replay skips.
-    fn compact_locked(
-        &self,
-        log: &mut LogState,
-        cache: &StorageCache,
-    ) -> Result<(), StorageError> {
+    fn compact_locked(&self, log: &mut LogState, cache: &StorageCache) -> Result<(), StorageError> {
         cache.validate_primary_shapes()?;
         // Until this finishes the in-memory view of the files is not trusted.
         log.loaded = false;
@@ -2075,17 +2074,20 @@ impl FileStorage {
                     }
                     Value::Array(items)
                 }
-                Value::Object(m) => Value::Object(m.into_iter().map(|(k, v)| (k, norm(v))).collect()),
+                Value::Object(m) => {
+                    Value::Object(m.into_iter().map(|(k, v)| (k, norm(v))).collect())
+                }
                 other => other,
             }
         }
-        let a = norm(
-            crate::with_vault_secret_serialization(|| serde_json::to_value(&fresh)).unwrap(),
+        let a =
+            norm(crate::with_vault_secret_serialization(|| serde_json::to_value(&fresh)).unwrap());
+        let b =
+            norm(crate::with_vault_secret_serialization(|| serde_json::to_value(cache)).unwrap());
+        assert_eq!(
+            a, b,
+            "replaying the vault files differs from the in-memory state"
         );
-        let b = norm(
-            crate::with_vault_secret_serialization(|| serde_json::to_value(cache)).unwrap(),
-        );
-        assert_eq!(a, b, "replaying the vault files differs from the in-memory state");
     }
 
     /// Persist what the mutation changed as one log record, then mark the changes durable.

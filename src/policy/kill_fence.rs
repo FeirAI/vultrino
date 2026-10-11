@@ -339,7 +339,10 @@ mod tests {
         // No live admissions: only the lifted, old marks go.
         let mut dead = dead_kill_marks(&st, stored, [], now);
         dead.sort();
-        assert_eq!(dead, vec!["lifted-old".to_string(), "lifted-old-2".to_string()]);
+        assert_eq!(
+            dead,
+            vec!["lifted-old".to_string(), "lifted-old-2".to_string()]
+        );
         // A live admission at epoch 2 depends on marks above 2 (it is refused by them), so the
         // epoch-4 mark stays; the epoch-1 mark cannot refuse it and goes.
         let dead = dead_kill_marks(&st, stored, [2], now);
@@ -364,7 +367,10 @@ mod tests {
                 m
             }),
         ]);
-        assert_eq!(dead_kill_marks(&st, |_| false, [], now), vec!["exact".to_string()]);
+        assert_eq!(
+            dead_kill_marks(&st, |_| false, [], now),
+            vec!["exact".to_string()]
+        );
     }
 
     #[test]
