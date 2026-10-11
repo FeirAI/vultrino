@@ -62,11 +62,28 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   vault read and refused (fail closed), but only after the v9 process has written.
 - **Vault format v10 is one-way, with a backup.** The first open of a v9 or older
   vault copies the vault file to `<vault>.v9.bak` (the version it found; atomic,
-  owner-only, never overwritten) and rewrites it as a snapshot plus an empty
-  `<vault>.wal`. To roll back: stop every process, delete `<vault>.wal`, restore
-  `<vault>.v9.bak` over the vault file and start the v9 build; every write made
-  after the migration is lost. A backup of a v10 vault must copy the vault file and
-  `<vault>.wal` together, with the processes stopped (or under the lock).
+  owner-only; an existing backup is never overwritten: if it differs, the copy goes
+  to `<vault>.v9.<unix-nanos>.bak`) and rewrites it as a snapshot plus an empty log.
+  The file names replace the extension of the vault file: for `credentials.enc` they
+  are `credentials.wal` and `credentials.v9.bak`. To roll back: stop every process,
+  delete `credentials.wal`, restore `credentials.v9.bak` over `credentials.enc` and
+  start the v9 build; every write made after the migration is lost. If the log is
+  left behind, the next open of the restored v9 file refuses to start (a log beside a
+  pre-v10 snapshot is never replayed) and names the file to delete. A backup of a v10
+  vault must copy the vault file and its `.wal` together, with the processes stopped
+  (or under the lock).
+- **Vault change detection and lock behaviour.** Another process's commit is noticed
+  through the snapshot's (mtime, length, inode) token plus the log length; a
+  filesystem with coarse timestamps is unsupported (this now covers writes and the
+  fence, not only the read cache). `flock` does not prefer a waiting writer, so
+  under sustained overlapping dispatches a kill write can wait without bound against
+  the caller's timeout. In-process lock-free readers (`get`, `get_by_alias`,
+  `get_policy`, the fence epoch) block for one log fsync per write and for a
+  whole-snapshot encrypt and fsync on the write that triggers compaction; a fence
+  catch-up after a foreign write validates and re-indexes the whole vault under the
+  in-process cache lock (O(vault) CPU, no decrypt beyond the new records). A failed
+  append is taken back out of the log on a best-effort basis; if that also fails the
+  line may be read as committed.
 - **Kill fence cost.** Every dispatch, including `vk_` and streamed LLM-proxy calls that
   were lock-free before, takes the cross-process vault lock SHARED and reads only the
   log records appended since the process last looked: an unchanged vault costs two

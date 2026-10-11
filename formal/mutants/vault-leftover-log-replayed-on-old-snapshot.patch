@@ -1,0 +1,13 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index ada0d86..2dace5c 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1801,7 +1801,7 @@ impl FileStorage {
+             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+             Err(e) => return Err(e.into()),
+         };
+-        if version < STORAGE_VERSION && !bytes.is_empty() {
++        if false && version < STORAGE_VERSION && !bytes.is_empty() {
+             // A log beside a pre-v10 snapshot is left over from a rollback (a v9 build never writes
+             // one). Replaying it would resurrect abandoned writes and undo lifted or applied kills.
+             return Err(StorageError::Unavailable(format!(

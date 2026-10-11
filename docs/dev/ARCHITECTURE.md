@@ -341,13 +341,18 @@ The default backend is an **encrypted file vault**:
   writer truncates it. Any other damaged line fails the open closed.
   Each process keeps its decrypted state and the position it has read to; under the
   lock it reads only the log bytes after that position (a changed snapshot means
-  another process compacted or re-keyed, so it reloads in full).
+  another process compacted or re-keyed, so it reloads in full). The (mtime, length,
+  inode) token and the log length are trusted to detect another process's commit, so
+  coarse-timestamp filesystems are unsupported (see LIMITATIONS).
 - **Format version:** `STORAGE_VERSION = 10`. A vault whose recorded version is
   **greater** than the binary understands is **refused** (`check_version`), which
   is what stops a v9 build from reading the v10 snapshot, ignoring the log and
   overwriting committed writes. This build opens older vaults (new fields use
   `#[serde(default)]`) and, on the first open, copies the old file to
-  `<vault>.v<N>.bak` and migrates it to v10 (one way). Stop EVERY vultrino process
+  `<vault>.v<N>.bak` (the extension of the vault file is replaced: `credentials.enc`
+  gives `credentials.v9.bak`; a differing existing backup is kept and the copy gets a
+  unique name) and migrates it to v10 (one way). A log file beside a pre-v10
+  snapshot is refused at open, never replayed. Stop EVERY vultrino process
   sharing the vault before starting the new build: a v9 process still running keeps
   its loaded engine and does not know the fence, so it can dispatch (notably `vk_`
   API-key and LLM-proxy calls, which take no vault lock) after govder reports
