@@ -1032,3 +1032,165 @@ async fn an_older_build_rewriting_the_snapshot_under_a_running_process_is_refuse
     let r = s.kill_fence_check(&q("gh-main", 0)).await;
     assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
 }
+
+// ------------------------------------------------ review fix round 1: rollback, GC, races
+
+#[tokio::test]
+async fn gc_keeps_a_mark_for_an_approved_not_yet_executed_approval() {
+    // An approval opened before the kill, approved after the lift, resumed much later: its mark
+    // must survive GC and the claim must still be refused afterwards.
+    use crate::approval::ApprovalStatus;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let s = open(&path).await;
+    let mut appr = super::tests::mk_approval("appr-open");
+    appr.kill_epoch_at_open = Some(0);
+    s.store_approval(&appr).await.unwrap();
+    s.store_policy(&kill("k1", "gh-*")).await.unwrap();
+    s.delete_policy("k1").await.unwrap();
+    let mut a = s.get_approval("appr_appr-open").await.unwrap().unwrap();
+    a.approve(crate::approval::Decision::new("test", "bob@corp"))
+        .unwrap();
+    assert_eq!(a.status(), ApprovalStatus::Approved);
+    assert!(!a.executed && !a.executing);
+    s.update_approval(&a).await.unwrap();
+    assert_eq!(
+        s.gc_vault_at(now_plus_hours(48)).await.unwrap().2,
+        0,
+        "an approved, not executed approval still depends on the mark"
+    );
+    drop(s);
+    let s = open(&path).await;
+    assert!(
+        matches!(
+            s.kill_fence_check(&q("gh-main", 0)).await.unwrap(),
+            KillFenceVerdict::KilledSinceAdmission { .. }
+        ),
+        "the claim is still refused after GC ran"
+    );
+}
+
+#[tokio::test]
+async fn gc_keeps_a_mark_for_an_executing_approval() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let s = open(&path).await;
+    let mut appr = super::tests::mk_approval("appr-exec");
+    appr.kill_epoch_at_open = Some(0);
+    appr.approve(crate::approval::Decision::new("test", "bob@corp"))
+        .unwrap();
+    appr.executing = true;
+    appr.executing_since = Some(Utc::now());
+    s.store_approval(&appr).await.unwrap();
+    s.store_policy(&kill("k1", "gh-*")).await.unwrap();
+    s.delete_policy("k1").await.unwrap();
+    assert_eq!(s.gc_vault_at(now_plus_hours(48)).await.unwrap().2, 0);
+    assert!(matches!(
+        s.kill_fence_check(&q("gh-main", 0)).await.unwrap(),
+        KillFenceVerdict::KilledSinceAdmission { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_leftover_log_beside_a_pre_v10_snapshot_is_refused_not_replayed() {
+    // Roll back as documented, but leave the log (the operator deleted the wrong file or forgot):
+    // the next open must fail closed instead of replaying abandoned writes onto the v9 state.
+    let exp: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture_dir().join("expected.json")).unwrap())
+            .unwrap();
+    let pw = SecretString::from(exp["password"].as_str().unwrap());
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("credentials.enc");
+    let original = std::fs::read(fixture_dir().join("vault.enc")).unwrap();
+    std::fs::write(&path, &original).unwrap();
+    {
+        let s = FileStorage::new(&path, &pw).await.unwrap();
+        s.set_compact_min_bytes(u64::MAX);
+        s.delete_policy("kill-live").await.unwrap();
+        s.store(&cred("v10-period")).await.unwrap();
+    }
+    let wal = path.with_extension("wal");
+    assert!(wal.exists() && std::fs::metadata(&wal).unwrap().len() > 0);
+    // Roll back the snapshot only (the log is left behind).
+    std::fs::copy(path.with_extension("v9.bak"), &path).unwrap();
+    let err = FileStorage::new(&path, &pw).await.err().expect("refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("credentials.wal"),
+        "names the real file: {msg}"
+    );
+    // Nothing was replayed or changed on disk by the refusal.
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    // Deleting the log (the documented rollback, with the real name) then opens the v9 state.
+    std::fs::remove_file(&wal).unwrap();
+    let s = FileStorage::new(&path, &pw).await.unwrap();
+    assert!(s.get_policy("kill-live").await.unwrap().is_some());
+    assert!(s.get_by_alias("v10-period").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn migration_never_overwrites_a_differing_backup() {
+    let exp: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture_dir().join("expected.json")).unwrap())
+            .unwrap();
+    let pw = SecretString::from(exp["password"].as_str().unwrap());
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("credentials.enc");
+    let original = std::fs::read(fixture_dir().join("vault.enc")).unwrap();
+    std::fs::write(&path, &original).unwrap();
+    std::fs::write(path.with_extension("v9.bak"), b"an older backup").unwrap();
+    drop(FileStorage::new(&path, &pw).await.unwrap());
+    assert_eq!(
+        std::fs::read(path.with_extension("v9.bak")).unwrap(),
+        b"an older backup",
+        "the existing backup is kept"
+    );
+    let extra: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| {
+            n.starts_with("credentials.v9.") && n.ends_with(".bak") && n != "credentials.v9.bak"
+        })
+        .collect();
+    assert_eq!(extra.len(), 1, "the current v9 state got its own backup");
+    let copy = std::fs::read(dir.path().join(&extra[0])).unwrap();
+    assert_eq!(copy, original);
+}
+
+#[tokio::test]
+async fn creating_a_vault_that_another_process_just_created_opens_it() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let first = open(&path).await;
+    first.store(&cred("from-first")).await.unwrap();
+    // The loser of the creation race reaches `create` although the file now exists.
+    let second = FileStorage::create(path.clone(), &SecretString::from(PW), false, false)
+        .await
+        .unwrap();
+    assert!(second.get_by_alias("from-first").await.unwrap().is_some());
+    first.store(&cred("later")).await.unwrap();
+    drop((first, second));
+    let s = open(&path).await;
+    assert!(s.get_by_alias("later").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_failed_append_does_not_leave_an_acknowledged_looking_record() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let s = open(&path).await;
+    s.set_compact_min_bytes(u64::MAX);
+    s.store(&cred("kept")).await.unwrap();
+    let before = std::fs::read(path.with_extension("wal")).unwrap();
+    *s.fault.lock() = Some("wal.after_write".into());
+    assert!(s.store(&cred("failed")).await.is_err());
+    assert_eq!(
+        std::fs::read(path.with_extension("wal")).unwrap(),
+        before,
+        "the unacknowledged line is taken back out"
+    );
+    let reader = open(&path).await;
+    assert!(reader.get_by_alias("failed").await.unwrap().is_none());
+    assert!(reader.get_by_alias("kept").await.unwrap().is_some());
+}

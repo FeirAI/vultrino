@@ -1208,14 +1208,26 @@ impl FileStorage {
             io: IoCounters::default(),
         };
 
-        // Write the initial empty snapshot under the cross-process lock.
-        {
+        // Write the initial empty snapshot under the cross-process lock. A second process racing to
+        // create the same vault may have won while this one derived its key: re-check under the
+        // lock and open what is there instead of overwriting it (a different salt would orphan it).
+        let raced = {
             let mut flock = storage.lock_file()?;
             let _guard = flock.write().map_err(StorageError::Io)?;
-            let mut log = storage.log.lock();
-            let cache = storage.cache.read();
-            storage.compact_locked(&mut log, &cache)?;
-            log.refresh_baselines(&cache);
+            if storage.path.exists() {
+                true
+            } else {
+                let mut log = storage.log.lock();
+                let cache = storage.cache.read();
+                storage.compact_locked(&mut log, &cache)?;
+                log.refresh_baselines(&cache);
+                false
+            }
+        };
+        if raced {
+            let path = storage.path.clone();
+            drop(storage);
+            return Self::load(path, password, averin_enabled, strict).await;
         }
 
         Ok(storage)
@@ -1744,13 +1756,22 @@ impl FileStorage {
         let parsed = parse_log(&region, log.applied_seq, &self.master_key)?;
         self.note_log_decrypts(&parsed);
         if !parsed.records.is_empty() {
-            for (seq, ops) in parsed.records {
-                for op in ops {
-                    cache.apply_op(op)?;
+            let applied: Result<(), StorageError> = (|| {
+                for (seq, ops) in parsed.records {
+                    for op in ops {
+                        cache.apply_op(op)?;
+                    }
+                    log.applied_seq = seq;
                 }
-                log.applied_seq = seq;
+                cache.validate_primary_shapes()
+            })();
+            if let Err(e) = applied {
+                // Records that failed validation must not stay reachable by lock-free readers:
+                // drop the whole view (readers see nothing, which denies) and force a full reload.
+                *cache = StorageCache::default();
+                log.loaded = false;
+                return Err(e);
             }
-            cache.validate_primary_shapes()?;
             cache.rebuild_indexes();
             log.refresh_baselines(cache);
         }
@@ -1780,6 +1801,19 @@ impl FileStorage {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
+        if version < STORAGE_VERSION && !bytes.is_empty() {
+            // A log beside a pre-v10 snapshot is left over from a rollback (a v9 build never writes
+            // one). Replaying it would resurrect abandoned writes and undo lifted or applied kills.
+            return Err(StorageError::Unavailable(format!(
+                "the vault file {} is format v{version} but a write-ahead log {} exists beside it \
+                 (left over from a rollback). Refusing to replay it. If you rolled back on \
+                 purpose, stop every vultrino process, delete {} and start again; otherwise \
+                 restore the matching vault file and log together",
+                self.path.display(),
+                self.wal_path().display(),
+                self.wal_path().display()
+            )));
+        }
         let parsed = parse_log(&bytes, applied, &self.master_key)?;
         self.note_log_decrypts(&parsed);
         let mut seq_now = applied;
@@ -1836,9 +1870,19 @@ impl FileStorage {
                 "injected crash at wal.torn",
             )));
         }
-        f.write_all(&line)?;
-        self.crash_point("wal.after_write")?;
-        f.sync_all()?;
+        let durable = (|| -> Result<(), StorageError> {
+            f.write_all(&line)?;
+            self.crash_point("wal.after_write")?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = durable {
+            // Best effort: take the unacknowledged line back out so the next reader does not
+            // treat it as committed (we hold the exclusive lock, the log ends at wal_offset).
+            let _ = f.set_len(log.wal_offset);
+            let _ = f.sync_all();
+            return Err(e);
+        }
         let mut syncs = 1;
         if created {
             self.fsync_dir()?;
@@ -1882,11 +1926,22 @@ impl FileStorage {
         Ok(())
     }
 
-    /// Copy the vault file to `<stem>.v<N>.bak` (atomically, 0600) unless a backup already exists.
+    /// Copy the vault file to `<stem>.v<N>.bak` (atomically, 0600). An existing backup is kept: if
+    /// it already equals the current file nothing is written, otherwise the copy goes to a unique
+    /// `<stem>.v<N>.<unix-nanos>.bak` so the state written after a rollback is never lost.
     fn backup_before_migration(&self, from_version: u32) -> Result<(), StorageError> {
-        let bak = self.path.with_extension(format!("v{from_version}.bak"));
+        let mut bak = self.path.with_extension(format!("v{from_version}.bak"));
         if bak.exists() {
-            return Ok(());
+            if std::fs::read(&bak)? == std::fs::read(&self.path)? {
+                return Ok(());
+            }
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            bak = self
+                .path
+                .with_extension(format!("v{from_version}.{nanos}.bak"));
         }
         let tmp = self.path.with_extension("bak.tmp");
         {
