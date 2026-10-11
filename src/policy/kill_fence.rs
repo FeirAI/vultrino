@@ -308,4 +308,76 @@ mod tests {
         let p = principal("vut_1", Some("agent-k"));
         assert!(kill_fence_verdict([&deny], &s, &query("c", Some(&p), 0)).is_clear());
     }
+
+    fn mark(epoch: u64, age_hours: i64, now: chrono::DateTime<chrono::Utc>) -> KillMark {
+        KillMark {
+            credential_pattern: "x".into(),
+            principal_pattern: None,
+            epoch,
+            stored_at: Some(now - chrono::Duration::hours(age_hours)),
+        }
+    }
+
+    fn state_with(marks: Vec<(&str, KillMark)>) -> KillFenceState {
+        let epoch = marks.iter().map(|(_, m)| m.epoch).max().unwrap_or(0);
+        KillFenceState {
+            epoch,
+            marks: marks.into_iter().map(|(k, m)| (k.to_string(), m)).collect(),
+        }
+    }
+
+    #[test]
+    fn dead_marks_need_a_lifted_policy_an_old_stamp_and_no_older_live_admission() {
+        let now = chrono::Utc::now();
+        let st = state_with(vec![
+            ("lifted-old", mark(1, 30, now)),
+            ("lifted-young", mark(2, 1, now)),
+            ("stored-old", mark(3, 30, now)),
+            ("lifted-old-2", mark(4, 30, now)),
+        ]);
+        let stored = |id: &str| id == "stored-old";
+        // No live admissions: only the lifted, old marks go.
+        let mut dead = dead_kill_marks(&st, stored, [], now);
+        dead.sort();
+        assert_eq!(dead, vec!["lifted-old".to_string(), "lifted-old-2".to_string()]);
+        // A live admission at epoch 2 depends on marks above 2 (it is refused by them), so the
+        // epoch-4 mark stays; the epoch-1 mark cannot refuse it and goes.
+        let dead = dead_kill_marks(&st, stored, [2], now);
+        assert_eq!(dead, vec!["lifted-old".to_string()]);
+        // A live admission at epoch 0 (an approval from before epochs existed) keeps all of them.
+        assert!(dead_kill_marks(&st, stored, [0], now).is_empty());
+        // The oldest live admission decides, not the newest.
+        assert!(dead_kill_marks(&st, stored, [9, 0, 5], now).is_empty());
+    }
+
+    #[test]
+    fn a_mark_without_a_timestamp_is_never_dead_and_the_grace_boundary_is_inclusive() {
+        let now = chrono::Utc::now();
+        let mut unstamped = mark(1, 0, now);
+        unstamped.stored_at = None;
+        let st = state_with(vec![
+            ("unstamped", unstamped),
+            ("just-inside", mark(2, 23, now)),
+            ("exact", {
+                let mut m = mark(3, 0, now);
+                m.stored_at = Some(now - chrono::Duration::seconds(KILL_MARK_GC_GRACE_SECS));
+                m
+            }),
+        ]);
+        assert_eq!(dead_kill_marks(&st, |_| false, [], now), vec!["exact".to_string()]);
+    }
+
+    #[test]
+    fn stamping_gives_every_unstamped_mark_a_timestamp_and_leaves_the_rest() {
+        let now = chrono::Utc::now();
+        let mut old = mark(1, 5, now);
+        let keep = old.stored_at;
+        let mut unstamped = mark(2, 0, now);
+        unstamped.stored_at = None;
+        old.epoch = 1;
+        let mut st = state_with(vec![("a", old), ("b", unstamped)]);
+        assert_eq!(st.stamp_unstamped(now), 1);
+        assert_eq!(st.marks["a"].stored_at, keep);
+        assert_eq!(st.marks["b"].stored_at, Some(now));
+    }
 }

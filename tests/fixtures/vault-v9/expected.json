@@ -1,0 +1,19 @@
+{
+  "aliases": [
+    "gh-main",
+    "slack-bot"
+  ],
+  "allow_policy_name": "fixture-allow",
+  "kill_epoch": 2,
+  "lifted_mark_id": "kill-lifted",
+  "live_kill_id": "kill-live",
+  "password": "fixture-pw",
+  "policy_ids": [
+    "kill-live"
+  ],
+  "token_ids": [
+    "ut_beb42b8f-4ab6-4983-a21d-bfa72d6fd85e",
+    "ut_8c0a2a61-15e2-4767-be38-9de04ee0365d",
+    "ut_252fab74-c048-413f-a2c3-f80b063a34e0"
+  ]
+}

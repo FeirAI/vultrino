@@ -1540,6 +1540,21 @@ impl FileStorage {
         self.path.with_extension("wal")
     }
 
+    fn wal_len(&self) -> u64 {
+        std::fs::metadata(self.wal_path())
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Whether `cache` already reflects the committed files (no stat-visible change since).
+    fn is_current(&self, log: &LogState) -> bool {
+        if !log.loaded {
+            return false;
+        }
+        let tok = file_token(&self.path);
+        tok.is_some() && tok == log.snap_token && self.wal_len() == log.wal_offset
+    }
+
     /// Test-only crash injection: fail at the named step, leaving the disk exactly as a process
     /// death at that step would. Compiled out of non-test builds.
     #[cfg(test)]
@@ -1689,9 +1704,7 @@ impl FileStorage {
         if log.loaded {
             let tok = file_token(&self.path);
             if tok.is_some() && tok == log.snap_token {
-                let wal_len = std::fs::metadata(self.wal_path())
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let wal_len = self.wal_len();
                 if wal_len == log.wal_offset {
                     return Ok(());
                 }
@@ -1838,9 +1851,11 @@ impl FileStorage {
             self.io.fsyncs.fetch_add(syncs, Relaxed);
             self.io.records_written.fetch_add(record_count, Relaxed);
         }
+        // A crash here is "committed, acknowledgement lost": the record is durable, this process's
+        // view is left behind, and the next sync reads the record as a foreign append.
+        self.crash_point("wal.after_fsync")?;
         log.applied_seq = seq;
         log.wal_offset += line.len() as u64;
-        self.crash_point("wal.after_fsync")?;
         Ok(())
     }
 
@@ -1950,9 +1965,16 @@ impl FileStorage {
     ) -> Result<T, StorageError> {
         let flock = self.lock_file()?;
         let _guard = flock.read().map_err(StorageError::Io)?;
-        let mut log = self.log.lock();
-        let mut cache = self.cache.write();
-        self.sync_locked(&mut log, &mut cache, false)?;
+        {
+            let mut log = self.log.lock();
+            if !self.is_current(&log) {
+                let mut cache = self.cache.write();
+                self.sync_locked(&mut log, &mut cache, false)?;
+            }
+        }
+        // The shared lock excludes every writer, in this process and others, so the state just
+        // synced cannot change while `f` reads it; concurrent readers share the cache read lock.
+        let cache = self.cache.read();
         Ok(f(&cache))
         // `_guard` dropped here releases the lock.
     }
@@ -2006,8 +2028,6 @@ impl FileStorage {
         };
         if let Err(e) = self.commit_locked(&mut log, &mut cache) {
             self.rollback_locked(&log, &mut cache);
-            #[cfg(test)]
-            self.check_replay_equals(&cache);
             return Err(e);
         }
         #[cfg(test)]
@@ -4338,7 +4358,7 @@ mod tests {
     }
 
     /// Build a stored-ready approval; caller mutates status/executed/result_body/decided_at.
-    fn mk_approval(id_suffix: &str) -> ApprovalRequest {
+    pub(super) fn mk_approval(id_suffix: &str) -> ApprovalRequest {
         use crate::approval::{CriticalityClass, NewApproval, RequesterInfo};
         let (mut req, _tok) = ApprovalRequest::open(NewApproval {
             credential: "cred".to_string(),
@@ -5800,3 +5820,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "vault_tests.rs"]
+mod vault_tests;
