@@ -5,11 +5,14 @@
 //! 1. **Always-on secret-material redaction.** If an endpoint reflects the
 //!    credential's own injected secret in its response (a header-echoing
 //!    reflector, an open redirect to an attacker host, etc.), the server scrubs
-//!    the secret — and its common re-encoded forms — from the body and headers
+//!    the secret and its common re-encoded forms from the body and headers
 //!    before returning them. Closes the read-back vector (REVIEW H2/F2) at one
-//!    place, for every plugin. Defense-in-depth, not absolute: an endpoint that
-//!    *transforms* the secret (base64/gzip/hashing) or returns it compressed can
-//!    still leak it — use a `block` rule for endpoints you don't trust.
+//!    place, for every plugin. Defense-in-depth, not absolute: the whole-value
+//!    base64 and hex spellings, and the base64 of a value of 14 or more bytes
+//!    inside a longer string (such as `Bearer <token>`), are scrubbed, but an
+//!    endpoint that hashes the secret, encodes it inside a longer string in any
+//!    other way, or returns it compressed can still leak it. Use a `block` rule
+//!    for endpoints you don't trust.
 //! 2. **Egress classification.** Operator `[[egress]]` rules mark a
 //!    `(credential, action)` whose response may carry a *secondary* secret —
 //!    `block`ing the body+headers entirely or redacting extra `redact_patterns`.
@@ -24,6 +27,10 @@ use zeroize::Zeroizing;
 /// complete response whenever one is present; this is no longer warning-only.
 pub const MIN_REDACT_LEN: usize = 5;
 
+/// Shortest base64 core (in characters) of a value that is scrubbed when the value sits inside a
+/// longer base64 string; see `derive_secret_forms`.
+const BASE64_CORE_MIN_LEN: usize = 16;
+
 /// Whether any of these secrets is non-empty but below the redaction floor (so
 /// the always-on scrubbing would NOT catch a reflection of it). Used to warn
 /// operators at credential-store time.
@@ -32,7 +39,7 @@ pub fn has_unredactable_secret(secrets: &[Zeroizing<String>]) -> bool {
 }
 
 /// Build the set of forms to scrub for a credential's secret material: the raw
-/// secret plus its percent-encoded and JSON-escaped representations, each at least
+/// secret plus its percent-encoded, JSON-escaped, base64 and hex representations, each at least
 /// [`MIN_REDACT_LEN`] bytes, deduplicated and sorted **longest-first** (so a longer
 /// encoded form is replaced before a shorter form it may contain).
 ///
@@ -75,9 +82,53 @@ pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
         // chars unescaped that the full encoder escapes): JS encodeURIComponent keeps `!~*'()`,
         // Python urllib.parse.quote keeps `/` by default. Both hex cases. Bounded named-default
         // coverage; exhaustive safe-set permutations would use decode-normalize (LIMITATIONS.md).
-        for safe in ["!~*'()", "/"] {
+        // Also Go's net/url PathEscape default (keeps `$&+=:@`, escapes `/`) and the RFC 3986
+        // `pchar` set (keeps `!$&'()*+,;=:@`), the two other mainstream spellings of a value
+        // placed in a URL path or query. Both hex cases. (XV-18 found a reflected `/`-bearing
+        // value spelled the PathEscape way passing every previous form.)
+        for safe in ["!~*'()", "/", "$&+=:@", "!$&'()*+,;=:@"] {
             for upper in [true, false] {
                 add(&mut forms, percent_encode_safe(raw, safe, upper), raw);
+            }
+        }
+        // base64 (standard and URL alphabets, padded and unpadded) and hex (both cases) of the
+        // whole value: how a service that logs or echoes an "id" or "token" derived from the
+        // credential spells it. XV-18 found these reflected to the agent unscrubbed. A base64 of
+        // the value inside a longer string is covered by its whole-group cores, below; a hex or
+        // percent encoding is always byte-aligned, so its whole-value form already matches inside
+        // a longer string.
+        {
+            use base64::engine::general_purpose::{
+                STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD,
+            };
+            use base64::Engine as _;
+            let bytes = raw.as_bytes();
+            add(&mut forms, STANDARD.encode(bytes), raw);
+            add(&mut forms, STANDARD_NO_PAD.encode(bytes), raw);
+            add(&mut forms, URL_SAFE.encode(bytes), raw);
+            add(&mut forms, URL_SAFE_NO_PAD.encode(bytes), raw);
+            add(&mut forms, hex::encode(bytes), raw);
+            add(&mut forms, hex::encode_upper(bytes), raw);
+            // A base64 of the value INSIDE a longer string (a base64 of "Bearer <token>", the
+            // way an echo service logs a whole Authorization header) has no fixed whole-value
+            // spelling, but the groups that lie wholly inside the value do have one for each of
+            // the three alignments the value can start at: base64 of `bytes[shift..]` cut back
+            // to a multiple of three. Both alphabets, unpadded (a core never carries padding).
+            // A core must be at least BASE64_CORE_MIN_LEN characters, so a short secret does
+            // not turn a few characters of ordinary text into a redaction trigger; the 0 to 2
+            // bytes beside the core stay unscrubbed, which no longer identifies the value.
+            // (The review of XV-18 found a decodable "Bearer <token>" reaching the agent.)
+            for shift in 0..3usize {
+                if shift >= bytes.len() {
+                    continue;
+                }
+                let rest = &bytes[shift..];
+                let core = &rest[..rest.len() / 3 * 3];
+                if core.len() / 3 * 4 < BASE64_CORE_MIN_LEN {
+                    continue;
+                }
+                add(&mut forms, STANDARD_NO_PAD.encode(core), raw);
+                add(&mut forms, URL_SAFE_NO_PAD.encode(core), raw);
             }
         }
         // JSON-escaped inner (serde default: \", \\, \n, control \uXXXX). Also a
@@ -85,6 +136,22 @@ pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
         // default escaping does not, so a secret with `/` reflected by such an encoder
         // would otherwise slip past.
         if let Some(escaped) = json_escaped_inner(raw) {
+            // Nested JSON: an API that reports "bad request: <the request it received>" inside
+            // a JSON string escapes the value again (and a log line inside that, once more).
+            // Two further levels of the plain and the slash-escaped spelling, which is as deep
+            // as a request echoed into an error message echoed into a log line goes.
+            for base in [escaped.clone(), escaped.replace('/', "\\/")] {
+                let mut level = base;
+                for _ in 0..2 {
+                    match json_escaped_inner(&level) {
+                        Some(next) => {
+                            add(&mut forms, next.clone(), raw);
+                            level = next;
+                        }
+                        None => break,
+                    }
+                }
+            }
             if escaped.contains('/') {
                 add(&mut forms, escaped.replace('/', "\\/"), raw);
             }
@@ -984,6 +1051,168 @@ mod tests {
             "composed secret form survived: {body}"
         );
         assert!(body.contains("[REDACTED]"));
+    }
+
+    /// XV-18 (govder e2e credential canary scan): an upstream that reflects a credential
+    /// base64- or hex-encoded (a service that logs `id=<base64>` or `token=<hex>`) returned
+    /// the credential to the agent, because only the raw, percent-encoded and JSON-escaped
+    /// spellings were scrubbed. Every standard spelling of the whole value must be scrubbed on
+    /// the buffered path, the streaming path and the final postcondition.
+    #[test]
+    fn test_redact_catches_base64_and_hex_spellings() {
+        use base64::Engine as _;
+        let secret = "cnry/+q\"=\\~key-0123456789abcdef";
+        let b = secret.as_bytes();
+        let spellings = [
+            (
+                "base64",
+                base64::engine::general_purpose::STANDARD.encode(b),
+            ),
+            (
+                "base64-nopad",
+                base64::engine::general_purpose::STANDARD_NO_PAD.encode(b),
+            ),
+            (
+                "base64url",
+                base64::engine::general_purpose::URL_SAFE.encode(b),
+            ),
+            (
+                "base64url-nopad",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b),
+            ),
+            ("hex", hex::encode(b)),
+            ("hex-upper", hex::encode_upper(b)),
+        ];
+        for (kind, spelled) in spellings {
+            let mut r = resp(&format!("{{\"echo\":\"{spelled}\"}}"));
+            assert!(
+                redact_secret_material(&mut r, &secrets(&[secret]), "x"),
+                "{kind} spelling of the secret must be detected: {spelled}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&r.body).contains(spelled.as_str()),
+                "{kind} spelling survived buffered redaction"
+            );
+            let streamed = run_stream(&[secret], "x", format!("a {spelled} b").as_bytes(), &[7]);
+            assert!(
+                !String::from_utf8_lossy(&streamed).contains(spelled.as_str()),
+                "{kind} spelling survived streaming redaction"
+            );
+            let confined = confine_response(
+                resp(&format!("{{\"echo\":\"{spelled}\"}}")),
+                &secrets(&[secret]),
+                "x",
+                &[],
+                "http.request",
+            )
+            .into_inner();
+            assert!(
+                !String::from_utf8_lossy(&confined.body).contains(spelled.as_str()),
+                "{kind} spelling survived confine_response"
+            );
+        }
+    }
+
+    /// XV-18 review: an echo service that base64-encodes a whole header ("Bearer <token>") put
+    /// a decodable credential in front of the agent although no whole-value spelling of the
+    /// token appears in it: the seven-byte prefix shifts the base64 alignment. Every alignment
+    /// (prefix length mod 3 = 0, 1, 2) and both alphabets must be scrubbed, buffered and
+    /// streamed.
+    #[test]
+    fn test_redact_catches_base64_of_value_inside_a_longer_string() {
+        use base64::Engine as _;
+        let secret = "cnry/+q\"=\\~key-0123456789abcdef";
+        for prefix in ["", "Bearer ", "Bearer x", "Authorization: Bearer "] {
+            let plain = format!("{prefix}{secret}!tail");
+            for (alphabet, encoded) in [
+                (
+                    "standard",
+                    base64::engine::general_purpose::STANDARD.encode(plain.as_bytes()),
+                ),
+                (
+                    "url",
+                    base64::engine::general_purpose::URL_SAFE.encode(plain.as_bytes()),
+                ),
+            ] {
+                // The independent derivation of the core: the encoded groups wholly inside the
+                // value.
+                let start = prefix.len().div_ceil(3) * 3;
+                let end = (prefix.len() + secret.len()) / 3 * 3;
+                let core = &encoded[start / 3 * 4..end / 3 * 4];
+                assert!(core.len() >= 16, "test setup: core too short");
+                let mut r = resp(&format!("{{\"echo\":\"{encoded}\"}}"));
+                assert!(
+                    redact_secret_material(&mut r, &secrets(&[secret]), "x"),
+                    "{alphabet} base64 of {prefix:?}+secret must be detected: {encoded}"
+                );
+                assert!(
+                    !String::from_utf8_lossy(&r.body).contains(core),
+                    "{alphabet} core of {prefix:?}+secret survived buffered redaction"
+                );
+                let streamed =
+                    run_stream(&[secret], "x", format!("a {encoded} b").as_bytes(), &[7]);
+                assert!(
+                    !String::from_utf8_lossy(&streamed).contains(core),
+                    "{alphabet} core of {prefix:?}+secret survived streaming redaction"
+                );
+            }
+        }
+        // A short secret has no core long enough to scrub, and must not start redacting
+        // ordinary text.
+        assert!(derive_secret_forms(&secrets(&["short-secret-1"]))
+            .iter()
+            .all(|f| f.len() >= 5));
+    }
+
+    /// XV-18: a JSON API that reports "bad request: <the request it received>" inside a JSON
+    /// string writes the credential escaped twice (and a log line inside that, three times).
+    /// The single-level form does not occur in such text, so the nested spellings must be
+    /// scrubbed too.
+    #[test]
+    fn test_redact_catches_nested_json_escaped_spellings() {
+        let secret = "cnry/+q\"=\\~key-0123456789abcdef";
+        let one = json_escaped_inner(secret).expect("level 1");
+        let two = json_escaped_inner(&one).expect("level 2");
+        let three = json_escaped_inner(&two).expect("level 3");
+        let slash_two = json_escaped_inner(&one.replace('/', "\\/")).expect("slash level 2");
+        for (kind, spelled) in [
+            ("level 2", two),
+            ("level 3", three),
+            ("slash-escaped level 2", slash_two),
+        ] {
+            let mut r = resp(&format!("{{\"error\":\"{spelled}\"}}"));
+            assert!(
+                redact_secret_material(&mut r, &secrets(&[secret]), "x"),
+                "{kind} JSON-escaped spelling must be detected: {spelled}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&r.body).contains(spelled.as_str()),
+                "{kind} JSON-escaped spelling survived redaction"
+            );
+        }
+    }
+
+    /// XV-18: mainstream URL encoders leave different characters alone. Go's
+    /// `url.PathEscape` keeps `$&+=:@` and escapes `/`; RFC 3986 `pchar` encoders keep
+    /// `!$&'()*+,;=:@`. A value reflected in either spelling is the credential in a URL
+    /// path or query, and was not scrubbed because neither safe set was derived.
+    #[test]
+    fn test_redact_catches_go_path_escape_and_pchar_spellings() {
+        let secret = "cnry/+q\"=\\~key:a@b$c&d,e;f!g'h(i)j*k-0123456789";
+        for (kind, safe) in [("go-path", "$&+=:@"), ("pchar", "!$&'()*+,;=:@")] {
+            for upper in [true, false] {
+                let spelled = percent_encode_safe(secret, safe, upper);
+                let mut r = resp(&format!("see /x/{spelled}/y"));
+                assert!(
+                    redact_secret_material(&mut r, &secrets(&[secret]), "x"),
+                    "{kind} (upper={upper}) spelling must be detected: {spelled}"
+                );
+                assert!(
+                    !String::from_utf8_lossy(&r.body).contains(spelled.as_str()),
+                    "{kind} (upper={upper}) spelling survived redaction"
+                );
+            }
+        }
     }
 
     #[test]

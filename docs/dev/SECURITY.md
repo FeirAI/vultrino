@@ -171,6 +171,16 @@ those — checking **every** resolved IP, not just an IP literal. OAuth2 token U
 get the same guard and must be HTTPS. So a proxied request to `127.0.0.1` or a
 metadata endpoint is denied at the transport step.
 
+**Known bound: an ambient proxy bypasses the connect-time guard.** The HTTP plugin's
+client (`build_guarded_client`) does not call `.no_proxy()`, unlike `internal_http`. If the
+vultrino process runs with `HTTP_PROXY` or `HTTPS_PROXY` set, reqwest sends the request to
+that proxy: the connect-time resolver that guards against DNS rebinding is not consulted for
+the target, and an `http://` request carries its credential to the proxy in plaintext. The
+admission-time URL check above still runs. Do not set an ambient proxy on a vultrino process
+that is not meant to route its upstream traffic through it. The govder credential-canary
+end-to-end test relies on this behaviour to reach a local reflecting upstream, and would fail
+loudly if it changed.
+
 The authoritative list of ranges the HTTP plugin's guard blocks is the
 `IPV4_BLOCKED` and `IPV6_BLOCKED` tables in `src/plugins/http.rs`, plus the IPv4
 address carried inside an IPv4-mapped (`::ffff:0:0/96`), NAT64 or 6to4 (`2002::/16`)
@@ -221,9 +231,10 @@ under these bounds. All of them are enforcement, not documentation:
 Two layers at the execution seam, obtained through the private
 `egress::confine_response` constructor before a buffered body reaches the caller:
 
-1. **Always-on secret scrubbing.** The credential's own injected secret — and its
-   percent-encoded and JSON-escaped forms, and derived forms like the Basic-auth
-   base64 — is replaced with the constant `[REDACTED]` marker in the body and headers.
+1. **Always-on secret scrubbing.** The credential's own injected secret, its
+   percent-encoded, JSON-escaped, base64 and hex forms of the whole value, the
+   base64 of the value inside a longer string, and derived forms like the Basic-auth
+   base64, is replaced with the constant `[REDACTED]` marker in the body and headers.
    Framing headers (`Content-Length`/`Transfer-Encoding`) a redaction invalidates
    are stripped so a stale length can't leak the original.
 2. **Operator egress classification.** `[[egress]]` rules `block` a secret-bearing
@@ -236,9 +247,11 @@ replaced wholesale by a constant error before it can reach the caller or an
 approval record.
 
 **Honest bounds (defense-in-depth, not absolute):** scrubbing operates on the
-plaintext response. An endpoint that *transforms* the secret (re-encodes,
-hashes, gzips a reflected copy beyond what the client decompressed) can still leak
-it — use a `block` rule for endpoints you don't trust. Secrets shorter than
+plaintext response. An endpoint that *transforms* the secret beyond the
+whole-value spellings above (hashes it, encodes it inside a longer string other than as
+base64 of 14 or more bytes of the value, splits it
+across separate SSE events, gzips a reflected copy beyond what the client decompressed)
+can still leak it; use a `block` rule for endpoints you don't trust. Secrets shorter than
 `MIN_REDACT_LEN = 5` are not byte-scrubbed (they'd over-redact); any execution
 using one is forced through the buffered path and its entire response is withheld.
 A still-compressed body is also withheld entirely (fail-closed).

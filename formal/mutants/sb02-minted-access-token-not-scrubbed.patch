@@ -1,10 +1,10 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 3982d0d..600be05 100644
+index e48d139..8ac1138 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -585,9 +585,7 @@ impl CredentialData {
-                     // The Basic-auth form some token endpoints expect.
+@@ -591,9 +591,7 @@ impl CredentialData {
                      z(STANDARD.encode(basic.as_bytes())),
+                     z(basic.to_string()),
                  ];
 -                if let Some(t) = access_token {
 -                    v.push(z(t.expose().to_string()));

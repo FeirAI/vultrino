@@ -1,0 +1,13 @@
+diff --git a/src/egress.rs b/src/egress.rs
+index 7bb6b24..6b3fc83 100644
+--- a/src/egress.rs
++++ b/src/egress.rs
+@@ -80,7 +80,7 @@ pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
+         // `pchar` set (keeps `!$&'()*+,;=:@`), the two other mainstream spellings of a value
+         // placed in a URL path or query. Both hex cases. (XV-18 found a reflected `/`-bearing
+         // value spelled the PathEscape way passing every previous form.)
+-        for safe in ["!~*'()", "/", "$&+=:@", "!$&'()*+,;=:@"] {
++        for safe in ["!~*'()", "/"] {
+             for upper in [true, false] {
+                 add(&mut forms, percent_encode_safe(raw, safe, upper), raw);
+             }
