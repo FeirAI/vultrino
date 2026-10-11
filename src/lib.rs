@@ -570,6 +570,10 @@ impl CredentialData {
                 vec![
                     z(password.expose().to_string()),
                     z(STANDARD.encode(raw.as_bytes())),
+                    // The decoded composite too, so its unpadded, URL-alphabet and hex
+                    // spellings (what an upstream that decodes and re-encodes reflects) are
+                    // derived and scrubbed, not only the one wire spelling above.
+                    z(raw.to_string()),
                 ]
             }
             CredentialData::OAuth2 {
@@ -582,8 +586,10 @@ impl CredentialData {
                 let basic = Zeroizing::new(format!("{}:{}", client_id, client_secret.expose()));
                 let mut v = vec![
                     z(client_secret.expose().to_string()),
-                    // The Basic-auth form some token endpoints expect.
+                    // The Basic-auth form some token endpoints expect, and the decoded
+                    // composite it encodes (see the BasicAuth arm).
                     z(STANDARD.encode(basic.as_bytes())),
+                    z(basic.to_string()),
                 ];
                 if let Some(t) = access_token {
                     v.push(z(t.expose().to_string()));
@@ -1492,5 +1498,46 @@ mod tests {
             .collect();
         assert!(material.iter().any(|value| value == "exchange-api-key"));
         assert!(material.iter().any(|value| value == "exchange-api-secret"));
+    }
+
+    /// XV-18: an upstream that decodes a Basic credential and echoes it, or re-encodes the
+    /// decoded `user:secret` (unpadded, URL alphabet, hex), reflects a spelling of the
+    /// composite that the padded standard base64 string alone does not generate. The raw
+    /// composite is egress material so every derived spelling of it is scrubbed.
+    #[test]
+    fn basic_and_oauth_composites_are_egress_material() {
+        let basic = CredentialData::BasicAuth {
+            username: "svc-user".to_string(),
+            password: Secret::new("pa55word-value-1234"),
+        };
+        let material: Vec<String> = basic
+            .secret_material()
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert!(
+            material.iter().any(|v| v == "svc-user:pa55word-value-1234"),
+            "basic raw user:password composite must be egress material: {material:?}"
+        );
+        let oauth = CredentialData::OAuth2 {
+            client_id: "client-abc".to_string(),
+            client_secret: Secret::new("client-secret-value-5678"),
+            refresh_token: None,
+            access_token: None,
+            expires_at: None,
+            token_url: "https://idp.example.test/token".to_string(),
+            scopes: vec![],
+        };
+        let material: Vec<String> = oauth
+            .secret_material()
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert!(
+            material
+                .iter()
+                .any(|v| v == "client-abc:client-secret-value-5678"),
+            "oauth raw client_id:client_secret composite must be egress material: {material:?}"
+        );
     }
 }
