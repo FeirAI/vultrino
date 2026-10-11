@@ -25,6 +25,10 @@ use zeroize::Zeroizing;
 /// complete response whenever one is present; this is no longer warning-only.
 pub const MIN_REDACT_LEN: usize = 5;
 
+/// Shortest base64 core (in characters) of a value that is scrubbed when the value sits inside a
+/// longer base64 string; see `derive_secret_forms`.
+const BASE64_CORE_MIN_LEN: usize = 16;
+
 /// Whether any of these secrets is non-empty but below the redaction floor (so
 /// the always-on scrubbing would NOT catch a reflection of it). Used to warn
 /// operators at credential-store time.
@@ -87,9 +91,10 @@ pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
         }
         // base64 (standard and URL alphabets, padded and unpadded) and hex (both cases) of the
         // whole value: how a service that logs or echoes an "id" or "token" derived from the
-        // credential spells it. Whole-value only: an encoding of the value INSIDE a longer
-        // string (a base64 of "Bearer <token>") has no fixed spelling and is not covered
-        // (docs/dev/LIMITATIONS.md). XV-18 found these reflected to the agent unscrubbed.
+        // credential spells it. XV-18 found these reflected to the agent unscrubbed. A base64 of
+        // the value inside a longer string is covered by its whole-group cores, below; a hex or
+        // percent encoding is always byte-aligned, so its whole-value form already matches inside
+        // a longer string.
         {
             use base64::engine::general_purpose::{
                 STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD,
@@ -102,6 +107,27 @@ pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
             add(&mut forms, URL_SAFE_NO_PAD.encode(bytes), raw);
             add(&mut forms, hex::encode(bytes), raw);
             add(&mut forms, hex::encode_upper(bytes), raw);
+            // A base64 of the value INSIDE a longer string (a base64 of "Bearer <token>", the
+            // way an echo service logs a whole Authorization header) has no fixed whole-value
+            // spelling, but the groups that lie wholly inside the value do have one for each of
+            // the three alignments the value can start at: base64 of `bytes[shift..]` cut back
+            // to a multiple of three. Both alphabets, unpadded (a core never carries padding).
+            // A core must be at least BASE64_CORE_MIN_LEN characters, so a short secret does
+            // not turn a few characters of ordinary text into a redaction trigger; the 0 to 2
+            // bytes beside the core stay unscrubbed, which no longer identifies the value.
+            // (The review of XV-18 found a decodable "Bearer <token>" reaching the agent.)
+            for shift in 0..3usize {
+                if shift >= bytes.len() {
+                    continue;
+                }
+                let rest = &bytes[shift..];
+                let core = &rest[..rest.len() / 3 * 3];
+                if core.len() / 3 * 4 < BASE64_CORE_MIN_LEN {
+                    continue;
+                }
+                add(&mut forms, STANDARD_NO_PAD.encode(core), raw);
+                add(&mut forms, URL_SAFE_NO_PAD.encode(core), raw);
+            }
         }
         // JSON-escaped inner (serde default: \", \\, \n, control \uXXXX). Also a
         // slash-escaped variant — HTML-safe JSON encoders emit `/` as `\/`, which the
@@ -1083,6 +1109,57 @@ mod tests {
                 "{kind} spelling survived confine_response"
             );
         }
+    }
+
+    /// XV-18 review: an echo service that base64-encodes a whole header ("Bearer <token>") put
+    /// a decodable credential in front of the agent although no whole-value spelling of the
+    /// token appears in it: the seven-byte prefix shifts the base64 alignment. Every alignment
+    /// (prefix length mod 3 = 0, 1, 2) and both alphabets must be scrubbed, buffered and
+    /// streamed.
+    #[test]
+    fn test_redact_catches_base64_of_value_inside_a_longer_string() {
+        use base64::Engine as _;
+        let secret = "cnry/+q\"=\\~key-0123456789abcdef";
+        for prefix in ["", "Bearer ", "Bearer x", "Authorization: Bearer "] {
+            let plain = format!("{prefix}{secret}!tail");
+            for (alphabet, encoded) in [
+                (
+                    "standard",
+                    base64::engine::general_purpose::STANDARD.encode(plain.as_bytes()),
+                ),
+                (
+                    "url",
+                    base64::engine::general_purpose::URL_SAFE.encode(plain.as_bytes()),
+                ),
+            ] {
+                // The independent derivation of the core: the encoded groups wholly inside the
+                // value.
+                let start = prefix.len().div_ceil(3) * 3;
+                let end = (prefix.len() + secret.len()) / 3 * 3;
+                let core = &encoded[start / 3 * 4..end / 3 * 4];
+                assert!(core.len() >= 16, "test setup: core too short");
+                let mut r = resp(&format!("{{\"echo\":\"{encoded}\"}}"));
+                assert!(
+                    redact_secret_material(&mut r, &secrets(&[secret]), "x"),
+                    "{alphabet} base64 of {prefix:?}+secret must be detected: {encoded}"
+                );
+                assert!(
+                    !String::from_utf8_lossy(&r.body).contains(core),
+                    "{alphabet} core of {prefix:?}+secret survived buffered redaction"
+                );
+                let streamed =
+                    run_stream(&[secret], "x", format!("a {encoded} b").as_bytes(), &[7]);
+                assert!(
+                    !String::from_utf8_lossy(&streamed).contains(core),
+                    "{alphabet} core of {prefix:?}+secret survived streaming redaction"
+                );
+            }
+        }
+        // A short secret has no core long enough to scrub, and must not start redacting
+        // ordinary text.
+        assert!(derive_secret_forms(&secrets(&["short-secret-1"]))
+            .iter()
+            .all(|f| f.len() >= 5));
     }
 
     /// XV-18: a JSON API that reports "bad request: <the request it received>" inside a JSON

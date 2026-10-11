@@ -1,0 +1,12 @@
+diff --git a/src/egress.rs b/src/egress.rs
+--- a/src/egress.rs
++++ b/src/egress.rs
+@@ -116,7 +116,7 @@
+             // not turn a few characters of ordinary text into a redaction trigger; the 0 to 2
+             // bytes beside the core stay unscrubbed, which no longer identifies the value.
+             // (The review of XV-18 found a decodable "Bearer <token>" reaching the agent.)
+-            for shift in 0..3usize {
++            for shift in 0..0usize {
+                 if shift >= bytes.len() {
+                     continue;
+                 }

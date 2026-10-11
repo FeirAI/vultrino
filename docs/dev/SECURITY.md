@@ -171,6 +171,16 @@ those — checking **every** resolved IP, not just an IP literal. OAuth2 token U
 get the same guard and must be HTTPS. So a proxied request to `127.0.0.1` or a
 metadata endpoint is denied at the transport step.
 
+**Known bound: an ambient proxy bypasses the connect-time guard.** The HTTP plugin's
+client (`build_guarded_client`) does not call `.no_proxy()`, unlike `internal_http`. If the
+vultrino process runs with `HTTP_PROXY` or `HTTPS_PROXY` set, reqwest sends the request to
+that proxy: the connect-time resolver that guards against DNS rebinding is not consulted for
+the target, and an `http://` request carries its credential to the proxy in plaintext. The
+admission-time URL check above still runs. Do not set an ambient proxy on a vultrino process
+that is not meant to route its upstream traffic through it. The govder credential-canary
+end-to-end test relies on this behaviour to reach a local reflecting upstream, and would fail
+loudly if it changed.
+
 The authoritative list of ranges the HTTP plugin's guard blocks is the
 `IPV4_BLOCKED` and `IPV6_BLOCKED` tables in `src/plugins/http.rs`, plus the IPv4
 address carried inside an IPv4-mapped (`::ffff:0:0/96`), NAT64 or 6to4 (`2002::/16`)
