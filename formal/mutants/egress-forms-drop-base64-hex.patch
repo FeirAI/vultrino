@@ -1,0 +1,24 @@
+diff --git a/src/egress.rs b/src/egress.rs
+index 7bb6b24..bc4f7d1 100644
+--- a/src/egress.rs
++++ b/src/egress.rs
+@@ -90,19 +90,6 @@ pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
+         // credential spells it. Whole-value only: an encoding of the value INSIDE a longer
+         // string (a base64 of "Bearer <token>") has no fixed spelling and is not covered
+         // (docs/dev/LIMITATIONS.md). XV-18 found these reflected to the agent unscrubbed.
+-        {
+-            use base64::engine::general_purpose::{
+-                STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD,
+-            };
+-            use base64::Engine as _;
+-            let bytes = raw.as_bytes();
+-            add(&mut forms, STANDARD.encode(bytes), raw);
+-            add(&mut forms, STANDARD_NO_PAD.encode(bytes), raw);
+-            add(&mut forms, URL_SAFE.encode(bytes), raw);
+-            add(&mut forms, URL_SAFE_NO_PAD.encode(bytes), raw);
+-            add(&mut forms, hex::encode(bytes), raw);
+-            add(&mut forms, hex::encode_upper(bytes), raw);
+-        }
+         // JSON-escaped inner (serde default: \", \\, \n, control \uXXXX). Also a
+         // slash-escaped variant — HTML-safe JSON encoders emit `/` as `\/`, which the
+         // default escaping does not, so a secret with `/` reflected by such an encoder

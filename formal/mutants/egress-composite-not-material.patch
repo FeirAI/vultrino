@@ -1,0 +1,12 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e48d139..73b64e6 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -573,7 +573,6 @@ impl CredentialData {
+                     // The decoded composite too, so its unpadded, URL-alphabet and hex
+                     // spellings (what an upstream that decodes and re-encodes reflects) are
+                     // derived and scrubbed, not only the one wire spelling above.
+-                    z(raw.to_string()),
+                 ]
+             }
+             CredentialData::OAuth2 {

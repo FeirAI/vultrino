@@ -1,0 +1,27 @@
+diff --git a/src/egress.rs b/src/egress.rs
+index 7bb6b24..2c48e77 100644
+--- a/src/egress.rs
++++ b/src/egress.rs
+@@ -108,22 +108,6 @@ pub fn derive_secret_forms(secrets: &[Zeroizing<String>]) -> Vec<String> {
+         // default escaping does not, so a secret with `/` reflected by such an encoder
+         // would otherwise slip past.
+         if let Some(escaped) = json_escaped_inner(raw) {
+-            // Nested JSON: an API that reports "bad request: <the request it received>" inside
+-            // a JSON string escapes the value again (and a log line inside that, once more).
+-            // Two further levels of the plain and the slash-escaped spelling, which is as deep
+-            // as a request echoed into an error message echoed into a log line goes.
+-            for base in [escaped.clone(), escaped.replace('/', "\\/")] {
+-                let mut level = base;
+-                for _ in 0..2 {
+-                    match json_escaped_inner(&level) {
+-                        Some(next) => {
+-                            add(&mut forms, next.clone(), raw);
+-                            level = next;
+-                        }
+-                        None => break,
+-                    }
+-                }
+-            }
+             if escaped.contains('/') {
+                 add(&mut forms, escaped.replace('/', "\\/"), raw);
+             }
