@@ -5,12 +5,14 @@
 //! 1. **Always-on secret-material redaction.** If an endpoint reflects the
 //!    credential's own injected secret in its response (a header-echoing
 //!    reflector, an open redirect to an attacker host, etc.), the server scrubs
-//!    the secret — and its common re-encoded forms — from the body and headers
+//!    the secret and its common re-encoded forms from the body and headers
 //!    before returning them. Closes the read-back vector (REVIEW H2/F2) at one
 //!    place, for every plugin. Defense-in-depth, not absolute: the whole-value
-//!    base64 and hex spellings are scrubbed, but an endpoint that hashes the
-//!    secret, encodes it inside a longer string, or returns it compressed can
-//!    still leak it — use a `block` rule for endpoints you don't trust.
+//!    base64 and hex spellings, and the base64 of a value of 14 or more bytes
+//!    inside a longer string (such as `Bearer <token>`), are scrubbed, but an
+//!    endpoint that hashes the secret, encodes it inside a longer string in any
+//!    other way, or returns it compressed can still leak it. Use a `block` rule
+//!    for endpoints you don't trust.
 //! 2. **Egress classification.** Operator `[[egress]]` rules mark a
 //!    `(credential, action)` whose response may carry a *secondary* secret —
 //!    `block`ing the body+headers entirely or redacting extra `redact_patterns`.
