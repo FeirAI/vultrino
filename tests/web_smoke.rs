@@ -3499,6 +3499,25 @@ async fn test_json_decision_sod_is_on_by_default_with_verified_approver_identiti
 /// `Some(true)` = refused 409 approval_not_decidable with nothing written,
 /// `Some(false)` = recorded with 200.
 async fn self_approval_outcome(default_verified: bool, explicit_false: bool) -> bool {
+    self_approval_outcome_as(
+        default_verified,
+        explicit_false,
+        "alice@example.com",
+        None,
+        "alice@example.com",
+    )
+    .await
+}
+
+/// Whether the decision route REFUSED `approver` on a request whose requesting agent is
+/// `principal` and whose directory owner is `owner`.
+async fn self_approval_outcome_as(
+    default_verified: bool,
+    explicit_false: bool,
+    principal: &str,
+    owner: Option<&str>,
+    approver: &str,
+) -> bool {
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
     std::mem::forget(dir);
@@ -3540,7 +3559,8 @@ async fn self_approval_outcome(default_verified: bool, explicit_false: bool) -> 
 
     // Single-approver request whose requester principal name is the approver.
     let mut requester = RequesterInfo::local();
-    requester.principal_name = Some("alice@example.com".to_string());
+    requester.principal_name = Some(principal.to_string());
+    requester.owner = owner.map(str::to_string);
     let (approval, _token) = ApprovalRequest::open(NewApproval {
         credential: "stripe-prod".to_string(),
         action: "http.request".to_string(),
@@ -3571,7 +3591,7 @@ async fn self_approval_outcome(default_verified: bool, explicit_false: bool) -> 
             "POST",
             &format!("/api/v1/approvals/{}/decision", id),
             &key,
-            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+            serde_json::json!({"approve": true, "approver": approver}),
         ))
         .await
         .unwrap();
@@ -3609,6 +3629,35 @@ async fn test_json_decision_self_approval_follows_the_sod_default() {
     assert!(
         !self_approval_outcome(false, false).await,
         "dev (unverified identities): default off, self-approval recorded"
+    );
+}
+
+#[tokio::test]
+async fn test_json_decision_owner_may_approve_own_agent_under_the_sod_default() {
+    // The Solo model: separation of duty refuses the requesting AGENT, not its owner.
+    // The owner approves their own agent's request with SoD on by default; the agent's
+    // own identity is still refused.
+    assert!(
+        !self_approval_outcome_as(
+            true,
+            false,
+            "solo-agent",
+            Some("owner@example.com"),
+            "owner@example.com"
+        )
+        .await,
+        "the agent's owner is allowed to approve under the default"
+    );
+    assert!(
+        self_approval_outcome_as(
+            true,
+            false,
+            "solo-agent",
+            Some("owner@example.com"),
+            "solo-agent"
+        )
+        .await,
+        "the requesting agent itself is refused"
     );
 }
 
@@ -3885,6 +3934,7 @@ async fn test_json_decision_recipe_hard_sod_senior_pair_one_key_409() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
 
@@ -3938,6 +3988,7 @@ async fn test_verified_broker_assertion_requires_named_and_allows_two_bound_subj
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
     let uri = format!("/api/v1/approvals/{id}/decision");
@@ -4035,6 +4086,7 @@ fn two_teammate_rule() -> ApprovalRule {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     }
 }
 
@@ -4156,6 +4208,7 @@ async fn test_denials_of_either_provenance_are_unaffected_by_the_provenance_rule
             }],
         }],
         decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "Low").await;
     let uri = format!("/api/v1/approvals/{id}/decision");
@@ -4489,6 +4542,7 @@ async fn test_invalid_present_broker_assertion_fails_closed_without_signoff() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
     let uri = format!("/api/v1/approvals/{id}/decision");
@@ -4531,6 +4585,7 @@ async fn test_json_decision_recipe_hard_sod_senior_then_teammate_one_key_409() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
 
@@ -4580,6 +4635,7 @@ async fn test_json_decision_recipe_hard_sod_teammate_then_senior_one_key_409() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
 
@@ -4645,6 +4701,7 @@ async fn test_json_decision_recipe_hard_sod_unsatisfiable_branch_then_senior_all
             },
         ],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
 
@@ -4701,6 +4758,7 @@ async fn test_json_decision_recipe_hard_sod_dissent_then_distinct_approve_allowe
             }],
         }],
         decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        exclude_owner: false,
     };
     // "High" (required): majority-with-dissent semantics are only honored below
     // Extreme — Extreme/irreversible force DenyOnAnyDeny regardless of the rule's
@@ -4805,6 +4863,7 @@ async fn test_json_decision_recipe_hard_sod_two_distinct_keys_allowed() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (mut approval, _token) = ApprovalRequest::open(NewApproval {
         credential: "stripe-prod".to_string(),
@@ -4916,10 +4975,11 @@ async fn test_json_decision_rejects_missing_operator_after_named_signoff() {
 
 #[tokio::test]
 async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
-    // [#2 regression] An NHI whose OWNER is alice@ approved by human alice@ through
-    // the aggregator (recorded as `agg:<key>:alice@`) is a self-approval. SoD is
-    // computed against the BARE operator, so under hard SoD this is rejected 409 —
-    // the agg: namespacing must NOT let a self-approval slip past.
+    // [#2 regression] An NHI `refund-bot` approving itself through the aggregator
+    // (recorded as `agg:<key>:refund-bot`) is a self-approval. SoD is computed against
+    // the BARE operator, so under hard SoD this is rejected 409 — the agg: namespacing
+    // must NOT let a self-approval slip past. (Its owner alice@ may approve: see
+    // test_json_decision_owner_may_approve_own_agent_under_the_sod_default.)
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
     std::mem::forget(dir);
@@ -4991,21 +5051,21 @@ async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
     let id = approval.id.clone();
     storage.store_approval(&approval).await.unwrap();
 
-    // alice@ approving her own NHI's action via the aggregator → 409, stays pending.
+    // refund-bot approving its own action via the aggregator → 409, stays pending.
     let resp = router
         .clone()
         .oneshot(admin_req(
             "POST",
             &format!("/api/v1/approvals/{}/decision", id),
             &key,
-            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+            serde_json::json!({"approve": true, "approver": "refund-bot"}),
         ))
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::CONFLICT,
-        "aggregator self-approval (owner == operator) must be caught under hard SoD",
+        "aggregator self-approval (agent == operator) must be caught under hard SoD",
     );
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(

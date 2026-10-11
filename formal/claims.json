@@ -408,6 +408,12 @@
     },
     "xv10-sod-explicit-false-overridden": {
       "tier": "full"
+    },
+    "xv10-sod-owner-axis-readded": {
+      "tier": "fast"
+    },
+    "xv10-exclude-owner-ignored": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -1124,7 +1130,7 @@
         {
           "path": "src/approval/mod.rs",
           "symbol": "ApprovalRequest::transition",
-          "sha256": "99a3400485ee6c8f1170f77e85fe4eb229a2fc1b913a40c246db7e6b1aabb3b3"
+          "sha256": "cac04debe7a42897e89aaf999bc88ad349cdb71c6d9eeeab6e2b54cf84c1883a"
         }
       ],
       "mutants": [
@@ -1183,7 +1189,7 @@
         {
           "path": "src/approval/mod.rs",
           "symbol": "ApprovalRequest::transition",
-          "sha256": "99a3400485ee6c8f1170f77e85fe4eb229a2fc1b913a40c246db7e6b1aabb3b3"
+          "sha256": "cac04debe7a42897e89aaf999bc88ad349cdb71c6d9eeeab6e2b54cf84c1883a"
         },
         {
           "path": "src/approval/mod.rs",
@@ -2263,7 +2269,7 @@
         {
           "path": "src/approval/mod.rs",
           "symbol": "ApprovalRequest::transition",
-          "sha256": "99a3400485ee6c8f1170f77e85fe4eb229a2fc1b913a40c246db7e6b1aabb3b3"
+          "sha256": "cac04debe7a42897e89aaf999bc88ad349cdb71c6d9eeeab6e2b54cf84c1883a"
         }
       ],
       "mutants": [
@@ -2352,7 +2358,7 @@
     },
     {
       "id": "sod-default-with-verified-approvers",
-      "statement": "With a distinct approver-identity key configured (verified approver identities) and nothing written for enforce_separation_of_duty, separation of duty resolves to enforced, and the decision route refuses a self-approval (approver equal to the requester's identity) with 409 approval_not_decidable and writes nothing, with no explicit flag, while an explicit false records it; an explicit false in [approvals] keeps it off and the startup line says so; without verified identities (dev mode) the default stays off and the startup line says so; an explicit true holds in every case.",
+      "statement": "With a distinct approver-identity key configured (verified approver identities) and nothing written for enforce_separation_of_duty, separation of duty resolves to enforced, and the decision route refuses a self-approval (approver equal to the requester's identity) with 409 approval_not_decidable and writes nothing, with no explicit flag, while an explicit false records it; an explicit false in [approvals] keeps it off and the startup line says so; without verified identities (dev mode) the default stays off and the startup line says so; an explicit true holds in every case. Separation of duty compares the approver only with the requesting agent's own identities (principal name, agent label, principal ids): the agent's directory owner is NOT a self-approval, so an owner approves their own agent's request under the enforced default, and the requesting agent itself is still refused. A stamped recipe with exclude_owner true refuses the directory owner (409, nothing recorded) even with the flag off, a deny by the owner is never blocked, and exclude_owner defaults to false.",
       "method": "test",
       "artifacts": [
         "src/approval/mod.rs",
@@ -2364,12 +2370,22 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::tests::sod_defaults_on_only_with_verified_approver_identities govder::tests::approver_identities_are_verified_only_with_a_distinct_key config::types::tests::test_sod_explicit_is_recorded_from_the_config && cargo test --locked --no-default-features --test web_smoke -- --exact test_json_decision_sod_is_on_by_default_with_verified_approver_identities test_json_decision_self_approval_follows_the_sod_default",
+      "detector": "cargo test --locked --no-default-features --lib -- --exact approval::tests::sod_defaults_on_only_with_verified_approver_identities govder::tests::approver_identities_are_verified_only_with_a_distinct_key config::types::tests::test_sod_explicit_is_recorded_from_the_config approval::tests::test_owner_may_approve_own_agent_under_enforced_sod approval::tests::test_recipe_exclude_owner_refuses_the_owner_only_when_set approval::tests::test_exclude_owner_is_a_serde_default_false && cargo test --locked --no-default-features --test web_smoke -- --exact test_json_decision_sod_is_on_by_default_with_verified_approver_identities test_json_decision_self_approval_follows_the_sod_default test_json_decision_owner_may_approve_own_agent_under_the_sod_default",
       "covers": [
         {
           "path": "src/approval/mod.rs",
           "symbol": "ApprovalConfig::apply_sod_default",
           "sha256": "ae56e42fa8e81d14f4839b95b3fd0e4ae963101752b959dfbc1dcc809a7e7d99"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalRequest::sod_for",
+          "sha256": "b52e1525ffcab1bf180ffa02d8d12a606c30223bb3647691e16abe8abf40884f"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalRequest::owner_excluded",
+          "sha256": "f367750d2863d79401b11fa377703d342c52b45ecbb0cbf2a82b788168cc4667"
         },
         {
           "path": "src/govder/mod.rs",
@@ -2379,9 +2395,11 @@
       ],
       "mutants": [
         "xv10-sod-default-ignores-verified",
-        "xv10-sod-explicit-false-overridden"
+        "xv10-sod-explicit-false-overridden",
+        "xv10-sod-owner-axis-readded",
+        "xv10-exclude-owner-ignored"
       ],
-      "does_not_establish": "That main.rs calls apply_sod_default with the live key posture before serving (a wiring line, covered by the four-plane e2e self-approval leg, not by this detector or a drift lock); that the approver identity is authenticated (the broker signs only under a real IdP; the dev escape VULTRINO_ALLOW_SHARED_APPROVAL_KEY and FEIR_OS_ALLOW_DEV_VERIFIED_APPROVERS are documented dev/test postures that weaken it); that requester and approver are compared on the same identity namespace (an owner that differs from the approver's IdP subject is not a self-approval); and nothing about [approvals] enabled. The same-aggregator-key refusal (one key filling two seats of a two-person rule) is independent of this flag and is not established by it. The CLI approve/deny path never enforces separation of duty regardless of this setting (decide_approval in src/main.rs passes false)."
+      "does_not_establish": "That main.rs calls apply_sod_default with the live key posture before serving (a wiring line, covered by the four-plane e2e self-approval leg, not by this detector or a drift lock); that the approver identity is authenticated (the broker signs only under a real IdP; the dev escape VULTRINO_ALLOW_SHARED_APPROVAL_KEY and FEIR_OS_ALLOW_DEV_VERIFIED_APPROVERS are documented dev/test postures that weaken it); that requester and approver are compared on the same identity namespace (an agent identity that differs from the approver's IdP subject is not a self-approval); and nothing about [approvals] enabled. The same-aggregator-key refusal (one key filling two seats of a two-person rule) is independent of this flag and is not established by it. The CLI approve/deny path never enforces separation of duty regardless of this setting (decide_approval in src/main.rs passes false)."
     }
   ]
 }

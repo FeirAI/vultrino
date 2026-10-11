@@ -230,8 +230,8 @@ A delegate agent can also decide via a `vap_` token at
 `POST /api/v1/approvals/{id}/delegate-decision`, gated by govder-evaluated D3
 floors (irreversible => human-only, Medium risk => veto window); the sign-off
 records `approver_kind = delegate-agent` plus a `delegation_grant_ref`.
-Self-approval (separation of duty) is recorded and, if
-`enforce_separation_of_duty`, rejected. Unset, the setting defaults to ON when approver identities
+Self-approval (separation of duty: the REQUESTING AGENT approving its own request, under its label, principal name or principal id) is recorded and, if
+`enforce_separation_of_duty`, rejected. The agent's directory owner is not a self-approval and may approve; a govder-authored recipe flag `exclude_owner` refuses the owner on that recipe (independent of the setting). Unset, the setting defaults to ON when approver identities
 are verified (a distinct `VULTRINO_APPROVAL_ASSERTION_SECRET`) and OFF in dev mode, where an
 identity is a typed-in name; an explicit value always wins.
 

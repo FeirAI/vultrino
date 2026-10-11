@@ -4752,6 +4752,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         });
         approval.push_signoff_for_test(Signoff {
             approver_identity: "agg:00000000-0000-0000-0000-000000000000:alice@example.com"
