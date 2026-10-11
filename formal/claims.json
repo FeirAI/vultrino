@@ -429,6 +429,45 @@
     },
     "xv10-exclude-owner-ignored": {
       "tier": "fast"
+    },
+    "vault-write-all-records": {
+      "tier": "fast"
+    },
+    "vault-rollback-skipped": {
+      "tier": "full"
+    },
+    "vault-log-replay-skips-first-newer-record": {
+      "tier": "full"
+    },
+    "vault-torn-tail-not-truncated": {
+      "tier": "full"
+    },
+    "vault-fence-read-skips-lock": {
+      "tier": "fast"
+    },
+    "vault-fence-read-takes-exclusive-lock": {
+      "tier": "full"
+    },
+    "vault-fence-ignores-appended-records": {
+      "tier": "full"
+    },
+    "vault-gc-drops-stored-kill-mark": {
+      "tier": "fast"
+    },
+    "vault-gc-ignores-live-admissions": {
+      "tier": "full"
+    },
+    "vault-gc-ignores-grace": {
+      "tier": "full"
+    },
+    "vault-gc-legacy-approval-ignored": {
+      "tier": "full"
+    },
+    "vault-migration-skips-backup": {
+      "tier": "full"
+    },
+    "vault-migration-drops-kill-marks": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -2233,7 +2272,7 @@
         "kill-fence-dispatch-never-refuses",
         "kill-fence-ack-live-without-readback"
       ],
-      "does_not_establish": "Rollout safety of the one-way vault format: STORAGE_VERSION 9 makes an older binary refuse the vault on open, but an older process already running keeps its loaded engine and is refused only where it takes the vault lock, so a vk_ API-key or LLM-proxy call on it can still dispatch after Contained; every process sharing the vault must be stopped (and the vault backed up) before the fence build starts. Kill marks are keyed by policy id (a re-stored id with a narrower pattern overwrites its mark). Dispatch lock contention is not measured. Also: Several hosts (the vault is one file under one cross-process lock; a network storage backend answers the default fail-closed 'unsupported'), a dispatch whose fence vault read preceded the kill policy's vault write (the fence is the last check before the dispatch call, not a recall, so work already past that read runs), MCP, /execute and /llm entry points individually (they reach the shared execute_gated, execute_gated_streaming and resume_approved paths the tests drive; a new path that bypasses them is not covered), a halt that writes no kill policy, a kill epoch snapshot older than the durable value (conservatively refuses), or any CI run. Example-based tests over in-process servers and a counting plugin, not a proof; the model is govder formal/tla/KillFence.tla. Kill marks are never garbage-collected (the vault grows with the number of distinct kill policy ids ever stored; collecting them is wave-3 work, see LIMITATIONS).",
+      "does_not_establish": "Rollout safety of the one-way vault format: the vault format (now 10, see vault-v9-migration) makes an older binary refuse the vault on open, but an older process already running keeps its loaded engine and is refused only where it takes the vault lock, so a vk_ API-key or LLM-proxy call on it can still dispatch after Contained; every process sharing the vault must be stopped (and the vault backed up) before the fence build starts. Kill marks are keyed by policy id (a re-stored id with a narrower pattern overwrites its mark). Dispatch lock contention is not measured (the fence read now takes the lock shared, see vault-fence-shared-lock-delta-read). Also: Several hosts (the vault is one file under one cross-process lock; a network storage backend answers the default fail-closed 'unsupported'), a dispatch whose fence vault read preceded the kill policy's vault write (the fence is the last check before the dispatch call, not a recall, so work already past that read runs), MCP, /execute and /llm entry points individually (they reach the shared execute_gated, execute_gated_streaming and resume_approved paths the tests drive; a new path that bypasses them is not covered), a halt that writes no kill policy, a kill epoch snapshot older than the durable value (conservatively refuses), or any CI run. Example-based tests over in-process servers and a counting plugin, not a proof; the model is govder formal/tla/KillFence.tla. Kill-mark garbage collection is a separate claim (vault-kill-mark-gc), with its own bounds.",
       "evidence_run": "38048104085"
     },
     {
@@ -2450,6 +2489,228 @@
         "xv10-exclude-owner-ignored"
       ],
       "does_not_establish": "That main.rs calls apply_sod_default with the live key posture before serving (a wiring line, covered by the four-plane e2e self-approval leg, not by this detector or a drift lock); that the approver identity is authenticated (the broker signs only under a real IdP; the dev escape VULTRINO_ALLOW_SHARED_APPROVAL_KEY and FEIR_OS_ALLOW_DEV_VERIFIED_APPROVERS are documented dev/test postures that weaken it); that requester and approver are compared on the same identity namespace (an agent identity that differs from the approver's IdP subject is not a self-approval); and nothing about [approvals] enabled. The same-aggregator-key refusal (one key filling two seats of a two-person rule) is independent of this flag and is not established by it. The CLI approve/deny path never enforces separation of duty regardless of this setting (decide_approval in src/main.rs passes false)."
+    },
+    {
+      "id": "vault-write-cost-per-changed-record",
+      "statement": "An admin write to the vault appends one encrypted log record that holds only the records the write changed, and fsyncs that record, so the bytes written, the records written and the decrypt work of one write do not grow with the number of unrelated stored use tokens, policies or kill marks. With the compaction threshold held out of the way: storing one policy writes exactly one record and one log line, decrypts nothing and leaves the snapshot byte-identical at 0, 60 and 400 stored tokens, with equal bytes written (within 16 bytes); a 40-write provision burst writes 40 records, decrypts nothing and costs the same at 0 and 300 stored tokens; a mutation that changes nothing writes nothing; a mutation that returns an error rolls its changes back in memory (an inserted record gone, a removed record restored) and commits nothing, and a reopen sees the pre-mutation state. In debug builds every mutation in the whole unit-test suite also replays the vault files from scratch and requires the result to equal the in-memory state. The vault_cost example reports the same counters against vault size.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/vault_log.rs",
+        "src/storage/file.rs",
+        "src/storage/vault_tests.rs",
+        "examples/vault_cost.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::write_cost_does_not_grow_with_unrelated_records storage::file::vault_tests::a_provision_burst_costs_its_own_writes_not_the_vault_size storage::file::vault_tests::a_closure_that_changes_nothing_writes_nothing storage::file::vault_tests::an_aborted_mutation_rolls_back_memory_and_writes_nothing",
+      "covers": [
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::locked_mutate_blocking",
+          "sha256": "dc1a6473c272f6a1666a94809f58752179dcd487efd058fcca009eb04968cc50"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::commit_locked",
+          "sha256": "c2c712c75902b33024a39cec53a99c012a218c893f410c442c702012cc85c8d2"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::append_record_locked",
+          "sha256": "635870842346b35873f29424b22ae749d2855501e6188badc1981a03bb1cbea8"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "StorageCache::collect_ops",
+          "sha256": "a5b22610f7641fd7b3622a4d45cf141fc8a360fed0f9652d28f50bb2986e307e"
+        },
+        {
+          "path": "src/storage/vault_log.rs",
+          "symbol": "Tracked::changes",
+          "sha256": "b3dac16eb17ad7e1cebd1b37f97933ca7b9fe8007b0c7a5ced89b9494b73c99d"
+        }
+      ],
+      "mutants": [
+        "vault-write-all-records",
+        "vault-rollback-skipped"
+      ],
+      "does_not_establish": "Wall-clock latency or throughput: every assertion counts bytes, records, decrypts and files, never time, and the benchmark prints counters, not durations. The CPU cost of a write: the in-memory shape validation and the kill-fence diff still walk the in-memory records, so the CPU per write is not constant (it is no longer an encrypt-and-fsync of the whole vault). Amortised compaction: when the log passes max(256 KiB, snapshot size) one write rewrites the whole snapshot, so the worst single write is still O(vault) and only the average is O(record); the example's build_B/write column shows the average. The separate outbox file, which is still rewritten whole by its own store. Filesystem fsync honesty or power-loss durability. Any CI run."
+    },
+    {
+      "id": "vault-log-crash-consistency",
+      "statement": "A vultrino process that dies at any step of a vault log append or compaction leaves a vault that reopens with every acknowledged write present and no torn record. For a kill-policy write (three changes: the policy, the kill epoch, the mark) killed before the append, after half a line, after a full unsynced line and after the fsync with the acknowledgement lost, the reopened vault has all three changes or none, still holds the earlier credential, tokens and epoch, and accepts and persists a further write. A torn (unterminated) tail is ignored by a reader without modifying the file, is truncated by the next writer, and never appears as a record. A crash at each of the four compaction steps, and between the snapshot rename and the log reset (where the log still holds records the snapshot already folded in), reopens with nothing lost and continues the sequence. A missing, reordered or bit-flipped terminated record fails the open closed. Rekey folds the log, never decrypts old-key records, and a crash between its rename and the log reset still opens under the new password. A crash during the v9 migration at three steps reopens with every record.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/vault_log.rs",
+        "src/storage/file.rs",
+        "src/storage/vault_tests.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::a_crash_at_each_append_step_loses_no_committed_write_and_tears_no_record storage::file::vault_tests::a_torn_tail_is_only_present_after_the_torn_step_and_is_never_applied storage::file::vault_tests::a_crash_at_each_compaction_step_loses_nothing_and_leaves_a_usable_vault storage::file::vault_tests::a_crash_after_the_snapshot_rename_leaves_a_log_the_snapshot_already_contains storage::file::vault_tests::automatic_compaction_bounds_the_log_and_loses_nothing storage::file::vault_tests::a_corrupt_or_reordered_log_record_fails_the_open_closed storage::file::vault_tests::rekey_folds_the_log_and_the_old_key_log_is_never_decrypted storage::file::vault_tests::a_crash_between_the_rekey_rename_and_the_log_reset_leaves_a_vault_that_opens storage::file::vault_tests::a_crash_during_migration_leaves_the_v9_vault_intact_and_re_migrates",
+      "covers": [
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::append_record_locked",
+          "sha256": "635870842346b35873f29424b22ae749d2855501e6188badc1981a03bb1cbea8"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::apply_log_tail",
+          "sha256": "a74cbdae6c3398689d3d396e74e01a3f7b5ff379ac8da3aca061dd7fe1e80bcf"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::full_load_locked",
+          "sha256": "180478197abf17826d554c5d1b18b33ec9d467d8f9e79ec96fccd0f92d93ab21"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::compact_locked",
+          "sha256": "e22770fb41a42130032da888dcb0431e652d6a02cd281045b62670c1dc634b5e"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::reset_wal",
+          "sha256": "0c0678be21309b4d25bb35e76fd188b1028da4cda08763ff32a068636494e75b"
+        },
+        {
+          "path": "src/storage/vault_log.rs",
+          "symbol": "parse_log",
+          "sha256": "aac10fdce08d9a60cdcd6af44a6efc66536c0dad11dd6370c9ba449bfc0d43db"
+        },
+        {
+          "path": "src/storage/vault_log.rs",
+          "symbol": "encode_record",
+          "sha256": "9241009c4da071e12d9a53ea6d56fc8bab99058a6fd477f38617c1a8ca396fe3"
+        }
+      ],
+      "mutants": [
+        "vault-log-replay-skips-first-newer-record",
+        "vault-torn-tail-not-truncated"
+      ],
+      "does_not_establish": "Power-loss durability of any real filesystem or disk: a crash is an injected error at a named step that leaves the files exactly as written (the page cache is not dropped, fsync is assumed honest). Crashes at steps the injection points do not name, or inside the standard library. Detection of a vault rolled back by replacing the snapshot and log with older copies, or of a log truncated at a record boundary: both are accepted by the format, as a replaced vault file always was. A terminated final line damaged by a crash or bit rot fails the open closed instead of being recovered; an operator must truncate it after checking. Behaviour under concurrent writers in several real processes beyond what the advisory lock already serialises. Any CI run."
+    },
+    {
+      "id": "vault-fence-shared-lock-delta-read",
+      "statement": "The dispatch kill-fence read takes the cross-process vault lock shared, not exclusive, and reads only what changed since this process last looked. An unchanged vault costs the fence zero decrypts, zero bytes written and zero fsyncs; after another handle appends one record the fence decrypts exactly that one record and sees the kill it carries; another handle's kill and its lift are seen without a reload (the lifted kill still refuses work admitted before it); a compaction by another handle is picked up. A fence read completes while another handle holds the lock shared, and waits while another handle holds it exclusive, so committed state is still what the fence sees. A v9 process rewriting the snapshot under a running v10 process is refused (fail closed).",
+      "method": "test",
+      "artifacts": [
+        "src/storage/file.rs",
+        "src/storage/vault_tests.rs",
+        "docs/dev/ARCHITECTURE.md",
+        "docs/dev/LIMITATIONS.md"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::an_unchanged_vault_fence_read_decrypts_nothing storage::file::vault_tests::a_fence_read_after_a_foreign_write_decrypts_only_that_record storage::file::vault_tests::the_fence_sees_another_handles_kill_and_its_lift_without_a_reload storage::file::vault_tests::fence_reads_hold_the_lock_shared_so_dispatches_do_not_serialize storage::file::vault_tests::a_writer_still_excludes_fence_readers storage::file::vault_tests::another_handles_compaction_is_picked_up_by_the_fence storage::file::vault_tests::an_older_build_rewriting_the_snapshot_under_a_running_process_is_refused",
+      "covers": [
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::locked_read_blocking",
+          "sha256": "3edb202d541c7b2235798e571ffc01a8a6a3ef7b8e6de808f3e9a42090b88446"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::is_current",
+          "sha256": "62d745eed77815643c34cb0ce78e2ec6da9c9409af962ff99697dde366d9501b"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::sync_locked",
+          "sha256": "cf4a617f1e70740d8c9afd8f8e8138323ac94f2093a79c57969747bd90cfa731"
+        }
+      ],
+      "mutants": [
+        "vault-fence-read-skips-lock",
+        "vault-fence-read-takes-exclusive-lock",
+        "vault-fence-ignores-appended-records"
+      ],
+      "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run."
+    },
+    {
+      "id": "vault-kill-mark-gc",
+      "statement": "Kill marks are garbage-collected only when provably dead, and a collected mark never re-admits killed work. A mark is collected only when its kill policy is no longer stored as a kill, its timestamp is at least 24 hours old (an unstamped mark is never collected, and the boundary is inclusive), and no approval that can still be claimed (open, approved and not executed, or executing) was admitted at an epoch below the mark's epoch (an approval with no recorded epoch counts as epoch 0). A stored kill policy's mark is kept however old, including when a lifted id is killed again. The kill epoch is never lowered, the drop is durable across a reopen, work admitted at the current epoch stays clear, a later kill still halts, and an approval opened before a lifted kill is refused until it finishes, after which its mark is collected.",
+      "method": "test",
+      "artifacts": [
+        "src/policy/kill_fence.rs",
+        "src/storage/file.rs",
+        "src/storage/vault_tests.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib policy::kill_fence && cargo test --locked --no-default-features --lib -- storage::file::vault_tests::gc_drops_a_lifted_old_mark_and_never_lowers_the_epoch storage::file::vault_tests::gc_never_drops_a_live_kill_however_old storage::file::vault_tests::gc_keeps_a_mark_that_a_live_approval_still_depends_on storage::file::vault_tests::gc_keeps_a_mark_for_an_approval_opened_before_the_epoch_field_existed storage::file::vault_tests::gc_leaves_an_unstamped_mark_alone",
+      "covers": [
+        {
+          "path": "src/policy/kill_fence.rs",
+          "symbol": "dead_kill_marks",
+          "sha256": "c114b085d480069d0b1d2a1e732d9b3149862bc5416269434e89b0413dad587f"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "dead_marks",
+          "sha256": "8854fac4c0ae33f099b25d85c9afdd601374003903b1ff429b65c6360e696705"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::gc_vault_at",
+          "sha256": "8fe1cd0c513b771f1320525548918479f2a3f248f5adf1d19faa65f55bb94dc4"
+        },
+        {
+          "path": "src/policy/kill_fence.rs",
+          "symbol": "KillFenceState::stamp_unstamped",
+          "sha256": "5f818d4a5ca38533574d36f429b365e6fe6a7a064679ffb827e8773588a6511d"
+        }
+      ],
+      "mutants": [
+        "vault-gc-drops-stored-kill-mark",
+        "vault-gc-ignores-live-admissions",
+        "vault-gc-ignores-grace",
+        "vault-gc-legacy-approval-ignored"
+      ],
+      "does_not_establish": "That every holder of an admission epoch is counted. Approvals are counted explicitly; a live call in flight inside one process holds its epoch only in memory, and is covered by the 24 hour grace alone, so a request that stalled for more than 24 hours between admission and dispatch could be re-admitted after a collected kill. Marks written by a build that does not stamp them. How often garbage collection runs (the periodic vault GC tick, not tested here). Mark keying by policy id, unchanged: a re-stored id with a narrower pattern still overwrites its mark. Any CI run."
+    },
+    {
+      "id": "vault-v9-migration",
+      "statement": "A real v9 vault file (generated by the v9 build, tests/fixtures/vault-v9) opens in this build with every credential, use token, stored policy, the kill epoch and a lifted kill's mark intact, and the lifted mark still refuses pre-kill work. The first open copies the v9 file byte-for-byte to <vault>.v9.bak (atomically, owner-only) and rewrites the vault as v10 (a snapshot plus an empty log); a later open neither migrates again nor overwrites the backup; writes after the migration persist. Marks written before v10 carry no timestamp and are stamped at migration so they age out 24 hours later. A v10 vault is refused by a v9 build's version gate (its supported maximum is 9), and a vault whose snapshot is rewritten by an older build under a running v10 process is refused.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/file.rs",
+        "src/storage/vault_tests.rs",
+        "tests/fixtures/vault-v9/vault.enc",
+        "tests/fixtures/vault-v9/expected.json",
+        "tests/fixtures/vault-v9/gen_v9_fixture.rs.txt"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::a_real_v9_vault_migrates_with_a_backup_and_keeps_everything storage::file::vault_tests::a_v9_build_would_be_refused_a_v10_vault",
+      "covers": [
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::bootstrap_locked",
+          "sha256": "aaadedc4cc24f26cd2679736c8b575ec2145d3ce2f81d66762180c459063e7c3"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::backup_before_migration",
+          "sha256": "e4dde4bb4a923a8707f1cb800de33256917f647d2d9b626f9cffb20f1cd618ff"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "check_version",
+          "sha256": "fdfddc81dbf3a38d2c40f272cf0857858a644bbe292961bf10febaa7cf86ef59"
+        }
+      ],
+      "mutants": [
+        "vault-migration-skips-backup",
+        "vault-migration-drops-kill-marks"
+      ],
+      "does_not_establish": "Rollback after new writes: restoring the .v9.bak file with the v9 build loses every write made since the migration (the format is one-way by design). A fixture that exercises approvals, workload grants or idempotency records (the fixture holds credentials, tokens, policies and kill marks; the older-version migrations are covered by the existing v6 tests). That the v9 binary really refuses the file: the test asserts the version number the v9 gate compares against, it does not run a v9 binary. A mixed-build fleet running during the migration, which must be stopped first. Any CI run."
     }
   ]
 }

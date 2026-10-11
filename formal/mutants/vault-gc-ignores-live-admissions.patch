@@ -1,0 +1,13 @@
+diff --git a/src/policy/kill_fence.rs b/src/policy/kill_fence.rs
+index 37e26a3..946498c 100644
+--- a/src/policy/kill_fence.rs
++++ b/src/policy/kill_fence.rs
+@@ -127,7 +127,7 @@ pub fn dead_kill_marks(
+                 && mark
+                     .stored_at
+                     .is_some_and(|t| (now - t).num_seconds() >= KILL_MARK_GC_GRACE_SECS)
+-                && oldest_live.is_none_or(|e| e >= mark.epoch)
++                && oldest_live.is_none_or(|_| true)
+         })
+         .map(|(id, _)| id.clone())
+         .collect()

@@ -1,0 +1,13 @@
+diff --git a/src/storage/vault_log.rs b/src/storage/vault_log.rs
+index 39eb08c..c445af4 100644
+--- a/src/storage/vault_log.rs
++++ b/src/storage/vault_log.rs
+@@ -269,7 +269,7 @@ pub(super) fn parse_log(
+             .map_err(|e| corrupt(format!("unparseable record at byte {pos}: {e}")))?;
+         pos += nl + 1;
+         out.consumed = pos;
+-        if env.seq <= applied_seq {
++        if env.seq <= applied_seq + 1 {
+             continue;
+         }
+         if env.seq != next {

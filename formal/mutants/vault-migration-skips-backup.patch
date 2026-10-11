@@ -1,0 +1,13 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 6f4edb7..81f2a3c 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1869,7 +1869,7 @@ impl FileStorage {
+         self.full_load_locked(&mut log, &mut cache, true)?;
+         if log.snapshot_version < STORAGE_VERSION {
+             let from = log.snapshot_version;
+-            self.backup_before_migration(from)?;
++            let _ = from;
+             // Marks written before v10 carry no timestamp; age them from now so GC can retire them.
+             cache.kill_fence.stamp_unstamped(Utc::now());
+             self.compact_locked(&mut log, &cache)?;

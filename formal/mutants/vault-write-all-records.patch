@@ -1,0 +1,21 @@
+diff --git a/src/storage/vault_log.rs b/src/storage/vault_log.rs
+index 39eb08c..0459aa0 100644
+--- a/src/storage/vault_log.rs
++++ b/src/storage/vault_log.rs
+@@ -141,13 +141,10 @@ impl<V: Clone> Tracked<V> {
+     /// absent before and is absent now (inserted then removed) is not a change.
+     pub(super) fn changes(&self) -> Vec<(&String, Option<&V>)> {
+         let mut out = Vec::new();
+-        for (k, pre) in &self.touched {
+-            let cur = self.map.get(k);
+-            if cur.is_none() && pre.is_none() {
+-                continue;
+-            }
+-            out.push((k, cur));
++        for (k, cur) in &self.map {
++            out.push((k, Some(cur)));
+         }
++        let _ = &self.touched;
+         out
+     }
+ 
