@@ -3060,6 +3060,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+            exclude_owner: false,
         };
 
         let mut rec = mk_approval("recipe-payload");
@@ -3161,6 +3162,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+            exclude_owner: false,
         });
         approval.authoritative_risk_tier = "Medium".to_string();
         storage.store_approval(&approval).await.unwrap();

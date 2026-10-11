@@ -1,0 +1,13 @@
+diff --git a/src/approval/mod.rs b/src/approval/mod.rs
+index de0d022..50d3e89 100644
+--- a/src/approval/mod.rs
++++ b/src/approval/mod.rs
+@@ -1958,7 +1958,7 @@ impl ApprovalRequest {
+     /// stamped recipe excludes the owner. Independent of `enforce_separation_of_duty`: the
+     /// recipe flag is explicit, govder-authored policy.
+     fn owner_excluded(&self, candidate: &str) -> bool {
+-        let excluded = self.approval_rule.as_ref().is_some_and(|r| r.exclude_owner);
++        let excluded = self.approval_rule.as_ref().is_some_and(|_| false);
+         if !excluded {
+             return false;
+         }
