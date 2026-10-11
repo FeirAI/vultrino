@@ -1,0 +1,12 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index ada0d86..f59a202 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1879,7 +1879,6 @@ impl FileStorage {
+         if let Err(e) = durable {
+             // Best effort: take the unacknowledged line back out so the next reader does not
+             // treat it as committed (we hold the exclusive lock, the log ends at wal_offset).
+-            let _ = f.set_len(log.wal_offset);
+             let _ = f.sync_all();
+             return Err(e);
+         }

@@ -9,10 +9,11 @@ mod outbox_model;
 mod outbox_store;
 mod popkey_store;
 mod social;
+mod vault_log;
 
 pub use averin_deadletter::{AverinDeadLetterStore, QuarantineRecord, QuarantineStatus};
 pub use averin_queue::AverinQueue;
-pub use file::FileStorage;
+pub use file::{FileStorage, VaultIoStats};
 pub use outbox_store::OutboxStore;
 pub use popkey_store::{PopKeyEntry, PopKeyStore};
 pub use social::{

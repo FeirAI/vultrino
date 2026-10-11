@@ -1,0 +1,17 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index ada0d86..a67ed31 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -991,11 +991,7 @@ fn dead_marks(cache: &StorageCache, now: DateTime<Utc>) -> Vec<String> {
+     let live = cache
+         .approvals
+         .values()
+-        .filter(|a| {
+-            a.executing
+-                || (!a.executed
+-                    && !matches!(a.status(), ApprovalStatus::Denied | ApprovalStatus::Expired))
+-        })
++        .filter(|a| a.status().is_open())
+         .map(|a| a.kill_epoch_at_open.unwrap_or(0));
+     crate::policy::dead_kill_marks(
+         &cache.kill_fence,

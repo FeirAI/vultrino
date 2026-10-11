@@ -1,0 +1,50 @@
+//! Writes a REAL v9 vault (storage format 9, whole-vault rewrite) plus an expectations file.
+//! Run against the pre-WAL build: cargo run --example gen_v9_fixture -- <out_dir>
+use secrecy::SecretString;
+use vultrino::auth::{NewUseToken, UseToken};
+use vultrino::policy::Policy;
+use vultrino::storage::{FileStorage, StorageBackend};
+use vultrino::{Credential, CredentialData, Secret};
+
+#[tokio::main]
+async fn main() {
+    let out = std::path::PathBuf::from(std::env::args().nth(1).unwrap());
+    std::fs::create_dir_all(&out).unwrap();
+    let path = out.join("vault.enc");
+    let s = FileStorage::new(&path, &SecretString::from("fixture-pw")).await.unwrap();
+    let mut aliases = vec![];
+    for a in ["gh-main", "slack-bot"] {
+        s.store(&Credential::new(a.to_string(), CredentialData::ApiKey {
+            key: Secret::new(format!("sekret-{a}")),
+            header_name: "Authorization".into(),
+            header_prefix: "Bearer ".into(),
+        })).await.unwrap();
+        aliases.push(a);
+    }
+    let mut token_ids = vec![];
+    for i in 0..3 {
+        let (_p, t) = UseToken::create(NewUseToken {
+            name: format!("fixture-tok-{i}"), credential_scope: "*".into(), action_scope: None,
+            max_uses: Some(5), require_approval: false, expires_in: None,
+        });
+        token_ids.push(t.id.clone());
+        s.store_use_token(&t).await.unwrap();
+    }
+    s.store_policy(&Policy::allow_all("fixture-allow", "gh-*")).await.unwrap();
+    // A kill that is later lifted (leaves a mark) and a kill that stays stored.
+    let mut lifted = Policy::allow_all("lifted", "slack-*");
+    lifted.id = "kill-lifted".into(); lifted.kill = true;
+    s.store_policy(&lifted).await.unwrap();
+    s.delete_policy("kill-lifted").await.unwrap();
+    let mut live = Policy::allow_all("live", "gh-*");
+    live.id = "kill-live".into(); live.kill = true; live.principal_pattern = Some("agent-7".into());
+    s.store_policy(&live).await.unwrap();
+    let exp = serde_json::json!({
+        "password": "fixture-pw", "aliases": aliases, "token_ids": token_ids,
+        "policy_ids": ["kill-live"], "allow_policy_name": "fixture-allow",
+        "kill_epoch": s.kill_fence_epoch().await,
+        "lifted_mark_id": "kill-lifted", "live_kill_id": "kill-live",
+    });
+    std::fs::write(out.join("expected.json"), serde_json::to_string_pretty(&exp).unwrap()).unwrap();
+    println!("{exp}");
+}

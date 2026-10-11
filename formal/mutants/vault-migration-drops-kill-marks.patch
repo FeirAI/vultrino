@@ -1,0 +1,13 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 96b1d8c..f00222c 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1870,7 +1870,7 @@ impl FileStorage {
+             let from = log.snapshot_version;
+             self.backup_before_migration(from)?;
+             // Marks written before v10 carry no timestamp; age them from now so GC can retire them.
+-            cache.kill_fence.stamp_unstamped(Utc::now());
++            cache.kill_fence.marks.clear();
+             self.compact_locked(&mut log, &cache)?;
+             log.refresh_baselines(&cache);
+             tracing::info!(

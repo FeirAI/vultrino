@@ -8,6 +8,7 @@ use super::outbox_store::OutboxStore;
 #[cfg(test)]
 use super::popkey_store::PopKeyEntry;
 use super::popkey_store::PopKeyStore;
+use super::vault_log::{encode_record, parse_log, Op, ParsedLog, Tracked, KILL_MARKS};
 #[cfg(test)]
 use super::DraftReceipt;
 use super::{
@@ -48,10 +49,15 @@ const STALE_EXECUTING_SECS: i64 = 120;
 /// `#[serde(default)]`, so a v6 binary reads older vaults; an older binary is
 /// refused a v6 vault rather than silently dropping capabilities on its next write.
 ///
+/// v10 (P3-VAULT): the vault file becomes a snapshot stamped with `applied_seq`, and every
+/// committed mutation is one encrypted record appended to `<vault>.wal` (see [`super::vault_log`]).
+/// A v9 binary would read the snapshot, ignore the log and silently drop committed writes, so it is
+/// refused a v10 vault. A v9 (or older) vault is migrated one way on first open, with a backup.
+///
 /// v9 (P3-KILL): adds the `kill_fence` state (kill epoch + per-policy marks). An older
 /// binary is refused a v9 vault, so it can neither drop the marks on a write nor keep
 /// dispatching without the fence beside processes that run it.
-const STORAGE_VERSION: u32 = 9; // v9: durable kill fence (epoch + marks)
+const STORAGE_VERSION: u32 = 10; // v10: snapshot + write-ahead log (P3-VAULT)
 
 /// A reservation older than this (seconds) is assumed orphaned by a crashed
 /// request and may be re-reserved, so a single failed admin call can't block a
@@ -252,8 +258,50 @@ fn check_version(found: u32) -> Result<(), StorageError> {
     }
 }
 
+/// Deterministic I/O accounting for the vault file (P3-VAULT). Counts work, not time, so a benchmark
+/// or test can assert how much one admin write or one dispatch fence read touches as the vault
+/// grows. Cumulative since the handle was opened; take two snapshots and subtract.
+#[derive(Debug, Default)]
+struct IoCounters {
+    bytes_written: std::sync::atomic::AtomicU64,
+    fsyncs: std::sync::atomic::AtomicU64,
+    bytes_decrypted: std::sync::atomic::AtomicU64,
+    decrypts: std::sync::atomic::AtomicU64,
+    records_written: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time copy of the vault's [`IoCounters`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VaultIoStats {
+    /// Bytes written to vault files (snapshot, log, tmp files), after encryption and encoding.
+    pub bytes_written: u64,
+    /// fsync calls on vault files and their directory.
+    pub fsyncs: u64,
+    /// Plaintext bytes produced by decrypting vault data.
+    pub bytes_decrypted: u64,
+    /// Number of AES-GCM decrypt operations on vault data.
+    pub decrypts: u64,
+    /// Records (one per changed object) written. A whole-vault snapshot counts every record in it.
+    pub records_written: u64,
+}
+
+impl VaultIoStats {
+    /// `self - earlier`, saturating.
+    pub fn since(self, earlier: VaultIoStats) -> VaultIoStats {
+        VaultIoStats {
+            bytes_written: self.bytes_written.saturating_sub(earlier.bytes_written),
+            fsyncs: self.fsyncs.saturating_sub(earlier.fsyncs),
+            bytes_decrypted: self.bytes_decrypted.saturating_sub(earlier.bytes_decrypted),
+            decrypts: self.decrypts.saturating_sub(earlier.decrypts),
+            records_written: self.records_written.saturating_sub(earlier.records_written),
+        }
+    }
+}
+
 /// File-based storage with AES-256-GCM encryption
 pub struct FileStorage {
+    /// I/O accounting (see [`VaultIoStats`]).
+    io: IoCounters,
     /// Path to the storage file
     path: PathBuf,
     /// Master encryption key (Arc so the OutboxStore shares the SAME derived key — D2: the outbox
@@ -279,14 +327,18 @@ pub struct FileStorage {
     /// Pinned Argon2 KDF params the master key was derived with (#12), re-written on every save so
     /// the vault always reopens with the params it was created with — never a shifted crate default.
     kdf: crate::crypto::KdfParams,
-    /// Change token (mtime, len) of the on-disk vault as of the last decrypt INTO
-    /// `cache` by THIS process. `reload` skips the (expensive) whole-vault decrypt when
-    /// the file is byte-unchanged since then — so a broker poll that finds no new outbox
-    /// events doesn't re-decrypt every secret. `None` until the first load. Per-instance:
-    /// a sibling process's write bumps the file mtime, which this process detects on its
-    /// next reload. (STOPGAP for the read path — subsumed once the outbox moves to its own
-    /// store; see docs/dev/OUTBOX-OUT-OF-VAULT-MIGRATION.md.)
-    last_loaded: parking_lot::Mutex<Option<(std::time::SystemTime, u64)>>,
+    /// What this process knows of the snapshot and the log: the point `cache` is current to.
+    log: parking_lot::Mutex<LogState>,
+    /// Test-only crash injection (see `crash_point`).
+    #[cfg(test)]
+    fault: parking_lot::Mutex<Option<String>>,
+    /// Test-only: after every mutation, replay the files from scratch and require the result to
+    /// equal the in-memory state (catches any change that reached memory but not the log).
+    #[cfg(test)]
+    verify_replay: std::sync::atomic::AtomicBool,
+    /// Compact once the log passes `max(this, snapshot size)` bytes, so a write is amortised
+    /// O(record) and replay is bounded by twice the snapshot.
+    compact_min: std::sync::atomic::AtomicU64,
 }
 
 /// The outbox file lives alongside the vault (credentials.enc → outbox.enc), in the same data dir
@@ -457,33 +509,33 @@ struct IdempotencyRecord {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StorageCache {
     /// Credentials by ID
-    credentials: HashMap<String, Credential>,
+    credentials: Tracked<Credential>,
     /// Roles by ID
     #[serde(default)]
-    roles: HashMap<String, Role>,
+    roles: Tracked<Role>,
     /// API keys by ID
     #[serde(default)]
-    api_keys: HashMap<String, ApiKey>,
+    api_keys: Tracked<ApiKey>,
     /// Use tokens by ID
     #[serde(default)]
-    use_tokens: HashMap<String, UseToken>,
+    use_tokens: Tracked<UseToken>,
     /// Consumed workload assertion JTIs and their expiry. This is security
     /// state, not a cache: it is encrypted and mutated under the cross-process
     /// vault lock so a restart cannot reopen a replay window.
     #[serde(default)]
-    workload_jtis: HashMap<String, i64>,
+    workload_jtis: Tracked<i64>,
     #[serde(default)]
-    workload_grants: HashMap<String, serde_json::Value>,
+    workload_grants: Tracked<serde_json::Value>,
     /// Approval tokens by ID (delegate-agent authority, plan 031).
     #[serde(default)]
-    approval_tokens: HashMap<String, ApprovalToken>,
+    approval_tokens: Tracked<ApprovalToken>,
     /// Approval requests by ID
     #[serde(default)]
-    approvals: HashMap<String, ApprovalRequest>,
+    approvals: Tracked<ApprovalRequest>,
     /// Policies pushed via the admin API (V1), keyed by policy id. The server
     /// merges these with the static config policies into the live engine.
     #[serde(default)]
-    policies: HashMap<String, Policy>,
+    policies: Tracked<Policy>,
     /// The durable kill fence (P3-KILL): the kill epoch and the per-kill-policy marks,
     /// written in the same locked mutation as the kill policy and kept after a delete.
     #[serde(default)]
@@ -493,14 +545,14 @@ struct StorageCache {
     /// expose per-principal named tools. They carry no secret (a credential_ref
     /// alias only).
     #[serde(default)]
-    capabilities: HashMap<String, Capability>,
+    capabilities: Tracked<Capability>,
     /// Idempotency records for admin-API mutations, keyed by Idempotency-Key.
     #[serde(default)]
-    idempotency: HashMap<String, IdempotencyRecord>,
+    idempotency: Tracked<IdempotencyRecord>,
     /// Durable provider-native draft operations. These records are never
     /// reclaimed by age: a reserved operation may have fired remotely.
     #[serde(default)]
-    native_drafts: HashMap<String, NativeDraftRecord>,
+    native_drafts: Tracked<NativeDraftRecord>,
     /// LEGACY (v6): the signed event outbox used to live IN the vault. v7 moved it to its own file
     /// (OutboxStore). These two fields are retained ONLY so a v6 vault's outbox can be READ and
     /// drained on first v7 open (migrate_v6_outbox); they stay empty thereafter. Do not append here.
@@ -531,6 +583,202 @@ struct StorageCache {
     /// Index: approval token hash -> approval token ID
     #[serde(skip)]
     approval_token_hash_index: HashMap<String, String>,
+}
+
+/// The small block of vault state that is rewritten as a unit: the intent-staging queue and the
+/// legacy v6 outbox fields. Empty or tiny in steady state.
+#[derive(Serialize)]
+struct MiscRef<'a> {
+    pending_events: &'a Vec<StagedEvent>,
+    outbox: &'a std::collections::BTreeMap<u64, crate::outbox::OutboxEvent>,
+    outbox_seq: u64,
+}
+
+#[derive(Deserialize, Default)]
+struct MiscOwned {
+    #[serde(default)]
+    pending_events: Vec<StagedEvent>,
+    #[serde(default)]
+    outbox: std::collections::BTreeMap<u64, crate::outbox::OutboxEvent>,
+    #[serde(default)]
+    outbox_seq: u64,
+}
+
+fn ser_err(e: serde_json::Error) -> StorageError {
+    StorageError::Serialization(e.to_string())
+}
+
+impl StorageCache {
+    fn misc_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&MiscRef {
+            pending_events: &self.pending_events,
+            outbox: &self.outbox,
+            outbox_seq: self.outbox_seq,
+        })
+        .unwrap_or_default()
+    }
+
+    fn restore_misc(&mut self, bytes: &[u8]) {
+        let m: MiscOwned = serde_json::from_slice(bytes).unwrap_or_default();
+        self.pending_events = m.pending_events;
+        self.outbox = m.outbox;
+        self.outbox_seq = m.outbox_seq;
+    }
+
+    /// The records this mutation changed, as log ops. Touch-tracked collections report the keys
+    /// touched; the kill fence is diffed against the committed copy (its epoch and marks) and the
+    /// misc block is compared as bytes.
+    fn collect_ops(&self, log: &LogState) -> Result<Vec<Op>, StorageError> {
+        let mut ops: Vec<Op> = Vec::new();
+        crate::with_vault_secret_serialization(|| -> Result<(), StorageError> {
+            macro_rules! col {
+                ($f:ident, $name:expr) => {
+                    for (k, cur) in self.$f.changes() {
+                        ops.push(match cur {
+                            Some(v) => Op::Put {
+                                c: $name.into(),
+                                k: k.clone(),
+                                v: serde_json::to_value(v).map_err(ser_err)?,
+                            },
+                            None => Op::Del {
+                                c: $name.into(),
+                                k: k.clone(),
+                            },
+                        });
+                    }
+                };
+            }
+            col!(credentials, "credentials");
+            col!(roles, "roles");
+            col!(api_keys, "api_keys");
+            col!(use_tokens, "use_tokens");
+            col!(workload_jtis, "workload_jtis");
+            col!(workload_grants, "workload_grants");
+            col!(approval_tokens, "approval_tokens");
+            col!(approvals, "approvals");
+            col!(policies, "policies");
+            col!(capabilities, "capabilities");
+            col!(idempotency, "idempotency");
+            col!(native_drafts, "native_drafts");
+            Ok(())
+        })?;
+        let old = &log.committed_kill;
+        let new = &self.kill_fence;
+        if new.epoch != old.epoch {
+            ops.push(Op::KillEpoch { epoch: new.epoch });
+        }
+        for (id, mark) in &new.marks {
+            if old.marks.get(id) != Some(mark) {
+                ops.push(Op::Put {
+                    c: KILL_MARKS.into(),
+                    k: id.clone(),
+                    v: serde_json::to_value(mark).map_err(ser_err)?,
+                });
+            }
+        }
+        for id in old.marks.keys() {
+            if !new.marks.contains_key(id) {
+                ops.push(Op::Del {
+                    c: KILL_MARKS.into(),
+                    k: id.clone(),
+                });
+            }
+        }
+        let misc = self.misc_bytes();
+        if misc != log.misc_bytes {
+            ops.push(Op::Misc {
+                v: serde_json::from_slice(&misc).map_err(ser_err)?,
+            });
+        }
+        Ok(ops)
+    }
+
+    /// Apply one durable log op. An unknown collection is corruption, never skipped: a record
+    /// this build cannot place must not be silently dropped.
+    fn apply_op(&mut self, op: Op) -> Result<(), StorageError> {
+        fn de<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Result<T, StorageError> {
+            serde_json::from_value(v).map_err(ser_err)
+        }
+        let unknown = |c: &str| {
+            StorageError::Serialization(format!("vault log is corrupt: unknown collection {c:?}"))
+        };
+        match op {
+            Op::Put { c, k, v } => match c.as_str() {
+                "credentials" => self.credentials.insert_clean(k, de(v)?),
+                "roles" => self.roles.insert_clean(k, de(v)?),
+                "api_keys" => self.api_keys.insert_clean(k, de(v)?),
+                "use_tokens" => self.use_tokens.insert_clean(k, de(v)?),
+                "workload_jtis" => self.workload_jtis.insert_clean(k, de(v)?),
+                "workload_grants" => self.workload_grants.insert_clean(k, v),
+                "approval_tokens" => self.approval_tokens.insert_clean(k, de(v)?),
+                "approvals" => self.approvals.insert_clean(k, de(v)?),
+                "policies" => self.policies.insert_clean(k, de(v)?),
+                "capabilities" => self.capabilities.insert_clean(k, de(v)?),
+                "idempotency" => self.idempotency.insert_clean(k, de(v)?),
+                "native_drafts" => self.native_drafts.insert_clean(k, de(v)?),
+                KILL_MARKS => {
+                    self.kill_fence.marks.insert(k, de(v)?);
+                }
+                other => return Err(unknown(other)),
+            },
+            Op::Del { c, k } => match c.as_str() {
+                "credentials" => self.credentials.remove_clean(&k),
+                "roles" => self.roles.remove_clean(&k),
+                "api_keys" => self.api_keys.remove_clean(&k),
+                "use_tokens" => self.use_tokens.remove_clean(&k),
+                "workload_jtis" => self.workload_jtis.remove_clean(&k),
+                "workload_grants" => self.workload_grants.remove_clean(&k),
+                "approval_tokens" => self.approval_tokens.remove_clean(&k),
+                "approvals" => self.approvals.remove_clean(&k),
+                "policies" => self.policies.remove_clean(&k),
+                "capabilities" => self.capabilities.remove_clean(&k),
+                "idempotency" => self.idempotency.remove_clean(&k),
+                "native_drafts" => self.native_drafts.remove_clean(&k),
+                KILL_MARKS => {
+                    self.kill_fence.marks.remove(&k);
+                }
+                other => return Err(unknown(other)),
+            },
+            Op::KillEpoch { epoch } => self.kill_fence.epoch = epoch,
+            Op::Misc { v } => {
+                let m: MiscOwned = de(v)?;
+                self.pending_events = m.pending_events;
+                self.outbox = m.outbox;
+                self.outbox_seq = m.outbox_seq;
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_all(&mut self) {
+        self.credentials.rollback();
+        self.roles.rollback();
+        self.api_keys.rollback();
+        self.use_tokens.rollback();
+        self.workload_jtis.rollback();
+        self.workload_grants.rollback();
+        self.approval_tokens.rollback();
+        self.approvals.rollback();
+        self.policies.rollback();
+        self.capabilities.rollback();
+        self.idempotency.rollback();
+        self.native_drafts.rollback();
+    }
+
+    fn commit_all(&mut self) {
+        self.credentials.commit();
+        self.roles.commit();
+        self.api_keys.commit();
+        self.use_tokens.commit();
+        self.workload_jtis.commit();
+        self.workload_grants.commit();
+        self.approval_tokens.commit();
+        self.approvals.commit();
+        self.policies.commit();
+        self.capabilities.commit();
+        self.idempotency.commit();
+        self.native_drafts.commit();
+    }
 }
 
 impl StorageCache {
@@ -594,6 +842,23 @@ impl StorageCache {
     }
 
     /// Rebuild all secondary indexes from primary data
+    /// Number of stored records across every collection (the kill fence counts its marks).
+    fn record_count(&self) -> usize {
+        self.credentials.len()
+            + self.roles.len()
+            + self.api_keys.len()
+            + self.use_tokens.len()
+            + self.workload_jtis.len()
+            + self.workload_grants.len()
+            + self.approval_tokens.len()
+            + self.approvals.len()
+            + self.policies.len()
+            + self.kill_fence.marks.len()
+            + self.capabilities.len()
+            + self.idempotency.len()
+            + self.native_drafts.len()
+    }
+
     fn rebuild_indexes(&mut self) {
         // Clear existing indexes
         self.alias_index.clear();
@@ -663,9 +928,166 @@ struct StorageFile {
     /// is introduced. See [`crate::crypto::KdfParams`].
     #[serde(default)]
     kdf: crate::crypto::KdfParams,
+    /// The last write-ahead-log sequence this snapshot already contains (v10). Log records at or
+    /// below it are skipped on replay. 0 for a vault written before the log existed.
+    #[serde(default)]
+    applied_seq: u64,
     /// Encrypted data (credentials, roles, api_keys)
     #[serde(alias = "credentials")]
     data: EncryptedData,
+}
+
+/// Identity of a file on disk: modification time, length, inode. Any snapshot replacement is a
+/// rename of a new file, so a changed token means another writer compacted or re-keyed.
+type FileToken = (std::time::SystemTime, u64, u64);
+
+fn file_token(path: &Path) -> Option<FileToken> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    };
+    #[cfg(not(unix))]
+    let ino = 0u64;
+    Some((meta.modified().ok()?, meta.len(), ino))
+}
+
+/// What this process knows about the vault files. Guarded by a process-local mutex that is only
+/// taken while holding the cross-process lock.
+#[derive(Default)]
+struct LogState {
+    /// `cache` reflects the snapshot and log below.
+    loaded: bool,
+    /// Token of the snapshot `cache` was built from.
+    snap_token: Option<FileToken>,
+    snap_len: u64,
+    snapshot_version: u32,
+    /// Last log sequence reflected in `cache`.
+    applied_seq: u64,
+    /// Bytes of the log reflected in `cache`.
+    wal_offset: u64,
+    /// The committed kill fence, to diff against and to roll back to.
+    committed_kill: crate::policy::KillFenceState,
+    /// The committed serialized misc block (see [`StorageCache::misc_bytes`]).
+    misc_bytes: Vec<u8>,
+}
+
+impl LogState {
+    fn refresh_baselines(&mut self, cache: &StorageCache) {
+        self.committed_kill = cache.kill_fence.clone();
+        self.misc_bytes = cache.misc_bytes();
+    }
+}
+
+/// Compact the log into the snapshot once it exceeds this many bytes (and the snapshot's size).
+const DEFAULT_COMPACT_MIN_BYTES: u64 = 256 * 1024;
+
+/// The kill marks that are provably dead at `now` (see [`crate::policy::dead_kill_marks`]): the
+/// kill policy is no longer stored, the mark is past its grace, and no approval that can still be
+/// claimed was admitted before the mark's epoch.
+fn dead_marks(cache: &StorageCache, now: DateTime<Utc>) -> Vec<String> {
+    use crate::approval::ApprovalStatus;
+    let live = cache
+        .approvals
+        .values()
+        .filter(|a| {
+            a.executing
+                || (!a.executed
+                    && !matches!(a.status(), ApprovalStatus::Denied | ApprovalStatus::Expired))
+        })
+        .map(|a| a.kill_epoch_at_open.unwrap_or(0));
+    crate::policy::dead_kill_marks(
+        &cache.kill_fence,
+        |id| cache.policies.get(id).is_some_and(|p| p.kill),
+        live,
+        now,
+    )
+}
+
+impl FileStorage {
+    /// Vault garbage collection at an explicit clock: shed old terminal approval bodies, drop dead
+    /// use tokens, and drop provably dead kill marks. Returns `(bodies_shed, tokens_dropped,
+    /// marks_dropped)`. An idle vault writes nothing. Crate-private: a caller-chosen `now` in the
+    /// future would collect marks before their grace; production uses `gc_vault`.
+    pub(crate) async fn gc_vault_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(usize, usize, usize), StorageError> {
+        // Cheap cross-process pre-check (mirrors sweep_approval_lifecycle's `any_due`): reload so a
+        // SIBLING process's terminal approvals / dead tokens are visible (web + MCP share the vault),
+        // then scan the in-memory cache. If nothing is prunable, skip the lock and the write
+        // entirely so an idle vault is never churned. The authoritative prune re-checks under the lock.
+        self.reload().await?;
+        let any_prunable = {
+            let c = self.cache.read();
+            c.approvals
+                .values()
+                .any(|a| approval_result_body_prunable(a, now))
+                || c.use_tokens.values().any(|t| use_token_prunable(t, now))
+                || !dead_marks(&c, now).is_empty()
+        };
+        if !any_prunable {
+            return Ok((0, 0, 0));
+        }
+        self.locked_mutate(|cache| {
+            // Shed the large result_body of terminal approvals past the window (keep the audit row).
+            let ids: Vec<String> = cache
+                .approvals
+                .values()
+                .filter(|a| approval_result_body_prunable(a, now))
+                .map(|a| a.id.clone())
+                .collect();
+            let bodies_shed = ids.len();
+            for id in ids {
+                if let Some(a) = cache.approvals.get_mut(&id) {
+                    a.result_body = None;
+                }
+            }
+            // Drop dead use tokens past the grace, keeping the hash index consistent (mirrors
+            // delete_use_token). Collect ids first to avoid borrowing the map while removing.
+            let dead: Vec<(String, String)> = cache
+                .use_tokens
+                .values()
+                .filter(|t| use_token_prunable(t, now))
+                .map(|t| (t.id.clone(), t.token_hash.clone()))
+                .collect();
+            for (id, hash) in &dead {
+                cache.use_tokens.remove(id);
+                cache.use_token_hash_index.remove(hash);
+            }
+            let tokens_dropped = dead.len();
+            // Drop kill marks that can no longer refuse anything. The epoch is never lowered.
+            let marks = dead_marks(cache, now);
+            for id in &marks {
+                cache.kill_fence.marks.remove(id);
+            }
+            let marks_dropped = marks.len();
+            if bodies_shed > 0 || tokens_dropped > 0 || marks_dropped > 0 {
+                tracing::info!(
+                    bodies_shed,
+                    tokens_dropped,
+                    marks_dropped,
+                    "vault GC shed terminal approval result bodies, dropped dead use tokens and dead kill marks"
+                );
+            }
+            Ok((bodies_shed, tokens_dropped, marks_dropped))
+        })
+        .await
+    }
+}
+
+impl FileStorage {
+    /// Test and tooling hook: set the minimum log size before compaction.
+    #[cfg(test)]
+    pub(crate) fn set_compact_min_bytes(&self, bytes: u64) {
+        self.compact_min
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn compact_min_bytes(&self) -> u64 {
+        self.compact_min.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl FileStorage {
@@ -778,11 +1200,36 @@ impl FileStorage {
             cache: RwLock::new(StorageCache::default()),
             salt,
             kdf,
-            last_loaded: parking_lot::Mutex::new(None),
+            log: parking_lot::Mutex::new(LogState::default()),
+            #[cfg(test)]
+            fault: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            verify_replay: std::sync::atomic::AtomicBool::new(true),
+            compact_min: std::sync::atomic::AtomicU64::new(DEFAULT_COMPACT_MIN_BYTES),
+            io: IoCounters::default(),
         };
 
-        // Write initial empty storage (through the cross-process lock).
-        storage.locked_mutate(|_| Ok(())).await?;
+        // Write the initial empty snapshot under the cross-process lock. A second process racing to
+        // create the same vault may have won while this one derived its key: re-check under the
+        // lock and open what is there instead of overwriting it (a different salt would orphan it).
+        let raced = {
+            let mut flock = storage.lock_file()?;
+            let _guard = flock.write().map_err(StorageError::Io)?;
+            if storage.path.exists() {
+                true
+            } else {
+                let mut log = storage.log.lock();
+                let cache = storage.cache.read();
+                storage.compact_locked(&mut log, &cache)?;
+                log.refresh_baselines(&cache);
+                false
+            }
+        };
+        if raced {
+            let path = storage.path.clone();
+            drop(storage);
+            return Self::load(path, password, averin_enabled, strict).await;
+        }
 
         Ok(storage)
     }
@@ -812,29 +1259,32 @@ impl FileStorage {
         let kdf = storage_file.kdf;
         let master_key = Arc::new(derive_key(password, &salt, kdf)?);
 
-        // Decrypt + parse (tolerates the legacy credentials-only format)
-        let decrypted = decrypt(&storage_file.data, &master_key)?;
-        let cache = Self::parse_cache(&decrypted)?;
-
         let outbox = OutboxStore::new(outbox_path(&path), Arc::clone(&master_key));
-        let averin = if averin_enabled {
-            AverinStores::open(&path, &master_key, strict)?
-        } else {
-            None
-        };
-        let storage = Self {
+        // The averin stores are opened AFTER the snapshot decrypt below: opening replays the queue
+        // eagerly, and a wrong password must surface as a decrypt error, not as a corrupt queue.
+        let averin: Option<AverinStores> = None;
+        let mut storage = Self {
             path,
             master_key,
             outbox,
             averin,
-            cache: RwLock::new(cache),
+            cache: RwLock::new(StorageCache::default()),
             salt,
             kdf,
-            last_loaded: parking_lot::Mutex::new(None),
+            log: parking_lot::Mutex::new(LogState::default()),
+            #[cfg(test)]
+            fault: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            verify_replay: std::sync::atomic::AtomicBool::new(true),
+            compact_min: std::sync::atomic::AtomicU64::new(DEFAULT_COMPACT_MIN_BYTES),
+            io: IoCounters::default(),
         };
-        // Seed the change token so the first reload can skip a redundant decrypt of the
-        // file we just loaded (unless a write bumps its mtime first).
-        *storage.last_loaded.lock() = storage.file_change_token();
+        // Decrypt the snapshot, replay the log, and one-way migrate a pre-v10 vault (with a backup).
+        // A wrong password fails here, closed.
+        storage.bootstrap_locked()?;
+        if averin_enabled {
+            storage.averin = AverinStores::open(&storage.path, &storage.master_key, strict)?;
+        }
 
         // v6→v7 migration (D4, best-effort): a v6 vault carried the outbox INSIDE it. Drain those
         // events into the new outbox file (preserving their sequence so the broker cursor doesn't
@@ -1051,7 +1501,7 @@ impl FileStorage {
             let credentials: HashMap<String, Credential> = serde_json::from_slice(decrypted)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
             Ok::<_, StorageError>(StorageCache {
-                credentials,
+                credentials: Tracked::from_map(credentials),
                 ..Default::default()
             })
         })?;
@@ -1060,45 +1510,123 @@ impl FileStorage {
         Ok(cache)
     }
 
-    /// Read and decrypt the authoritative on-disk cache (blocking).
-    fn read_cache_from_disk_sync(&self) -> Result<StorageCache, StorageError> {
-        if !self.path.exists() {
-            return Ok(StorageCache::default());
-        }
+    /// Read and decrypt the vault snapshot (blocking). Returns the last log sequence the snapshot
+    /// already contains, the parsed state (log records NOT yet applied) and the snapshot's version.
+    fn read_snapshot(&self) -> Result<(u64, StorageCache, u32), StorageError> {
         let content = std::fs::read_to_string(&self.path)?;
         let storage_file: StorageFile = serde_json::from_str(&content)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         check_version(storage_file.version)?;
         let decrypted = decrypt(&storage_file.data, &self.master_key)?;
-        Self::parse_cache(&decrypted)
+        self.note_decrypt(decrypted.len());
+        let cache = Self::parse_cache(&decrypted)?;
+        Ok((storage_file.applied_seq, cache, storage_file.version))
     }
 
-    /// Encrypt and atomically write a cache to disk (blocking).
-    fn write_cache_to_disk_sync(&self, cache: &StorageCache) -> Result<(), StorageError> {
-        cache.validate_primary_shapes()?;
+    fn note_decrypt(&self, plaintext_len: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.io.decrypts.fetch_add(1, Relaxed);
+        self.io
+            .bytes_decrypted
+            .fetch_add(plaintext_len as u64, Relaxed);
+    }
+
+    fn note_log_decrypts(&self, parsed: &ParsedLog) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.io.decrypts.fetch_add(parsed.decrypts, Relaxed);
+        self.io
+            .bytes_decrypted
+            .fetch_add(parsed.decrypted_bytes, Relaxed);
+    }
+
+    /// A snapshot of the vault's cumulative I/O counters.
+    pub fn io_stats(&self) -> VaultIoStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        VaultIoStats {
+            bytes_written: self.io.bytes_written.load(Relaxed),
+            fsyncs: self.io.fsyncs.load(Relaxed),
+            bytes_decrypted: self.io.bytes_decrypted.load(Relaxed),
+            decrypts: self.io.decrypts.load(Relaxed),
+            records_written: self.io.records_written.load(Relaxed),
+        }
+    }
+
+    fn wal_path(&self) -> PathBuf {
+        self.path.with_extension("wal")
+    }
+
+    fn wal_len(&self) -> u64 {
+        std::fs::metadata(self.wal_path())
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Whether `cache` already reflects the committed files (no stat-visible change since).
+    fn is_current(&self, log: &LogState) -> bool {
+        if !log.loaded {
+            return false;
+        }
+        let tok = file_token(&self.path);
+        tok.is_some() && tok == log.snap_token && self.wal_len() == log.wal_offset
+    }
+
+    /// Test-only crash injection: fail at the named step, leaving the disk exactly as a process
+    /// death at that step would. Compiled out of non-test builds.
+    #[cfg(test)]
+    fn crash_point(&self, step: &str) -> Result<(), StorageError> {
+        let mut f = self.fault.lock();
+        if f.as_deref() == Some(step) {
+            *f = None;
+            return Err(StorageError::Io(std::io::Error::other(format!(
+                "injected crash at {step}"
+            ))));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn crash_point(&self, _step: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fault_armed(&self, step: &str) -> bool {
+        let mut f = self.fault.lock();
+        if f.as_deref() == Some(step) {
+            *f = None;
+            return true;
+        }
+        false
+    }
+
+    /// Encrypt `cache` as a snapshot stamped with `applied_seq` into `tmp` and fsync it (no rename).
+    /// Returns the snapshot's byte length.
+    fn write_snapshot_tmp(
+        &self,
+        cache: &StorageCache,
+        applied_seq: u64,
+        tmp: &Path,
+    ) -> Result<u64, StorageError> {
         let data = crate::with_vault_secret_serialization(|| serde_json::to_vec(cache))
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let encrypted = encrypt(&data, &self.master_key)?;
         let storage_file = StorageFile {
             version: STORAGE_VERSION,
             salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &self.salt),
-            // Re-persist the pinned KDF params on every save (write-on-save, per #12).
+            // Re-persist the pinned KDF params on every snapshot (write-on-save, per #12).
             kdf: self.kdf,
+            applied_seq,
             data: encrypted,
         };
         let content = serde_json::to_string_pretty(&storage_file)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        let temp_path = self.path.with_extension("tmp");
-        // fsync the tmp BEFORE the rename so the contents are durable, not just the directory entry —
-        // else a power-loss can expose the rename while the bytes are unflushed, corrupting the vault
-        // (catastrophic: every subsequent read fails). Lock-step with OutboxStore::write_to_disk.
+        // fsync the tmp BEFORE the rename so the contents are durable, not just the directory entry,
+        // else a power loss can expose the rename while the bytes are unflushed. The tmp is created
+        // 0600: the snapshot holds the cleartext KDF salt (an offline Argon2 target) and the encrypted
+        // secrets, and the final vault inherits the mode through the rename.
         {
-            // 0600: the vault holds the cleartext KDF salt (offline Argon2 target) and
-            // the encrypted secret material — it must not be group/world-readable under
-            // a permissive umask. Creating the temp at 0600 means the final vault file
-            // inherits it through the rename below (which carries the temp's mode),
-            // tightening even a pre-existing loose vault on the next save.
-            let f = super::outbox_store::create_private_file(&temp_path)?;
+            let f = super::outbox_store::create_private_file(tmp)?;
             use std::io::Write;
             let mut w = std::io::BufWriter::new(f);
             w.write_all(content.as_bytes())?;
@@ -1107,47 +1635,377 @@ impl FileStorage {
                 .map_err(|e| StorageError::Io(e.into_error()))?
                 .sync_all()?;
         }
-        std::fs::rename(&temp_path, &self.path)?;
-        // Make the rename crash-DURABLE (not just crash-atomic): fsync the parent dir, propagating a real
-        // error so a non-durable vault write fails loudly rather than silently committing. Lock-step with
-        // the outbox store's write path (an unsupported dir-fsync is downgraded to a warning there).
-        super::outbox_store::fsync_parent_dir(&self.path)?;
+        use std::sync::atomic::Ordering::Relaxed;
+        self.io
+            .bytes_written
+            .fetch_add(content.len() as u64, Relaxed);
+        self.io.fsyncs.fetch_add(1, Relaxed);
+        self.io
+            .records_written
+            .fetch_add(cache.record_count() as u64, Relaxed);
+        Ok(content.len() as u64)
+    }
+
+    fn fsync_dir(&self) -> Result<(), StorageError> {
+        self.io
+            .fsyncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::outbox_store::fsync_parent_dir(&self.path)
+    }
+
+    /// Replace the log with an empty one (tmp, fsync, rename, directory fsync).
+    fn reset_wal(&self) -> Result<(), StorageError> {
+        let wal = self.wal_path();
+        let tmp = wal.with_extension("wal.tmp");
+        let f = super::outbox_store::create_private_file(&tmp)?;
+        f.sync_all()?;
+        self.io
+            .fsyncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        drop(f);
+        self.crash_point("compact.after_wal_tmp")?;
+        std::fs::rename(&tmp, &wal)?;
+        self.fsync_dir()?;
+        self.crash_point("compact.after_wal_rename")?;
         Ok(())
     }
 
-    /// Perform a **cross-process atomic** read-modify-write of the storage file.
+    fn truncate_wal(&self, len: u64) -> Result<(), StorageError> {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(self.wal_path())?;
+        f.set_len(len)?;
+        f.sync_all()?;
+        self.io
+            .fsyncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Fold the log into a fresh snapshot and start an empty log. Caller holds the exclusive lock
+    /// and `cache` is current. Crash safety: the snapshot is stamped with the last sequence it
+    /// contains, so a crash before the log is reset leaves records that replay skips.
+    fn compact_locked(&self, log: &mut LogState, cache: &StorageCache) -> Result<(), StorageError> {
+        cache.validate_primary_shapes()?;
+        // Until this finishes the in-memory view of the files is not trusted.
+        log.loaded = false;
+        let tmp = self.path.with_extension("tmp");
+        let len = self.write_snapshot_tmp(cache, log.applied_seq, &tmp)?;
+        self.crash_point("compact.after_snapshot_tmp")?;
+        std::fs::rename(&tmp, &self.path)?;
+        self.fsync_dir()?;
+        self.crash_point("compact.after_snapshot_rename")?;
+        self.reset_wal()?;
+        log.snap_token = file_token(&self.path);
+        log.snap_len = len;
+        log.wal_offset = 0;
+        log.snapshot_version = STORAGE_VERSION;
+        log.loaded = true;
+        Ok(())
+    }
+
+    /// Bring `cache` up to the committed on-disk state. The caller holds the cross-process lock
+    /// (shared for a read, exclusive for a write; `exclusive` says which). When this process has
+    /// already seen the current snapshot, only the log records appended since are read and
+    /// decrypted; an unchanged vault costs two stats.
+    fn sync_locked(
+        &self,
+        log: &mut LogState,
+        cache: &mut StorageCache,
+        exclusive: bool,
+    ) -> Result<(), StorageError> {
+        if log.loaded {
+            let tok = file_token(&self.path);
+            if tok.is_some() && tok == log.snap_token {
+                let wal_len = self.wal_len();
+                if wal_len == log.wal_offset {
+                    return Ok(());
+                }
+                if wal_len > log.wal_offset {
+                    let applied = self.apply_log_tail(log, cache, exclusive);
+                    if applied.is_err() {
+                        log.loaded = false;
+                    }
+                    return applied;
+                }
+            }
+        }
+        self.full_load_locked(log, cache, exclusive)?;
+        if log.snapshot_version < STORAGE_VERSION {
+            log.loaded = false;
+            return Err(StorageError::Unavailable(format!(
+                "the vault was rewritten by an older build (format v{}) while this process was \
+                 running; stop every vultrino process sharing the vault and restart them all on \
+                 one build",
+                log.snapshot_version
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply the log records after `log.wal_offset` to `cache`.
+    fn apply_log_tail(
+        &self,
+        log: &mut LogState,
+        cache: &mut StorageCache,
+        exclusive: bool,
+    ) -> Result<(), StorageError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(self.wal_path())?;
+        f.seek(SeekFrom::Start(log.wal_offset))?;
+        let mut region = Vec::new();
+        f.read_to_end(&mut region)?;
+        let parsed = parse_log(&region, log.applied_seq, &self.master_key)?;
+        self.note_log_decrypts(&parsed);
+        if !parsed.records.is_empty() {
+            let applied: Result<(), StorageError> = (|| {
+                for (seq, ops) in parsed.records {
+                    for op in ops {
+                        cache.apply_op(op)?;
+                    }
+                    log.applied_seq = seq;
+                }
+                cache.validate_primary_shapes()
+            })();
+            if let Err(e) = applied {
+                // Records that failed validation must not stay reachable by lock-free readers:
+                // drop the whole view (readers see nothing, which denies) and force a full reload.
+                *cache = StorageCache::default();
+                log.loaded = false;
+                return Err(e);
+            }
+            cache.rebuild_indexes();
+            log.refresh_baselines(cache);
+        }
+        log.wal_offset += parsed.consumed as u64;
+        if parsed.torn_tail && exclusive {
+            self.truncate_wal(log.wal_offset)?;
+        }
+        Ok(())
+    }
+
+    /// Replace `cache` with the snapshot plus the whole log.
+    fn full_load_locked(
+        &self,
+        log: &mut LogState,
+        cache: &mut StorageCache,
+        exclusive: bool,
+    ) -> Result<(), StorageError> {
+        log.loaded = false;
+        let snap_tok = file_token(&self.path);
+        let (applied, mut fresh, version) = if snap_tok.is_some() {
+            self.read_snapshot()?
+        } else {
+            (0, StorageCache::default(), STORAGE_VERSION)
+        };
+        let bytes = match std::fs::read(self.wal_path()) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        if version < STORAGE_VERSION && !bytes.is_empty() {
+            // A log beside a pre-v10 snapshot is left over from a rollback (a v9 build never writes
+            // one). Replaying it would resurrect abandoned writes and undo lifted or applied kills.
+            return Err(StorageError::Unavailable(format!(
+                "the vault file {} is format v{version} but a write-ahead log {} exists beside it \
+                 (left over from a rollback). Refusing to replay it. If you rolled back on \
+                 purpose, stop every vultrino process, delete {} and start again; otherwise \
+                 restore the matching vault file and log together",
+                self.path.display(),
+                self.wal_path().display(),
+                self.wal_path().display()
+            )));
+        }
+        let parsed = parse_log(&bytes, applied, &self.master_key)?;
+        self.note_log_decrypts(&parsed);
+        let mut seq_now = applied;
+        for (seq, ops) in parsed.records {
+            for op in ops {
+                fresh.apply_op(op)?;
+            }
+            seq_now = seq;
+        }
+        fresh.validate_primary_shapes()?;
+        fresh.rebuild_indexes();
+        if parsed.torn_tail && exclusive {
+            self.truncate_wal(parsed.consumed as u64)?;
+        }
+        *cache = fresh;
+        log.applied_seq = seq_now;
+        log.wal_offset = parsed.consumed as u64;
+        log.snap_token = snap_tok;
+        log.snap_len = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        log.snapshot_version = version;
+        log.refresh_baselines(cache);
+        log.loaded = true;
+        Ok(())
+    }
+
+    /// Append one committed mutation to the log: write the line, fsync. Caller holds the exclusive
+    /// lock and has run `sync_locked`, so the log ends exactly at `log.wal_offset`.
+    fn append_record_locked(&self, log: &mut LogState, ops: Vec<Op>) -> Result<(), StorageError> {
+        use std::io::Write;
+        let seq = log.applied_seq + 1;
+        let record_count = ops.len() as u64;
+        let line = encode_record(seq, ops, &self.master_key)?;
+        self.crash_point("wal.before_append")?;
+        let wal = self.wal_path();
+        let created = !wal.exists();
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&wal)?;
+        if f.metadata()?.len() != log.wal_offset {
+            return Err(StorageError::Unavailable(
+                "vault log moved while the lock was held".into(),
+            ));
+        }
+        #[cfg(test)]
+        if self.fault_armed("wal.torn") {
+            f.write_all(&line[..line.len() / 2])?;
+            f.flush()?;
+            return Err(StorageError::Io(std::io::Error::other(
+                "injected crash at wal.torn",
+            )));
+        }
+        let durable = (|| -> Result<(), StorageError> {
+            f.write_all(&line)?;
+            self.crash_point("wal.after_write")?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = durable {
+            // Best effort: take the unacknowledged line back out so the next reader does not
+            // treat it as committed (we hold the exclusive lock, the log ends at wal_offset).
+            let _ = f.set_len(log.wal_offset);
+            let _ = f.sync_all();
+            return Err(e);
+        }
+        let mut syncs = 1;
+        if created {
+            self.fsync_dir()?;
+            syncs += 1;
+        }
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.io.bytes_written.fetch_add(line.len() as u64, Relaxed);
+            self.io.fsyncs.fetch_add(syncs, Relaxed);
+            self.io.records_written.fetch_add(record_count, Relaxed);
+        }
+        // A crash here is "committed, acknowledgement lost": the record is durable, this process's
+        // view is left behind, and the next sync reads the record as a foreign append.
+        self.crash_point("wal.after_fsync")?;
+        log.applied_seq = seq;
+        log.wal_offset += line.len() as u64;
+        Ok(())
+    }
+
+    /// Open-time step, under the exclusive lock: load the vault, then one-way migrate a pre-v10
+    /// vault (back it up first) to the snapshot-plus-log format.
+    fn bootstrap_locked(&self) -> Result<(), StorageError> {
+        let mut flock = self.lock_file()?;
+        let _guard = flock.write().map_err(StorageError::Io)?;
+        let mut log = self.log.lock();
+        let mut cache = self.cache.write();
+        self.full_load_locked(&mut log, &mut cache, true)?;
+        if log.snapshot_version < STORAGE_VERSION {
+            let from = log.snapshot_version;
+            self.backup_before_migration(from)?;
+            // Marks written before v10 carry no timestamp; age them from now so GC can retire them.
+            cache.kill_fence.stamp_unstamped(Utc::now());
+            self.compact_locked(&mut log, &cache)?;
+            log.refresh_baselines(&cache);
+            tracing::info!(
+                from_version = from,
+                to_version = STORAGE_VERSION,
+                "migrated the vault to the snapshot-plus-log format; the previous file is kept as a backup"
+            );
+        }
+        Ok(())
+    }
+
+    /// Copy the vault file to `<stem>.v<N>.bak` (atomically, 0600). An existing backup is kept: if
+    /// it already equals the current file nothing is written, otherwise the copy goes to a unique
+    /// `<stem>.v<N>.<unix-nanos>.bak` so the state written after a rollback is never lost.
+    fn backup_before_migration(&self, from_version: u32) -> Result<(), StorageError> {
+        let mut bak = self.path.with_extension(format!("v{from_version}.bak"));
+        if bak.exists() {
+            if std::fs::read(&bak)? == std::fs::read(&self.path)? {
+                return Ok(());
+            }
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            bak = self
+                .path
+                .with_extension(format!("v{from_version}.{nanos}.bak"));
+        }
+        let tmp = self.path.with_extension("bak.tmp");
+        {
+            let bytes = std::fs::read(&self.path)?;
+            let f = super::outbox_store::create_private_file(&tmp)?;
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(f);
+            w.write_all(&bytes)?;
+            w.flush()?;
+            w.into_inner()
+                .map_err(|e| StorageError::Io(e.into_error()))?
+                .sync_all()?;
+        }
+        std::fs::rename(&tmp, &bak)?;
+        self.fsync_dir()
+    }
+
+    /// Fold the log into the snapshot now (tests, offline maintenance).
+    pub async fn compact(&self) -> Result<(), StorageError> {
+        self.locked_mutate_inner(|_| Ok(()), true).await
+    }
+
+    /// Perform a **cross-process atomic** read-modify-write of the vault.
     ///
-    /// Acquires an exclusive advisory lock on a sidecar `.lock` file, then reads
-    /// the authoritative on-disk state, applies `f`, persists the result, and
-    /// refreshes the in-memory cache — all while holding the lock. This is what
-    /// makes the single-use-token check-and-increment and the approval
-    /// execution-claim atomic even though the web and MCP servers run as
-    /// separate processes sharing one encrypted file.
+    /// Takes the exclusive advisory lock on the sidecar `.lock` file, brings the in-memory state up
+    /// to the committed on-disk state (decrypting only the log records appended since this process
+    /// last looked), applies `f`, and commits ONLY the records `f` changed as one fsynced log
+    /// record. If `f` errors, or the commit fails, every change is rolled back in memory and
+    /// nothing is committed. This is what makes the single-use-token check-and-increment and the
+    /// approval execution-claim atomic even though the web and MCP servers run as separate
+    /// processes sharing one vault.
     ///
-    /// The lock acquisition + decrypt/encrypt + file I/O are all *blocking*. On a
-    /// multi-thread runtime (the web and MCP servers) we run them inside
-    /// [`tokio::task::block_in_place`], which hands the worker's other tasks to a
-    /// replacement thread so a held lock can't stall unrelated requests. On a
-    /// current-thread runtime (unit tests) `block_in_place` would panic, so we
-    /// run inline. The closure operates purely on the in-memory snapshot read
-    /// from disk and must not perform I/O.
+    /// The lock acquisition + decrypt/encrypt + file I/O are all *blocking*. On a multi-thread
+    /// runtime (the web and MCP servers) we run them inside [`tokio::task::block_in_place`], which
+    /// hands the worker's other tasks to a replacement thread so a held lock can't stall unrelated
+    /// requests. On a current-thread runtime (unit tests) `block_in_place` would panic, so we run
+    /// inline. The closure operates purely on the in-memory state and must not perform I/O.
     async fn locked_mutate<T>(
         &self,
         f: impl FnOnce(&mut StorageCache) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
+        self.locked_mutate_inner(f, false).await
+    }
+
+    async fn locked_mutate_inner<T>(
+        &self,
+        f: impl FnOnce(&mut StorageCache) -> Result<T, StorageError>,
+        force_compact: bool,
+    ) -> Result<T, StorageError> {
         use tokio::runtime::{Handle, RuntimeFlavor};
         match Handle::current().runtime_flavor() {
-            RuntimeFlavor::CurrentThread => self.locked_mutate_blocking(f),
-            _ => tokio::task::block_in_place(|| self.locked_mutate_blocking(f)),
+            RuntimeFlavor::CurrentThread => self.locked_mutate_blocking(f, force_compact),
+            _ => tokio::task::block_in_place(|| self.locked_mutate_blocking(f, force_compact)),
         }
     }
 
-    /// Read the authoritative on-disk state under the cross-process lock and apply
-    /// `f` to it, without writing (P3-KILL: the kill fence). Like
-    /// [`Self::locked_mutate`], and unlike the read-cache [`Self::reload`], it always
-    /// re-reads and decrypts the file under the lock and never trusts the
-    /// `(mtime, len)` change token, so a kill committed by any process before this
-    /// read is seen. The fresh state also refreshes this process's cache.
+    /// Read the committed state under the SHARED cross-process lock and apply `f` to it, without
+    /// writing (P3-KILL: the kill fence). It reads whatever any process committed before this
+    /// call: committed records are fsynced under the exclusive lock, and this read excludes every
+    /// writer, so it never sees a half-written record. It decrypts only the records appended
+    /// since this process last synced, and shared holders do not exclude each other, so
+    /// concurrent dispatches do not serialize on the vault.
     async fn locked_read<T>(&self, f: impl FnOnce(&StorageCache) -> T) -> Result<T, StorageError> {
         use tokio::runtime::{Handle, RuntimeFlavor};
         match Handle::current().runtime_flavor() {
@@ -1161,22 +2019,25 @@ impl FileStorage {
         &self,
         f: impl FnOnce(&StorageCache) -> T,
     ) -> Result<T, StorageError> {
-        let mut flock = self.lock_file_exclusive()?;
-        let _guard = flock.write().map_err(StorageError::Io)?;
-        let cache = self.read_cache_from_disk_sync()?;
-        let out = f(&cache);
-        *self.cache.write() = cache;
-        *self.last_loaded.lock() = self.file_change_token();
-        Ok(out)
+        let flock = self.lock_file()?;
+        let _guard = flock.read().map_err(StorageError::Io)?;
+        {
+            let mut log = self.log.lock();
+            if !self.is_current(&log) {
+                let mut cache = self.cache.write();
+                self.sync_locked(&mut log, &mut cache, false)?;
+            }
+        }
+        // The shared lock excludes every writer, in this process and others, so the state just
+        // synced cannot change while `f` reads it; concurrent readers share the cache read lock.
+        let cache = self.cache.read();
+        Ok(f(&cache))
         // `_guard` dropped here releases the lock.
     }
 
-    /// Acquire the exclusive cross-process advisory lock on the sidecar `.lock`
-    /// file (blocking). Returned guard releases the lock on drop. Shared by the
-    /// read-modify-write path ([`Self::locked_mutate_blocking`]) and the
-    /// read-into-cache reload path ([`Self::reload_blocking`]) so the two are
-    /// serialized against each other.
-    fn lock_file_exclusive(&self) -> Result<fd_lock::RwLock<std::fs::File>, StorageError> {
+    /// Open the sidecar `.lock` file (0600). Callers take it shared (`read`) or exclusive
+    /// (`write`); the lock is released when the returned handle's guard drops.
+    fn lock_file(&self) -> Result<fd_lock::RwLock<std::fs::File>, StorageError> {
         let lock_path = self.path.with_extension("lock");
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).read(true).write(true).truncate(false);
@@ -1190,100 +2051,147 @@ impl FileStorage {
         Ok(fd_lock::RwLock::new(lock_file))
     }
 
-    /// The blocking read-modify-write body of [`Self::locked_mutate`]. Holds the
-    /// advisory file lock for the whole cycle; must only be called off the async
-    /// reactor (via `block_in_place` or a current-thread runtime).
+    /// Undo an aborted mutation in memory.
+    fn rollback_locked(&self, log: &LogState, cache: &mut StorageCache) {
+        cache.rollback_all();
+        cache.kill_fence = log.committed_kill.clone();
+        cache.restore_misc(&log.misc_bytes);
+        cache.rebuild_indexes();
+    }
+
+    /// The blocking read-modify-write body of [`Self::locked_mutate`]. Holds the advisory file lock
+    /// for the whole cycle; must only be called off the async reactor.
     fn locked_mutate_blocking<T>(
         &self,
         f: impl FnOnce(&mut StorageCache) -> Result<T, StorageError>,
+        force_compact: bool,
     ) -> Result<T, StorageError> {
-        let mut flock = self.lock_file_exclusive()?;
+        let mut flock = self.lock_file()?;
         // Blocks until no other process/thread holds the lock.
         let _guard = flock.write().map_err(StorageError::Io)?;
+        let mut log = self.log.lock();
+        let mut cache = self.cache.write();
+        self.sync_locked(&mut log, &mut cache, true)?;
 
-        // Authoritative read from disk (not the possibly-stale in-memory cache).
-        let mut cache = self.read_cache_from_disk_sync()?;
-        let result = f(&mut cache)?;
-        self.write_cache_to_disk_sync(&cache)?;
-        *self.cache.write() = cache;
-        // Record the just-written file's change token so a following reload (which would
-        // see the new mtime) recognizes the cache is already current and skips a redundant
-        // decrypt of the state we just wrote.
-        *self.last_loaded.lock() = self.file_change_token();
+        // A panic inside `f` or the commit must not leave a half-applied change in the live cache
+        // (readers would see it, and the next write would commit it). Roll back, then re-raise.
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match f(&mut cache) {
+                Ok(r) => self
+                    .commit_locked(&mut log, &mut cache)
+                    .map(|_| r)
+                    .map_err(|e| (e, true)),
+                Err(e) => Err((e, false)),
+            }));
+        let result = match outcome {
+            Ok(Ok(r)) => r,
+            Ok(Err((e, _from_commit))) => {
+                self.rollback_locked(&log, &mut cache);
+                #[cfg(test)]
+                if !_from_commit {
+                    self.check_replay_equals(&cache);
+                }
+                return Err(e);
+            }
+            Err(payload) => {
+                self.rollback_locked(&log, &mut cache);
+                std::panic::resume_unwind(payload);
+            }
+        };
+        #[cfg(test)]
+        self.check_replay_equals(&cache);
+        let over = log.wal_offset > self.compact_min_bytes().max(log.snap_len);
+        if over || force_compact {
+            if let Err(e) = self.compact_locked(&mut log, &cache) {
+                if force_compact {
+                    return Err(e);
+                }
+                // The mutation is committed; a failed compaction only leaves a longer log.
+                tracing::warn!(error = %e, "vault compaction failed; the committed write is unaffected");
+                log.loaded = false;
+            }
+        }
         Ok(result)
         // `_guard` dropped here releases the lock.
     }
 
-    /// A cheap change token for the on-disk vault: `(mtime, len)`. `None` if the file
-    /// can't be stat'd (e.g. not yet created) — callers then always reload. Any write
-    /// goes through tmp + atomic rename, so a real change always bumps mtime; the target
-    /// filesystems (container ext4/overlayfs) have sub-second mtime resolution, so a
-    /// distinct write is never collapsed into an unchanged token.
-    ///
-    /// DEPLOYMENT CONSTRAINT (non-security): this read-cache skip relies on sub-second mtime
-    /// resolution. On a coarse-mtime mount (some NFS/overlay configs) two writes in the same tick that
-    /// re-encrypt to an identical length could collapse to the same token, delaying cross-process
-    /// visibility in the READ cache until the next length-changing write. This NEVER affects correctness:
-    /// every security-critical path (consume_use_token, claim_approval_for_execution, idempotency,
-    /// decide) runs under `locked_mutate`, which ALWAYS re-reads authoritative on-disk state under the fd
-    /// lock and ignores this token — so a stale read-cache can't cause token reuse, a double-claim, or an
-    /// admin-Deny bypass. Run on a sub-second-mtime filesystem; coarse-mtime mounts are unsupported.
-    fn file_change_token(&self) -> Option<(std::time::SystemTime, u64)> {
-        let meta = std::fs::metadata(&self.path).ok()?;
-        Some((meta.modified().ok()?, meta.len()))
-    }
-
-    /// The blocking body of [`Self::reload`]: read the authoritative on-disk
-    /// state into the in-memory cache.
-    ///
-    /// This takes the **same** exclusive advisory lock as
-    /// [`Self::locked_mutate_blocking`]. That serialization is load-bearing, not
-    /// incidental: without it, `reload`'s lock-free read-disk-then-assign-cache
-    /// could lose a concurrent mutation's update. Concretely — `reload` reads the
-    /// OLD disk snapshot, a `store_policy` (under the lock) then atomically
-    /// renames the new file into place and updates `self.cache`, and finally
-    /// `reload` overwrites `self.cache` with its stale snapshot. The just-stored
-    /// policy vanishes from the in-memory cache (it's still durable on disk) until
-    /// the next mutation or reload re-reads disk — exactly the "admin Deny bites
-    /// only intermittently" flicker under the periodic policy refresh. Holding the
-    /// lock makes the read-disk + assign-cache atomic w.r.t. any mutation, so a
-    /// committed write is never reverted.
-    fn reload_blocking(&self) -> Result<(), StorageError> {
-        let mut flock = self.lock_file_exclusive()?;
-        let _guard = flock.write().map_err(StorageError::Io)?;
-        // Read-cache: under the lock (so no write can race the stat→read), skip the
-        // whole-vault decrypt when the file is byte-unchanged (same mtime + len) since
-        // THIS process last loaded it — the in-memory cache is then already current. A
-        // broker poll that finds no new outbox events avoids decrypting every secret.
-        // Correctness: any mutation (append/store) bumps the file mtime (tmp + atomic
-        // rename) and goes through the SAME fd-lock, so a committed change is never
-        // skipped; an unchanged file means our cache already reflects it (we loaded it),
-        // so not overwriting it cannot revert anything (the invariant reload upholds).
-        if let Some(token) = self.file_change_token() {
-            if *self.last_loaded.lock() == Some(token) {
-                return Ok(());
+    /// Test-only invariant: a from-scratch replay of the files equals the in-memory state.
+    #[cfg(test)]
+    fn check_replay_equals(&self, cache: &StorageCache) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.verify_replay.load(Relaxed) || self.fault.lock().is_some() {
+            return;
+        }
+        let content = std::fs::read_to_string(&self.path).unwrap();
+        let sf: StorageFile = serde_json::from_str(&content).unwrap();
+        let mut fresh = Self::parse_cache(&decrypt(&sf.data, &self.master_key).unwrap()).unwrap();
+        let bytes = std::fs::read(self.wal_path()).unwrap_or_default();
+        let parsed = parse_log(&bytes, sf.applied_seq, &self.master_key).unwrap();
+        for (_, ops) in parsed.records {
+            for op in ops {
+                fresh.apply_op(op).unwrap();
             }
         }
-        let cache = self.read_cache_from_disk_sync()?;
-        *self.cache.write() = cache;
-        *self.last_loaded.lock() = self.file_change_token();
-        Ok(())
-        // `_guard` dropped here releases the lock.
+        fn norm(v: serde_json::Value) -> serde_json::Value {
+            use serde_json::Value;
+            match v {
+                Value::Array(items) => {
+                    let mut items: Vec<Value> = items.into_iter().map(norm).collect();
+                    // Set-valued fields (permissions) serialize in hash order.
+                    if items.iter().all(|i| i.is_string()) {
+                        items.sort_by_key(|i| i.as_str().unwrap_or_default().to_string());
+                    }
+                    Value::Array(items)
+                }
+                Value::Object(m) => {
+                    Value::Object(m.into_iter().map(|(k, v)| (k, norm(v))).collect())
+                }
+                other => other,
+            }
+        }
+        let a =
+            norm(crate::with_vault_secret_serialization(|| serde_json::to_value(&fresh)).unwrap());
+        let b =
+            norm(crate::with_vault_secret_serialization(|| serde_json::to_value(cache)).unwrap());
+        assert_eq!(
+            a, b,
+            "replaying the vault files differs from the in-memory state"
+        );
     }
 
-    /// Reload data from disk (for picking up external changes).
-    ///
-    /// Takes the cross-process advisory lock for the read so a committed
-    /// mutation's in-memory update can't be clobbered by a stale snapshot — see
-    /// [`Self::reload_blocking`]. Like [`Self::locked_mutate`], the lock + I/O are
-    /// blocking, so we run them under `block_in_place` on a multi-thread runtime
-    /// (web/MCP servers) and inline on a current-thread runtime (unit tests).
+    /// Persist what the mutation changed as one log record, then mark the changes durable.
+    fn commit_locked(
+        &self,
+        log: &mut LogState,
+        cache: &mut StorageCache,
+    ) -> Result<(), StorageError> {
+        cache.validate_primary_shapes()?;
+        let ops = cache.collect_ops(log)?;
+        if !ops.is_empty() {
+            self.append_record_locked(log, ops)?;
+        }
+        cache.commit_all();
+        log.refresh_baselines(cache);
+        Ok(())
+    }
+
+    /// Reload data from disk (for picking up external changes). Takes the SHARED lock, so it
+    /// cannot race a mutation, and costs two stats when nothing changed. A mutation's in-memory
+    /// update is never reverted: the committed log record it produced is part of what is read.
     pub async fn reload(&self) -> Result<(), StorageError> {
         use tokio::runtime::{Handle, RuntimeFlavor};
         match Handle::current().runtime_flavor() {
             RuntimeFlavor::CurrentThread => self.reload_blocking(),
             _ => tokio::task::block_in_place(|| self.reload_blocking()),
         }
+    }
+
+    fn reload_blocking(&self) -> Result<(), StorageError> {
+        let flock = self.lock_file()?;
+        let _guard = flock.read().map_err(StorageError::Io)?;
+        let mut log = self.log.lock();
+        let mut cache = self.cache.write();
+        self.sync_locked(&mut log, &mut cache, false)
     }
 
     /// Re-key the vault to a NEW master password (offline, single-sided — the vault master password
@@ -1343,22 +2251,27 @@ impl FileStorage {
     /// outbox fd-lock (taken inside [`OutboxStore::rekey_prepare`]) follows the same vault→outbox lock
     /// ordering the drain path uses, so it cannot deadlock.
     fn rekey_blocking(&self, new_password: &SecretString) -> Result<(), StorageError> {
-        let mut flock = self.lock_file_exclusive()?;
+        let mut flock = self.lock_file()?;
         let _guard = flock.write().map_err(StorageError::Io)?;
 
-        // 1. Decrypt the vault with the CURRENT master key (authoritative on-disk state; fails closed
-        //    on a newer-version vault via check_version).
-        let cache = self.read_cache_from_disk_sync()?;
+        // 1. Decrypt the vault with the CURRENT master key (authoritative on-disk state: the snapshot
+        //    plus the whole log; fails closed on a newer-version vault via check_version).
+        let mut log = self.log.lock();
+        let mut cache_guard = self.cache.write();
+        self.sync_locked(&mut log, &mut cache_guard, true)?;
+        let cache = &*cache_guard;
+        let applied_seq = log.applied_seq;
 
         // 2. Derive a fresh key: NEW password + NEW salt, SAME pinned KDF params (never reset — #12).
         let new_salt = generate_salt();
         let new_key = derive_key(new_password, &new_salt, self.kdf)?;
 
         // 3. Prepare the vault tmp (re-encrypted with the new key + new salt), fsynced, NOT yet renamed.
-        let data = crate::with_vault_secret_serialization(|| serde_json::to_vec(&cache))
+        let data = crate::with_vault_secret_serialization(|| serde_json::to_vec(cache))
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let encrypted = encrypt(&data, &new_key)?;
         let storage_file = StorageFile {
+            applied_seq, // the log is folded in; old-key records at or below this are skipped
             version: STORAGE_VERSION, // PRESERVED — key rotates, format does not
             salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &new_salt),
             kdf: self.kdf, // SAME pinned params
@@ -1421,6 +2334,11 @@ impl FileStorage {
         }
         std::fs::rename(&vault_tmp, &self.path)?;
         super::outbox_store::fsync_parent_dir(&self.path)?;
+        // The old-key log is now entirely folded into the new snapshot (every record is at or below
+        // `applied_seq` and is skipped on replay). Empty it so no old-key bytes linger. A crash
+        // before this is harmless for the same reason. This handle holds the old key and exits.
+        log.loaded = false;
+        self.reset_wal()?;
         Ok(())
     }
 }
@@ -1762,7 +2680,10 @@ impl StorageBackend for FileStorage {
         self.locked_mutate(move |cache| {
             let mut live_before = 0usize;
             let mut retired = 0usize;
-            for token in cache.use_tokens.values_mut() {
+            // Select first, then touch only the tokens that change: a record is only written to the
+            // log when it is actually revoked.
+            let mut to_retire: Vec<String> = Vec::new();
+            for token in cache.use_tokens.values() {
                 if token.tenant.as_deref() != Some(tenant.as_str())
                     || token.agent_label.as_deref() != Some(agent_label.as_str())
                 {
@@ -1776,8 +2697,13 @@ impl StorageBackend for FileStorage {
                 if keep.iter().any(|k| k == &token.id) {
                     continue;
                 }
-                token.revoked = true;
-                retired += 1;
+                to_retire.push(token.id.clone());
+            }
+            for id in to_retire {
+                if let Some(token) = cache.use_tokens.get_mut(&id) {
+                    token.revoked = true;
+                    retired += 1;
+                }
             }
             Ok((live_before, retired))
         })
@@ -2161,7 +3087,17 @@ impl StorageBackend for FileStorage {
                 // Collect events during the &mut iteration; push them after (can't
                 // borrow `cache` again while iterating its approvals).
                 let mut events: Vec<(String, &'static str, serde_json::Value)> = Vec::new();
-                for approval in cache.approvals.values_mut() {
+                // Only open or reauth-lapsing requests can transition; touch just those.
+                let candidates: Vec<String> = cache
+                    .approvals
+                    .values()
+                    .filter(|a| a.status().is_open() || a.needs_reauth())
+                    .map(|a| a.id.clone())
+                    .collect();
+                for cid in candidates {
+                    let Some(approval) = cache.approvals.get_mut(&cid) else {
+                        continue;
+                    };
                     match approval.advance_lifecycle() {
                         LifecycleChange::Escalated => {
                             sweep.escalated.push(approval.clone());
@@ -2439,55 +3375,8 @@ impl StorageBackend for FileStorage {
     }
 
     async fn gc_vault(&self) -> Result<(usize, usize), StorageError> {
-        // Cheap cross-process pre-check (mirrors sweep_approval_lifecycle's `any_due`): reload so a
-        // SIBLING process's terminal approvals / dead tokens are visible (web + MCP share the vault),
-        // then scan the in-memory cache. If nothing is prunable, skip the lock + re-encrypt + write
-        // entirely so an idle vault is never churned. The authoritative prune re-checks under the lock.
-        self.reload().await?;
-        let now = Utc::now();
-        let any_prunable = {
-            let c = self.cache.read();
-            c.approvals
-                .values()
-                .any(|a| approval_result_body_prunable(a, now))
-                || c.use_tokens.values().any(|t| use_token_prunable(t, now))
-        };
-        if !any_prunable {
-            return Ok((0, 0));
-        }
-        self.locked_mutate(|cache| {
-            let now = Utc::now();
-            // Shed the large result_body of terminal approvals past the window (keep the audit row).
-            let mut bodies_shed = 0usize;
-            for a in cache.approvals.values_mut() {
-                if approval_result_body_prunable(a, now) {
-                    a.result_body = None;
-                    bodies_shed += 1;
-                }
-            }
-            // Drop dead use tokens past the grace, keeping the hash index consistent (mirrors
-            // delete_use_token). Collect ids first to avoid borrowing the map while removing.
-            let dead: Vec<(String, String)> = cache
-                .use_tokens
-                .values()
-                .filter(|t| use_token_prunable(t, now))
-                .map(|t| (t.id.clone(), t.token_hash.clone()))
-                .collect();
-            for (id, hash) in &dead {
-                cache.use_tokens.remove(id);
-                cache.use_token_hash_index.remove(hash);
-            }
-            let tokens_dropped = dead.len();
-            if bodies_shed > 0 || tokens_dropped > 0 {
-                tracing::info!(
-                    bodies_shed,
-                    tokens_dropped,
-                    "vault GC shed terminal approval result bodies / dropped dead use tokens"
-                );
-            }
-            Ok((bodies_shed, tokens_dropped))
-        })
-        .await
+        let (bodies, tokens, _marks) = self.gc_vault_at(Utc::now()).await?;
+        Ok((bodies, tokens))
     }
 
     /// Periodic safety-net reconcile of intent-staged events (D1) — delegates to the inherent
@@ -3438,10 +4327,12 @@ mod tests {
             version: 6,
             salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &salt),
             kdf: crate::crypto::KdfParams::default(),
+            applied_seq: 0,
             data: encrypted,
         };
         let mut file_json = serde_json::to_value(&file).unwrap();
         file_json.as_object_mut().unwrap().remove("kdf"); // v6 predates the persisted KDF params
+        file_json.as_object_mut().unwrap().remove("applied_seq"); // and the write-ahead log
         std::fs::write(&path, serde_json::to_string_pretty(&file_json).unwrap()).unwrap();
 
         // Open via the real load path → check_version(6) accepts + migrate_v6_outbox runs.
@@ -3538,7 +4429,7 @@ mod tests {
     }
 
     /// Build a stored-ready approval; caller mutates status/executed/result_body/decided_at.
-    fn mk_approval(id_suffix: &str) -> ApprovalRequest {
+    pub(super) fn mk_approval(id_suffix: &str) -> ApprovalRequest {
         use crate::approval::{CriticalityClass, NewApproval, RequesterInfo};
         let (mut req, _tok) = ApprovalRequest::open(NewApproval {
             credential: "cred".to_string(),
@@ -3727,7 +4618,13 @@ mod tests {
             );
             storage.store(&cred).await.unwrap();
         }
-        let vault_before = std::fs::read(&path).unwrap();
+        // v10: the vault is the snapshot plus the write-ahead log; both must stay untouched.
+        let vault_bytes = |p: &std::path::Path| {
+            let mut b = std::fs::read(p).unwrap();
+            b.extend(std::fs::read(p.with_extension("wal")).unwrap_or_default());
+            b
+        };
+        let vault_before = vault_bytes(&path);
         assert!(
             vault_before.len() > 1000,
             "the aged secrets vault should be non-trivially large"
@@ -3742,7 +4639,7 @@ mod tests {
             assert_eq!(seq, i + 1);
         }
 
-        let vault_after = std::fs::read(&path).unwrap();
+        let vault_after = vault_bytes(&path);
         assert_eq!(
             vault_before, vault_after,
             "outbox append re-wrote credentials.enc — the O(secrets-vault-size) cliff is NOT decoupled"
@@ -4994,3 +5891,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "vault_tests.rs"]
+mod vault_tests;

@@ -323,24 +323,46 @@ The default backend is an **encrypted file vault**:
   (m=19456 KiB, t=2, p=1 for a new vault) stored in the file header as `kdf`; a
   vault with no `kdf` header uses those same values. The salt is stored in the
   file header (cleartext), the key is never stored.
-- **On-disk shape:** a JSON file with `version`, `salt`, and an encrypted blob
-  holding the cache (credentials, roles, API keys, use tokens, approvals, stored
-  policies, and idempotency records; since v7 the signed outbox lives OUTSIDE the
-  vault in its own encrypted file).
-- **Format version:** `STORAGE_VERSION = 9`. A vault whose recorded version is
-  **greater** than the binary understands is **refused** (`check_version`). A
-  newer binary reads older vaults (new fields use `#[serde(default)]`), but the
-  first write upgrades the on-disk format — after which an older binary sharing the
-  same vault is refused. **Upgrade all processes before writing.**
-  The v9 bump (durable kill fence) is one-way: back up the vault first, and stop
-  EVERY vultrino process sharing it before starting the fence build. A pre-v9
-  process that is still running keeps its loaded engine and does not know the
-  fence, so it can dispatch (notably `vk_` API-key and LLM-proxy calls, which take
-  no vault lock) after govder reports Contained; it is refused only where it takes
-  the vault lock. Rolling back to a pre-v9 build needs the vault backup.
+- **On-disk shape (v10):** the vault file is a JSON snapshot with `version`,
+  `salt`, `kdf`, `applied_seq` and an encrypted blob holding the cache (credentials,
+  roles, API keys, use tokens, approvals, stored policies, idempotency records and
+  the kill fence; since v7 the signed outbox lives OUTSIDE the vault in its own
+  encrypted file). Beside it, `<vault>.wal` is a write-ahead log: one line per
+  committed mutation, `{"seq","nonce","ct"}`, where the ciphertext holds only the
+  records that mutation changed (put or delete of one record of one collection, the
+  kill epoch, or the small intent-staging block). `seq` is contiguous; a record at
+  or below the snapshot's `applied_seq` is skipped without being decrypted.
+  A write is committed when its line is fsynced under the exclusive lock. When the
+  log passes the larger of 256 KiB and the snapshot size, the writer writes a new
+  snapshot (tmp, fsync, rename, directory fsync) stamped with the last sequence it
+  contains and then replaces the log with an empty one; a crash between the two
+  leaves a log the snapshot already contains, which replay skips. An unterminated
+  final line is a torn append (never acknowledged): readers ignore it and the next
+  writer truncates it. Any other damaged line fails the open closed.
+  Each process keeps its decrypted state and the position it has read to; under the
+  lock it reads only the log bytes after that position (a changed snapshot means
+  another process compacted or re-keyed, so it reloads in full). The (mtime, length,
+  inode) token and the log length are trusted to detect another process's commit, so
+  coarse-timestamp filesystems are unsupported (see LIMITATIONS).
+- **Format version:** `STORAGE_VERSION = 10`. A vault whose recorded version is
+  **greater** than the binary understands is **refused** (`check_version`), which
+  is what stops a v9 build from reading the v10 snapshot, ignoring the log and
+  overwriting committed writes. This build opens older vaults (new fields use
+  `#[serde(default)]`) and, on the first open, copies the old file to
+  `<vault>.v<N>.bak` (the extension of the vault file is replaced: `credentials.enc`
+  gives `credentials.v9.bak`; a differing existing backup is kept and the copy gets a
+  unique name) and migrates it to v10 (one way). A log file beside a pre-v10
+  snapshot is refused at open, never replayed. Stop EVERY vultrino process
+  sharing the vault before starting the new build: a v9 process still running keeps
+  its loaded engine and does not know the fence, so it can dispatch (notably `vk_`
+  API-key and LLM-proxy calls, which take no vault lock) after govder reports
+  Contained; it is refused only where it takes the vault lock. Rolling back needs
+  the backup (see LIMITATIONS).
 - **Cross-process safety:** every read-modify-write takes an **exclusive
   `fd-lock`** on a lock file, so the `web`, `mcp`, and CLI processes can share one
-  vault. Monotonic outbox sequences, token consumption, approval decisions, and
+  vault. The dispatch kill-fence read takes the same lock **shared**: it excludes
+  every writer (so it sees exactly the committed records, as the model's atomic
+  "read under the vault lock" step assumes) but not other readers. Monotonic outbox sequences, token consumption, approval decisions, and
   idempotency reservations are all atomic under this lock.
 
 Other backends (`keychain`, `vault`) are **declared in config but not

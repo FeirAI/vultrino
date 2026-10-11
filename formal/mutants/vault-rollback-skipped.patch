@@ -1,0 +1,12 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 2bb79b7..9f7dad4 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -2086,7 +2086,6 @@ impl FileStorage {
+         let result = match outcome {
+             Ok(Ok(r)) => r,
+             Ok(Err((e, _from_commit))) => {
+-                self.rollback_locked(&log, &mut cache);
+                 #[cfg(test)]
+                 if !_from_commit {
+                     self.check_replay_equals(&cache);

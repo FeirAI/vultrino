@@ -1,0 +1,15 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 96b1d8c..a39884e 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1962,8 +1962,8 @@ impl FileStorage {
+         &self,
+         f: impl FnOnce(&StorageCache) -> T,
+     ) -> Result<T, StorageError> {
+-        let flock = self.lock_file()?;
+-        let _guard = flock.read().map_err(StorageError::Io)?;
++        let mut flock = self.lock_file()?;
++        let _guard = flock.write().map_err(StorageError::Io)?;
+         {
+             let mut log = self.log.lock();
+             if !self.is_current(&log) {

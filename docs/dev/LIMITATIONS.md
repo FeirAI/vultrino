@@ -26,15 +26,24 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
 - **No cumulative spend / budget state.** SpendCap is **per-action and stateless**
   only — there is no ledger. Windowed budgets are a metering-plane concern returned
   as a pushed `Deny` policy.
-- **Every vault write rewrites the whole vault.** A write (a policy PUT or
-  delete, a credential, role, API-key or use-token change, an approval decision)
-  takes the cross-process file lock, decrypts the whole vault file, applies the
-  change, re-encrypts the whole file and renames it into place. The latency of a
-  write therefore grows with the size of the vault (credentials, use tokens,
-  approvals, policies), and writes are serialised. On a slow or emulated CI host
-  a policy PUT has taken longer than govder's 10 second client timeout.
-  Incremental vault writes (or a write-ahead log) are not built; measuring on
-  native hardware and choosing a design is phase-3 work.
+- **Vault writes append one record; a compaction still rewrites the whole vault.**
+  Since format v10 a write (a policy PUT or delete, a credential, role, API-key or
+  use-token change, an approval decision) takes the cross-process file lock,
+  catches up on the log records other processes appended, applies the change and
+  appends ONE encrypted record holding only the records it changed, then fsyncs it.
+  The bytes written and the decrypt work of a write do not grow with the vault
+  (counted by `cargo run --release --example vault_cost`, not timed). Bounds that
+  remain: when the log grows past the larger of 256 KiB and the snapshot size, the
+  write that crosses it also rewrites the whole snapshot (amortised constant, but
+  that one write is O(vault)); opening the vault decrypts the snapshot and replays
+  the log (at most about twice the snapshot); in-memory shape validation and the
+  kill-fence diff still walk the in-memory records on every write; the signed
+  outbox is a separate file that its own store still rewrites whole; and writes
+  are still serialised by the one lock. A newline-terminated log line that fails
+  to authenticate fails the open closed instead of being skipped: an operator must
+  inspect the log (a torn, unterminated final line from a crash is ignored and
+  truncated by the next writer). Latency on native arm64 and on the amd64 VPS has
+  not been measured by this change.
 - **Policy propagation across processes is bounded-staleness, not instant.** An
   admin policy push is synchronous on the web process but reaches the MCP server /
   other replicas only on the periodic refresh (`POLICY_REFRESH_SECS = 5`). For an
@@ -43,25 +52,68 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   wait for the refresh; ordinary Deny policies do, and `VULTRINO_POLICY_REFRESH_SECS`
   (1 to 86400) stretches that wait up to a day.
 - **Kill fence: one-way vault format and a mixed-build window.** The fence stores its
-  epoch in the vault (`STORAGE_VERSION` 9); an older binary refuses a v9 vault, so
-  back up the vault before the first fence start. Stop every vultrino process sharing
-  the vault before starting the fence build: an older process already running is not
-  fenced and can still dispatch after govder reports Contained (the model's
-  `KillFence_mixed_builds` counterexample), most plainly on lock-free `vk_` API-key and
-  LLM-proxy calls.
+  epoch in the vault (since `STORAGE_VERSION` 9, now 10); an older binary refuses a
+  newer vault, so the first start of this build backs the vault up (see below).
+  Stop every vultrino process sharing the vault before starting the fence build: an
+  older process already running is not fenced and can still dispatch after govder
+  reports Contained (the model's `KillFence_mixed_builds` counterexample), most
+  plainly on lock-free `vk_` API-key and LLM-proxy calls. A v9 process that rewrites
+  the vault under a running v10 process is detected at the v10 process's next
+  vault read and refused (fail closed), but only after the v9 process has written.
+- **Vault format v10 is one-way, with a backup.** The first open of a v9 or older
+  vault copies the vault file to `<vault>.v9.bak` (the version it found; atomic,
+  owner-only; an existing backup is never overwritten: if it differs, the copy goes
+  to `<vault>.v9.<unix-nanos>.bak`) and rewrites it as a snapshot plus an empty log.
+  The file names replace the extension of the vault file: for `credentials.enc` they
+  are `credentials.wal` and `credentials.v9.bak`. To roll back: stop every process,
+  delete `credentials.wal`, restore `credentials.v9.bak` over `credentials.enc` and
+  start the v9 build; every write made after the migration is lost. If the log is
+  left behind, the next open of the restored v9 file refuses to start (a log beside a
+  pre-v10 snapshot is never replayed) and names the file to delete. A backup of a v10
+  vault must copy the vault file and its `.wal` together, with the processes stopped
+  (or under the lock).
+- **Vault change detection and lock behaviour.** Another process's commit is noticed
+  through the snapshot's (mtime, length, inode) token plus the log length; a
+  filesystem with coarse timestamps is unsupported (this now covers writes and the
+  fence, not only the read cache). `flock` does not prefer a waiting writer, so
+  under sustained overlapping dispatches a kill write can wait without bound against
+  the caller's timeout. In-process lock-free readers (`get`, `get_by_alias`,
+  `get_policy`, the fence epoch) block for one log fsync per write and for a
+  whole-snapshot encrypt and fsync on the write that triggers compaction; a fence
+  catch-up after a foreign write validates and re-indexes the whole vault under the
+  in-process cache lock (O(vault) CPU, no decrypt beyond the new records). A failed
+  append is taken back out of the log on a best-effort basis; if that also fails the
+  line may be read as committed.
 - **Kill fence cost.** Every dispatch, including `vk_` and streamed LLM-proxy calls that
-  were lock-free before, now takes the exclusive cross-process vault lock and decrypts
-  the vault, so dispatches across processes serialize. Not measured.
+  were lock-free before, takes the cross-process vault lock SHARED and reads only the
+  log records appended since the process last looked: an unchanged vault costs two
+  stats and no decrypt, and dispatches do not serialise against each other, only
+  against a writer. A burst of writes by other processes makes the next fence read
+  decrypt those records (and rebuild the in-memory indexes). Latency is not measured.
 - **Kill marks are keyed by policy id.** Re-storing a kill policy id with a narrower
   or retargeted pattern overwrites its mark, so work admitted before the original kill
   and no longer matched can run after a later lift. govder's ids are per-target; an
   admin-edited kill policy is not covered.
-- **Kill marks are never garbage-collected.** Each kill policy id keeps its mark
-  (id, patterns, epoch) in the vault for as long as the vault exists, and the kill
-  epoch only rises; lifting a kill (deleting the policy) does not remove its mark.
-  The vault, and so the work done under its exclusive lock on every dispatch, grows
-  with the number of distinct kill policy ids ever stored. The marks are small, but
-  the growth is unbounded and unmeasured; collecting them is wave-3 work (P3-VAULT).
+- **Kill marks are garbage-collected by a bounded rule.** The periodic vault GC drops
+  a mark only when its kill policy is no longer stored as a kill, the mark is at
+  least 24 hours old, and no approval that can still be claimed was admitted at an
+  epoch below the mark's (an approval with no recorded epoch counts as 0). The
+  epoch is never lowered. Marks from before v10 are stamped at migration and age out
+  24 hours after it; a mark with no timestamp is never collected. The 24 hour grace
+  is the only protection for a live call in flight inside one process (its admission
+  epoch is in memory only): a request that stalls for more than 24 hours between
+  admission and dispatch could run after its mark was collected.
+  The grace compares the storing process's wall clock with the collecting process's
+  wall clock, so a clock that steps forward, or a host that was behind when the kill
+  was stored, shortens the effective grace. The govder TLA+ model
+  `formal/tla/KillFence.tla` models the fence as an epoch comparison that is never
+  collected (it has no marks and no collection), so its `NoStaleDispatch` property
+  does not cover a collected mark.
+- **A fence read that catches up after a foreign write still revalidates the whole
+  vault in memory.** It decrypts only the new records, but runs shape validation and
+  index rebuild over every record while holding the in-process cache write lock. In a
+  web plus MCP deployment where every dispatch writes a use token, most fence reads
+  in the other process pay this. The vault cost counters count decrypts only.
 - **At-most-once execution sacrifices automatic recovery after an ambiguous
   crash.** Reserve → operate → complete are not one external transaction. If a
   worker disappears after claiming an approved action, a stale claim is finalized
