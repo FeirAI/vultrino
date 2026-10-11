@@ -40,6 +40,10 @@ pub struct KillMark {
     pub principal_pattern: Option<String>,
     /// The kill epoch this store produced.
     pub epoch: u64,
+    /// When the kill policy was stored. Marks written before v10 carry none and are stamped at
+    /// migration; a mark with no timestamp is never garbage-collected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The fence state kept in the vault.
@@ -68,10 +72,65 @@ impl KillFenceState {
                 credential_pattern: policy.credential_pattern.clone(),
                 principal_pattern: policy.principal_pattern.clone(),
                 epoch: self.epoch,
+                stored_at: Some(chrono::Utc::now()),
             },
         );
         Some(self.epoch)
     }
+
+    /// Give every mark that has no timestamp one (the v10 migration), so garbage collection can
+    /// age it. Returns how many were stamped.
+    pub fn stamp_unstamped(&mut self, now: chrono::DateTime<chrono::Utc>) -> usize {
+        let mut n = 0;
+        for mark in self.marks.values_mut() {
+            if mark.stored_at.is_none() {
+                mark.stored_at = Some(now);
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+/// A kill mark older than this (and otherwise dead, see [`dead_kill_marks`]) is garbage-collected.
+/// It must exceed the longest time work can sit between its admission (the epoch snapshot taken
+/// before policy evaluation) and its dispatch. Approvals are tracked explicitly, so this bounds the
+/// only other holder of an admission epoch: a live request in flight inside one process. 24 hours is
+/// orders of magnitude above any request timeout.
+pub const KILL_MARK_GC_GRACE_SECS: i64 = 24 * 60 * 60;
+
+/// The ids of kill marks that can be dropped without ever re-admitting killed work.
+///
+/// A mark can only refuse work whose admission epoch is lower than the mark's epoch, and only
+/// while no stored kill policy already refuses the work outright. So a mark is dead when ALL hold:
+///
+/// 1. its kill policy is no longer stored as a kill (it was lifted or replaced),
+/// 2. it carries a `stored_at` at least [`KILL_MARK_GC_GRACE_SECS`] old, and
+/// 3. no live admission could still be refused by it: every admission epoch in `live_admitted`
+///    (one per approval that has not finished and can still be claimed) is at or above the mark's
+///    epoch.
+///
+/// A mark with no timestamp, a mark whose policy is still a stored kill, and a mark an older live
+/// admission still depends on are all kept. The kill epoch itself is never lowered.
+pub fn dead_kill_marks(
+    state: &KillFenceState,
+    is_stored_kill: impl Fn(&str) -> bool,
+    live_admitted: impl IntoIterator<Item = u64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let oldest_live = live_admitted.into_iter().min();
+    state
+        .marks
+        .iter()
+        .filter(|(id, mark)| {
+            !is_stored_kill(id)
+                && mark
+                    .stored_at
+                    .is_some_and(|t| (now - t).num_seconds() >= KILL_MARK_GC_GRACE_SECS)
+                && oldest_live.is_none_or(|e| e >= mark.epoch)
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// What the fence is asked about: the work's credential, its principal, and the

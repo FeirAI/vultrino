@@ -40,6 +40,12 @@ struct Row {
     token_write: VaultIoStats,
     dispatch_fence: VaultIoStats,
     provision_40: VaultIoStats,
+    /// Total bytes written per write while building the vault up to N tokens (includes any
+    /// compaction, so it shows the amortised cost).
+    build_bytes_per_write: u64,
+    /// A second handle on the same vault (standing in for a second process) running its fence
+    /// check right after the first handle wrote one record.
+    fence_after_foreign_write: VaultIoStats,
 }
 
 async fn measure(n: usize, k: usize) -> Row {
@@ -48,14 +54,24 @@ async fn measure(n: usize, k: usize) -> Row {
     let s = FileStorage::new(&path, &SecretString::from("pw"))
         .await
         .unwrap();
+    let build_start = s.io_stats();
+    let mut build_writes = 0u64;
     for i in 0..n {
         s.store_use_token(&token(i)).await.unwrap();
+        build_writes += 1;
         if i % 10 == 0 {
             s.store_policy(&Policy::allow_all(&format!("p{i}"), "gh-*"))
                 .await
                 .unwrap();
+            build_writes += 1;
         }
     }
+    let build_bytes_per_write = s
+        .io_stats()
+        .since(build_start)
+        .bytes_written
+        .checked_div(build_writes)
+        .unwrap_or(0);
     for i in 0..k {
         // store then lift: the mark stays behind
         let p = kill_policy(i);
@@ -82,7 +98,26 @@ async fn measure(n: usize, k: usize) -> Row {
         s.store_use_token(&token(n + 10 + i)).await.unwrap();
     }
     let e = s.io_stats();
+    // Second handle: open (full load), then watch what one foreign write costs it.
+    let s2 = FileStorage::new(&path, &SecretString::from("pw"))
+        .await
+        .unwrap();
+    s.store_policy(&Policy::allow_all("foreign", "foreign-*"))
+        .await
+        .unwrap();
+    let f0 = s2.io_stats();
+    let _ = s2
+        .kill_fence_check(&KillFenceQuery {
+            credential_alias: "gh-main",
+            principal: None,
+            admitted_epoch: 0,
+        })
+        .await
+        .unwrap();
+    let f1 = s2.io_stats();
     Row {
+        build_bytes_per_write,
+        fence_after_foreign_write: f1.since(f0),
         n,
         k,
         policy_write: b.since(a),
@@ -117,7 +152,9 @@ async fn main() {
                 };
                 serde_json::json!({"tokens": r.n, "kill_marks": r.k,
                     "policy_write": f(r.policy_write), "token_write": f(r.token_write),
-                    "dispatch_fence": f(r.dispatch_fence), "provision_40": f(r.provision_40)})
+                    "dispatch_fence": f(r.dispatch_fence), "provision_40": f(r.provision_40),
+                    "build_bytes_per_write": r.build_bytes_per_write,
+                    "fence_after_foreign_write": f(r.fence_after_foreign_write)})
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
@@ -127,6 +164,7 @@ async fn main() {
         "{:>6} {:>5} | {:>10} {:>8} {:>10} {:>5} | {:>10} {:>10} {:>5} | {:>12} {:>12}",
         "tokens", "marks", "wr_bytes", "wr_recs", "wr_decrypt", "fsync", "fence_dec", "fence_dcnt", "", "prov40_bytes", "prov40_dec"
     );
+    println!("build_B/write = average bytes written per write while building the vault (incl. compaction); foreign_dec = plaintext bytes a second handle decrypts for one fence check right after another handle wrote one record");
     for r in &rows {
         println!(
             "{:>6} {:>5} | {:>10} {:>8} {:>10} {:>5} | {:>10} {:>10} {:>5} | {:>12} {:>12}",
@@ -141,6 +179,12 @@ async fn main() {
             "",
             r.provision_40.bytes_written,
             r.provision_40.bytes_decrypted
+        );
+        println!(
+            "         build_B/write={:>8}  foreign_dec={:>8} ({} decrypts)",
+            r.build_bytes_per_write,
+            r.fence_after_foreign_write.bytes_decrypted,
+            r.fence_after_foreign_write.decrypts
         );
     }
 }

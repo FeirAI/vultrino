@@ -7,6 +7,7 @@ mod averin_queue;
 mod file;
 mod outbox_model;
 mod outbox_store;
+mod vault_log;
 mod popkey_store;
 mod social;
 
