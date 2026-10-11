@@ -1,0 +1,12 @@
+diff --git a/src/approval/mod.rs b/src/approval/mod.rs
+index de0d022..c2aa2ac 100644
+--- a/src/approval/mod.rs
++++ b/src/approval/mod.rs
+@@ -1937,6 +1937,7 @@ impl ApprovalRequest {
+         // approve it (Solo: the owner is the only human approver). A recipe that wants
+         // "someone other than the owner" sets `exclude_owner` (see `owner_excluded`).
+         let identities = [
++            self.requester.owner.as_deref(),
+             self.requester.principal_name.as_deref(),
+             self.agent_label.as_deref(),
+             self.principal_id.as_deref(),
