@@ -1194,3 +1194,78 @@ async fn a_failed_append_does_not_leave_an_acknowledged_looking_record() {
     assert!(reader.get_by_alias("failed").await.unwrap().is_none());
     assert!(reader.get_by_alias("kept").await.unwrap().is_some());
 }
+
+// ------------------------------------------------------------- panic atomicity
+
+/// A panic inside a mutation closure must leave neither the live view nor the next commit with
+/// the half-applied change: a panic in the middle of a kill lift must not become a lift.
+#[tokio::test]
+async fn a_panic_inside_a_mutation_rolls_back_and_never_commits() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let s = std::sync::Arc::new(open(&path).await);
+    s.store_policy(&kill("halt:x", "gh-*")).await.unwrap();
+    let epoch0 = 0;
+
+    let s2 = std::sync::Arc::clone(&s);
+    let joined = tokio::spawn(async move {
+        let _: Result<(), StorageError> = s2
+            .locked_mutate(|c| {
+                c.policies.remove("halt:x");
+                if c.policies.is_empty() {
+                    panic!("injected panic mid-lift");
+                }
+                Ok(())
+            })
+            .await;
+    })
+    .await;
+    assert!(joined.unwrap_err().is_panic());
+
+    // The live view still has the kill.
+    assert!(s.get_policy("halt:x").await.unwrap().is_some());
+    assert!(!s
+        .kill_fence_check(&q("gh-main", epoch0))
+        .await
+        .unwrap()
+        .is_clear());
+
+    // An unrelated successful write must not commit the abandoned lift.
+    s.store_use_token(&token(1)).await.unwrap();
+    assert!(s.get_policy("halt:x").await.unwrap().is_some());
+    drop(s);
+    let r = open(&path).await;
+    assert!(
+        r.get_policy("halt:x").await.unwrap().is_some(),
+        "the kill was lost through a panicked mutation"
+    );
+    assert!(!r
+        .kill_fence_check(&q("gh-main", epoch0))
+        .await
+        .unwrap()
+        .is_clear());
+}
+
+// ------------------------------------------------------------- wrong password with averin
+
+/// The password is verified (snapshot decrypt) before the averin queue is replayed, so a wrong
+/// password with a non-empty queue is a decrypt error, never a "corrupt queue" claim.
+#[tokio::test]
+async fn a_wrong_password_with_averin_enabled_is_a_decrypt_error() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    {
+        let s = FileStorage::new_with_averin(&path, &SecretString::from(PW), true)
+            .await
+            .unwrap();
+        s.averin_queue()
+            .unwrap()
+            .append("tok-1", "averin.use", serde_json::json!({"n": 1}))
+            .unwrap();
+    }
+    let r = FileStorage::new_with_averin(&path, &SecretString::from("wrong"), true).await;
+    assert!(
+        matches!(r, Err(StorageError::Encryption(_))),
+        "expected a decrypt error"
+    );
+}

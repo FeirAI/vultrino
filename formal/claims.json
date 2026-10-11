@@ -477,6 +477,9 @@
     },
     "vault-failed-append-line-kept": {
       "tier": "full"
+    },
+    "vault-panic-skips-rollback": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -2517,7 +2520,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_mutate_blocking",
-          "sha256": "dc1a6473c272f6a1666a94809f58752179dcd487efd058fcca009eb04968cc50"
+          "sha256": "3ae544e058bf0acd53dff00616ce91ae044daf0fd99f13cdb72c0622d294cdbd"
         },
         {
           "path": "src/storage/file.rs",
@@ -2549,7 +2552,7 @@
     },
     {
       "id": "vault-log-crash-consistency",
-      "statement": "A vultrino process that dies at any step of a vault log append or compaction leaves a vault that reopens with every acknowledged write present and no torn record. For a kill-policy write (three changes: the policy, the kill epoch, the mark) killed before the append, after half a line, after a full unsynced line and after the fsync with the acknowledgement lost, the reopened vault has all three changes or none, still holds the earlier credential, tokens and epoch, and accepts and persists a further write. A torn (unterminated) tail is ignored by a reader without modifying the file, is truncated by the next writer, and never appears as a record. A crash at each of the four compaction steps, and between the snapshot rename and the log reset (where the log still holds records the snapshot already folded in), reopens with nothing lost and continues the sequence. A missing, reordered or bit-flipped terminated record fails the open closed. Rekey folds the log, never decrypts old-key records, and a crash between its rename and the log reset still opens under the new password. A crash during the v9 migration at three steps reopens with every record. A write whose append or fsync fails in a live process takes its line back out of the log (best effort), so the next reader does not treat it as committed. A process that loses the race to create a fresh vault opens the winner's vault instead of overwriting it.",
+      "statement": "A vultrino process that dies at any step of a vault log append or compaction leaves a vault that reopens with every acknowledged write present and no torn record. For a kill-policy write (three changes: the policy, the kill epoch, the mark) killed before the append, after half a line, after a full unsynced line and after the fsync with the acknowledgement lost, the reopened vault has all three changes or none, still holds the earlier credential, tokens and epoch, and accepts and persists a further write. A torn (unterminated) tail is ignored by a reader without modifying the file, is truncated by the next writer, and never appears as a record. A crash at each of the four compaction steps, and between the snapshot rename and the log reset (where the log still holds records the snapshot already folded in), reopens with nothing lost and continues the sequence. A missing, reordered or bit-flipped terminated record fails the open closed. Rekey folds the log, never decrypts old-key records, and a crash between its rename and the log reset still opens under the new password. A crash during the v9 migration at three steps reopens with every record. A write whose append or fsync fails in a live process takes its line back out of the log (best effort), so the next reader does not treat it as committed. A process that loses the race to create a fresh vault opens the winner's vault instead of overwriting it. A panic inside a mutation (for example in the middle of a kill lift) rolls the in-memory state back before it unwinds, so readers keep the kill and a later unrelated write does not commit the abandoned change. A wrong master password with the averin stores enabled and a non-empty queue is reported as a decrypt error, because the snapshot is decrypted before the queue is replayed.",
       "method": "test",
       "artifacts": [
         "src/storage/vault_log.rs",
@@ -2559,7 +2562,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::a_crash_at_each_append_step_loses_no_committed_write_and_tears_no_record storage::file::vault_tests::a_torn_tail_is_only_present_after_the_torn_step_and_is_never_applied storage::file::vault_tests::a_crash_at_each_compaction_step_loses_nothing_and_leaves_a_usable_vault storage::file::vault_tests::a_crash_after_the_snapshot_rename_leaves_a_log_the_snapshot_already_contains storage::file::vault_tests::automatic_compaction_bounds_the_log_and_loses_nothing storage::file::vault_tests::a_corrupt_or_reordered_log_record_fails_the_open_closed storage::file::vault_tests::rekey_folds_the_log_and_the_old_key_log_is_never_decrypted storage::file::vault_tests::a_crash_between_the_rekey_rename_and_the_log_reset_leaves_a_vault_that_opens storage::file::vault_tests::a_crash_during_migration_leaves_the_v9_vault_intact_and_re_migrates storage::file::vault_tests::a_failed_append_does_not_leave_an_acknowledged_looking_record storage::file::vault_tests::creating_a_vault_that_another_process_just_created_opens_it",
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::a_crash_at_each_append_step_loses_no_committed_write_and_tears_no_record storage::file::vault_tests::a_torn_tail_is_only_present_after_the_torn_step_and_is_never_applied storage::file::vault_tests::a_crash_at_each_compaction_step_loses_nothing_and_leaves_a_usable_vault storage::file::vault_tests::a_crash_after_the_snapshot_rename_leaves_a_log_the_snapshot_already_contains storage::file::vault_tests::automatic_compaction_bounds_the_log_and_loses_nothing storage::file::vault_tests::a_corrupt_or_reordered_log_record_fails_the_open_closed storage::file::vault_tests::rekey_folds_the_log_and_the_old_key_log_is_never_decrypted storage::file::vault_tests::a_crash_between_the_rekey_rename_and_the_log_reset_leaves_a_vault_that_opens storage::file::vault_tests::a_crash_during_migration_leaves_the_v9_vault_intact_and_re_migrates storage::file::vault_tests::a_failed_append_does_not_leave_an_acknowledged_looking_record storage::file::vault_tests::creating_a_vault_that_another_process_just_created_opens_it storage::file::vault_tests::a_panic_inside_a_mutation_rolls_back_and_never_commits storage::file::vault_tests::a_wrong_password_with_averin_enabled_is_a_decrypt_error",
       "covers": [
         {
           "path": "src/storage/file.rs",
@@ -2600,9 +2603,10 @@
       "mutants": [
         "vault-log-replay-skips-first-newer-record",
         "vault-torn-tail-not-truncated",
-        "vault-failed-append-line-kept"
+        "vault-failed-append-line-kept",
+        "vault-panic-skips-rollback"
       ],
-      "does_not_establish": "Power-loss durability of any real filesystem or disk: a crash is an injected error at a named step that leaves the files exactly as written (the page cache is not dropped, fsync is assumed honest). Crashes at steps the injection points do not name, or inside the standard library. Detection of a vault rolled back by replacing the snapshot and log with older copies, or of a log truncated at a record boundary: both are accepted by the format, as a replaced vault file always was. A terminated final line damaged by a crash or bit rot fails the open closed instead of being recovered; an operator must truncate it after checking. Behaviour under concurrent writers in several real processes beyond what the advisory lock already serialises. Any CI run. The take-back of a failed append is best effort: if the truncate itself fails after an fsync error, the line may remain and be read as committed by the next reader. An invalid record in a delta replay drops the process's whole in-memory view (readers see nothing and deny) and forces a full reload; this is not covered by a test.",
+      "does_not_establish": "Power-loss durability of any real filesystem or disk: a crash is an injected error at a named step that leaves the files exactly as written (the page cache is not dropped, fsync is assumed honest). Crashes at steps the injection points do not name, or inside the standard library. Detection of a vault rolled back by replacing the snapshot and log with older copies, or of a log truncated at a record boundary: both are accepted by the format, as a replaced vault file always was. A terminated final line damaged by a crash or bit rot fails the open closed instead of being recovered; an operator must truncate it after checking. Behaviour under concurrent writers in several real processes beyond what the advisory lock already serialises. Any CI run. The take-back of a failed append is best effort: if the truncate itself fails after an fsync error, the line may remain and be read as committed by the next reader. A panic raised inside the commit itself (as opposed to the mutation closure) is rolled back by the same path but has no dedicated test. An invalid record in a delta replay drops the process's whole in-memory view (readers see nothing and deny) and forces a full reload; this is not covered by a test.",
       "evidence_run": "38172337609"
     },
     {
@@ -2671,7 +2675,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::gc_vault_at",
-          "sha256": "8fe1cd0c513b771f1320525548918479f2a3f248f5adf1d19faa65f55bb94dc4"
+          "sha256": "58ae227b57f2ebe09610b2da4ddb03a5d40d6503865b294b7a7f2da06cc48d30"
         },
         {
           "path": "src/policy/kill_fence.rs",
@@ -2686,7 +2690,7 @@
         "vault-gc-legacy-approval-ignored",
         "vault-gc-treats-approved-and-executing-as-dead"
       ],
-      "does_not_establish": "That every holder of an admission epoch is counted. Approvals are counted explicitly; a live call in flight inside one process holds its epoch only in memory, and is covered by the 24 hour grace alone, so a request that stalled for more than 24 hours between admission and dispatch could be re-admitted after a collected kill. Marks written by a build that does not stamp them. How often garbage collection runs (the periodic vault GC tick, not tested here). Mark keying by policy id, unchanged: a re-stored id with a narrower pattern still overwrites its mark. Any CI run.",
+      "does_not_establish": "The govder TLA+ model formal/tla/KillFence.tla: it models the fence as an epoch comparison that is never collected (there are no marks and no collection in it), so its NoStaleDispatch property does not cover a collected mark; in code the guarantee for a live in-flight call rests on the 24 hour grace. That grace compares the storing process's wall clock (stored_at) with the collecting process's wall clock, so a clock that steps forward, or a host that was behind when the kill was stored, shortens the effective grace. That every holder of an admission epoch is counted. Approvals are counted explicitly; a live call in flight inside one process holds its epoch only in memory, and is covered by the 24 hour grace alone, so a request that stalled for more than 24 hours between admission and dispatch could be re-admitted after a collected kill. Marks written by a build that does not stamp them. How often garbage collection runs (the periodic vault GC tick, not tested here). Mark keying by policy id, unchanged: a re-stored id with a narrower pattern still overwrites its mark. Any CI run.",
       "evidence_run": "38172337609"
     },
     {

@@ -1008,8 +1008,9 @@ fn dead_marks(cache: &StorageCache, now: DateTime<Utc>) -> Vec<String> {
 impl FileStorage {
     /// Vault garbage collection at an explicit clock: shed old terminal approval bodies, drop dead
     /// use tokens, and drop provably dead kill marks. Returns `(bodies_shed, tokens_dropped,
-    /// marks_dropped)`. An idle vault writes nothing.
-    pub async fn gc_vault_at(
+    /// marks_dropped)`. An idle vault writes nothing. Crate-private: a caller-chosen `now` in the
+    /// future would collect marks before their grace; production uses `gc_vault`.
+    pub(crate) async fn gc_vault_at(
         &self,
         now: DateTime<Utc>,
     ) -> Result<(usize, usize, usize), StorageError> {
@@ -1078,8 +1079,8 @@ impl FileStorage {
 
 impl FileStorage {
     /// Test and tooling hook: set the minimum log size before compaction.
-    #[doc(hidden)]
-    pub fn set_compact_min_bytes(&self, bytes: u64) {
+    #[cfg(test)]
+    pub(crate) fn set_compact_min_bytes(&self, bytes: u64) {
         self.compact_min
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1259,12 +1260,10 @@ impl FileStorage {
         let master_key = Arc::new(derive_key(password, &salt, kdf)?);
 
         let outbox = OutboxStore::new(outbox_path(&path), Arc::clone(&master_key));
-        let averin = if averin_enabled {
-            AverinStores::open(&path, &master_key, strict)?
-        } else {
-            None
-        };
-        let storage = Self {
+        // The averin stores are opened AFTER the snapshot decrypt below: opening replays the queue
+        // eagerly, and a wrong password must surface as a decrypt error, not as a corrupt queue.
+        let averin: Option<AverinStores> = None;
+        let mut storage = Self {
             path,
             master_key,
             outbox,
@@ -1283,6 +1282,9 @@ impl FileStorage {
         // Decrypt the snapshot, replay the log, and one-way migrate a pre-v10 vault (with a backup).
         // A wrong password fails here, closed.
         storage.bootstrap_locked()?;
+        if averin_enabled {
+            storage.averin = AverinStores::open(&storage.path, &storage.master_key, strict)?;
+        }
 
         // v6→v7 migration (D4, best-effort): a v6 vault carried the outbox INSIDE it. Drain those
         // events into the new outbox file (preserving their sequence so the broker cursor doesn't
@@ -2071,19 +2073,31 @@ impl FileStorage {
         let mut cache = self.cache.write();
         self.sync_locked(&mut log, &mut cache, true)?;
 
-        let result = match f(&mut cache) {
-            Ok(r) => r,
-            Err(e) => {
+        // A panic inside `f` or the commit must not leave a half-applied change in the live cache
+        // (readers would see it, and the next write would commit it). Roll back, then re-raise.
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match f(&mut cache) {
+                Ok(r) => self
+                    .commit_locked(&mut log, &mut cache)
+                    .map(|_| r)
+                    .map_err(|e| (e, true)),
+                Err(e) => Err((e, false)),
+            }));
+        let result = match outcome {
+            Ok(Ok(r)) => r,
+            Ok(Err((e, _from_commit))) => {
                 self.rollback_locked(&log, &mut cache);
                 #[cfg(test)]
-                self.check_replay_equals(&cache);
+                if !_from_commit {
+                    self.check_replay_equals(&cache);
+                }
                 return Err(e);
             }
+            Err(payload) => {
+                self.rollback_locked(&log, &mut cache);
+                std::panic::resume_unwind(payload);
+            }
         };
-        if let Err(e) = self.commit_locked(&mut log, &mut cache) {
-            self.rollback_locked(&log, &mut cache);
-            return Err(e);
-        }
         #[cfg(test)]
         self.check_replay_equals(&cache);
         let over = log.wal_offset > self.compact_min_bytes().max(log.snap_len);

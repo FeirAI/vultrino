@@ -103,6 +103,17 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   is the only protection for a live call in flight inside one process (its admission
   epoch is in memory only): a request that stalls for more than 24 hours between
   admission and dispatch could run after its mark was collected.
+  The grace compares the storing process's wall clock with the collecting process's
+  wall clock, so a clock that steps forward, or a host that was behind when the kill
+  was stored, shortens the effective grace. The govder TLA+ model
+  `formal/tla/KillFence.tla` models the fence as an epoch comparison that is never
+  collected (it has no marks and no collection), so its `NoStaleDispatch` property
+  does not cover a collected mark.
+- **A fence read that catches up after a foreign write still revalidates the whole
+  vault in memory.** It decrypts only the new records, but runs shape validation and
+  index rebuild over every record while holding the in-process cache write lock. In a
+  web plus MCP deployment where every dispatch writes a use token, most fence reads
+  in the other process pay this. The vault cost counters count decrypts only.
 - **At-most-once execution sacrifices automatic recovery after an ambiguous
   crash.** Reserve → operate → complete are not one external transaction. If a
   worker disappears after claiming an approved action, a stale claim is finalized
