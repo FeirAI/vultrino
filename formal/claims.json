@@ -409,6 +409,9 @@
     "egress-forms-drop-nested-json": {
       "tier": "fast"
     },
+    "egress-forms-drop-base64-core": {
+      "tier": "fast"
+    },
     "egress-forms-drop-pathescape": {
       "tier": "fast"
     },
@@ -925,7 +928,7 @@
     },
     {
       "id": "egress-derived-forms",
-      "statement": "The set of spellings the response scrub removes for a credential's secret includes, for each secret of at least 5 bytes: the raw value, its percent-encodings (full, lowercase hex, form-url plus, and the JS encodeURIComponent, Python quote, Go url.PathEscape and RFC 3986 pchar safe sets), its JSON-escaped forms (plain, slash-escaped, ensure_ascii, HTML-safe, and two further nested levels of the plain and slash-escaped spelling), and its whole-value base64 (standard and URL alphabet, padded and unpadded) and hex (both cases) spellings, and, for a value of at least 14 bytes, the base64 (standard and URL alphabet, unpadded) of the whole 3-byte groups of the value at each of its three alignments, so the base64 of a longer string such as Bearer <token> is scrubbed apart from at most 2 bytes at each end. The decoded Basic user:password and OAuth2 client_id:client_secret composites are secret material, so every one of those spellings of the composite is also removed. The buffered redaction, the incremental stream scrubber and the final confine_response postcondition use the one set; the named unit tests reflect each spelling through the buffered path, and the base64 and hex spellings through the stream scrubber and confine_response as well.",
+      "statement": "The set of spellings the response scrub removes for a credential's secret includes, for each secret of at least 5 bytes: the raw value, its percent-encodings (full, lowercase hex, form-url plus, and the JS encodeURIComponent, Python quote, Go url.PathEscape and RFC 3986 pchar safe sets), its JSON-escaped forms (plain, slash-escaped, ensure_ascii, HTML-safe, and two further nested levels of the plain and slash-escaped spelling), and its whole-value base64 (standard and URL alphabet, padded and unpadded) and hex (both cases) spellings, and, for a value of at least 14 bytes, the base64 (standard and URL alphabet, unpadded) of the whole 3-byte groups of the value at each of its three alignments, so the base64 of a longer string such as Bearer <token> is scrubbed apart from at most 2 bytes at each end. The decoded Basic user:password and OAuth2 client_id:client_secret composites are secret material, so every one of those spellings of the composite is also removed. The buffered redaction, the incremental stream scrubber and the final confine_response postcondition use the one set; the named unit tests reflect each spelling through the buffered path, and the base64 and hex spellings through the stream scrubber as well; the base64 core test drives the buffered and streamed paths only, and confine_response is covered by sharing the one form set.",
       "method": "test",
       "artifacts": [
         "src/egress.rs",
@@ -955,7 +958,7 @@
         "egress-composite-not-material",
         "egress-forms-drop-base64-core"
       ],
-      "does_not_establish": "Whole-value spellings only: a hash of the secret, an encoding other than base64 of a longer string that contains it, a base64 core shorter than 16 characters (a value under 14 bytes), a value split across separate SSE events or lines, a spelling in a dialect not listed, and a reflection in a header NAME are not covered, and the scrub stays byte-exact defense in depth against an upstream that reflects by accident, not against one that encodes on purpose. The unit tests use one value with the characters that make the spellings differ; the end-to-end reflection through the running binary is the govder claim e2e-credential-canary-scan. Secrets shorter than 5 bytes are handled by withholding the response, not by this set.",
+      "does_not_establish": "Whole-value spellings and whole-group base64 cores only: a hash of the secret, an encoding other than base64 of a longer string that contains it, a base64 core shorter than 16 characters (a value under 14 bytes), a value split across separate SSE events or lines, a spelling in a dialect not listed, and a reflection in a header NAME are not covered, and the scrub stays byte-exact defense in depth against an upstream that reflects by accident, not against one that encodes on purpose. The unit tests use one value with the characters that make the spellings differ; the end-to-end reflection through the running binary is the govder claim e2e-credential-canary-scan. Secrets shorter than 5 bytes are handled by withholding the response, not by this set.",
       "evidence_run": "38114512189"
     },
     {
