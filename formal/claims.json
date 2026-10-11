@@ -954,7 +954,8 @@
         "egress-forms-drop-pathescape",
         "egress-composite-not-material"
       ],
-      "does_not_establish": "Whole-value spellings only: a hash of the secret, a base64 of a longer string that contains it (Bearer <token>), a value split across separate SSE events or lines, a spelling in a dialect not listed, and a reflection in a header NAME are not covered, and the scrub stays byte-exact defense in depth against an upstream that reflects by accident, not against one that encodes on purpose. The unit tests use one value with the characters that make the spellings differ; the end-to-end reflection through the running binary is the govder claim e2e-credential-canary-scan. Secrets shorter than 5 bytes are handled by withholding the response, not by this set."
+      "does_not_establish": "Whole-value spellings only: a hash of the secret, a base64 of a longer string that contains it (Bearer <token>), a value split across separate SSE events or lines, a spelling in a dialect not listed, and a reflection in a header NAME are not covered, and the scrub stays byte-exact defense in depth against an upstream that reflects by accident, not against one that encodes on purpose. The unit tests use one value with the characters that make the spellings differ; the end-to-end reflection through the running binary is the govder claim e2e-credential-canary-scan. Secrets shorter than 5 bytes are handled by withholding the response, not by this set.",
+      "evidence_run": "38106126173"
     },
     {
       "id": "sb04-approval-key",
