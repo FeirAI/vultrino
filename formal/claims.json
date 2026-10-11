@@ -2566,6 +2566,11 @@
       "covers": [
         {
           "path": "src/storage/file.rs",
+          "symbol": "FileStorage::locked_mutate_blocking",
+          "sha256": "3ae544e058bf0acd53dff00616ce91ae044daf0fd99f13cdb72c0622d294cdbd"
+        },
+        {
+          "path": "src/storage/file.rs",
           "symbol": "FileStorage::append_record_locked",
           "sha256": "3f35092c6c74b7f575a84fa85c5dedf8e5586b8f0cdc7f72a66c762064e1c0ab"
         },
