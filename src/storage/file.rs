@@ -252,8 +252,50 @@ fn check_version(found: u32) -> Result<(), StorageError> {
     }
 }
 
+/// Deterministic I/O accounting for the vault file (P3-VAULT). Counts work, not time, so a benchmark
+/// or test can assert how much one admin write or one dispatch fence read touches as the vault
+/// grows. Cumulative since the handle was opened; take two snapshots and subtract.
+#[derive(Debug, Default)]
+struct IoCounters {
+    bytes_written: std::sync::atomic::AtomicU64,
+    fsyncs: std::sync::atomic::AtomicU64,
+    bytes_decrypted: std::sync::atomic::AtomicU64,
+    decrypts: std::sync::atomic::AtomicU64,
+    records_written: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time copy of the vault's [`IoCounters`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VaultIoStats {
+    /// Bytes written to vault files (snapshot, log, tmp files), after encryption and encoding.
+    pub bytes_written: u64,
+    /// fsync calls on vault files and their directory.
+    pub fsyncs: u64,
+    /// Plaintext bytes produced by decrypting vault data.
+    pub bytes_decrypted: u64,
+    /// Number of AES-GCM decrypt operations on vault data.
+    pub decrypts: u64,
+    /// Records (one per changed object) written. A whole-vault snapshot counts every record in it.
+    pub records_written: u64,
+}
+
+impl VaultIoStats {
+    /// `self - earlier`, saturating.
+    pub fn since(self, earlier: VaultIoStats) -> VaultIoStats {
+        VaultIoStats {
+            bytes_written: self.bytes_written.saturating_sub(earlier.bytes_written),
+            fsyncs: self.fsyncs.saturating_sub(earlier.fsyncs),
+            bytes_decrypted: self.bytes_decrypted.saturating_sub(earlier.bytes_decrypted),
+            decrypts: self.decrypts.saturating_sub(earlier.decrypts),
+            records_written: self.records_written.saturating_sub(earlier.records_written),
+        }
+    }
+}
+
 /// File-based storage with AES-256-GCM encryption
 pub struct FileStorage {
+    /// I/O accounting (see [`VaultIoStats`]).
+    io: IoCounters,
     /// Path to the storage file
     path: PathBuf,
     /// Master encryption key (Arc so the OutboxStore shares the SAME derived key — D2: the outbox
@@ -594,6 +636,23 @@ impl StorageCache {
     }
 
     /// Rebuild all secondary indexes from primary data
+    /// Number of stored records across every collection (the kill fence counts its marks).
+    fn record_count(&self) -> usize {
+        self.credentials.len()
+            + self.roles.len()
+            + self.api_keys.len()
+            + self.use_tokens.len()
+            + self.workload_jtis.len()
+            + self.workload_grants.len()
+            + self.approval_tokens.len()
+            + self.approvals.len()
+            + self.policies.len()
+            + self.kill_fence.marks.len()
+            + self.capabilities.len()
+            + self.idempotency.len()
+            + self.native_drafts.len()
+    }
+
     fn rebuild_indexes(&mut self) {
         // Clear existing indexes
         self.alias_index.clear();
@@ -779,6 +838,7 @@ impl FileStorage {
             salt,
             kdf,
             last_loaded: parking_lot::Mutex::new(None),
+            io: IoCounters::default(),
         };
 
         // Write initial empty storage (through the cross-process lock).
@@ -831,6 +891,7 @@ impl FileStorage {
             salt,
             kdf,
             last_loaded: parking_lot::Mutex::new(None),
+            io: IoCounters::default(),
         };
         // Seed the change token so the first reload can skip a redundant decrypt of the
         // file we just loaded (unless a write bumps its mtime first).
@@ -1070,7 +1131,28 @@ impl FileStorage {
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         check_version(storage_file.version)?;
         let decrypted = decrypt(&storage_file.data, &self.master_key)?;
+        self.note_decrypt(decrypted.len());
         Self::parse_cache(&decrypted)
+    }
+
+    fn note_decrypt(&self, plaintext_len: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.io.decrypts.fetch_add(1, Relaxed);
+        self.io
+            .bytes_decrypted
+            .fetch_add(plaintext_len as u64, Relaxed);
+    }
+
+    /// A snapshot of the vault's cumulative I/O counters.
+    pub fn io_stats(&self) -> VaultIoStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        VaultIoStats {
+            bytes_written: self.io.bytes_written.load(Relaxed),
+            fsyncs: self.io.fsyncs.load(Relaxed),
+            bytes_decrypted: self.io.bytes_decrypted.load(Relaxed),
+            decrypts: self.io.decrypts.load(Relaxed),
+            records_written: self.io.records_written.load(Relaxed),
+        }
     }
 
     /// Encrypt and atomically write a cache to disk (blocking).
@@ -1106,6 +1188,12 @@ impl FileStorage {
             w.into_inner()
                 .map_err(|e| StorageError::Io(e.into_error()))?
                 .sync_all()?;
+        }
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.io.bytes_written.fetch_add(content.len() as u64, Relaxed);
+            self.io.fsyncs.fetch_add(2, Relaxed);
+            self.io.records_written.fetch_add(cache.record_count() as u64, Relaxed);
         }
         std::fs::rename(&temp_path, &self.path)?;
         // Make the rename crash-DURABLE (not just crash-atomic): fsync the parent dir, propagating a real

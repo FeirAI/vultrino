@@ -12,7 +12,7 @@ mod social;
 
 pub use averin_deadletter::{AverinDeadLetterStore, QuarantineRecord, QuarantineStatus};
 pub use averin_queue::AverinQueue;
-pub use file::FileStorage;
+pub use file::{FileStorage, VaultIoStats};
 pub use outbox_store::OutboxStore;
 pub use popkey_store::{PopKeyEntry, PopKeyStore};
 pub use social::{
