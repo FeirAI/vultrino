@@ -2535,7 +2535,8 @@
         "vault-write-all-records",
         "vault-rollback-skipped"
       ],
-      "does_not_establish": "Wall-clock latency or throughput: every assertion counts bytes, records, decrypts and files, never time, and the benchmark prints counters, not durations. The CPU cost of a write: the in-memory shape validation and the kill-fence diff still walk the in-memory records, so the CPU per write is not constant (it is no longer an encrypt-and-fsync of the whole vault). Amortised compaction: when the log passes max(256 KiB, snapshot size) one write rewrites the whole snapshot, so the worst single write is still O(vault) and only the average is O(record); the example's build_B/write column shows the average. The separate outbox file, which is still rewritten whole by its own store. Filesystem fsync honesty or power-loss durability. Any CI run."
+      "does_not_establish": "Wall-clock latency or throughput: every assertion counts bytes, records, decrypts and files, never time, and the benchmark prints counters, not durations. The CPU cost of a write: the in-memory shape validation and the kill-fence diff still walk the in-memory records, so the CPU per write is not constant (it is no longer an encrypt-and-fsync of the whole vault). Amortised compaction: when the log passes max(256 KiB, snapshot size) one write rewrites the whole snapshot, so the worst single write is still O(vault) and only the average is O(record); the example's build_B/write column shows the average. The separate outbox file, which is still rewritten whole by its own store. Filesystem fsync honesty or power-loss durability. Any CI run.",
+      "evidence_run": "38167847815"
     },
     {
       "id": "vault-log-crash-consistency",
@@ -2591,7 +2592,8 @@
         "vault-log-replay-skips-first-newer-record",
         "vault-torn-tail-not-truncated"
       ],
-      "does_not_establish": "Power-loss durability of any real filesystem or disk: a crash is an injected error at a named step that leaves the files exactly as written (the page cache is not dropped, fsync is assumed honest). Crashes at steps the injection points do not name, or inside the standard library. Detection of a vault rolled back by replacing the snapshot and log with older copies, or of a log truncated at a record boundary: both are accepted by the format, as a replaced vault file always was. A terminated final line damaged by a crash or bit rot fails the open closed instead of being recovered; an operator must truncate it after checking. Behaviour under concurrent writers in several real processes beyond what the advisory lock already serialises. Any CI run."
+      "does_not_establish": "Power-loss durability of any real filesystem or disk: a crash is an injected error at a named step that leaves the files exactly as written (the page cache is not dropped, fsync is assumed honest). Crashes at steps the injection points do not name, or inside the standard library. Detection of a vault rolled back by replacing the snapshot and log with older copies, or of a log truncated at a record boundary: both are accepted by the format, as a replaced vault file always was. A terminated final line damaged by a crash or bit rot fails the open closed instead of being recovered; an operator must truncate it after checking. Behaviour under concurrent writers in several real processes beyond what the advisory lock already serialises. Any CI run.",
+      "evidence_run": "38167847815"
     },
     {
       "id": "vault-fence-shared-lock-delta-read",
@@ -2629,7 +2631,8 @@
         "vault-fence-read-takes-exclusive-lock",
         "vault-fence-ignores-appended-records"
       ],
-      "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run."
+      "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run.",
+      "evidence_run": "38167847815"
     },
     {
       "id": "vault-kill-mark-gc",
@@ -2672,7 +2675,8 @@
         "vault-gc-ignores-grace",
         "vault-gc-legacy-approval-ignored"
       ],
-      "does_not_establish": "That every holder of an admission epoch is counted. Approvals are counted explicitly; a live call in flight inside one process holds its epoch only in memory, and is covered by the 24 hour grace alone, so a request that stalled for more than 24 hours between admission and dispatch could be re-admitted after a collected kill. Marks written by a build that does not stamp them. How often garbage collection runs (the periodic vault GC tick, not tested here). Mark keying by policy id, unchanged: a re-stored id with a narrower pattern still overwrites its mark. Any CI run."
+      "does_not_establish": "That every holder of an admission epoch is counted. Approvals are counted explicitly; a live call in flight inside one process holds its epoch only in memory, and is covered by the 24 hour grace alone, so a request that stalled for more than 24 hours between admission and dispatch could be re-admitted after a collected kill. Marks written by a build that does not stamp them. How often garbage collection runs (the periodic vault GC tick, not tested here). Mark keying by policy id, unchanged: a re-stored id with a narrower pattern still overwrites its mark. Any CI run.",
+      "evidence_run": "38167847815"
     },
     {
       "id": "vault-v9-migration",
@@ -2710,7 +2714,8 @@
         "vault-migration-skips-backup",
         "vault-migration-drops-kill-marks"
       ],
-      "does_not_establish": "Rollback after new writes: restoring the .v9.bak file with the v9 build loses every write made since the migration (the format is one-way by design). A fixture that exercises approvals, workload grants or idempotency records (the fixture holds credentials, tokens, policies and kill marks; the older-version migrations are covered by the existing v6 tests). That the v9 binary really refuses the file: the test asserts the version number the v9 gate compares against, it does not run a v9 binary. A mixed-build fleet running during the migration, which must be stopped first. Any CI run."
+      "does_not_establish": "Rollback after new writes: restoring the .v9.bak file with the v9 build loses every write made since the migration (the format is one-way by design). A fixture that exercises approvals, workload grants or idempotency records (the fixture holds credentials, tokens, policies and kill marks; the older-version migrations are covered by the existing v6 tests). That the v9 binary really refuses the file: the test asserts the version number the v9 gate compares against, it does not run a v9 binary. A mixed-build fleet running during the migration, which must be stopped first. Any CI run.",
+      "evidence_run": "38167847815"
     }
   ]
 }
