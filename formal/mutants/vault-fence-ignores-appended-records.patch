@@ -1,8 +1,8 @@
 diff --git a/src/storage/file.rs b/src/storage/file.rs
-index 6f4edb7..c18ca8c 100644
+index 96b1d8c..c6b9098 100644
 --- a/src/storage/file.rs
 +++ b/src/storage/file.rs
-@@ -1552,7 +1552,7 @@ impl FileStorage {
+@@ -1553,7 +1553,7 @@ impl FileStorage {
              return false;
          }
          let tok = file_token(&self.path);

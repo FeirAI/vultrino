@@ -1,8 +1,8 @@
 diff --git a/src/storage/file.rs b/src/storage/file.rs
-index 6f4edb7..4a40647 100644
+index 96b1d8c..d52441a 100644
 --- a/src/storage/file.rs
 +++ b/src/storage/file.rs
-@@ -2020,7 +2020,6 @@ impl FileStorage {
+@@ -2019,7 +2019,6 @@ impl FileStorage {
          let result = match f(&mut cache) {
              Ok(r) => r,
              Err(e) => {

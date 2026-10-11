@@ -1,8 +1,8 @@
 diff --git a/src/storage/file.rs b/src/storage/file.rs
-index 6f4edb7..4536bbd 100644
+index 96b1d8c..d2ac3a3 100644
 --- a/src/storage/file.rs
 +++ b/src/storage/file.rs
-@@ -1756,9 +1756,7 @@ impl FileStorage {
+@@ -1755,9 +1755,7 @@ impl FileStorage {
              log.refresh_baselines(cache);
          }
          log.wal_offset += parsed.consumed as u64;

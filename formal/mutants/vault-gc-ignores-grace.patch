@@ -1,5 +1,5 @@
 diff --git a/src/policy/kill_fence.rs b/src/policy/kill_fence.rs
-index 37e26a3..3427fe3 100644
+index 87a4ba2..d4db386 100644
 --- a/src/policy/kill_fence.rs
 +++ b/src/policy/kill_fence.rs
 @@ -126,7 +126,7 @@ pub fn dead_kill_marks(

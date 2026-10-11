@@ -2569,7 +2569,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::compact_locked",
-          "sha256": "e22770fb41a42130032da888dcb0431e652d6a02cd281045b62670c1dc634b5e"
+          "sha256": "77f558b3f19d8a0e0e745536d59e3f2be2b639a5191ac33fe8113d09c0a2738f"
         },
         {
           "path": "src/storage/file.rs",
@@ -2653,7 +2653,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "dead_marks",
-          "sha256": "8854fac4c0ae33f099b25d85c9afdd601374003903b1ff429b65c6360e696705"
+          "sha256": "ddadeba4f2b775a1b835bd79aee8f7fcda5a47a8d7d81d71cab55990d124d7fc"
         },
         {
           "path": "src/storage/file.rs",

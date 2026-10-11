@@ -1,8 +1,8 @@
 diff --git a/src/storage/file.rs b/src/storage/file.rs
-index 6f4edb7..91b8cf1 100644
+index 96b1d8c..34a4c51 100644
 --- a/src/storage/file.rs
 +++ b/src/storage/file.rs
-@@ -1963,8 +1963,7 @@ impl FileStorage {
+@@ -1962,8 +1962,7 @@ impl FileStorage {
          &self,
          f: impl FnOnce(&StorageCache) -> T,
      ) -> Result<T, StorageError> {

@@ -1,8 +1,8 @@
 diff --git a/src/storage/file.rs b/src/storage/file.rs
-index 6f4edb7..81f2a3c 100644
+index 96b1d8c..d8f7096 100644
 --- a/src/storage/file.rs
 +++ b/src/storage/file.rs
-@@ -1869,7 +1869,7 @@ impl FileStorage {
+@@ -1868,7 +1868,7 @@ impl FileStorage {
          self.full_load_locked(&mut log, &mut cache, true)?;
          if log.snapshot_version < STORAGE_VERSION {
              let from = log.snapshot_version;

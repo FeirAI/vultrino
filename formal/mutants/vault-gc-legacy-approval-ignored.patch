@@ -1,10 +1,10 @@
 diff --git a/src/storage/file.rs b/src/storage/file.rs
-index 6f4edb7..1d10504 100644
+index 96b1d8c..5cca39f 100644
 --- a/src/storage/file.rs
 +++ b/src/storage/file.rs
-@@ -995,7 +995,7 @@ fn dead_marks(cache: &StorageCache, now: DateTime<Utc>) -> Vec<String> {
-             a.executing
-                 || (!a.executed && !matches!(a.status(), ApprovalStatus::Denied | ApprovalStatus::Expired))
+@@ -996,7 +996,7 @@ fn dead_marks(cache: &StorageCache, now: DateTime<Utc>) -> Vec<String> {
+                 || (!a.executed
+                     && !matches!(a.status(), ApprovalStatus::Denied | ApprovalStatus::Expired))
          })
 -        .map(|a| a.kill_epoch_at_open.unwrap_or(0));
 +        .map(|a| a.kill_epoch_at_open.unwrap_or(u64::MAX));

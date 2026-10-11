@@ -1,8 +1,8 @@
 diff --git a/src/storage/file.rs b/src/storage/file.rs
-index 6f4edb7..f9344b1 100644
+index 96b1d8c..f00222c 100644
 --- a/src/storage/file.rs
 +++ b/src/storage/file.rs
-@@ -1871,7 +1871,7 @@ impl FileStorage {
+@@ -1870,7 +1870,7 @@ impl FileStorage {
              let from = log.snapshot_version;
              self.backup_before_migration(from)?;
              // Marks written before v10 carry no timestamp; age them from now so GC can retire them.
