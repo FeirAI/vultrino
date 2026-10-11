@@ -2548,7 +2548,7 @@
         "vault-rollback-skipped"
       ],
       "does_not_establish": "Wall-clock latency or throughput: every assertion counts bytes, records, decrypts and files, never time, and the benchmark prints counters, not durations. The CPU cost of a write: the in-memory shape validation and the kill-fence diff still walk the in-memory records, so the CPU per write is not constant (it is no longer an encrypt-and-fsync of the whole vault). Amortised compaction: when the log passes max(256 KiB, snapshot size) one write rewrites the whole snapshot, so the worst single write is still O(vault) and only the average is O(record); the example's build_B/write column shows the average. The separate outbox file, which is still rewritten whole by its own store. Filesystem fsync honesty or power-loss durability. Any CI run.",
-      "evidence_run": "38172337609"
+      "evidence_run": "38177797197"
     },
     {
       "id": "vault-log-crash-consistency",
@@ -2612,7 +2612,7 @@
         "vault-panic-skips-rollback"
       ],
       "does_not_establish": "Power-loss durability of any real filesystem or disk: a crash is an injected error at a named step that leaves the files exactly as written (the page cache is not dropped, fsync is assumed honest). Crashes at steps the injection points do not name, or inside the standard library. Detection of a vault rolled back by replacing the snapshot and log with older copies, or of a log truncated at a record boundary: both are accepted by the format, as a replaced vault file always was. A terminated final line damaged by a crash or bit rot fails the open closed instead of being recovered; an operator must truncate it after checking. Behaviour under concurrent writers in several real processes beyond what the advisory lock already serialises. Any CI run. The take-back of a failed append is best effort: if the truncate itself fails after an fsync error, the line may remain and be read as committed by the next reader. A panic raised inside the commit itself (as opposed to the mutation closure) is rolled back by the same path but has no dedicated test. An invalid record in a delta replay drops the process's whole in-memory view (readers see nothing and deny) and forces a full reload; this is not covered by a test.",
-      "evidence_run": "38172337609"
+      "evidence_run": "38177797197"
     },
     {
       "id": "vault-fence-shared-lock-delta-read",
@@ -2651,7 +2651,7 @@
         "vault-fence-ignores-appended-records"
       ],
       "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation: flock does not prefer a waiting writer, so under sustained overlapping dispatches a kill write can wait without bound against the caller's timeout. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
-      "evidence_run": "38172337609"
+      "evidence_run": "38177797197"
     },
     {
       "id": "vault-kill-mark-gc",
@@ -2696,7 +2696,7 @@
         "vault-gc-treats-approved-and-executing-as-dead"
       ],
       "does_not_establish": "The govder TLA+ model formal/tla/KillFence.tla: it models the fence as an epoch comparison that is never collected (there are no marks and no collection in it), so its NoStaleDispatch property does not cover a collected mark; in code the guarantee for a live in-flight call rests on the 24 hour grace. That grace compares the storing process's wall clock (stored_at) with the collecting process's wall clock, so a clock that steps forward, or a host that was behind when the kill was stored, shortens the effective grace. That every holder of an admission epoch is counted. Approvals are counted explicitly; a live call in flight inside one process holds its epoch only in memory, and is covered by the 24 hour grace alone, so a request that stalled for more than 24 hours between admission and dispatch could be re-admitted after a collected kill. Marks written by a build that does not stamp them. How often garbage collection runs (the periodic vault GC tick, not tested here). Mark keying by policy id, unchanged: a re-stored id with a narrower pattern still overwrites its mark. Any CI run.",
-      "evidence_run": "38172337609"
+      "evidence_run": "38177797197"
     },
     {
       "id": "vault-v9-migration",
@@ -2741,7 +2741,7 @@
         "vault-leftover-log-replayed-on-old-snapshot"
       ],
       "does_not_establish": "Rollback after new writes: restoring the backup with the v9 build loses every write made since the migration (the format is one-way by design). The real file names are <vault>.wal and <vault>.v9.bak with the extension of the vault file replaced (credentials.enc gives credentials.wal and credentials.v9.bak). A rollback that restores the vault file but leaves the log is refused at open, not repaired; the operator deletes the log. A fixture that exercises approvals, workload grants or idempotency records (the fixture holds credentials, tokens, policies and kill marks; the older-version migrations are covered by the existing v6 tests). That the v9 binary really refuses the file: the test asserts the version number the v9 gate compares against, it does not run a v9 binary. A mixed-build fleet running during the migration, which must be stopped first. Any CI run.",
-      "evidence_run": "38172337609"
+      "evidence_run": "38177797197"
     }
   ]
 }
