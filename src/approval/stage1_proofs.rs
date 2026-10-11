@@ -574,6 +574,7 @@ fn a_recipe_grant_that_no_longer_satisfies_yields_no_witness() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (mut a, _t) = fresh();
     a.approval_rule = Some(rule);
@@ -720,6 +721,7 @@ fn an_unnamed_principal_fills_no_slot() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let unnamed = |ident: &str| Signoff {
         approver_identity: ident.to_string(),
@@ -855,6 +857,7 @@ fn reachable_approval_vault_roundtrip_preserves_invariants_20k() {
                         } else {
                             RecipeDecisionMode::DenyOnAnyDeny
                         },
+                        exclude_owner: false,
                     });
                     approval.authoritative_risk_tier = "Medium".to_string();
                 }

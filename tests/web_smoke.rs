@@ -3371,6 +3371,296 @@ async fn test_json_decision_hard_sod_blocks_same_key_second_signoff() {
     );
 }
 
+#[tokio::test]
+async fn test_json_decision_sod_is_on_by_default_with_verified_approver_identities() {
+    // XV-10 twin of the explicit-flag test above. #2: under hard separation-of-duty, a SINGLE aggregator key must not satisfy a
+    // dual-control (M-of-N) threshold by inventing two distinct operator names.
+    // The first sign-off records `agg:<key-id>:alice`; the second from the same key
+    // (`agg:<key-id>:bob`) is rejected 409 before it can satisfy threshold 2.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+
+    let seed = AuthManager::new();
+    let (key, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some("team-a".to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    // XV-10: NOTHING is written for separation of duty. With verified approver identities
+    // (a distinct VULTRINO_APPROVAL_ASSERTION_SECRET, which the binary passes as `true`) the
+    // default resolves to enforced. The same-key 409 below is independent of the flag (it also
+    // fires with SoD off); the default's own route effect is the self-approval test further down.
+    let mut sod_config = Config::default();
+    assert!(!sod_config.approval.enforce_separation_of_duty);
+    sod_config.approval.apply_sod_default(true);
+    assert!(sod_config.approval.enforce_separation_of_duty);
+
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        sod_config,
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    // A dual-control (2-of-N) approval tagged to the acting tenant.
+    let (approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo::local(),
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: Some("team-a".to_string()),
+        workload_id: None,
+        preview: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: true,
+        criticality: vultrino::approval::CriticalityClass::High,
+        trusted_irreversible: None,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 2,
+        approval_rule: None,
+    });
+    let id = approval.id.clone();
+    storage.store_approval(&approval).await.unwrap();
+
+    // First sign-off as "alice" → 200, still awaiting a second distinct approver.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        body["status"], "pending",
+        "one of two sign-offs: still open"
+    );
+    assert_eq!(body["approvals_received"], 1);
+
+    // Second sign-off as a DIFFERENT operator name but the SAME aggregator key →
+    // 409. The key cannot fabricate the second distinct approver under hard SoD.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": "bob@example.com"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "the same aggregator key cannot satisfy M-of-N with a second invented name",
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["code"], "separation_of_duty");
+
+    // The approval is still pending (not granted by the single key).
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    assert_eq!(stored.status(), vultrino::approval::ApprovalStatus::Pending);
+    assert_eq!(
+        stored.signoffs().len(),
+        1,
+        "the second same-key sign-off was not recorded"
+    );
+}
+
+/// Route outcome of a requester-equals-approver decision under a given SoD posture:
+/// `Some(true)` = refused 409 approval_not_decidable with nothing written,
+/// `Some(false)` = recorded with 200.
+async fn self_approval_outcome(default_verified: bool, explicit_false: bool) -> bool {
+    self_approval_outcome_as(
+        default_verified,
+        explicit_false,
+        "alice@example.com",
+        None,
+        "alice@example.com",
+    )
+    .await
+}
+
+/// Whether the decision route REFUSED `approver` on a request whose requesting agent is
+/// `principal` and whose directory owner is `owner`.
+async fn self_approval_outcome_as(
+    default_verified: bool,
+    explicit_false: bool,
+    principal: &str,
+    owner: Option<&str>,
+    approver: &str,
+) -> bool {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let seed = AuthManager::new();
+    let (key, api_key) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = api_key.clone();
+    tenant_key.tenant = Some("team-a".to_string());
+    let auth_manager = AuthManager::from_data(seed.list_roles(), vec![tenant_key.clone()]);
+    storage.store_api_key(&tenant_key).await.unwrap();
+
+    let mut cfg = Config::default();
+    if explicit_false {
+        cfg.approval.sod_explicit = true;
+        cfg.approval.enforce_separation_of_duty = false;
+    }
+    cfg.approval.apply_sod_default(default_verified);
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        cfg,
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+
+    // Single-approver request whose requester principal name is the approver.
+    let mut requester = RequesterInfo::local();
+    requester.principal_name = Some(principal.to_string());
+    requester.owner = owner.map(str::to_string);
+    let (approval, _token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester,
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: Some("team-a".to_string()),
+        workload_id: None,
+        preview: None,
+        action_label: Some("payments.refund".to_string()),
+        dual_control: false,
+        criticality: vultrino::approval::CriticalityClass::High,
+        trusted_irreversible: None,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: None,
+        reauth_interval_secs: None,
+        required_approvals: 1,
+        approval_rule: None,
+    });
+    let id = approval.id.clone();
+    storage.store_approval(&approval).await.unwrap();
+
+    let resp = router
+        .oneshot(admin_req(
+            "POST",
+            &format!("/api/v1/approvals/{}/decision", id),
+            &key,
+            serde_json::json!({"approve": true, "approver": approver}),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let stored = storage.get_approval(&id).await.unwrap().unwrap();
+    if status == StatusCode::CONFLICT {
+        assert_eq!(body["code"], "approval_not_decidable");
+        assert_eq!(
+            stored.signoffs().len(),
+            0,
+            "a refused self-approval writes nothing"
+        );
+        true
+    } else {
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored.signoffs().len(), 1, "the self-approval was recorded");
+        false
+    }
+}
+
+#[tokio::test]
+async fn test_json_decision_self_approval_follows_the_sod_default() {
+    // XV-10: the default's route effect. Requester == approver is refused with the
+    // default on (verified identities, nothing written), and recorded when an
+    // explicit false keeps it off. This, not the same-key guard, is what the flag buys.
+    assert!(
+        self_approval_outcome(true, false).await,
+        "default on: self-approval refused"
+    );
+    assert!(
+        !self_approval_outcome(true, true).await,
+        "explicit false: self-approval recorded"
+    );
+    assert!(
+        !self_approval_outcome(false, false).await,
+        "dev (unverified identities): default off, self-approval recorded"
+    );
+}
+
+#[tokio::test]
+async fn test_json_decision_owner_may_approve_own_agent_under_the_sod_default() {
+    // The Solo model: separation of duty refuses the requesting AGENT, not its owner.
+    // The owner approves their own agent's request with SoD on by default; the agent's
+    // own identity is still refused.
+    assert!(
+        !self_approval_outcome_as(
+            true,
+            false,
+            "solo-agent",
+            Some("owner@example.com"),
+            "owner@example.com"
+        )
+        .await,
+        "the agent's owner is allowed to approve under the default"
+    );
+    assert!(
+        self_approval_outcome_as(
+            true,
+            false,
+            "solo-agent",
+            Some("owner@example.com"),
+            "solo-agent"
+        )
+        .await,
+        "the requesting agent itself is refused"
+    );
+}
+
 /// Build a tenant-scoped, hard-SoD router + a stored dual-control (2-of-N)
 /// approval, returning (router, storage, key, approval-id). Shared by the same-key
 /// M-of-N regression tests.
@@ -3644,6 +3934,7 @@ async fn test_json_decision_recipe_hard_sod_senior_pair_one_key_409() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
 
@@ -3697,6 +3988,7 @@ async fn test_verified_broker_assertion_requires_named_and_allows_two_bound_subj
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
     let uri = format!("/api/v1/approvals/{id}/decision");
@@ -3794,6 +4086,7 @@ fn two_teammate_rule() -> ApprovalRule {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     }
 }
 
@@ -3915,6 +4208,7 @@ async fn test_denials_of_either_provenance_are_unaffected_by_the_provenance_rule
             }],
         }],
         decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "Low").await;
     let uri = format!("/api/v1/approvals/{id}/decision");
@@ -4248,6 +4542,7 @@ async fn test_invalid_present_broker_assertion_fails_closed_without_signoff() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
     let uri = format!("/api/v1/approvals/{id}/decision");
@@ -4290,6 +4585,7 @@ async fn test_json_decision_recipe_hard_sod_senior_then_teammate_one_key_409() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
 
@@ -4339,6 +4635,7 @@ async fn test_json_decision_recipe_hard_sod_teammate_then_senior_one_key_409() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
 
@@ -4404,6 +4701,7 @@ async fn test_json_decision_recipe_hard_sod_unsatisfiable_branch_then_senior_all
             },
         ],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (router, storage, key, id) = build_hard_sod_recipe_fixture("team-a", rule, "High").await;
 
@@ -4460,6 +4758,7 @@ async fn test_json_decision_recipe_hard_sod_dissent_then_distinct_approve_allowe
             }],
         }],
         decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+        exclude_owner: false,
     };
     // "High" (required): majority-with-dissent semantics are only honored below
     // Extreme — Extreme/irreversible force DenyOnAnyDeny regardless of the rule's
@@ -4564,6 +4863,7 @@ async fn test_json_decision_recipe_hard_sod_two_distinct_keys_allowed() {
             }],
         }],
         decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+        exclude_owner: false,
     };
     let (mut approval, _token) = ApprovalRequest::open(NewApproval {
         credential: "stripe-prod".to_string(),
@@ -4675,10 +4975,11 @@ async fn test_json_decision_rejects_missing_operator_after_named_signoff() {
 
 #[tokio::test]
 async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
-    // [#2 regression] An NHI whose OWNER is alice@ approved by human alice@ through
-    // the aggregator (recorded as `agg:<key>:alice@`) is a self-approval. SoD is
-    // computed against the BARE operator, so under hard SoD this is rejected 409 —
-    // the agg: namespacing must NOT let a self-approval slip past.
+    // [#2 regression] An NHI `refund-bot` approving itself through the aggregator
+    // (recorded as `agg:<key>:refund-bot`) is a self-approval. SoD is computed against
+    // the BARE operator, so under hard SoD this is rejected 409 — the agg: namespacing
+    // must NOT let a self-approval slip past. (Its owner alice@ may approve: see
+    // test_json_decision_owner_may_approve_own_agent_under_the_sod_default.)
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
     std::mem::forget(dir);
@@ -4750,21 +5051,21 @@ async fn test_json_decision_hard_sod_catches_aggregator_self_approval() {
     let id = approval.id.clone();
     storage.store_approval(&approval).await.unwrap();
 
-    // alice@ approving her own NHI's action via the aggregator → 409, stays pending.
+    // refund-bot approving its own action via the aggregator → 409, stays pending.
     let resp = router
         .clone()
         .oneshot(admin_req(
             "POST",
             &format!("/api/v1/approvals/{}/decision", id),
             &key,
-            serde_json::json!({"approve": true, "approver": "alice@example.com"}),
+            serde_json::json!({"approve": true, "approver": "refund-bot"}),
         ))
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::CONFLICT,
-        "aggregator self-approval (owner == operator) must be caught under hard SoD",
+        "aggregator self-approval (agent == operator) must be caught under hard SoD",
     );
     let stored = storage.get_approval(&id).await.unwrap().unwrap();
     assert_eq!(

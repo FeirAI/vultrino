@@ -552,6 +552,14 @@ pub struct ApprovalRule {
     /// The partial-dissent semantics knob (see [`RecipeDecisionMode`]).
     #[serde(default)]
     pub decision_mode: RecipeDecisionMode,
+    /// govder-authored: when true, the requesting agent's OWNER may not approve (a
+    /// sign-off by the directory owner is refused like a self-approval), for
+    /// organizations that want "someone other than the owner". Default false: the
+    /// owner of an agent MAY approve that agent's actions (the Solo model, where the
+    /// owner is the only human approver). Independent of `enforce_separation_of_duty`,
+    /// which only ever refuses the requesting AGENT's own identities.
+    #[serde(default)]
+    pub exclude_owner: bool,
 }
 
 /// One approver's sign-off on a dual-control (M-of-N) approval (V12).
@@ -1713,6 +1721,9 @@ impl ApprovalRequest {
         if decision.enforce_sod && sod == Some(true) {
             return Err(ApprovalError::SeparationOfDuty);
         }
+        if self.owner_excluded(&identity) {
+            return Err(ApprovalError::SeparationOfDuty);
+        }
         // Controller separation for M-of-N (in-lock, TOCTOU-safe): one aggregator
         // key may contribute AT MOST ONE positive recipe slot — the aggregator's
         // claim of distinct HUMAN operators is unverifiable, so a SECOND
@@ -1921,8 +1932,11 @@ impl ApprovalRequest {
         // violation (not just the highest-precedence one). A blank identity is
         // skipped rather than treated as "the owner" (so it can't poison the result
         // to not-computable).
+        // The directory OWNER is deliberately not in this list: separation of duty is
+        // "the requesting agent cannot approve its own request", and an agent's owner may
+        // approve it (Solo: the owner is the only human approver). A recipe that wants
+        // "someone other than the owner" sets `exclude_owner` (see `owner_excluded`).
         let identities = [
-            self.requester.owner.as_deref(),
             self.requester.principal_name.as_deref(),
             self.agent_label.as_deref(),
             self.principal_id.as_deref(),
@@ -1938,6 +1952,21 @@ impl ApprovalRequest {
             return None; // not computable
         }
         Some(known.iter().any(|id| id.eq_ignore_ascii_case(approver)))
+    }
+
+    /// Whether a candidate approver is the requesting agent's directory owner AND the
+    /// stamped recipe excludes the owner. Independent of `enforce_separation_of_duty`: the
+    /// recipe flag is explicit, govder-authored policy.
+    fn owner_excluded(&self, candidate: &str) -> bool {
+        let excluded = self.approval_rule.as_ref().is_some_and(|r| r.exclude_owner);
+        if !excluded {
+            return false;
+        }
+        let approver = bare_approver_identity(candidate).trim();
+        match self.requester.owner.as_deref().map(str::trim) {
+            Some(o) if !o.is_empty() && !approver.is_empty() => o.eq_ignore_ascii_case(approver),
+            _ => false,
+        }
     }
 
     /// Expire an approved-but-unrun grant whose continuous-reauth window lapsed
@@ -2879,12 +2908,43 @@ pub struct ApprovalConfig {
     /// When true, a self-approval (approver == requesting agent) is **rejected**
     /// at decision time (V5); otherwise it is recorded + logged but allowed.
     pub enforce_separation_of_duty: bool,
+    /// True when `[approvals] enforce_separation_of_duty` was written in the config (either value).
+    /// An explicit setting always wins over the verified-approver default
+    /// ([`ApprovalConfig::apply_sod_default`]).
+    pub sod_explicit: bool,
     /// Number of distinct approvers a dual-control request requires (V12 M-of-N).
     /// Defaults to 2; only takes effect for requests flagged `dual_control`.
     pub dual_control_approvers: u32,
 }
 
 impl ApprovalConfig {
+    /// Resolve the separation-of-duty posture once the approver-identity posture is known.
+    ///
+    /// Separation of duty ("the approver must not be the requester") is only meaningful when the
+    /// approver identity is authenticated. With a distinct `VULTRINO_APPROVAL_ASSERTION_SECRET`
+    /// the identity is the broker's signed assertion of an IdP subject, so enforcement is ON BY
+    /// DEFAULT; an operator who writes `enforce_separation_of_duty` in `[approvals]` keeps that
+    /// value, either way. Without verified approver identities (dev mode: an identity is whatever
+    /// was typed into a login form) the default stays off, because blocking a self-approval of an
+    /// unauthenticated name would stop nothing and break single-person development.
+    ///
+    /// Returns the one-line posture to log at startup.
+    pub fn apply_sod_default(&mut self, approver_identities_verified: bool) -> &'static str {
+        match (self.sod_explicit, approver_identities_verified) {
+            (true, true) if !self.enforce_separation_of_duty => {
+                "separation of duty is explicitly OFF while approver identities are verified: a requester can approve its own request"
+            }
+            (true, _) => "separation of duty follows the explicit [approvals] setting",
+            (false, true) => {
+                self.enforce_separation_of_duty = true;
+                "separation of duty is ON by default (approver identities are verified)"
+            }
+            (false, false) => {
+                "separation of duty is OFF by default (no verified approver identities: dev mode)"
+            }
+        }
+    }
+
     /// The startup warning to print when approvals are DISABLED, or `None` when they
     /// are on.
     ///
@@ -3330,6 +3390,7 @@ mod tests {
                 ],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         }
     }
 
@@ -3578,24 +3639,23 @@ mod tests {
 
     #[test]
     fn test_sod_computed_against_bare_operator_of_aggregator_identity() {
-        // [#2 regression] An NHI whose OWNER is alice@ approved by human alice@ via
-        // the aggregator (recorded as `agg:<key>:alice@`) is a self-approval — SoD
-        // must be computed against the BARE operator, not the namespaced wrapper,
-        // or it would fail OPEN on exactly this surface.
-        let (mut a, _) = new_approval();
-        a.requester.owner = Some("alice@example.com".to_string());
+        // [#2 regression] An aggregator-asserted approval (`agg:<key>:<operator>`) must
+        // be compared by its BARE operator, not the namespaced wrapper, or a
+        // self-approval by the requesting AGENT would fail OPEN on exactly this
+        // surface. (The agent's OWNER is not a self-approval; see
+        // test_owner_may_approve_own_agent_under_enforced_sod.)
+        let (mut a, _) = new_approval(); // principal_name "agent"
+        let agg_self = "agg:key-123:agent";
         // Not enforcing: the violation must still be RECORDED (observable).
-        let agg_self = "agg:key-123:alice@example.com";
         a.approve(Decision::new("json-api", agg_self)).unwrap();
         assert_eq!(
             a.sod_violation,
             Some(true),
-            "aggregator self-approval (owner == operator) must be flagged"
+            "aggregator self-approval (agent == operator) must be flagged"
         );
 
         // Enforcing: the same self-approval is REJECTED (not merely recorded).
         let (mut b, _) = new_approval();
-        b.requester.owner = Some("alice@example.com".to_string());
         let err = b
             .approve(Decision::new("json-api", agg_self).enforcing_sod(true))
             .unwrap_err();
@@ -3709,52 +3769,105 @@ mod tests {
     }
 
     #[test]
-    fn test_sod_uses_directory_owner_when_present() {
-        // V10: when the requesting NHI has a bound directory owner, SoD compares
-        // the approver to that owner (the most precise "requester's owner"), not
-        // just the agent label.
+    fn test_owner_may_approve_own_agent_under_enforced_sod() {
+        // Separation of duty is "the requesting AGENT cannot approve its own request".
+        // The agent's directory owner is NOT the requester: in Solo the owner is the
+        // only human approver of their own agents, so enforced SoD must allow it.
         let (mut a, _) = new_approval(); // principal_name "agent"
         a.requester.owner = Some("alice@example.com".to_string());
-        a.approve(Decision::new("admin panel", "ALICE@example.com"))
+        a.approve(Decision::new("admin panel", "ALICE@example.com").enforcing_sod(true))
             .unwrap();
+        assert_eq!(a.status, ApprovalStatus::Approved);
         assert_eq!(
             a.violates_sod(),
-            Some(true),
-            "approver == bound owner → SoD violation"
+            Some(false),
+            "owner is not a self-approval"
         );
 
-        // SoD checks ALL the agent's identities: approving under the agent's own
-        // name (not the owner) is still a self-approval.
-        let (mut b, _) = new_approval(); // principal_name "agent"
+        // Approving under ANY of the agent's own identities is still refused.
+        let (mut b, _) = new_approval();
         b.requester.owner = Some("alice@example.com".to_string());
-        b.approve(Decision::new("admin panel", "agent")).unwrap();
-        assert_eq!(
-            b.violates_sod(),
-            Some(true),
-            "self-approval under any identity is flagged"
-        );
+        let err = b
+            .approve(Decision::new("admin panel", "agent").enforcing_sod(true))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::SeparationOfDuty));
+        let (mut b2, _) = new_approval();
+        b2.requester.owner = Some("alice@example.com".to_string());
+        b2.agent_label = Some("label-1".to_string());
+        let err = b2
+            .approve(Decision::new("admin panel", "LABEL-1").enforcing_sod(true))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::SeparationOfDuty));
 
-        // A genuinely distinct approver (neither the owner nor the agent) is clean.
+        // A distinct approver is clean.
         let (mut c, _) = new_approval();
         c.requester.owner = Some("alice@example.com".to_string());
         c.approve(Decision::new("admin panel", "secops-oncall"))
             .unwrap();
-        assert_eq!(
-            c.violates_sod(),
-            Some(false),
-            "distinct approver satisfies SoD"
-        );
+        assert_eq!(c.violates_sod(), Some(false));
 
-        // A blank owner must NOT poison the result to not-computable — SoD falls
-        // through to the agent's other identities (the old `.or()` chain bug).
-        let (mut d, _) = new_approval(); // principal_name "agent"
+        // A blank owner must NOT poison the result to not-computable.
+        let (mut d, _) = new_approval();
         d.requester.owner = Some("   ".to_string());
         d.approve(Decision::new("admin panel", "agent")).unwrap();
-        assert_eq!(
-            d.violates_sod(),
-            Some(true),
-            "blank owner doesn't poison SoD to None"
+        assert_eq!(d.violates_sod(), Some(true));
+    }
+
+    #[test]
+    fn test_recipe_exclude_owner_refuses_the_owner_only_when_set() {
+        // exclude_owner is explicit recipe policy, enforced even with SoD off, and it
+        // refuses only the directory owner (an approval by anyone else still counts).
+        let mut rule = two_teammate_rule();
+        rule.exclude_owner = true;
+        let mut a = new_approval_with_rule(rule);
+        a.requester.owner = Some("alice@example.com".to_string());
+        let err = a
+            .approve(
+                Decision::new("admin panel", "agg:key-1:Alice@example.com")
+                    .with_resolved_class(ApproverClass::Teammate),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::SeparationOfDuty));
+        assert!(
+            a.signoffs.is_empty(),
+            "the owner's sign-off is not recorded"
         );
+        a.approve(Decision::new("admin panel", "bob").with_resolved_class(ApproverClass::Teammate))
+            .unwrap();
+        assert_eq!(a.signoffs.len(), 1);
+
+        // Default (false): the owner approves.
+        let mut b = new_approval_with_rule(two_teammate_rule());
+        b.requester.owner = Some("alice@example.com".to_string());
+        b.approve(
+            Decision::new("admin panel", "alice@example.com")
+                .with_resolved_class(ApproverClass::Teammate),
+        )
+        .unwrap();
+        assert_eq!(b.signoffs.len(), 1);
+
+        // A deny by the owner is never blocked by the flag (a veto is always allowed).
+        let mut rule = two_teammate_rule();
+        rule.exclude_owner = true;
+        let mut c = new_approval_with_rule(rule);
+        c.requester.owner = Some("alice@example.com".to_string());
+        c.deny(Decision::new("admin panel", "alice@example.com"))
+            .unwrap();
+        assert_eq!(c.status, ApprovalStatus::Denied);
+    }
+
+    #[test]
+    fn test_exclude_owner_is_a_serde_default_false() {
+        let rule: ApprovalRule = serde_json::from_str(
+            r#"{"recipes":[{"terms":[{"class":"senior","count":1}]}],"decision_mode":"deny-on-any-deny"}"#,
+        )
+        .unwrap();
+        assert!(!rule.exclude_owner);
+        let rule: ApprovalRule = serde_json::from_str(
+            r#"{"recipes":[{"terms":[{"class":"senior","count":1}]}],"exclude_owner":true}"#,
+        )
+        .unwrap();
+        assert!(rule.exclude_owner);
     }
 
     #[test]
@@ -3961,6 +4074,36 @@ mod tests {
     }
 
     #[test]
+    fn sod_defaults_on_only_with_verified_approver_identities() {
+        // Verified approver identities, nothing written in the config: ON.
+        let mut cfg = ApprovalConfig::default();
+        let line = cfg.apply_sod_default(true);
+        assert!(cfg.enforce_separation_of_duty, "{line}");
+        // No verified identities (dev mode): OFF, and it says so.
+        let mut dev = ApprovalConfig::default();
+        let line = dev.apply_sod_default(false);
+        assert!(!dev.enforce_separation_of_duty);
+        assert!(line.contains("OFF by default"), "{line}");
+        // An explicit false wins over the verified default, and the log line warns.
+        let mut off = ApprovalConfig {
+            sod_explicit: true,
+            enforce_separation_of_duty: false,
+            ..Default::default()
+        };
+        let line = off.apply_sod_default(true);
+        assert!(!off.enforce_separation_of_duty);
+        assert!(line.contains("explicitly OFF"), "{line}");
+        // An explicit true holds without verified identities.
+        let mut on = ApprovalConfig {
+            sod_explicit: true,
+            enforce_separation_of_duty: true,
+            ..Default::default()
+        };
+        on.apply_sod_default(false);
+        assert!(on.enforce_separation_of_duty);
+    }
+
+    #[test]
     fn test_sla_windows_per_class() {
         let mut cfg = ApprovalConfig {
             ttl_secs: 7200,
@@ -4066,6 +4209,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         // A human approval does NOT satisfy an agent-reviewer-only recipe, even
@@ -4087,6 +4231,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         a.approve(Decision::new("admin panel", "alice")).unwrap();
@@ -4110,6 +4255,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         // Majority mode is only honored below Extreme (approval-recipes.md §5 D4(a)):
@@ -4150,6 +4296,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "Extreme".to_string();
@@ -4180,6 +4327,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         assert_eq!(
@@ -4209,6 +4357,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "Medium".to_string();
@@ -4238,6 +4387,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "High".to_string();
@@ -4268,6 +4418,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "Medium".to_string();
@@ -4343,6 +4494,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         }
     }
 
@@ -4411,6 +4563,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "Medium".to_string();
@@ -4472,6 +4625,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "High".to_string(); // majority honored: dissent non-terminal
@@ -4513,6 +4667,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "Medium".to_string();
@@ -4557,6 +4712,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         };
         let signoff = |ident: &str, class| {
             let mut d = Decision::new("json-api", ident)
@@ -4637,6 +4793,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         };
         let signoff = |ident: &str, class| {
             let mut d = Decision::new("json-api", ident)
@@ -4751,6 +4908,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::MajorityWithDissentRecorded,
+            exclude_owner: false,
         });
         a.authoritative_risk_tier = "Low".to_string();
         a.approve(signoff("verified:sub-alice", ApproverClass::Teammate))
@@ -4771,6 +4929,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         });
         b.authoritative_risk_tier = "High".to_string();
         b.approve(signoff("verified:sub-alice", ApproverClass::Senior))
@@ -4842,6 +5001,7 @@ mod tests {
                 },
             ],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "High".to_string();
@@ -4877,6 +5037,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         a.authoritative_risk_tier = "Medium".to_string();
@@ -5048,6 +5209,7 @@ mod tests {
                 ],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         approve_as(&mut a, "senior@corp", ApproverClass::Senior, None, None).unwrap();
@@ -5071,6 +5233,7 @@ mod tests {
                 }],
             }],
             decision_mode: RecipeDecisionMode::DenyOnAnyDeny,
+            exclude_owner: false,
         };
         let mut a = new_approval_with_rule(rule);
         // Explicit unknown Kind with an otherwise-valid senior class: dropped.
