@@ -2543,7 +2543,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::commit_locked",
-          "sha256": "c2c712c75902b33024a39cec53a99c012a218c893f410c442c702012cc85c8d2"
+          "sha256": "682828b9072281a28be714ae407edca7ab0aab2d0e84312479eab20f9c8cf3f2"
         },
         {
           "path": "src/storage/file.rs",
@@ -2600,7 +2600,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::full_load_locked",
-          "sha256": "292848e2f93ebb71919a53c36efea51c5874d31b0f945ae78fc5ad35bd19171c"
+          "sha256": "b0c2b13f94799a8ec80412ccf4e1bc12d14d425dbe31de35b86a34cebaa74187"
         },
         {
           "path": "src/storage/file.rs",
@@ -2660,7 +2660,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "e476543a44284d10fd7f3e57d74d1ea5455d8bfdbfb48ccf2d0c5170e451c5e6"
+          "sha256": "846d12b6dc1d81596fc2a35b391df124ca4b2e90a09dc76ecbfc94196010eec6"
         }
       ],
       "mutants": [
@@ -2689,12 +2689,12 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "e476543a44284d10fd7f3e57d74d1ea5455d8bfdbfb48ccf2d0c5170e451c5e6"
+          "sha256": "846d12b6dc1d81596fc2a35b391df124ca4b2e90a09dc76ecbfc94196010eec6"
         },
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::full_load_locked",
-          "sha256": "292848e2f93ebb71919a53c36efea51c5874d31b0f945ae78fc5ad35bd19171c"
+          "sha256": "b0c2b13f94799a8ec80412ccf4e1bc12d14d425dbe31de35b86a34cebaa74187"
         },
         {
           "path": "src/storage/file.rs",
@@ -2825,7 +2825,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::full_load_locked",
-          "sha256": "292848e2f93ebb71919a53c36efea51c5874d31b0f945ae78fc5ad35bd19171c"
+          "sha256": "b0c2b13f94799a8ec80412ccf4e1bc12d14d425dbe31de35b86a34cebaa74187"
         }
       ],
       "mutants": [
