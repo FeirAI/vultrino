@@ -1,0 +1,13 @@
+diff --git a/src/web/posture.rs b/src/web/posture.rs
+index d508c5e..915c1c1 100644
+--- a/src/web/posture.rs
++++ b/src/web/posture.rs
+@@ -28,7 +28,7 @@ pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Pol
+     observe_tenants.sort_unstable();
+     let mut fail_open_rate_limits: Vec<&str> = policies
+         .iter()
+-        .filter(|p| p.rate_limit_default_not_deny())
++        .filter(|_| false)
+         .map(|p| p.id.as_str())
+         .collect();
+     fail_open_rate_limits.sort_unstable();

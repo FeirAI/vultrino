@@ -1,0 +1,13 @@
+diff --git a/src/policy/types.rs b/src/policy/types.rs
+index c735c10..2275c93 100644
+--- a/src/policy/types.rs
++++ b/src/policy/types.rs
+@@ -180,7 +180,7 @@ impl Policy {
+     /// through to the policy default, so a non-deny default turns the limit into an allow. The
+     /// posture endpoint lists these so an operator can fix them.
+     pub fn rate_limit_default_not_deny(&self) -> bool {
+-        self.default_action != PolicyAction::Deny
++        self.default_action == PolicyAction::Deny
+             && self
+                 .rules
+                 .iter()

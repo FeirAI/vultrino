@@ -1,0 +1,13 @@
+diff --git a/src/web/posture.rs b/src/web/posture.rs
+index d508c5e..14c5236 100644
+--- a/src/web/posture.rs
++++ b/src/web/posture.rs
+@@ -44,7 +44,7 @@ pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Pol
+         },
+         "approvals": {
+             "enabled": config.approval.enabled,
+-            "enforce_separation_of_duty": config.approval.enforce_separation_of_duty,
++            "enforce_separation_of_duty": true,
+         },
+         "approver_identity": {
+             "govder_configured": key.is_some(),
