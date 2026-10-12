@@ -522,6 +522,9 @@
     },
     "vault-panic-keeps-view-trusted": {
       "tier": "full"
+    },
+    "vault-file-gone-reload-accepted": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -2684,7 +2687,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "846d12b6dc1d81596fc2a35b391df124ca4b2e90a09dc76ecbfc94196010eec6"
+          "sha256": "3b693754e5dcaf4ed8c182d47b6d16c1711948fe67f4187f72caa30525d419eb"
         }
       ],
       "mutants": [
@@ -2713,7 +2716,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "846d12b6dc1d81596fc2a35b391df124ca4b2e90a09dc76ecbfc94196010eec6"
+          "sha256": "3b693754e5dcaf4ed8c182d47b6d16c1711948fe67f4187f72caa30525d419eb"
         },
         {
           "path": "src/storage/file.rs",
@@ -2744,6 +2747,36 @@
       ],
       "does_not_establish": "Log loss while no vultrino process is running: a log truncated at a record boundary (or by a torn tail) still opens as the shorter state, because the snapshot does not record the log's length; only a missing log is detected at open. An attacker who can write the vault directory and puts back an older vault file together with its older log. A log replaced by a different file of at least the same length while the snapshot is unchanged and the length equals the applied offset. Filesystems that report a stale length. A crash between the log creation and the snapshot rename leaves an empty log beside the old snapshot, which is accepted (it holds nothing). Any CI run other than the recorded one.",
       "evidence_run": "38219467303"
+    },
+    {
+      "id": "vault-file-gone-fails-closed",
+      "statement": "A vultrino process that has loaded the vault (it holds a snapshot token) and then finds the vault file itself gone never turns a halted agent clear: the next dispatch fence read and every write fail closed (Unavailable) and keep failing on repeat, both when the log still holds the kill and right after a compaction when the log is empty too, and a write does not recreate the vault file.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/file.rs",
+        "src/storage/vault_tests.rs",
+        "docs/dev/LIMITATIONS.md"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::deleting_the_vault_file_under_a_running_process_never_turns_a_halt_clear",
+      "covers": [
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::sync_locked",
+          "sha256": "3b693754e5dcaf4ed8c182d47b6d16c1711948fe67f4187f72caa30525d419eb"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::vault_file_gone_error",
+          "sha256": "71fee59903fa492bdd23d0505be894f1741f572586e963ff2e5654a095d52f67"
+        }
+      ],
+      "mutants": [
+        "vault-file-gone-reload-accepted"
+      ],
+      "does_not_establish": "Deletion while no vultrino process is running: a process started after the deletion finds no vault and starts one fresh, as for any vault that never existed. Offline truncation of the .wal tail at a record boundary without a durable anchor: accepted limitation, because filesystem write access is outside the threat model (stated in LIMITATIONS). Replacing the vault file with an older copy, or a file replaced by a different one between two looks (the snapshot token then changes and the process reloads as for a compaction). Another process's view: only the process that loaded the vault refuses. Any CI run until an evidence run is recorded."
     },
     {
       "id": "vault-reload-after-uncertain-commit",

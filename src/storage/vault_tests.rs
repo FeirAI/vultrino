@@ -1304,6 +1304,38 @@ async fn removing_the_log_under_a_running_process_never_turns_a_halt_clear() {
 }
 
 #[tokio::test]
+async fn deleting_the_vault_file_under_a_running_process_never_turns_a_halt_clear() {
+    // Right after a compaction the log is empty, so with the vault file gone too a reload would
+    // find nothing at all and answer Clear. The process already holds a snapshot token: refuse.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let (b, epoch0) = halted_vault(&path).await;
+    b.compact().await.unwrap();
+    assert_eq!(
+        std::fs::metadata(path.with_extension("wal")).unwrap().len(),
+        0
+    );
+    std::fs::remove_file(&path).unwrap();
+    for _ in 0..2 {
+        let r = b.kill_fence_check(&q("gh-main", epoch0)).await;
+        assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
+    }
+    // A write is refused too and does not recreate the vault.
+    assert!(matches!(
+        b.store(&cred("late")).await,
+        Err(StorageError::Unavailable(_))
+    ));
+    assert!(!path.exists());
+    // Same with a non-empty log (no compaction first).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let (b, epoch0) = halted_vault(&path).await;
+    std::fs::remove_file(&path).unwrap();
+    let r = b.kill_fence_check(&q("gh-main", epoch0)).await;
+    assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
+}
+
+#[tokio::test]
 async fn shrinking_the_log_under_a_running_process_never_turns_a_halt_clear() {
     for keep in [0u64, 1] {
         let dir = tempdir().unwrap();

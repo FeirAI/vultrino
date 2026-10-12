@@ -1719,6 +1719,14 @@ impl FileStorage {
         cache: &mut StorageCache,
         exclusive: bool,
     ) -> Result<(), StorageError> {
+        // A process that has seen the vault file (it holds a snapshot token) and now finds the
+        // file gone must not reload: an empty or missing view would read as "no kills" and turn a
+        // halted agent clear, most easily right after a compaction when the log is empty too.
+        // The token stays set, so every later look of THIS process refuses as well; a process
+        // started after the deletion sees no vault at all, as for any vault that never existed.
+        if log.snap_token.is_some() && file_token(&self.path).is_none() {
+            return Err(self.vault_file_gone_error());
+        }
         if log.loaded {
             let tok = file_token(&self.path);
             if tok.is_some() && tok == log.snap_token {
@@ -1755,6 +1763,15 @@ impl FileStorage {
             )));
         }
         Ok(())
+    }
+
+    fn vault_file_gone_error(&self) -> StorageError {
+        StorageError::Unavailable(format!(
+            "the vault file {} is gone while this process was running: committed records \
+             (including kills) may be lost. Refusing to continue. Stop every vultrino process \
+             and restore the vault file together with its log from the same backup",
+            self.path.display()
+        ))
     }
 
     fn log_gone_error(&self, what: &str) -> StorageError {
