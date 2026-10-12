@@ -8961,3 +8961,21 @@ async fn posture_lists_a_stored_fail_open_rate_limit_policy() {
         serde_json::json!(["legacy-rl"])
     );
 }
+
+#[tokio::test]
+async fn posture_reports_a_non_deny_engine_default_as_it_is() {
+    let (router, _storage, srv, key) = build_admin_router().await;
+    srv.policy_engine().set_default_deny(false);
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/posture",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["engine"]["default_deny"], false);
+}

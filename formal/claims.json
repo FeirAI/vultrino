@@ -2782,7 +2782,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --test web_smoke -- --exact posture_requires_an_operator_key_and_reports_the_live_engine posture_refuses_a_tenant_scoped_key posture_lists_a_stored_fail_open_rate_limit_policy && cargo test --locked --no-default-features --lib -- web::posture::tests",
+      "detector": "cargo test --locked --no-default-features --test web_smoke -- --exact posture_requires_an_operator_key_and_reports_the_live_engine posture_refuses_a_tenant_scoped_key posture_lists_a_stored_fail_open_rate_limit_policy posture_reports_a_non_deny_engine_default_as_it_is && cargo test --locked --no-default-features --lib -- web::posture::tests",
       "covers": [
         {
           "path": "src/web/posture.rs",
