@@ -11,6 +11,7 @@ mod api;
 mod auth;
 mod llm_proxy;
 mod mcp_http;
+mod posture;
 mod routes;
 mod server;
 mod templates;

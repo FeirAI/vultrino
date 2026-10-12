@@ -3662,6 +3662,22 @@ pub async fn api_list_sessions(_admin: AdminApiAuth, State(state): State<AppStat
         .into_response()
 }
 
+// -------- Live posture report --------
+
+/// `GET /api/v1/posture` — what THIS process enforces right now, for the deploy-time posture
+/// verifier. Operator-only (a global admin key): the report is about the whole process, not a
+/// tenant. Read-only; booleans, counts, ids and build provenance only, never a secret, a rule or
+/// a credential (see `posture::build_posture`).
+pub async fn api_posture(admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
+    let engine = state.server.policy_engine();
+    let policies = engine.list_policies();
+    let report = super::posture::build_posture(&state.config, engine.default_deny(), &policies);
+    (StatusCode::OK, Json(report)).into_response()
+}
+
 // -------- Tenant enforcement-mode read (shadow onboarding phase A) --------
 
 /// Query shape for [`api_tenant_mode`].

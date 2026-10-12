@@ -8864,3 +8864,100 @@ async fn test_replaying_a_captured_signed_decision_within_its_ttl_has_no_second_
         );
     }
 }
+
+// -------- Live posture report (GET /api/v1/posture) --------
+
+#[tokio::test]
+async fn posture_requires_an_operator_key_and_reports_the_live_engine() {
+    let (router, _storage, _srv, key) = build_admin_router().await;
+    // No credentials: 401, never a report.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/posture")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/posture",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["schema"], 1);
+    assert_eq!(body["plane"], "vultrino");
+    assert_eq!(body["engine"]["default_deny"], true);
+    assert_eq!(body["vault"]["format_version"], 10);
+    assert!(body["build"]["rustc"]
+        .as_str()
+        .unwrap()
+        .starts_with("rustc "));
+    assert!(!body["build"]["git_sha"].as_str().unwrap().is_empty());
+    // Booleans, counts and ids only: no key or secret value anywhere in the report.
+    assert!(!body.to_string().to_lowercase().contains("bearer"));
+}
+
+#[tokio::test]
+async fn posture_refuses_a_tenant_scoped_key() {
+    let (router, key) =
+        build_tenant_admin_router_with_modes("team-a", observe_config("team-a")).await;
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/posture",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn posture_lists_a_stored_fail_open_rate_limit_policy() {
+    let (router, storage, srv, key) = build_admin_router().await;
+    // A policy stored before the RateLimit default rule existed still loads; it is written
+    // straight to the engine here because the write routes now refuse it.
+    srv.policy_engine()
+        .load_policies(vec![vultrino::policy::Policy {
+            id: "legacy-rl".to_string(),
+            name: "legacy-rl".to_string(),
+            credential_pattern: "*".to_string(),
+            principal_pattern: None,
+            rules: vec![vultrino::policy::PolicyRule {
+                condition: vultrino::policy::PolicyCondition::RateLimit {
+                    max: 5,
+                    window_secs: 60,
+                },
+                action: vultrino::policy::PolicyAction::Allow,
+            }],
+            default_action: vultrino::policy::PolicyAction::Allow,
+            kill: false,
+        }]);
+    let _ = storage;
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/posture",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        body["policies"]["rate_limit_default_not_deny"],
+        serde_json::json!(["legacy-rl"])
+    );
+}
