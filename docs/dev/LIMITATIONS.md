@@ -71,7 +71,17 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   left behind, the next open of the restored v9 file refuses to start (a log beside a
   pre-v10 snapshot is never replayed) and names the file to delete. A backup of a v10
   vault must copy the vault file and its `.wal` together, with the processes stopped
-  (or under the lock).
+  (or under the lock). The `.wal` is part of the vault, not a cache: a vault file
+  restored without its `.wal` is refused at open (every v10 vault has one, empty
+  after a compaction), and restoring a `.wal` from a different moment than the vault
+  file fails the open or silently drops the records written in between, including a
+  kill. A running process also refuses to continue (every dispatch fence read and
+  every write fails closed) if the `.wal` is removed or shortened while the snapshot
+  is unchanged. It cannot notice the same edit made while no process is running
+  (a truncated log whose remaining records still parse opens as the shorter state),
+  and it does not defend against an attacker who can write the vault directory:
+  such an attacker can also put back an older copy of the vault. Backups must therefore take the
+  two files together and be tested by restoring them.
 - **Vault change detection and lock behaviour.** Another process's commit is noticed
   through the snapshot's (mtime, length, inode) token plus the log length; a
   filesystem with coarse timestamps is unsupported (this now covers writes and the

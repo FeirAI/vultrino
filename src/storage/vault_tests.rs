@@ -1269,3 +1269,193 @@ async fn a_wrong_password_with_averin_enabled_is_a_decrypt_error() {
         "expected a decrypt error"
     );
 }
+
+// ------------------------------------------------ follow-up: the log must not vanish or shrink
+
+/// A vault with a stored kill, opened twice: `b` has synced the kill, the snapshot is unchanged
+/// (nothing compacted), and the log holds the record that carries the kill.
+async fn halted_vault(path: &Path) -> (FileStorage, u64) {
+    let a = open(path).await;
+    a.set_compact_min_bytes(u64::MAX);
+    let epoch0 = a.kill_fence_epoch().await;
+    let b = open(path).await;
+    a.store_policy(&kill("k1", "gh-*")).await.unwrap();
+    assert!(matches!(
+        b.kill_fence_check(&q("gh-main", epoch0)).await.unwrap(),
+        KillFenceVerdict::Halted { .. }
+    ));
+    drop(a);
+    (b, epoch0)
+}
+
+#[tokio::test]
+async fn removing_the_log_under_a_running_process_never_turns_a_halt_clear() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let (b, epoch0) = halted_vault(&path).await;
+    std::fs::remove_file(path.with_extension("wal")).unwrap();
+    let r = b.kill_fence_check(&q("gh-main", epoch0)).await;
+    assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
+    // Refusal is sticky: a second look does not quietly accept the shorter state.
+    let r = b.kill_fence_check(&q("gh-main", epoch0)).await;
+    assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
+    // A write is refused too (it would append at the wrong sequence).
+    assert!(b.store(&cred("late")).await.is_err());
+}
+
+#[tokio::test]
+async fn shrinking_the_log_under_a_running_process_never_turns_a_halt_clear() {
+    for keep in [0u64, 1] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let (b, epoch0) = halted_vault(&path).await;
+        let wal = path.with_extension("wal");
+        let len = std::fs::metadata(&wal).unwrap().len();
+        assert!(len > 1);
+        let f = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+        f.set_len(keep).unwrap();
+        let r = b.kill_fence_check(&q("gh-main", epoch0)).await;
+        assert!(
+            matches!(r, Err(StorageError::Unavailable(_))),
+            "keep={keep}: {r:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_v10_snapshot_whose_log_is_missing_is_refused_at_open() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    {
+        let s = open(&path).await;
+        s.store_policy(&kill("k1", "gh-*")).await.unwrap();
+        s.compact().await.unwrap();
+    }
+    let wal = path.with_extension("wal");
+    assert!(
+        wal.exists(),
+        "a fresh and a compacted vault always has a log file"
+    );
+    std::fs::remove_file(&wal).unwrap();
+    let err = FileStorage::new(&path, &SecretString::from(PW))
+        .await
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("vault.wal"), "{err}");
+    assert!(!wal.exists(), "the refusal creates nothing");
+}
+
+#[tokio::test]
+async fn the_log_exists_before_the_snapshot_that_needs_it_is_renamed_in() {
+    // Create and migration both go through compact_locked. Crash right after the snapshot rename:
+    // the v10 snapshot is on disk, and the log must already be there (empty), so the next open
+    // does not mistake a crash for a deleted log.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    {
+        let salt = crate::crypto::generate_salt();
+        let kdf = crate::crypto::KdfParams::default();
+        let key = Arc::new(derive_key(&SecretString::from(PW), &salt, kdf).unwrap());
+        let st = FileStorage {
+            path: path.clone(),
+            master_key: Arc::clone(&key),
+            outbox: OutboxStore::new(outbox_path(&path), key),
+            averin: None,
+            cache: RwLock::new(StorageCache::default()),
+            salt,
+            kdf,
+            log: parking_lot::Mutex::new(LogState::default()),
+            fault: parking_lot::Mutex::new(Some("compact.after_snapshot_rename".into())),
+            verify_replay: std::sync::atomic::AtomicBool::new(false),
+            compact_min: std::sync::atomic::AtomicU64::new(DEFAULT_COMPACT_MIN_BYTES),
+            io: IoCounters::default(),
+        };
+        let mut log = st.log.lock();
+        let cache = st.cache.read();
+        assert!(st.compact_locked(&mut log, &cache).is_err());
+    }
+    assert!(path.exists());
+    let wal = path.with_extension("wal");
+    assert!(
+        wal.exists(),
+        "the log must exist before the snapshot is renamed in"
+    );
+    assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+    open(&path).await;
+}
+
+#[tokio::test]
+async fn an_older_build_rewriting_the_snapshot_after_compaction_is_refused() {
+    // The log is empty and its length equals the process's offset (0): the only sign of the foreign
+    // rewrite is the snapshot token and the version in it.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let s = open(&path).await;
+    s.store(&cred("a")).await.unwrap();
+    s.compact().await.unwrap();
+    assert_eq!(
+        std::fs::metadata(path.with_extension("wal")).unwrap().len(),
+        0
+    );
+    assert_eq!(s.kill_fence_epoch().await, 0);
+    let mut header: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    header["version"] = serde_json::json!(9);
+    let tmp = path.with_extension("old.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&header).unwrap()).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    for _ in 0..2 {
+        let r = s.kill_fence_check(&q("gh-main", 0)).await;
+        assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
+    }
+    assert!(s.store(&cred("b")).await.is_err());
+}
+
+// ------------------------------------------------ follow-up: force a reload after the durable point
+
+#[tokio::test]
+async fn a_commit_error_after_the_record_is_durable_forces_a_full_reload() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let s = open(&path).await;
+    s.set_compact_min_bytes(u64::MAX);
+    let epoch0 = s.kill_fence_epoch().await;
+    *s.fault.lock() = Some("wal.after_fsync".into());
+    assert!(s.store_policy(&kill("k1", "gh-*")).await.is_err());
+    assert!(
+        !s.log.lock().loaded,
+        "the in-memory view is no longer trusted after a commit error past the fsync"
+    );
+    // The record is durable: the next look reloads and sees the kill exactly once.
+    assert!(matches!(
+        s.kill_fence_check(&q("gh-main", epoch0)).await.unwrap(),
+        KillFenceVerdict::Halted { .. }
+    ));
+    assert!(s.log.lock().loaded);
+    s.store(&cred("after")).await.unwrap();
+    drop(s);
+    let r = open(&path).await;
+    assert!(r.get_policy("k1").await.unwrap().is_some());
+    assert!(r.get_by_alias("after").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_panic_in_a_mutation_forces_a_full_reload() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let s = std::sync::Arc::new(open(&path).await);
+    s.store_policy(&kill("halt:x", "gh-*")).await.unwrap();
+    let s2 = std::sync::Arc::clone(&s);
+    let joined = tokio::spawn(async move {
+        let _: Result<(), StorageError> = s2
+            .locked_mutate(|c| {
+                c.policies.remove("halt:x");
+                panic!("injected panic");
+            })
+            .await;
+    })
+    .await;
+    assert!(joined.unwrap_err().is_panic());
+    assert!(!s.log.lock().loaded);
+    assert!(s.get_policy("halt:x").await.unwrap().is_some());
+}
