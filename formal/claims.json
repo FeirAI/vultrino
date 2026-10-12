@@ -496,9 +496,6 @@
     "vault-v9-rewrite-accepted-after-compaction": {
       "tier": "full"
     },
-    "vault-commit-error-keeps-view-trusted": {
-      "tier": "full"
-    },
     "vault-panic-keeps-view-trusted": {
       "tier": "full"
     }
@@ -2726,7 +2723,7 @@
     },
     {
       "id": "vault-reload-after-uncertain-commit",
-      "statement": "After a vault write whose commit returns an error (including an error after the record is fsynced, where the record is durable and the caller sees a failure) or whose closure panics, the process rolls back its in-memory state and marks its view of the files unloaded, so the next read or write reloads from the snapshot and the log. A kill stored by a write that failed after its fsync is therefore seen by the next fence read exactly once, and later writes and a reopen agree with it. A panic inside a mutation also forces the reload.",
+      "statement": "If a vault write panics after its log record is durable and the offsets have advanced, the rollback alone would restore the pre-write kill state while the process believes it is current with the log; the process instead marks its view unloaded, so the next fence read reloads from the files and answers Halted for the durable kill, and later reads, writes and a reopen agree with it. A panic inside a mutation closure rolls back and also reloads. A commit error reloads too, conservatively, with no observable difference from the offsets alone (the failed append never advances them), so that reload is pinned by a flag check and is not a semantic claim.",
       "method": "test",
       "artifacts": [
         "src/storage/file.rs",
@@ -2735,7 +2732,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::a_commit_error_after_the_record_is_durable_forces_a_full_reload storage::file::vault_tests::a_panic_in_a_mutation_forces_a_full_reload",
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::a_panic_after_the_record_is_durable_does_not_turn_the_fence_clear storage::file::vault_tests::a_panic_in_a_mutation_closure_rolls_back_and_reloads storage::file::vault_tests::a_commit_error_after_the_record_is_durable_reloads_conservatively",
       "covers": [
         {
           "path": "src/storage/file.rs",
@@ -2744,10 +2741,9 @@
         }
       ],
       "mutants": [
-        "vault-commit-error-keeps-view-trusted",
         "vault-panic-keeps-view-trusted"
       ],
-      "does_not_establish": "Failure points other than the injected wal.after_fsync step and a panic in the closure; a panic inside commit itself is not injected. The reload is conservative: any commit error, including one before the record was written, reloads. A process killed at the same points is covered by vault-log-crash-consistency, not here. Any CI run other than the recorded one.",
+      "does_not_establish": "Failure points other than a panic injected right after the log append and one in the closure; no production commit error occurs after the offsets advance, so the commit-error reload has no killing mutant. A panic or error inside the append itself is not injected. The reload is conservative: any commit error, including one before the record was written, reloads. A process killed at the same points is covered by vault-log-crash-consistency, not here. Any CI run other than the recorded one.",
       "evidence_run": "38213907611"
     },
     {

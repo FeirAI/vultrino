@@ -1414,7 +1414,10 @@ async fn an_older_build_rewriting_the_snapshot_after_compaction_is_refused() {
 // ------------------------------------------------ follow-up: force a reload after the durable point
 
 #[tokio::test]
-async fn a_commit_error_after_the_record_is_durable_forces_a_full_reload() {
+async fn a_commit_error_after_the_record_is_durable_reloads_conservatively() {
+    // Observable behaviour is the same with or without the reload (the failed append never
+    // advances the offset, so the next look reads the durable record as a foreign append). The
+    // flag check pins the conservative reload; it is not a semantic claim.
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.enc");
     let s = open(&path).await;
@@ -1422,16 +1425,11 @@ async fn a_commit_error_after_the_record_is_durable_forces_a_full_reload() {
     let epoch0 = s.kill_fence_epoch().await;
     *s.fault.lock() = Some("wal.after_fsync".into());
     assert!(s.store_policy(&kill("k1", "gh-*")).await.is_err());
-    assert!(
-        !s.log.lock().loaded,
-        "the in-memory view is no longer trusted after a commit error past the fsync"
-    );
-    // The record is durable: the next look reloads and sees the kill exactly once.
+    assert!(!s.log.lock().loaded);
     assert!(matches!(
         s.kill_fence_check(&q("gh-main", epoch0)).await.unwrap(),
         KillFenceVerdict::Halted { .. }
     ));
-    assert!(s.log.lock().loaded);
     s.store(&cred("after")).await.unwrap();
     drop(s);
     let r = open(&path).await;
@@ -1440,7 +1438,34 @@ async fn a_commit_error_after_the_record_is_durable_forces_a_full_reload() {
 }
 
 #[tokio::test]
-async fn a_panic_in_a_mutation_forces_a_full_reload() {
+async fn a_panic_after_the_record_is_durable_does_not_turn_the_fence_clear() {
+    // The log append succeeded (offsets advanced) and then the writer panicked: rollback restores
+    // the pre-write kill state, and only the forced reload makes the durable kill visible.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let s = std::sync::Arc::new(open(&path).await);
+    s.set_compact_min_bytes(u64::MAX);
+    let epoch0 = s.kill_fence_epoch().await;
+    *s.fault.lock() = Some("commit.panic_after_append".into());
+    let s2 = std::sync::Arc::clone(&s);
+    let joined = tokio::spawn(async move {
+        let _ = s2.store_policy(&kill("k1", "gh-*")).await;
+    })
+    .await;
+    assert!(joined.unwrap_err().is_panic());
+    assert!(matches!(
+        s.kill_fence_check(&q("gh-main", epoch0)).await.unwrap(),
+        KillFenceVerdict::Halted { .. }
+    ));
+    assert!(s.get_policy("k1").await.unwrap().is_some());
+    assert!(s.kill_fence_epoch().await > epoch0);
+    drop(s);
+    let r = open(&path).await;
+    assert!(r.get_policy("k1").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_panic_in_a_mutation_closure_rolls_back_and_reloads() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.enc");
     let s = std::sync::Arc::new(open(&path).await);
@@ -1456,6 +1481,5 @@ async fn a_panic_in_a_mutation_forces_a_full_reload() {
     })
     .await;
     assert!(joined.unwrap_err().is_panic());
-    assert!(!s.log.lock().loaded);
     assert!(s.get_policy("halt:x").await.unwrap().is_some());
 }

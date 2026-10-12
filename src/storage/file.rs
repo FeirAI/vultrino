@@ -1738,7 +1738,9 @@ impl FileStorage {
                 // The log is shorter than what this process already applied while the snapshot is
                 // unchanged: committed records (possibly a kill) were removed. Reloading would
                 // quietly accept the shorter state, so refuse; `loaded` stays set so every later
-                // look refuses too until the operator restores the log and restarts.
+                // look of THIS process refuses too. It is not permanent: a process started after
+                // the shrink opens the shorter log, and a later compaction or foreign append
+                // changes what this process sees, after which it reloads the shorter state.
                 return Err(self.log_gone_error("shrank"));
             }
         }
@@ -1824,11 +1826,15 @@ impl FileStorage {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if snap_tok.is_some() && version >= STORAGE_VERSION {
                     // Every v10 vault is created with its (possibly empty) log before the
-                    // snapshot is renamed in, so a missing one was deleted.
+                    // snapshot is renamed in, so a missing one was deleted (or the creating build
+                    // crashed between the snapshot rename and the log creation: then an empty
+                    // file at that path is all that is needed, not a restore).
                     return Err(StorageError::Unavailable(format!(
                         "the vault file {} is format v{version} but its write-ahead log {} is \
                          missing: records (including kills) may have been lost. Restore the log \
-                         together with the vault file from the same backup",
+                         together with the vault file from the same backup (if the vault was \
+                         created by an earlier build that crashed before creating its log, and \
+                         never held records, an empty file at that path is enough)",
                         self.path.display(),
                         self.wal_path().display()
                     )));
@@ -2209,6 +2215,11 @@ impl FileStorage {
         let ops = cache.collect_ops(log)?;
         if !ops.is_empty() {
             self.append_record_locked(log, ops)?;
+        }
+        // Test-only: a panic after the record is durable and the offsets advanced.
+        #[cfg(test)]
+        if self.fault_armed("commit.panic_after_append") {
+            panic!("injected panic after the log append");
         }
         cache.commit_all();
         log.refresh_baselines(cache);

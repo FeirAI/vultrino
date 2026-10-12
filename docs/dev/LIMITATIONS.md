@@ -75,9 +75,15 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   restored without its `.wal` is refused at open (every v10 vault has one, empty
   after a compaction), and restoring a `.wal` from a different moment than the vault
   file fails the open or silently drops the records written in between, including a
-  kill. A running process also refuses to continue (every dispatch fence read and
-  every write fails closed) if the `.wal` is removed or shortened while the snapshot
-  is unchanged. It cannot notice the same edit made while no process is running
+  kill. A running process refuses (every dispatch fence read and every write fails
+  closed) if the `.wal` is removed or shortened while the snapshot is unchanged. The
+  refusal is per process and not permanent: a process started after the shrink opens
+  the shorter log, and a later compaction or foreign append makes a refusing process
+  reload and accept the shorter state. The same applies to the snapshot: if the vault
+  file itself is deleted under a running process while the log is empty (right after a
+  compaction), that process reads it as a fresh vault. A missing `.wal` has one benign
+  cause: a vault created by an earlier build that crashed between the snapshot rename
+  and the log creation, which needs an empty file at that path and not a restore. The check cannot notice the same edit made while no process is running
   (a truncated log whose remaining records still parse opens as the shorter state),
   and it does not defend against an attacker who can write the vault directory:
   such an attacker can also put back an older copy of the vault. Backups must therefore take the

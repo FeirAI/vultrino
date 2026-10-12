@@ -227,18 +227,25 @@ tail -f /var/log/vultrino/audit.log | grep github-api
 
 ### Backup
 
-The credentials file is encrypted. Back it up securely:
+The credentials file is encrypted. Back it up securely. The vault is two files: the
+snapshot (`credentials.enc`) and its write-ahead log (`credentials.wal`, next to it). The
+log is part of the vault, not a cache: it holds the writes since the last compaction,
+including kill switches. Stop every vultrino process first, then copy both files together:
 
 ```bash
-cp ~/.vultrino/credentials.enc ~/backup/vultrino-$(date +%Y%m%d).enc
+d=~/backup/vultrino-$(date +%Y%m%d)
+mkdir -p "$d"
+cp ~/.vultrino/credentials.enc ~/.vultrino/credentials.wal "$d"/
 ```
 
 ### Recovery
 
-To restore:
+To restore, stop every vultrino process, then put back both files from the same backup:
 ```bash
-cp ~/backup/vultrino-20240115.enc ~/.vultrino/credentials.enc
+cp ~/backup/vultrino-20240115/credentials.enc ~/backup/vultrino-20240115/credentials.wal ~/.vultrino/
 ```
+A vault file restored without its `.wal` is refused at start. A `.wal` from a different
+moment than the vault file fails the start or silently drops the records written in between.
 
 You'll need the same `VULTRINO_PASSWORD` used when the backup was created.
 
