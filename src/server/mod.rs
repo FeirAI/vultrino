@@ -5785,15 +5785,16 @@ pub async fn drain_pending_events_periodically(
         }
         // Surface a persistent backlog: a non-zero pending count after a reconcile means the outbox
         // store is unwritable — the staged events are committed-but-undelivered AND each new coupled
-        // emit re-encrypts the whole secrets vault (the staging record lives there), re-opening the
-        // O(vault-size) cost the v6→v7 split removed. Log the count so a stuck outbox is alertable
-        // rather than silently churning the vault. (No-op/cheap when the backlog is 0, the common case.)
+        // emit appends a staging record to the vault log (the staging record lives there; since
+        // vault format v10 that is one small encrypted record, not a rewrite of the whole vault, and
+        // the log is compacted into the snapshot as it grows). Log the count so a stuck outbox is
+        // alertable. (No-op/cheap when the backlog is 0, the common case.)
         match storage.pending_event_count().await {
             Ok(0) => {}
             Ok(pending) => warn!(
                 pending,
-                "intent-staged events remain undrained — the outbox store may be unwritable; the secrets \
-                 vault is re-encrypted on every new coupled emit until this clears"
+                "intent-staged events remain undrained — the outbox store may be unwritable; every new \
+                 coupled emit appends a staging record to the vault log until this clears"
             ),
             Err(e) => warn!(error = %e, "could not read the intent-staged event backlog"),
         }

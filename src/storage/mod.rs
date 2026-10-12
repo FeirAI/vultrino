@@ -767,8 +767,9 @@ pub trait StorageBackend: Send + Sync {
 
     /// Number of intent-staged events still awaiting drain to the outbox (D1). Normally 0. A persistent
     /// non-zero count is the degraded-mode signal that the outbox store is unwritable: the events are
-    /// committed-but-undelivered AND each new coupled emit re-encrypts the whole secrets vault (the
-    /// staging record lives in the vault), re-opening the O(vault-size) cost the v6→v7 split removed.
+    /// committed-but-undelivered AND each staged event is one more vault log record (the staging
+    /// record lives in the vault) that grows the log and the next snapshot, so the backlog costs
+    /// vault space and compaction time. (It no longer re-encrypts the whole vault per emit.)
     /// The periodic reconciler logs this so a stuck outbox is alertable, not silently churning. Cheap
     /// (an in-memory read). Default 0: only the file backend stages events inside the vault.
     async fn pending_event_count(&self) -> Result<usize, StorageError> {

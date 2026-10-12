@@ -1,12 +1,12 @@
 diff --git a/src/storage/file.rs b/src/storage/file.rs
-index f72ceff..9560e74 100644
+index 2f41f33..e4afc1f 100644
 --- a/src/storage/file.rs
 +++ b/src/storage/file.rs
-@@ -2091,7 +2091,6 @@ impl FileStorage {
+@@ -2133,7 +2133,6 @@ impl FileStorage {
                  return Err(e);
              }
              Err(payload) => {
 -                self.rollback_locked(&log, &mut cache);
+                 log.loaded = false;
                  std::panic::resume_unwind(payload);
              }
-         };

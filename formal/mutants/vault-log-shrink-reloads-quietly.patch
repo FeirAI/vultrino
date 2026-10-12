@@ -1,0 +1,13 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 4288af3..c26ad62 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1741,7 +1741,7 @@ impl FileStorage {
+                 // look of THIS process refuses too. It is not permanent: a process started after
+                 // the shrink opens the shorter log, and a later compaction or foreign append
+                 // changes what this process sees, after which it reloads the shorter state.
+-                return Err(self.log_gone_error("shrank"));
++                let _ = self.log_gone_error("shrank");
+             }
+         }
+         self.full_load_locked(log, cache, exclusive)?;

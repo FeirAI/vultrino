@@ -1,0 +1,14 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 2f41f33..1647faa 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1691,9 +1691,6 @@ impl FileStorage {
+         log.loaded = false;
+         // The log must exist before a v10 snapshot is renamed in (create and migration have none
+         // yet); an existing log is never touched here, it still holds records until the reset.
+-        if !self.wal_path().exists() {
+-            self.reset_wal()?;
+-        }
+         let tmp = self.path.with_extension("tmp");
+         let len = self.write_snapshot_tmp(cache, log.applied_seq, &tmp)?;
+         self.crash_point("compact.after_snapshot_tmp")?;
