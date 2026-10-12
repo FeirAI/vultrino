@@ -127,10 +127,11 @@ fn use_token_prunable(t: &UseToken, now: DateTime<Utc>) -> bool {
 
 /// Upper bound on the vault's staged-but-undrained outbox intents. If the split outbox file is
 /// persistently unwritable, `pending_events` would otherwise grow without limit — and because it lives
-/// IN the secrets vault, every new coupled emit re-encrypts an ever-larger vault (re-opening the
-/// O(vault-size) cliff the v6→v7 split removed). At the cap, staging FAILS CLOSED: a new
-/// security-sensitive decision is refused rather than committed-but-undeliverable, bounding the vault
-/// churn. Generous — only reached after the outbox has been dead for a long time under heavy decision
+/// IN the secrets vault, every new coupled emit adds an ever-larger staging record to the vault log
+/// and so to the next snapshot (since vault format v10 a write appends one record; it no longer
+/// rewrites the whole vault, but the snapshot a compaction writes still grows with the backlog).
+/// At the cap, staging FAILS CLOSED: a new security-sensitive decision is refused rather than
+/// committed-but-undeliverable, bounding the vault growth. Generous — only reached after the outbox has been dead for a long time under heavy decision
 /// load (the periodic reconciler clears the backlog within a tick in the normal/transient case).
 const MAX_PENDING_EVENTS: usize = 10_000;
 
@@ -1555,10 +1556,9 @@ impl FileStorage {
         self.path.with_extension("wal")
     }
 
-    fn wal_len(&self) -> u64 {
-        std::fs::metadata(self.wal_path())
-            .map(|m| m.len())
-            .unwrap_or(0)
+    /// The log's length, or `None` when the file is missing (a v10 vault always has one).
+    fn wal_len_opt(&self) -> Option<u64> {
+        std::fs::metadata(self.wal_path()).ok().map(|m| m.len())
     }
 
     /// Whether `cache` already reflects the committed files (no stat-visible change since).
@@ -1567,7 +1567,7 @@ impl FileStorage {
             return false;
         }
         let tok = file_token(&self.path);
-        tok.is_some() && tok == log.snap_token && self.wal_len() == log.wal_offset
+        tok.is_some() && tok == log.snap_token && self.wal_len_opt() == Some(log.wal_offset)
     }
 
     /// Test-only crash injection: fail at the named step, leaving the disk exactly as a process
@@ -1689,6 +1689,11 @@ impl FileStorage {
         cache.validate_primary_shapes()?;
         // Until this finishes the in-memory view of the files is not trusted.
         log.loaded = false;
+        // The log must exist before a v10 snapshot is renamed in (create and migration have none
+        // yet); an existing log is never touched here, it still holds records until the reset.
+        if !self.wal_path().exists() {
+            self.reset_wal()?;
+        }
         let tmp = self.path.with_extension("tmp");
         let len = self.write_snapshot_tmp(cache, log.applied_seq, &tmp)?;
         self.crash_point("compact.after_snapshot_tmp")?;
@@ -1717,7 +1722,9 @@ impl FileStorage {
         if log.loaded {
             let tok = file_token(&self.path);
             if tok.is_some() && tok == log.snap_token {
-                let wal_len = self.wal_len();
+                let Some(wal_len) = self.wal_len_opt() else {
+                    return Err(self.log_gone_error("is missing"));
+                };
                 if wal_len == log.wal_offset {
                     return Ok(());
                 }
@@ -1728,6 +1735,13 @@ impl FileStorage {
                     }
                     return applied;
                 }
+                // The log is shorter than what this process already applied while the snapshot is
+                // unchanged: committed records (possibly a kill) were removed. Reloading would
+                // quietly accept the shorter state, so refuse; `loaded` stays set so every later
+                // look of THIS process refuses too. It is not permanent: a process started after
+                // the shrink opens the shorter log, and a later compaction or foreign append
+                // changes what this process sees, after which it reloads the shorter state.
+                return Err(self.log_gone_error("shrank"));
             }
         }
         self.full_load_locked(log, cache, exclusive)?;
@@ -1741,6 +1755,15 @@ impl FileStorage {
             )));
         }
         Ok(())
+    }
+
+    fn log_gone_error(&self, what: &str) -> StorageError {
+        StorageError::Unavailable(format!(
+            "the vault log {} {what} while this process was running and the snapshot is \
+             unchanged: committed records may be lost. Refusing to continue. Stop every \
+             vultrino process and restore the log that belongs to this vault file",
+            self.wal_path().display()
+        ))
     }
 
     /// Apply the log records after `log.wal_offset` to `cache`.
@@ -1800,7 +1823,24 @@ impl FileStorage {
         };
         let bytes = match std::fs::read(self.wal_path()) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if snap_tok.is_some() && version >= STORAGE_VERSION {
+                    // Every v10 vault is created with its (possibly empty) log before the
+                    // snapshot is renamed in, so a missing one was deleted (or the creating build
+                    // crashed between the snapshot rename and the log creation: then an empty
+                    // file at that path is all that is needed, not a restore).
+                    return Err(StorageError::Unavailable(format!(
+                        "the vault file {} is format v{version} but its write-ahead log {} is \
+                         missing: records (including kills) may have been lost. Restore the log \
+                         together with the vault file from the same backup (if the vault was \
+                         created by an earlier build that crashed before creating its log, and \
+                         never held records, an empty file at that path is enough)",
+                        self.path.display(),
+                        self.wal_path().display()
+                    )));
+                }
+                Vec::new()
+            }
             Err(e) => return Err(e.into()),
         };
         if version < STORAGE_VERSION && !bytes.is_empty() {
@@ -2085,16 +2125,22 @@ impl FileStorage {
             }));
         let result = match outcome {
             Ok(Ok(r)) => r,
-            Ok(Err((e, _from_commit))) => {
+            Ok(Err((e, from_commit))) => {
                 self.rollback_locked(&log, &mut cache);
+                if from_commit {
+                    // The record may already be durable (error after the fsync): this process's
+                    // view is no longer trusted, so the next look reloads from the files.
+                    log.loaded = false;
+                }
                 #[cfg(test)]
-                if !_from_commit {
+                if !from_commit {
                     self.check_replay_equals(&cache);
                 }
                 return Err(e);
             }
             Err(payload) => {
                 self.rollback_locked(&log, &mut cache);
+                log.loaded = false;
                 std::panic::resume_unwind(payload);
             }
         };
@@ -2169,6 +2215,11 @@ impl FileStorage {
         let ops = cache.collect_ops(log)?;
         if !ops.is_empty() {
             self.append_record_locked(log, ops)?;
+        }
+        // Test-only: a panic after the record is durable and the offsets advanced.
+        #[cfg(test)]
+        if self.fault_armed("commit.panic_after_append") {
+            panic!("injected panic after the log append");
         }
         cache.commit_all();
         log.refresh_baselines(cache);

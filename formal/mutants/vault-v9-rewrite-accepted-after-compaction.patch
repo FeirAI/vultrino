@@ -1,0 +1,13 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 2f41f33..e8365f3 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1743,7 +1743,7 @@ impl FileStorage {
+             }
+         }
+         self.full_load_locked(log, cache, exclusive)?;
+-        if log.snapshot_version < STORAGE_VERSION {
++        if false && log.snapshot_version < STORAGE_VERSION {
+             log.loaded = false;
+             return Err(StorageError::Unavailable(format!(
+                 "the vault was rewritten by an older build (format v{}) while this process was \

@@ -200,15 +200,23 @@ curl -s http://127.0.0.1:7879/login | head -1
 
 ## Backup & Restore
 
+The vault is a snapshot plus its write-ahead log (`.enc` and `.wal` in the same
+directory); both go into the backup together, and the services must be stopped while
+the backup is taken (a copy of a running vault can pair a snapshot with a log from a
+different moment). Restore both files from the same backup.
+
 ### Backup
 ```bash
+sudo systemctl stop vultrino-web
 sudo tar -czf vultrino-backup-$(date +%Y%m%d).tar.gz \
     /etc/vultrino \
     /var/lib/vultrino
+sudo systemctl start vultrino-web
 ```
 
 ### Restore
 ```bash
+sudo systemctl stop vultrino-web
 sudo tar -xzf vultrino-backup-YYYYMMDD.tar.gz -C /
 sudo systemctl restart vultrino-web
 ```

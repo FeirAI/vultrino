@@ -5,6 +5,14 @@ Status: **IMPLEMENTED + adversarially reviewed (2026-06-25).** D1–D4 locked an
 SQLite plan is SUPERSEDED — D2 note). Scope: vultrino storage layer (`src/storage/file.rs`,
 `src/storage/outbox_store.rs`, `src/outbox.rs`, `src/server/mod.rs`, `src/main.rs`). Companion §12 item.
 
+> UPDATE (vault format v10): this document describes the v6 to v7 outbox split as designed and
+> built then. Since vault format v10 the secrets vault is an encrypted snapshot plus an append-only
+> encrypted log (`<vault>.wal`): a vault write appends one record instead of rewriting the whole
+> file, so the "re-encrypt and rewrite the entire vault" costs described below no longer apply to
+> the vault itself. The intent-staging design (state and event staged in one vault mutation, drained
+> to the outbox file afterwards) is unchanged. The `.wal` must be backed up and restored together
+> with the vault file (see `LIMITATIONS.md`).
+
 > CLARIFICATION (what this does NOT do): the **credentials never leave the encrypted vault and are
 > never exposed**. "Out of the vault" moves only the *signed event log* (budget/approval/lifecycle
 > events — agent-safe: credential *aliases*/metadata, never secret values) into its own store, so
