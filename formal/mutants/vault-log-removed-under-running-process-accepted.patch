@@ -1,0 +1,15 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 2f41f33..5abbbad 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1722,9 +1722,7 @@ impl FileStorage {
+         if log.loaded {
+             let tok = file_token(&self.path);
+             if tok.is_some() && tok == log.snap_token {
+-                let Some(wal_len) = self.wal_len_opt() else {
+-                    return Err(self.log_gone_error("is missing"));
+-                };
++                let wal_len = self.wal_len_opt().unwrap_or(log.wal_offset);
+                 if wal_len == log.wal_offset {
+                     return Ok(());
+                 }

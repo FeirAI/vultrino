@@ -1,0 +1,13 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 2f41f33..7ac00d4 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1739,7 +1739,7 @@ impl FileStorage {
+                 // unchanged: committed records (possibly a kill) were removed. Reloading would
+                 // quietly accept the shorter state, so refuse; `loaded` stays set so every later
+                 // look refuses too until the operator restores the log and restarts.
+-                return Err(self.log_gone_error("shrank"));
++                let _ = self.log_gone_error("shrank");
+             }
+         }
+         self.full_load_locked(log, cache, exclusive)?;

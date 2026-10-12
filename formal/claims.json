@@ -480,6 +480,27 @@
     },
     "vault-panic-skips-rollback": {
       "tier": "full"
+    },
+    "vault-log-shrink-reloads-quietly": {
+      "tier": "fast"
+    },
+    "vault-log-removed-under-running-process-accepted": {
+      "tier": "fast"
+    },
+    "vault-missing-log-under-snapshot-accepted": {
+      "tier": "full"
+    },
+    "vault-compaction-skips-log-precreate": {
+      "tier": "full"
+    },
+    "vault-v9-rewrite-accepted-after-compaction": {
+      "tier": "full"
+    },
+    "vault-commit-error-keeps-view-trusted": {
+      "tier": "full"
+    },
+    "vault-panic-keeps-view-trusted": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -2520,7 +2541,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_mutate_blocking",
-          "sha256": "3ae544e058bf0acd53dff00616ce91ae044daf0fd99f13cdb72c0622d294cdbd"
+          "sha256": "def20882b09da8fce842394ca4f467bd011f97f30d854d404b790ef577f738d5"
         },
         {
           "path": "src/storage/file.rs",
@@ -2567,7 +2588,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_mutate_blocking",
-          "sha256": "3ae544e058bf0acd53dff00616ce91ae044daf0fd99f13cdb72c0622d294cdbd"
+          "sha256": "def20882b09da8fce842394ca4f467bd011f97f30d854d404b790ef577f738d5"
         },
         {
           "path": "src/storage/file.rs",
@@ -2582,12 +2603,12 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::full_load_locked",
-          "sha256": "325cc7aab5eff553e1a3ceeb149f51cbd872a6e2decb7a1d11a38e6b54673d09"
+          "sha256": "292848e2f93ebb71919a53c36efea51c5874d31b0f945ae78fc5ad35bd19171c"
         },
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::compact_locked",
-          "sha256": "77f558b3f19d8a0e0e745536d59e3f2be2b639a5191ac33fe8113d09c0a2738f"
+          "sha256": "7b1cf584cea80259ddc23025da8e3afa103303c0ee919bc908f83b76462b3c9b"
         },
         {
           "path": "src/storage/file.rs",
@@ -2616,7 +2637,7 @@
     },
     {
       "id": "vault-fence-shared-lock-delta-read",
-      "statement": "The dispatch kill-fence read takes the cross-process vault lock shared, not exclusive, and reads only what changed since this process last looked. An unchanged vault costs the fence zero decrypts, zero bytes written and zero fsyncs; after another handle appends one record the fence decrypts exactly that one record and sees the kill it carries; another handle's kill and its lift are seen without a reload (the lifted kill still refuses work admitted before it); a compaction by another handle is picked up. A fence read completes while another handle holds the lock shared, and waits while another handle holds it exclusive, so committed state is still what the fence sees. A v9 process rewriting the snapshot under a running v10 process is refused (fail closed).",
+      "statement": "The dispatch kill-fence read takes the cross-process vault lock shared, not exclusive, and reads only what changed since this process last looked. An unchanged vault costs the fence zero decrypts, zero bytes written and zero fsyncs; after another handle appends one record the fence decrypts exactly that one record and sees the kill it carries; another handle's kill and its lift are seen without a reload (the lifted kill still refuses work admitted before it); a compaction by another handle is picked up. A fence read completes while another handle holds the lock shared, and waits while another handle holds it exclusive, so committed state is still what the fence sees. A v9 process rewriting the snapshot under a running v10 process is refused (fail closed), including right after a compaction when the log is empty and its length equals the process offset, so the snapshot version is the only sign.",
       "method": "test",
       "artifacts": [
         "src/storage/file.rs",
@@ -2627,7 +2648,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::an_unchanged_vault_fence_read_decrypts_nothing storage::file::vault_tests::a_fence_read_after_a_foreign_write_decrypts_only_that_record storage::file::vault_tests::the_fence_sees_another_handles_kill_and_its_lift_without_a_reload storage::file::vault_tests::fence_reads_hold_the_lock_shared_so_dispatches_do_not_serialize storage::file::vault_tests::a_writer_still_excludes_fence_readers storage::file::vault_tests::another_handles_compaction_is_picked_up_by_the_fence storage::file::vault_tests::an_older_build_rewriting_the_snapshot_under_a_running_process_is_refused",
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::an_unchanged_vault_fence_read_decrypts_nothing storage::file::vault_tests::a_fence_read_after_a_foreign_write_decrypts_only_that_record storage::file::vault_tests::the_fence_sees_another_handles_kill_and_its_lift_without_a_reload storage::file::vault_tests::fence_reads_hold_the_lock_shared_so_dispatches_do_not_serialize storage::file::vault_tests::a_writer_still_excludes_fence_readers storage::file::vault_tests::another_handles_compaction_is_picked_up_by_the_fence storage::file::vault_tests::an_older_build_rewriting_the_snapshot_under_a_running_process_is_refused storage::file::vault_tests::an_older_build_rewriting_the_snapshot_after_compaction_is_refused",
       "covers": [
         {
           "path": "src/storage/file.rs",
@@ -2637,21 +2658,95 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::is_current",
-          "sha256": "62d745eed77815643c34cb0ce78e2ec6da9c9409af962ff99697dde366d9501b"
+          "sha256": "e1fa7ae4ba2a5cb95d4929688f9d1a84cb0b5a991b8589e0f675d07f361d5116"
         },
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "cf4a617f1e70740d8c9afd8f8e8138323ac94f2093a79c57969747bd90cfa731"
+          "sha256": "e476543a44284d10fd7f3e57d74d1ea5455d8bfdbfb48ccf2d0c5170e451c5e6"
         }
       ],
       "mutants": [
         "vault-fence-read-skips-lock",
         "vault-fence-read-takes-exclusive-lock",
-        "vault-fence-ignores-appended-records"
+        "vault-fence-ignores-appended-records",
+        "vault-v9-rewrite-accepted-after-compaction"
       ],
       "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation: flock does not prefer a waiting writer, so under sustained overlapping dispatches a kill write can wait without bound against the caller's timeout. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
       "evidence_run": "38177797197"
+    },
+    {
+      "id": "vault-log-loss-fails-closed",
+      "statement": "A vault write-ahead log that is removed, or shortened below what a running process has already applied, while the snapshot is unchanged, never turns a halted agent clear: the next dispatch fence read and every write fail closed (Unavailable), and keep failing on repeat, in both cases (log deleted; log truncated to 0 bytes and to 1 byte, with a stored kill in the log). A v10 snapshot whose log file is missing is refused at open, naming the log, and the refusal creates nothing. Vault creation, migration and compaction create the (empty) log before the snapshot is renamed in, so a crash right after the rename leaves a log the next open finds and an empty file, not a missing one.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/file.rs",
+        "src/storage/vault_tests.rs",
+        "docs/dev/LIMITATIONS.md"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::removing_the_log_under_a_running_process_never_turns_a_halt_clear storage::file::vault_tests::shrinking_the_log_under_a_running_process_never_turns_a_halt_clear storage::file::vault_tests::a_v10_snapshot_whose_log_is_missing_is_refused_at_open storage::file::vault_tests::the_log_exists_before_the_snapshot_that_needs_it_is_renamed_in",
+      "covers": [
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::sync_locked",
+          "sha256": "e476543a44284d10fd7f3e57d74d1ea5455d8bfdbfb48ccf2d0c5170e451c5e6"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::full_load_locked",
+          "sha256": "292848e2f93ebb71919a53c36efea51c5874d31b0f945ae78fc5ad35bd19171c"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::compact_locked",
+          "sha256": "7b1cf584cea80259ddc23025da8e3afa103303c0ee919bc908f83b76462b3c9b"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::is_current",
+          "sha256": "e1fa7ae4ba2a5cb95d4929688f9d1a84cb0b5a991b8589e0f675d07f361d5116"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::log_gone_error",
+          "sha256": "ff2a4ee95245149196e5bcd456b943f577804e5802a614aebcc4ccc8a7857358"
+        }
+      ],
+      "mutants": [
+        "vault-log-shrink-reloads-quietly",
+        "vault-log-removed-under-running-process-accepted",
+        "vault-missing-log-under-snapshot-accepted",
+        "vault-compaction-skips-log-precreate"
+      ],
+      "does_not_establish": "Log loss while no vultrino process is running: a log truncated at a record boundary (or by a torn tail) still opens as the shorter state, because the snapshot does not record the log's length; only a missing log is detected at open. An attacker who can write the vault directory and puts back an older vault file together with its older log. A log replaced by a different file of at least the same length while the snapshot is unchanged and the length equals the applied offset. Filesystems that report a stale length. A crash between the log creation and the snapshot rename leaves an empty log beside the old snapshot, which is accepted (it holds nothing). Any CI run other than the recorded one."
+    },
+    {
+      "id": "vault-reload-after-uncertain-commit",
+      "statement": "After a vault write whose commit returns an error (including an error after the record is fsynced, where the record is durable and the caller sees a failure) or whose closure panics, the process rolls back its in-memory state and marks its view of the files unloaded, so the next read or write reloads from the snapshot and the log. A kill stored by a write that failed after its fsync is therefore seen by the next fence read exactly once, and later writes and a reopen agree with it. A panic inside a mutation also forces the reload.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/file.rs",
+        "src/storage/vault_tests.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::a_commit_error_after_the_record_is_durable_forces_a_full_reload storage::file::vault_tests::a_panic_in_a_mutation_forces_a_full_reload",
+      "covers": [
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::locked_mutate_blocking",
+          "sha256": "def20882b09da8fce842394ca4f467bd011f97f30d854d404b790ef577f738d5"
+        }
+      ],
+      "mutants": [
+        "vault-commit-error-keeps-view-trusted",
+        "vault-panic-keeps-view-trusted"
+      ],
+      "does_not_establish": "Failure points other than the injected wal.after_fsync step and a panic in the closure; a panic inside commit itself is not injected. The reload is conservative: any commit error, including one before the record was written, reloads. A process killed at the same points is covered by vault-log-crash-consistency, not here. Any CI run other than the recorded one."
     },
     {
       "id": "vault-kill-mark-gc",
@@ -2732,7 +2827,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::full_load_locked",
-          "sha256": "325cc7aab5eff553e1a3ceeb149f51cbd872a6e2decb7a1d11a38e6b54673d09"
+          "sha256": "292848e2f93ebb71919a53c36efea51c5874d31b0f945ae78fc5ad35bd19171c"
         }
       ],
       "mutants": [

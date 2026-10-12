@@ -1,0 +1,12 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 2f41f33..64cf2f8 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -2134,7 +2134,6 @@ impl FileStorage {
+             }
+             Err(payload) => {
+                 self.rollback_locked(&log, &mut cache);
+-                log.loaded = false;
+                 std::panic::resume_unwind(payload);
+             }
+         };

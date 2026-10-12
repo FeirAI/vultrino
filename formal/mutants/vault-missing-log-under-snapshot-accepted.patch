@@ -1,0 +1,13 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 2f41f33..bbac75a 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1822,7 +1822,7 @@ impl FileStorage {
+         let bytes = match std::fs::read(self.wal_path()) {
+             Ok(b) => b,
+             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+-                if snap_tok.is_some() && version >= STORAGE_VERSION {
++                if false && snap_tok.is_some() && version >= STORAGE_VERSION {
+                     // Every v10 vault is created with its (possibly empty) log before the
+                     // snapshot is renamed in, so a missing one was deleted.
+                     return Err(StorageError::Unavailable(format!(
