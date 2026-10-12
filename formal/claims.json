@@ -2813,7 +2813,8 @@
         "posture-sod-hardcoded-true",
         "rate-limit-predicate-inverted"
       ],
-      "does_not_establish": "That the process enforces what it reports beyond the code paths those fields are read from: the report reads the engine and config objects the request handlers use, it does not re-run a policy decision. It does not prove the approver key is strong, rotated or known only to the broker, that the vault file on disk is at the reported format version (the field is the version this binary writes, a vault is migrated when opened), that no second vultrino process shares the vault (a process cannot see its peers), or that a deployment actually calls the endpoint: that is the feir-os posture verifier. The git commit is the one the build script saw; a build from an archive reports unknown. The detector runs the endpoint against an in-memory test router, not a deployed binary."
+      "does_not_establish": "That the process enforces what it reports beyond the code paths those fields are read from: the report reads the engine and config objects the request handlers use, it does not re-run a policy decision. It does not prove the approver key is strong, rotated or known only to the broker, that the vault file on disk is at the reported format version (the field is the version this binary writes, a vault is migrated when opened), that no second vultrino process shares the vault (a process cannot see its peers), or that a deployment actually calls the endpoint: that is the feir-os posture verifier. The git commit is the one the build script saw; a build from an archive reports unknown. The detector runs the endpoint against an in-memory test router, not a deployed binary.",
+      "evidence_run": "38192271558"
     }
   ]
 }
