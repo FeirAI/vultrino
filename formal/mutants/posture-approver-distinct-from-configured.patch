@@ -1,0 +1,13 @@
+diff --git a/src/web/posture.rs b/src/web/posture.rs
+index d508c5e..79dcf98 100644
+--- a/src/web/posture.rs
++++ b/src/web/posture.rs
+@@ -49,7 +49,7 @@ pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Pol
+         "approver_identity": {
+             "govder_configured": key.is_some(),
+             "key_configured": key.is_some_and(|k| k.key_configured),
+-            "key_distinct_from_govder_key": key.is_some_and(|k| k.key_distinct),
++            "key_distinct_from_govder_key": key.is_some_and(|k| k.key_configured),
+             "shared_key_escape": key.is_some_and(|k| k.shared_key_escape),
+         },
+         "engine": {

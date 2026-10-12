@@ -15,6 +15,14 @@ use url::Url;
 
 pub use tenant_assert::{sign_tenant_assertion, verify_tenant_assertion, TenantAssertionError};
 
+/// See [`GovderConfig::approval_key_posture`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalKeyPosture {
+    pub key_configured: bool,
+    pub key_distinct: bool,
+    pub shared_key_escape: bool,
+}
+
 /// Configuration for outbound govder delegation calls.
 #[derive(Clone)]
 pub struct GovderConfig {
@@ -132,6 +140,17 @@ impl GovderConfig {
             self.approval_assertion_secret.as_deref(),
             Some(m) if m != self.assertion_secret.trim()
         )
+    }
+
+    /// Approver-identity key posture for the live posture report: whether the dedicated key is
+    /// set, whether it is distinct from the shared govder key, and whether the explicit
+    /// shared-key escape is on. Booleans only; no key material.
+    pub fn approval_key_posture(&self) -> ApprovalKeyPosture {
+        ApprovalKeyPosture {
+            key_configured: self.approval_assertion_secret.is_some(),
+            key_distinct: self.approval_key_is_distinct(),
+            shared_key_escape: self.allow_shared_approval_key,
+        }
     }
 
     /// Startup posture line for the approver-identity key. Called once from the

@@ -13,7 +13,7 @@ mod vault_log;
 
 pub use averin_deadletter::{AverinDeadLetterStore, QuarantineRecord, QuarantineStatus};
 pub use averin_queue::AverinQueue;
-pub use file::{FileStorage, VaultIoStats};
+pub use file::{FileStorage, VaultIoStats, STORAGE_VERSION};
 pub use outbox_store::OutboxStore;
 pub use popkey_store::{PopKeyEntry, PopKeyStore};
 pub use social::{

@@ -57,7 +57,7 @@ const STALE_EXECUTING_SECS: i64 = 120;
 /// v9 (P3-KILL): adds the `kill_fence` state (kill epoch + per-policy marks). An older
 /// binary is refused a v9 vault, so it can neither drop the marks on a write nor keep
 /// dispatching without the fence beside processes that run it.
-const STORAGE_VERSION: u32 = 10; // v10: snapshot + write-ahead log (P3-VAULT)
+pub const STORAGE_VERSION: u32 = 10; // v10: snapshot + write-ahead log (P3-VAULT)
 
 /// A reservation older than this (seconds) is assumed orphaned by a crashed
 /// request and may be re-reserved, so a single failed admin call can't block a

@@ -282,6 +282,21 @@ event.
 `strictness` overrides `max_uses`/`require_approval`: `direct` = single-use +
 require_approval + dual_control; `checkpoint` = require_approval (multi-use).
 
+### `GET /api/v1/posture`: live posture report (operator key)
+
+What this process enforces right now, for the deploy-time posture verifier in feir-os
+(`deploy/vps/deploy.sh verify-posture`). Needs a global (untenanted) admin key; a tenant-scoped key gets 403.
+Read-only. The body holds booleans, counts, identifiers and build provenance only, never a key, a rule or a
+credential: `schema`, `plane`, `build` (`version`, `rustc`, `git_sha`, `git_dirty`), `approvals`
+(`enabled`, `enforce_separation_of_duty`), `approver_identity` (`govder_configured`, `key_configured`,
+`key_distinct_from_govder_key`, `shared_key_escape`), `engine` (`default_deny`, `tenants_in_observe_mode`,
+`unlisted_tenant_mode`), `policies` (`total`, `rate_limit_default_not_deny`: ids of enforced policies that have a
+`RateLimit` condition and a non-deny default), `vault.format_version` (the version this binary writes; a vault is
+migrated when it is opened).
+
+It cannot see other processes: whether a second vultrino shares the vault is checked by the verifier on the host.
+`git_sha` is the commit the build script saw (`VULTRINO_BUILD_SHA` overrides it; an archive build reports `unknown`).
+
 ### Roles
 
 | Method | Path | Body / result |

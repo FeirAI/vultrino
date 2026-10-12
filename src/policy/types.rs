@@ -174,6 +174,19 @@ impl Policy {
         self
     }
 
+    /// True when this policy has a `RateLimit` condition at any depth but its default action is
+    /// not deny. Such a policy is refused by [`Self::validate`] at write time, yet one stored
+    /// before that rule existed still loads and is enforced as written: an exhausted limit falls
+    /// through to the policy default, so a non-deny default turns the limit into an allow. The
+    /// posture endpoint lists these so an operator can fix them.
+    pub fn rate_limit_default_not_deny(&self) -> bool {
+        self.default_action != PolicyAction::Deny
+            && self
+                .rules
+                .iter()
+                .any(|r| condition_contains_rate_limit(&r.condition))
+    }
+
     /// Validate structural invariants for the spend-cap feature (V3), so a
     /// misconfigured cap can't silently fail open. Enforced at config load and
     /// by the admin API:

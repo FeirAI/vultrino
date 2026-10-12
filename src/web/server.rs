@@ -373,6 +373,7 @@ impl WebServer {
             // Metrics read-back (V12).
             .route("/api/v1/metrics", get(api::api_metrics))
             .route("/api/v1/tenant-mode", get(api::api_tenant_mode))
+            .route("/api/v1/posture", get(api::api_posture))
             .route(
                 "/api/v1/would-deny-reports",
                 get(api::api_would_deny_reports),
