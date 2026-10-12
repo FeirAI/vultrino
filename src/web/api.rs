@@ -3664,7 +3664,7 @@ pub async fn api_list_sessions(_admin: AdminApiAuth, State(state): State<AppStat
 
 // -------- Live posture report --------
 
-/// `GET /api/v1/posture` — what THIS process enforces right now, for the deploy-time posture
+/// `GET /api/v1/posture`: what THIS process enforces right now, for the deploy-time posture
 /// verifier. Operator-only (a global admin key): the report is about the whole process, not a
 /// tenant. Read-only; booleans, counts, ids and build provenance only, never a secret, a rule or
 /// a credential (see `posture::build_posture`).
