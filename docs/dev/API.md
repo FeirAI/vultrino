@@ -282,7 +282,7 @@ event.
 `strictness` overrides `max_uses`/`require_approval`: `direct` = single-use +
 require_approval + dual_control; `checkpoint` = require_approval (multi-use).
 
-### `GET /api/v1/posture` — live posture report (operator key)
+### `GET /api/v1/posture`: live posture report (operator key)
 
 What this process enforces right now, for the deploy-time posture verifier in feir-os
 (`deploy/vps/deploy.sh verify-posture`). Needs a global (untenanted) admin key; a tenant-scoped key gets 403.

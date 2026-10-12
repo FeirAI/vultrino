@@ -30,9 +30,24 @@ fn main() {
     println!("cargo:rustc-env=VULTRINO_BUILD_DIRTY={dirty}");
     println!("cargo:rerun-if-env-changed=VULTRINO_BUILD_SHA");
     println!("cargo:rerun-if-env-changed=RUSTC");
-    if let Some(head) = run("git", &["rev-parse", "--git-path", "HEAD"]) {
-        if std::path::Path::new(&head).exists() {
-            println!("cargo:rerun-if-changed={head}");
+    // Re-run when the commit or the tree changes, not only when HEAD's file does: on a branch
+    // checkout HEAD holds `ref: refs/heads/x` and never changes on commit or pull, so also watch
+    // the ref it points at, packed-refs and the index, and the sources (the dirty flag).
+    let mut watch: Vec<String> = ["HEAD", "packed-refs", "index"]
+        .iter()
+        .filter_map(|n| run("git", &["rev-parse", "--git-path", n]))
+        .collect();
+    if let Some(r) = run("git", &["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(p) = run("git", &["rev-parse", "--git-path", &r]) {
+            watch.push(p);
         }
+    }
+    for p in watch {
+        if std::path::Path::new(&p).exists() {
+            println!("cargo:rerun-if-changed={p}");
+        }
+    }
+    for p in ["src", "Cargo.toml", "Cargo.lock", "build.rs"] {
+        println!("cargo:rerun-if-changed={p}");
     }
 }
