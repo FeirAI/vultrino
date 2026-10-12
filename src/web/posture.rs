@@ -169,8 +169,10 @@ mod tests {
             ("f-key", None, true, false, false, true),
         ];
         for (f, m, esc, configured, distinct, escape) in cases {
-            let mut cfg = Config::default();
-            cfg.govder = Some(govder(f, m, esc));
+            let cfg = Config {
+                govder: Some(govder(f, m, esc)),
+                ..Config::default()
+            };
             let v = build_posture(&cfg, true, &[]);
             let a = &v["approver_identity"];
             assert_eq!(a["govder_configured"], true);
