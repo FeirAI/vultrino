@@ -1993,6 +1993,11 @@
           "path": "src/plugins/http.rs",
           "symbol": "HttpPlugin::url_token_send_url",
           "sha256": "f5cb14330b41d0a40324d3b591bbeb2ed57f5442ae489ec363fc31dd075b0162"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "canonical_pattern_core",
+          "sha256": "a3e1c2c41bd5249ca137b6feb186b665758710ac323e6171ee5fc5699135c5ef"
         }
       ],
       "mutants": [
@@ -2146,6 +2151,11 @@
           "path": "src/policy/url_canon.rs",
           "symbol": "canonical_pattern",
           "sha256": "02bcd4b278441f894caa37d7b8588e52f063d98ad9210a47ecec87419e9e8caf"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "canonical_pattern_core",
+          "sha256": "a3e1c2c41bd5249ca137b6feb186b665758710ac323e6171ee5fc5699135c5ef"
         }
       ],
       "mutants": [
