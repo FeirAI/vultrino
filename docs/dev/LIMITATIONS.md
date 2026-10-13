@@ -79,13 +79,21 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   closed) if the `.wal` is removed or shortened while the snapshot is unchanged. The
   refusal is per process and not permanent: a process started after the shrink opens
   the shorter log, and a later compaction or foreign append makes a refusing process
-  reload and accept the shorter state. The same applies to the snapshot: if the vault
-  file itself is deleted under a running process while the log is empty (right after a
-  compaction), that process reads it as a fresh vault. A missing `.wal` has one benign
+  reload and accept the shorter state. If the vault file itself is deleted under a
+  running process that has already loaded it, the process refuses the same way: every
+  fence read and write fails closed and keeps failing while the file stays gone,
+  including right after a compaction when the log is empty too, and a write does not
+  recreate the file. The refusal ends when a vault file reappears: a restored file is
+  reloaded and accepted (an older copy is accepted as the older state), and so is any
+  file that decrypts under the process's key. A fresh vault created by a new process
+  has a new salt, so the refusing process keeps failing with a decryption error while
+  the new process starts clear, as for any vault that never existed. A missing `.wal` has one benign
   cause: a vault created by an earlier build that crashed between the snapshot rename
-  and the log creation, which needs an empty file at that path and not a restore. The check cannot notice the same edit made while no process is running
-  (a truncated log whose remaining records still parse opens as the shorter state),
-  and it does not defend against an attacker who can write the vault directory:
+  and the log creation, which needs an empty file at that path and not a restore. The checks cannot notice the same edit made while no process is running
+  (a truncated log whose remaining records still parse opens as the shorter state;
+  offline `.wal` tail truncation without a durable anchor is an accepted limitation,
+  because filesystem write access is outside the threat model),
+  and they do not defend against an attacker who can write the vault directory:
   such an attacker can also put back an older copy of the vault. Backups must therefore take the
   two files together and be tested by restoring them.
 - **Vault change detection and lock behaviour.** Another process's commit is noticed

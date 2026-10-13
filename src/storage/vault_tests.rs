@@ -1304,6 +1304,90 @@ async fn removing_the_log_under_a_running_process_never_turns_a_halt_clear() {
 }
 
 #[tokio::test]
+async fn deleting_the_vault_file_under_a_running_process_never_turns_a_halt_clear() {
+    // Right after a compaction the log is empty, so with the vault file gone too a reload would
+    // find nothing at all and answer Clear. The process already holds a snapshot token: refuse.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let (b, epoch0) = halted_vault(&path).await;
+    b.compact().await.unwrap();
+    assert_eq!(
+        std::fs::metadata(path.with_extension("wal")).unwrap().len(),
+        0
+    );
+    std::fs::remove_file(&path).unwrap();
+    for _ in 0..2 {
+        let r = b.kill_fence_check(&q("gh-main", epoch0)).await;
+        assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
+    }
+    // A write is refused too and does not recreate the vault.
+    assert!(matches!(
+        b.store(&cred("late")).await,
+        Err(StorageError::Unavailable(_))
+    ));
+    assert!(!path.exists());
+    // Same with a non-empty log (no compaction first).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let (b, epoch0) = halted_vault(&path).await;
+    std::fs::remove_file(&path).unwrap();
+    let r = b.kill_fence_check(&q("gh-main", epoch0)).await;
+    assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn deleting_the_vault_file_between_two_looks_stays_closed() {
+    // The deletion lands between this process's looks. The reload must refuse on its own stat,
+    // or it reads a fresh empty vault, answers Clear and drops the token for good (a later write
+    // would then recreate an empty vault under the same key).
+    // Fence path: another handle compacted, so this process must reload.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let (b, epoch0) = halted_vault(&path).await;
+    let c = open(&path).await;
+    c.compact().await.unwrap();
+    *b.fault.lock() = Some("sync.delete_vault_before_look".into());
+    for _ in 0..2 {
+        let r = b.kill_fence_check(&q("gh-main", epoch0)).await;
+        assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
+    }
+    assert!(!path.exists());
+    // Write path: the load happens inside a write.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let (b, epoch0) = halted_vault(&path).await;
+    *b.fault.lock() = Some("sync.delete_vault_before_look".into());
+    assert!(matches!(
+        b.store(&cred("late")).await,
+        Err(StorageError::Unavailable(_))
+    ));
+    let r = b.kill_fence_check(&q("gh-main", epoch0)).await;
+    assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
+    assert!(matches!(
+        b.store(&cred("later")).await,
+        Err(StorageError::Unavailable(_))
+    ));
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn deleting_the_vault_file_right_after_a_compaction_rename_stays_closed() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let (b, epoch0) = halted_vault(&path).await;
+    *b.fault.lock() = Some("compact.delete_vault_after_rename".into());
+    assert!(matches!(
+        b.compact().await,
+        Err(StorageError::Unavailable(_))
+    ));
+    for _ in 0..2 {
+        let r = b.kill_fence_check(&q("gh-main", epoch0)).await;
+        assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
+    }
+    assert!(!path.exists());
+}
+
+#[tokio::test]
 async fn shrinking_the_log_under_a_running_process_never_turns_a_halt_clear() {
     for keep in [0u64, 1] {
         let dir = tempdir().unwrap();

@@ -1701,7 +1701,17 @@ impl FileStorage {
         self.fsync_dir()?;
         self.crash_point("compact.after_snapshot_rename")?;
         self.reset_wal()?;
-        log.snap_token = file_token(&self.path);
+        #[cfg(test)]
+        if self.fault_armed("compact.delete_vault_after_rename") {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        // Decide on one stat: a vault file that vanished right after the rename must not be
+        // recorded as a fresh view (that would disarm the deleted-file guard). `loaded` stays
+        // false and the old token stays set, so every later look refuses.
+        let Some(new_token) = file_token(&self.path) else {
+            return Err(self.vault_file_gone_error());
+        };
+        log.snap_token = Some(new_token);
         log.snap_len = len;
         log.wal_offset = 0;
         log.snapshot_version = STORAGE_VERSION;
@@ -1719,6 +1729,20 @@ impl FileStorage {
         cache: &mut StorageCache,
         exclusive: bool,
     ) -> Result<(), StorageError> {
+        // A process that has seen the vault file (it holds a snapshot token) and now finds the
+        // file gone must not treat it as a fresh vault: an empty view would read as "no kills" and
+        // turn a halted agent clear, most easily right after a compaction when the log is empty
+        // too. The decision is made by the one stat the reload itself uses (full_load_locked; the
+        // fast path below needs the file present), so no deletion can slip between a check and a
+        // load. The token stays set, so every later look of THIS process refuses as well; a
+        // process started after the deletion sees no vault at all, as for any vault that never
+        // existed.
+        // Test-only: delete the vault file just before this look (an accidental deletion's timing
+        // is nobody's to choose).
+        #[cfg(test)]
+        if self.fault_armed("sync.delete_vault_before_look") {
+            let _ = std::fs::remove_file(&self.path);
+        }
         if log.loaded {
             let tok = file_token(&self.path);
             if tok.is_some() && tok == log.snap_token {
@@ -1755,6 +1779,15 @@ impl FileStorage {
             )));
         }
         Ok(())
+    }
+
+    fn vault_file_gone_error(&self) -> StorageError {
+        StorageError::Unavailable(format!(
+            "the vault file {} is gone while this process was running: committed records \
+             (including kills) may be lost. Refusing to continue. Stop every vultrino process \
+             and restore the vault file together with its log from the same backup",
+            self.path.display()
+        ))
     }
 
     fn log_gone_error(&self, what: &str) -> StorageError {
@@ -1816,6 +1849,12 @@ impl FileStorage {
     ) -> Result<(), StorageError> {
         log.loaded = false;
         let snap_tok = file_token(&self.path);
+        // Same stat decides: a process that holds a snapshot token and finds the file gone here
+        // (deleted after the guard in sync_locked looked) must not treat it as a fresh vault. The
+        // token stays set, so the guard stays armed for this process.
+        if snap_tok.is_none() && log.snap_token.is_some() {
+            return Err(self.vault_file_gone_error());
+        }
         let (applied, mut fresh, version) = if snap_tok.is_some() {
             self.read_snapshot()?
         } else {

@@ -522,6 +522,12 @@
     },
     "vault-panic-keeps-view-trusted": {
       "tier": "full"
+    },
+    "vault-file-gone-fullload-fresh": {
+      "tier": "fast"
+    },
+    "vault-file-gone-compact-rename-unchecked": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -2624,12 +2630,12 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::full_load_locked",
-          "sha256": "b0c2b13f94799a8ec80412ccf4e1bc12d14d425dbe31de35b86a34cebaa74187"
+          "sha256": "f78e00162183463d002db4663c0344cb3c17ee4882a4171dd1cb17a4c2cff4d6"
         },
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::compact_locked",
-          "sha256": "7b1cf584cea80259ddc23025da8e3afa103303c0ee919bc908f83b76462b3c9b"
+          "sha256": "c4813e50aa687cd3b1f6ce8c6958ce5337f83dec706ab31ef471c82dea1a367f"
         },
         {
           "path": "src/storage/file.rs",
@@ -2684,7 +2690,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "846d12b6dc1d81596fc2a35b391df124ca4b2e90a09dc76ecbfc94196010eec6"
+          "sha256": "613c23120fc3e0e64f548c5d90e98c437205b0c69099ed3a28ecbbda4eb056b4"
         }
       ],
       "mutants": [
@@ -2694,7 +2700,7 @@
         "vault-v9-rewrite-accepted-after-compaction"
       ],
       "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation: flock does not prefer a waiting writer, so under sustained overlapping dispatches a kill write can wait without bound against the caller's timeout. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
-      "evidence_run": "38219467303"
+      "evidence_run": "38332553597"
     },
     {
       "id": "vault-log-loss-fails-closed",
@@ -2713,17 +2719,17 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "846d12b6dc1d81596fc2a35b391df124ca4b2e90a09dc76ecbfc94196010eec6"
+          "sha256": "613c23120fc3e0e64f548c5d90e98c437205b0c69099ed3a28ecbbda4eb056b4"
         },
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::full_load_locked",
-          "sha256": "b0c2b13f94799a8ec80412ccf4e1bc12d14d425dbe31de35b86a34cebaa74187"
+          "sha256": "f78e00162183463d002db4663c0344cb3c17ee4882a4171dd1cb17a4c2cff4d6"
         },
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::compact_locked",
-          "sha256": "7b1cf584cea80259ddc23025da8e3afa103303c0ee919bc908f83b76462b3c9b"
+          "sha256": "c4813e50aa687cd3b1f6ce8c6958ce5337f83dec706ab31ef471c82dea1a367f"
         },
         {
           "path": "src/storage/file.rs",
@@ -2743,7 +2749,49 @@
         "vault-compaction-skips-log-precreate"
       ],
       "does_not_establish": "Log loss while no vultrino process is running: a log truncated at a record boundary (or by a torn tail) still opens as the shorter state, because the snapshot does not record the log's length; only a missing log is detected at open. An attacker who can write the vault directory and puts back an older vault file together with its older log. A log replaced by a different file of at least the same length while the snapshot is unchanged and the length equals the applied offset. Filesystems that report a stale length. A crash between the log creation and the snapshot rename leaves an empty log beside the old snapshot, which is accepted (it holds nothing). Any CI run other than the recorded one.",
-      "evidence_run": "38219467303"
+      "evidence_run": "38332553597"
+    },
+    {
+      "id": "vault-file-gone-fails-closed",
+      "statement": "A vultrino process that has loaded the vault (it holds a snapshot token) and then finds the vault file itself gone never turns a halted agent clear: the next dispatch fence read and every write fail closed (Unavailable) and keep failing on repeat while the file stays gone, both when the log still holds the kill and right after a compaction when the log is empty too, and a write does not recreate the vault file. The decision is made on the same stat as the load, so a deletion landing between two looks, or right after a compaction's rename, is refused too and the token stays set. The refusal ends when a vault file reappears: the refusing process then reloads and accepts any file that decrypts under its key.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/file.rs",
+        "src/storage/vault_tests.rs",
+        "docs/dev/LIMITATIONS.md"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::deleting_the_vault_file",
+      "covers": [
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::sync_locked",
+          "sha256": "613c23120fc3e0e64f548c5d90e98c437205b0c69099ed3a28ecbbda4eb056b4"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::vault_file_gone_error",
+          "sha256": "71fee59903fa492bdd23d0505be894f1741f572586e963ff2e5654a095d52f67"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::full_load_locked",
+          "sha256": "f78e00162183463d002db4663c0344cb3c17ee4882a4171dd1cb17a4c2cff4d6"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::compact_locked",
+          "sha256": "c4813e50aa687cd3b1f6ce8c6958ce5337f83dec706ab31ef471c82dea1a367f"
+        }
+      ],
+      "mutants": [
+        "vault-file-gone-fullload-fresh",
+        "vault-file-gone-compact-rename-unchecked"
+      ],
+      "does_not_establish": "Deletion while no vultrino process is running: a process started after the deletion finds no vault and starts one fresh, as for any vault that never existed. Offline truncation of the .wal tail at a record boundary without a durable anchor: accepted limitation, because filesystem write access is outside the threat model (stated in LIMITATIONS). Replacing the vault file with an older copy, or a file replaced by a different one between two looks (the snapshot token then changes and the process reloads as for a compaction). A vault file recreated by a new process with a new salt: the refusing process then keeps failing with a decryption error (not Unavailable) while the new process answers Clear. Another process's view: only the process that loaded the vault refuses. Any CI run other than the recorded one.",
+      "evidence_run": "38332553597"
     },
     {
       "id": "vault-reload-after-uncertain-commit",
@@ -2849,7 +2897,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::full_load_locked",
-          "sha256": "b0c2b13f94799a8ec80412ccf4e1bc12d14d425dbe31de35b86a34cebaa74187"
+          "sha256": "f78e00162183463d002db4663c0344cb3c17ee4882a4171dd1cb17a4c2cff4d6"
         }
       ],
       "mutants": [

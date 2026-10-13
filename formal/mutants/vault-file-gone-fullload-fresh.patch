@@ -1,0 +1,13 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index e895615..1955ad7 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1852,7 +1852,7 @@ impl FileStorage {
+         // Same stat decides: a process that holds a snapshot token and finds the file gone here
+         // (deleted after the guard in sync_locked looked) must not treat it as a fresh vault. The
+         // token stays set, so the guard stays armed for this process.
+-        if snap_tok.is_none() && log.snap_token.is_some() {
++        if false && snap_tok.is_none() && log.snap_token.is_some() {
+             return Err(self.vault_file_gone_error());
+         }
+         let (applied, mut fresh, version) = if snap_tok.is_some() {
