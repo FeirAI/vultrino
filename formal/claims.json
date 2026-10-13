@@ -2776,7 +2776,8 @@
       "mutants": [
         "vault-file-gone-reload-accepted"
       ],
-      "does_not_establish": "Deletion while no vultrino process is running: a process started after the deletion finds no vault and starts one fresh, as for any vault that never existed. Offline truncation of the .wal tail at a record boundary without a durable anchor: accepted limitation, because filesystem write access is outside the threat model (stated in LIMITATIONS). Replacing the vault file with an older copy, or a file replaced by a different one between two looks (the snapshot token then changes and the process reloads as for a compaction). Another process's view: only the process that loaded the vault refuses. Any CI run until an evidence run is recorded."
+      "does_not_establish": "Deletion while no vultrino process is running: a process started after the deletion finds no vault and starts one fresh, as for any vault that never existed. Offline truncation of the .wal tail at a record boundary without a durable anchor: accepted limitation, because filesystem write access is outside the threat model (stated in LIMITATIONS). Replacing the vault file with an older copy, or a file replaced by a different one between two looks (the snapshot token then changes and the process reloads as for a compaction). Another process's view: only the process that loaded the vault refuses. Any CI run other than the recorded one.",
+      "evidence_run": "38323278208"
     },
     {
       "id": "vault-reload-after-uncertain-commit",
