@@ -351,13 +351,62 @@ const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
 ///     The buffered path applies its own total read timeout per request instead.
 ///     (H4/timeouts, ported from fix/agent-boundary-hardening, streaming-reconciled.)
 pub(crate) fn build_guarded_client() -> Client {
-    Client::builder()
+    let mut builder = Client::builder()
         .user_agent("vultrino/0.1.0")
         .redirect(reqwest::redirect::Policy::none())
         .dns_resolver(std::sync::Arc::new(SsrfGuardResolver))
         .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .expect("Failed to create HTTP client")
+        // VUL-29: never honour the ambient HTTP_PROXY / HTTPS_PROXY / ALL_PROXY. A proxy
+        // would receive the injected credential (in clear for http://) and the connect-time
+        // resolver guard would not see the target. The only proxy is the explicit opt-in
+        // below.
+        .no_proxy();
+    match upstream_proxy_from(std::env::var(UPSTREAM_PROXY_ENV).ok().as_deref()) {
+        Ok(None) => {}
+        Ok(Some(proxy_url)) => {
+            // Only https targets are routed through the proxy (a CONNECT tunnel: the
+            // credential is inside TLS). An http:// target is never handed to the proxy
+            // (and validate_url_ssrf refuses it while a proxy is configured).
+            builder = builder.proxy(reqwest::Proxy::custom(move |target| {
+                if target.scheme() == "https" {
+                    Some(proxy_url.clone())
+                } else {
+                    None
+                }
+            }));
+        }
+        Err(msg) => {
+            // Fail closed at construction: a malformed opt-in must not silently fall back
+            // to a direct connection the operator did not intend.
+            panic!("{UPSTREAM_PROXY_ENV} is invalid: {msg}");
+        }
+    }
+    builder.build().expect("Failed to create HTTP client")
+}
+
+/// The explicit opt-in upstream proxy for secret-bearing outbound calls (VUL-29). Unset
+/// means a direct, guarded connection. The ambient proxy variables are never read.
+pub const UPSTREAM_PROXY_ENV: &str = "VULTRINO_UPSTREAM_PROXY";
+
+/// Parse the opt-in proxy value. `None`/empty is "no proxy"; anything else must be an
+/// `http://` or `https://` URL with a host.
+pub(crate) fn upstream_proxy_from(raw: Option<&str>) -> Result<Option<url::Url>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let u = url::Url::parse(raw).map_err(|e| format!("not a URL ({e})"))?;
+    if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() {
+        return Err("must be an http:// or https:// URL with a host".to_string());
+    }
+    Ok(Some(u))
+}
+
+/// True when the explicit upstream proxy is configured (valid or not: an invalid value is
+/// treated as configured so every caller stays on the stricter path).
+pub fn upstream_proxy_configured() -> bool {
+    std::env::var(UPSTREAM_PROXY_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Total read timeout for a BUFFERED outbound request (applied per-request so it
@@ -718,6 +767,16 @@ impl HttpPlugin {
         let before = url::Url::parse(url_str)
             .map_err(|e| PluginError::InvalidParams(format!("Invalid URL: {}", e)))?;
 
+        // VUL-32: a secret holding `/`, `?`, `#`, `%` or whitespace would change the path or
+        // query that is sent (a `%` can also spell a placeholder or a dot segment). Refuse
+        // rather than send a URL other than the one policy judged.
+        if !crate::url_token_secret_is_path_safe(token.expose()) {
+            return Err(PluginError::InvalidParams(
+                "UrlToken secret holds a character ('/', '?', '#', '\\', '%', whitespace or a \
+                 control character) that would change the URL structure; the request is refused"
+                    .to_string(),
+            ));
+        }
         let substituted = url_str.replace(PLACEHOLDER, token.expose());
 
         // Re-parse the substituted URL to check it's still well-formed and to
@@ -850,7 +909,15 @@ impl HttpPlugin {
 
         // Only allow http and https schemes
         match url.scheme() {
-            "http" | "https" => {}
+            "http" => {
+                if upstream_proxy_configured() {
+                    return Err(PluginError::InvalidParams(format!(
+                        "plain http:// is refused while {UPSTREAM_PROXY_ENV} is set: a credential \
+                         must not cross a proxy in clear text. Use https://."
+                    )));
+                }
+            }
+            "https" => {}
             scheme => {
                 return Err(PluginError::InvalidParams(format!(
                     "URL scheme '{}' not allowed. Only http and https are permitted.",
@@ -1255,6 +1322,21 @@ impl Plugin for HttpPlugin {
     }
 }
 
+/// Test-only entry points for the integration tests in `tests/upstream_proxy.rs`, which
+/// need the real guarded client and the real URL admission check but run in their own
+/// process because they mutate the environment.
+#[doc(hidden)]
+pub mod proxy_test_support {
+    pub fn guarded_client() -> reqwest::Client {
+        super::build_guarded_client()
+    }
+    pub fn admit_url(url: &str) -> Result<(), String> {
+        super::HttpPlugin::validate_url_ssrf(url)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1283,6 +1365,46 @@ mod tests {
             format!("{err:?}").contains("cap"),
             "want a cap-exceeded error, got {err:?}"
         );
+    }
+
+    /// VUL-32: a UrlToken secret that would change the path or query that is sent is refused.
+    #[test]
+    fn url_token_secret_that_changes_the_url_structure_is_refused() {
+        for bad in ["a/b", "a?x=1", "a#f", "a\\b", "a%2Fb", "a b", "a\nb", ""] {
+            let token = Secret::new(bad);
+            let err = HttpPlugin::url_token_send_url(
+                "https://api.telegram.org/bot{credential}/sendMessage",
+                &HashMap::new(),
+                &token,
+            )
+            .expect_err(bad);
+            assert!(!format!("{err}").contains("a/b"), "no secret in the error");
+        }
+        let ok = HttpPlugin::url_token_send_url(
+            "https://api.telegram.org/bot{credential}/sendMessage",
+            &HashMap::new(),
+            &Secret::new("123456:ABC-def_GHI"),
+        )
+        .unwrap();
+        assert_eq!(
+            ok,
+            "https://api.telegram.org/bot123456:ABC-def_GHI/sendMessage"
+        );
+    }
+
+    #[test]
+    fn upstream_proxy_value_is_parsed_strictly() {
+        assert!(upstream_proxy_from(None).unwrap().is_none());
+        assert!(upstream_proxy_from(Some("  ")).unwrap().is_none());
+        assert!(upstream_proxy_from(Some("http://proxy.corp:3128"))
+            .unwrap()
+            .is_some());
+        assert!(upstream_proxy_from(Some("https://proxy.corp"))
+            .unwrap()
+            .is_some());
+        for bad in ["socks5://p:1", "proxy.corp:3128", "ftp://p", "http://"] {
+            assert!(upstream_proxy_from(Some(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

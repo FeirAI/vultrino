@@ -326,6 +326,16 @@ enum PolicyCommands {
         /// Stored policy id (the startup error names it)
         id: String,
     },
+    /// List every stored policy the servers refuse to load, with the reason and the fix
+    /// (exit status 1 when there is one).
+    Check,
+    /// Rewrite a stored policy's refused url_match patterns on Deny and Prompt rules: an
+    /// exact URL becomes its prefix form `<url>*` and `{a,b}` becomes an `or` of
+    /// alternatives. Only broadens what a deny or prompt matches.
+    FixUrlPatterns {
+        /// Stored policy id (the startup error names it)
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -597,6 +607,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|s| !s.trim().is_empty());
     config.govder = vultrino::govder::GovderConfig::from_env();
+    // VUL-20: the inbound identity header is believed only when the edge signed it. The key
+    // comes from the environment, never the config file.
+    if let Some(identity) = config.identity.as_mut() {
+        identity.verification_key =
+            vultrino::identity::verification_key_from_env().map(secrecy::SecretString::from);
+    }
     // Say at startup whether verified approver decisions are enabled, disabled,
     // or running on the explicit shared-key escape.
     if let Some(govder) = config.govder.as_ref() {
@@ -780,6 +796,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             execute_action(config, credential, action, params, quiet).await?;
         }
         Commands::Web { bind } => {
+            refuse_identity_without_key(&config)?;
             run_web_server(config, bind).await?;
         }
         Commands::Plugin { command } => match command {
@@ -840,6 +857,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Policy { command } => match command {
             PolicyCommands::DenyDefault { id } => {
                 policy_deny_default(config, id).await?;
+            }
+            PolicyCommands::Check => {
+                let storage = init_storage(&config).await?;
+                let stored = storage.list_stored_policies().await?;
+                let refusals = vultrino::policy::stored_policy_refusals(&stored);
+                if refusals.is_empty() {
+                    println!("All {} stored policies load.", stored.len());
+                } else {
+                    for r in &refusals {
+                        println!("{r}");
+                    }
+                    std::process::exit(1);
+                }
+            }
+            PolicyCommands::FixUrlPatterns { id } => {
+                let storage = init_storage(&config).await?;
+                let n = vultrino::policy::fix_stored_policy_url_patterns(&*storage, &id).await?;
+                println!("Policy {id}: {n} url_match pattern(s) rewritten.");
             }
         },
         Commands::Approval { command } => match command {
@@ -1702,6 +1737,25 @@ async fn list_credentials(
         }
     }
 
+    Ok(())
+}
+
+/// VUL-20: `[identity]` is enabled but no key verifies the edge's signature, so the inbound header
+/// could never be believed. Refuse to start rather than run with an identity feature that
+/// silently does nothing (or, in an older build, trusted everything).
+fn refuse_identity_without_key(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config
+        .identity
+        .as_ref()
+        .is_some_and(|i| i.verification_key.is_none())
+    {
+        return Err(
+            "[identity] is enabled but VULTRINO_IDENTITY_SECRET (or _FILE) is not set: the \
+             inbound identity header cannot be verified, so vultrino refuses to start. Set \
+             the key the edge signs the header with, or remove [identity]."
+                .into(),
+        );
+    }
     Ok(())
 }
 

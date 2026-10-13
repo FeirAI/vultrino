@@ -704,6 +704,17 @@ pub struct Credential {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Whether a `UrlToken` secret can be put into a URL path without changing the URL's
+/// structure (VUL-32). A `/`, `?`, `#` or `\\` would add a path segment, start a query or a
+/// fragment, and whitespace or a control character is re-encoded or stripped, so the bytes sent
+/// would differ from the string policy judged. Such a secret is refused at create and at use.
+pub fn url_token_secret_is_path_safe(secret: &str) -> bool {
+    !secret.is_empty()
+        && !secret
+            .chars()
+            .any(|c| matches!(c, '/' | '?' | '#' | '\\' | '%') || c.is_control() || c == ' ')
+}
+
 impl Credential {
     /// Create a new credential with generated ID and timestamps
     pub fn new(alias: String, data: CredentialData) -> Self {

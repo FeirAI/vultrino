@@ -150,6 +150,14 @@ pub enum PatternWarning {
     MeaningChanged,
     /// The pattern is not a parseable URL or path; it is compared literally.
     Unparseable,
+    /// The pattern is an exact URL (or path) with no `*`, no `?` and no query: a request for
+    /// the same URL with a query string appended (`?x=1`) does not match it, so a Deny or
+    /// Prompt rule on it is slipped past by adding one. Write the prefix form (`<url>*`).
+    ExactUrlMissesQuery,
+    /// The pattern holds a `{` or `}` other than the literal `{credential}` placeholder. A
+    /// glob has no `{a,b}` alternation: the braces are literal, so the pattern matches
+    /// nothing and a Deny or Prompt rule on it protects nothing.
+    BracesAreLiteral,
 }
 
 /// A pattern in canonical form plus load-time warnings.
@@ -197,6 +205,79 @@ fn star_cuts_an_escape(pattern: &str) -> bool {
 /// Canonicalise a policy pattern. Same two shapes as before: a trailing `*`
 /// makes a literal prefix, anything else is a glob (or an exact match).
 pub fn canonical_pattern(pattern: &str) -> CanonPattern {
+    let mut canon = canonical_pattern_core(pattern);
+    if braces_are_literal(pattern) {
+        canon.warnings.push(PatternWarning::BracesAreLiteral);
+    }
+    if exact_url_misses_query(pattern) {
+        canon.warnings.push(PatternWarning::ExactUrlMissesQuery);
+    }
+    canon
+}
+
+/// The only brace text a pattern may carry: the UrlToken placeholder.
+const PLACEHOLDER: &str = "{credential}";
+
+/// Whether a `{` or `}` other than a literal `{credential}` is present.
+pub fn braces_are_literal(pattern: &str) -> bool {
+    let rest = pattern.replace(PLACEHOLDER, "");
+    rest.contains(['{', '}'])
+}
+
+/// Whether the pattern is an exact URL or rooted path with no wildcard and no query.
+pub fn exact_url_misses_query(pattern: &str) -> bool {
+    if pattern.is_empty() || pattern.contains(['*', '?', '[', ']']) {
+        return false;
+    }
+    match pattern.split_once("://") {
+        Some((scheme, rest)) => {
+            !scheme.is_empty() && !rest.is_empty() && !rest.starts_with(['/', '?', '#'])
+        }
+        None => is_relative(pattern),
+    }
+}
+
+/// Expand a single-level `{a,b,...}` alternation into its alternatives (at most 64). `None`
+/// when the pattern has braces this cannot expand (nested, unbalanced, no comma, too many).
+pub fn expand_brace_alternation(pattern: &str) -> Option<Vec<String>> {
+    let masked = pattern.replace(PLACEHOLDER, "\u{1}");
+    let mut out = vec![String::new()];
+    let mut chars = masked.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                let mut body = String::new();
+                loop {
+                    match chars.next()? {
+                        '}' => break,
+                        '{' => return None,
+                        x => body.push(x),
+                    }
+                }
+                if !body.contains(',') {
+                    return None;
+                }
+                let alts: Vec<&str> = body.split(',').collect();
+                if out.len() * alts.len() > 64 {
+                    return None;
+                }
+                out = out
+                    .iter()
+                    .flat_map(|o| alts.iter().map(move |a| format!("{o}{a}")))
+                    .collect();
+            }
+            '}' => return None,
+            x => out.iter_mut().for_each(|o| o.push(x)),
+        }
+    }
+    Some(
+        out.into_iter()
+            .map(|o| o.replace("\u{1}", PLACEHOLDER))
+            .collect(),
+    )
+}
+
+fn canonical_pattern_core(pattern: &str) -> CanonPattern {
     let mut warnings = Vec::new();
     let keep = |text: &str, warnings: Vec<PatternWarning>| CanonPattern {
         text: text.to_string(),
@@ -569,15 +650,26 @@ mod tests {
         assert!(w("https://*.example.com/*").contains(&PatternWarning::StarInHost));
         assert!(w("https://api.example.com/a/../b/*").contains(&PatternWarning::MeaningChanged));
         assert!(w("https://[::1/*").contains(&PatternWarning::Unparseable));
+        // VUL-32: an exact URL with no query, and a brace that is not the placeholder.
+        assert!(w("https://api.github.com/x").contains(&PatternWarning::ExactUrlMissesQuery));
+        assert!(w("/v1/refunds").contains(&PatternWarning::ExactUrlMissesQuery));
+        assert!(w("https://api.telegram.org/bot{credential}/sendMessage")
+            .contains(&PatternWarning::ExactUrlMissesQuery));
+        assert!(w("https://a.example.com/{x,y}/*").contains(&PatternWarning::BracesAreLiteral));
+        assert!(w("https://a.example.com/x}").contains(&PatternWarning::BracesAreLiteral));
+        assert!(!w("https://a.example.com/bot{credential}/*")
+            .contains(&PatternWarning::BracesAreLiteral));
         // Quiet cases: case, default port, percent rewrites, plain prefixes.
         for quiet in [
             "https://api.example.com/*",
             // The parser encodes `{` and `}` in a path; the URL side is encoded
             // the same way, so this is not a meaning change.
-            "https://api.telegram.org/bot{credential}/sendMessage",
+            "https://api.telegram.org/bot{credential}/sendMessage?x=1",
             "https://api.example.com/a b/*",
             "HTTPS://API.example.com:443/v1/%61*",
-            "https://api.github.com/x",
+            "https://api.github.com/x?per_page=1",
+            "https://api.github.com/x*",
+            "https://api.telegram.org/bot{credential}/sendMessage*",
             "*",
             "https://*",
             "/v1/refunds/*",
@@ -733,5 +825,41 @@ mod tests {
             canonical_pattern("https://*.example.com/x").text,
             "https://*.example.com/x"
         );
+    }
+
+    /// VUL-32: what the new warnings mean, shown on the matcher itself. An exact Deny misses the
+    /// URL with a query; the suggested prefix form does not; an alternation expands.
+    #[test]
+    fn exact_pattern_misses_a_query_and_the_prefix_form_does_not() {
+        let url = canonical_url("https://api.example.com/admin?x=1").unwrap();
+        let exact = canonical_pattern("https://api.example.com/admin");
+        assert!(!canonical_matches(&url, &exact.text), "the footgun");
+        let prefix = canonical_pattern("https://api.example.com/admin*");
+        assert!(canonical_matches(&url, &prefix.text));
+        assert!(prefix.warnings.is_empty());
+        let braces = canonical_pattern("https://a.example.com/{x,y}");
+        let hit = canonical_url("https://a.example.com/x").unwrap();
+        assert!(!canonical_matches(&hit, &braces.text), "a dead alternation");
+    }
+
+    #[test]
+    fn brace_alternation_expands_or_refuses() {
+        assert_eq!(
+            expand_brace_alternation("https://h/{a,b}/x").unwrap(),
+            vec!["https://h/a/x", "https://h/b/x"]
+        );
+        assert_eq!(expand_brace_alternation("/{a,b}/{c,d}").unwrap().len(), 4);
+        assert_eq!(
+            expand_brace_alternation("https://h/bot{credential}/{a,b}").unwrap(),
+            vec!["https://h/bot{credential}/a", "https://h/bot{credential}/b"]
+        );
+        for no in [
+            "https://h/{a}",
+            "https://h/{a,{b,c}}",
+            "https://h/}",
+            "https://h/{a,b",
+        ] {
+            assert!(expand_brace_alternation(no).is_none(), "{no}");
+        }
     }
 }

@@ -394,9 +394,10 @@ required to approve from Telegram/email.
   match, but an untenanted caller never matches a tenanted one). This lets an agent
   keep polling after its use token is re-minted.
 - Set `public_base_url` to an **HTTPS** address so Telegram/email approve-deny
-  links are confidential, and avoid running the web server at `DEBUG` log level
-  in production (request URIs, which carry the link's capability token, are
-  logged at `DEBUG`).
+  links are confidential. The request log records only the method and the path,
+  never the query string, so a link's capability token is not written to the logs
+  at any level (a reverse proxy in front of vultrino keeps its own access log:
+  keep the token out of that one too).
 - A use token's *pending* approvals are **bounded**: `uses + outstanding pending
   approvals` can never exceed `max_uses`, checked-and-inserted atomically under
   the vault lock. So a single-use token can't flood the approval queue (or the

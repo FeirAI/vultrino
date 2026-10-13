@@ -250,3 +250,120 @@ fn serve_mcp_refuses_to_start_with_a_stored_rate_limit_policy_that_does_not_defa
         "the startup error names the policy and the fix: {stderr}"
     );
 }
+
+/// VUL-20: `[identity]` with no signing key is a startup refusal, and with a key the check passes
+/// (the next refusal is the unrelated missing policy-hash secret).
+#[test]
+fn web_refuses_to_start_with_identity_enabled_and_no_signing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("vultrino.toml");
+    std::fs::write(
+        &config,
+        "[identity]\nkind = \"spiffe\"\nheader = \"x-spiffe-verified\"\n",
+    )
+    .unwrap();
+    for key in [None, Some("   ")] {
+        let mut command = web_command(&config);
+        command
+            .env_remove("VULTRINO_POLICY_HASH_SECRET")
+            .env_remove("VULTRINO_IDENTITY_SECRET")
+            .env_remove("VULTRINO_IDENTITY_SECRET_FILE");
+        if let Some(k) = key {
+            command.env("VULTRINO_IDENTITY_SECRET", k);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("VULTRINO_IDENTITY_SECRET") && stderr.contains("refuses to start"),
+            "unexpected startup error: {stderr}"
+        );
+    }
+    let output = web_command(&config)
+        .env_remove("VULTRINO_POLICY_HASH_SECRET")
+        .env("VULTRINO_IDENTITY_SECRET", "identity-key-0123456789abcdef")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("VULTRINO_POLICY_HASH_SECRET is required"),
+        "with a key the identity check passes and the next gate speaks: {stderr}"
+    );
+}
+
+/// VUL-32: a stored Deny with an exact URL (a query string slips past it) makes `vultrino web`
+/// refuse to start, `vultrino policy check` lists it, and `policy fix-url-patterns` repairs it.
+#[test]
+fn web_refuses_a_stored_exact_url_deny_and_the_cli_fixes_it() {
+    use vultrino::policy::{Policy, PolicyAction, PolicyCondition};
+    use vultrino::storage::{FileStorage, StorageBackend};
+
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault.enc");
+    let config = dir.path().join("vultrino.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[storage]\nbackend = \"file\"\n[storage.file]\npath = \"{}\"\n",
+            vault.display()
+        ),
+    )
+    .unwrap();
+    let password = "startup-refusal-test-password";
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let storage = FileStorage::new(&vault, &secrecy::SecretString::from(password))
+            .await
+            .unwrap();
+        let mut p = Policy::deny_all("exact-deny", "cred-*").with_rule(
+            PolicyCondition::UrlMatch("https://api.example.com/admin".into()),
+            PolicyAction::Deny,
+        );
+        p.id = "exact-deny-id".to_string();
+        storage.store_policy(&p).await.unwrap();
+    });
+    let cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vultrino"))
+            .arg("--config")
+            .arg(&config)
+            .args(args)
+            .env("HOME", dir.path())
+            .env("VULTRINO_PASSWORD", password)
+            .output()
+            .unwrap()
+    };
+    let output = web_command(&config)
+        .env("HOME", dir.path())
+        .env("VULTRINO_PASSWORD", password)
+        .env(
+            "VULTRINO_POLICY_HASH_SECRET",
+            "01234567890123456789012345678901",
+        )
+        .env("VULTRINO_ADMIN_USERNAME", "admin")
+        .env("VULTRINO_ADMIN_PASSWORD", "startup-refusal-admin-password")
+        .env_remove("VULTRINO_WORKLOAD_EXCHANGE_ENABLED")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "startup must fail: {stderr}");
+    assert!(
+        stderr.contains("exact-deny-id") && stderr.contains("vultrino policy check"),
+        "the error names the policy and the fix: {stderr}"
+    );
+
+    let check = cli(&["policy", "check"]);
+    assert_eq!(check.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&check.stdout).contains("exact-deny-id"));
+    let fix = cli(&["policy", "fix-url-patterns", "exact-deny-id"]);
+    assert!(
+        fix.status.success(),
+        "fix failed: {}",
+        String::from_utf8_lossy(&fix.stderr)
+    );
+    let check = cli(&["policy", "check"]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}

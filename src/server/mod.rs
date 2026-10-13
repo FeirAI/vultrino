@@ -977,6 +977,8 @@ pub struct VultrinoServer {
 struct InboundIdentity {
     /// Lower-cased header name carrying the verified document/claims.
     header: String,
+    /// Key the edge signs the document with (VUL-20). `None`: nothing can verify.
+    key: Option<secrecy::SecretString>,
     resolver: Arc<dyn crate::identity::IdentityResolver>,
 }
 
@@ -1088,6 +1090,7 @@ impl VultrinoServer {
             };
             InboundIdentity {
                 header: ic.header.clone(),
+                key: ic.verification_key.clone(),
                 resolver,
             }
         });
@@ -1325,6 +1328,12 @@ impl VultrinoServer {
         }
     }
 
+    /// The header carrying the edge's signature over the identity document (VUL-20).
+    pub fn identity_signature_header(&self) -> Option<String> {
+        self.identity_header()
+            .map(crate::identity::signature_header_name)
+    }
+
     /// The inbound header to read a verified workload-identity document from, if a
     /// resolver is wired (V10/R6). Lower-cased for case-insensitive matching.
     pub fn identity_header(&self) -> Option<&str> {
@@ -1336,8 +1345,34 @@ impl VultrinoServer {
     /// resolver is wired or the document is malformed / untrusted (logged) — the
     /// caller then falls back to the static `vk_`/`vut_` principal (fail-safe: a
     /// bad document can't elevate, only fail to refine).
-    pub fn resolve_identity(&self, document: &str) -> Option<crate::identity::WorkloadIdentity> {
+    pub fn resolve_identity(
+        &self,
+        document: &str,
+        signature: Option<&str>,
+        bearer: &str,
+    ) -> Option<crate::identity::WorkloadIdentity> {
         let inbound = self.inbound_identity.as_ref()?;
+        // VUL-20: the header is believed only when the edge signed it for THIS bearer.
+        use secrecy::ExposeSecret;
+        let verified = match (inbound.key.as_ref(), signature) {
+            (Some(key), Some(sig)) => crate::identity::verify_identity_signature(
+                key.expose_secret(),
+                document,
+                bearer,
+                sig,
+                chrono::Utc::now().timestamp(),
+            ),
+            (None, _) => Err(crate::identity::IdentityError::BadSignature(
+                "no verification key configured".to_string(),
+            )),
+            (_, None) => Err(crate::identity::IdentityError::BadSignature(
+                "no signature header".to_string(),
+            )),
+        };
+        if let Err(e) = verified {
+            warn!(error = %e, "inbound workload-identity header not verified — using static principal");
+            return None;
+        }
         match inbound.resolver.resolve(document) {
             Ok(id) => Some(id),
             Err(e) => {

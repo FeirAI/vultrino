@@ -2436,6 +2436,15 @@ impl FileStorage {
 #[async_trait]
 impl StorageBackend for FileStorage {
     async fn store(&self, credential: &Credential) -> Result<(), StorageError> {
+        if let crate::CredentialData::UrlToken { token } = &credential.data {
+            if !crate::url_token_secret_is_path_safe(token.expose()) {
+                return Err(StorageError::InvalidConfig(
+                    "url_token secret holds a character ('/', '?', '#', '\\', '%', whitespace or a \
+                     control character) that would change the URL it is substituted into; refused"
+                        .to_string(),
+                ));
+            }
+        }
         self.locked_mutate(|cache| {
             if let Some(existing_id) = cache.alias_index.get(&credential.alias) {
                 if existing_id != &credential.id {

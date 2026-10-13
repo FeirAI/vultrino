@@ -153,7 +153,7 @@ upstream.
 |----------|----------|-------|
 | The calling agent | **No** | The primary adversary. Sees only aliases + scrubbed responses. |
 | The bearer token presented | Authenticated | `vk_`/`vut_` validated by hash; scope enforced server-side. |
-| The `[identity]` header | **Trusted (edge-verified)** | The deployment MUST terminate mTLS / verify the token and pass the verified document. Vultrino does not itself verify the SVID/OIDC signature. |
+| The `[identity]` header | **Verified (edge-signed)** | The edge verifies the SVID/OIDC token and signs the document; Vultrino checks that signature (`<header>-signature`) and ignores an unsigned, expired or foreign-bearer document. Vultrino does not itself verify the SVID/OIDC token. |
 | The host / disk / vault password | Trusted | Vault confidentiality rests on the password's secrecy and OS file protection. |
 | Built-in Rust plugins | **Trusted declassification boundary** | They receive `CredentialData` to inject/use it. Review them as part of Vultrino's TCB. |
 | Installed WASM plugins | **No** | ABI v2 receives only alias + credential type, never `CredentialData`; ABI v1 is rejected. No secret-using host capability exists yet. |
@@ -171,15 +171,17 @@ those — checking **every** resolved IP, not just an IP literal. OAuth2 token U
 get the same guard and must be HTTPS. So a proxied request to `127.0.0.1` or a
 metadata endpoint is denied at the transport step.
 
-**Known bound: an ambient proxy bypasses the connect-time guard.** The HTTP plugin's
-client (`build_guarded_client`) does not call `.no_proxy()`, unlike `internal_http`. If the
-vultrino process runs with `HTTP_PROXY` or `HTTPS_PROXY` set, reqwest sends the request to
-that proxy: the connect-time resolver that guards against DNS rebinding is not consulted for
-the target, and an `http://` request carries its credential to the proxy in plaintext. The
-admission-time URL check above still runs. Do not set an ambient proxy on a vultrino process
-that is not meant to route its upstream traffic through it. The govder credential-canary
-end-to-end test relies on this behaviour to reach a local reflecting upstream, and would fail
-loudly if it changed.
+**Upstream proxy: explicit opt-in only.** Every secret-bearing outbound client
+(`build_guarded_client`) ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, so an ambient
+proxy can neither see an injected credential nor skip the connect-time resolver guard. An
+operator who must route egress through a proxy sets `VULTRINO_UPSTREAM_PROXY` to an `http://`
+or `https://` proxy URL (an invalid value stops the process at client construction). Only
+`https://` targets go through it (a CONNECT tunnel, the credential inside TLS); a plain
+`http://` target is refused at admission while the proxy is set and is never handed to it.
+The proxy resolves the target host itself, so the connect-time resolver guard does not cover
+that hop: the admission-time URL check above still runs, and the proxy is trusted to enforce
+its own destination policy. `GET /api/v1/posture` reports `egress.upstream_proxy_configured`
+(never the URL).
 
 The authoritative list of ranges the HTTP plugin's guard blocks is the
 `IPV4_BLOCKED` and `IPV6_BLOCKED` tables in `src/plugins/http.rs`, plus the IPv4
@@ -320,8 +322,9 @@ every turn with `[llm_proxy] streaming_enabled = false`. See
 - **No in-path token ceiling.** The meter emit is fail-open and out-of-band, so it
   bounds (does not eliminate) overshoot. A zero-overshoot in-path hard ceiling is
   not built in v1.
-- **No SVID/OIDC signature verification.** The `[identity]` header is trusted as
-  edge-verified; Vultrino does not validate the token signature itself. (The
+- **No SVID/OIDC token verification.** Vultrino verifies the edge's HMAC over the
+  `[identity]` document (see `identity::sign_identity`), not the token's own signature;
+  whoever holds `VULTRINO_IDENTITY_SECRET` can assert any workload id. (The
   workload-exchange `vwa_` assertion, by contrast, **is** cryptographically verified
   by Vultrino against `VULTRINO_WORKLOAD_ASSERTION_SECRET` — see above.)
 - **No built-in TLS/network exposure hardening.** Serve plaintext HTTP behind a

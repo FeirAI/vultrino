@@ -197,9 +197,11 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   narrow host-side operation for that credential type. The repository's former
   PGP module is retained only as an ABI v1 rejection fixture, not a deployable
   plugin.
-- **Inbound workload identity trusts the edge.** Vultrino does **not** verify the
-  SVID/OIDC signature; the deployment must terminate mTLS / verify the token and
-  pass the verified document in the configured header.
+- **Inbound workload identity: Vultrino does not verify the SVID/OIDC token itself.**
+  The edge verifies the token; Vultrino verifies the edge's signature over the
+  document (`<header>-signature`, HMAC under `VULTRINO_IDENTITY_SECRET`, bound to the
+  request's bearer secret and a five-minute expiry). Whoever holds that key can
+  assert any workload id, so it is as sensitive as the approval-assertion key.
 - **In-memory, per-process state resets on restart.** Rate-limit counters, the
   unauthorized-attempt metric, and the in-flight session registry are per-process
   and reset on restart. The durable history is the signed outbox. Rate-limit
@@ -519,16 +521,20 @@ matched as one string. These rules are shown on the tested patterns and a
 property test over generated other-host URLs, not proved for every pattern. In
 a prefix pattern (trailing `*`) an earlier `*` is literal, so
 `https://*.example.com/*` matches no real host: a Deny or Prompt rule written
-that way is dead. The admin API refuses such a pattern (and every other
-warned pattern) on a Deny or Prompt rule when a policy is written; a policy
-already stored that way still loads and is enforced as written (the warning is
-then the only sign), and so does one in the config file (config load warns
-only). An Allow rule is refused only when the warned pattern sits under an odd
+that way is dead. The admin API, the config file and the stored-policy load all
+refuse such a pattern (and every other warned pattern, including an exact URL
+with no query and a `{a,b}` glob) on a Deny or Prompt rule: the admin API
+answers 400, config load is an error, and a stored policy that holds one makes
+`vultrino web` refuse to start and the live set stay unchanged, naming the policy
+and the fix (`vultrino policy check` lists them, `vultrino policy
+fix-url-patterns <id>` rewrites an exact URL to `<url>*` and expands `{a,b}`).
+An Allow rule is refused only when the warned pattern sits under an odd
 number of `not` (there a dead pattern allows every URL); any other Allow rule is
-stored and warned. The refusal is as good as the warnings: a
-pattern that matches less than it reads but logs no warning (a `{a,b}` glob, a
-glob without a port that misses a non-default port, an exact URL that misses a
-query) is not refused.
+stored and warned. An exact URL on a Prompt rule is accepted in a policy whose
+default is deny (govder's compiled shape; the query form falls to the deny
+default), but a different policy that allows the query form is not considered.
+The refusal is as good as the warnings: a
+glob without a port that misses a non-default port is not refused.
 A glob whose host part holds `?`
 is not canonicalised (warned); that `?` matches one host character. Patterns
 are canonicalised when they are matched, not rewritten in storage, so the admin
@@ -537,24 +543,22 @@ on its placeholder URL and sent as that judged string with the secret in place o
 the literal `{credential}`. A URL in which other text canonicalises to a
 spelling of the placeholder (percent-encoded, half-encoded, or with an escaped
 inner letter such as `%7Bcr%65dential%7D`, in any letter case) is refused; this
-is tested on a list of spellings, not proved for every URL. The secret is inserted as is, and the `url`
-crate percent-encodes only what it must, so a secret that contains `/`, `?` or
-`#` changes the path or query that is sent; the substitution is checked only for
-an unchanged scheme and host. A `url_match` glob has no `{a,b}` alternation: the
-braces are literal, so such a pattern matches nothing and logs no warning (a
-Deny rule written that way is dead). A scheme-less prefix such as `internal*`
+is tested on a list of spellings, not proved for every URL. A secret that contains `/`, `?`, `#`, `\`, `%`, whitespace or a control
+character is refused when the credential is stored and again when it is used,
+because it would change the path or query that is sent; other secrets are
+inserted as is and the substitution is checked for an unchanged scheme and
+host. A `url_match` glob has no `{a,b}` alternation: the braces are literal, so
+such a pattern matches nothing (a Deny or Prompt rule written that way is now
+refused, see above). A scheme-less prefix such as `internal*`
 matches no canonical `http(s)` URL; it logs the star-in-host warning, which is
 the only sign that a Deny or Prompt rule on it is dead (`http*` and `https*` do
 not warn). The server code that builds the judged URL (at request time and at
 approval resume) has no registered mutant; one integration test
 (`internal_http_integration::query_is_forwarded_and_is_part_of_the_policy_matched_string`)
 exercises the request-time path. Only the
-`http` and `hmac` plugins send the canonical string. The `internal_http` plugin
-does not: it sends the `url`-crate composition of the raw path, and its own
-path allowlists run on that composed path, not on the canonical form. What it
-sends can differ from the evaluated form in percent-escape spelling: unreserved
-escapes, hex case, and the form encoding of the `query` map (a space is sent as
-`+`, a `*` unescaped). The WASM
+`http` and `hmac` plugins send the canonical string, and so does `internal_http`
+(it composes the pinned base with the canonical path and query, and its path
+allowlists run on that composed path). The WASM
 plugin egress, ssh and postgres plugins do not use the `url` param and are not
 covered. The `hmac` plugin appends `timestamp`, `recvWindow` and `signature` to
 the evaluated query pairs, sorted among them; those three are not judged. AWS

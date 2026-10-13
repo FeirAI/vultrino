@@ -955,16 +955,24 @@ fn contains_negated_url_match(c: &PolicyCondition, negated: bool) -> bool {
 
 /// The first `url_match` pattern in a condition tree that [`canonical_pattern`]
 /// warns about, at any depth (`and`, `or`, `not`), with its warnings.
-fn first_warned_url_pattern(c: &PolicyCondition) -> Option<(&str, url_canon::CanonPattern)> {
+fn first_warned_url_pattern(
+    c: &PolicyCondition,
+    exact_ok: bool,
+) -> Option<(&str, url_canon::CanonPattern)> {
     match c {
         PolicyCondition::UrlMatch(p) => {
-            let canon = canonical_pattern(p);
+            let mut canon = canonical_pattern(p);
+            if exact_ok {
+                canon
+                    .warnings
+                    .retain(|w| *w != PatternWarning::ExactUrlMissesQuery);
+            }
             (!canon.warnings.is_empty()).then_some((p.as_str(), canon))
         }
         PolicyCondition::And(v) | PolicyCondition::Or(v) => {
-            v.iter().find_map(first_warned_url_pattern)
+            v.iter().find_map(|c| first_warned_url_pattern(c, exact_ok))
         }
-        PolicyCondition::Not(b) => first_warned_url_pattern(b),
+        PolicyCondition::Not(b) => first_warned_url_pattern(b, exact_ok),
         _ => None,
     }
 }
@@ -1007,6 +1015,14 @@ fn pattern_warning_reason(w: &PatternWarning, canonical: &str) -> String {
         PatternWarning::Unparseable => "the pattern is not a parseable URL or path and is compared \
             as literal text"
             .to_string(),
+        PatternWarning::ExactUrlMissesQuery => "the pattern is an exact URL with no query, so the \
+            same URL with a query string appended (?x=1) does not match it; write the prefix \
+            form with a trailing * (for example https://api.example.com/admin*)"
+            .to_string(),
+        PatternWarning::BracesAreLiteral => "the pattern has { or }: a glob has no {a,b} \
+            alternation, the braces are literal and the pattern matches nothing; write one \
+            url_match per alternative inside an or"
+            .to_string(),
     }
 }
 
@@ -1024,8 +1040,19 @@ pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
         // An Allow rule is refused only when the warned pattern sits under an odd
         // number of `not`: there a dead pattern allows every URL (wave-1 close-out).
         let (action, found) = match rule.action {
-            PolicyAction::Deny => ("deny", first_warned_url_pattern(&rule.condition)),
-            PolicyAction::Prompt => ("prompt", first_warned_url_pattern(&rule.condition)),
+            PolicyAction::Deny => ("deny", first_warned_url_pattern(&rule.condition, false)),
+            // A Prompt on an exact URL (govder's compiled shape, an AND of action, URL and
+            // method) is safe in a default-deny policy: the same URL with a query appended
+            // matches nothing and falls to the deny default instead of skipping a gate. It
+            // is refused when the policy default is not deny (it would fall to allow or
+            // prompt). Another policy that allows the query form is not considered.
+            PolicyAction::Prompt => (
+                "prompt",
+                first_warned_url_pattern(
+                    &rule.condition,
+                    policy.default_action == PolicyAction::Deny,
+                ),
+            ),
             PolicyAction::Allow => (
                 "allow",
                 first_negated_warned_url_pattern(&rule.condition, false),
@@ -1055,6 +1082,84 @@ pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
 /// The error names every refused policy and the fix. Callers that load from the
 /// vault (`VultrinoServer::reload_policies`, the periodic refresh) call this
 /// before they apply anything, so a refused set never replaces the live one.
+/// Rewrite a stored policy's refused `url_match` patterns on Deny and Prompt rules into a form
+/// that matches at least what they read (`vultrino policy fix-url-patterns <id>`): an exact URL
+/// with no query becomes the prefix `<url>*` (it denies or prompts on more, never less) and a
+/// `{a,b}` alternation becomes an `or` of its alternatives. Returns the number of patterns
+/// rewritten. Errors, and stores nothing, when a refused pattern remains afterwards (for
+/// example a `*` in a host, which only the operator can fix).
+pub async fn fix_stored_policy_url_patterns(
+    storage: &dyn crate::storage::StorageBackend,
+    id: &str,
+) -> Result<usize, crate::VultrinoError> {
+    let Some(mut policy) = storage.get_policy(id).await? else {
+        return Err(crate::VultrinoError::InvalidRequest(format!(
+            "no stored policy with id '{id}'"
+        )));
+    };
+    let mut changed = 0usize;
+    for rule in policy.rules.iter_mut() {
+        let exact_ok =
+            rule.action == PolicyAction::Prompt && policy.default_action == PolicyAction::Deny;
+        if matches!(rule.action, PolicyAction::Deny | PolicyAction::Prompt) {
+            rule.condition = fix_condition(rule.condition.clone(), &mut changed, exact_ok);
+        }
+    }
+    refuse_warned_url_patterns(&policy).map_err(|e| {
+        crate::VultrinoError::InvalidRequest(format!(
+            "after the automatic rewrite a pattern is still refused and nothing was stored; edit \
+             the policy by hand: {e}"
+        ))
+    })?;
+    if changed > 0 {
+        storage.store_policy(&policy).await?;
+    }
+    Ok(changed)
+}
+
+fn fix_condition(c: PolicyCondition, changed: &mut usize, exact_ok: bool) -> PolicyCondition {
+    match c {
+        PolicyCondition::UrlMatch(p) => {
+            if url_canon::braces_are_literal(&p) {
+                if let Some(alts) = url_canon::expand_brace_alternation(&p) {
+                    *changed += 1;
+                    let each = alts
+                        .into_iter()
+                        .map(|a| fix_condition(PolicyCondition::UrlMatch(a), changed, exact_ok))
+                        .collect();
+                    return PolicyCondition::Or(each);
+                }
+                return PolicyCondition::UrlMatch(p);
+            }
+            if !exact_ok && url_canon::exact_url_misses_query(&p) {
+                *changed += 1;
+                return PolicyCondition::UrlMatch(format!("{p}*"));
+            }
+            PolicyCondition::UrlMatch(p)
+        }
+        PolicyCondition::And(v) => PolicyCondition::And(
+            v.into_iter()
+                .map(|c| fix_condition(c, changed, exact_ok))
+                .collect(),
+        ),
+        PolicyCondition::Or(v) => PolicyCondition::Or(
+            v.into_iter()
+                .map(|c| fix_condition(c, changed, exact_ok))
+                .collect(),
+        ),
+        // Under a `not` the direction flips: leave it for the operator.
+        other => other,
+    }
+}
+
+/// Every stored policy the servers would refuse to load, with the reason. `vultrino policy check`.
+pub fn stored_policy_refusals(stored: &[Policy]) -> Vec<String> {
+    stored
+        .iter()
+        .filter_map(Policy::stored_load_refusal)
+        .collect()
+}
+
 pub fn refuse_unloadable_stored_policies(stored: &[Policy]) -> Result<(), String> {
     let refusals: Vec<String> = stored
         .iter()
@@ -1102,6 +1207,11 @@ fn warn_url_patterns(policy: &Policy) {
                 PolicyCondition::UrlMatch(p) => {
                     let canon = canonical_pattern(p);
                     for w in &canon.warnings {
+                        // An exact URL on an allow rule allows less, never more: not a
+                        // risk worth a log line (under `not` the write path refuses it).
+                        if !refused_on_write && *w == PatternWarning::ExactUrlMissesQuery {
+                            continue;
+                        }
                         // The refresh loop reloads the same policies every
                         // interval: warn once per (policy, pattern, warning, rule kind).
                         static SEEN: std::sync::OnceLock<

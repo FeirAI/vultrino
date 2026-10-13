@@ -24,6 +24,9 @@ use vultrino::govder::GovderConfig;
 use vultrino::storage::{FileStorage, StorageBackend};
 use vultrino::web::{AdminAuth, WebConfig, WebServer};
 
+/// Key the tests sign the inbound identity header with (VUL-20).
+const IDENTITY_TEST_KEY: &str = "identity-test-key-0123456789abcdef";
+
 async fn build_router() -> (axum::Router, Arc<dyn StorageBackend>) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
@@ -5241,6 +5244,7 @@ async fn test_admin_token_mint_trims_owner_identity() {
 
 #[tokio::test]
 async fn test_v10_inbound_svid_resolves_into_evaluated_principal() {
+    // (VUL-20: the header is honoured only with the edge's signature.)
     // R6: a SPIFFE SVID presented inbound (an already transport-verified document
     // in the configured header) is resolved into the principal evaluated by policy
     // — proven by a principal_pattern Deny that only fires when the SVID, not the
@@ -5265,6 +5269,7 @@ async fn test_v10_inbound_svid_resolves_into_evaluated_principal() {
         kind: IdentityResolverKind::Spiffe,
         header: "x-spiffe-verified".to_string(),
         allowed: vec!["example.org".to_string()],
+        verification_key: Some(SecretString::from(IDENTITY_TEST_KEY)),
     });
     config.policies =
         vec![Policy::deny_all("block-svid", "*").with_principal("spiffe://example.org/*")];
@@ -5316,22 +5321,74 @@ async fn test_v10_inbound_svid_resolves_into_evaluated_principal() {
         "method": "GET",
         "url": "http://127.0.0.1/x"
     });
-    let exec_req = |with_svid: bool| {
+    let svid = "spiffe://example.org/ns/prod/sa/agent";
+    let now = chrono::Utc::now().timestamp();
+    let good_sig = vultrino::identity::sign_identity(IDENTITY_TEST_KEY, svid, &secret, now + 60);
+    let exec_req = |header: Option<(&str, String)>| {
         let mut b = Request::builder()
             .method("POST")
             .uri("/api/v1/execute")
             .header("authorization", format!("Bearer {}", secret))
             .header("content-type", "application/json");
-        if with_svid {
-            b = b.header("x-spiffe-verified", "spiffe://example.org/ns/prod/sa/agent");
+        if let Some((sig_kind, sig)) = &header {
+            b = b.header("x-spiffe-verified", svid);
+            if *sig_kind == "signed" {
+                b = b.header("x-spiffe-verified-signature", sig.as_str());
+            }
         }
         b.body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     };
 
-    // WITH the SVID: the resolved principal matches the trust-domain Deny → blocked
-    // by that policy specifically (proves the SVID is the evaluated principal).
-    let resp = router.clone().oneshot(exec_req(true)).await.unwrap();
+    // VUL-20: a header the edge did not sign (no signature, a wrong key, an expired
+    // signature, or a signature made for another bearer) is IGNORED: the static
+    // principal stays and the SVID policy does not fire.
+    let forged = [
+        None,
+        Some(("unsigned", String::new())),
+        Some((
+            "signed",
+            vultrino::identity::sign_identity("some-other-key-0123456789", svid, &secret, now + 60),
+        )),
+        Some((
+            "signed",
+            vultrino::identity::sign_identity(IDENTITY_TEST_KEY, svid, &secret, now - 5),
+        )),
+        Some((
+            "signed",
+            vultrino::identity::sign_identity(
+                IDENTITY_TEST_KEY,
+                svid,
+                "vut_someone_else",
+                now + 60,
+            ),
+        )),
+        Some((
+            "signed",
+            vultrino::identity::sign_identity(
+                IDENTITY_TEST_KEY,
+                "spiffe://example.org/ns/prod/sa/other",
+                &secret,
+                now + 60,
+            ),
+        )),
+        Some(("signed", "v1.99999999999.AAAA".to_string())),
+    ];
+    for h in forged {
+        let resp = router.clone().oneshot(exec_req(h)).await.unwrap();
+        assert!(
+            !body_string(resp).await.contains("block-svid"),
+            "an unverified identity header must not become the principal"
+        );
+    }
+
+    // WITH a valid signature the SVID is the evaluated principal: blocked by that
+    // policy specifically.
+    let resp = router
+        .clone()
+        .oneshot(exec_req(Some(("signed", good_sig))))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert!(
         body_string(resp).await.contains("block-svid"),
@@ -5340,7 +5397,7 @@ async fn test_v10_inbound_svid_resolves_into_evaluated_principal() {
 
     // WITHOUT the SVID: the principal is the vut_ id, which the SVID policy does
     // NOT match → it proceeds past policy and fails later (SSRF), not by block-svid.
-    let resp = router.clone().oneshot(exec_req(false)).await.unwrap();
+    let resp = router.clone().oneshot(exec_req(None)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert!(
         !body_string(resp).await.contains("block-svid"),
@@ -5373,6 +5430,7 @@ async fn test_v10_inbound_oidc_resolves_subject_and_binds_owner() {
         kind: IdentityResolverKind::Oidc,
         header: "x-oidc-claims".to_string(),
         allowed: vec!["https://idp.example.com".to_string()],
+        verification_key: Some(SecretString::from(IDENTITY_TEST_KEY)),
     });
 
     let admin = AdminAuth::new("admin", "password123").unwrap();
@@ -5444,15 +5502,20 @@ async fn test_v10_inbound_oidc_resolves_subject_and_binds_owner() {
     storage.store_use_token(&token).await.unwrap();
 
     let body = serde_json::json!({ "credential": "api-cred", "method": "GET", "url": "https://api.example.com/x" });
+    let claims = r#"{"sub":"user-7","iss":"https://idp.example.com","email":"alice@example.com"}"#;
+    let sig = vultrino::identity::sign_identity(
+        IDENTITY_TEST_KEY,
+        claims,
+        &secret,
+        chrono::Utc::now().timestamp() + 60,
+    );
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/execute")
         .header("authorization", format!("Bearer {}", secret))
         .header("content-type", "application/json")
-        .header(
-            "x-oidc-claims",
-            r#"{"sub":"user-7","iss":"https://idp.example.com","email":"alice@example.com"}"#,
-        )
+        .header("x-oidc-claims", claims)
+        .header("x-oidc-claims-signature", sig)
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -8301,6 +8364,9 @@ async fn admin_policy_write_refuses_warned_deny_and_prompt_url_patterns() {
         "https://api?.example.com/v1/*/x",
         // scheme-less prefix that is not a scheme prefix
         "internal*",
+        // VUL-32: a dead {a,b} glob. (An exact URL is refused on a deny rule and on a
+        // prompt rule in a policy whose default is not deny: see the url_pattern tests.)
+        "https://api.example.com/{admin,root}/*",
     ];
     let conditions = |p: &str| {
         vec![
@@ -8978,4 +9044,62 @@ async fn posture_reports_a_non_deny_engine_default_as_it_is() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["engine"]["default_deny"], false);
+}
+
+/// VUL-39: an approval link's capability token (query string) must never reach the request
+/// logs, even at DEBUG, the level at which tower-http's default span records the full URI.
+#[tokio::test(flavor = "current_thread")]
+async fn approval_link_token_never_reaches_debug_request_logs() {
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+
+    let (router, _storage) = build_router().await;
+    let buf = Buf::default();
+    let sub = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+        .with_writer(buf.clone())
+        .finish();
+    let secret = "CAPTOKEN-4f9c1d7e-never-log-me";
+    {
+        let _g = tracing::subscriber::set_default(sub);
+        for uri in [
+            format!("/approvals/abc123/decide?token={secret}&decision=approve"),
+            format!("/approvals/abc123/decide?decision=deny&token={secret}"),
+        ] {
+            let _ = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+        }
+    }
+    let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logged.contains("abc123"),
+        "the span must still record the path; captured: {logged}"
+    );
+    assert!(
+        !logged.contains(secret) && !logged.contains("token="),
+        "capability token reached the logs: {logged}"
+    );
 }

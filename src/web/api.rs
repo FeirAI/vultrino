@@ -185,10 +185,16 @@ async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, R
 fn resolve_inbound_principal(
     state: &AppState,
     headers: &axum::http::HeaderMap,
+    bearer: &str,
 ) -> Option<crate::identity::WorkloadIdentity> {
     let header_name = state.server.identity_header()?;
     let value = headers.get(header_name)?.to_str().ok()?;
-    state.server.resolve_identity(value)
+    let signature = state
+        .server
+        .identity_signature_header()
+        .and_then(|n| headers.get(n.as_str()))
+        .and_then(|v| v.to_str().ok());
+    state.server.resolve_identity(value, signature, bearer)
 }
 
 /// Authenticate a caller and return its approval-ownership identity (without
@@ -347,7 +353,7 @@ pub async fn api_execute(
     // ownership anchor, so a halt keyed on it can never be escaped by presenting a
     // workload identity (and a policy/halt can still target the SVID via the
     // resolved subject).
-    if let Some(identity) = resolve_inbound_principal(&state, &headers) {
+    if let Some(identity) = resolve_inbound_principal(&state, &headers, &secret) {
         if let Some(auth) = exec_auth.auth.as_mut() {
             auth.api_key.workload_id = Some(identity.subject);
             if identity.owner.is_some() {

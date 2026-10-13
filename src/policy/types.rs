@@ -286,6 +286,19 @@ impl Policy {
     /// The message names the policy and the fix. Other validation failures of a
     /// stored policy are still only warned on load.
     pub fn stored_load_refusal(&self) -> Option<String> {
+        // VUL-32: a stored Deny or Prompt rule whose url_match pattern reads as more than it
+        // matches (an exact URL a query string slips past, a dead {a,b} glob, ...) is refused
+        // like the RateLimit case below, so a deny is never silently weaker than it reads.
+        if let Err(e) = super::refuse_warned_url_patterns(self) {
+            return Some(format!(
+                "stored policy '{name}' (id {id}) is refused: {e}. Fix: run `vultrino policy \
+                 check` to list every such policy, then `vultrino policy fix-url-patterns {id}` \
+                 (rewrites an exact URL to its prefix form and expands {{a,b}}), or edit the \
+                 policy through the admin API, then start again",
+                name = self.name,
+                id = self.id,
+            ));
+        }
         if self.default_action == PolicyAction::Deny
             || !self
                 .rules
