@@ -2916,7 +2916,9 @@ async fn make_request_via_api(
         std::env::var("VULTRINO_API_URL").unwrap_or_else(|_| "http://127.0.0.1:7879".to_string());
 
     // Build the API request
-    let client = reqwest::Client::new();
+    // No ambient proxy: the vk_ key goes to VULTRINO_API_URL directly, never through an
+    // HTTP_PROXY that would see it in clear text.
+    let client = reqwest::Client::builder().no_proxy().build()?;
     let api_response = client
         .post(format!("{}/api/v1/execute", api_url))
         .header("Authorization", format!("Bearer {}", api_key))

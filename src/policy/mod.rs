@@ -672,7 +672,12 @@ impl PolicyEngine {
                                     record, // check the cap on the live path; skip on resume
                                 )
                             }
-                            other => self.evaluate_condition(other, input, record, rule.action != PolicyAction::Allow),
+                            other => self.evaluate_condition(
+                                other,
+                                input,
+                                record,
+                                rule.action != PolicyAction::Allow,
+                            ),
                         };
                         if matched {
                             if tier == RuleOutcome::Deny {
@@ -970,9 +975,12 @@ fn first_warned_url_pattern(
         PolicyCondition::UrlMatch(p) => {
             let mut canon = canonical_pattern(p);
             if exact_ok {
-                canon
-                    .warnings
-                    .retain(|w| *w != PatternWarning::ExactUrlMissesQuery);
+                canon.warnings.retain(|w| {
+                    !matches!(
+                        w,
+                        PatternWarning::ExactUrlMissesQuery | PatternWarning::QueryInPattern
+                    )
+                });
             }
             (!canon.warnings.is_empty()).then_some((p.as_str(), canon))
         }
@@ -1025,6 +1033,11 @@ fn pattern_warning_reason(w: &PatternWarning, canonical: &str) -> String {
         PatternWarning::ExactUrlMissesQuery => "the pattern is an exact URL with no query, so the \
             same URL with a query string appended (?x=1) does not match it; write the prefix \
             form with a trailing * (for example https://api.example.com/admin*)"
+            .to_string(),
+        PatternWarning::QueryInPattern => "the pattern has a ?: a query in a pattern is slipped \
+            past by inserting or reordering a parameter (?x=1&confirm=true), and a bare ? matches \
+            neither the path nor the path with a query; write the path and a trailing * (for \
+            example https://api.example.com/v1/transfer*)"
             .to_string(),
         PatternWarning::BracesAreLiteral => "the pattern has { or }: a glob has no {a,b} \
             alternation, the braces are literal and the pattern matches nothing; write one \
@@ -1137,6 +1150,13 @@ fn fix_condition(c: PolicyCondition, changed: &mut usize, exact_ok: bool) -> Pol
                     return PolicyCondition::Or(each);
                 }
                 return PolicyCondition::UrlMatch(p);
+            }
+            if !exact_ok {
+                if let Some((head, _)) = p.split_once('?') {
+                    // A query in a pattern: the prefix up to it, denying or prompting on more.
+                    *changed += 1;
+                    return PolicyCondition::UrlMatch(format!("{head}*"));
+                }
             }
             if !exact_ok && url_canon::exact_url_misses_query(&p) {
                 *changed += 1;

@@ -178,11 +178,15 @@ operator who must route egress through a proxy sets `VULTRINO_UPSTREAM_PROXY` to
 or `https://` proxy URL (an invalid value stops the process at client construction). Only
 `https://` targets go through it (a CONNECT tunnel, the credential inside TLS); a plain
 `http://` target is refused at admission while the proxy is set, and is never handed to the
-proxy, unless the proxy is on this host (a loopback sidecar, such as a local egress filter or
+proxy, unless the proxy is on this host (a loopback IP literal sidecar, such as a local egress filter or
 the credential-canary test reflector): that first hop never leaves the machine, but the
 proxy then forwards the request onward and a credential is in clear text on that hop.
 The proxy resolves the target host itself, so the connect-time resolver guard does not cover
-that hop: the admission-time URL check above still runs, and the proxy is trusted to enforce
+that hop. While the proxy is set, a target host that this machine cannot resolve to any address
+is refused at admission (the plugins would otherwise hand a name to the proxy's own, possibly
+internal, DNS view). A name that does resolve here can still resolve differently at the proxy:
+that window between vultrino's lookup and the proxy's is not closed. The proxy host itself must
+be an IP literal. the admission-time URL check above still runs, and the proxy is trusted to enforce
 its own destination policy. `GET /api/v1/posture` reports `egress.upstream_proxy_configured`
 (never the URL).
 

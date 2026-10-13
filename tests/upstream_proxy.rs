@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::routing::any;
 use axum::Router;
-use vultrino::plugins::proxy_test_support::{admit_url, guarded_client};
+use vultrino::plugins::proxy_test_support::{admit_hmac_url, admit_url, guarded_client};
 
 async fn hit(State(n): State<Arc<AtomicUsize>>) -> &'static str {
     n.fetch_add(1, Ordering::SeqCst);
@@ -92,8 +92,15 @@ async fn ambient_proxy_is_ignored_and_opt_in_never_carries_plain_http() {
     admit_url("http://93.184.216.34/api").expect_err("a domain proxy is not on this host");
     std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://[2001:db8::1]:3128");
     admit_url("http://93.184.216.34/api").expect_err("a public IPv6 proxy is remote");
+    // A proxy named `localhost` is refused: only an IP literal works (a host name is resolved
+    // through the target guard, which refuses an internal proxy), so it is neither loopback nor
+    // constructible.
     std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://localhost:3128");
-    admit_url("http://93.184.216.34/api").expect("localhost is on this host");
+    admit_url("http://93.184.216.34/api").expect_err("a host-name proxy is never loopback");
+    assert!(
+        std::panic::catch_unwind(guarded_client).is_err(),
+        "a host-name proxy must stop client construction"
+    );
     std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://[::1]:3128");
     admit_url("http://93.184.216.34/api").expect("::1 is on this host");
 
@@ -113,6 +120,21 @@ async fn ambient_proxy_is_ignored_and_opt_in_never_carries_plain_http() {
         "routed via the loopback proxy"
     );
     assert_eq!(target.load(Ordering::SeqCst), 2);
+
+    // 2c. With the proxy set, a host this machine cannot resolve is refused at admission: the
+    //     proxy would resolve it in its own DNS view. Without the proxy it is not refused here
+    //     (the connect fails on its own), so the behaviour is unchanged.
+    for u in [
+        "http://unresolvable-zz9q.invalid/x",
+        "https://unresolvable-zz9q.invalid/x",
+    ] {
+        admit_url(u).expect_err(u);
+    }
+    admit_hmac_url("https://unresolvable-zz9q.invalid/x").expect_err("hmac plugin too");
+    std::env::remove_var("VULTRINO_UPSTREAM_PROXY");
+    admit_url("https://unresolvable-zz9q.invalid/x").expect("no proxy: connect-time failure");
+    admit_hmac_url("https://unresolvable-zz9q.invalid/x").expect("no proxy: connect-time failure");
+    std::env::set_var("VULTRINO_UPSTREAM_PROXY", &proxy_url);
 
     // 3. A malformed opt-in fails closed at client construction.
     std::env::set_var("VULTRINO_UPSTREAM_PROXY", "socks5://x");

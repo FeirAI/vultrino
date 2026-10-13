@@ -616,6 +616,22 @@
     "identity-short-key-accepted": {
       "tier": "fast",
       "claim": "inbound-identity-signed"
+    },
+    "egress-proxy-dns-failure-admitted": {
+      "tier": "fast",
+      "claim": "egress-no-ambient-proxy"
+    },
+    "egress-hmac-dns-failure-admitted": {
+      "tier": "fast",
+      "claim": "egress-no-ambient-proxy"
+    },
+    "url-trailing-slash-not-tried": {
+      "tier": "fast",
+      "claim": "url-query-never-weakens"
+    },
+    "url-query-pattern-warning-dropped": {
+      "tier": "fast",
+      "claim": "url-query-never-weakens"
     }
   },
   "claims": [
@@ -1789,7 +1805,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "756ddf3a62ab05ea46c6191d7204e0369e97100d5eed3557e0620b64df74660c"
+          "sha256": "f86a42a277f50d2d5de1d0f15ac117af09a50af18e9f5b62e45f2c6a4f6b1fa1"
         },
         {
           "path": "src/policy/precedence.rs",
@@ -1925,7 +1941,7 @@
         {
           "path": "src/policy/url_canon.rs",
           "symbol": "canonical_pattern",
-          "sha256": "02bcd4b278441f894caa37d7b8588e52f063d98ad9210a47ecec87419e9e8caf"
+          "sha256": "52b08baa64e5649d09ecc3eb7edad527a7e48a683ab37e47a1afef16bfa6ae6e"
         },
         {
           "path": "src/policy/url_canon.rs",
@@ -1935,7 +1951,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "756ddf3a62ab05ea46c6191d7204e0369e97100d5eed3557e0620b64df74660c"
+          "sha256": "f86a42a277f50d2d5de1d0f15ac117af09a50af18e9f5b62e45f2c6a4f6b1fa1"
         },
         {
           "path": "src/plugins/http.rs",
@@ -2015,7 +2031,7 @@
         {
           "path": "src/policy/url_canon.rs",
           "symbol": "url_matches_for",
-          "sha256": "3f77db82de68da180894f9572d8a6625aed347318575c2d6b077fd68004a6e12"
+          "sha256": "235e1b95a0953424838f62956ea7d077a248078ece6e083f68a39591e4a013f2"
         }
       ],
       "mutants": [
@@ -2155,7 +2171,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "first_warned_url_pattern",
-          "sha256": "392be58f0db6a410590ea413ce18cc5c81562984f51ecfbc6f2226efc3824b28"
+          "sha256": "bfd488f5aab85fdbd145a4deee7424ad6d44a8690f026150cc4571337aea79f4"
         },
         {
           "path": "src/policy/mod.rs",
@@ -2170,7 +2186,7 @@
         {
           "path": "src/policy/url_canon.rs",
           "symbol": "canonical_pattern",
-          "sha256": "02bcd4b278441f894caa37d7b8588e52f063d98ad9210a47ecec87419e9e8caf"
+          "sha256": "52b08baa64e5649d09ecc3eb7edad527a7e48a683ab37e47a1afef16bfa6ae6e"
         },
         {
           "path": "src/policy/url_canon.rs",
@@ -3073,12 +3089,13 @@
     },
     {
       "id": "egress-no-ambient-proxy",
-      "statement": "Every secret-bearing outbound client built by build_guarded_client ignores the ambient HTTP_PROXY, HTTPS_PROXY and ALL_PROXY variables: with all three pointing at a recording server, a request to a reachable target goes directly and the proxy sees none. The only proxy is the explicit VULTRINO_UPSTREAM_PROXY opt-in (an http:// or https:// URL; any other value stops client construction instead of falling back to a direct connection). With it set, an https:// target is routed through it. A plain http:// target is refused by HttpPlugin::validate_url_ssrf and never handed to the proxy unless the proxy is on this host (an IP literal in 127.0.0.0/8 or ::1, or localhost), so an injected credential never crosses a remote proxy in clear text. GET /api/v1/posture reports whether the opt-in is set, never its URL.",
+      "statement": "Every secret-bearing outbound client built by build_guarded_client ignores the ambient HTTP_PROXY, HTTPS_PROXY and ALL_PROXY variables: with all three pointing at a recording server, a request to a reachable target goes directly and the proxy sees none. The only proxy is the explicit VULTRINO_UPSTREAM_PROXY opt-in (an http:// or https:// URL whose host is an IP literal, a host name stopping client construction; any other value stops client construction instead of falling back to a direct connection). With it set, an https:// target is routed through it. A plain http:// target is refused by HttpPlugin::validate_url_ssrf and never handed to the proxy unless the proxy is on this host (an IP literal in 127.0.0.0/8 or ::1), so an injected credential never crosses a remote proxy in clear text. GET /api/v1/posture reports whether the opt-in is set, never its URL. While it is set, HttpPlugin::validate_url_ssrf and HmacPlugin::validate_url_ssrf refuse a target host whose local lookup fails or returns no address (proxy_needs_resolution); with no proxy set the same host is admitted and fails at connect time.",
       "method": "test",
       "artifacts": [
         "src/plugins/http.rs",
         "tests/upstream_proxy.rs",
-        "src/web/posture.rs"
+        "src/web/posture.rs",
+        "src/plugins/hmac.rs"
       ],
       "gates": [
         "rust"
@@ -3094,7 +3111,7 @@
         {
           "path": "src/plugins/http.rs",
           "symbol": "upstream_proxy_from",
-          "sha256": "f36ca07d5743222cd844aada29a7a15e26a2208e77334db7de8ea7ad80e2cab3"
+          "sha256": "fb315373197235bec1e86eeeb6df7b3095281c96a18e9b909438243a87b20706"
         },
         {
           "path": "src/plugins/http.rs",
@@ -3104,27 +3121,39 @@
         {
           "path": "src/plugins/http.rs",
           "symbol": "HttpPlugin::validate_url_ssrf",
-          "sha256": "f9f26e872e47b682a0f89c58d562e86414fdb6f6b11a62306833cd705cbc55b0"
+          "sha256": "bd0864661b4475f297ffb47c04deb4a3b72b1aa7bdfd95a48ffbaa05772b751d"
         },
         {
           "path": "src/plugins/http.rs",
           "symbol": "proxy_is_loopback",
-          "sha256": "77ebbac69ca54e8bb1d5bc96fcca61282b5e66da5749d1f37311d3eee199753e"
+          "sha256": "439381a9d264976ca8d9cb1072020ae5a43d337543f88ae1def2fe4011d2ffbd"
         },
         {
           "path": "src/plugins/http.rs",
           "symbol": "upstream_proxy_plaintext_ok",
           "sha256": "c7a9192925b09ad8ddca4d48c6c02b37bbbea9f6d5cd8f40ccc50a25408b3748"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "proxy_needs_resolution",
+          "sha256": "4ee374a2a246c145f708dd8d18062e7a383cf301cb896d0c290cc4ef8f7b06b8"
+        },
+        {
+          "path": "src/plugins/hmac.rs",
+          "symbol": "HmacPlugin::validate_url_ssrf",
+          "sha256": "98a9da571fd0882c2160b851d9260c12fc07c9fe98a92f147c7cc53bb737c394"
         }
       ],
       "mutants": [
         "egress-ambient-proxy-honoured",
         "egress-proxy-routes-plain-http",
         "egress-plain-http-admitted-with-proxy",
-        "egress-remote-proxy-counted-loopback"
+        "egress-remote-proxy-counted-loopback",
+        "egress-proxy-dns-failure-admitted",
+        "egress-hmac-dns-failure-admitted"
       ],
-      "does_not_establish": "That a proxy chosen with VULTRINO_UPSTREAM_PROXY behaves: it resolves the target host itself, so the connect-time resolver guard does not cover that hop (the admission-time URL check still runs) and the operator trusts the proxy. A loopback proxy may carry a plain http:// request: that first hop never leaves the machine, but the proxy then forwards it onward as it sees fit (a credential is in clear text on that onward hop unless the proxy upgrades it), and the loopback test is on the proxy host text, not on what is listening. The https route through a real CONNECT tunnel is not exercised, only that the client hands https targets to the proxy. Plain http:// to a public host with no proxy configured is still admitted, as before. The WASM plugin egress and the other crates' own clients (govder, averin, revocation) are separate. The wiring is shown on the shared client builder, not on each plugin that calls it.",
-      "evidence_run": "38407367367"
+      "does_not_establish": "That a proxy chosen with VULTRINO_UPSTREAM_PROXY behaves: it resolves the target host itself, so the connect-time resolver guard does not cover that hop (the admission-time URL check still runs) and the operator trusts the proxy. A loopback proxy may carry a plain http:// request: that first hop never leaves the machine, but the proxy then forwards it onward as it sees fit (a credential is in clear text on that onward hop unless the proxy upgrades it), and the loopback test is on the proxy host text, not on what is listening (whether a loopback proxy may carry plain http:// is a recorded lead question, not a settled decision). The https route through a real CONNECT tunnel is not exercised, only that the client hands https targets to the proxy. Plain http:// to a public host with no proxy configured is still admitted, as before. The WASM plugin egress and the other crates' own clients (govder, averin, revocation) are separate. The wiring is shown on the shared client builder, not on each plugin that calls it. The window between vultrino's lookup and the proxy's own lookup is not closed: a name that resolves here can resolve to an internal address at the proxy. The OAuth token-URL check shares the helper but is not shown by this detector.",
+      "evidence_run": "38469303391"
     },
     {
       "id": "request-log-no-capability-token",
@@ -3160,7 +3189,7 @@
     },
     {
       "id": "url-pattern-footguns-refused",
-      "statement": "A url_match pattern on a Deny rule, or on a Prompt rule in a policy whose default_action is not deny, that is an exact URL or path with no wildcard and no query (a request with a query string appended slips past it), or that holds a { or } other than the literal {credential} (a glob has no {a,b} alternation, so the pattern matches nothing), is refused with the other warned patterns: by Config::parse (an error), and when a stored policy is loaded (Policy::stored_load_refusal, which makes `vultrino web` refuse to start and leaves the live set unchanged, naming the policy and the fix). `vultrino policy check` lists the refused stored policies (exit 1) and `vultrino policy fix-url-patterns <id>` rewrites an exact Deny URL to its prefix form <url>* and expands a single-level {a,b} alternation into an or, storing nothing when a refused pattern remains. The same exact URL on an Allow rule loads. A Prompt on an exact URL in a default-deny policy loads (govder's compiled shape).",
+      "statement": "A url_match pattern on a Deny rule, or on a Prompt rule in a policy whose default_action is not deny, that is an exact URL or path with no wildcard and no query (a request with a query string appended slips past it), or that holds a ? (a query or one-character wildcard, slipped past by an inserted parameter), or that holds a { or } other than the literal {credential} (a glob has no {a,b} alternation, so the pattern matches nothing), is refused with the other warned patterns: by Config::parse (an error), and when a stored policy is loaded (Policy::stored_load_refusal, which makes `vultrino web` refuse to start and leaves the live set unchanged, naming the policy and the fix). `vultrino policy check` lists the refused stored policies (exit 1) and `vultrino policy fix-url-patterns <id>` rewrites an exact Deny URL to its prefix form <url>* and expands a single-level {a,b} alternation into an or, storing nothing when a refused pattern remains. The same exact URL on an Allow rule loads. A Prompt on an exact URL in a default-deny policy loads (govder's compiled shape).",
       "method": "test",
       "artifacts": [
         "src/policy/url_canon.rs",
@@ -3205,7 +3234,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "fix_condition",
-          "sha256": "78f8022d1faf8ae6e4a99fbd5003f7ac192451a6c60c6a0bc56e2e73d1741a5d"
+          "sha256": "f515a7c749c2204547ed15fafa39fe52c16133d1db1f6b2942526fa253f3b60f"
         },
         {
           "path": "src/policy/types.rs",
@@ -3226,7 +3255,7 @@
         "url-fix-exact-not-broadened"
       ],
       "does_not_establish": "The refusal is as good as the warnings: a glob without a port that misses a non-default port draws no warning and is not refused. An exact-URL Prompt in a default-deny policy is accepted; the engine matches Deny and Prompt patterns also without trailing query parameters (shown in url-query-never-weakens), so another Allow rule does not skip it. An exact URL under a not is refused only through the allow-under-odd-not rule shown in policy-write-refuses-warned-deny-prompt-patterns. The automatic fix broadens (prefix form), so a deny or prompt may then match more URLs than the author meant; it cannot fix a * in a host and expands only one level of braces with at most 64 alternatives. A stored policy refused on load stops the server from starting, so an operator must run the fix first; which deployed vaults hold such a policy is not checked. Shown on the listed patterns, not every pattern.",
-      "evidence_run": "38465582293"
+      "evidence_run": "38469303391"
     },
     {
       "id": "url-token-secret-structure-refused",
@@ -3349,7 +3378,7 @@
     },
     {
       "id": "url-query-never-weakens",
-      "statement": "For every policy the write path accepts (refuse_warned_url_patterns), over a grid of 19 url_match patterns (globs with a literal tail, character classes, exact, prefix, host-only, port, query-bearing and path-only), 11 URLs, Deny, Prompt and Allow rules, 5 condition shapes (plain, and with a method, or with a method, not not, not), 3 policy defaults and with or without an Allow rule over the same host, the engine's decision for a URL with a query parameter appended (?x=1, or &x=1 when it has a query) is at least as strict as for the URL without it (Allow < Prompt < Deny). A Deny or Prompt url_match also matches the URL with trailing query parameters removed, flipped under each not.",
+      "statement": "For every policy the write path accepts (refuse_warned_url_patterns), over a grid of 19 url_match patterns (globs with a literal tail, character classes, exact, prefix, host-only, port, query-bearing and path-only), 13 URLs, Deny, Prompt and Allow rules, 5 condition shapes (plain, and with a method, or with a method, not not, not), 3 policy defaults and with or without an Allow rule over the same host, the engine's decision for a URL with a query parameter appended (?x=1, or &x=1 when it has a query), with one trailing / added to its path, or with a parameter inserted before its own, is at least as strict as for the URL without it (Allow < Prompt < Deny). A Deny or Prompt pattern holding a ? is refused at write. A Deny or Prompt url_match also matches the URL with trailing query parameters removed and with one trailing / of the path removed, flipped under each not.",
       "method": "exhaustive",
       "artifacts": [
         "src/policy/url_canon.rs",
@@ -3365,20 +3394,27 @@
         {
           "path": "src/policy/url_canon.rs",
           "symbol": "url_matches_for",
-          "sha256": "3f77db82de68da180894f9572d8a6625aed347318575c2d6b077fd68004a6e12"
+          "sha256": "235e1b95a0953424838f62956ea7d077a248078ece6e083f68a39591e4a013f2"
         },
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_condition",
           "sha256": "e974955cf02cedef5e52b1acc9591bca4fde321e7affda1ffd1210aeb1c098dc"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "canonical_pattern",
+          "sha256": "52b08baa64e5649d09ecc3eb7edad527a7e48a683ab37e47a1afef16bfa6ae6e"
         }
       ],
       "mutants": [
         "url-query-broadening-removed",
-        "url-query-broadening-not-flipped"
+        "url-query-broadening-not-flipped",
+        "url-trailing-slash-not-tried",
+        "url-query-pattern-warning-dropped"
       ],
-      "does_not_establish": "Only the listed patterns, URLs and shapes, not every pattern; a property of the engine decision, not a proof. A parameter inserted before or between a pattern's own query parameters is not covered (write a * after them). A Prompt under a single not is excluded from the grid: it prompts every URL except the pattern's, so with a deny default the query form moves from Deny to Prompt. Other policies and rule kinds (rate limits, principal or time conditions) are not in the grid. Which deployed vaults hold a policy relying on the old narrower matching is not checked.",
-      "evidence_run": "38465582293"
+      "does_not_establish": "Only the listed patterns, URLs and shapes, not every pattern; a property of the engine decision, not a proof. A pattern holding a ? is refused on Deny and Prompt rules, not matched; an Allow rule with a ? is accepted and only narrows. Only one trailing slash is tried; frameworks that fold more (//) or other path spellings are not covered. A server that treats the trailing-slash path as a different resource is over-denied, not under-denied. A Prompt under a single not is excluded from the grid: it prompts every URL except the pattern's, so with a deny default the query form moves from Deny to Prompt. Other policies and rule kinds (rate limits, principal or time conditions) are not in the grid. Which deployed vaults hold a policy relying on the old narrower matching is not checked.",
+      "evidence_run": "38469303391"
     }
   ]
 }

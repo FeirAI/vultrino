@@ -531,12 +531,19 @@ fix-url-patterns <id>` rewrites an exact URL to `<url>*` and expands `{a,b}`).
 An Allow rule is refused only when the warned pattern sits under an odd
 number of `not` (there a dead pattern allows every URL); any other Allow rule is
 stored and warned. A Deny or Prompt rule's `url_match` (flipped under each `not`)
-also matches the URL with trailing query parameters removed, so `?x=1` or `&x=1`
-appended at the end never slips a request past a pattern written without its
-query (an Allow rule is not widened, so a rule that allowed the bare URL no longer
-allows it with a query). A parameter inserted before or between the pattern's own
-query parameters is not covered: write a `*` after them. A Prompt under a single
-`not` is outside this (it prompts every URL except the pattern's). The refusal is
+also matches the URL with trailing query parameters removed and with one trailing
+`/` of the path removed, so `?x=1`, `&x=1` or a trailing `/` appended never slips a
+request past a pattern written without them (an Allow rule is not widened, so a rule
+that allowed the bare URL no longer allows it with a query). A pattern that itself
+holds a `?` (a literal query, a bare trailing `?`, or the glob one-character
+wildcard) is refused on those rules, because a parameter inserted before or
+between its own would slip past it: write the path and a trailing `*`
+(`https://api.example.com/v1/transfer*`); `vultrino policy fix-url-patterns`
+rewrites a stored one to that prefix form. A Prompt under a single `not` is
+outside this (it prompts every URL except the pattern's). The exact-URL Prompt
+that govder compiles (an and of url and method, default deny) now also prompts
+on its query and trailing-slash variants, which used to be denied, so a human can
+approve a request that was refused before. The refusal is
 as good as the warnings: a glob without a port that misses a non-default port is
 not refused.
 A glob whose host part holds `?`

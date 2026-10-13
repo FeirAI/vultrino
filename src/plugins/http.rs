@@ -401,16 +401,24 @@ pub(crate) fn upstream_proxy_from(raw: Option<&str>) -> Result<Option<url::Url>,
     if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() {
         return Err("must be an http:// or https:// URL with a host".to_string());
     }
+    // The guarded client resolves a proxy named by host name through the target SSRF guard, so
+    // a name for an internal proxy could never connect. Only an IP literal works; refuse the rest.
+    if !matches!(u.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_))) {
+        return Err(
+            "the proxy host must be an IP address literal (a host name is resolved \
+                    through the target SSRF guard and would fail for an internal proxy)"
+                .to_string(),
+        );
+    }
     Ok(Some(u))
 }
 
-/// Whether the proxy is on this host (an IP literal in 127.0.0.0/8 or ::1, or `localhost`).
+/// Whether the proxy is on this host (an IP literal in 127.0.0.0/8 or ::1).
 pub(crate) fn proxy_is_loopback(u: &url::Url) -> bool {
     match u.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        None => false,
+        Some(url::Host::Domain(_)) | None => false,
     }
 }
 
@@ -420,6 +428,21 @@ fn upstream_proxy_plaintext_ok() -> bool {
         .ok()
         .flatten()
         .is_some_and(|u| proxy_is_loopback(&u))
+}
+
+/// With the explicit upstream proxy configured, the proxy (not reqwest) resolves the target, so
+/// the admission-time lookup is the only local look at the host: a name this host cannot resolve
+/// to at least one address is refused instead of handed to the proxy's own, possibly internal,
+/// DNS view. Without the proxy a failed lookup fails again at connect time, so it is not refused.
+/// The window between this lookup and the proxy's own is not closed (see SECURITY.md).
+pub(crate) fn proxy_needs_resolution(resolved_any: bool, host: &str) -> Result<(), PluginError> {
+    if upstream_proxy_configured() && !resolved_any {
+        return Err(PluginError::InvalidParams(format!(
+            "host '{host}' does not resolve to any address on this host, and {UPSTREAM_PROXY_ENV} \
+             is set: the proxy would resolve it in its own DNS view, so it is refused"
+        )));
+    }
+    Ok(())
 }
 
 /// True when the explicit upstream proxy is configured (valid or not: an invalid value is
@@ -511,15 +534,21 @@ impl HttpPlugin {
         let port = url.port_or_known_default().unwrap_or(443);
         let socket_addr = format!("{}:{}", host, port);
 
-        if let Ok(addrs) = socket_addr.to_socket_addrs() {
-            for addr in addrs {
-                if Self::is_private_ip(&addr.ip()) {
-                    return Err(PluginError::InvalidParams(format!(
-                        "Token URL host '{}' resolves to private/internal IP address, which is not allowed",
-                        host
-                    )));
+        match socket_addr.to_socket_addrs() {
+            Ok(addrs) => {
+                let mut any = false;
+                for addr in addrs {
+                    any = true;
+                    if Self::is_private_ip(&addr.ip()) {
+                        return Err(PluginError::InvalidParams(format!(
+                            "Token URL host '{}' resolves to private/internal IP address, which is not allowed",
+                            host
+                        )));
+                    }
                 }
+                proxy_needs_resolution(any, host)?;
             }
+            Err(_) => proxy_needs_resolution(false, host)?,
         }
 
         Ok(url)
@@ -966,15 +995,21 @@ impl HttpPlugin {
         let port = url.port_or_known_default().unwrap_or(80);
         let socket_addr = format!("{}:{}", host, port);
 
-        if let Ok(addrs) = socket_addr.to_socket_addrs() {
-            for addr in addrs {
-                if Self::is_private_ip(&addr.ip()) {
-                    return Err(PluginError::InvalidParams(format!(
-                        "Host '{}' resolves to private/internal IP address, which is not allowed",
-                        host
-                    )));
+        match socket_addr.to_socket_addrs() {
+            Ok(addrs) => {
+                let mut any = false;
+                for addr in addrs {
+                    any = true;
+                    if Self::is_private_ip(&addr.ip()) {
+                        return Err(PluginError::InvalidParams(format!(
+                            "Host '{}' resolves to private/internal IP address, which is not allowed",
+                            host
+                        )));
+                    }
                 }
+                proxy_needs_resolution(any, host)?;
             }
+            Err(_) => proxy_needs_resolution(false, host)?,
         }
         // This is the REQUEST-time check (fast reject of obvious private targets +
         // IP literals). The DNS-rebinding TOCTOU it cannot close on its own — a host
@@ -1352,6 +1387,11 @@ pub mod proxy_test_support {
     pub fn guarded_client() -> reqwest::Client {
         super::build_guarded_client()
     }
+    pub fn admit_hmac_url(url: &str) -> Result<(), String> {
+        crate::plugins::HmacPlugin::validate_url_ssrf(url)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
     pub fn admit_url(url: &str) -> Result<(), String> {
         super::HttpPlugin::validate_url_ssrf(url)
             .map(|_| ())
@@ -1392,7 +1432,9 @@ mod tests {
     /// VUL-32: a UrlToken secret that would change the path or query that is sent is refused.
     #[test]
     fn url_token_secret_that_changes_the_url_structure_is_refused() {
-        for bad in ["a/b", "a?x=1", "a#f", "a\\b", "a%2Fb", "a b", "a\nb", "", ".", ".."] {
+        for bad in [
+            "a/b", "a?x=1", "a#f", "a\\b", "a%2Fb", "a b", "a\nb", "", ".", "..",
+        ] {
             let token = Secret::new(bad);
             let err = HttpPlugin::url_token_send_url(
                 "https://api.telegram.org/bot{credential}/sendMessage",
@@ -1418,12 +1460,16 @@ mod tests {
     fn upstream_proxy_value_is_parsed_strictly() {
         assert!(upstream_proxy_from(None).unwrap().is_none());
         assert!(upstream_proxy_from(Some("  ")).unwrap().is_none());
-        assert!(upstream_proxy_from(Some("http://proxy.corp:3128"))
+        assert!(upstream_proxy_from(Some("http://10.1.2.3:3128"))
             .unwrap()
             .is_some());
-        assert!(upstream_proxy_from(Some("https://proxy.corp"))
+        assert!(upstream_proxy_from(Some("https://[2001:db8::1]"))
             .unwrap()
             .is_some());
+        // A host name is refused: it would resolve through the target SSRF guard.
+        for named in ["http://proxy.corp:3128", "http://localhost:3128"] {
+            assert!(upstream_proxy_from(Some(named)).is_err(), "{named}");
+        }
         for bad in ["socks5://p:1", "proxy.corp:3128", "ftp://p", "http://"] {
             assert!(upstream_proxy_from(Some(bad)).is_err(), "{bad}");
         }

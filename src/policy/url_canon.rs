@@ -158,6 +158,11 @@ pub enum PatternWarning {
     /// glob has no `{a,b}` alternation: the braces are literal, so the pattern matches
     /// nothing and a Deny or Prompt rule on it protects nothing.
     BracesAreLiteral,
+    /// The pattern holds a `?`: a query the URL parser would read, or a one-character glob
+    /// wildcard. A Deny or Prompt rule on it is slipped past by inserting or reordering a
+    /// parameter (`?x=1&confirm=true`), and a bare trailing `?` matches neither `/admin` nor
+    /// `/admin?x=1`. Write the path and a trailing `*` (`<url>*`) instead.
+    QueryInPattern,
 }
 
 /// A pattern in canonical form plus load-time warnings.
@@ -211,6 +216,9 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
     }
     if exact_url_misses_query(pattern) {
         canon.warnings.push(PatternWarning::ExactUrlMissesQuery);
+    }
+    if pattern.contains('?') {
+        canon.warnings.push(PatternWarning::QueryInPattern);
     }
     canon
 }
@@ -512,10 +520,12 @@ pub fn url_matches(raw_url: &str, raw_pattern: &str) -> bool {
 }
 
 /// `url_matches`, and when `broaden` is set also against the URL with trailing query parameters
-/// removed, one at a time down to no query at all (Deny and Prompt rules, flipped under `not`):
+/// removed, one at a time down to no query at all, and with one trailing `/` of the path removed
+/// (Deny and Prompt rules, flipped under `not`):
 /// a pattern written without its query (or with only its first parameters) then matches the
 /// same URL with `?x=1` (or `&x=1`) appended, so a parameter added at the end never slips a
-/// request past it. A parameter inserted before or between the pattern's own is not covered.
+/// request past it. A pattern that itself carries a query is refused at write time on those rules (`PatternWarning::QueryInPattern`), so
+/// an inserted or reordered parameter cannot slip past a literal one.
 pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool {
     let Some(u) = canonical_url(raw_url) else {
         return false;
@@ -527,16 +537,24 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool 
     if !broaden {
         return false;
     }
-    let Some(q) = u.find('?') else {
-        return false;
+    let (base, query) = match u.find('?') {
+        Some(q) => (&u[..q], &u[q..]),
+        None => (&u[..], ""),
     };
-    // Cut points: every `&` after the `?` (last first), then the `?` itself.
-    u[q..]
-        .match_indices('&')
-        .map(|(i, _)| q + i)
-        .rev()
-        .chain(std::iter::once(q))
-        .any(|at| canonical_matches(&u[..at], &p))
+    // Cut points in the query: the whole query, every `&` (last first), then no query at all.
+    let mut cuts: Vec<usize> = vec![query.len()];
+    cuts.extend(query.match_indices('&').map(|(i, _)| i).rev());
+    if !query.is_empty() {
+        cuts.push(0);
+    }
+    // Many frameworks route `/x/` to the handler of `/x`, so the path without one trailing `/`
+    // is judged too, with and without the query.
+    let bases = [Some(base), base.strip_suffix('/')];
+    let hit = bases.into_iter().flatten().any(|b| {
+        cuts.iter()
+            .any(|&at| canonical_matches(&format!("{b}{}", &query[..at]), &p))
+    });
+    hit
 }
 
 #[cfg(test)]
@@ -685,15 +703,22 @@ mod tests {
         assert!(w("https://a.example.com/x}").contains(&PatternWarning::BracesAreLiteral));
         assert!(!w("https://a.example.com/bot{credential}/*")
             .contains(&PatternWarning::BracesAreLiteral));
+        // A `?` is a query or a one-character wildcard: slipped past by an inserted parameter.
+        for q in [
+            "https://api.telegram.org/bot{credential}/sendMessage?x=1",
+            "https://api.github.com/x?per_page=1",
+            "https://api.example.com/admin?",
+            "https://api.example.com/v1/transfer?confirm=true*",
+        ] {
+            assert!(w(q).contains(&PatternWarning::QueryInPattern), "{q}");
+        }
         // Quiet cases: case, default port, percent rewrites, plain prefixes.
         for quiet in [
             "https://api.example.com/*",
             // The parser encodes `{` and `}` in a path; the URL side is encoded
             // the same way, so this is not a meaning change.
-            "https://api.telegram.org/bot{credential}/sendMessage?x=1",
             "https://api.example.com/a b/*",
             "HTTPS://API.example.com:443/v1/%61*",
-            "https://api.github.com/x?per_page=1",
             "https://api.github.com/x*",
             "https://api.telegram.org/bot{credential}/sendMessage*",
             "*",

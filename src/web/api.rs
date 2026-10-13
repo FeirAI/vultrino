@@ -176,11 +176,11 @@ async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, R
 }
 
 /// V10/R6: resolve an inbound workload identity from the request, if a resolver
-/// is wired and the request carries its configured header (an already
-/// transport-verified SVID/OIDC document). The deployment is responsible for
-/// terminating mTLS / verifying the token at the edge and passing the verified
-/// document in that header. Returns `None` when not configured/present/valid, in
-/// which case the caller keeps its static `vk_`/`vut_` principal (fail-safe — a
+/// is wired and the request carries its configured header. The header is a signed
+/// document: an HMAC-SHA-256 over the identity document, its expiry (at most 300 s)
+/// and the SHA-256 of the request's bearer, keyed with the identity key and checked in
+/// constant time (VUL-20). An unsigned, forged, expired or other-bearer document is
+/// ignored. Returns `None` when not configured/present/valid, in which case the caller keeps its static `vk_`/`vut_` principal (fail-safe: a
 /// bad document can only fail to refine the principal, never elevate it).
 fn resolve_inbound_principal(
     state: &AppState,

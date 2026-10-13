@@ -291,7 +291,10 @@ fn web_refuses_to_start_with_identity_enabled_and_no_signing_key() {
     );
     let output = web_command(&config)
         .env_remove("VULTRINO_POLICY_HASH_SECRET")
-        .env("VULTRINO_IDENTITY_SECRET", "identity-key-0123456789abcdef-0123456789")
+        .env(
+            "VULTRINO_IDENTITY_SECRET",
+            "identity-key-0123456789abcdef-0123456789",
+        )
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);

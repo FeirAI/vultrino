@@ -17,8 +17,9 @@ const PATTERNS: &[&str] = &[
     "https://api.example.com/v1/refunds",
     "https://api.example.com/v1/ref?nds",
     "https://api.example.com/v1/*",
-    "https://api.example.com/v1/a?b=1",
-    "https://api.example.com/v1/a?b=*",
+    "https://api.example.com/v1/transfer?confirm=true",
+    "https://api.example.com/v1/transfer?confirm=true*",
+    "https://api.example.com/admin?",
     "https://api.example.com:8443/x",
     "https://*/x",
     "https://*.example.com/*",
@@ -31,6 +32,8 @@ const PATTERNS: &[&str] = &[
 ];
 
 const URLS: &[&str] = &[
+    "https://api.example.com/v1/a/delete/",
+    "https://api.example.com/admin/",
     "https://api.example.com/v1/a/delete",
     "https://api.example.com/admin",
     "https://api.example.com/admin/x",
@@ -42,6 +45,7 @@ const URLS: &[&str] = &[
     "https://api.example.com:8443/x",
     "https://other.example.com/x",
     "https://api.example.com/v1/a?b=1",
+    "https://api.example.com/v1/transfer?b=1",
 ];
 
 fn rank(d: &PolicyDecision) -> u8 {
@@ -82,8 +86,16 @@ fn rules(action: PolicyAction, shape: usize, p: &str, allow_all_rule: bool) -> V
 fn a_query_suffix_never_weakens_an_accepted_policy() {
     let mut accepted = 0usize;
     let mut checked = 0usize;
-    for action in [PolicyAction::Deny, PolicyAction::Prompt, PolicyAction::Allow] {
-        for default in [PolicyAction::Allow, PolicyAction::Prompt, PolicyAction::Deny] {
+    for action in [
+        PolicyAction::Deny,
+        PolicyAction::Prompt,
+        PolicyAction::Allow,
+    ] {
+        for default in [
+            PolicyAction::Allow,
+            PolicyAction::Prompt,
+            PolicyAction::Deny,
+        ] {
             for shape in 0..5 {
                 // A Prompt under a single not is outside the property: it prompts every URL
                 // except the pattern's, so with a deny default the query form moves from the
@@ -108,6 +120,25 @@ fn a_query_suffix_never_weakens_an_accepted_policy() {
                             let a = rank(&e.evaluate_readonly("c", Some(u), Some("GET")));
                             let b = rank(&e.evaluate_readonly("c", Some(&with_q), Some("GET")));
                             checked += 1;
+                            // A trailing slash and a parameter placed before an existing one
+                            // never weaken either.
+                            let slashed = format!("{}/", u.split('?').next().unwrap());
+                            // A pattern that itself ends in `/`, or holds a `?` (a one-character wildcard, accepted only
+                            // as a default-deny Prompt or an Allow), matches the slashed URL on its own terms.
+                            if !u.contains('?')
+                                && !u.ends_with('/')
+                                && !p.ends_with('/')
+                                && !p.contains('?')
+                            {
+                                let c =
+                                    rank(&e.evaluate_readonly("c", Some(&slashed), Some("GET")));
+                                assert!(c >= a, "slash weakened {action:?} {shape} {default:?} {allow_rule} {p}: {u} -> {a}, {slashed} -> {c}");
+                            }
+                            if u.contains("?b=1") {
+                                let ins = u.replace("?b=1", "?x=1&b=1");
+                                let c = rank(&e.evaluate_readonly("c", Some(&ins), Some("GET")));
+                                assert!(c >= a, "inserted param weakened {action:?} {shape} {default:?} {allow_rule} {p}: {u} -> {a}, {ins} -> {c}");
+                            }
                             // An Allow rule may legitimately narrow: a rule that allowed u
                             // allows less once a query is appended. That is stricter, never
                             // weaker, so the same inequality holds for every action.
@@ -122,15 +153,27 @@ fn a_query_suffix_never_weakens_an_accepted_policy() {
             }
         }
     }
-    assert!(accepted > 300 && checked > 3000, "{accepted} {checked}");
+    assert!(accepted > 250 && checked > 3000, "{accepted} {checked}");
 }
 
 #[test]
 fn the_reviewer_probes_are_now_strict() {
     for (action, pat, url) in [
-        (PolicyAction::Deny, "https://api.example.com/v1/*/delete", "https://api.example.com/v1/a/delete"),
-        (PolicyAction::Deny, "https://api.example.com/admi[n]", "https://api.example.com/admin"),
-        (PolicyAction::Prompt, "https://api.example.com/v1/refunds", "https://api.example.com/v1/refunds"),
+        (
+            PolicyAction::Deny,
+            "https://api.example.com/v1/*/delete",
+            "https://api.example.com/v1/a/delete",
+        ),
+        (
+            PolicyAction::Deny,
+            "https://api.example.com/admi[n]",
+            "https://api.example.com/admin",
+        ),
+        (
+            PolicyAction::Prompt,
+            "https://api.example.com/v1/refunds",
+            "https://api.example.com/v1/refunds",
+        ),
     ] {
         let e = PolicyEngine::new();
         let mut p = Policy::allow_all("p", "*");
@@ -143,6 +186,46 @@ fn the_reviewer_probes_are_now_strict() {
             rank(&e.evaluate_readonly("c", Some(&q), Some("GET"))),
             "{pat}"
         );
-        assert_ne!(rank(&e.evaluate_readonly("c", Some(&q), Some("GET"))), 0, "{pat}");
+        assert_ne!(
+            rank(&e.evaluate_readonly("c", Some(&q), Some("GET"))),
+            0,
+            "{pat}"
+        );
+    }
+}
+
+fn decide(pat: &str, action: PolicyAction, url: &str) -> u8 {
+    let e = PolicyEngine::new();
+    let mut p = Policy::allow_all("p", "*");
+    p.default_action = PolicyAction::Allow;
+    p.rules = rules(action, 0, pat, false);
+    e.add_policy(p);
+    rank(&e.evaluate_readonly("c", Some(url), Some("GET")))
+}
+
+/// Round 2 probes: a Deny that carries a query is refused at write (the old acceptance let
+/// `?x=1&confirm=true` through, and so did the documented `*` form), a bare trailing `?` is
+/// refused, and a trailing slash no longer slips past a path pattern.
+#[test]
+fn query_patterns_are_refused_and_trailing_slash_is_denied() {
+    for pat in [
+        "https://api.example.com/v1/transfer?confirm=true",
+        "https://api.example.com/v1/transfer?confirm=true*",
+        "https://api.example.com/admin?",
+    ] {
+        for action in [PolicyAction::Deny, PolicyAction::Prompt] {
+            let mut p = Policy::allow_all("p", "*");
+            p.rules = rules(action, 0, pat, false);
+            assert!(refuse_warned_url_patterns(&p).is_err(), "{action:?} {pat}");
+        }
+    }
+    let pat = "https://api.example.com/v1/*/delete";
+    for u in [
+        "https://api.example.com/v1/a/delete/",
+        "https://api.example.com/v1/a/delete/?x=1",
+        "https://api.example.com/v1/a/delete?x=1",
+        "https://api.example.com/v1/a/delete",
+    ] {
+        assert_eq!(decide(pat, PolicyAction::Deny, u), 2, "{u}");
     }
 }

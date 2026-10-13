@@ -26,6 +26,14 @@ fn config_file_load_refuses_the_footgun_deny_and_prompt_patterns() {
         ("deny", "https://api.example.com/{admin,root}/*", "deny"),
         ("prompt", "https://api.example.com/{admin,root}/*", "deny"),
         ("prompt", "https://*.example.com/x", "deny"),
+        // A literal query (or a bare ?) is slipped past by an inserted parameter.
+        ("deny", "https://api.example.com/admin?x=1", "allow"),
+        ("deny", "https://api.example.com/admin?", "deny"),
+        (
+            "prompt",
+            "https://api.example.com/v1/transfer?confirm=true*",
+            "allow",
+        ),
     ] {
         let toml = format!(
             r#"
@@ -44,7 +52,6 @@ condition = {{ url_match = "{pattern}" }}
     // The prefix form, and an exact URL on an Allow rule, still load.
     for (action, pattern) in [
         ("deny", "https://api.example.com/admin*"),
-        ("deny", "https://api.example.com/admin?x=1"),
         ("allow", "https://api.example.com/admin"),
         // govder's compiled shape: a prompt on an exact URL in a default-deny policy.
         ("prompt", "https://api.example.com/admin"),
@@ -155,7 +162,9 @@ async fn url_token_secret_with_structure_characters_is_refused_at_store() {
     let storage = FileStorage::new(&dir.path().join("v.enc"), &SecretString::from("pw"))
         .await
         .unwrap();
-    for bad in ["a/b", "a?b", "a#b", "a\\b", "a%2Fb", "a b", "a\nb", "", ".", ".."] {
+    for bad in [
+        "a/b", "a?b", "a#b", "a\\b", "a%2Fb", "a b", "a\nb", "", ".", "..",
+    ] {
         let c = Credential::new(
             "tg".to_string(),
             CredentialData::UrlToken {
