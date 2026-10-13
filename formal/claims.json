@@ -2700,7 +2700,7 @@
         "vault-v9-rewrite-accepted-after-compaction"
       ],
       "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation: flock does not prefer a waiting writer, so under sustained overlapping dispatches a kill write can wait without bound against the caller's timeout. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
-      "evidence_run": "38219467303"
+      "evidence_run": "38332553597"
     },
     {
       "id": "vault-log-loss-fails-closed",
@@ -2749,7 +2749,7 @@
         "vault-compaction-skips-log-precreate"
       ],
       "does_not_establish": "Log loss while no vultrino process is running: a log truncated at a record boundary (or by a torn tail) still opens as the shorter state, because the snapshot does not record the log's length; only a missing log is detected at open. An attacker who can write the vault directory and puts back an older vault file together with its older log. A log replaced by a different file of at least the same length while the snapshot is unchanged and the length equals the applied offset. Filesystems that report a stale length. A crash between the log creation and the snapshot rename leaves an empty log beside the old snapshot, which is accepted (it holds nothing). Any CI run other than the recorded one.",
-      "evidence_run": "38219467303"
+      "evidence_run": "38332553597"
     },
     {
       "id": "vault-file-gone-fails-closed",
@@ -2791,7 +2791,7 @@
         "vault-file-gone-compact-rename-unchecked"
       ],
       "does_not_establish": "Deletion while no vultrino process is running: a process started after the deletion finds no vault and starts one fresh, as for any vault that never existed. Offline truncation of the .wal tail at a record boundary without a durable anchor: accepted limitation, because filesystem write access is outside the threat model (stated in LIMITATIONS). Replacing the vault file with an older copy, or a file replaced by a different one between two looks (the snapshot token then changes and the process reloads as for a compaction). A vault file recreated by a new process with a new salt: the refusing process then keeps failing with a decryption error (not Unavailable) while the new process answers Clear. Another process's view: only the process that loaded the vault refuses. Any CI run other than the recorded one.",
-      "evidence_run": "38323278208"
+      "evidence_run": "38332553597"
     },
     {
       "id": "vault-reload-after-uncertain-commit",
