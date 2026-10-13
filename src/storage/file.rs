@@ -1730,17 +1730,17 @@ impl FileStorage {
         exclusive: bool,
     ) -> Result<(), StorageError> {
         // A process that has seen the vault file (it holds a snapshot token) and now finds the
-        // file gone must not reload: an empty or missing view would read as "no kills" and turn a
-        // halted agent clear, most easily right after a compaction when the log is empty too.
-        // The token stays set, so every later look of THIS process refuses as well; a process
-        // started after the deletion sees no vault at all, as for any vault that never existed.
-        if log.snap_token.is_some() && file_token(&self.path).is_none() {
-            return Err(self.vault_file_gone_error());
-        }
-        // Test-only: delete the vault file in the window between the guard's stat and the
-        // reload's stat (an accidental deletion's timing is nobody's to choose).
+        // file gone must not treat it as a fresh vault: an empty view would read as "no kills" and
+        // turn a halted agent clear, most easily right after a compaction when the log is empty
+        // too. The decision is made by the one stat the reload itself uses (full_load_locked; the
+        // fast path below needs the file present), so no deletion can slip between a check and a
+        // load. The token stays set, so every later look of THIS process refuses as well; a
+        // process started after the deletion sees no vault at all, as for any vault that never
+        // existed.
+        // Test-only: delete the vault file just before this look (an accidental deletion's timing
+        // is nobody's to choose).
         #[cfg(test)]
-        if self.fault_armed("sync.delete_vault_after_guard") {
+        if self.fault_armed("sync.delete_vault_before_look") {
             let _ = std::fs::remove_file(&self.path);
         }
         if log.loaded {

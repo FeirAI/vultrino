@@ -523,9 +523,6 @@
     "vault-panic-keeps-view-trusted": {
       "tier": "full"
     },
-    "vault-file-gone-reload-accepted": {
-      "tier": "fast"
-    },
     "vault-file-gone-fullload-fresh": {
       "tier": "fast"
     },
@@ -2693,7 +2690,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "c45f12fe27c3b74a2b3f59dabd5cc5798eb3674ebd17ebdff743ed55e13b7138"
+          "sha256": "613c23120fc3e0e64f548c5d90e98c437205b0c69099ed3a28ecbbda4eb056b4"
         }
       ],
       "mutants": [
@@ -2722,7 +2719,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "c45f12fe27c3b74a2b3f59dabd5cc5798eb3674ebd17ebdff743ed55e13b7138"
+          "sha256": "613c23120fc3e0e64f548c5d90e98c437205b0c69099ed3a28ecbbda4eb056b4"
         },
         {
           "path": "src/storage/file.rs",
@@ -2756,7 +2753,7 @@
     },
     {
       "id": "vault-file-gone-fails-closed",
-      "statement": "A vultrino process that has loaded the vault (it holds a snapshot token) and then finds the vault file itself gone never turns a halted agent clear: the next dispatch fence read and every write fail closed (Unavailable) and keep failing on repeat while the file stays gone, both when the log still holds the kill and right after a compaction when the log is empty too, and a write does not recreate the vault file. The decision uses the same stat as the load, so a deletion landing between the guard's look and the reload's look, or right after a compaction's rename, is refused too and leaves the guard armed. The refusal ends when a vault file reappears: the refusing process then reloads and accepts any file that decrypts under its key.",
+      "statement": "A vultrino process that has loaded the vault (it holds a snapshot token) and then finds the vault file itself gone never turns a halted agent clear: the next dispatch fence read and every write fail closed (Unavailable) and keep failing on repeat while the file stays gone, both when the log still holds the kill and right after a compaction when the log is empty too, and a write does not recreate the vault file. The decision is made on the same stat as the load, so a deletion landing between two looks, or right after a compaction's rename, is refused too and the token stays set. The refusal ends when a vault file reappears: the refusing process then reloads and accepts any file that decrypts under its key.",
       "method": "test",
       "artifacts": [
         "src/storage/file.rs",
@@ -2771,7 +2768,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "c45f12fe27c3b74a2b3f59dabd5cc5798eb3674ebd17ebdff743ed55e13b7138"
+          "sha256": "613c23120fc3e0e64f548c5d90e98c437205b0c69099ed3a28ecbbda4eb056b4"
         },
         {
           "path": "src/storage/file.rs",
@@ -2790,7 +2787,6 @@
         }
       ],
       "mutants": [
-        "vault-file-gone-reload-accepted",
         "vault-file-gone-fullload-fresh",
         "vault-file-gone-compact-rename-unchecked"
       ],

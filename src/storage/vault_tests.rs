@@ -1336,17 +1336,17 @@ async fn deleting_the_vault_file_under_a_running_process_never_turns_a_halt_clea
 }
 
 #[tokio::test]
-async fn deleting_the_vault_file_between_the_guard_and_the_reload_stays_closed() {
-    // The deletion lands after the guard's stat and before the reload's stat. The reload must
-    // decide on its own stat too, or it reads a fresh empty vault, answers Clear and disarms the
-    // guard for good (a later write would then recreate an empty vault under the same key).
+async fn deleting_the_vault_file_between_two_looks_stays_closed() {
+    // The deletion lands between this process's looks. The reload must refuse on its own stat,
+    // or it reads a fresh empty vault, answers Clear and drops the token for good (a later write
+    // would then recreate an empty vault under the same key).
     // Fence path: another handle compacted, so this process must reload.
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.enc");
     let (b, epoch0) = halted_vault(&path).await;
     let c = open(&path).await;
     c.compact().await.unwrap();
-    *b.fault.lock() = Some("sync.delete_vault_after_guard".into());
+    *b.fault.lock() = Some("sync.delete_vault_before_look".into());
     for _ in 0..2 {
         let r = b.kill_fence_check(&q("gh-main", epoch0)).await;
         assert!(matches!(r, Err(StorageError::Unavailable(_))), "{r:?}");
@@ -1356,7 +1356,7 @@ async fn deleting_the_vault_file_between_the_guard_and_the_reload_stays_closed()
     let dir = tempdir().unwrap();
     let path = dir.path().join("vault.enc");
     let (b, epoch0) = halted_vault(&path).await;
-    *b.fault.lock() = Some("sync.delete_vault_after_guard".into());
+    *b.fault.lock() = Some("sync.delete_vault_before_look".into());
     assert!(matches!(
         b.store(&cred("late")).await,
         Err(StorageError::Unavailable(_))
