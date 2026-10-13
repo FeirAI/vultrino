@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use url_canon::url_matches;
+use url_canon::url_matches_for;
 
 /// Policy-related errors
 #[derive(Error, Debug)]
@@ -672,7 +672,7 @@ impl PolicyEngine {
                                     record, // check the cap on the live path; skip on resume
                                 )
                             }
-                            other => self.evaluate_condition(other, input, record),
+                            other => self.evaluate_condition(other, input, record, rule.action != PolicyAction::Allow),
                         };
                         if matched {
                             if tier == RuleOutcome::Deny {
@@ -700,16 +700,23 @@ impl PolicyEngine {
     }
 
     /// Evaluate a single condition against the request input.
+    ///
+    /// `broaden` is true when matching MORE is the strict direction: a Deny or Prompt rule,
+    /// flipped under each `Not` (VUL-32). A broadened `url_match` also matches the URL with
+    /// its query removed, so a pattern written without a query (`/v1/*/delete`, `/admi[n]`)
+    /// cannot be slipped past by appending `?x=1`.
     fn evaluate_condition(
         &self,
         condition: &PolicyCondition,
         input: &EvalInput,
         record: bool,
+        broaden: bool,
     ) -> bool {
         match condition {
-            PolicyCondition::UrlMatch(pattern) => {
-                input.url.map(|u| url_matches(u, pattern)).unwrap_or(false)
-            }
+            PolicyCondition::UrlMatch(pattern) => input
+                .url
+                .map(|u| url_matches_for(u, pattern, broaden))
+                .unwrap_or(false),
 
             PolicyCondition::MethodMatch(methods) => input
                 .method
@@ -769,13 +776,13 @@ impl PolicyEngine {
 
             PolicyCondition::And(conditions) => conditions
                 .iter()
-                .all(|c| self.evaluate_condition(c, input, record)),
+                .all(|c| self.evaluate_condition(c, input, record, broaden)),
 
             PolicyCondition::Or(conditions) => conditions
                 .iter()
-                .any(|c| self.evaluate_condition(c, input, record)),
+                .any(|c| self.evaluate_condition(c, input, record, broaden)),
 
-            PolicyCondition::Not(inner) => !self.evaluate_condition(inner, input, record),
+            PolicyCondition::Not(inner) => !self.evaluate_condition(inner, input, record, !broaden),
 
             PolicyCondition::Always => true,
         }

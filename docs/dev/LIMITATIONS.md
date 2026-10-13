@@ -530,11 +530,15 @@ and the fix (`vultrino policy check` lists them, `vultrino policy
 fix-url-patterns <id>` rewrites an exact URL to `<url>*` and expands `{a,b}`).
 An Allow rule is refused only when the warned pattern sits under an odd
 number of `not` (there a dead pattern allows every URL); any other Allow rule is
-stored and warned. An exact URL on a Prompt rule is accepted in a policy whose
-default is deny (govder's compiled shape; the query form falls to the deny
-default), but a different policy that allows the query form is not considered.
-The refusal is as good as the warnings: a
-glob without a port that misses a non-default port is not refused.
+stored and warned. A Deny or Prompt rule's `url_match` (flipped under each `not`)
+also matches the URL with trailing query parameters removed, so `?x=1` or `&x=1`
+appended at the end never slips a request past a pattern written without its
+query (an Allow rule is not widened, so a rule that allowed the bare URL no longer
+allows it with a query). A parameter inserted before or between the pattern's own
+query parameters is not covered: write a `*` after them. A Prompt under a single
+`not` is outside this (it prompts every URL except the pattern's). The refusal is
+as good as the warnings: a glob without a port that misses a non-default port is
+not refused.
 A glob whose host part holds `?`
 is not canonicalised (warned); that `?` matches one host character. Patterns
 are canonicalised when they are matched, not rewritten in storage, so the admin

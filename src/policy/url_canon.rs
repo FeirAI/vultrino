@@ -506,11 +506,37 @@ pub fn policy_url(params: &serde_json::Value) -> Option<String> {
 
 /// `UrlMatch` semantics: canonicalise both sides, then match. A URL that cannot
 /// be canonicalised never matches.
+#[cfg(test)]
 pub fn url_matches(raw_url: &str, raw_pattern: &str) -> bool {
-    match canonical_url(raw_url) {
-        Some(u) => canonical_matches(&u, &canonical_pattern(raw_pattern).text),
-        None => false,
+    url_matches_for(raw_url, raw_pattern, false)
+}
+
+/// `url_matches`, and when `broaden` is set also against the URL with trailing query parameters
+/// removed, one at a time down to no query at all (Deny and Prompt rules, flipped under `not`):
+/// a pattern written without its query (or with only its first parameters) then matches the
+/// same URL with `?x=1` (or `&x=1`) appended, so a parameter added at the end never slips a
+/// request past it. A parameter inserted before or between the pattern's own is not covered.
+pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool {
+    let Some(u) = canonical_url(raw_url) else {
+        return false;
+    };
+    let p = canonical_pattern(raw_pattern).text;
+    if canonical_matches(&u, &p) {
+        return true;
     }
+    if !broaden {
+        return false;
+    }
+    let Some(q) = u.find('?') else {
+        return false;
+    };
+    // Cut points: every `&` after the `?` (last first), then the `?` itself.
+    u[q..]
+        .match_indices('&')
+        .map(|(i, _)| q + i)
+        .rev()
+        .chain(std::iter::once(q))
+        .any(|at| canonical_matches(&u[..at], &p))
 }
 
 #[cfg(test)]

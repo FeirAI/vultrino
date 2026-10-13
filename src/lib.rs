@@ -707,9 +707,12 @@ pub struct Credential {
 /// Whether a `UrlToken` secret can be put into a URL path without changing the URL's
 /// structure (VUL-32). A `/`, `?`, `#` or `\\` would add a path segment, start a query or a
 /// fragment, and whitespace or a control character is re-encoded or stripped, so the bytes sent
-/// would differ from the string policy judged. Such a secret is refused at create and at use.
+/// would differ from the string policy judged, and so would a secret that is `.` or `..`. Such a secret is refused at create and at use.
 pub fn url_token_secret_is_path_safe(secret: &str) -> bool {
     !secret.is_empty()
+        // A whole-segment `.` or `..` is removed by the URL parser, dropping the secret.
+        && secret != "."
+        && secret != ".."
         && !secret
             .chars()
             .any(|c| matches!(c, '/' | '?' | '#' | '\\' | '%') || c.is_control() || c == ' ')

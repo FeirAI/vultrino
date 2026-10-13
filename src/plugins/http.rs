@@ -1392,7 +1392,7 @@ mod tests {
     /// VUL-32: a UrlToken secret that would change the path or query that is sent is refused.
     #[test]
     fn url_token_secret_that_changes_the_url_structure_is_refused() {
-        for bad in ["a/b", "a?x=1", "a#f", "a\\b", "a%2Fb", "a b", "a\nb", ""] {
+        for bad in ["a/b", "a?x=1", "a#f", "a\\b", "a%2Fb", "a b", "a\nb", "", ".", ".."] {
             let token = Secret::new(bad);
             let err = HttpPlugin::url_token_send_url(
                 "https://api.telegram.org/bot{credential}/sendMessage",

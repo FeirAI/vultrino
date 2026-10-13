@@ -155,7 +155,7 @@ async fn url_token_secret_with_structure_characters_is_refused_at_store() {
     let storage = FileStorage::new(&dir.path().join("v.enc"), &SecretString::from("pw"))
         .await
         .unwrap();
-    for bad in ["a/b", "a?b", "a#b", "a\\b", "a%2Fb", "a b", "a\nb", ""] {
+    for bad in ["a/b", "a?b", "a#b", "a\\b", "a%2Fb", "a b", "a\nb", "", ".", ".."] {
         let c = Credential::new(
             "tg".to_string(),
             CredentialData::UrlToken {

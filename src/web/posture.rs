@@ -70,7 +70,7 @@ pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Pol
         "egress": {
             // The URL is never reported (it can carry proxy credentials).
             "upstream_proxy_configured": crate::plugins::upstream_proxy_configured(),
-            "ambient_proxy_honoured": false,
+            "plugin_ambient_proxy_honoured": false,
         },
         "policies": {
             "total": policies.len(),

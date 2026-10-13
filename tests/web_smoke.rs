@@ -8967,7 +8967,7 @@ async fn posture_requires_an_operator_key_and_reports_the_live_engine() {
     // VUL-29 / VUL-20: the egress and identity posture. No proxy, no [identity] here; the
     // ambient proxy variables are never honoured and the proxy URL is never reported.
     assert_eq!(body["egress"]["upstream_proxy_configured"], false);
-    assert_eq!(body["egress"]["ambient_proxy_honoured"], false);
+    assert_eq!(body["egress"]["plugin_ambient_proxy_honoured"], false);
     assert_eq!(body["identity"]["inbound_header_configured"], false);
     assert_eq!(body["identity"]["signature_key_configured"], false);
     assert!(body["build"]["rustc"]

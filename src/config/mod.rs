@@ -399,7 +399,7 @@ pub struct IdentityConfig {
     pub allowed: Vec<String>,
     /// The key the edge signs the header with (VUL-20). Read from `VULTRINO_IDENTITY_SECRET`
     /// at startup, never from the config file. `None` means no header can be verified: the
-    /// document is ignored and `serve`/`web` refuse to start.
+    /// document is ignored and `web` refuses to start.
     pub verification_key: Option<secrecy::SecretString>,
 }
 

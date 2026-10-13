@@ -604,6 +604,14 @@
     "egress-remote-proxy-counted-loopback": {
       "tier": "full",
       "claim": "egress-no-ambient-proxy"
+    },
+    "url-query-broadening-removed": {
+      "tier": "fast",
+      "claim": "url-query-never-weakens"
+    },
+    "url-query-broadening-not-flipped": {
+      "tier": "fast",
+      "claim": "url-query-never-weakens"
     }
   },
   "claims": [
@@ -1998,6 +2006,11 @@
           "path": "src/policy/url_canon.rs",
           "symbol": "canonical_pattern_core",
           "sha256": "a3e1c2c41bd5249ca137b6feb186b665758710ac323e6171ee5fc5699135c5ef"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "url_matches_for",
+          "sha256": ""
         }
       ],
       "mutants": [
@@ -2169,7 +2182,7 @@
         "policy-write-allow-not-parity-ignored",
         "url-exact-prompt-refused-in-default-deny"
       ],
-      "does_not_establish": "The refusal is as good as canonical_pattern's warnings: a pattern that matches less than it reads but draws no warning (a glob without a port that misses a non-default port) is accepted. Stored policies and config-file [[policies]] are refused by the claim url-pattern-footguns-refused, not by this detector; the engine's add_policy and load paths do not refuse. An allow rule is refused only under an odd number of not; any other warned allow pattern is stored and only warned. A deny or prompt rule whose url_match sits under not is refused too, although a dead pattern under not denies more, not less. Shown on the listed patterns and shapes, not every pattern. Which deployed vaults hold such a stored policy is not checked. An exact-URL Prompt in a default-deny policy is accepted even when a different policy allows the query form of that URL.",
+      "does_not_establish": "The refusal is as good as canonical_pattern's warnings: a pattern that matches less than it reads but draws no warning (a glob without a port that misses a non-default port) is accepted. Stored policies and config-file [[policies]] are refused by the claim url-pattern-footguns-refused, not by this detector; the engine's add_policy and load paths do not refuse. An allow rule is refused only under an odd number of not; any other warned allow pattern is stored and only warned. A deny or prompt rule whose url_match sits under not is refused too, although a dead pattern under not denies more, not less. Shown on the listed patterns and shapes, not every pattern. Which deployed vaults hold such a stored policy is not checked. An exact-URL Prompt in a default-deny policy is accepted; the engine matches Deny and Prompt patterns also without trailing query parameters (shown in url-query-never-weakens), so another Allow rule does not skip it.",
       "evidence_run": "38407367367"
     },
     {
@@ -3207,7 +3220,7 @@
         "config-load-url-refusal-removed",
         "url-fix-exact-not-broadened"
       ],
-      "does_not_establish": "The refusal is as good as the warnings: a glob without a port that misses a non-default port draws no warning and is not refused. An exact-URL Prompt in a default-deny policy is accepted even when another policy allows the query form. An exact URL under a not is refused only through the allow-under-odd-not rule shown in policy-write-refuses-warned-deny-prompt-patterns. The automatic fix broadens (prefix form), so a deny or prompt may then match more URLs than the author meant; it cannot fix a * in a host and expands only one level of braces with at most 64 alternatives. A stored policy refused on load stops the server from starting, so an operator must run the fix first; which deployed vaults hold such a policy is not checked. Shown on the listed patterns, not every pattern.",
+      "does_not_establish": "The refusal is as good as the warnings: a glob without a port that misses a non-default port draws no warning and is not refused. An exact-URL Prompt in a default-deny policy is accepted; the engine matches Deny and Prompt patterns also without trailing query parameters (shown in url-query-never-weakens), so another Allow rule does not skip it. An exact URL under a not is refused only through the allow-under-odd-not rule shown in policy-write-refuses-warned-deny-prompt-patterns. The automatic fix broadens (prefix form), so a deny or prompt may then match more URLs than the author meant; it cannot fix a * in a host and expands only one level of braces with at most 64 alternatives. A stored policy refused on load stops the server from starting, so an operator must run the fix first; which deployed vaults hold such a policy is not checked. Shown on the listed patterns, not every pattern.",
       "evidence_run": "38407367367"
     },
     {
@@ -3326,6 +3339,39 @@
         "identity-startup-key-check-removed"
       ],
       "does_not_establish": "That the edge verified the underlying token: Vultrino verifies only the edge's signature, so whoever holds VULTRINO_IDENTITY_SECRET can assert any workload id and owner. Replay: a signed header can be reused with the same bearer until it expires (at most 300 s), and the signature is not bound to the request path or body. No sender implements the signing contract yet (feir-os runtime-edge and govder do not send this header today); the contract is identity::sign_identity and docs/dev/CONFIGURATION.md. Only the /api/v1/execute route reads the header. The cloud-IAM claim adapters are still not wired inbound. A key rotation has no overlap window (one key at a time).",
+      "evidence_run": "38407367367"
+    },
+    {
+      "id": "url-query-never-weakens",
+      "statement": "For every policy the write path accepts (refuse_warned_url_patterns), over a grid of 19 url_match patterns (globs with a literal tail, character classes, exact, prefix, host-only, port, query-bearing and path-only), 11 URLs, Deny, Prompt and Allow rules, 5 condition shapes (plain, and with a method, or with a method, not not, not), 3 policy defaults and with or without an Allow rule over the same host, the engine's decision for a URL with a query parameter appended (?x=1, or &x=1 when it has a query) is at least as strict as for the URL without it (Allow < Prompt < Deny). A Deny or Prompt url_match also matches the URL with trailing query parameters removed, flipped under each not.",
+      "method": "exhaustive",
+      "artifacts": [
+        "src/policy/url_canon.rs",
+        "src/policy/mod.rs",
+        "tests/url_query_never_weakens.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test url_query_never_weakens",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "url_matches_for",
+          "sha256": ""
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::evaluate_condition",
+          "sha256": ""
+        }
+      ],
+      "mutants": [
+        "url-query-broadening-removed",
+        "url-query-broadening-not-flipped"
+      ],
+      "does_not_establish": "Only the listed patterns, URLs and shapes, not every pattern; a property of the engine decision, not a proof. A parameter inserted before or between a pattern's own query parameters is not covered (write a * after them). A Prompt under a single not is excluded from the grid: it prompts every URL except the pattern's, so with a deny default the query form moves from Deny to Prompt. Other policies and rule kinds (rate limits, principal or time conditions) are not in the grid. Which deployed vaults hold a policy relying on the old narrower matching is not checked.",
       "evidence_run": "38407367367"
     }
   ]

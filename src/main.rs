@@ -1744,6 +1744,18 @@ async fn list_credentials(
 /// could never be believed. Refuse to start rather than run with an identity feature that
 /// silently does nothing (or, in an older build, trusted everything).
 fn refuse_identity_without_key(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    use secrecy::ExposeSecret;
+    if let Some(i) = config.identity.as_ref() {
+        if let Some(k) = i.verification_key.as_ref() {
+            if k.expose_secret().len() < 32 {
+                return Err(
+                    "VULTRINO_IDENTITY_SECRET is shorter than 32 bytes: a short key can be \
+                     guessed, so vultrino refuses to start. Use a random key of at least 32 bytes."
+                        .into(),
+                );
+            }
+        }
+    }
     if config
         .identity
         .as_ref()

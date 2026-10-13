@@ -3104,6 +3104,9 @@ pub fn build_notifiers(cfg: &ApprovalConfig) -> Vec<std::sync::Arc<dyn ApprovalN
 /// unintended target (Codex medium).
 fn approval_notifier_client() -> reqwest::Client {
     reqwest::Client::builder()
+        // Never an ambient HTTP_PROXY/HTTPS_PROXY: the payloads carry approve/deny capability
+        // tokens, which must not cross a proxy the operator did not name (VUL-29).
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         // Bound both connect and total time: a stalled Telegram/webhook endpoint
         // must never hang an approval-decision notification. This client never
