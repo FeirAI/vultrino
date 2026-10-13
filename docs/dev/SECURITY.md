@@ -177,7 +177,10 @@ proxy can neither see an injected credential nor skip the connect-time resolver 
 operator who must route egress through a proxy sets `VULTRINO_UPSTREAM_PROXY` to an `http://`
 or `https://` proxy URL (an invalid value stops the process at client construction). Only
 `https://` targets go through it (a CONNECT tunnel, the credential inside TLS); a plain
-`http://` target is refused at admission while the proxy is set and is never handed to it.
+`http://` target is refused at admission while the proxy is set, and is never handed to the
+proxy, unless the proxy is on this host (a loopback sidecar, such as a local egress filter or
+the credential-canary test reflector): that first hop never leaves the machine, but the
+proxy then forwards the request onward and a credential is in clear text on that hop.
 The proxy resolves the target host itself, so the connect-time resolver guard does not cover
 that hop: the admission-time URL check above still runs, and the proxy is trusted to enforce
 its own destination policy. `GET /api/v1/posture` reports `egress.upstream_proxy_configured`

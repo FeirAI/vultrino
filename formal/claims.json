@@ -600,6 +600,10 @@
     "identity-startup-key-check-removed": {
       "tier": "full",
       "claim": "inbound-identity-signed"
+    },
+    "egress-remote-proxy-counted-loopback": {
+      "tier": "full",
+      "claim": "egress-no-ambient-proxy"
     }
   },
   "claims": [
@@ -3037,7 +3041,7 @@
     },
     {
       "id": "egress-no-ambient-proxy",
-      "statement": "Every secret-bearing outbound client built by build_guarded_client ignores the ambient HTTP_PROXY, HTTPS_PROXY and ALL_PROXY variables: with all three pointing at a recording server, a request to a reachable public-looking target goes directly and the proxy sees none. The only proxy is the explicit VULTRINO_UPSTREAM_PROXY opt-in (an http:// or https:// URL; any other value stops client construction instead of falling back to a direct connection). With it set, an https:// target is routed through it and an http:// target is never handed to it, and HttpPlugin::validate_url_ssrf refuses a plain http:// URL, so an injected credential never crosses the proxy in clear text. GET /api/v1/posture reports whether the opt-in is set, never its URL.",
+      "statement": "Every secret-bearing outbound client built by build_guarded_client ignores the ambient HTTP_PROXY, HTTPS_PROXY and ALL_PROXY variables: with all three pointing at a recording server, a request to a reachable target goes directly and the proxy sees none. The only proxy is the explicit VULTRINO_UPSTREAM_PROXY opt-in (an http:// or https:// URL; any other value stops client construction instead of falling back to a direct connection). With it set, an https:// target is routed through it. A plain http:// target is refused by HttpPlugin::validate_url_ssrf and never handed to the proxy unless the proxy is on this host (an IP literal in 127.0.0.0/8 or ::1, or localhost), so an injected credential never crosses a remote proxy in clear text. GET /api/v1/posture reports whether the opt-in is set, never its URL.",
       "method": "test",
       "artifacts": [
         "src/plugins/http.rs",
@@ -3053,7 +3057,7 @@
         {
           "path": "src/plugins/http.rs",
           "symbol": "build_guarded_client",
-          "sha256": "862520fef10f05b466934f87ab050f3ca22f8e8b0b677beb68daa8fa1079ae55"
+          "sha256": "3ff65743836e21fa0aa36dda563f695c72357defde6305ad0b14a02bcf09810f"
         },
         {
           "path": "src/plugins/http.rs",
@@ -3068,15 +3072,26 @@
         {
           "path": "src/plugins/http.rs",
           "symbol": "HttpPlugin::validate_url_ssrf",
-          "sha256": "7f0c947c58ad8939276c9cb2f027fcd3385f733211f14819eee919ca744640b8"
+          "sha256": "f9f26e872e47b682a0f89c58d562e86414fdb6f6b11a62306833cd705cbc55b0"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "proxy_is_loopback",
+          "sha256": "77ebbac69ca54e8bb1d5bc96fcca61282b5e66da5749d1f37311d3eee199753e"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "upstream_proxy_plaintext_ok",
+          "sha256": "c7a9192925b09ad8ddca4d48c6c02b37bbbea9f6d5cd8f40ccc50a25408b3748"
         }
       ],
       "mutants": [
         "egress-ambient-proxy-honoured",
         "egress-proxy-routes-plain-http",
-        "egress-plain-http-admitted-with-proxy"
+        "egress-plain-http-admitted-with-proxy",
+        "egress-remote-proxy-counted-loopback"
       ],
-      "does_not_establish": "That a proxy chosen with VULTRINO_UPSTREAM_PROXY behaves: it resolves the target host itself, so the connect-time resolver guard does not cover that hop (the admission-time URL check still runs) and the operator trusts the proxy. The https route through a real CONNECT tunnel is not exercised, only that the client hands https targets to the proxy and never an http one (the test sends an http target to a local recording server and checks the proxy saw nothing). Plain http:// to a public host with no proxy configured is still admitted, as before. The WASM plugin egress and the other crates' own clients (govder, averin, revocation) are separate. The wiring is shown on the shared client builder, not on each plugin that calls it."
+      "does_not_establish": "That a proxy chosen with VULTRINO_UPSTREAM_PROXY behaves: it resolves the target host itself, so the connect-time resolver guard does not cover that hop (the admission-time URL check still runs) and the operator trusts the proxy. A loopback proxy may carry a plain http:// request: that first hop never leaves the machine, but the proxy then forwards it onward as it sees fit (a credential is in clear text on that onward hop unless the proxy upgrades it), and the loopback test is on the proxy host text, not on what is listening. The https route through a real CONNECT tunnel is not exercised, only that the client hands https targets to the proxy. Plain http:// to a public host with no proxy configured is still admitted, as before. The WASM plugin egress and the other crates' own clients (govder, averin, revocation) are separate. The wiring is shown on the shared client builder, not on each plugin that calls it."
     },
     {
       "id": "request-log-no-capability-token",
