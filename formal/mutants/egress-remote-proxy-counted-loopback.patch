@@ -1,15 +1,13 @@
 diff --git a/src/plugins/http.rs b/src/plugins/http.rs
-index fa9fc88..4fcbd17 100644
+index 2178b68..b85f4ef 100644
 --- a/src/plugins/http.rs
 +++ b/src/plugins/http.rs
-@@ -409,8 +409,8 @@ pub(crate) fn proxy_is_loopback(u: &url::Url) -> bool {
+@@ -418,7 +418,7 @@ pub(crate) fn proxy_is_loopback(u: &url::Url) -> bool {
      match u.host() {
          Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
          Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
--        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
--        None => false,
-+        Some(url::Host::Domain(_)) => true,
-+        None => true,
+-        Some(url::Host::Domain(_)) | None => false,
++        Some(url::Host::Domain(_)) | None => true,
      }
  }
  

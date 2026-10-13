@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index 371a9b4..bcdfc41 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -549,7 +549,7 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool
+     }
+     // Many frameworks route `/x/` to the handler of `/x`, so the path without one trailing `/`
+     // is judged too, with and without the query.
+-    let bases = [Some(base), base.strip_suffix('/')];
++    let bases = [Some(base), None];
+     let hit = bases.into_iter().flatten().any(|b| {
+         cuts.iter()
+             .any(|&at| canonical_matches(&format!("{b}{}", &query[..at]), &p))

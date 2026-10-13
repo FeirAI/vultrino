@@ -1,8 +1,8 @@
 diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
-index ee99081..4efd1cd 100644
+index 371a9b4..a176e16 100644
 --- a/src/policy/url_canon.rs
 +++ b/src/policy/url_canon.rs
-@@ -524,7 +524,7 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool
+@@ -534,7 +534,7 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool
      if canonical_matches(&u, &p) {
          return true;
      }
@@ -10,4 +10,4 @@ index ee99081..4efd1cd 100644
 +    if true {
          return false;
      }
-     let Some(q) = u.find('?') else {
+     let (base, query) = match u.find('?') {
