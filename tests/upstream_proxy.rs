@@ -65,9 +65,10 @@ async fn ambient_proxy_is_ignored_and_opt_in_never_carries_plain_http() {
     );
     assert!(!vultrino::plugins::upstream_proxy_configured());
 
-    // 2. With the explicit opt-in set: plain http:// is refused at admission, and the
-    //    client never hands an http:// request to the proxy.
-    std::env::set_var("VULTRINO_UPSTREAM_PROXY", &proxy_url);
+    // 2. With the explicit opt-in set to a proxy that is NOT on this host: plain http:// is
+    //    refused at admission, and the client never hands an http:// request to the proxy
+    //    (it goes direct; the proxy address here is never contacted for it).
+    std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://10.255.255.1:3128");
     assert!(vultrino::plugins::upstream_proxy_configured());
     let err = admit_url("http://93.184.216.34/api").expect_err("plain http must be refused");
     assert!(
@@ -80,12 +81,25 @@ async fn ambient_proxy_is_ignored_and_opt_in_never_carries_plain_http() {
         .get(format!("http://127.0.0.1:{target_port}/y"))
         .send()
         .await
-        .expect("http target is not routed via the proxy");
+        .expect("an http target is not routed via a remote proxy");
+    assert_eq!(target.load(Ordering::SeqCst), 2, "went direct");
+
+    // 2b. A proxy on this host (a loopback sidecar) may carry plain http: the hop never
+    //     leaves the machine. The request reaches the proxy and not the target.
+    std::env::set_var("VULTRINO_UPSTREAM_PROXY", &proxy_url);
+    admit_url("http://93.184.216.34/api").expect("loopback proxy: plain http admitted");
+    let client = guarded_client();
+    let _ = client
+        .get("http://93.184.216.34/z")
+        .send()
+        .await
+        .expect("served by the loopback proxy");
     assert_eq!(
         proxy.load(Ordering::SeqCst),
-        0,
-        "http request reached the proxy"
+        1,
+        "routed via the loopback proxy"
     );
+    assert_eq!(target.load(Ordering::SeqCst), 2);
 
     // 3. A malformed opt-in fails closed at client construction.
     std::env::set_var("VULTRINO_UPSTREAM_PROXY", "socks5://x");
