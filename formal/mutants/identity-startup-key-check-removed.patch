@@ -1,0 +1,17 @@
+diff --git a/src/main.rs b/src/main.rs
+index f3fd368..433c9c4 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1744,11 +1744,7 @@ async fn list_credentials(
+ /// could never be believed. Refuse to start rather than run with an identity feature that
+ /// silently does nothing (or, in an older build, trusted everything).
+ fn refuse_identity_without_key(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+-    if config
+-        .identity
+-        .as_ref()
+-        .is_some_and(|i| i.verification_key.is_none())
+-    {
++    if false {
+         return Err(
+             "[identity] is enabled but VULTRINO_IDENTITY_SECRET (or _FILE) is not set: the \
+              inbound identity header cannot be verified, so vultrino refuses to start. Set \

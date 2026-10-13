@@ -1,0 +1,13 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 1b6c9c4..5f6e26f 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -360,7 +360,7 @@ pub(crate) fn build_guarded_client() -> Client {
+         // would receive the injected credential (in clear for http://) and the connect-time
+         // resolver guard would not see the target. The only proxy is the explicit opt-in
+         // below.
+-        .no_proxy();
++        ;
+     match upstream_proxy_from(std::env::var(UPSTREAM_PROXY_ENV).ok().as_deref()) {
+         Ok(None) => {}
+         Ok(Some(proxy_url)) => {

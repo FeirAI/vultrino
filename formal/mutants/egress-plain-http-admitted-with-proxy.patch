@@ -1,0 +1,13 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 1b6c9c4..7a73c02 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -910,7 +910,7 @@ impl HttpPlugin {
+         // Only allow http and https schemes
+         match url.scheme() {
+             "http" => {
+-                if upstream_proxy_configured() {
++                if false {
+                     return Err(PluginError::InvalidParams(format!(
+                         "plain http:// is refused while {UPSTREAM_PROXY_ENV} is set: a credential \
+                          must not cross a proxy in clear text. Use https://."

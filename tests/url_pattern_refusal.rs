@@ -147,3 +147,28 @@ fn exact_prompt_is_refused_only_when_the_policy_default_is_not_deny() {
     let d = policy(PolicyAction::Deny, "https://api.example.com/admin");
     assert!(refuse_warned_url_patterns(&d).is_err());
 }
+
+#[tokio::test]
+async fn url_token_secret_with_structure_characters_is_refused_at_store() {
+    use vultrino::{Credential, CredentialData, Secret};
+    let dir = tempdir().unwrap();
+    let storage = FileStorage::new(&dir.path().join("v.enc"), &SecretString::from("pw"))
+        .await
+        .unwrap();
+    for bad in ["a/b", "a?b", "a#b", "a\\b", "a%2Fb", "a b", "a\nb", ""] {
+        let c = Credential::new(
+            "tg".to_string(),
+            CredentialData::UrlToken {
+                token: Secret::new(bad),
+            },
+        );
+        assert!(storage.store(&c).await.is_err(), "{bad:?} must be refused");
+    }
+    let ok = Credential::new(
+        "tg".to_string(),
+        CredentialData::UrlToken {
+            token: Secret::new("123456:ABC-def_GHI"),
+        },
+    );
+    storage.store(&ok).await.expect("a plain token is stored");
+}

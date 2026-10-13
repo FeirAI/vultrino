@@ -1,0 +1,13 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 1b6c9c4..4e98ec6 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -368,7 +368,7 @@ pub(crate) fn build_guarded_client() -> Client {
+             // credential is inside TLS). An http:// target is never handed to the proxy
+             // (and validate_url_ssrf refuses it while a proxy is configured).
+             builder = builder.proxy(reqwest::Proxy::custom(move |target| {
+-                if target.scheme() == "https" {
++                if true {
+                     Some(proxy_url.clone())
+                 } else {
+                     None
