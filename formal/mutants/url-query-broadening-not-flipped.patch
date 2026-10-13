@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 436bfa5..31f4686 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -782,7 +782,7 @@ impl PolicyEngine {
+                 .iter()
+                 .any(|c| self.evaluate_condition(c, input, record, broaden)),
+ 
+-            PolicyCondition::Not(inner) => !self.evaluate_condition(inner, input, record, !broaden),
++            PolicyCondition::Not(inner) => !self.evaluate_condition(inner, input, record, broaden),
+ 
+             PolicyCondition::Always => true,
+         }

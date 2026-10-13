@@ -1,11 +1,11 @@
 diff --git a/src/main.rs b/src/main.rs
-index f3fd368..433c9c4 100644
+index 4333389..7c989b6 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -1744,11 +1744,7 @@ async fn list_credentials(
- /// could never be believed. Refuse to start rather than run with an identity feature that
- /// silently does nothing (or, in an older build, trusted everything).
- fn refuse_identity_without_key(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+@@ -1756,11 +1756,7 @@ fn refuse_identity_without_key(config: &Config) -> Result<(), Box<dyn std::error
+             }
+         }
+     }
 -    if config
 -        .identity
 -        .as_ref()

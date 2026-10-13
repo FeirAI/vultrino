@@ -612,6 +612,10 @@
     "url-query-broadening-not-flipped": {
       "tier": "fast",
       "claim": "url-query-never-weakens"
+    },
+    "identity-short-key-accepted": {
+      "tier": "fast",
+      "claim": "inbound-identity-signed"
     }
   },
   "claims": [
@@ -1785,7 +1789,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "9d3c6390515ddf44e7f70bcb4436ccfb422d74e28363d0b9dd24fbbb26de6df0"
+          "sha256": "756ddf3a62ab05ea46c6191d7204e0369e97100d5eed3557e0620b64df74660c"
         },
         {
           "path": "src/policy/precedence.rs",
@@ -1925,12 +1929,12 @@
         {
           "path": "src/policy/url_canon.rs",
           "symbol": "url_matches",
-          "sha256": "b47c71b8faabf2cbf239ab68251197c0946e1f43a676cf92d93ccb5638cf7c25"
+          "sha256": "0d57b0a1178c319083f3c1804bb55b4542920f70677a99f42645e9443d251e7f"
         },
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "9d3c6390515ddf44e7f70bcb4436ccfb422d74e28363d0b9dd24fbbb26de6df0"
+          "sha256": "756ddf3a62ab05ea46c6191d7204e0369e97100d5eed3557e0620b64df74660c"
         },
         {
           "path": "src/plugins/http.rs",
@@ -2010,7 +2014,7 @@
         {
           "path": "src/policy/url_canon.rs",
           "symbol": "url_matches_for",
-          "sha256": ""
+          "sha256": "3f77db82de68da180894f9572d8a6625aed347318575c2d6b077fd68004a6e12"
         }
       ],
       "mutants": [
@@ -3014,7 +3018,7 @@
     },
     {
       "id": "posture-report-live",
-      "statement": "GET /api/v1/posture answers only to a global (untenanted) admin key and reports, from the running process, the policy engine's live default (deny or allow), whether separation of duty is enforced, whether the approver-identity key is configured, distinct from the govder key, or on the shared-key escape, which tenants are in observe mode, which enforced policies have a RateLimit condition with a non-deny default, whether an explicit upstream proxy is configured (never its URL) and that the ambient proxy variables are not honoured, whether an inbound [identity] header is configured and its signing key is present, the vault format version this binary writes, and the rustc and git commit it was built with. The report holds booleans, counts and identifiers only.",
+      "statement": "GET /api/v1/posture answers only to a global (untenanted) admin key and reports, from the running process, the policy engine's live default (deny or allow), whether separation of duty is enforced, whether the approver-identity key is configured, distinct from the govder key, or on the shared-key escape, which tenants are in observe mode, which enforced policies have a RateLimit condition with a non-deny default, whether an explicit upstream proxy is configured (never its URL) and that the plugin egress client does not honour the ambient proxy variables (the field plugin_ambient_proxy_honoured; the approval notifier client also ignores them, the outbox, govder and averin clients still do), whether an inbound [identity] header is configured and its signing key is present, the vault format version this binary writes, and the rustc and git commit it was built with. The report holds booleans, counts and identifiers only.",
       "method": "test",
       "artifacts": [
         "src/web/posture.rs",
@@ -3032,7 +3036,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "d07582971a9b504d9e81dd3dfbf6c32bf5c6e580cb5bb3bbd0dc4f1ba12a3e15"
+          "sha256": "331b7bdc57bbbba13d4a75b07a7042c55945dc0ae00a0e23bd684e2b8439e18d"
         },
         {
           "path": "src/web/api.rs",
@@ -3225,7 +3229,7 @@
     },
     {
       "id": "url-token-secret-structure-refused",
-      "statement": "A UrlToken secret holding /, ?, #, a backslash, %, whitespace or a control character, or empty, is refused: url_token_send_url returns an error that does not contain the secret, and FileStorage::store refuses to store such a credential. A secret of unreserved and common token characters (digits, letters, :, -, _) is substituted unchanged into the {credential} placeholder.",
+      "statement": "A UrlToken secret holding /, ?, #, a backslash, %, whitespace or a control character, or empty, or exactly `.` or `..` (a whole path segment the URL parser would remove), is refused: url_token_send_url returns an error that does not contain the secret, and FileStorage::store refuses to store such a credential. A secret of unreserved and common token characters (digits, letters, :, -, _) is substituted unchanged into the {credential} placeholder.",
       "method": "test",
       "artifacts": [
         "src/lib.rs",
@@ -3242,7 +3246,7 @@
         {
           "path": "src/lib.rs",
           "symbol": "url_token_secret_is_path_safe",
-          "sha256": "761b9e94873e55bd4bb632cbcd04cc74c0352820dcff521b6593086ebe073f13"
+          "sha256": "94a648c898ea777ad627c67784376e0d52e1b7d5d3435b9ac33ae02b0e422034"
         },
         {
           "path": "src/plugins/http.rs",
@@ -3284,7 +3288,7 @@
     },
     {
       "id": "inbound-identity-signed",
-      "statement": "The inbound workload-identity header is believed only when it carries a valid edge signature. The signature header <header>-signature holds v1.<exp>.<base64url HMAC-SHA-256> under VULTRINO_IDENTITY_SECRET over the document, the expiry and the SHA-256 of the bearer secret of the request. verify_identity_signature rejects a wrong key, another document, another bearer, an expired signature, an expiry more than 300 s ahead, and malformed values; with a valid signature the SVID or OIDC document becomes the evaluated principal, and with none of the forged variants (no signature, wrong key, expired, other bearer, other document, malformed) does it. A configuration with [identity] and no key makes `vultrino web` refuse to start, and that is shown with a blank key too.",
+      "statement": "The inbound workload-identity header is believed only when it carries a valid edge signature. The signature header <header>-signature holds v1.<exp>.<base64url HMAC-SHA-256> under VULTRINO_IDENTITY_SECRET over the document, the expiry and the SHA-256 of the bearer secret of the request. verify_identity_signature rejects a wrong key, another document, another bearer, an expired signature, an expiry more than 300 s ahead, and malformed values; with a valid signature the SVID or OIDC document becomes the evaluated principal, and with none of the forged variants (no signature, wrong key, expired, other bearer, other document, malformed) does it. A configuration with [identity] and no key makes `vultrino web` refuse to start, and that is shown with a blank key too. A key shorter than 32 bytes is refused at startup as well.",
       "method": "test",
       "artifacts": [
         "src/identity.rs",
@@ -3328,7 +3332,7 @@
         {
           "path": "src/main.rs",
           "symbol": "refuse_identity_without_key",
-          "sha256": "f9bc930be157bf672258ad8714094cba30ba966ff1bdc77c9a6a8f68215f6233"
+          "sha256": "2ce0847ee4398437458096ba96d91bcb04ec91e98d561b01cc42ab076999cf04"
         }
       ],
       "mutants": [
@@ -3336,7 +3340,8 @@
         "identity-signature-expiry-ignored",
         "identity-signature-bearer-unbound",
         "identity-unsigned-header-accepted",
-        "identity-startup-key-check-removed"
+        "identity-startup-key-check-removed",
+        "identity-short-key-accepted"
       ],
       "does_not_establish": "That the edge verified the underlying token: Vultrino verifies only the edge's signature, so whoever holds VULTRINO_IDENTITY_SECRET can assert any workload id and owner. Replay: a signed header can be reused with the same bearer until it expires (at most 300 s), and the signature is not bound to the request path or body. No sender implements the signing contract yet (feir-os runtime-edge and govder do not send this header today); the contract is identity::sign_identity and docs/dev/CONFIGURATION.md. Only the /api/v1/execute route reads the header. The cloud-IAM claim adapters are still not wired inbound. A key rotation has no overlap window (one key at a time).",
       "evidence_run": "38407367367"
@@ -3359,12 +3364,12 @@
         {
           "path": "src/policy/url_canon.rs",
           "symbol": "url_matches_for",
-          "sha256": ""
+          "sha256": "3f77db82de68da180894f9572d8a6625aed347318575c2d6b077fd68004a6e12"
         },
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_condition",
-          "sha256": ""
+          "sha256": "e974955cf02cedef5e52b1acc9591bca4fde321e7affda1ffd1210aeb1c098dc"
         }
       ],
       "mutants": [
