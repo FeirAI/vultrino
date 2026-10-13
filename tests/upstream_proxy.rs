@@ -84,6 +84,19 @@ async fn ambient_proxy_is_ignored_and_opt_in_never_carries_plain_http() {
         .expect("an http target is not routed via a remote proxy");
     assert_eq!(target.load(Ordering::SeqCst), 2, "went direct");
 
+    // A proxy named by a domain other than localhost is remote too.
+    std::env::set_var(
+        "VULTRINO_UPSTREAM_PROXY",
+        "http://proxy.example.invalid:3128",
+    );
+    admit_url("http://93.184.216.34/api").expect_err("a domain proxy is not on this host");
+    std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://[2001:db8::1]:3128");
+    admit_url("http://93.184.216.34/api").expect_err("a public IPv6 proxy is remote");
+    std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://localhost:3128");
+    admit_url("http://93.184.216.34/api").expect("localhost is on this host");
+    std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://[::1]:3128");
+    admit_url("http://93.184.216.34/api").expect("::1 is on this host");
+
     // 2b. A proxy on this host (a loopback sidecar) may carry plain http: the hop never
     //     leaves the machine. The request reaches the proxy and not the target.
     std::env::set_var("VULTRINO_UPSTREAM_PROXY", &proxy_url);
