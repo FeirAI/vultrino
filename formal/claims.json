@@ -3190,8 +3190,8 @@
         },
         {
           "path": "src/config/mod.rs",
-          "symbol": "Config::parse",
-          "sha256": "7d800776246f51101772525fe3c2325b1c00bfc1d6350c20496661a0394023b2"
+          "symbol": "Config::from_raw",
+          "sha256": "0e5e492386909274d9227c7721882e253ec44e7d30d28918450b26d179515791"
         }
       ],
       "mutants": [
