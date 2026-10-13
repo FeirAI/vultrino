@@ -525,6 +525,12 @@
     },
     "vault-file-gone-reload-accepted": {
       "tier": "fast"
+    },
+    "vault-file-gone-fullload-fresh": {
+      "tier": "fast"
+    },
+    "vault-file-gone-compact-rename-unchecked": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -2627,12 +2633,12 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::full_load_locked",
-          "sha256": "b0c2b13f94799a8ec80412ccf4e1bc12d14d425dbe31de35b86a34cebaa74187"
+          "sha256": "f78e00162183463d002db4663c0344cb3c17ee4882a4171dd1cb17a4c2cff4d6"
         },
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::compact_locked",
-          "sha256": "7b1cf584cea80259ddc23025da8e3afa103303c0ee919bc908f83b76462b3c9b"
+          "sha256": "c4813e50aa687cd3b1f6ce8c6958ce5337f83dec706ab31ef471c82dea1a367f"
         },
         {
           "path": "src/storage/file.rs",
@@ -2687,7 +2693,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "3b693754e5dcaf4ed8c182d47b6d16c1711948fe67f4187f72caa30525d419eb"
+          "sha256": "c45f12fe27c3b74a2b3f59dabd5cc5798eb3674ebd17ebdff743ed55e13b7138"
         }
       ],
       "mutants": [
@@ -2716,17 +2722,17 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "3b693754e5dcaf4ed8c182d47b6d16c1711948fe67f4187f72caa30525d419eb"
+          "sha256": "c45f12fe27c3b74a2b3f59dabd5cc5798eb3674ebd17ebdff743ed55e13b7138"
         },
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::full_load_locked",
-          "sha256": "b0c2b13f94799a8ec80412ccf4e1bc12d14d425dbe31de35b86a34cebaa74187"
+          "sha256": "f78e00162183463d002db4663c0344cb3c17ee4882a4171dd1cb17a4c2cff4d6"
         },
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::compact_locked",
-          "sha256": "7b1cf584cea80259ddc23025da8e3afa103303c0ee919bc908f83b76462b3c9b"
+          "sha256": "c4813e50aa687cd3b1f6ce8c6958ce5337f83dec706ab31ef471c82dea1a367f"
         },
         {
           "path": "src/storage/file.rs",
@@ -2750,7 +2756,7 @@
     },
     {
       "id": "vault-file-gone-fails-closed",
-      "statement": "A vultrino process that has loaded the vault (it holds a snapshot token) and then finds the vault file itself gone never turns a halted agent clear: the next dispatch fence read and every write fail closed (Unavailable) and keep failing on repeat, both when the log still holds the kill and right after a compaction when the log is empty too, and a write does not recreate the vault file.",
+      "statement": "A vultrino process that has loaded the vault (it holds a snapshot token) and then finds the vault file itself gone never turns a halted agent clear: the next dispatch fence read and every write fail closed (Unavailable) and keep failing on repeat while the file stays gone, both when the log still holds the kill and right after a compaction when the log is empty too, and a write does not recreate the vault file. The decision uses the same stat as the load, so a deletion landing between the guard's look and the reload's look, or right after a compaction's rename, is refused too and leaves the guard armed. The refusal ends when a vault file reappears: the refusing process then reloads and accepts any file that decrypts under its key.",
       "method": "test",
       "artifacts": [
         "src/storage/file.rs",
@@ -2760,23 +2766,35 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::deleting_the_vault_file_under_a_running_process_never_turns_a_halt_clear",
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::deleting_the_vault_file",
       "covers": [
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
-          "sha256": "3b693754e5dcaf4ed8c182d47b6d16c1711948fe67f4187f72caa30525d419eb"
+          "sha256": "c45f12fe27c3b74a2b3f59dabd5cc5798eb3674ebd17ebdff743ed55e13b7138"
         },
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::vault_file_gone_error",
           "sha256": "71fee59903fa492bdd23d0505be894f1741f572586e963ff2e5654a095d52f67"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::full_load_locked",
+          "sha256": "f78e00162183463d002db4663c0344cb3c17ee4882a4171dd1cb17a4c2cff4d6"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::compact_locked",
+          "sha256": "c4813e50aa687cd3b1f6ce8c6958ce5337f83dec706ab31ef471c82dea1a367f"
         }
       ],
       "mutants": [
-        "vault-file-gone-reload-accepted"
+        "vault-file-gone-reload-accepted",
+        "vault-file-gone-fullload-fresh",
+        "vault-file-gone-compact-rename-unchecked"
       ],
-      "does_not_establish": "Deletion while no vultrino process is running: a process started after the deletion finds no vault and starts one fresh, as for any vault that never existed. Offline truncation of the .wal tail at a record boundary without a durable anchor: accepted limitation, because filesystem write access is outside the threat model (stated in LIMITATIONS). Replacing the vault file with an older copy, or a file replaced by a different one between two looks (the snapshot token then changes and the process reloads as for a compaction). Another process's view: only the process that loaded the vault refuses. Any CI run other than the recorded one.",
+      "does_not_establish": "Deletion while no vultrino process is running: a process started after the deletion finds no vault and starts one fresh, as for any vault that never existed. Offline truncation of the .wal tail at a record boundary without a durable anchor: accepted limitation, because filesystem write access is outside the threat model (stated in LIMITATIONS). Replacing the vault file with an older copy, or a file replaced by a different one between two looks (the snapshot token then changes and the process reloads as for a compaction). A vault file recreated by a new process with a new salt: the refusing process then keeps failing with a decryption error (not Unavailable) while the new process answers Clear. Another process's view: only the process that loaded the vault refuses. Any CI run other than the recorded one.",
       "evidence_run": "38323278208"
     },
     {
@@ -2883,7 +2901,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::full_load_locked",
-          "sha256": "b0c2b13f94799a8ec80412ccf4e1bc12d14d425dbe31de35b86a34cebaa74187"
+          "sha256": "f78e00162183463d002db4663c0344cb3c17ee4882a4171dd1cb17a4c2cff4d6"
         }
       ],
       "mutants": [

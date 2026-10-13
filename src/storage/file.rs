@@ -1701,7 +1701,17 @@ impl FileStorage {
         self.fsync_dir()?;
         self.crash_point("compact.after_snapshot_rename")?;
         self.reset_wal()?;
-        log.snap_token = file_token(&self.path);
+        #[cfg(test)]
+        if self.fault_armed("compact.delete_vault_after_rename") {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        // Decide on one stat: a vault file that vanished right after the rename must not be
+        // recorded as a fresh view (that would disarm the deleted-file guard). `loaded` stays
+        // false and the old token stays set, so every later look refuses.
+        let Some(new_token) = file_token(&self.path) else {
+            return Err(self.vault_file_gone_error());
+        };
+        log.snap_token = Some(new_token);
         log.snap_len = len;
         log.wal_offset = 0;
         log.snapshot_version = STORAGE_VERSION;
@@ -1726,6 +1736,12 @@ impl FileStorage {
         // started after the deletion sees no vault at all, as for any vault that never existed.
         if log.snap_token.is_some() && file_token(&self.path).is_none() {
             return Err(self.vault_file_gone_error());
+        }
+        // Test-only: delete the vault file in the window between the guard's stat and the
+        // reload's stat (an accidental deletion's timing is nobody's to choose).
+        #[cfg(test)]
+        if self.fault_armed("sync.delete_vault_after_guard") {
+            let _ = std::fs::remove_file(&self.path);
         }
         if log.loaded {
             let tok = file_token(&self.path);
@@ -1833,6 +1849,12 @@ impl FileStorage {
     ) -> Result<(), StorageError> {
         log.loaded = false;
         let snap_tok = file_token(&self.path);
+        // Same stat decides: a process that holds a snapshot token and finds the file gone here
+        // (deleted after the guard in sync_locked looked) must not treat it as a fresh vault. The
+        // token stays set, so the guard stays armed for this process.
+        if snap_tok.is_none() && log.snap_token.is_some() {
+            return Err(self.vault_file_gone_error());
+        }
         let (applied, mut fresh, version) = if snap_tok.is_some() {
             self.read_snapshot()?
         } else {

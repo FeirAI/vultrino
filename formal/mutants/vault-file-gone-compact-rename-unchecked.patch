@@ -1,0 +1,16 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 6d4147c..2780b25 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1708,10 +1708,7 @@ impl FileStorage {
+         // Decide on one stat: a vault file that vanished right after the rename must not be
+         // recorded as a fresh view (that would disarm the deleted-file guard). `loaded` stays
+         // false and the old token stays set, so every later look refuses.
+-        let Some(new_token) = file_token(&self.path) else {
+-            return Err(self.vault_file_gone_error());
+-        };
+-        log.snap_token = Some(new_token);
++        log.snap_token = file_token(&self.path);
+         log.snap_len = len;
+         log.wal_offset = 0;
+         log.snapshot_version = STORAGE_VERSION;
