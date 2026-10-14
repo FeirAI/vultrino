@@ -528,6 +528,18 @@
     },
     "vault-file-gone-compact-rename-unchecked": {
       "tier": "fast"
+    },
+    "vault-fence-reader-skips-writer-gate": {
+      "tier": "full"
+    },
+    "vault-writer-skips-writer-gate": {
+      "tier": "full"
+    },
+    "vault-restore-skips-checksum": {
+      "tier": "full"
+    },
+    "vault-backup-allows-missing-wal": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -2568,7 +2580,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_mutate_blocking",
-          "sha256": "def20882b09da8fce842394ca4f467bd011f97f30d854d404b790ef577f738d5"
+          "sha256": "86f5b2cd913cbc439850cac5659f6396f67d467f580a7d1588816fa22e43a1be"
         },
         {
           "path": "src/storage/file.rs",
@@ -2615,7 +2627,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_mutate_blocking",
-          "sha256": "def20882b09da8fce842394ca4f467bd011f97f30d854d404b790ef577f738d5"
+          "sha256": "86f5b2cd913cbc439850cac5659f6396f67d467f580a7d1588816fa22e43a1be"
         },
         {
           "path": "src/storage/file.rs",
@@ -2664,7 +2676,7 @@
     },
     {
       "id": "vault-fence-shared-lock-delta-read",
-      "statement": "The dispatch kill-fence read takes the cross-process vault lock shared, not exclusive, and reads only what changed since this process last looked. An unchanged vault costs the fence zero decrypts, zero bytes written and zero fsyncs; after another handle appends one record the fence decrypts exactly that one record and sees the kill it carries; another handle's kill and its lift are seen without a reload (the lifted kill still refuses work admitted before it); a compaction by another handle is picked up. A fence read completes while another handle holds the lock shared, and waits while another handle holds it exclusive, so committed state is still what the fence sees. A v9 process rewriting the snapshot under a running v10 process is refused (fail closed), including right after a compaction when the log is empty and its length equals the process offset, so the snapshot version is the only sign.",
+      "statement": "The dispatch kill-fence read takes the cross-process vault lock shared, not exclusive, and reads only what changed since this process last looked. An unchanged vault costs the fence zero decrypts, zero bytes written and zero fsyncs; after another handle appends one record the fence decrypts exactly that one record and sees the kill it carries; another handle's kill and its lift are seen without a reload (the lifted kill still refuses work admitted before it); a compaction by another handle is picked up. A fence read completes while another handle holds the lock shared, and waits while another handle holds it exclusive, so committed state is still what the fence sees. A v9 process rewriting the snapshot under a running v10 process is refused (fail closed), including right after a compaction when the log is empty and its length equals the process offset, so the snapshot version is the only sign. A kill write that is waiting for the vault lock holds the writer-intent gate (a sidecar lock file taken exclusively before the vault lock, released once the vault lock is held), and every fence read passes through that gate before its shared lock, so a fence read that starts after a waiting kill write queues behind it and the write commits first; with eight handles looping fence reads, a kill write on another handle completes within five seconds.",
       "method": "test",
       "artifacts": [
         "src/storage/file.rs",
@@ -2675,12 +2687,12 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::an_unchanged_vault_fence_read_decrypts_nothing storage::file::vault_tests::a_fence_read_after_a_foreign_write_decrypts_only_that_record storage::file::vault_tests::the_fence_sees_another_handles_kill_and_its_lift_without_a_reload storage::file::vault_tests::fence_reads_hold_the_lock_shared_so_dispatches_do_not_serialize storage::file::vault_tests::a_writer_still_excludes_fence_readers storage::file::vault_tests::another_handles_compaction_is_picked_up_by_the_fence storage::file::vault_tests::an_older_build_rewriting_the_snapshot_under_a_running_process_is_refused storage::file::vault_tests::an_older_build_rewriting_the_snapshot_after_compaction_is_refused",
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::an_unchanged_vault_fence_read_decrypts_nothing storage::file::vault_tests::a_fence_read_after_a_foreign_write_decrypts_only_that_record storage::file::vault_tests::the_fence_sees_another_handles_kill_and_its_lift_without_a_reload storage::file::vault_tests::fence_reads_hold_the_lock_shared_so_dispatches_do_not_serialize storage::file::vault_tests::a_writer_still_excludes_fence_readers storage::file::vault_tests::another_handles_compaction_is_picked_up_by_the_fence storage::file::vault_tests::an_older_build_rewriting_the_snapshot_under_a_running_process_is_refused storage::file::vault_tests::an_older_build_rewriting_the_snapshot_after_compaction_is_refused storage::file::vault_tests::a_waiting_kill_write_holds_new_fence_readers_behind_it storage::file::vault_tests::a_kill_write_completes_in_bounded_time_under_a_stream_of_fence_reads",
       "covers": [
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_read_blocking",
-          "sha256": "3edb202d541c7b2235798e571ffc01a8a6a3ef7b8e6de808f3e9a42090b88446"
+          "sha256": "2f791f4ed619feee763b4f21c9f41f7419702cd11f869031f21ee5208488d9ea"
         },
         {
           "path": "src/storage/file.rs",
@@ -2691,15 +2703,27 @@
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
           "sha256": "613c23120fc3e0e64f548c5d90e98c437205b0c69099ed3a28ecbbda4eb056b4"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::pass_writer_gate",
+          "sha256": "dea6bcc8ecf529155257f5db5dbf85db81f52852e9d00740f9834c60bb4beaa4"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::gate_file",
+          "sha256": "4ae29370c0d90baaf48e8f7729a9dbbd0cb5277fcdee82a5a59ab282d9f7d1d8"
         }
       ],
       "mutants": [
         "vault-fence-read-skips-lock",
         "vault-fence-read-takes-exclusive-lock",
         "vault-fence-ignores-appended-records",
-        "vault-v9-rewrite-accepted-after-compaction"
+        "vault-v9-rewrite-accepted-after-compaction",
+        "vault-fence-reader-skips-writer-gate",
+        "vault-writer-skips-writer-gate"
       ],
-      "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation: flock does not prefer a waiting writer, so under sustained overlapping dispatches a kill write can wait without bound against the caller's timeout. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
+      "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation is bounded by the shared holders already inside the lock when the writer arrives; the bound is tested with handles in one process (eight looping readers, five seconds), not measured as a latency figure, and not across several OS processes, and it relies on flock on a local filesystem. Writers queue one at a time on the gate. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
       "evidence_run": "38332553597"
     },
     {
@@ -2809,7 +2833,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_mutate_blocking",
-          "sha256": "def20882b09da8fce842394ca4f467bd011f97f30d854d404b790ef577f738d5"
+          "sha256": "86f5b2cd913cbc439850cac5659f6396f67d467f580a7d1588816fa22e43a1be"
         }
       ],
       "mutants": [
@@ -2882,7 +2906,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::bootstrap_locked",
-          "sha256": "aaadedc4cc24f26cd2679736c8b575ec2145d3ce2f81d66762180c459063e7c3"
+          "sha256": "0e78a12496efea4ae9bcc212853510b9212ebc001c58c7002c39d18bd9a53d1f"
         },
         {
           "path": "src/storage/file.rs",
@@ -2956,6 +2980,53 @@
       ],
       "does_not_establish": "That the process enforces what it reports beyond the code paths those fields are read from: the report reads the engine and config objects the request handlers use, it does not re-run a policy decision. It does not prove the approver key is strong, rotated or known only to the broker, that the vault file on disk is at the reported format version (the field is the version this binary writes, a vault is migrated when opened), that no second vultrino process shares the vault (a process cannot see its peers), or that a deployment actually calls the endpoint: that is the feir-os posture verifier. The git commit is the one the build script saw; a build from an archive reports unknown. The detector runs the endpoint against an in-memory test router, not a deployed binary.",
       "evidence_run": "38200796647"
+    },
+    {
+      "id": "vault-backup-restore-consistent",
+      "statement": "vultrino vault backup copies the vault snapshot, its .wal, the outbox and the averin stores while holding the exclusive vault lock, into a new empty directory, with a manifest of SHA-256 sums and sizes; it refuses a vault that has no .wal (a partial backup), a destination that is not empty, and checks the copy by re-reading it against the manifest and by opening it under the password. vultrino vault restore checks the manifest, every checksum and size, and that nothing is in the directory that the manifest does not list, requires the snapshot and the .wal in the manifest, and opens the copy, all before it touches the target; it refuses to replace an existing vault without --force (then moves the old files aside, never deletes them), stages every file before renaming any, and while it runs leaves <vault>.restore-pending, which makes FileStorage refuse to open until the restore is re-run. A restored vault holds the kill that was in its .wal.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/vault_backup.rs",
+        "src/storage/file.rs",
+        "src/main.rs",
+        "docs/dev/LIMITATIONS.md"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::vault_backup::tests",
+      "covers": [
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "backup",
+          "sha256": "75a026b405329ddb702b65053dab0cc4765d3d03bb50576caf5ad7a773d5e9b0"
+        },
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "restore",
+          "sha256": "80e3d70acc7d7fcc2f1515c7ddb9312e6589a9e89bba77c5f568a221734936d0"
+        },
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "verify_manifest",
+          "sha256": "37113f5e9b68f160586d7fd159ce8014588068f483d34c4cca4d5971468c9495"
+        },
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "collect",
+          "sha256": "6241d0cdf6add0c384b0956296dceea5dcd9731f0c2700e3e9cfe3c0d0ba00a8"
+        },
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "lock_everything",
+          "sha256": "d37f0513b900ecbd2ade166f236b55faa671e306c62ab6cace8b4dce22a26474"
+        }
+      ],
+      "mutants": [
+        "vault-restore-skips-checksum",
+        "vault-backup-allows-missing-wal"
+      ],
+      "does_not_establish": "Rollback to an older but self-consistent backup, or a backup tampered with together with its manifest by someone who can write the backup directory: the manifest is not signed. A backup taken while a process holds the vault or the durable averin queue is refused after 30 seconds (vault) or at once (queue), not tested with a second OS process. Power-loss durability of the restore renames: a crash between them is covered by the marker, which is tested only by presence, not by injecting a crash. The averin queue segments are copied as files and are not opened by the open check. Backups of a vault on a filesystem without flock semantics. A damaged final .wal line: there is no vault check command yet. Any CI run."
     }
   ]
 }

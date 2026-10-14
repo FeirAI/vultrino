@@ -1,0 +1,13 @@
+diff --git a/src/storage/vault_backup.rs b/src/storage/vault_backup.rs
+index 20ea640..b3efd17 100644
+--- a/src/storage/vault_backup.rs
++++ b/src/storage/vault_backup.rs
+@@ -284,7 +284,7 @@ fn verify_manifest(src: &Path) -> BackupResult<Manifest> {
+         }
+         let p = src.join(&e.path);
+         let (sha, size) = sha_of(&p).map_err(|err| format!("{}: {err}", e.path))?;
+-        if sha != e.sha256 || size != e.size {
++        if size != e.size && sha != e.sha256 {
+             return Err(format!(
+                 "{} does not match its checksum; refusing this backup",
+                 e.path

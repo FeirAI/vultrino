@@ -1,0 +1,13 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index 6e88a7d..6bad992 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -307,7 +307,7 @@ impl VaultIoStats {
+ macro_rules! lock_vault_exclusive {
+     ($s:expr, $flock:ident, $guard:ident) => {
+         let mut gate = $s.gate_file()?;
+-        let gate_guard = gate.write().map_err(StorageError::Io)?;
++        let gate_guard = gate.read().map_err(StorageError::Io)?;
+         let mut $flock = $s.lock_file()?;
+         let $guard = $flock.write().map_err(StorageError::Io)?;
+         drop(gate_guard);
