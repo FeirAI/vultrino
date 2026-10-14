@@ -4047,9 +4047,17 @@ pub async fn api_list_events(
                     }
                 })
                 .collect();
+            // LER-02: tell the poller about appends that failed and are not yet announced
+            // by a `meter.lost` marker. While this is non-zero the feed is known to be
+            // missing events, so a consumer must not treat an idle page as "caught up".
+            let gap_pending = state.storage.meter_loss().gap_pending;
             (
                 StatusCode::OK,
-                Json(serde_json::json!({ "events": bodies, "next_cursor": next })),
+                Json(serde_json::json!({
+                    "events": bodies,
+                    "next_cursor": next,
+                    "meter_gap_pending": gap_pending,
+                })),
             )
                 .into_response()
         }

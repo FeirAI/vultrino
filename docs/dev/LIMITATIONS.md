@@ -26,7 +26,11 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   stays contiguous. It is no longer silent: every failed append is counted (reported
   on `/api/v1/health`, `/api/v1/ready` and `/api/v1/posture`) and the next
   successful append is followed by a `meter.lost` marker event with the count, the
-  first and last failure times and the lost event types. The count is held in memory:
+  first and last failure times and the lost event types. While appends are still
+  failing, `GET /api/v1/events` reports the pending count as `meter_gap_pending` so a
+  poller can freeze its freshness watermark during the outage. The calls themselves
+  are still admitted (a full disk does not fail closed on the gateway). The count is
+  held in memory:
   if the process dies before an append succeeds again the marker is never written,
   and the consumer's stale-watermark detection is the only remaining signal. An
   out-of-band meter still bounds, but does not eliminate, overshoot. (See METERING.md

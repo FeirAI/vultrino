@@ -2476,6 +2476,81 @@ async fn test_admin_halt_rejects_glob_label() {
 }
 
 #[tokio::test]
+async fn test_event_feed_reports_pending_meter_gap_while_appends_fail() {
+    // LER-02: during a sustained append failure the feed's idle pages looked identical to a
+    // quiet gateway. The envelope now carries `meter_gap_pending` so a poller can refuse to
+    // treat the feed as caught up while it is non-zero, and it drops to 0 once the marker
+    // is written.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let auth_manager = AuthManager::new();
+    let (key, api_key) = auth_manager
+        .create_api_key("admin-key", "admin", None)
+        .unwrap();
+    storage.store_api_key(&api_key).await.unwrap();
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        Config::default(),
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+    let feed = |router: axum::Router, key: String| async move {
+        let resp = router
+            .oneshot(admin_req(
+                "GET",
+                "/api/v1/events?after=0",
+                &key,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()
+    };
+
+    assert_eq!(feed(router.clone(), key.clone()).await["meter_gap_pending"], 0);
+
+    let tmp = dir.path().join("outbox.tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    assert!(storage
+        .append_event("a", "meter.observed", serde_json::json!({}))
+        .await
+        .is_err());
+    let body = feed(router.clone(), key.clone()).await;
+    assert_eq!(body["meter_gap_pending"], 1, "failing appends are visible on the feed");
+    assert!(body["events"].as_array().unwrap().is_empty());
+
+    std::fs::remove_dir(&tmp).unwrap();
+    storage
+        .append_event("a", "meter.observed", serde_json::json!({}))
+        .await
+        .unwrap();
+    let body = feed(router, key).await;
+    assert_eq!(body["meter_gap_pending"], 0);
+    assert!(body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["body"]["event"] == "meter.lost"));
+}
+
+#[tokio::test]
 async fn test_admin_event_replay_api() {
     // V9: events emitted by admin actions are replayable from a cursor.
     let (router, _storage, _server, key) = build_admin_router().await;

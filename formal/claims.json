@@ -3042,12 +3042,12 @@
         "layered-limit-refusal-still-charges",
         "layered-limit-duplicate-charged-twice"
       ],
-      "does_not_establish": "Example tests over the listed rule shapes, not an exhaustive check, and the Kani precedence harnesses do not model the Allow tier's guard set. A RateLimit written inside or or not is not part of the guard set and keeps its inline evaluation. Counters are per process and in memory, so two vultrino processes enforce their own caps (the cross-process shared limit is a separate item). The fixed-window transition is covered by the rate-limiter trace vectors, not here. Which matching rule's reason is reported when several match follows storage order. The tests run the engine directly; that the server calls it on every admission path is covered by the permit-kernel claims.",
+      "does_not_establish": "Example tests over the listed rule shapes, not an exhaustive check, and the Kani precedence harnesses do not model the Allow tier's guard set. A RateLimit written inside or or not is not part of the guard set and keeps its inline evaluation. Counters are per process and in memory, so two vultrino processes enforce their own caps (the cross-process shared limit is a separate item). The fixed-window transition is covered by the rate-limiter trace vectors, not here. Which matching rule's reason is reported when several match follows storage order. The tests run the engine directly; that the server calls it on every admission path is covered by the permit-kernel claims. The Allow tier evaluates every Allow rule's non-guard conditions, so a RateLimit written inside or or not is charged on every request even when another rule matched or when the guard set then refuses it: that over-charges (the fail-closed direction) and is not tested for exactness.",
       "evidence_run": "38591586258"
     },
     {
       "id": "meter-append-loss-announced",
-      "statement": "A failed outbox append is counted and later announced. In the unit tests of the real file storage, with every outbox write forced to fail by a directory sitting on the writer's temp path: each failed append returns an error and increments the lost counter and the pending-gap counter; no marker can be written while writes fail; after the writer recovers the next successful append is followed by exactly one meter.lost event carrying lost_count, the first and last failure times and the distinct lost event types, with the sequence still gap-free; the pending gap returns to zero while the lifetime counter stays; no second marker appears for the same loss; a second outage gets its own marker. GET /api/v1/health reports meter_lost_total and meter_gap_pending (and stays status ok), GET /api/v1/ready reports meter_gap_pending, and the posture report carries the same counters under meter.",
+      "statement": "A failed outbox append is counted and later announced. In the unit tests of the real file storage, with every outbox write forced to fail by a directory sitting on the writer's temp path: each failed append returns an error and increments the lost counter and the pending-gap counter; no marker can be written while writes fail; after the writer recovers the next successful append is followed by exactly one meter.lost event carrying lost_count, the first and last failure times and the distinct lost event types, with the sequence still gap-free; the pending gap returns to zero while the lifetime counter stays; no second marker appears for the same loss; a second outage gets its own marker. GET /api/v1/health reports meter_lost_total and meter_gap_pending (and stays status ok), GET /api/v1/ready reports meter_gap_pending, and the posture report carries the same counters under meter. GET /api/v1/events carries meter_gap_pending on its envelope: 0 when healthy, the pending count while appends fail (with no events and no marker yet), and 0 again once the marker has been written.",
       "method": "test",
       "artifacts": [
         "src/storage/outbox_store.rs",
@@ -3060,7 +3060,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- --exact storage::file::vault_tests::a_failed_append_is_counted_then_announced_by_a_meter_lost_marker storage::file::vault_tests::a_second_outage_gets_its_own_marker web::posture::tests::report_carries_the_meter_append_loss_counters && cargo test --locked --no-default-features --test web_smoke -- --exact test_health_and_ready_report_a_failed_outbox_append",
+      "detector": "cargo test --locked --no-default-features --lib -- --exact storage::file::vault_tests::a_failed_append_is_counted_then_announced_by_a_meter_lost_marker storage::file::vault_tests::a_second_outage_gets_its_own_marker web::posture::tests::report_carries_the_meter_append_loss_counters && cargo test --locked --no-default-features --test web_smoke -- --exact test_health_and_ready_report_a_failed_outbox_append test_event_feed_reports_pending_meter_gap_while_appends_fail",
       "covers": [
         {
           "path": "src/storage/outbox_store.rs",
@@ -3091,19 +3091,25 @@
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
           "sha256": "34dd93497bb9645a528e782d3f0389956ec89fdbabbb872e0c5fa4f672ef87f6"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_list_events",
+          "sha256": ""
         }
       ],
       "mutants": [
         "meter-loss-not-counted",
         "meter-lost-marker-not-appended",
-        "meter-health-gap-hidden"
+        "meter-health-gap-hidden",
+        "meter-feed-gap-pending-hidden"
       ],
-      "does_not_establish": "The counters and the pending marker are held in memory: if the process exits before an append succeeds again the marker is never written, and a consumer's stale watermark is the only remaining signal. Failures are produced by one injected fault (an unwritable temp path), not by a real full disk or a failing fsync. Only the direct append path is counted; events staged in the vault and drained later are retried by the reconciler instead. That a consumer acts on the marker is the leria claim for its poller, not this one. Says nothing about events lost while the process is down or about the outbox being tampered with.",
-      "evidence_run": "38591586258"
+      "does_not_establish": "The counters and the pending marker are held in memory: if the process exits before an append succeeds again the marker is never written, and a consumer's stale watermark is the only remaining signal. Failures are produced by one injected fault (an unwritable temp path), not by a real full disk or a failing fsync. Only the direct append path is counted; events staged in the vault and drained later are retried by the reconciler instead. That a consumer acts on the marker is the leria claim for its poller, not this one. Says nothing about events lost while the process is down or about the outbox being tampered with. Failed appends do not fail the metered call: vultrino keeps admitting calls during an outage, and the pending count is the only in-band signal until the marker (so the fail-open choice stands and the consumer's watermark is the control). The count is in the unsigned envelope. That the consumer acts on it is the leria claim meter-lost-marker-holds-as-of.",
+      "evidence_run": ""
     },
     {
       "id": "stream-usage-charged-without-trailer",
-      "statement": "A streamed LLM call is charged tokens even when the provider's usage trailer does not reach the client. With a gated test upstream: when the client hangs up before the trailer, the producer keeps draining the upstream and the token event carries the provider's exact counts (OpenAI-style trailer 11 and 22; Anthropic message_delta output 77 rather than message_start's provisional 1) with no estimated marker; when the stream ends without any trailer the token event carries an estimate (3000 generated bytes give 1000 output tokens, input from the request size) and dims.estimated is true; when the drain's idle cap fires first the call is charged an estimate and the drain stops at the cap; a halted stream and a stream with no trailer on the buffered fallback are charged estimates. In unit tests: an Anthropic message_start usage is not final, an OpenAI trailer, a Responses response.completed and an Anthropic message_delta are, a null usage is not; the estimate counts generated delta text and not framing, prefers the provider's real counts, is capped by the request's own output limit and is never zero; the estimated payload carries dims.estimated and the exact one does not.",
+      "statement": "A streamed LLM call is charged tokens even when the provider's usage trailer does not reach the client. With a gated test upstream: when the client hangs up before the trailer, the producer keeps draining the upstream and the token event carries the provider's exact counts (OpenAI-style trailer 11 and 22; Anthropic message_delta output 77 rather than message_start's provisional 1) with no estimated marker; when the stream ends without any trailer the token event carries an estimate (3000 generated bytes give 1000 output tokens, input from the request size) and dims.estimated is true; when the drain's idle cap fires first the call is charged an estimate and the drain stops at the cap; a halted stream and a stream with no trailer on the buffered fallback are charged estimates. In unit tests: an Anthropic message_start usage is not final, an OpenAI trailer, a Responses response.completed and an Anthropic message_delta are, a null usage is not; the estimate counts generated delta text and not framing, prefers the provider's real counts, is capped by the request's own output limit and is never zero; the estimated payload carries dims.estimated and the exact one does not. A halt that lands after the client has already hung up, while the producer is draining, closes the upstream within one chunk (the upstream is dropped, not drained to its idle cap) and the call is charged an estimate.",
       "method": "test",
       "artifacts": [
         "src/outbox.rs",
@@ -3113,7 +3119,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- --exact outbox::tests::anthropic_message_start_usage_is_provisional_until_the_final_delta outbox::tests::openai_trailer_and_responses_completed_are_complete_but_a_null_usage_is_not outbox::tests::estimate_counts_generated_text_not_framing_and_prefers_real_counts outbox::tests::estimate_falls_back_to_raw_bytes_when_a_giant_line_stopped_parsing outbox::tests::request_output_limit_is_read_from_every_provider_shape outbox::tests::estimated_token_payload_carries_the_marker_and_the_normal_one_does_not && cargo test --locked --no-default-features --test llm_proxy_integration -- --exact vul01_disconnect_before_the_trailer_still_charges_the_providers_exact_count vul01_a_provisional_anthropic_output_count_is_not_charged_as_final vul01_a_stream_that_ends_without_any_trailer_is_charged_an_estimate vul01_the_drain_is_bounded_by_the_idle_cap_and_then_estimates llm_streamed_without_a_usage_trailer_is_charged_an_estimate llm_streamed_halt_cancels_midstream",
+      "detector": "cargo test --locked --no-default-features --lib -- --exact outbox::tests::anthropic_message_start_usage_is_provisional_until_the_final_delta outbox::tests::openai_trailer_and_responses_completed_are_complete_but_a_null_usage_is_not outbox::tests::estimate_counts_generated_text_not_framing_and_prefers_real_counts outbox::tests::estimate_falls_back_to_raw_bytes_when_a_giant_line_stopped_parsing outbox::tests::request_output_limit_is_read_from_every_provider_shape outbox::tests::estimated_token_payload_carries_the_marker_and_the_normal_one_does_not && cargo test --locked --no-default-features --test llm_proxy_integration -- --exact vul01_disconnect_before_the_trailer_still_charges_the_providers_exact_count vul01_a_provisional_anthropic_output_count_is_not_charged_as_final vul01_a_stream_that_ends_without_any_trailer_is_charged_an_estimate vul01_the_drain_is_bounded_by_the_idle_cap_and_then_estimates llm_streamed_without_a_usage_trailer_is_charged_an_estimate llm_streamed_halt_cancels_midstream vul01_a_halt_after_the_hangup_closes_the_draining_upstream_at_once",
       "covers": [
         {
           "path": "src/outbox.rs",
@@ -3161,10 +3167,11 @@
         "stream-provisional-usage-final",
         "stream-estimate-unmarked",
         "stream-no-trailer-no-estimate",
-        "stream-drain-idle-cap-removed"
+        "stream-drain-idle-cap-removed",
+        "stream-drain-ignores-halt"
       ],
-      "does_not_establish": "The estimate is a rough one (about one token per three generated bytes, rounded up on purpose), not the provider's count: it over-charges typical text and can still under-charge text that tokenises very densely. It needs a model from the request or the stream to be priced; a stream with neither meters the api-calls event only. The upstream is a test double with the OpenAI and Anthropic shapes, not a live provider; Gemini and the Responses API shapes are covered by the accumulator unit tests only. The drain is bounded by the same idle, total and byte caps as a live stream, not by a new cap, and a hostile client can hold an upstream stream open for that long. A halt closes the upstream (stopping generation) and is charged an estimate rather than drained. Says nothing about leria pricing or deduplicating the event, which is leria's claim.",
-      "evidence_run": "38591586258"
+      "does_not_establish": "The estimate is a rough one (about one token per three generated bytes, rounded up on purpose), not the provider's count: it over-charges typical text and can still under-charge text that tokenises very densely. It needs a model from the request or the stream to be priced; a stream with neither meters the api-calls event only. The upstream is a test double with the OpenAI and Anthropic shapes, not a live provider; Gemini and the Responses API shapes are covered by the accumulator unit tests only. The drain is bounded by the same idle, total and byte caps as a live stream, not by a new cap, and a hostile client can hold an upstream stream open for that long. A halt closes the upstream (stopping generation) and is charged an estimate rather than drained, both while forwarding and while draining after a hang-up. The estimate counts text under delta keys only, so a provider that streams text elsewhere (Gemini candidates parts) estimates low, hidden reasoning tokens are not counted, and a provider that reports cumulative usage on every chunk would be read as complete on the first one; today only stream:true requests take this path and the OpenAI and Anthropic shapes are the tested ones. Says nothing about leria pricing or deduplicating the event, which is leria's claim.",
+      "evidence_run": ""
     }
   ]
 }

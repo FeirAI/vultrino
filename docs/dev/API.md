@@ -412,9 +412,14 @@ delivery uses, plus its `Govder-Signature` when a signing secret is configured):
     { "body": { "sequence": 42, "subject": "…", "event": "meter.observed", "payload": {…}, "created_at": "…" },
       "signature": "sha256=…" }
   ],
-  "next_cursor": 42
+  "next_cursor": 42,
+  "meter_gap_pending": 0
 }
 ```
+
+`meter_gap_pending` is the number of failed event appends not yet announced by a
+`meter.lost` marker. A poller must not treat an idle page as caught up while it is
+non-zero. It is on the envelope, not inside a signed body.
 
 `next_cursor` is what a consumer persists for the next poll. See
 [METERING.md](METERING.md) for the `meter.observed` payloads.

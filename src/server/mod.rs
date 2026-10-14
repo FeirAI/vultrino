@@ -151,6 +151,7 @@ async fn drain_upstream_for_usage<S>(
     usage_acc: &mut crate::outbox::UsageAccumulator,
     ctx: &StreamEstimateContext,
     finalizer: &StreamFinalizer,
+    abort: &tokio::sync::Notify,
     idle: Option<std::time::Duration>,
     deadline: Option<tokio::time::Instant>,
     max_bytes: u64,
@@ -163,6 +164,9 @@ async fn drain_upstream_for_usage<S>(
         tokio::pin!(next);
         let item = tokio::select! {
             biased;
+            // A V6 halt landing during the drain closes the upstream at once (the
+            // provider stops generating); the caller then charges an estimate.
+            _ = abort.notified() => None,
             _ = async {
                 match deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -3556,6 +3560,7 @@ impl VultrinoServer {
                     &mut usage_acc,
                     &estimate_ctx,
                     &finalizer,
+                    &abort,
                     idle,
                     deadline,
                     max_bytes,

@@ -70,9 +70,10 @@ safely.
 For an admitted `/execute` (buffered) or LLM-proxy stream whose response carries a
 parseable provider usage block, the metering path emits a **second** `meter.observed`
 event (the token observation) alongside the V13a event for the same call, via the
-shared `emit_meter`. A response with no parseable usage block (a streamed response
-whose client suppressed the usage trailer, a truncated/halted stream, or any non-LLM
-action) emits **only** the V13a event.
+shared `emit_meter`. A buffered response with no parseable usage block (or any non-LLM
+action) emits **only** the V13a event. A streamed LLM call whose usage block never
+arrives (a truncated or halted stream, a cap hit, an NVIDIA tool stream) is charged an
+**estimate** instead, marked `dims.estimated = "true"` (see below).
 
 Built by `crate::outbox::meter_tokens_payload`:
 
@@ -131,7 +132,7 @@ RAW (pre-scrub) SSE chunk to a `crate::outbox::UsageAccumulator`, which line-buf
 across chunk boundaries and reads the token counts + model from the **top level** of
 each recognized `data:` event (never a substring scan, so a prompt that literally
 contains a `usage` object can't forge a count). On a **clean** end the parsed split
-is emitted as the V13b token event — identical shape to the buffered path. A stream
+is emitted as the V13b token event - identical shape to the buffered path. A stream
 whose usage block was not final (see below) is charged an estimate instead. Three
 wire shapes are recognized:
 
@@ -166,8 +167,17 @@ wire shapes are recognized:
   bytes per token over-estimates typical text on purpose. leria ingests and prices an
   estimated event like any other and keeps the marker on the ledger entry; the
   authoritative bill still reconciles it.
-- **A halt does not drain.** A halted agent's upstream is closed, which stops
-  generation, and the call is charged an estimate.
+- **A halt does not drain, before or after a hang-up.** A halted agent's upstream is
+  closed, which stops generation, and the call is charged an estimate. This holds
+  when the halt lands while the producer is still forwarding and also when it lands
+  while the producer is draining after the client left: the drain watches the
+  session's abort signal first and stops at once.
+- **Bounds of the estimate.** Output is counted from text under `delta` keys, so a
+  provider that streams text elsewhere (for example Gemini `candidates[].content.parts`)
+  estimates low, hidden reasoning tokens are not in the byte count, and a provider
+  that reports a cumulative usage block on every chunk is read as complete on the
+  first one. OpenAI and Anthropic shapes are covered; today only requests with
+  `stream: true` take this path.
 - **No request model.** A token event needs a model to select leria's rate card, so a
   stream with no model in the request or the stream meters V13a only.
 
@@ -198,7 +208,7 @@ There are **two distinct loss modes**, and the gap detector covers only one:
   catches it.
 - **Failed `append_event`** → the fail-open emit does not fail the action. The
   monotonic sequence is minted **inside** the append (only on success), so a failed
-  append mints **no** sequence and the stored stream stays contiguous — **there is no
+  append mints **no** sequence and the stored stream stays contiguous - **there is no
   hole to detect.** Sequence-gap detection is therefore **not** the compensation for
   a failed append; the `meter.lost` marker below is.
 
@@ -211,13 +221,17 @@ and `GET /api/v1/posture` (`meter.*`). On the **next successful append** the out
 writes one `meter.lost` event right after it, with payload
 `{lost_count, first_lost_at, last_lost_at, event_types}` (no body, no secret); if that
 marker append itself fails the counts are kept and it is retried on the following
-success. A consumer that meters from the feed treats the marker as "usage may be
+success. While failures are still pending, `GET /api/v1/events` also reports the
+pending count as `meter_gap_pending` on the response envelope (next to `events` and
+`next_cursor`), so a poller can tell an idle feed from one that is dropping events
+during the outage itself; leria freezes its `as_of` watermark while it is non-zero.
+The envelope is not signed. A consumer that meters from the feed treats the marker as "usage may be
 missing": leria (`gatewaypoll`) freezes its `as_of` watermark for a hold-down period so
 govder's existing meter-stale Deny fires. The counters live in memory: if the process
 dies before an append succeeds again, no marker is written, and only a stale watermark
 remains as the signal.
 
-An out-of-band meter still permits a **bounded overshoot** that an outage widens —
+An out-of-band meter still permits a **bounded overshoot** that an outage widens -
 only an in-path hard ceiling (not built in Vultrino's v1) is zero-overshoot. The
 fail-open emit stays correct for `/execute` availability; the consumer **mitigates**
 but does not eliminate the bounded window, and the authoritative source (invoice)

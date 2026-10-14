@@ -1408,6 +1408,17 @@ async fn hang_up_midstream(
     config: Config,
     wait: std::time::Duration,
 ) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
+    hang_up_midstream_then(end, release_gate, false, config, wait).await
+}
+
+/// As [`hang_up_midstream`], optionally halting the agent after the hang-up (V6).
+async fn hang_up_midstream_then(
+    end: GatedEnd,
+    release_gate: bool,
+    halt_after_hangup: bool,
+    config: Config,
+    wait: std::time::Duration,
+) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
     let (router, storage, srv) = build_stack(config).await;
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     srv.plugins().register(Arc::new(GatedStreamingPlugin {
@@ -1435,6 +1446,18 @@ async fn hang_up_midstream(
     // The client hangs up here, with the upstream still producing.
     drop(resp);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    if halt_after_hangup {
+        let token_id = storage
+            .list_use_tokens()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+        let outcome = srv.halt_agent(&token_id).await.unwrap();
+        assert_eq!(outcome.in_flight.len(), 1, "the draining session is still registered");
+    }
     if release_gate {
         gate.add_permits(1);
     }
@@ -1515,7 +1538,6 @@ async fn vul01_the_drain_is_bounded_by_the_idle_cap_and_then_estimates() {
     // give up at the idle cap instead of waiting forever, and charge an estimate.
     let mut config = config_with_policies(vec![allow_policy("cred-*")]);
     config.llm_proxy.stream_idle_timeout_secs = 1;
-    let started = std::time::Instant::now();
     let (events, token) = hang_up_midstream(
         GatedEnd::OpenAiTrailer,
         false,
@@ -1524,11 +1546,27 @@ async fn vul01_the_drain_is_bounded_by_the_idle_cap_and_then_estimates() {
     )
     .await;
     let token = token.unwrap_or_else(|| panic!("no token event: {events:?}"));
+    // The wait is 15 s from the hang-up and the default idle cap is 120 s, so a charge inside
+    // the wait means the drain stopped at the 1 s cap. (Setup time is not part of the wait.)
     assert_eq!(token["dims"]["estimated"], "true");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(14),
-        "the drain must stop at the idle cap"
-    );
+}
+
+#[tokio::test]
+async fn vul01_a_halt_after_the_hangup_closes_the_draining_upstream_at_once() {
+    // The gate is never released and the idle cap is 120 s: without the abort arm in the
+    // drain the upstream stays open (the provider keeps generating) until that cap.
+    let (events, token) = hang_up_midstream_then(
+        GatedEnd::OpenAiTrailer,
+        false,
+        true,
+        config_with_policies(vec![allow_policy("cred-*")]),
+        // The wait starts after the halt; the idle cap is 120 s, so only the abort arm can
+        // produce the charge in time.
+        std::time::Duration::from_secs(3),
+    )
+    .await;
+    let token = token.unwrap_or_else(|| panic!("a halt must end the drain and charge: {events:?}"));
+    assert_eq!(token["dims"]["estimated"], "true");
 }
 
 // ===========================================================================
