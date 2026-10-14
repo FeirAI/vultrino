@@ -2713,6 +2713,11 @@
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::gate_file",
           "sha256": "4ae29370c0d90baaf48e8f7729a9dbbd0cb5277fcdee82a5a59ab282d9f7d1d8"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::locked_mutate_blocking",
+          "sha256": "86f5b2cd913cbc439850cac5659f6396f67d467f580a7d1588816fa22e43a1be"
         }
       ],
       "mutants": [
