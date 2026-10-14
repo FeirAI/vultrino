@@ -224,10 +224,12 @@ marker append itself fails the counts are kept and it is retried on the followin
 success. While failures are still pending, `GET /api/v1/events` also reports the
 pending count as `meter_gap_pending` on the response envelope (next to `events` and
 `next_cursor`), so a poller can tell an idle feed from one that is dropping events
-during the outage itself; leria freezes its `as_of` watermark while it is non-zero.
-The envelope is not signed. A consumer that meters from the feed treats the marker as "usage may be
-missing": leria (`gatewaypoll`) freezes its `as_of` watermark for a hold-down period so
-govder's existing meter-stale Deny fires. The counters live in memory: if the process
+during the outage itself; leria freezes its `as_of` watermark while it is non-zero, and
+govder's activity feed reads the same count and treats its watched agents as acting, so the
+meter-stale Deny can fire during the outage (a frozen `as_of` alone cannot: no activity is
+reported while appends fail). The envelope is not signed. A consumer that meters from the feed
+treats the marker as "usage may be missing": leria (`gatewaypoll`) freezes its `as_of` watermark
+for a hold-down period so govder's meter-stale Deny stays in force through the recovery. The counters live in memory: if the process
 dies before an append succeeds again, no marker is written, and only a stale watermark
 remains as the signal.
 

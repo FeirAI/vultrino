@@ -142,8 +142,9 @@ in [METERING.md](METERING.md). Wire-contract specifics:
 - A **`meter.lost`** event (payload `lost_count`, `first_lost_at`, `last_lost_at`,
   `event_types`) is a gap marker: vultrino failed to append that many events and this is
   the first successful append after. Treat it as "usage may be missing since
-  `first_lost_at`" and fail closed (leria freezes its `as_of` watermark so govder's
-  meter-stale Deny fires). See METERING.md "Failed appends are counted and announced".
+  `first_lost_at`" and fail closed (leria freezes its `as_of` watermark; govder, which also reads
+  `meter_gap_pending` from the events envelope, denies after `stale_after_s`, during the outage and
+  through the hold). See METERING.md "Failed appends are counted and announced".
 
 ### vultrino → a proof plane (e.g. averin)
 
