@@ -2672,7 +2672,7 @@
         "vault-panic-skips-rollback"
       ],
       "does_not_establish": "Power-loss durability of any real filesystem or disk: a crash is an injected error at a named step that leaves the files exactly as written (the page cache is not dropped, fsync is assumed honest). Crashes at steps the injection points do not name, or inside the standard library. Detection of a vault rolled back by replacing the snapshot and log with older copies, or of a log truncated at a record boundary: both are accepted by the format, as a replaced vault file always was. A terminated final line damaged by a crash or bit rot fails the open closed instead of being recovered; an operator must truncate it after checking. Behaviour under concurrent writers in several real processes beyond what the advisory lock already serialises. Any CI run. The take-back of a failed append is best effort: if the truncate itself fails after an fsync error, the line may remain and be read as committed by the next reader. A panic raised inside the commit itself (as opposed to the mutation closure) is rolled back by the same path but has no dedicated test. An invalid record in a delta replay drops the process's whole in-memory view (readers see nothing and deny) and forces a full reload; this is not covered by a test.",
-      "evidence_run": "38219467303"
+      "evidence_run": "38652676871"
     },
     {
       "id": "vault-fence-shared-lock-delta-read",
@@ -2729,7 +2729,7 @@
         "vault-writer-skips-writer-gate"
       ],
       "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation is bounded by the shared holders already inside the lock when the writer arrives; the bound is tested with handles in one process (eight looping readers, five seconds), not measured as a latency figure, and not across several OS processes, and it relies on flock on a local filesystem. Writers queue one at a time on the gate. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
-      "evidence_run": "38332553597"
+      "evidence_run": "38652676871"
     },
     {
       "id": "vault-log-loss-fails-closed",
@@ -3031,7 +3031,8 @@
         "vault-restore-skips-checksum",
         "vault-backup-allows-missing-wal"
       ],
-      "does_not_establish": "Rollback to an older but self-consistent backup, or a backup tampered with together with its manifest by someone who can write the backup directory: the manifest is not signed. A backup taken while a process holds the vault or the durable averin queue is refused after 30 seconds (vault) or at once (queue), not tested with a second OS process. Power-loss durability of the restore renames: a crash between them is covered by the marker, which is tested only by presence, not by injecting a crash. The averin queue segments are copied as files and are not opened by the open check. Backups of a vault on a filesystem without flock semantics. A damaged final .wal line: there is no vault check command yet. Any CI run."
+      "does_not_establish": "Rollback to an older but self-consistent backup, or a backup tampered with together with its manifest by someone who can write the backup directory: the manifest is not signed. A backup taken while a process holds the vault or the durable averin queue is refused after 30 seconds (vault) or at once (queue), not tested with a second OS process. Power-loss durability of the restore renames: a crash between them is covered by the marker, which is tested only by presence, not by injecting a crash. The averin queue segments are copied as files and are not opened by the open check. Backups of a vault on a filesystem without flock semantics. A damaged final .wal line: there is no vault check command yet. Any CI run.",
+      "evidence_run": "38652676871"
     }
   ]
 }
