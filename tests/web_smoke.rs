@@ -8733,11 +8733,13 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RejectLog {
 async fn test_approval_decision_route_refuses_every_assertion_failure_opaquely_and_logs_the_reason()
 {
     let log = RejectLog::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(log.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let _guard = tracing::dispatcher::set_default(&dispatch);
 
     let (router, storage, key, id) =
         build_hard_sod_recipe_fixture("team-a", two_teammate_rule(), "High").await;
@@ -8803,6 +8805,12 @@ async fn test_approval_decision_route_refuses_every_assertion_failure_opaquely_a
         ),
     ];
     for (name, assertion, reason) in cases {
+        // Re-install the scoped subscriber before each case. set_default rebuilds tracing's
+        // process-wide callsite interest cache; without it a concurrently running test that
+        // registers the same callsite while no subscriber is active on its thread can cache
+        // "never" for it, and this test then misses a log line that was emitted (observed in
+        // CI as a flaky miss of the second or later case's reason).
+        let _case_guard = tracing::dispatcher::set_default(&dispatch);
         let req = Request::builder()
             .method("POST")
             .uri(&uri)
