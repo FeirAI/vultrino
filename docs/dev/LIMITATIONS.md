@@ -221,8 +221,11 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   then all are charged together under one lock (a refused request charges none). A
   `RateLimit` written inside `or` or `not` keeps the old inline evaluation, because
   "all caps must pass" has no meaning there. The compiled shapes (a bare rule, or
-  `and` of an action match and limits) are all covered. Which matching rule's reason
-  is reported still follows policy storage order.
+  `and` of an action match and limits) are all covered. An unlimited Allow rule that also
+  matches the request (in the same or another matching policy) does not switch a matching
+  limit off: the limits apply to the request whichever Allow rule matched, so a broad
+  allow-all policy on a credential no longer lets an exhausted rate limit through. Which
+  matching rule's reason is reported still follows policy storage order.
 - **No built-in TLS / network hardening.** The server speaks plaintext HTTP;
   terminate TLS at a reverse proxy and bind to localhost unless fronted.
 - **Audit-to-file is not implemented.** `[logging] audit_file` is parsed but unused;

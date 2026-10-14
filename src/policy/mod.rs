@@ -2976,6 +2976,27 @@ mod tests {
         assert!(matches!(call(), PolicyDecision::Deny(_)));
     }
 
+    /// A broad allow-all policy on the credential does not let an exhausted limit of another
+    /// matching policy through (it did before VUL-15: the exhausted rule stopped matching and
+    /// the other policy's plain Allow rule admitted the request).
+    #[test]
+    fn an_allow_all_policy_does_not_bypass_another_policys_limit() {
+        let engine = PolicyEngine::new();
+        engine.add_policy(Policy::allow_all("open", "*"));
+        engine.add_policy(
+            Policy::allow_all("open-rule", "*")
+                .with_rule(PolicyCondition::Always, PolicyAction::Allow),
+        );
+        engine.add_policy(layered_policy("limited", &[(2, 60)]));
+        let call = || engine.evaluate_full(&layered_input("cred", None));
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert!(
+            matches!(call(), PolicyDecision::Deny(_)),
+            "the 2 per minute limit binds although another matching policy allows everything"
+        );
+    }
+
     /// The post-approval resume re-checks nothing and charges nothing, as before.
     #[test]
     fn layered_limits_are_not_charged_or_checked_on_resume() {
