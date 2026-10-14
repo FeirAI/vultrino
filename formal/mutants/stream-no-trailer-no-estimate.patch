@@ -1,0 +1,22 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 552feb4..8c60015 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -787,15 +787,8 @@ impl StreamEstimateContext {
+                 estimated: false,
+             });
+         }
+-        model.map(|m| StreamMeterState {
+-            usage: crate::outbox::estimate_stream_usage(
+-                acc,
+-                self.prompt_bytes,
+-                self.max_output_tokens,
+-            ),
+-            model: Some(m),
+-            estimated: true,
+-        })
++        let _ = model;
++        None
+     }
+ }
+ 

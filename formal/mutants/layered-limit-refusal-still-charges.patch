@@ -1,0 +1,30 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 0de94f6..e84295a 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -781,6 +781,7 @@ impl PolicyEngine {
+         }
+         let mut limits = self.rate_limits.write();
+         let now = Instant::now();
++        let mut refused = false;
+         for (max, window_secs) in guards {
+             let key = rate_limit_key(credential_alias, principal_id, *max, *window_secs);
+             let (count, elapsed) = match limits.get(&key) {
+@@ -791,7 +792,7 @@ impl PolicyEngine {
+                 None => (0, false),
+             };
+             if !fixed_window_transition(count, elapsed, *max).allowed {
+-                return false;
++                refused = true;
+             }
+         }
+         for (max, window_secs) in guards {
+@@ -810,7 +811,7 @@ impl PolicyEngine {
+                 state.window_start = now;
+             }
+         }
+-        true
++        !refused
+     }
+ 
+     /// Evaluate a single condition against the request input.
