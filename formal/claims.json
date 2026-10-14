@@ -1827,7 +1827,7 @@
         "policy-precedence-engine-kill-flag-ignored"
       ],
       "does_not_establish": "Only the precedence step. Whether a rule matches (URL, method, time window, rate limit, spend cap, action label) is outside it, and the domain is bounded at 4 outcomes and 3 policy defaults for the pure and lazy functions and at two policies of 48 shapes for the engine test. The engine test uses only always-matching rules and a fixed credential, so it does not cover rate-limit charging order beyond the lazy-scan check that no weaker tier is asked, and the first matching rule within a tier is chosen by storage order. The oracles are test code. The engine hands the lazy function at most one outcome per call by design; the multi-outcome equivalence is shown for membership of tiers, which is all the scan can observe. Layered Allow-RateLimit rules are still first-match, not conjunctive. The engine default applies only when no policy matches, and is not applied on top of a matching policy's default. The tail is shown to deny by the mapping test, not shown unreachable from the engine (it is unreachable only because any matching policy has a default action). The engine runs an unparseable-URL pre-check before the kill tier: a halted principal whose request URL cannot be canonicalised, under a policy with a URL deny or prompt rule, gets the unparseable reason instead of the halt reason. The outcome is still Deny and the pre-check is outside this claim.",
-      "evidence_run": "38465582293"
+      "evidence_run": "38489872094"
     },
     {
       "id": "kani-policy-precedence",
@@ -2059,7 +2059,7 @@
         "url-canon-warning-overclaims-refusal"
       ],
       "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or path case differently is not modelled). How a glob is matched part by part (scheme, host, port, rest) is the url-glob-part-wise claim, with its own limits; a glob * in the path or query still matches / and ?. Warned patterns only log a warning at load; the refusal of warned patterns on Deny and Prompt rules (admin API, config file, stored load) is the claims policy-write-refuses-warned-deny-prompt-patterns and url-pattern-footguns-refused, and Allow rules are not refused (except under an odd number of not). A glob whose host holds ? is not canonicalised. The http, hmac and internal_http plugins send the canonical URL (internal_http: claim internal-http-sends-the-judged-string); the wasm plugin egress, ssh and postgres plugins do not use params url. The hmac plugin adds timestamp, recvWindow and signature after evaluation, and AWS SigV4 re-sorts query pairs for signing; those additions are not judged. For UrlToken requests the sent bytes equal the evaluated string apart from the secret on the tested URLs only, and the refusal of other placeholder spellings is shown on the listed spellings only. A secret holding /, ?, #, a backslash, %, whitespace or a control character is refused at store and at use (claim url-token-secret-structure-refused); other secrets are inserted as is and the substitution is checked for scheme and host only; a {credential} in a query-map value stays literal. The query map is merged only when it is a JSON object (a value that is not a string is judged as its JSON text; the http and hmac plugins refuse such a map). A prefix that ends in * inside a host (https://api.*, https://10.0.0*) is matched as the one host the parser reads from it, so a deny rule of that shape denies less than before (warned; refused on Deny and Prompt rules at admin-API write, config load and stored load, see url-pattern-footguns-refused). A pattern without a trailing * must match the query too, so a deny rule on an exact URL does not match the same URL with a query (such a Deny, and a Prompt in a policy whose default is not deny, is now refused). The meaning-change warning compares against a loose normal form and is shown on examples only; it can miss a change. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested. The load-time warning is a log line and is not a refusal. The server call sites that build the judged URL (policy_url at request time and at approval resume) are not covered by the detector.",
-      "evidence_run": "38465582293"
+      "evidence_run": "38489872094"
     },
     {
       "id": "url-glob-part-wise",
@@ -2204,7 +2204,7 @@
         "url-exact-prompt-refused-in-default-deny"
       ],
       "does_not_establish": "The refusal is as good as canonical_pattern's warnings: a pattern that matches less than it reads but draws no warning (a glob without a port that misses a non-default port) is accepted. Stored policies and config-file [[policies]] are refused by the claim url-pattern-footguns-refused, not by this detector; the engine's add_policy and load paths do not refuse. An allow rule is refused only under an odd number of not; any other warned allow pattern is stored and only warned. A deny or prompt rule whose url_match sits under not is refused too, although a dead pattern under not denies more, not less. Shown on the listed patterns and shapes, not every pattern. Which deployed vaults hold such a stored policy is not checked. An exact-URL Prompt in a default-deny policy is accepted; the engine matches Deny and Prompt patterns also without trailing query parameters (shown in url-query-never-weakens), so another Allow rule does not skip it.",
-      "evidence_run": "38465582293"
+      "evidence_run": "38489872094"
     },
     {
       "id": "stored-rate-limit-refused-on-load",
@@ -3153,7 +3153,7 @@
         "egress-hmac-dns-failure-admitted"
       ],
       "does_not_establish": "That a proxy chosen with VULTRINO_UPSTREAM_PROXY behaves: it resolves the target host itself, so the connect-time resolver guard does not cover that hop (the admission-time URL check still runs) and the operator trusts the proxy. A loopback proxy may carry a plain http:// request: that first hop never leaves the machine, but the proxy then forwards it onward as it sees fit (a credential is in clear text on that onward hop unless the proxy upgrades it), and the loopback test is on the proxy host text, not on what is listening (whether a loopback proxy may carry plain http:// is a recorded lead question, not a settled decision). The https route through a real CONNECT tunnel is not exercised, only that the client hands https targets to the proxy. Plain http:// to a public host with no proxy configured is still admitted, as before. The WASM plugin egress and the other crates' own clients (govder, averin, revocation) are separate. The wiring is shown on the shared client builder, not on each plugin that calls it. The window between vultrino's lookup and the proxy's own lookup is not closed: a name that resolves here can resolve to an internal address at the proxy. The OAuth token-URL check shares the helper but is not shown by this detector.",
-      "evidence_run": "38469303391"
+      "evidence_run": "38489872094"
     },
     {
       "id": "request-log-no-capability-token",
@@ -3255,7 +3255,7 @@
         "url-fix-exact-not-broadened"
       ],
       "does_not_establish": "The refusal is as good as the warnings: a glob without a port that misses a non-default port draws no warning and is not refused. An exact-URL Prompt in a default-deny policy is accepted; the engine matches Deny and Prompt patterns also without trailing query parameters (shown in url-query-never-weakens), so another Allow rule does not skip it. An exact URL under a not is refused only through the allow-under-odd-not rule shown in policy-write-refuses-warned-deny-prompt-patterns. The automatic fix broadens (prefix form), so a deny or prompt may then match more URLs than the author meant; it cannot fix a * in a host and expands only one level of braces with at most 64 alternatives. A stored policy refused on load stops the server from starting, so an operator must run the fix first; which deployed vaults hold such a policy is not checked. Shown on the listed patterns, not every pattern.",
-      "evidence_run": "38469303391"
+      "evidence_run": "38489872094"
     },
     {
       "id": "url-token-secret-structure-refused",
@@ -3414,7 +3414,7 @@
         "url-query-pattern-warning-dropped"
       ],
       "does_not_establish": "Only the listed patterns, URLs and shapes, not every pattern; a property of the engine decision, not a proof. A pattern holding a ? is refused on Deny and Prompt rules, not matched; an Allow rule with a ? is accepted and only narrows. Only one trailing slash is tried; frameworks that fold more (//) or other path spellings are not covered. A server that treats the trailing-slash path as a different resource is over-denied, not under-denied. A Prompt under a single not is excluded from the grid: it prompts every URL except the pattern's, so with a deny default the query form moves from Deny to Prompt. Other policies and rule kinds (rate limits, principal or time conditions) are not in the grid. Which deployed vaults hold a policy relying on the old narrower matching is not checked.",
-      "evidence_run": "38469303391"
+      "evidence_run": "38489872094"
     }
   ]
 }
