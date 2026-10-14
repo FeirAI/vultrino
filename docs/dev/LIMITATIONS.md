@@ -94,14 +94,30 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   offline `.wal` tail truncation without a durable anchor is an accepted limitation,
   because filesystem write access is outside the threat model),
   and they do not defend against an attacker who can write the vault directory:
-  such an attacker can also put back an older copy of the vault. Backups must therefore take the
-  two files together and be tested by restoring them.
+  such an attacker can also put back an older copy of the vault. Use `vultrino vault backup <dir>`
+  and `vultrino vault restore <dir>` rather than copying files by hand: backup takes
+  the exclusive vault lock and copies the snapshot, the `.wal`, the outbox and the
+  averin stores together with a SHA-256 manifest, then checks the copy; restore
+  verifies the manifest, every checksum and an open of the copy before touching the
+  target, refuses a backup without the snapshot or the `.wal`, replaces an existing
+  vault only with `--force` (moving the old files aside), and leaves
+  `<vault>.restore-pending` if interrupted, which stops the vault opening until the
+  restore is re-run. Both refuse while a process holds the vault or the durable
+  averin queue, so stop the service first. They do not detect a rollback to an
+  older but self-consistent backup, and a damaged final `.wal` line still stops
+  startup until an operator truncates it after checking (there is no `vault check`
+  command yet).
 - **Vault change detection and lock behaviour.** Another process's commit is noticed
   through the snapshot's (mtime, length, inode) token plus the log length; a
   filesystem with coarse timestamps is unsupported (this now covers writes and the
-  fence, not only the read cache). `flock` does not prefer a waiting writer, so
-  under sustained overlapping dispatches a kill write can wait without bound against
-  the caller's timeout. In-process lock-free readers (`get`, `get_by_alias`,
+  fence, not only the read cache). A waiting writer holds the
+  sidecar `<vault>.gate` file exclusively while it waits for the vault lock, and every
+  shared reader passes through that gate before taking the vault lock, so new fence
+  reads queue behind a waiting kill write instead of starving it. The wait is bounded
+  by the reads already in flight when the writer arrived (each short), not by the
+  traffic that follows; it is tested under eight looping readers, not measured as a
+  latency figure, and it relies on `flock` semantics on a local filesystem (not NFS,
+  FUSE or Windows). Writers still serialise one at a time on the gate. In-process lock-free readers (`get`, `get_by_alias`,
   `get_policy`, the fence epoch) block for one log fsync per write and for a
   whole-snapshot encrypt and fsync on the write that triggers compaction; a fence
   catch-up after a foreign write validates and re-indexes the whole vault under the
@@ -401,7 +417,14 @@ kernels.
   ordinary Observe/RequireEvidence posture. Unknown `[averin] mode` values are
   refused at config load rather than coerced into Observe. Undeclared actions in
   non-strict posture, reversible declarations, and deployments with Averin
-  disabled still have no record-existence guarantee.
+  disabled still have no record-existence guarantee. That split is the intended
+  posture, not an oversight: money and irreversible actions require committed
+  evidence and are refused while Averin is down, routine actions keep running and
+  their background seals can be dropped under overload or lost in a crash (the
+  plan 085 reconciliation detects the gap, it cannot recover the seal). The FeirOS
+  Solo config ships exactly this (`[averin] enabled = true`, `mode = "observe"`,
+  `d8_complete_evidence = false`); `d8_complete_evidence = true` would make every
+  action wait on Averin and is not the default.
 - **An `internal_http` capability's HTTP verb is operator authority, and the agent
   may not send one.** The transport requires `method`, so a capability registered
   through the admin API must make it decidable: exactly one `target.methods` entry,

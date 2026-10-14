@@ -220,6 +220,10 @@ enum Commands {
     /// KDF params. Distinct from shared-HMAC secret rotation (which is a config repoint).
     Rekey,
 
+    /// Consistent vault backup and restore (offline or under the exclusive vault lock).
+    #[command(subcommand)]
+    Vault(VaultCommands),
+
     /// Run the MCP server (for LLM integration)
     Mcp,
 
@@ -314,6 +318,27 @@ enum Commands {
     Policy {
         #[command(subcommand)]
         command: PolicyCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum VaultCommands {
+    /// Copy the snapshot, its .wal, the outbox and the averin stores together into a NEW empty
+    /// directory, with a manifest of SHA-256 sums. Takes the exclusive vault lock for the copy and
+    /// refuses while a durable averin queue is in use (stop the service first).
+    Backup {
+        /// Destination directory (must not exist or be empty)
+        dir: PathBuf,
+    },
+    /// Restore a backup made by `vault backup`. Verifies every checksum and opens the copy before
+    /// touching the target; refuses a partial backup; replaces an existing vault only with --force
+    /// (the old files are moved aside, not deleted).
+    Restore {
+        /// Directory holding the backup
+        dir: PathBuf,
+        /// Replace an existing vault
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -720,6 +745,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Rekey => {
             rekey_vault(config).await?;
         }
+        Commands::Vault(cmd) => {
+            vault_backup_cmd(config, cmd).await?;
+        }
         Commands::Mcp => {
             run_mcp_server(config).await?;
         }
@@ -990,6 +1018,41 @@ fn get_new_storage_password() -> Result<SecretString, Box<dyn std::error::Error>
 /// Re-key the file-backed vault to a new master password (offline, single-sided). Opens the vault with
 /// the CURRENT password (a wrong current password fails HERE, before any write), then re-encrypts the
 /// vault + outbox with a key derived from the new password. Only the `File` backend supports re-keying.
+async fn vault_backup_cmd(
+    config: Config,
+    cmd: VaultCommands,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use vultrino::storage::vault_backup;
+    if !matches!(config.storage.backend, StorageBackendType::File) {
+        return Err("vault backup and restore support the file backend only".into());
+    }
+    let path = config
+        .storage
+        .file_path
+        .clone()
+        .unwrap_or_else(Config::default_storage_path);
+    let password = get_storage_password()?;
+    match cmd {
+        VaultCommands::Backup { dir } => {
+            let n = vault_backup::backup(&path, &dir, Some(&password)).await?;
+            println!(
+                "backed up {n} files from {} to {}",
+                path.display(),
+                dir.display()
+            );
+        }
+        VaultCommands::Restore { dir, force } => {
+            let n = vault_backup::restore(&dir, &path, force, Some(&password)).await?;
+            println!(
+                "restored {n} files from {} to {}",
+                dir.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn rekey_vault(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     match config.storage.backend {
         StorageBackendType::File => {
