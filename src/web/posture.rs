@@ -17,7 +17,12 @@ pub const POSTURE_SCHEMA: u32 = 1;
 ///
 /// `default_deny` is the policy engine's live default (set from `[enforcement] default_action`),
 /// `policies` the policies the engine enforces right now (config plus stored).
-pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Policy]) -> Value {
+pub(crate) fn build_posture(
+    config: &Config,
+    default_deny: bool,
+    policies: &[Policy],
+    meter: &crate::outbox::MeterLossSnapshot,
+) -> Value {
     let key = config.govder.as_ref().map(|g| g.approval_key_posture());
     let mut observe_tenants: Vec<&str> = config
         .tenants
@@ -67,6 +72,15 @@ pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Pol
         "vault": {
             "format_version": crate::storage::STORAGE_VERSION,
         },
+        // VUL-02: failed event appends. `gap_pending > 0` means the outbox is failing (or
+        // has not had a successful append since it failed) and consumers may be missing
+        // events; a `meter.lost` marker follows the next successful append.
+        "meter": {
+            "append_failures_total": meter.lost_total,
+            "gap_pending": meter.gap_pending,
+            "gap_markers_emitted": meter.markers_emitted,
+            "last_failure_at": meter.last_lost_at,
+        },
     })
 }
 
@@ -99,7 +113,7 @@ mod tests {
             rate_limited("rl-open", PolicyAction::Allow),
             rate_limited("rl-closed", PolicyAction::Deny),
         ];
-        let v = build_posture(&Config::default(), true, &policies);
+        let v = build_posture(&Config::default(), true, &policies, &Default::default());
         assert_eq!(
             v["policies"]["rate_limit_default_not_deny"],
             json!(["rl-open"])
@@ -109,10 +123,38 @@ mod tests {
 
     #[test]
     fn report_reflects_the_live_engine_default_and_never_claims_deny_it_was_not_given() {
-        let v = build_posture(&Config::default(), false, &[]);
+        let v = build_posture(&Config::default(), false, &[], &Default::default());
         assert_eq!(v["engine"]["default_deny"], false);
-        let v = build_posture(&Config::default(), true, &[]);
+        let v = build_posture(&Config::default(), true, &[], &Default::default());
         assert_eq!(v["engine"]["default_deny"], true);
+    }
+
+    #[test]
+    fn report_carries_the_meter_append_loss_counters() {
+        let healthy = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &crate::outbox::MeterLossSnapshot::default(),
+        );
+        assert_eq!(healthy["meter"]["append_failures_total"], 0);
+        assert_eq!(healthy["meter"]["gap_pending"], 0);
+        assert!(healthy["meter"]["last_failure_at"].is_null());
+        let failing = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &crate::outbox::MeterLossSnapshot {
+                lost_total: 4,
+                gap_pending: 2,
+                markers_emitted: 1,
+                last_lost_at: Some(chrono::Utc::now()),
+            },
+        );
+        assert_eq!(failing["meter"]["append_failures_total"], 4);
+        assert_eq!(failing["meter"]["gap_pending"], 2);
+        assert_eq!(failing["meter"]["gap_markers_emitted"], 1);
+        assert!(failing["meter"]["last_failure_at"].is_string());
     }
 
     #[test]
@@ -121,18 +163,18 @@ mod tests {
         cfg.tenants.insert("b".into(), TenantMode::Observe);
         cfg.tenants.insert("a".into(), TenantMode::Observe);
         cfg.tenants.insert("c".into(), TenantMode::Enforce);
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &Default::default());
         assert_eq!(v["engine"]["tenants_in_observe_mode"], json!(["a", "b"]));
         assert_eq!(v["engine"]["unlisted_tenant_mode"], "enforce");
     }
 
     #[test]
     fn report_carries_the_sod_flag_and_the_vault_format_and_no_secret_material() {
-        let v = build_posture(&Config::default(), true, &[]);
+        let v = build_posture(&Config::default(), true, &[], &Default::default());
         assert_eq!(v["approvals"]["enforce_separation_of_duty"], false);
         let mut cfg = Config::default();
         cfg.approval.enforce_separation_of_duty = true;
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &Default::default());
         assert_eq!(v["approvals"]["enforce_separation_of_duty"], true);
         assert_eq!(
             v["vault"]["format_version"],
@@ -173,7 +215,7 @@ mod tests {
                 govder: Some(govder(f, m, esc)),
                 ..Config::default()
             };
-            let v = build_posture(&cfg, true, &[]);
+            let v = build_posture(&cfg, true, &[], &Default::default());
             let a = &v["approver_identity"];
             assert_eq!(a["govder_configured"], true);
             assert_eq!(a["key_configured"], configured, "{f}/{m:?}");

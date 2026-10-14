@@ -167,9 +167,11 @@ worker can never overwrite the re-taker's outcome.
    through.
 3. **No match → engine default:** `default_deny` → `Deny("no_policy: …")`;
    otherwise `Allow`.
-4. Otherwise walk each matching policy's rules in order; the first matching rule's
-   action (`Allow`/`Deny`/`Prompt`) wins; if no rule matches, the policy's
-   `default_action` applies.
+4. Otherwise the tiers are scanned `Deny`, then `Prompt`, then `Allow`, stopping at the
+   first tier with a matching rule; if no rule matches, the policy's `default_action`
+   applies. The `Allow` tier is conjunctive over rate limits: every matching Allow
+   rule's top-level `RateLimit` must have room, and all are charged together (a refused
+   request charges none).
 
 Conditions: `UrlMatch` (glob; a trailing `*` is a prefix match), `MethodMatch`
 (case-insensitive), `RateLimit { max, window_secs }` (in-memory, per-process,

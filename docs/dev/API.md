@@ -47,8 +47,13 @@ k8s **startup** probe's vault-decrypt boot gate depends on; it deliberately stay
 dependency-free so a transient dependency blip can't restart a singleton pod.
 
 ```json
-{ "status": "ok", "version": "0.1.0" }
+{ "status": "ok", "version": "0.1.0", "meter_lost_total": 0, "meter_gap_pending": 0 }
 ```
+
+`meter_lost_total` counts event appends that failed since the process started and
+`meter_gap_pending` counts failed appends whose `meter.lost` gap marker has not been
+written yet (see [METERING.md](METERING.md)). Both are in-memory counters; `status`
+stays `ok` while the process is alive, because a restart does not repair a full disk.
 
 ### `GET /api/v1/ready` — no auth
 
@@ -62,7 +67,7 @@ contend with the fd-locked vault). `200` takes the pod in; `503` takes it out of
 the Service's endpoints (without restarting it, unlike a failing liveness check).
 
 ```json
-{ "status": "ready", "outbox_pending": 0 }
+{ "status": "ready", "outbox_pending": 0, "meter_gap_pending": 0 }
 ```
 
 ```json
@@ -292,7 +297,8 @@ credential: `schema`, `plane`, `build` (`version`, `rustc`, `git_sha`, `git_dirt
 `key_distinct_from_govder_key`, `shared_key_escape`), `engine` (`default_deny`, `tenants_in_observe_mode`,
 `unlisted_tenant_mode`), `policies` (`total`, `rate_limit_default_not_deny`: ids of enforced policies that have a
 `RateLimit` condition and a non-deny default), `vault.format_version` (the version this binary writes; a vault is
-migrated when it is opened).
+migrated when it is opened), `meter` (`append_failures_total`, `gap_pending`, `gap_markers_emitted`,
+`last_failure_at`: failed outbox appends, see [METERING.md](METERING.md)).
 
 It cannot see other processes: whether a second vultrino shares the vault is checked by the verifier on the host.
 `git_sha` is the commit the build script saw (`VULTRINO_BUILD_SHA` overrides it; an archive build reports `unknown`).

@@ -148,7 +148,7 @@ Every key is optional; an absent key falls back to the streaming-on default.
 | Key | Default | Behavior |
 |-----|---------|----------|
 | `streaming_enabled` | `true` | Master switch for incremental SSE. When `false`, a `{"stream": true}` request still works — Vultrino strips the stream flags and serves it on the buffered path (disabling streaming de-streams a client, never breaks it). |
-| `inject_stream_usage` | `true` | When a streamed **OpenAI-chat** request omits `stream_options.include_usage`, force it to `true` so the provider emits a terminal usage chunk and V13b token metering fires. An explicit client value (true **or** false) is honored, never overwritten. Anthropic `/v1/messages` and OpenAI `/v1/responses` report usage natively and are excluded. |
+| `inject_stream_usage` | `true` | When `true`, a streamed **OpenAI-chat** request is forced to `stream_options.include_usage = true` (a missing value is added and a client `false` is **overwritten**: the flag is gateway-owned, so a client cannot opt out of token metering) so the provider emits a terminal usage chunk and V13b token metering fires. When `false`, nothing is injected and a stream without a trailer is charged an estimate (`dims.estimated = "true"`). Anthropic `/v1/messages` and OpenAI `/v1/responses` report usage natively and are excluded. |
 | `stream_idle_timeout_secs` | `120` | Abort a stream idle this many seconds (slow-loris upstream). `0` disables. |
 | `stream_total_timeout_secs` | `1800` | Abort a stream running longer than this in total. `0` disables. |
 | `stream_max_bytes` | `268435456` (256 MiB) | Abort a stream once it has forwarded more than this many bytes. `0` disables. |

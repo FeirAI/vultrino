@@ -490,6 +490,83 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
+async fn test_health_and_ready_report_a_failed_outbox_append() {
+    // VUL-02: a failed event append used to vanish into a log line. It is now a counter on
+    // /api/v1/health and /api/v1/ready, and drops back to a pending-gap of zero once the next
+    // successful append has carried the meter.lost marker.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let server = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        Config::default(),
+        storage.clone(),
+        AuthManager::new(),
+        admin,
+        exec_server,
+    );
+    let router = server.into_router();
+    let get = |router: axum::Router, uri: &'static str| async move {
+        let resp = router
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        (status, body)
+    };
+
+    let (status, health) = get(router.clone(), "/api/v1/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["meter_lost_total"], 0);
+    assert_eq!(health["meter_gap_pending"], 0);
+
+    // A directory where the outbox writer wants its temp file fails every append, for any user.
+    let tmp = dir.path().join("outbox.tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    assert!(storage
+        .append_event("a", "meter.observed", serde_json::json!({}))
+        .await
+        .is_err());
+
+    let (status, health) = get(router.clone(), "/api/v1/health").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a failing outbox does not fail liveness"
+    );
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["meter_lost_total"], 1);
+    assert_eq!(health["meter_gap_pending"], 1);
+    let (_, ready) = get(router.clone(), "/api/v1/ready").await;
+    assert_eq!(ready["meter_gap_pending"], 1);
+
+    std::fs::remove_dir(&tmp).unwrap();
+    storage
+        .append_event("a", "meter.observed", serde_json::json!({}))
+        .await
+        .unwrap();
+    let (_, health) = get(router.clone(), "/api/v1/health").await;
+    assert_eq!(health["meter_lost_total"], 1, "the lifetime counter stays");
+    assert_eq!(
+        health["meter_gap_pending"], 0,
+        "the marker has been written"
+    );
+}
+
+#[tokio::test]
 async fn test_ready_endpoint_healthy() {
     // Observability item 4 / #5: a healthy process reports 200 + "ready", with no
     // failing_components key (omitted, not an empty array — see ReadyResponse's

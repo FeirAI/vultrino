@@ -1567,3 +1567,116 @@ async fn a_panic_in_a_mutation_closure_rolls_back_and_reloads() {
     assert!(joined.unwrap_err().is_panic());
     assert!(s.get_policy("halt:x").await.unwrap().is_some());
 }
+
+// ==================== VUL-02: a failed outbox append is counted and then announced ====================
+
+/// Make every outbox write fail the way a full disk does, for any user (root included): a
+/// directory sits where the writer wants to create its temp file.
+fn break_outbox_writes(vault: &Path) -> PathBuf {
+    let tmp = outbox_path(vault).with_extension("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    tmp
+}
+
+#[tokio::test]
+async fn a_failed_append_is_counted_then_announced_by_a_meter_lost_marker() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let s = open(&path).await;
+    let first = s
+        .append_event("agent-1", "meter.observed", serde_json::json!({"n": 1}))
+        .await
+        .unwrap();
+    assert_eq!(s.meter_loss(), crate::outbox::MeterLossSnapshot::default());
+
+    let tmp = break_outbox_writes(&path);
+    for ty in ["meter.observed", "meter.observed", "policy.denied"] {
+        assert!(
+            s.append_event("agent-1", ty, serde_json::json!({}))
+                .await
+                .is_err(),
+            "the append must fail while the outbox cannot be written"
+        );
+    }
+    let snap = s.meter_loss();
+    assert_eq!(snap.lost_total, 3);
+    assert_eq!(
+        snap.gap_pending, 3,
+        "no marker can be written while it fails"
+    );
+    assert_eq!(snap.markers_emitted, 0);
+    assert!(snap.last_lost_at.is_some());
+    // A failed append mints no sequence: the stored stream is contiguous, which is exactly why
+    // an in-band marker is needed.
+    assert_eq!(s.list_events_after(0, 100).await.unwrap().len(), 1);
+
+    // The disk recovers. The next successful append is followed by one gap marker.
+    std::fs::remove_dir(&tmp).unwrap();
+    let next = s
+        .append_event("agent-1", "meter.observed", serde_json::json!({"n": 2}))
+        .await
+        .unwrap();
+    assert_eq!(next, first + 1, "the sequence stays gap-free");
+    let events = s.list_events_after(0, 100).await.unwrap();
+    assert_eq!(
+        events.len(),
+        3,
+        "first event, the next event, then the marker"
+    );
+    let marker = &events[2];
+    assert_eq!(marker.event_type, crate::outbox::EVENT_METER_LOST);
+    assert_eq!(marker.sequence, next + 1);
+    assert_eq!(marker.payload["lost_count"], 3);
+    assert_eq!(
+        marker.payload["event_types"],
+        serde_json::json!(["meter.observed", "policy.denied"])
+    );
+    assert!(marker.payload["first_lost_at"].is_string());
+    assert!(marker.payload["last_lost_at"].is_string());
+
+    let snap = s.meter_loss();
+    assert_eq!(snap.gap_pending, 0);
+    assert_eq!(snap.lost_total, 3, "the lifetime counter is not reset");
+    assert_eq!(snap.markers_emitted, 1);
+
+    // Healthy again: no further marker, ever, for the same loss.
+    s.append_event("agent-1", "meter.observed", serde_json::json!({"n": 3}))
+        .await
+        .unwrap();
+    let events = s.list_events_after(0, 100).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type == crate::outbox::EVENT_METER_LOST)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_second_outage_gets_its_own_marker() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let s = open(&path).await;
+    for round in 1..=2u64 {
+        let tmp = break_outbox_writes(&path);
+        assert!(s
+            .append_event("a", "meter.observed", serde_json::json!({}))
+            .await
+            .is_err());
+        std::fs::remove_dir(&tmp).unwrap();
+        s.append_event("a", "meter.observed", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(s.meter_loss().markers_emitted, round);
+    }
+    let markers: Vec<_> = s
+        .list_events_after(0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == crate::outbox::EVENT_METER_LOST)
+        .collect();
+    assert_eq!(markers.len(), 2);
+    assert!(markers.iter().all(|m| m.payload["lost_count"] == 1));
+}

@@ -1033,7 +1033,7 @@ async fn llm_max_output_tokens_ceiling_clamps_the_forwarded_request() {
 }
 
 #[tokio::test]
-async fn llm_streamed_emits_api_calls_only_no_token_count() {
+async fn llm_streamed_without_a_usage_trailer_is_charged_an_estimate() {
     let (router, storage, srv) =
         build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
     srv.plugins().register(Arc::new(MockLlmPlugin));
@@ -1075,10 +1075,17 @@ async fn llm_streamed_emits_api_calls_only_no_token_count() {
         1,
         "a streamed call still meters api-calls=1: {events:?}"
     );
-    assert!(
-        token_events.is_empty(),
-        "a streamed response (no usage trailer) must NOT emit a token event: {events:?}"
+    // VUL-01: a stream that ends without a usage trailer is no longer free. It is charged
+    // an ESTIMATE, marked `dims.estimated = "true"`, so leria still counts it.
+    assert_eq!(
+        token_events.len(),
+        1,
+        "a streamed response with no usage trailer is charged an estimate: {events:?}"
     );
+    assert_eq!(token_events[0]["dims"]["estimated"], "true");
+    assert_eq!(token_events[0]["dims"]["model_ref"], "gpt-4o-mini");
+    assert!(token_events[0]["tokens"]["input_tokens"].as_u64().unwrap() > 0);
+    assert!(token_events[0]["tokens"]["output_tokens"].as_u64().unwrap() >= 1);
 }
 
 // ===========================================================================
@@ -1292,8 +1299,8 @@ async fn llm_streamed_halt_cancels_midstream() {
         "no key leak on the halted stream"
     );
 
-    // A halted streamed call still meters V13a api-calls=1, but NOT V13b (a halted
-    // stream has no trustworthy usage trailer — never under-count).
+    // A halted streamed call meters V13a api-calls=1 and, because a halt closes the upstream
+    // (stopping generation) rather than draining it, an ESTIMATED V13b event (VUL-01).
     let events = meter_events(&storage).await;
     let api_calls: Vec<_> = events
         .iter()
@@ -1305,9 +1312,222 @@ async fn llm_streamed_halt_cancels_midstream() {
         1,
         "a halted streamed call still meters api-calls=1: {events:?}"
     );
+    assert_eq!(
+        token_events.len(),
+        1,
+        "a halted stream is charged an estimated token event: {events:?}"
+    );
+    assert_eq!(token_events[0]["dims"]["estimated"], "true");
+}
+
+// ===========================================================================
+// VUL-01: a client that hangs up before the usage trailer is still charged
+// ===========================================================================
+
+/// How the gated upstream ends its stream once the test releases the gate.
+#[derive(Clone, Copy)]
+enum GatedEnd {
+    /// OpenAI-style terminal usage chunk (prompt 11, completion 22), then `[DONE]`.
+    OpenAiTrailer,
+    /// Anthropic-shaped: `message_start` carries input 40 and a provisional output 1; the
+    /// final `message_delta` after the gate carries output 77.
+    AnthropicFinalDelta,
+    /// The stream just ends, with no usage anywhere (the NVIDIA tool-call shape).
+    NoTrailer,
+}
+
+/// An upstream that sends one chunk immediately and the rest only after `gate` is released,
+/// so a test can hang up while the upstream is still producing.
+struct GatedStreamingPlugin {
+    end: GatedEnd,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl Plugin for GatedStreamingPlugin {
+    fn name(&self) -> &str {
+        "mockgate"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["chat"]
+    }
+    async fn execute(&self, _request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        Ok(ExecuteResponse::new(200, HashMap::new(), b"{}".to_vec()))
+    }
+    async fn execute_streaming(
+        &self,
+        _request: PluginRequest,
+    ) -> Result<vultrino::StreamingResponse, PluginError> {
+        use futures::StreamExt;
+        let text = "x".repeat(3000);
+        let (first, rest) = match self.end {
+            GatedEnd::OpenAiTrailer => (
+                format!("data: {{\"model\":\"gpt-4o-mini\",\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n"),
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\ndata: [DONE]\n\n".to_string(),
+            ),
+            GatedEnd::AnthropicFinalDelta => (
+                format!(
+                    "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"model\":\"gpt-4o-mini\",\"usage\":{{\"input_tokens\":40,\"output_tokens\":1}}}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n"
+                ),
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":77}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+            ),
+            GatedEnd::NoTrailer => (
+                format!("data: {{\"model\":\"gpt-4o-mini\",\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n"),
+                "data: [DONE]\n\n".to_string(),
+            ),
+        };
+        let gate = Arc::clone(&self.gate);
+        let tail = futures::stream::once(async move {
+            gate.acquire().await.unwrap().forget();
+            Ok::<bytes::Bytes, PluginError>(bytes::Bytes::from(rest))
+        });
+        let body = futures::stream::iter(vec![Ok(bytes::Bytes::from(first))]).chain(tail);
+        Ok(vultrino::StreamingResponse::new(
+            200,
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]),
+            Box::pin(body),
+        ))
+    }
+    fn validate_params(
+        &self,
+        _action: &str,
+        _params: &serde_json::Value,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+/// Start a gated stream, hang up before the gate opens, optionally release the gate, and
+/// return the token event once it appears (or `None` after `wait`).
+async fn hang_up_midstream(
+    end: GatedEnd,
+    release_gate: bool,
+    config: Config,
+    wait: std::time::Duration,
+) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
+    let (router, storage, srv) = build_stack(config).await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    srv.plugins().register(Arc::new(GatedStreamingPlugin {
+        end,
+        gate: Arc::clone(&gate),
+    }));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockgate.chat",
+        "https://api.openai.com",
+    )
+    .await;
+    let token = mint_token(&storage, "cred-openai", Some("mockgate.chat")).await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": true, "messages": [{"role": "user", "content": "hello"}] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The client hangs up here, with the upstream still producing.
+    drop(resp);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    if release_gate {
+        gate.add_permits(1);
+    }
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let events = meter_events(&storage).await;
+        if let Some(t) = events.iter().find(|p| p["asset"] == "usd") {
+            let t = t.clone();
+            return (events, Some(t));
+        }
+        if tokio::time::Instant::now() > deadline {
+            return (events, None);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn vul01_disconnect_before_the_trailer_still_charges_the_providers_exact_count() {
+    let (events, token) = hang_up_midstream(
+        GatedEnd::OpenAiTrailer,
+        true,
+        config_with_policies(vec![allow_policy("cred-*")]),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let token = token.unwrap_or_else(|| panic!("no token event after a disconnect: {events:?}"));
+    assert_eq!(token["tokens"]["input_tokens"], 11);
+    assert_eq!(token["tokens"]["output_tokens"], 22);
     assert!(
-        token_events.is_empty(),
-        "a halted stream emits no V13b token event: {events:?}"
+        token["dims"].get("estimated").is_none(),
+        "the drained trailer is the provider's own count, not an estimate: {token}"
+    );
+    assert_eq!(
+        events.iter().filter(|p| p["asset"] == "api-calls").count(),
+        1,
+        "still exactly one api-calls event"
+    );
+}
+
+#[tokio::test]
+async fn vul01_a_provisional_anthropic_output_count_is_not_charged_as_final() {
+    // message_start said output_tokens = 1. Before the fix a disconnect here charged 1 token for
+    // an answer of 77. The drain reaches message_delta and charges the real count.
+    let (events, token) = hang_up_midstream(
+        GatedEnd::AnthropicFinalDelta,
+        true,
+        config_with_policies(vec![allow_policy("cred-*")]),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let token = token.unwrap_or_else(|| panic!("no token event: {events:?}"));
+    assert_eq!(token["tokens"]["input_tokens"], 40);
+    assert_eq!(token["tokens"]["output_tokens"], 77);
+    assert!(token["dims"].get("estimated").is_none());
+}
+
+#[tokio::test]
+async fn vul01_a_stream_that_ends_without_any_trailer_is_charged_an_estimate() {
+    let (events, token) = hang_up_midstream(
+        GatedEnd::NoTrailer,
+        true,
+        config_with_policies(vec![allow_policy("cred-*")]),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let token = token.unwrap_or_else(|| panic!("no token event: {events:?}"));
+    assert_eq!(token["dims"]["estimated"], "true");
+    assert_eq!(token["dims"]["model_ref"], "gpt-4o-mini");
+    // 3000 generated bytes at 3 bytes per token.
+    assert_eq!(token["tokens"]["output_tokens"], 1000);
+    assert!(token["tokens"]["input_tokens"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn vul01_the_drain_is_bounded_by_the_idle_cap_and_then_estimates() {
+    // The gate is never released: the upstream goes silent after the hang-up. The drain must
+    // give up at the idle cap instead of waiting forever, and charge an estimate.
+    let mut config = config_with_policies(vec![allow_policy("cred-*")]);
+    config.llm_proxy.stream_idle_timeout_secs = 1;
+    let started = std::time::Instant::now();
+    let (events, token) = hang_up_midstream(
+        GatedEnd::OpenAiTrailer,
+        false,
+        config,
+        std::time::Duration::from_secs(15),
+    )
+    .await;
+    let token = token.unwrap_or_else(|| panic!("no token event: {events:?}"));
+    assert_eq!(token["dims"]["estimated"], "true");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(14),
+        "the drain must stop at the idle cap"
     );
 }
 

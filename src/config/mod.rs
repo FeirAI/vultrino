@@ -342,10 +342,12 @@ pub struct LlmProxyConfig {
     /// returns a single JSON body and serves it on the buffered path (so an
     /// operator disabling streaming never breaks a client, only de-streams it).
     pub streaming_enabled: bool,
-    /// When `true` and a streamed OpenAI-chat request omits
-    /// `stream_options.include_usage`, vultrino injects `include_usage = true` so
-    /// the provider emits a terminal usage chunk and V13b token metering fires. An
-    /// explicit client value (true OR false) is always honored, never overwritten.
+    /// When `true`, a streamed OpenAI-chat request is forced to
+    /// `stream_options.include_usage = true` (a missing value is added and a client
+    /// `false` is OVERWRITTEN: include_usage is gateway-owned, so a client cannot opt out
+    /// of token metering) so the provider emits a terminal usage chunk and V13b token
+    /// metering fires. When `false`, nothing is injected and a stream without a trailer
+    /// is charged an estimate (`dims.estimated = "true"`) instead of exact counts.
     pub inject_stream_usage: bool,
     /// Abort a stream that goes this many seconds without producing a chunk
     /// (slow-loris upstream). `0` disables the idle timeout.

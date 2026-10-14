@@ -1704,13 +1704,27 @@ pub async fn api_list_credentials(
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    /// Event appends that failed since this process started (VUL-02). Non-zero means
+    /// metering or audit events may be missing downstream; see `meter_gap_pending`.
+    #[serde(default)]
+    pub meter_lost_total: u64,
+    /// Failed appends whose `meter.lost` gap marker has not been written yet (the outbox
+    /// is failing now, or has not had a successful append since it failed).
+    #[serde(default)]
+    pub meter_gap_pending: u64,
 }
 
-/// Health check endpoint (no auth required)
-pub async fn api_health() -> impl IntoResponse {
+/// Health check endpoint (no auth required). Stays dependency-free: it reads two in-memory
+/// counters and never touches the vault or the outbox file. `status` stays `ok` while the
+/// process is alive; a failing outbox is reported in the two counters, not by failing the
+/// liveness probe (a restart does not fix a full disk).
+pub async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
+    let loss = state.storage.meter_loss();
     Json(HealthResponse {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        meter_lost_total: loss.lost_total,
+        meter_gap_pending: loss.gap_pending,
     })
 }
 
@@ -1737,6 +1751,9 @@ pub struct ReadyResponse {
     /// `failing_components`, so there's nothing meaningful to report here).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outbox_pending: Option<usize>,
+    /// Failed event appends not yet announced by a `meter.lost` marker (VUL-02).
+    /// Reported for visibility like `outbox_pending`; it does not 503 the probe.
+    pub meter_gap_pending: u64,
 }
 
 /// Readiness probe (observability item 4 / #5): dependency-aware, SHORT-timeout
@@ -1794,6 +1811,7 @@ pub async fn api_ready(State(state): State<AppState>) -> impl IntoResponse {
                 status: "ready",
                 failing_components: Vec::new(),
                 outbox_pending,
+                meter_gap_pending: state.storage.meter_loss().gap_pending,
             }),
         )
             .into_response()
@@ -1804,6 +1822,7 @@ pub async fn api_ready(State(state): State<AppState>) -> impl IntoResponse {
                 status: "not_ready",
                 failing_components: failing,
                 outbox_pending,
+                meter_gap_pending: state.storage.meter_loss().gap_pending,
             }),
         )
             .into_response()
@@ -3674,7 +3693,12 @@ pub async fn api_posture(admin: AdminApiAuth, State(state): State<AppState>) -> 
     }
     let engine = state.server.policy_engine();
     let policies = engine.list_policies();
-    let report = super::posture::build_posture(&state.config, engine.default_deny(), &policies);
+    let report = super::posture::build_posture(
+        &state.config,
+        engine.default_deny(),
+        &policies,
+        &state.storage.meter_loss(),
+    );
     (StatusCode::OK, Json(report)).into_response()
 }
 
@@ -4989,10 +5013,14 @@ mod tests {
         let response = HealthResponse {
             status: "ok".to_string(),
             version: "1.0.0".to_string(),
+            meter_lost_total: 3,
+            meter_gap_pending: 1,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"status\":\"ok\""));
         assert!(json.contains("\"version\":\"1.0.0\""));
+        assert!(json.contains("\"meter_lost_total\":3"));
+        assert!(json.contains("\"meter_gap_pending\":1"));
     }
 
     #[test]

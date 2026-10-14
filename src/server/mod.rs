@@ -141,6 +141,57 @@ where
     }
 }
 
+/// Keep reading the upstream after the client left, forwarding nothing, until the usage
+/// trailer arrives (VUL-01). It runs under the same idle, total and byte caps as the live
+/// stream, so a client that hangs up cannot keep the upstream open longer than one that
+/// stayed. If a cap fires first the caller charges an estimate instead.
+#[allow(clippy::too_many_arguments)]
+async fn drain_upstream_for_usage<S>(
+    upstream: &mut S,
+    usage_acc: &mut crate::outbox::UsageAccumulator,
+    ctx: &StreamEstimateContext,
+    finalizer: &StreamFinalizer,
+    idle: Option<std::time::Duration>,
+    deadline: Option<tokio::time::Instant>,
+    max_bytes: u64,
+    mut total_bytes: u64,
+) where
+    S: Stream<Item = Result<Bytes, crate::plugins::PluginError>> + Unpin,
+{
+    while !usage_acc.is_complete() {
+        let next = upstream.next();
+        tokio::pin!(next);
+        let item = tokio::select! {
+            biased;
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => None,
+            _ = async {
+                match idle {
+                    Some(idle) => tokio::time::sleep(idle).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => None,
+            result = &mut next => result,
+        };
+        match item {
+            Some(Ok(chunk)) => {
+                total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+                if max_bytes > 0 && total_bytes > max_bytes {
+                    break;
+                }
+                usage_acc.push(&chunk);
+                finalizer.record_state(ctx.state(usage_acc));
+            }
+            // Clean end, upstream error or a cap: nothing more to learn.
+            _ => break,
+        }
+    }
+}
+
 /// Trusted capability-catalog answer used to decide whether an action may take
 /// the direct execution path. `Undeclared` preserves legacy/local plugin calls
 /// only outside strict mode; an unavailable catalog always refuses because it
@@ -611,6 +662,7 @@ async fn emit_meter(
     attr: &MeterAttribution,
     usage: Option<crate::outbox::TokenUsage>,
     model: Option<&str>,
+    estimated: bool,
 ) {
     let add_dimensions = |mut payload: serde_json::Value| {
         if let Some(dims) = payload
@@ -649,13 +701,13 @@ async fn emit_meter(
     }
 
     // V13b: the priced token event (asset=usd + tokens split), only when a usage
-    // split was parsed (a streamed turn with no usage trailer emits V13a only).
+    // split was parsed or estimated (`estimated` marks a stream estimate, VUL-01).
     if let Some(usage) = usage {
         if let Err(e) = storage
             .append_event(
                 &attr.principal,
                 crate::outbox::EVENT_METER_OBSERVED,
-                add_dimensions(crate::outbox::meter_tokens_payload(
+                add_dimensions(crate::outbox::meter_tokens_payload_marked(
                     &attr.request_id,
                     &attr.principal,
                     attr.occurred_at,
@@ -663,6 +715,7 @@ async fn emit_meter(
                     &attr.credential_alias,
                     model,
                     usage,
+                    estimated,
                 )),
             )
             .await
@@ -696,16 +749,66 @@ fn buffered_as_stream(resp: ExecuteResponse) -> StreamingExecution {
     }
 }
 
+/// What a streamed call is charged: the provider's own final counts, or an estimate
+/// (VUL-01) when the stream ended without a complete usage trailer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamMeterState {
+    usage: crate::outbox::TokenUsage,
+    model: Option<String>,
+    estimated: bool,
+}
+
+/// Request-side facts a stream estimate needs, captured before `params` moves into the
+/// plugin request.
+#[derive(Debug, Clone, Default)]
+struct StreamEstimateContext {
+    /// Size of the request body, for the input estimate when the provider reported none.
+    prompt_bytes: u64,
+    /// The request's own output-token limit, if it set one.
+    max_output_tokens: Option<u64>,
+    /// The request-side model: the rate-card key when the stream echoes none. Without a
+    /// model leria cannot price a token event, so no estimate is emitted (V13a only).
+    request_model: Option<String>,
+}
+
+impl StreamEstimateContext {
+    /// The charge for the stream as it stands. A complete trailer is exact; anything else
+    /// is an estimate, provided a model is known to price it with.
+    fn state(&self, acc: &crate::outbox::UsageAccumulator) -> Option<StreamMeterState> {
+        let model = acc
+            .stream_model()
+            .map(str::to_string)
+            .or_else(|| self.request_model.clone());
+        if acc.is_complete() {
+            let (usage, _) = acc.snapshot()?;
+            return Some(StreamMeterState {
+                usage,
+                model,
+                estimated: false,
+            });
+        }
+        model.map(|m| StreamMeterState {
+            usage: crate::outbox::estimate_stream_usage(
+                acc,
+                self.prompt_bytes,
+                self.max_output_tokens,
+            ),
+            model: Some(m),
+            estimated: true,
+        })
+    }
+}
+
 /// Emits the metering events for a streamed call EXACTLY ONCE, on whichever of two
 /// paths wins (connector M1, V13b on streams):
-/// - **clean end / in-band error:** the adaptor calls [`Self::finalize`] with the
-///   parsed usage (a complete trailer) or `None` (a truncated turn with no trailer →
-///   V13a only).
-/// - **client disconnect / panic:** the eager producer observes receiver closure
-///   and calls `finalize` with its carried usage. `Drop` is a fallback for producer
-///   task cancellation before that terminus; it spawns the emit (a sync `Drop` can't
-///   await). It emits V13b when a complete usage trailer was already parsed and
-///   recorded via [`Self::record_usage`] BEFORE cancellation, otherwise V13a-only.
+/// - **clean end / in-band error:** the producer calls [`Self::finalize`] with the
+///   charge computed from the usage accumulator: the provider's complete trailer, or an
+///   estimate (`estimated = true`) when the stream ended without one.
+/// - **client disconnect / panic:** the producer keeps draining the upstream (without
+///   forwarding) so the trailer can still arrive, then calls `finalize`. `Drop` is a
+///   fallback for producer task cancellation before that terminus; it spawns the emit
+///   (a sync `Drop` can't await) from the latest state recorded via
+///   [`Self::record_state`], which is an estimate until a complete trailer was parsed.
 ///
 /// An `AtomicBool` makes the two paths mutually exclusive, so V13a fires once and
 /// only once for the call.
@@ -713,11 +816,10 @@ struct StreamFinalizer {
     storage: Arc<dyn StorageBackend>,
     attribution: MeterAttribution,
     emitted: std::sync::atomic::AtomicBool,
-    /// The most-recent COMPLETE usage trailer parsed from the stream (+ resolved
-    /// model), recorded each chunk by the generator. Read by `Drop` so a client
-    /// disconnect AFTER the trailer arrived still meters V13b. `None` until a complete
-    /// split is seen.
-    carried: parking_lot::Mutex<Option<(crate::outbox::TokenUsage, Option<String>)>>,
+    /// The latest charge computed by the producer after each chunk. Read by `Drop` so a
+    /// producer cancelled mid-stream still meters tokens (exact when the trailer was
+    /// already parsed, an estimate otherwise) instead of V13a only.
+    carried: parking_lot::Mutex<Option<StreamMeterState>>,
 }
 
 impl StreamFinalizer {
@@ -730,30 +832,47 @@ impl StreamFinalizer {
         }
     }
 
-    /// Record the latest COMPLETE usage trailer (from `UsageAccumulator::snapshot`) so a
-    /// subsequent producer cancellation before a terminus still emits V13b in `Drop`
-    /// rather than under-counting to V13a-only. Cheap; called once per chunk that
-    /// completes the split (idempotent thereafter — last value wins).
-    fn record_usage(&self, usage: crate::outbox::TokenUsage, model: Option<String>) {
-        *self.carried.lock() = Some((usage, model));
+    /// Record the latest charge so a producer cancellation before a terminus still emits
+    /// tokens in `Drop`. Cheap; last value wins.
+    fn record_state(&self, state: Option<StreamMeterState>) {
+        *self.carried.lock() = state;
     }
 
-    /// Emit the meter events inline at a known stream terminus. `usage` is `Some` when a
-    /// complete token split was parsed (a clean EOF, OR a non-clean terminus that still
-    /// had the full trailer); a genuinely partial stream passes `None` (V13a only).
-    async fn finalize(&self, usage: Option<crate::outbox::TokenUsage>, model: Option<String>) {
+    /// Emit the meter events inline at a known stream terminus. `state` is the exact
+    /// charge for a complete trailer, an estimate otherwise, or `None` when no model is
+    /// known to price tokens with (V13a only).
+    async fn finalize(&self, state: Option<StreamMeterState>) {
         if self.emitted.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        emit_meter(&self.storage, &self.attribution, usage, model.as_deref()).await;
+        emit_stream_meter(&self.storage, &self.attribution, state).await;
+    }
+}
+
+async fn emit_stream_meter(
+    storage: &Arc<dyn StorageBackend>,
+    attribution: &MeterAttribution,
+    state: Option<StreamMeterState>,
+) {
+    match state {
+        Some(state) => {
+            emit_meter(
+                storage,
+                attribution,
+                Some(state.usage),
+                state.model.as_deref(),
+                state.estimated,
+            )
+            .await
+        }
+        None => emit_meter(storage, attribution, None, None, false).await,
     }
 }
 
 impl Drop for StreamFinalizer {
     fn drop(&mut self) {
         // Producer cancellation/panic before a terminus: emit via a detached task
-        // (Drop can't await). No-op if finalize() already emitted. If a complete
-        // usage trailer was recorded before cancellation, emit V13b; else V13a-only.
+        // (Drop can't await). No-op if finalize() already emitted.
         if !self.emitted.swap(true, std::sync::atomic::Ordering::SeqCst) {
             // Only spawn when a runtime is live: dropping the body during runtime
             // shutdown would make `tokio::spawn` panic. Metering is best-effort
@@ -761,13 +880,8 @@ impl Drop for StreamFinalizer {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let storage = Arc::clone(&self.storage);
                 let attribution = self.attribution.clone();
-                let (usage, model) = match self.carried.lock().take() {
-                    Some((u, m)) => (Some(u), m),
-                    None => (None, None),
-                };
-                handle.spawn(async move {
-                    emit_meter(&storage, &attribution, usage, model.as_deref()).await
-                });
+                let state = self.carried.lock().take();
+                handle.spawn(async move { emit_stream_meter(&storage, &attribution, state).await });
             }
         }
     }
@@ -2863,6 +2977,7 @@ impl VultrinoServer {
             &attribution,
             meter_token_usage,
             meter_model.as_deref(),
+            false,
         )
         .await;
 
@@ -3056,6 +3171,17 @@ impl VultrinoServer {
             .or_else(|| params.get("model"))
             .and_then(|m| m.as_str())
             .map(str::to_string);
+        // VUL-01: what an estimate needs if the stream ends without a usage trailer.
+        let estimate_ctx = StreamEstimateContext {
+            prompt_bytes: params
+                .get("body")
+                .map(|b| b.to_string().len() as u64)
+                .unwrap_or(0),
+            max_output_tokens: params
+                .get("body")
+                .and_then(crate::outbox::request_max_output_tokens),
+            request_model: meter_request_model.clone(),
+        };
         // Capture the credential's secret material to scrub from the streamed body
         // + headers, before `credential` moves into the plugin request.
         let secret_material = credential.data.secret_material();
@@ -3208,7 +3334,7 @@ impl VultrinoServer {
                 credential = %credential_alias,
                 "streamed response withheld: a credential minted during the action is too short to redact"
             );
-            emit_meter(&Arc::clone(&self.storage), &attribution, None, None).await;
+            emit_meter(&Arc::clone(&self.storage), &attribution, None, None, false).await;
             if let Some((av, evidence)) = &exact_evidence {
                 if let Err(error) = av.complete_exact_use(evidence, "error").await {
                     warn!(request_id = %request_id, error = %error, "withheld stream D8 outcome evidence failed");
@@ -3235,7 +3361,7 @@ impl VultrinoServer {
                 credential = %credential_alias,
                 "streamed response is compressed and cannot be scrubbed — withholding"
             );
-            emit_meter(&Arc::clone(&self.storage), &attribution, None, None).await;
+            emit_meter(&Arc::clone(&self.storage), &attribution, None, None, false).await;
             if let Some((av, evidence)) = &exact_evidence {
                 if let Err(error) = av.complete_exact_use(evidence, "error").await {
                     warn!(request_id = %request_id, error = %error, "compressed stream D8 outcome evidence failed");
@@ -3318,6 +3444,10 @@ impl VultrinoServer {
             let mut usage_acc = crate::outbox::UsageAccumulator::new(max_line);
             let mut upstream = upstream;
             let mut clean = false;
+            // Set when the client went away while the upstream was still producing: the
+            // upstream is then drained (forwarding nothing) so the usage trailer can
+            // still arrive and be charged (VUL-01).
+            let mut drain = false;
             let mut total_bytes: u64 = 0;
             let deadline = total.map(|d| tokio::time::Instant::now() + d);
 
@@ -3326,6 +3456,7 @@ impl VultrinoServer {
                 // that case before touching the upstream so it is an error outcome,
                 // not a misleading clean EOF from a response nobody can receive.
                 if sender.is_closed() {
+                    drain = true;
                     break 'producer;
                 }
                 // Race the next upstream byte against halt, total, and idle. The
@@ -3357,7 +3488,10 @@ impl VultrinoServer {
                         Err(_) => scrubber.terminate_with(SSE_ERROR_FRAME),
                     },
                     StreamStep::Halted => scrubber.terminate_with(SSE_HALT_FRAME),
-                    StreamStep::DownstreamGone => break 'producer,
+                    StreamStep::DownstreamGone => {
+                        drain = true;
+                        break 'producer;
+                    }
                     StreamStep::IdleTimeout
                     | StreamStep::TotalTimeout
                     | StreamStep::UpstreamError => scrubber.terminate_with(SSE_ERROR_FRAME),
@@ -3370,12 +3504,7 @@ impl VultrinoServer {
                             // usage parser and carrying a complete trailer across a
                             // downstream disconnect.
                             usage_acc.push(&chunk);
-                            if let Some((usage, model)) = usage_acc.snapshot() {
-                                finalizer.record_usage(
-                                    usage,
-                                    model.or_else(|| meter_request_model.clone()),
-                                );
-                            }
+                            finalizer.record_state(estimate_ctx.state(&usage_acc));
                             match scrubber.push(&chunk) {
                                 Ok(out) if out.is_empty() => continue,
                                 Ok(out) => {
@@ -3389,7 +3518,10 @@ impl VultrinoServer {
                                     .await
                                     {
                                         StreamDelivery::Delivered => continue,
-                                        StreamDelivery::DownstreamGone => break 'producer,
+                                        StreamDelivery::DownstreamGone => {
+                                            drain = true;
+                                            break 'producer;
+                                        }
                                         StreamDelivery::Halted => {
                                             scrubber.terminate_with(SSE_HALT_FRAME)
                                         }
@@ -3418,9 +3550,23 @@ impl VultrinoServer {
             // A clean EOF that was fully forwarded is the only successful outcome.
             // Every timeout, scrub failure, halt, full/non-consuming downstream, and
             // receiver drop completes both accounting paths as error exactly once.
-            let (usage, stream_model) = usage_acc.finish();
-            let model = stream_model.or(meter_request_model);
-            finalizer.finalize(usage, model).await;
+            if drain {
+                drain_upstream_for_usage(
+                    &mut upstream,
+                    &mut usage_acc,
+                    &estimate_ctx,
+                    &finalizer,
+                    idle,
+                    deadline,
+                    max_bytes,
+                    total_bytes,
+                )
+                .await;
+            }
+            // Flush a trailing partial line, then charge: the provider's complete trailer
+            // when one arrived, otherwise an estimate marked `estimated`.
+            usage_acc.flush();
+            finalizer.finalize(estimate_ctx.state(&usage_acc)).await;
             exact_use_finalizer
                 .finalize(if clean { "ok" } else { "error" })
                 .await;

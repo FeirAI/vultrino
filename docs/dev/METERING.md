@@ -22,9 +22,10 @@ denial never reaches). Both the immediate path and the post-approval
 `resume_approved` path funnel through `run_action`, so an admitted action is
 metered exactly once however it was admitted.
 
-The emit is **off the latency path and fail-open**: it rides `emit_event`, which
-swallows outbox-append failures (logs a `warn!`, "never fails the calling
-operation"). A consumer/outbox outage does **not** block or fail `/execute`.
+The emit is **off the latency path and fail-open**: a failed outbox append (logs a
+`warn!`) never fails the calling operation, and a consumer/outbox outage does **not**
+block or fail `/execute`. A failed append is **counted**, though: see "Failed appends
+are counted and announced" below.
 
 The event carries **no secrets/PII** — ids + a count only. It is test-asserted
 that the credential secret string and the response body never appear in the
@@ -130,27 +131,49 @@ RAW (pre-scrub) SSE chunk to a `crate::outbox::UsageAccumulator`, which line-buf
 across chunk boundaries and reads the token counts + model from the **top level** of
 each recognized `data:` event (never a substring scan, so a prompt that literally
 contains a `usage` object can't forge a count). On a **clean** end the parsed split
-is emitted as the V13b token event — identical shape to the buffered path. Three
+is emitted as the V13b token event — identical shape to the buffered path. A stream
+whose usage block was not final (see below) is charged an estimate instead. Three
 wire shapes are recognized:
 
 - **OpenAI chat** (`stream_options.include_usage`): a terminal `data:` event with
   top-level `usage.{prompt_tokens, completion_tokens}` and `choices: []`. To make the
   provider emit it, vultrino injects `stream_options.include_usage = true` when the
-  request streams and the client did **not** set it (an explicit client value — true
-  OR false — is honored). Gated by `[llm_proxy] inject_stream_usage` (default on).
+  request streams (a client `false` is **overwritten**: the flag is gateway-owned, so a
+  client cannot opt out of token metering). Gated by `[llm_proxy] inject_stream_usage`
+  (default on).
 - **OpenAI responses**: `response.completed` carries `response.usage.{input_tokens,
   output_tokens}`.
 - **Anthropic messages**: `message_start` → `message.usage.input_tokens`;
   `message_delta` → `usage.output_tokens` (**cumulative** → last value wins, never
   summed). Anthropic / responses report usage natively, so no injection is done.
 
-**Honest bound:** V13a `api-calls=1` always fires (including on a halt or client
-disconnect). V13b fires only on a clean end with a parsed usage split — a client that
-sets `include_usage:false`, or a truncated/halted stream, meters V13a only (emitting
-partial counts would under-count, the dangerous direction). A capability with an
-operator `block`/`redact_patterns` egress rule, or a compressed response, is served
-buffered (the incremental scrubber can't honor whole-body regex/block), so its
-metering follows the buffered path.
+**What is charged when the stream does not finish cleanly (VUL-01).** V13a
+`api-calls=1` always fires. V13b is always attempted too:
+
+- **Client hangs up before the trailer.** The producer keeps reading the upstream,
+  forwarding nothing, until the final usage block arrives, under the same idle, total
+  and byte caps as a live stream. The charge is then the provider's exact count.
+- **Anthropic's provisional count.** `message_start` carries `input_tokens` and a
+  provisional `output_tokens`; only the final `message_delta` count is treated as
+  complete. A stream that stops before it is charged an estimate, never the
+  provisional 1.
+- **No trailer at all** (the drain hit a cap, a truncated stream, an upstream error,
+  NVIDIA tool streams, a halted agent). The charge is an **estimate** and the token
+  event carries `dims.estimated = "true"`: input is the provider's count if one was
+  parsed, else the request body size over 3 bytes per token; output is the larger of
+  the provider's partial count and the generated text received over 3 bytes per
+  token (at least 1), capped by the request's own `max_tokens`-style limit. Three
+  bytes per token over-estimates typical text on purpose. leria ingests and prices an
+  estimated event like any other and keeps the marker on the ledger entry; the
+  authoritative bill still reconciles it.
+- **A halt does not drain.** A halted agent's upstream is closed, which stops
+  generation, and the call is charged an estimate.
+- **No request model.** A token event needs a model to select leria's rate card, so a
+  stream with no model in the request or the stream meters V13a only.
+
+A capability with an operator `block`/`redact_patterns` egress rule, or a compressed
+response, is served buffered (the incremental scrubber can't honor whole-body
+regex/block), so its metering follows the buffered path.
 
 ## Consuming the feed: poll or push
 
@@ -173,19 +196,32 @@ There are **two distinct loss modes**, and the gap detector covers only one:
 - **Lost-in-transit delivery** → a minted event whose *delivery* is lost leaves a
   hole in the gap-free replayed sequence; a consumer's sequence-gap detector
   catches it.
-- **Swallowed `append_event`** → the fail-open emit swallows an append failure.
-  The monotonic sequence is minted **inside** the append (only on success), so a
-  swallowed append mints **no** sequence and the stored stream stays contiguous —
-  **there is no hole to detect.** Sequence-gap detection is therefore **not** the
-  compensation for a swallowed append.
+- **Failed `append_event`** → the fail-open emit does not fail the action. The
+  monotonic sequence is minted **inside** the append (only on success), so a failed
+  append mints **no** sequence and the stored stream stays contiguous — **there is no
+  hole to detect.** Sequence-gap detection is therefore **not** the compensation for
+  a failed append; the `meter.lost` marker below is.
 
-The swallowed-append / sustained-outage case must be mitigated **consumer-side**
-(e.g. stale-watermark detection that fires a precautionary `Deny` when the meter
-freezes), and reconciled later by the authoritative source (invoice). None of this
-makes the fail-open emit "closed": an out-of-band meter permits a **bounded
-overshoot** that an outage widens — only an in-path hard ceiling (not built in
-Vultrino's v1) is zero-overshoot. The fail-open emit stays correct for `/execute`
-availability; the consumer **mitigates** but does not eliminate the bounded window.
+### Failed appends are counted and announced (VUL-02)
+
+Every failed outbox append increments an in-memory counter and remembers the first
+and last failure time and the event type. The counters are on `GET /api/v1/health`
+(`meter_lost_total`, `meter_gap_pending`), `GET /api/v1/ready` (`meter_gap_pending`)
+and `GET /api/v1/posture` (`meter.*`). On the **next successful append** the outbox
+writes one `meter.lost` event right after it, with payload
+`{lost_count, first_lost_at, last_lost_at, event_types}` (no body, no secret); if that
+marker append itself fails the counts are kept and it is retried on the following
+success. A consumer that meters from the feed treats the marker as "usage may be
+missing": leria (`gatewaypoll`) freezes its `as_of` watermark for a hold-down period so
+govder's existing meter-stale Deny fires. The counters live in memory: if the process
+dies before an append succeeds again, no marker is written, and only a stale watermark
+remains as the signal.
+
+An out-of-band meter still permits a **bounded overshoot** that an outage widens —
+only an in-path hard ceiling (not built in Vultrino's v1) is zero-overshoot. The
+fail-open emit stays correct for `/execute` availability; the consumer **mitigates**
+but does not eliminate the bounded window, and the authoritative source (invoice)
+reconciles the rest.
 
 ## What stays out of Vultrino (the boundary)
 

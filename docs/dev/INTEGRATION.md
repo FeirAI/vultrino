@@ -136,6 +136,14 @@ in [METERING.md](METERING.md). Wire-contract specifics:
 - The token event is `asset=usd` + a `tokens` split + `dims.model_ref`, with **no
   `amount`** — the consumer mints usd from the counts. Vultrino sends counts, not
   dollars, and holds no pricing/ledger state.
+- A token event whose counts are an **estimate** (a stream that ended without the
+  provider's usage trailer) carries `dims.estimated = "true"`. Price and charge it like
+  any other token event.
+- A **`meter.lost`** event (payload `lost_count`, `first_lost_at`, `last_lost_at`,
+  `event_types`) is a gap marker: vultrino failed to append that many events and this is
+  the first successful append after. Treat it as "usage may be missing since
+  `first_lost_at`" and fail closed (leria freezes its `as_of` watermark so govder's
+  meter-stale Deny fires). See METERING.md "Failed appends are counted and announced".
 
 ### vultrino → a proof plane (e.g. averin)
 

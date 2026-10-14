@@ -683,8 +683,9 @@ async fn llm_proxy_impl(
     }
     // NVIDIA hangs when `stream_options` accompanies a non-empty OpenAI `tools` array.
     // Normalize only that known-incompatible provider shape, including a client-supplied
-    // stream_options, and intentionally meter it V13a-only. Other providers' tool
-    // streams (and NVIDIA streams without tools) retain the usage trailer.
+    // stream_options. NVIDIA cannot send a usage trailer with tools, so that stream is
+    // charged an ESTIMATE (`dims.estimated = "true"`, VUL-01) rather than exact counts.
+    // Other providers' tool streams (and NVIDIA streams without tools) retain the trailer.
     let nvidia_tool_stream = use_streaming
         && request_body
             .as_mut()
