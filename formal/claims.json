@@ -1767,7 +1767,7 @@
         "policy-precedence-engine-kill-flag-ignored"
       ],
       "does_not_establish": "Only the precedence step. Whether a rule matches (URL, method, time window, rate limit, spend cap, action label) is outside it, and the domain is bounded at 4 outcomes and 3 policy defaults for the pure and lazy functions and at two policies of 48 shapes for the engine test. The engine test uses only always-matching rules and a fixed credential, so it does not cover rate-limit charging order beyond the lazy-scan check that no weaker tier is asked, and which matching rule's reason is reported within a tier follows storage order. The oracles are test code. The engine hands the lazy function at most one outcome per call by design; the multi-outcome equivalence is shown for membership of tiers, which is all the scan can observe. Layered Allow-RateLimit rules are conjunctive, which is the separate claim layered-rate-limits-conjunctive and not part of this one. The engine default applies only when no policy matches, and is not applied on top of a matching policy's default. The tail is shown to deny by the mapping test, not shown unreachable from the engine (it is unreachable only because any matching policy has a default action). The engine runs an unparseable-URL pre-check before the kill tier: a halted principal whose request URL cannot be canonicalised, under a policy with a URL deny or prompt rule, gets the unparseable reason instead of the halt reason. The outcome is still Deny and the pre-check is outside this claim.",
-      "evidence_run": "38591586258"
+      "evidence_run": "38622465060"
     },
     {
       "id": "kani-policy-precedence",
@@ -1854,7 +1854,7 @@
         "policy-invalid-warning-dropped-on-refresh"
       ],
       "does_not_establish": "Validation refuses only at config load and on the admin API. The engine's own load paths (add_policy, load_policies, load_policies_if_newer) only log a failing policy, once per policy id, name and error in each process; the refusal of a stored RateLimit policy with a non-deny default happens one layer up, where the server loads from the vault, and is the claim stored-rate-limit-refused-on-load. The engine itself does not validate, so a policy added through PolicyEngine::add_policy without validation is not refused. Example tests over a few condition shapes. Layered rate limits are covered by layered-rate-limits-conjunctive. Default deny makes an over-limit request a denial because the whole Allow tier stops matching (every matching Allow rule's limits are enforced together, so another Allow rule in this or another matching policy cannot admit it; see layered-rate-limits-conjunctive). A Deny or Prompt rule that matches is an earlier tier and still decides first, and a rule whose only condition is a RateLimit allows every request on the credential until it is spent.",
-      "evidence_run": "38591586258"
+      "evidence_run": "38622465060"
     },
     {
       "id": "url-match-canonical",
@@ -3043,7 +3043,7 @@
         "layered-limit-duplicate-charged-twice"
       ],
       "does_not_establish": "Example tests over the listed rule shapes, not an exhaustive check, and the Kani precedence harnesses do not model the Allow tier's guard set. A RateLimit written inside or or not is not part of the guard set and keeps its inline evaluation. Counters are per process and in memory, so two vultrino processes enforce their own caps (the cross-process shared limit is a separate item). The fixed-window transition is covered by the rate-limiter trace vectors, not here. Which matching rule's reason is reported when several match follows storage order. The tests run the engine directly; that the server calls it on every admission path is covered by the permit-kernel claims. The Allow tier evaluates every Allow rule's non-guard conditions, so a RateLimit written inside or or not is charged on every request even when another rule matched or when the guard set then refuses it: that over-charges (the fail-closed direction) and is not tested for exactness.",
-      "evidence_run": "38591586258"
+      "evidence_run": "38622465060"
     },
     {
       "id": "meter-append-loss-announced",
@@ -3105,7 +3105,7 @@
         "meter-feed-gap-pending-hidden"
       ],
       "does_not_establish": "The counters and the pending marker are held in memory: if the process exits before an append succeeds again the marker is never written, and a consumer's stale watermark is the only remaining signal. Failures are produced by one injected fault (an unwritable temp path), not by a real full disk or a failing fsync. Only the direct append path is counted; events staged in the vault and drained later are retried by the reconciler instead. That a consumer acts on the marker is the leria claim for its poller, not this one. Says nothing about events lost while the process is down or about the outbox being tampered with. Failed appends do not fail the metered call: vultrino keeps admitting calls during an outage, and the pending count is the only in-band signal until the marker (so the fail-open choice stands and the consumer's watermark is the control). The count is in the unsigned envelope. That the consumer acts on it is the leria claim meter-lost-marker-holds-as-of.",
-      "evidence_run": "38591586258"
+      "evidence_run": "38622465060"
     },
     {
       "id": "stream-usage-charged-without-trailer",
@@ -3171,7 +3171,7 @@
         "stream-drain-ignores-halt"
       ],
       "does_not_establish": "The estimate is a rough one (about one token per three generated bytes, rounded up on purpose), not the provider's count: it over-charges typical text and can still under-charge text that tokenises very densely. It needs a model from the request or the stream to be priced; a stream with neither meters the api-calls event only. The upstream is a test double with the OpenAI and Anthropic shapes, not a live provider; Gemini and the Responses API shapes are covered by the accumulator unit tests only. The drain is bounded by the same idle, total and byte caps as a live stream, not by a new cap, and a hostile client can hold an upstream stream open for that long. A halt closes the upstream (stopping generation) and is charged an estimate rather than drained, both while forwarding and while draining after a hang-up. The estimate counts text under delta keys only, so a provider that streams text elsewhere (Gemini candidates parts) estimates low, hidden reasoning tokens are not counted, and a provider that reports cumulative usage on every chunk would be read as complete on the first one; today only stream:true requests take this path and the OpenAI and Anthropic shapes are the tested ones. Says nothing about leria pricing or deduplicating the event, which is leria's claim.",
-      "evidence_run": "38591586258"
+      "evidence_run": "38622465060"
     }
   ]
 }
