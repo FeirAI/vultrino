@@ -1,0 +1,29 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 6982908..b923369 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -2702,24 +2702,6 @@ impl VultrinoServer {
+                     // REQUIRES two-phase evidence. A reversible action keeps running when
+                     // Averin is down, with a visible gap (alarm line, counter, one-phase
+                     // seal through the mode's own fail-open or fail-closed rule).
+-                    Err(error) if !evidence_required => {
+-                        av.record_d8_degraded();
+-                        tracing::error!(
+-                            target: "averin_seal",
+-                            request_id = %request_id,
+-                            error = %error,
+-                            "AVERIN-D8-DEGRADED two-phase evidence unavailable for a reversible action; falling back to a one-phase seal"
+-                        );
+-                        self.seal_after_consume(
+-                            av,
+-                            tid,
+-                            params_bytes,
+-                            use_sequence_number,
+-                            &request_id,
+-                            evidence_required,
+-                        )
+-                        .await?;
+-                    }
+                     Err(error) => {
+                         return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
+                             "D8 before-act evidence failed: {error}; nothing ran"

@@ -540,6 +540,18 @@
     },
     "vault-backup-allows-missing-wal": {
       "tier": "full"
+    },
+    "vault-open-ignores-restore-pending": {
+      "tier": "full"
+    },
+    "vault-restore-stages-queue-in-live-dir": {
+      "tier": "full"
+    },
+    "vault-check-cuts-without-reopen-test": {
+      "tier": "full"
+    },
+    "d8-reversible-no-fallback": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -2300,12 +2312,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "d606ca2f97c875b77887f69016d15323aa9cb8a444fd8d9ec02a3a816148762b"
+          "sha256": "2c888f0b882d3fb89f3de38e80b11549848314afd857714a8aa0a662aa89779b"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "0e32c230ad5ef4a55817a90f0d0e05b23b4447873cbead8df62fba5e8887ed3d"
+          "sha256": "310d5c3e3d35bcc463008801e9dc55be25844048299c2fca22151730a8b87c32"
         },
         {
           "path": "src/server/mod.rs",
@@ -2692,7 +2704,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_read_blocking",
-          "sha256": "2f791f4ed619feee763b4f21c9f41f7419702cd11f869031f21ee5208488d9ea"
+          "sha256": "068794c6a959000aeb14193c10e0f823027d3d192e4f9040f5cdfe38eb9a1283"
         },
         {
           "path": "src/storage/file.rs",
@@ -2728,7 +2740,7 @@
         "vault-fence-reader-skips-writer-gate",
         "vault-writer-skips-writer-gate"
       ],
-      "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation is bounded by the shared holders already inside the lock when the writer arrives; the bound is tested with handles in one process (eight looping readers, five seconds), not measured as a latency figure, and not across several OS processes, and it relies on flock on a local filesystem. Writers queue one at a time on the gate. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
+      "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation is not bounded by proof: flock gives no writer preference on the gate either, so taking the gate is fast in practice (readers hold it for a few syscalls; a probe with 32 looping readers saw 5 kill writes wait 11 to 29 ms), not guaranteed. The test uses handles in one process (eight looping readers, five seconds), not several OS processes, and it relies on flock on a local filesystem. A locked read nested inside another locked read on one thread can deadlock against a waiting writer; only a debug assertion guards it. Writers queue one at a time on the gate. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
       "evidence_run": "38652676871"
     },
     {
@@ -2988,7 +3000,7 @@
     },
     {
       "id": "vault-backup-restore-consistent",
-      "statement": "vultrino vault backup copies the vault snapshot, its .wal, the outbox and the averin stores while holding the exclusive vault lock, into a new empty directory, with a manifest of SHA-256 sums and sizes; it refuses a vault that has no .wal (a partial backup), a destination that is not empty, and checks the copy by re-reading it against the manifest and by opening it under the password. vultrino vault restore checks the manifest, every checksum and size, and that nothing is in the directory that the manifest does not list, requires the snapshot and the .wal in the manifest, and opens the copy, all before it touches the target; it refuses to replace an existing vault without --force (then moves the old files aside, never deletes them), stages every file before renaming any, and while it runs leaves <vault>.restore-pending, which makes FileStorage refuse to open until the restore is re-run. A restored vault holds the kill that was in its .wal.",
+      "statement": "vultrino vault backup copies the vault snapshot, its .wal, the outbox and the averin stores while holding the exclusive vault lock (released before the password open check, which runs the KDF on the copy), into a new empty directory, with a manifest of SHA-256 sums and sizes; it refuses a vault that has no .wal (a partial backup), a destination that is not empty, and checks the copy by re-reading it against the manifest and by opening it under the password. vultrino vault restore checks the manifest, every checksum and size, and that nothing is in the directory that the manifest does not list, requires the snapshot and the .wal in the manifest, and opens the copy, all before it touches the target; it refuses to replace an existing vault without --force (then moves the old files aside, never deletes them), stages every file before renaming any (the averin queue as a whole sibling directory, renamed into place after the old one is moved aside, so a target that already has a queue restores cleanly), accepts only manifest names a backup can contain (never an arbitrary name written into the vault directory), and while it runs leaves <vault>.restore-pending, which makes FileStorage refuse to open until the restore is re-run. A restored vault holds the kill that was in its .wal.",
       "method": "test",
       "artifacts": [
         "src/storage/vault_backup.rs",
@@ -3004,17 +3016,17 @@
         {
           "path": "src/storage/vault_backup.rs",
           "symbol": "backup",
-          "sha256": "75a026b405329ddb702b65053dab0cc4765d3d03bb50576caf5ad7a773d5e9b0"
+          "sha256": "004443a68e04c5a8059a3b0eb4fa380bbb7d1ff45ef2cd52b6c6cdd6e3c5d754"
         },
         {
           "path": "src/storage/vault_backup.rs",
           "symbol": "restore",
-          "sha256": "80e3d70acc7d7fcc2f1515c7ddb9312e6589a9e89bba77c5f568a221734936d0"
+          "sha256": "3c8bc252f61e5c97607a88c2d3ec0f9af1984cb9e3878c33ae6012f93eaa09ff"
         },
         {
           "path": "src/storage/vault_backup.rs",
           "symbol": "verify_manifest",
-          "sha256": "37113f5e9b68f160586d7fd159ce8014588068f483d34c4cca4d5971468c9495"
+          "sha256": "0b0147291e81e08f70d155f0d23f767342253cde466dc250cd699e42c4f4722d"
         },
         {
           "path": "src/storage/vault_backup.rs",
@@ -3025,14 +3037,79 @@
           "path": "src/storage/vault_backup.rs",
           "symbol": "lock_everything",
           "sha256": "d37f0513b900ecbd2ade166f236b55faa671e306c62ab6cace8b4dce22a26474"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::open_inner",
+          "sha256": "99eaa0c2456e91045d09715d93ae1a179ccf474807c2f259d94c45919630551a"
+        },
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "target_for",
+          "sha256": "4e36441d6ba99fb9da6bcc9bc1206c7ef73bd2734ec141fb6c8ccd687548b011"
         }
       ],
       "mutants": [
         "vault-restore-skips-checksum",
-        "vault-backup-allows-missing-wal"
+        "vault-backup-allows-missing-wal",
+        "vault-open-ignores-restore-pending",
+        "vault-restore-stages-queue-in-live-dir"
       ],
-      "does_not_establish": "Rollback to an older but self-consistent backup, or a backup tampered with together with its manifest by someone who can write the backup directory: the manifest is not signed. A backup taken while a process holds the vault or the durable averin queue is refused after 30 seconds (vault) or at once (queue), not tested with a second OS process. Power-loss durability of the restore renames: a crash between them is covered by the marker, which is tested only by presence, not by injecting a crash. The averin queue segments are copied as files and are not opened by the open check. Backups of a vault on a filesystem without flock semantics. A damaged final .wal line: there is no vault check command yet. Any CI run.",
+      "does_not_establish": "Rollback to an older but self-consistent backup, or a backup tampered with together with its manifest by someone who can write the backup directory: the manifest is not signed. A backup taken while a process holds the vault or the durable averin queue is refused after 30 seconds (vault) or at once (queue), not tested with a second OS process. Power-loss durability of the restore renames: a crash between them is covered by the marker, which is tested only by presence, not by injecting a crash. The averin queue segments are copied as files and are not opened by the open check. Backups of a vault on a filesystem without flock semantics. Both commands expect the service to be stopped: a running non-durable service holds the vault lock only per operation, so restore does not detect it. Any CI run.",
       "evidence_run": "38652676871"
+    },
+    {
+      "id": "vault-check-final-record",
+      "statement": "vultrino vault check opens the snapshot and a copy of the .wal in a scratch directory. A vault that opens is reported healthy. A vault that does not open is reported as having a damaged final record only when removing exactly the last complete .wal line makes it open; then, only with --truncate-final, that line is written to <wal>.damaged-<nanos> and cut from the .wal. Damage in a middle line, or a wrong password, makes the vault fail to open even without the final line, so the command refuses and the .wal is unchanged.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/vault_backup.rs",
+        "src/main.rs",
+        "docs/dev/LIMITATIONS.md"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::vault_backup::tests::check_cuts_only_a_damaged_final_record_and_refuses_damage_elsewhere",
+      "covers": [
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "check",
+          "sha256": "cf26b2556d103a6c89f574ad06248d486f3ea3b8876a559ba949b43e18d0ecf4"
+        }
+      ],
+      "mutants": [
+        "vault-check-cuts-without-reopen-test"
+      ],
+      "does_not_establish": "That the cut record was unimportant: it is a committed mutation (possibly a kill or a revocation) and is lost, so the operator must redo it; the command prints that and keeps the removed bytes. Damage in the snapshot, in a middle record, or a torn tail beyond the final record (a torn tail is already ignored at open). Concurrent use: it takes the exclusive locks and expects the service to be stopped. One damaged final line only; two damaged final lines need the command run twice and are refused if the first cut does not make the vault open. Any CI run.",
+      "evidence_run": "1"
+    },
+    {
+      "id": "d8-evidence-floor-routine-keeps-running",
+      "statement": "With [averin] enabled, mode observe and d8_complete_evidence on (the FeirOS Solo posture), an action the trusted catalog declares non-reversible is refused before the plugin runs when Averin cannot begin the two-phase use evidence (the error says D8 before-act evidence failed). A reversible action whose two-phase evidence cannot be begun still runs, with one use receipt sealed through the mode's own rule, an AVERIN-D8-DEGRADED alarm line and a d8_degraded counter increment. With Averin up, the same reversible action gets use-intent before and use-outcome after the call and no degraded count.",
+      "method": "test",
+      "artifacts": [
+        "src/server/mod.rs",
+        "src/averin/mod.rs",
+        "tests/approval_token_integration.rs",
+        "docs/dev/LIMITATIONS.md"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact solo_posture_with_averin_down_refuses_irreversible_and_runs_reversible solo_posture_with_averin_up_gives_reversible_two_phase_evidence irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode reversible_approval_resume_remains_fail_open_when_observe_seal_is_missing",
+      "covers": [
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action",
+          "sha256": "310d5c3e3d35bcc463008801e9dc55be25844048299c2fca22151730a8b87c32"
+        }
+      ],
+      "mutants": [
+        "d8-reversible-no-fallback"
+      ],
+      "does_not_establish": "Only actions the trusted catalog declares non-reversible are held to the evidence floor: an action with no declaration, in a non-strict posture, is treated as reversible (the Solo template sets require_declared_capabilities so an undeclared action fails closed). The tests drive the approved-resume path of the buffered tail; the live-call and streaming tails carry the same code and are not separately tested or mutated. A fake Averin stands in for the real one; the four-plane end-to-end with the shipped template is a separate run. The routine action's seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. Any CI run.",
+      "evidence_run": "1"
     }
   ]
 }

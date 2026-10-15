@@ -95,18 +95,22 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   because filesystem write access is outside the threat model),
   and they do not defend against an attacker who can write the vault directory:
   such an attacker can also put back an older copy of the vault. Use `vultrino vault backup <dir>`
-  and `vultrino vault restore <dir>` rather than copying files by hand: backup takes
-  the exclusive vault lock and copies the snapshot, the `.wal`, the outbox and the
-  averin stores together with a SHA-256 manifest, then checks the copy; restore
-  verifies the manifest, every checksum and an open of the copy before touching the
-  target, refuses a backup without the snapshot or the `.wal`, replaces an existing
-  vault only with `--force` (moving the old files aside), and leaves
-  `<vault>.restore-pending` if interrupted, which stops the vault opening until the
-  restore is re-run. Both refuse while a process holds the vault or the durable
-  averin queue, so stop the service first. They do not detect a rollback to an
-  older but self-consistent backup, and a damaged final `.wal` line still stops
-  startup until an operator truncates it after checking (there is no `vault check`
-  command yet).
+  and `vultrino vault restore <dir>` rather than copying files by hand (the Solo VPS
+  nightly backup does): backup holds the exclusive vault lock while it copies the
+  snapshot, the `.wal`, the outbox and the averin stores together with a SHA-256
+  manifest, then checks the copy; restore verifies the manifest, every checksum and an
+  open of the copy before touching the target, refuses a backup without the snapshot
+  or the `.wal`, replaces an existing vault only with `--force` (moving the old
+  files aside), and leaves `<vault>.restore-pending` if interrupted, which stops the
+  vault opening until the restore is re-run. Stop the service before a restore: a
+  non-durable service holds the vault lock only per operation, so restore does not
+  detect it (backup is safe under a running non-durable service, it pauses
+  dispatches for the copy; the durable averin queue refuses both). They do not detect
+  a rollback to an older but self-consistent backup. A damaged final `.wal` line
+  stops startup; `vultrino vault check` says whether removing exactly that one
+  record makes the vault open, and `--truncate-final` cuts it (kept in a side file;
+  the cut record is a lost mutation, so redo a kill or revocation that was in it).
+  Damage anywhere else is refused, not guessed at.
 - **Vault change detection and lock behaviour.** Another process's commit is noticed
   through the snapshot's (mtime, length, inode) token plus the log length; a
   filesystem with coarse timestamps is unsupported (this now covers writes and the
@@ -419,13 +423,16 @@ kernels.
   refused at config load rather than coerced into Observe. Undeclared actions in
   non-strict posture, reversible declarations, and deployments with Averin
   disabled still have no record-existence guarantee. That split is the intended
-  posture, not an oversight: money and irreversible actions require committed
-  evidence and are refused while Averin is down, routine actions keep running and
-  their background seals can be dropped under overload or lost in a crash (the
-  plan 085 reconciliation detects the gap, it cannot recover the seal). The FeirOS
-  Solo config ships exactly this (`[averin] enabled = true`, `mode = "observe"`,
-  `d8_complete_evidence = false`); `d8_complete_evidence = true` would make every
-  action wait on Averin and is not the default.
+  posture, not an oversight: actions the trusted catalog declares non-reversible
+  (money and irreversible actions) require committed two-phase evidence and are
+  refused while Averin is down; reversible actions keep running. With
+  `d8_complete_evidence = true` (the FeirOS Solo setting) a reversible action gets
+  two-phase evidence while Averin is up, and when Averin is down it still runs with
+  a one-phase seal, an `AVERIN-D8-DEGRADED` alarm line and a `d8_degraded` counter
+  (`averin_seal` in `/api/v1/metrics`); that seal can be dropped or lost in a crash,
+  and the plan 085 reconciliation detects the gap, it cannot recover it. An action
+  with no catalog declaration is treated as reversible unless
+  `require_declared_capabilities = true`, which the Solo config sets.
 - **An `internal_http` capability's HTTP verb is operator authority, and the agent
   may not send one.** The transport requires `method`, so a capability registered
   through the admin API must make it decidable: exactly one `target.methods` entry,
