@@ -4,8 +4,8 @@
 //! (Allow < Prompt < Deny). Exhaustive over the grid, not over all patterns.
 
 use vultrino::policy::{
-    refuse_warned_url_patterns, Policy, PolicyAction, PolicyCondition, PolicyDecision,
-    PolicyEngine, PolicyRule,
+    refuse_warned_url_patterns, url_matches_exact, Policy, PolicyAction, PolicyCondition,
+    PolicyDecision, PolicyEngine, PolicyRule,
 };
 
 const PATTERNS: &[&str] = &[
@@ -67,6 +67,43 @@ fn wrap(shape: usize, p: &str) -> PolicyCondition {
     }
 }
 
+/// What the engine decided before the broadening existed: each rule matches exactly what it
+/// says, the tiers run Deny, Prompt, Allow, then the policy default. A broadened engine is never
+/// weaker than this.
+fn unbroadened(rules: &[PolicyRule], default: PolicyAction, url: &str) -> u8 {
+    fn m(c: &PolicyCondition, url: &str) -> bool {
+        match c {
+            PolicyCondition::UrlMatch(p) => url_matches_exact(url, p),
+            PolicyCondition::MethodMatch(ms) => ms.iter().any(|x| x.eq_ignore_ascii_case("GET")),
+            PolicyCondition::And(v) => v.iter().all(|c| m(c, url)),
+            PolicyCondition::Or(v) => v.iter().any(|c| m(c, url)),
+            PolicyCondition::Not(i) => !m(i, url),
+            _ => unreachable!("not in the grid"),
+        }
+    }
+    for tier in [
+        PolicyAction::Deny,
+        PolicyAction::Prompt,
+        PolicyAction::Allow,
+    ] {
+        if rules
+            .iter()
+            .any(|r| r.action == tier && m(&r.condition, url))
+        {
+            return match tier {
+                PolicyAction::Deny => 2,
+                PolicyAction::Prompt => 1,
+                PolicyAction::Allow => 0,
+            };
+        }
+    }
+    match default {
+        PolicyAction::Deny => 2,
+        PolicyAction::Prompt => 1,
+        PolicyAction::Allow => 0,
+    }
+}
+
 fn rules(action: PolicyAction, shape: usize, p: &str, allow_all_rule: bool) -> Vec<PolicyRule> {
     let mut v = Vec::new();
     if allow_all_rule {
@@ -112,6 +149,7 @@ fn a_query_suffix_never_weakens_an_accepted_policy() {
                             continue;
                         }
                         accepted += 1;
+                        let rule_set = pol.rules.clone();
                         let e = PolicyEngine::new();
                         e.add_policy(pol);
                         for u in URLS {
@@ -120,6 +158,17 @@ fn a_query_suffix_never_weakens_an_accepted_policy() {
                             let a = rank(&e.evaluate_readonly("c", Some(u), Some("GET")));
                             let b = rank(&e.evaluate_readonly("c", Some(&with_q), Some("GET")));
                             checked += 1;
+                            // Never weaker than the engine without the broadening, for the URL
+                            // as sent and for the same URL with a query appended.
+                            for (url, got) in [(*u, a), (with_q.as_str(), b)] {
+                                let reference = unbroadened(&rule_set, default, url);
+                                assert!(
+                                    got >= reference,
+                                    "weaker than the unbroadened engine: {action:?} shape {shape} \
+                                     default {default:?} allow_rule {allow_rule} pattern {p}: \
+                                     {url} -> {got}, unbroadened {reference}"
+                                );
+                            }
                             // A trailing slash and a parameter placed before an existing one
                             // never weaken either.
                             let slashed = format!("{}/", u.split('?').next().unwrap());
@@ -228,4 +277,42 @@ fn query_patterns_are_refused_and_trailing_slash_is_denied() {
     ] {
         assert_eq!(decide(pat, PolicyAction::Deny, u), 2, "{u}");
     }
+}
+
+/// Servlet containers drop `;name=value` path parameters and many servers fold repeated
+/// trailing slashes, so those spellings of a denied path are denied too.
+#[test]
+fn path_parameters_and_repeated_trailing_slashes_are_denied() {
+    for (pat, urls) in [
+        (
+            "https://api.example.com/v1/*/delete",
+            &[
+                "https://api.example.com/v1/a/delete;jsessionid=1",
+                "https://api.example.com/v1/a/delete;jsessionid=1?x=1",
+                "https://api.example.com/v1/a/delete//",
+                "https://api.example.com/v1/a/delete//?x=1",
+                "https://api.example.com/v1/a/delete/;x=1",
+            ][..],
+        ),
+        (
+            "https://api.example.com/admin*",
+            &[
+                "https://api.example.com/admin;x=1/",
+                "https://api.example.com/admin//",
+            ][..],
+        ),
+    ] {
+        for u in urls {
+            assert_eq!(decide(pat, PolicyAction::Deny, u), 2, "{pat} vs {u}");
+        }
+    }
+    // A different path is still allowed.
+    assert_eq!(
+        decide(
+            "https://api.example.com/v1/*/delete",
+            PolicyAction::Deny,
+            "https://api.example.com/v1/a/read;x=1"
+        ),
+        0
+    );
 }

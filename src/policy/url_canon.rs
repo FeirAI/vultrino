@@ -519,6 +519,27 @@ pub fn url_matches(raw_url: &str, raw_pattern: &str) -> bool {
     url_matches_for(raw_url, raw_pattern, false)
 }
 
+/// The URL with every `;name=value` parameter removed from its path segments.
+fn strip_path_params(base: &str) -> String {
+    let Some(auth_start) = base.find("://").map(|i| i + 3) else {
+        return strip_segments(base);
+    };
+    match base[auth_start..].find('/') {
+        None => base.to_string(),
+        Some(i) => {
+            let (head, path) = base.split_at(auth_start + i);
+            format!("{head}{}", strip_segments(path))
+        }
+    }
+}
+
+fn strip_segments(path: &str) -> String {
+    path.split('/')
+        .map(|seg| seg.split(';').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// `url_matches`, and when `broaden` is set also against the URL with trailing query parameters
 /// removed, one at a time down to no query at all, and with one trailing `/` of the path removed
 /// (Deny and Prompt rules, flipped under `not`):
@@ -547,14 +568,21 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool 
     if !query.is_empty() {
         cuts.push(0);
     }
-    // Many frameworks route `/x/` to the handler of `/x`, so the path without one trailing `/`
-    // is judged too, with and without the query.
-    let bases = [Some(base), base.strip_suffix('/')];
-    let hit = bases.into_iter().flatten().any(|b| {
+    // Many frameworks route `/x/` to the handler of `/x`, so the path without trailing `/`
+    // is judged too (one, or all of them), with and without the query. Servlet containers
+    // and Spring drop `;name=value` path parameters (`/x;jsessionid=1` reaches `/x`), so the
+    // path without them is judged as well.
+    let no_params = strip_path_params(base);
+    let mut bases: Vec<&str> = vec![base];
+    bases.extend(base.strip_suffix('/'));
+    bases.push(base.trim_end_matches('/'));
+    bases.push(&no_params);
+    let no_params_trimmed = no_params.trim_end_matches('/').to_string();
+    bases.push(&no_params_trimmed);
+    bases.iter().any(|b| {
         cuts.iter()
             .any(|&at| canonical_matches(&format!("{b}{}", &query[..at]), &p))
-    });
-    hit
+    })
 }
 
 #[cfg(test)]

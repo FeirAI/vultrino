@@ -171,22 +171,25 @@ those — checking **every** resolved IP, not just an IP literal. OAuth2 token U
 get the same guard and must be HTTPS. So a proxied request to `127.0.0.1` or a
 metadata endpoint is denied at the transport step.
 
-**Upstream proxy: explicit opt-in only.** Every secret-bearing outbound client
-(`build_guarded_client`) ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, so an ambient
-proxy can neither see an injected credential nor skip the connect-time resolver guard. An
+**Upstream proxy: explicit opt-in only.** Every secret-bearing outbound client ignores
+`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`: the guarded client (`build_guarded_client`, used by the
+HTTP, OAuth, HMAC and Google plugins), `internal_http`, the averin and govder plane clients, the
+approval notifier, the outbox pusher and the request CLI each call `.no_proxy()`
+(`tests/no_ambient_proxy_clients.rs` fails when a product client builder lacks it). An ambient
+proxy can neither see an injected credential nor skip the connect-time resolver guard.
+**The HTTP plugin refuses a plain `http://` target in every mode** (every target it can reach is
+public, so a credential would cross the network in clear text); operator-pinned internal
+destinations use `internal_http`. An
 operator who must route egress through a proxy sets `VULTRINO_UPSTREAM_PROXY` to an `http://`
 or `https://` proxy URL (an invalid value stops the process at client construction). Only
-`https://` targets go through it (a CONNECT tunnel, the credential inside TLS); a plain
-`http://` target is refused at admission while the proxy is set, and is never handed to the
-proxy, unless the proxy is on this host (a loopback IP literal sidecar, such as a local egress filter or
-the credential-canary test reflector): that first hop never leaves the machine, but the
-proxy then forwards the request onward and a credential is in clear text on that hop.
-The proxy resolves the target host itself, so the connect-time resolver guard does not cover
+`https://` targets go through it (a CONNECT tunnel, the credential inside TLS), and
+`VULTRINO_UPSTREAM_PROXY_CA_FILE` adds a private CA for a TLS-inspecting proxy (refused without the
+proxy). The proxy resolves the target host itself, so the connect-time resolver guard does not cover
 that hop. While the proxy is set, a target host that this machine cannot resolve to any address
 is refused at admission (the plugins would otherwise hand a name to the proxy's own, possibly
 internal, DNS view). A name that does resolve here can still resolve differently at the proxy:
 that window between vultrino's lookup and the proxy's is not closed. The proxy host itself must
-be an IP literal. the admission-time URL check above still runs, and the proxy is trusted to enforce
+be an IP literal. The admission-time URL check above still runs, and the proxy is trusted to enforce
 its own destination policy. `GET /api/v1/posture` reports `egress.upstream_proxy_configured`
 (never the URL).
 

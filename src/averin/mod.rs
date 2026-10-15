@@ -445,6 +445,9 @@ impl AverinClient {
             return Err(AverinError::MissingResourceId);
         }
         let http = reqwest::Client::builder()
+            // The averin API key travels in the Authorization header: never to an ambient
+            // HTTP_PROXY / HTTPS_PROXY / ALL_PROXY (VUL-29).
+            .no_proxy()
             .timeout(cfg.timeout)
             .build()
             .map_err(AverinError::HttpBuild)?;

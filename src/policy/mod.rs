@@ -21,7 +21,15 @@ pub use url_canon::{canonical_pattern, canonical_url, effective_url, policy_url,
 
 pub use types::*;
 
-use precedence::{decision_for, resolve_lazily, RuleOutcome};
+/// The exact, unbroadened `url_match` of a request URL against a pattern. Test support: the
+/// oracle in `tests/url_query_never_weakens.rs` compares the engine against rules that match
+/// exactly what they say.
+#[doc(hidden)]
+pub fn url_matches_exact(raw_url: &str, raw_pattern: &str) -> bool {
+    url_canon::url_matches_for(raw_url, raw_pattern, false)
+}
+
+use precedence::{decision_for, resolve_lazily, RuleOutcome, Verdict};
 
 use crate::RequestContext;
 use glob::Pattern;
@@ -54,6 +62,32 @@ pub enum PolicyDecision {
     Deny(String),
     /// Request requires user prompt (future feature)
     Prompt,
+}
+
+/// Which components of an `eval_pair` result the caller reads.
+#[derive(Clone, Copy)]
+struct Want {
+    narrow: bool,
+    wide: bool,
+}
+
+impl Want {
+    const NARROW: Want = Want {
+        narrow: true,
+        wide: false,
+    };
+    const WIDE: Want = Want {
+        narrow: false,
+        wide: true,
+    };
+    const BOTH: Want = Want {
+        narrow: true,
+        wide: true,
+    };
+}
+
+fn same(v: bool) -> (bool, bool) {
+    (v, v)
 }
 
 /// What the execute path asks the engine to judge for one request (VUL-05).
@@ -640,6 +674,7 @@ impl PolicyEngine {
         // evaluated first and is authoritative). Making layered RateLimit Allow rules
         // conjunctive is tracked in LIMITATIONS.md.
         let mut deny_policy: Option<&str> = None;
+        let broadened_prompt = std::cell::Cell::new(false);
         let policy_defaults: Vec<PolicyAction> =
             matching_policies.iter().map(|p| p.default_action).collect();
         let kill = matching_policies.iter().any(|p| p.kill);
@@ -672,12 +707,29 @@ impl PolicyEngine {
                                     record, // check the cap on the live path; skip on resume
                                 )
                             }
-                            other => self.evaluate_condition(
-                                other,
-                                input,
-                                record,
-                                rule.action != PolicyAction::Allow,
-                            ),
+                            other => match rule.action {
+                                // Allow rules match exactly what they say.
+                                PolicyAction::Allow => {
+                                    self.eval_pair(other, input, record, Want::NARROW).0
+                                }
+                                // Deny rules are broadened: matching more is stricter.
+                                PolicyAction::Deny => {
+                                    self.eval_pair(other, input, record, Want::WIDE).1
+                                }
+                                // Prompt rules: an exact match is a Prompt. A match that
+                                // only the broadening produces is held back and used only
+                                // when the unbroadened verdict is Allow (VUL-32), so the
+                                // broadening can turn an Allow into a Prompt but never a
+                                // Deny into one.
+                                PolicyAction::Prompt => {
+                                    let (narrow, wide) =
+                                        self.eval_pair(other, input, record, Want::BOTH);
+                                    if !narrow && wide {
+                                        broadened_prompt.set(true);
+                                    }
+                                    narrow
+                                }
+                            },
                         };
                         if matched {
                             if tier == RuleOutcome::Deny {
@@ -692,6 +744,15 @@ impl PolicyEngine {
             &policy_defaults,
             self.default_deny.load(Ordering::SeqCst),
         );
+        // VUL-32: the broadening of a Prompt rule only ever upgrades an Allow outcome.
+        let verdict = match verdict {
+            Verdict::Allow | Verdict::PolicyDefaultAllow | Verdict::EngineDefaultAllow
+                if broadened_prompt.get() =>
+            {
+                Verdict::Prompt
+            }
+            v => v,
+        };
         let default_deny_policy = matching_policies
             .iter()
             .find(|p| p.default_action == PolicyAction::Deny)
@@ -706,35 +767,45 @@ impl PolicyEngine {
 
     /// Evaluate a single condition against the request input.
     ///
-    /// `broaden` is true when matching MORE is the strict direction: a Deny or Prompt rule,
-    /// flipped under each `Not` (VUL-32). A broadened `url_match` also matches the URL with
-    /// its query removed, so a pattern written without a query (`/v1/*/delete`, `/admi[n]`)
-    /// cannot be slipped past by appending `?x=1`.
-    fn evaluate_condition(
+    /// Returns `(narrow, wide)`. `narrow` is the condition as written. `wide` also lets a
+    /// `url_match` match the URL with its query removed or one trailing `/` dropped, so a
+    /// pattern written without a query (`/v1/*/delete`, `/admi[n]`) cannot be slipped past
+    /// by appending `?x=1` (VUL-32). `narrow` implies `wide` at every node: `Not` swaps and
+    /// inverts the pair. Only the components in `want` are guaranteed to be computed, and a
+    /// rate limit is charged at most once, only on a path a wanted component still reaches.
+    #[allow(clippy::only_used_in_recursion)]
+    fn eval_pair(
         &self,
         condition: &PolicyCondition,
         input: &EvalInput,
         record: bool,
-        broaden: bool,
-    ) -> bool {
+        want: Want,
+    ) -> (bool, bool) {
         match condition {
-            PolicyCondition::UrlMatch(pattern) => input
-                .url
-                .map(|u| url_matches_for(u, pattern, broaden))
-                .unwrap_or(false),
+            PolicyCondition::UrlMatch(pattern) => match input.url {
+                Some(u) => {
+                    let narrow = url_matches_for(u, pattern, false);
+                    (narrow, narrow || url_matches_for(u, pattern, true))
+                }
+                None => (false, false),
+            },
 
-            PolicyCondition::MethodMatch(methods) => input
-                .method
-                .map(|m| methods.iter().any(|x| x.eq_ignore_ascii_case(m)))
-                .unwrap_or(false),
+            PolicyCondition::MethodMatch(methods) => same(
+                input
+                    .method
+                    .map(|m| methods.iter().any(|x| x.eq_ignore_ascii_case(m)))
+                    .unwrap_or(false),
+            ),
 
-            PolicyCondition::ActionMatch(pattern) => input
-                .action
-                .map(|a| match glob::Pattern::new(pattern) {
-                    Ok(p) => p.matches(a),
-                    Err(_) => pattern == a, // malformed glob -> exact-match fallback
-                })
-                .unwrap_or(false),
+            PolicyCondition::ActionMatch(pattern) => same(
+                input
+                    .action
+                    .map(|a| match glob::Pattern::new(pattern) {
+                        Ok(p) => p.matches(a),
+                        Err(_) => pattern == a, // malformed glob -> exact-match fallback
+                    })
+                    .unwrap_or(false),
+            ),
 
             PolicyCondition::TimeWindow { start, end } => {
                 let now = chrono::Local::now().time();
@@ -745,28 +816,26 @@ impl PolicyEngine {
                 // could NEVER match, silently failing an overnight Deny **open** —
                 // the dangerous direction. `start == end` is rejected at load
                 // (`Policy::validate`) as ambiguous (empty vs. all-day).
-                if start <= end {
+                same(if start <= end {
                     now >= *start && now <= *end
                 } else {
                     now >= *start || now <= *end
-                }
+                })
             }
 
-            PolicyCondition::RateLimit { max, window_secs } => {
-                if record {
-                    self.check_rate_limit(
-                        input.credential_alias,
-                        input.principal.map(rate_limit_principal),
-                        *max,
-                        *window_secs,
-                    )
-                } else {
-                    // Deferred (post-approval) evaluation: the slot was taken when
-                    // the request first opened the approval; re-applying the limit
-                    // would wrongly deny an already-approved action.
-                    true
-                }
-            }
+            PolicyCondition::RateLimit { max, window_secs } => same(if record {
+                self.check_rate_limit(
+                    input.credential_alias,
+                    input.principal.map(rate_limit_principal),
+                    *max,
+                    *window_secs,
+                )
+            } else {
+                // Deferred (post-approval) evaluation: the slot was taken when
+                // the request first opened the approval; re-applying the limit
+                // would wrongly deny an already-approved action.
+                true
+            }),
 
             PolicyCondition::SpendCap {
                 asset,
@@ -776,20 +845,49 @@ impl PolicyEngine {
                 // which Policy::validate rejects at load. Evaluate it purely as a
                 // safety net — the authoritative check is a top-level SpendCap rule
                 // in evaluate_inner.
-                self.spend_within_cap(input.spend, asset, *per_action_max, record)
+                same(self.spend_within_cap(input.spend, asset, *per_action_max, record))
             }
 
-            PolicyCondition::And(conditions) => conditions
-                .iter()
-                .all(|c| self.evaluate_condition(c, input, record, broaden)),
+            PolicyCondition::And(conditions) => {
+                let mut acc = (true, true);
+                for c in conditions {
+                    let r = self.eval_pair(c, input, record, want);
+                    acc = (acc.0 && r.0, acc.1 && r.1);
+                    // Stop once no wanted component can still be true.
+                    if !((want.narrow && acc.0) || (want.wide && acc.1)) {
+                        break;
+                    }
+                }
+                acc
+            }
 
-            PolicyCondition::Or(conditions) => conditions
-                .iter()
-                .any(|c| self.evaluate_condition(c, input, record, broaden)),
+            PolicyCondition::Or(conditions) => {
+                let mut acc = (false, false);
+                for c in conditions {
+                    let r = self.eval_pair(c, input, record, want);
+                    acc = (acc.0 || r.0, acc.1 || r.1);
+                    // Stop once every wanted component is already true.
+                    if (!want.narrow || acc.0) && (!want.wide || acc.1) {
+                        break;
+                    }
+                }
+                acc
+            }
 
-            PolicyCondition::Not(inner) => !self.evaluate_condition(inner, input, record, !broaden),
+            PolicyCondition::Not(inner) => {
+                let (n, w) = self.eval_pair(
+                    inner,
+                    input,
+                    record,
+                    Want {
+                        narrow: want.wide,
+                        wide: want.narrow,
+                    },
+                );
+                (!w, !n)
+            }
 
-            PolicyCondition::Always => true,
+            PolicyCondition::Always => (true, true),
         }
     }
 
@@ -1031,8 +1129,9 @@ fn pattern_warning_reason(w: &PatternWarning, canonical: &str) -> String {
             as literal text"
             .to_string(),
         PatternWarning::ExactUrlMissesQuery => "the pattern is an exact URL with no query, so the \
-            same URL with a query string appended (?x=1) does not match it; write the prefix \
-            form with a trailing * (for example https://api.example.com/admin*)"
+            same URL with a query string appended (?x=1) is matched too on a deny or prompt rule, so \
+            this is refused as belt and braces; write the prefix form with a trailing * (for \
+            example https://api.example.com/admin*)"
             .to_string(),
         PatternWarning::QueryInPattern => "the pattern has a ?: a query in a pattern is slipped \
             past by inserting or reordering a parameter (?x=1&confirm=true), and a bare ? matches \

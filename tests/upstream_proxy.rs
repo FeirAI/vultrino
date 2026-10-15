@@ -1,6 +1,6 @@
 //! VUL-29: the guarded outbound client ignores the ambient proxy environment, routes only
-//! https targets through the explicit VULTRINO_UPSTREAM_PROXY opt-in, and refuses plain
-//! http:// targets while that opt-in is set.
+//! https targets through the explicit VULTRINO_UPSTREAM_PROXY opt-in, and plain http://
+//! targets are refused at admission in every mode.
 //!
 //! Own test binary: it mutates process environment. A single test fn keeps ordering fixed.
 
@@ -65,61 +65,77 @@ async fn ambient_proxy_is_ignored_and_opt_in_never_carries_plain_http() {
     );
     assert!(!vultrino::plugins::upstream_proxy_configured());
 
-    // 2. With the explicit opt-in set to a proxy that is NOT on this host: plain http:// is
-    //    refused at admission, and the client never hands an http:// request to the proxy
-    //    (it goes direct; the proxy address here is never contacted for it).
-    std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://10.255.255.1:3128");
-    assert!(vultrino::plugins::upstream_proxy_configured());
-    let err = admit_url("http://93.184.216.34/api").expect_err("plain http must be refused");
+    // 2. Plain http:// to a public host is refused at admission in EVERY mode, because the
+    //    plugin injects a credential and the request would carry it in clear text: with no
+    //    proxy, with a remote proxy and with a loopback proxy. https is still admitted.
+    for proxy_setting in [
+        None,
+        Some("http://10.255.255.1:3128".to_string()),
+        Some("http://[2001:db8::1]:3128".to_string()),
+        Some("http://proxy.example.invalid:3128".to_string()),
+        Some("http://localhost:3128".to_string()),
+        Some("http://[::1]:3128".to_string()),
+        Some(proxy_url.clone()),
+    ] {
+        match &proxy_setting {
+            Some(v) => std::env::set_var("VULTRINO_UPSTREAM_PROXY", v),
+            None => std::env::remove_var("VULTRINO_UPSTREAM_PROXY"),
+        }
+        for url in ["http://93.184.216.34/api", "http://8.8.8.8/api"] {
+            let err = admit_url(url).expect_err(&format!("{url} under {proxy_setting:?}"));
+            assert!(err.contains("plain http://"), "{err}");
+        }
+        if proxy_setting.is_none() {
+            admit_url("https://93.184.216.34/api").expect("https is admitted");
+        }
+    }
+
+    // A proxy named by a host name is refused at client construction (only an IP literal
+    // works, because a name is resolved through the target SSRF guard).
+    std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://localhost:3128");
     assert!(
-        err.contains("plain http://") && err.contains("VULTRINO_UPSTREAM_PROXY"),
-        "{err}"
+        std::panic::catch_unwind(guarded_client).is_err(),
+        "a host-name proxy must stop client construction"
     );
-    admit_url("https://93.184.216.34/api").expect("https is still admitted");
+
+    // 2b. Even with a loopback proxy configured, the client never hands an http:// request
+    //     to it: the request is not proxied, so the proxy sees nothing.
+    std::env::set_var("VULTRINO_UPSTREAM_PROXY", &proxy_url);
     let client = guarded_client();
     let _ = client
         .get(format!("http://127.0.0.1:{target_port}/y"))
         .send()
         .await
-        .expect("an http target is not routed via a remote proxy");
-    assert_eq!(target.load(Ordering::SeqCst), 2, "went direct");
-
-    // A proxy named by a domain other than localhost is remote too.
-    std::env::set_var(
-        "VULTRINO_UPSTREAM_PROXY",
-        "http://proxy.example.invalid:3128",
-    );
-    admit_url("http://93.184.216.34/api").expect_err("a domain proxy is not on this host");
-    std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://[2001:db8::1]:3128");
-    admit_url("http://93.184.216.34/api").expect_err("a public IPv6 proxy is remote");
-    // A proxy named `localhost` is refused: only an IP literal works (a host name is resolved
-    // through the target guard, which refuses an internal proxy), so it is neither loopback nor
-    // constructible.
-    std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://localhost:3128");
-    admit_url("http://93.184.216.34/api").expect_err("a host-name proxy is never loopback");
-    assert!(
-        std::panic::catch_unwind(guarded_client).is_err(),
-        "a host-name proxy must stop client construction"
-    );
-    std::env::set_var("VULTRINO_UPSTREAM_PROXY", "http://[::1]:3128");
-    admit_url("http://93.184.216.34/api").expect("::1 is on this host");
-
-    // 2b. A proxy on this host (a loopback sidecar) may carry plain http: the hop never
-    //     leaves the machine. The request reaches the proxy and not the target.
-    std::env::set_var("VULTRINO_UPSTREAM_PROXY", &proxy_url);
-    admit_url("http://93.184.216.34/api").expect("loopback proxy: plain http admitted");
-    let client = guarded_client();
-    let _ = client
-        .get("http://93.184.216.34/z")
-        .send()
-        .await
-        .expect("served by the loopback proxy");
+        .expect("an http target is not routed via the proxy");
     assert_eq!(
         proxy.load(Ordering::SeqCst),
-        1,
-        "routed via the loopback proxy"
+        0,
+        "the proxy saw an http:// request"
     );
-    assert_eq!(target.load(Ordering::SeqCst), 2);
+    assert_eq!(target.load(Ordering::SeqCst), 2, "went direct");
+
+    // 2b'. The proxy's private CA: set without a proxy it is refused (it would only widen the
+    //      trust of direct connections); unreadable or not a certificate it stops construction.
+    std::env::remove_var("VULTRINO_UPSTREAM_PROXY");
+    std::env::set_var("VULTRINO_UPSTREAM_PROXY_CA_FILE", "/nonexistent/ca.pem");
+    assert!(
+        std::panic::catch_unwind(guarded_client).is_err(),
+        "a CA with no proxy must stop client construction"
+    );
+    std::env::set_var("VULTRINO_UPSTREAM_PROXY", &proxy_url);
+    assert!(
+        std::panic::catch_unwind(guarded_client).is_err(),
+        "an unreadable CA must stop client construction"
+    );
+    let junk = std::env::temp_dir().join(format!("vultrino-junk-ca-{}.pem", std::process::id()));
+    std::fs::write(&junk, b"not a certificate").unwrap();
+    std::env::set_var("VULTRINO_UPSTREAM_PROXY_CA_FILE", &junk);
+    assert!(
+        std::panic::catch_unwind(guarded_client).is_err(),
+        "a CA that is not PEM must stop client construction"
+    );
+    let _ = std::fs::remove_file(&junk);
+    std::env::remove_var("VULTRINO_UPSTREAM_PROXY_CA_FILE");
 
     // 2c. With the proxy set, a host this machine cannot resolve is refused at admission: the
     //     proxy would resolve it in its own DNS view. Without the proxy it is not refused here

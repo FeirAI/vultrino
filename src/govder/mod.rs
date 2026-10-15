@@ -418,7 +418,11 @@ impl GovderClient {
                 }
             })
             .ok_or_else(|| GovderError::BadUrl("missing host".to_string()))?;
-        let http = Client::builder().timeout(cfg.http_timeout).build()?;
+        // The tenant assertion travels in a header: never via an ambient proxy (VUL-29).
+        let http = Client::builder()
+            .no_proxy()
+            .timeout(cfg.http_timeout)
+            .build()?;
         Ok(Self {
             cfg,
             base,

@@ -362,21 +362,37 @@ pub(crate) fn build_guarded_client() -> Client {
         // below.
         .no_proxy();
     match upstream_proxy_from(std::env::var(UPSTREAM_PROXY_ENV).ok().as_deref()) {
-        Ok(None) => {}
+        Ok(None) if upstream_proxy_ca_path().is_none() => {}
         Ok(Some(proxy_url)) => {
             // Only https targets are routed through the proxy (a CONNECT tunnel: the
-            // credential is inside TLS), unless the proxy is on this host (a loopback
-            // sidecar), where a plain http:// hop never leaves the machine. An http://
-            // target is otherwise never handed to the proxy (and validate_url_ssrf refuses
-            // it while a proxy is configured).
-            let plaintext_ok = proxy_is_loopback(&proxy_url);
+            // credential is inside TLS). An http:// target is never handed to the proxy,
+            // and validate_url_ssrf refuses a plain http:// target in every mode.
             builder = builder.proxy(reqwest::Proxy::custom(move |target| {
-                if target.scheme() == "https" || plaintext_ok {
+                if target.scheme() == "https" {
                     Some(proxy_url.clone())
                 } else {
                     None
                 }
             }));
+            // A TLS-inspecting or test egress proxy presents certificates from a private CA.
+            // The operator names that CA here; it is trusted in addition to the built-in
+            // roots, and only together with the proxy opt-in.
+            if let Some(pem_path) = upstream_proxy_ca_path() {
+                let pem = std::fs::read(&pem_path).unwrap_or_else(|e| {
+                    panic!("{UPSTREAM_PROXY_CA_ENV} could not be read ({pem_path}): {e}")
+                });
+                if !String::from_utf8_lossy(&pem).contains("-----BEGIN CERTIFICATE-----") {
+                    panic!("{UPSTREAM_PROXY_CA_ENV} is not a PEM certificate ({pem_path})");
+                }
+                let cert = reqwest::Certificate::from_pem(&pem).unwrap_or_else(|e| {
+                    panic!("{UPSTREAM_PROXY_CA_ENV} is not a PEM certificate ({pem_path}): {e}")
+                });
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        Ok(None) => {
+            // A CA with no proxy would only widen trust for direct connections.
+            panic!("{UPSTREAM_PROXY_CA_ENV} is set but {UPSTREAM_PROXY_ENV} is not");
         }
         Err(msg) => {
             // Fail closed at construction: a malformed opt-in must not silently fall back
@@ -413,21 +429,14 @@ pub(crate) fn upstream_proxy_from(raw: Option<&str>) -> Result<Option<url::Url>,
     Ok(Some(u))
 }
 
-/// Whether the proxy is on this host (an IP literal in 127.0.0.0/8 or ::1).
-pub(crate) fn proxy_is_loopback(u: &url::Url) -> bool {
-    match u.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(_)) | None => false,
-    }
-}
+/// Optional PEM file naming the private CA of the opt-in proxy's certificates.
+pub const UPSTREAM_PROXY_CA_ENV: &str = "VULTRINO_UPSTREAM_PROXY_CA_FILE";
 
-/// True when plain http:// may be sent to the configured proxy: only a loopback proxy.
-fn upstream_proxy_plaintext_ok() -> bool {
-    upstream_proxy_from(std::env::var(UPSTREAM_PROXY_ENV).ok().as_deref())
+fn upstream_proxy_ca_path() -> Option<String> {
+    std::env::var(UPSTREAM_PROXY_CA_ENV)
         .ok()
-        .flatten()
-        .is_some_and(|u| proxy_is_loopback(&u))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// With the explicit upstream proxy configured, the proxy (not reqwest) resolves the target, so
@@ -959,15 +968,9 @@ impl HttpPlugin {
 
         // Only allow http and https schemes
         match url.scheme() {
-            "http" => {
-                if upstream_proxy_configured() && !upstream_proxy_plaintext_ok() {
-                    return Err(PluginError::InvalidParams(format!(
-                        "plain http:// is refused while {UPSTREAM_PROXY_ENV} is set to a proxy \
-                         that is not on this host: a credential must not cross a proxy in clear \
-                         text. Use https://."
-                    )));
-                }
-            }
+            // Refused below, after the host checks, so a private or loopback target keeps
+            // its own message.
+            "http" => {}
             "https" => {}
             scheme => {
                 return Err(PluginError::InvalidParams(format!(
@@ -1017,6 +1020,19 @@ impl HttpPlugin {
         // re-filters the CONNECT-time resolution to public IPs only (see new()). So
         // the two together cover both the request-time and connect-time windows; a
         // DNS *failure* here is not a fail-open (reqwest's connect resolves + fails too).
+
+        // This plugin injects a secret into every request, and every target that reaches this
+        // point is public (private and loopback addresses were refused above). A plain
+        // http:// request would put the credential on the public network in clear text,
+        // whether it goes direct or through a proxy, so it is refused in every mode.
+        // Operator-pinned internal destinations use the internal_http plugin instead.
+        if url.scheme() == "http" {
+            return Err(PluginError::InvalidParams(
+                "plain http:// is refused: this plugin sends a credential, which must not \
+                 cross a public network in clear text. Use https://."
+                    .to_string(),
+            ));
+        }
 
         Ok(url)
     }
@@ -2077,9 +2093,9 @@ mod tests {
     }
 
     #[test]
-    fn test_ssrf_allows_http() {
+    fn test_ssrf_refuses_plain_http_to_a_public_host() {
         let result = HttpPlugin::validate_url_ssrf("http://api.example.com/v1");
-        assert!(result.is_ok());
+        assert!(result.unwrap_err().to_string().contains("plain http://"));
     }
 
     #[test]
