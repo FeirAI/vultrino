@@ -2301,9 +2301,10 @@ async fn test_out_of_band_decide_without_named_identity_is_refused() {
 async fn fei16_decision_links_cannot_complete_a_two_person_action() {
     // A decision link carries no identity: every click is recorded as the one configured
     // oob_approver_identity, so a second click is the SAME approver and is refused as a
-    // duplicate. Two people clicking the same link therefore never satisfy a two-person rule
-    // (fail closed). Per-person attribution is the Telegram callback mode
-    // ([approvals.telegram] callback_decisions), or the Approvals screen.
+    // duplicate. Two link clicks therefore never satisfy a two-person rule (fail closed). One link
+    // click plus ONE sign-off under another identity still does, and may be the same person (see
+    // approval::tests::fei16_a_link_is_one_unknown_identity...). Per-person attribution is the
+    // Telegram callback mode ([approvals.telegram] callback_decisions), or the Approvals screen.
     let (router, storage) = build_router().await;
 
     let (approval, token) = ApprovalRequest::open(NewApproval {

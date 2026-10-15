@@ -420,8 +420,8 @@ chat_id   = "987654321"
 # Needs a NUMERIC chat_id (a group is negative) and the table below. Off by default.
 # callback_decisions = true
 # [approvals.telegram.approvers]       # Telegram user id = the named approver identity
-# "11111111" = "alice@example.com"
-# "22222222" = "bob@example.com"
+# "11111111" = "auth0|64f2a9c1d3e5"    # use the person's IdP subject (OIDC sub), not an email (see below)
+# "22222222" = "auth0|7b1e0d44c2a8"
 
 [approvals.webhook]
 url         = "https://hooks.example.com/vultrino-approvals"
@@ -448,15 +448,25 @@ purpose:
 
 - *Decision links* (the default Telegram URL buttons, and every webhook link). A link is a
   bearer capability: whoever can read the channel can use it, and the clicker is not
-  identified. Every verdict is recorded as the one `oob_approver_identity`. A second click is
-  the same approver and is refused as a duplicate, so **a link can never complete a
-  two-person action**. Use the Approvals screen for those.
+  identified. Every verdict is recorded as the one `oob_approver_identity`. So a link verdict
+  is **one approver of unknown identity**: a second click is the same approver and is refused
+  as a duplicate (two link clicks never complete a two-person action), but a link click **plus
+  any one sign-off under another identity** (the Approvals screen, a Telegram callback) does
+  complete it, and the clicker may be the same human who gave the other sign-off, because
+  nothing can tell. If a two-person action must be two distinct people, take both sign-offs in
+  the Approvals screen or with Telegram callbacks.
 - *Telegram callback decisions* (`callback_decisions = true`). The notifier posts callback
   buttons, so **no decision link is posted into the chat**, and vultrino long-polls
   `getUpdates` (outbound only, nothing exposed) for presses. Telegram itself reports which
   user pressed, and the press is recorded under the identity the operator mapped that user id
   to, with channel `telegram:<user id>`; so separation of duty, `exclude_owner` and the
-  distinct-approver count of a dual-control request all see the individual. A user who is not
+  distinct-approver count of a dual-control request see the individual **among Telegram
+  users**. Across channels they compare strings: the Approvals screen under OIDC records
+  `verified:<immutable IdP subject>`, and the Telegram identity is whatever string you mapped.
+  The same person is counted once only if the mapping value **is** that person's IdP subject
+  (the OIDC `sub`, for example `"11111111" = "auth0|64f2a9c1d3e5"`, not an email). Map a
+  Telegram user to anything else (`alice@example.com`) and that person pressing in Telegram and
+  approving in the Approvals screen counts as two approvers. A user who is not
   in `[approvals.telegram.approvers]` is told so and nothing is recorded; a press outside the
   configured chat is ignored. Config load refuses: a non-numeric `chat_id`, an empty table, two
   Telegram users mapped to one identity (it would collapse two people into one approver), an

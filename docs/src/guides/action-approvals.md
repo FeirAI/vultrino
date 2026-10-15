@@ -63,7 +63,7 @@ bot_token = "123456:ABC-DEF..."
 chat_id = "987654321"
 # callback_decisions = true                       # per-person attribution: needs a numeric chat_id
 # [approvals.telegram.approvers]                  # and a Telegram user id -> approver identity table
-# "11111111" = "alice@example.com"
+# "11111111" = "auth0|64f2a9c1d3e5"   # the person's IdP subject, so Telegram and the Approvals screen count them once
 
 [approvals.webhook]                               # POST to any URL (email / Slack / ...)
 url = "https://hooks.example.com/vultrino-approvals"
@@ -84,7 +84,7 @@ action_pattern = "*"
 class = "critical"
 ```
 
-**Decision links versus Telegram callback decisions.** An Approve/Deny link is a bearer capability and cannot tell the people in a chat apart: every link verdict is recorded as `oob_approver_identity`, so a second click is the same approver and a link can never complete a two-person action. With `callback_decisions = true` the buttons carry no link at all; Telegram reports who pressed, the press is recorded under that person's mapped identity, and two different people are two approvers. See [CONFIGURATION.md](../../dev/CONFIGURATION.md) for the bounds.
+**Decision links versus Telegram callback decisions.** An Approve/Deny link is a bearer capability and cannot tell the people in a chat apart: every link verdict is recorded as `oob_approver_identity`, so a link verdict is one approver of unknown identity. Two link clicks never complete a two-person action (the second is the same approver), but one link click plus one sign-off under any other identity does, and the two may be the same person. With `callback_decisions = true` the buttons carry no link at all; Telegram reports who pressed, the press is recorded under that person's mapped identity, and two different Telegram users are two approvers. To count the same person once across Telegram and the Approvals screen, map the Telegram user to that person's IdP subject (for example `"11111111" = "auth0|64f2a9c1d3e5"`), not to an email. See [CONFIGURATION.md](../../dev/CONFIGURATION.md) for the bounds.
 
 If approvals are enabled but no notifier is configured, decisions can still be made from the admin panel; Vultrino logs a warning that out-of-band approval is unavailable.
 

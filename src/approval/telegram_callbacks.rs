@@ -2,8 +2,8 @@
 //!
 //! A decision link carries no identity: whoever can read the chat can open it, so every link
 //! verdict is recorded under the one configured `oob_approver_identity`, and a second link
-//! click is refused as a duplicate approver (so a two-person action can never complete over
-//! links). Telegram does tell a bot WHO pressed a callback button: `callback_query.from.id` is
+//! click is refused as a duplicate approver (so two link clicks never complete a two-person
+//! action; one link click plus one sign-off under another identity still does). Telegram does tell a bot WHO pressed a callback button: `callback_query.from.id` is
 //! set by Telegram's servers and cannot be forged by a chat member. This module turns that into
 //! an attributable decision:
 //!
@@ -13,8 +13,10 @@
 //!   each button press, looks the Telegram user id up in the operator's `[approvals.telegram.
 //!   approvers]` table. An unlisted user is told they may not decide and nothing is recorded;
 //! * a listed user's verdict is recorded under THEIR named identity (channel `telegram:<id>`), so
-//!   two different people are two different approvers: separation of duty, `exclude_owner` and
-//!   the distinct-approver count of a two-person rule all see the right person.
+//!   two different Telegram users are two different approvers: separation of duty, `exclude_owner`
+//!   and the distinct-approver count of a two-person rule see the right person among Telegram
+//!   users. Against a verified panel sign-off the strings are compared, so the mapped identity
+//!   must BE the person's IdP subject for them to count once (see docs/dev/CONFIGURATION.md).
 //!
 //! What it does not do: it does not resolve an approver class (an approval gated by a govder
 //! recipe that names classes still needs the broker's verified assertion), and a bot can have only

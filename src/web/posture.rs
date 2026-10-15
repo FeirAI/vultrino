@@ -81,6 +81,7 @@ pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Pol
 const REL_OUTBOX_POLL: &str = "vultrino-outbox-poll"; // A: vultrino signs its meter feed; leria verifies
 const REL_APPROVAL_PUSH: &str = "vultrino-approval-push"; // E: the same outbox secret signs approval pushes; govder verifies
 const REL_TENANT_ASSERTION: &str = "tenant-assertion"; // F: the edge/broker-signed tenant assertion (vultrino signs its calls to govder with it)
+const REL_AVERIN_API_KEY: &str = "averin-api-key"; // I: the project bearer vultrino sends to averin (averin accepts a list)
 const REL_APPROVER_KEY: &str = "approver-key"; // M: the key that verifies the broker's signed approver decisions
 
 /// The fingerprints of the secrets this process was configured with, per relationship. A
@@ -104,6 +105,15 @@ fn secret_fingerprints(config: &Config) -> Value {
             .as_deref()
             .is_some_and(|u| !u.trim().is_empty());
     add(REL_APPROVAL_PUSH, outbox.filter(|_| pushing));
+    // Reported only while the seal client is on: AVERIN_API_KEY is read but never sent otherwise.
+    add(
+        REL_AVERIN_API_KEY,
+        config
+            .averin
+            .api_key
+            .as_deref()
+            .filter(|_| config.averin.enabled),
+    );
     if let Some(g) = config.govder.as_ref() {
         add(REL_TENANT_ASSERTION, Some(g.assertion_secret.as_str()));
         add(REL_APPROVER_KEY, g.approval_verification_secret());
@@ -298,6 +308,28 @@ mod tests {
         assert!(v["secret_fingerprints"]
             .get("vultrino-approval-push")
             .is_none());
+    }
+
+    /// FEI-40 relationship I: vultrino reports the averin key it sends, only while the seal client
+    /// is enabled, and never the key.
+    #[test]
+    fn report_carries_the_averin_key_fingerprint_only_while_the_seal_client_is_on() {
+        use crate::secret_fp::fingerprint;
+        let mut cfg = Config::default();
+        cfg.averin.api_key = Some("averin-project-bearer".into());
+        cfg.averin.enabled = false;
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"].get("averin-api-key").is_none());
+        cfg.averin.enabled = true;
+        let v = build_posture(&cfg, true, &[]);
+        assert_eq!(
+            v["secret_fingerprints"]["averin-api-key"],
+            json!([fingerprint("averin-project-bearer", "averin-api-key").unwrap()])
+        );
+        assert!(!v.to_string().contains("averin-project-bearer"));
+        cfg.averin.api_key = None;
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"].get("averin-api-key").is_none());
     }
 
     /// An unset secret has no fingerprint (the relationship is absent), and an approver key that is

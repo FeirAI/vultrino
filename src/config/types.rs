@@ -617,12 +617,35 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
                     .to_string(),
             ));
         }
+        // FEI-33: an `enabled = true` block that cannot build a seal client used to start the
+        // server with the client silently off (a warn line), so every Observe action then ran with
+        // no receipt and no evidence.receipt_gap event. Refuse to start instead: the operator asked
+        // for evidence and cannot be given it.
+        let enabled = raw.enabled.unwrap_or(d.enabled);
+        let base_url = raw.base_url.unwrap_or(d.base_url);
+        let resource_id = raw.resource_id.unwrap_or(d.resource_id);
+        if enabled && base_url.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "[averin] enabled = true but base_url is empty: the seal client cannot be built, so no \
+                 action would be sealed and no receipt gap would be recorded. Set base_url, or set \
+                 enabled = false."
+                    .to_string(),
+            ));
+        }
+        if enabled && resource_id.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "[averin] enabled = true but resource_id is empty (it must equal averin's \
+                 AVERIN_RESOURCE_ID): the seal client cannot be built, so no action would be sealed \
+                 and no receipt gap would be recorded. Set resource_id, or set enabled = false."
+                    .to_string(),
+            ));
+        }
         Ok(Self {
-            enabled: raw.enabled.unwrap_or(d.enabled),
-            base_url: raw.base_url.unwrap_or(d.base_url),
+            enabled,
+            base_url,
             project_id: raw.project_id.unwrap_or(d.project_id),
             session_id: raw.session_id.unwrap_or(d.session_id),
-            resource_id: raw.resource_id.unwrap_or(d.resource_id),
+            resource_id,
             // Sourced from AVERIN_API_KEY at startup, never TOML.
             api_key: None,
             mode,
@@ -1411,6 +1434,41 @@ action = "deny"
         }
     }
 
+    /// FEI-33: `enabled = true` with no base_url or no resource_id cannot build a seal client; the
+    /// server used to start with it silently off, so no Observe action got a receipt or a gap event.
+    /// Now the config does not load. A disabled block (staged, not turned on) is not judged.
+    #[test]
+    fn fei33_enabled_averin_without_base_url_or_resource_id_refuses_to_load() {
+        for (toml, names) in [
+            ("[averin]\nenabled = true", "base_url"),
+            (
+                "[averin]\nenabled = true\nbase_url = \"  \"\nresource_id = \"r\"",
+                "base_url",
+            ),
+            (
+                "[averin]\nenabled = true\nbase_url = \"http://x\"",
+                "resource_id",
+            ),
+            (
+                "[averin]\nenabled = true\nbase_url = \"http://x\"\nresource_id = \" \"",
+                "resource_id",
+            ),
+        ] {
+            let msg = Config::parse(toml)
+                .expect_err("an enabled averin block that cannot build a client must refuse")
+                .to_string();
+            assert!(
+                msg.contains(names) && msg.contains("receipt"),
+                "{toml:?}: {msg}"
+            );
+        }
+        assert!(Config::parse("[averin]\nenabled = false").is_ok());
+        assert!(Config::parse(
+            "[averin]\nenabled = true\nbase_url = \"http://x\"\nresource_id = \"r\""
+        )
+        .is_ok());
+    }
+
     #[test]
     fn averin_mode_is_closed_and_typos_fail_config_load() {
         for mode in ["Observe", "require-evidnce", "best_effort", ""] {
@@ -1444,10 +1502,12 @@ action = "deny"
         // byte-identical-to-087 default.
         assert!(!Config::parse("").unwrap().averin.durable);
         assert!(
-            !Config::parse("[averin]\nenabled = true")
-                .unwrap()
-                .averin
-                .durable
+            !Config::parse(
+                "[averin]\nenabled = true\nbase_url = \"http://x\"\nresource_id = \"r\""
+            )
+            .unwrap()
+            .averin
+            .durable
         );
         // Explicit durable = true (with the default Observe mode) parses fine.
         let cfg = Config::parse(

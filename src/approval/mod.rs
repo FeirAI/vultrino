@@ -3627,6 +3627,81 @@ mod tests {
         assert_eq!(a.status, ApprovalStatus::Approved);
     }
 
+    /// FEI-16, what a decision link can and cannot do in a two-person action. The link verdict is
+    /// ONE sign-off under the configured `oob_approver_identity`, an identity that says nothing
+    /// about WHO clicked. So (a) two link clicks never complete a two-person action (same identity),
+    /// but (b) one link click plus ONE sign-off under any other identity DOES complete it, and the
+    /// two may be the same human: nothing here can tell. The docs say exactly this; this test is the
+    /// executable statement of it (the earlier wording, "a link can never complete a two-person
+    /// action", was false).
+    #[test]
+    fn fei16_a_link_is_one_unknown_identity_that_completes_a_two_person_action_with_any_other_signoff(
+    ) {
+        let (mut two_clicks, _) = new_approval();
+        two_clicks.required_approvals = 2;
+        two_clicks
+            .approve(Decision::new("out-of-band link", "oncall").enforcing_sod(true))
+            .unwrap();
+        let err = two_clicks
+            .approve(Decision::new("out-of-band link", "oncall").enforcing_sod(true))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::DuplicateApprover));
+        assert_eq!(two_clicks.status, ApprovalStatus::Pending);
+
+        let (mut link_plus_panel, _) = new_approval();
+        link_plus_panel.required_approvals = 2;
+        link_plus_panel
+            .approve(Decision::new("out-of-band link", "oncall").enforcing_sod(true))
+            .unwrap();
+        link_plus_panel
+            .approve(Decision::new("admin panel", "verified:sub-alice").enforcing_sod(true))
+            .unwrap();
+        assert_eq!(
+            link_plus_panel.status,
+            ApprovalStatus::Approved,
+            "a link plus one other sign-off completes a two-person action"
+        );
+    }
+
+    /// FEI-16, cross-channel distinctness. Telegram callback identities are strings the operator
+    /// maps; panel identities under OIDC are `verified:<immutable subject>`. Distinctness, SoD and
+    /// `exclude_owner` compare the BARE strings, so one person pressing in Telegram and approving in
+    /// the panel is counted as one approver only when the Telegram mapping is exactly that person's
+    /// IdP subject. A mapping to anything else (an email) makes the same person two approvers.
+    #[test]
+    fn fei16_telegram_and_panel_dedupe_only_when_the_mapping_is_the_idp_subject() {
+        let (mut same_subject, _) = new_approval();
+        same_subject.required_approvals = 2;
+        same_subject
+            .approve(Decision::new("telegram:11111111", "auth0|64f2a9c1d3e5").enforcing_sod(true))
+            .unwrap();
+        let err = same_subject
+            .approve(
+                Decision::new("admin panel", "verified:auth0|64f2a9c1d3e5").enforcing_sod(true),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ApprovalError::DuplicateApprover),
+            "a Telegram mapping equal to the IdP subject must collide with the panel sign-off: {err:?}"
+        );
+
+        let (mut email_mapping, _) = new_approval();
+        email_mapping.required_approvals = 2;
+        email_mapping
+            .approve(Decision::new("telegram:11111111", "alice@example.com").enforcing_sod(true))
+            .unwrap();
+        email_mapping
+            .approve(
+                Decision::new("admin panel", "verified:auth0|64f2a9c1d3e5").enforcing_sod(true),
+            )
+            .unwrap();
+        assert_eq!(
+            email_mapping.status,
+            ApprovalStatus::Approved,
+            "a Telegram mapping that is NOT the IdP subject counts as a second person (the documented bound)"
+        );
+    }
+
     #[test]
     fn test_aggregator_identity_helpers() {
         // Bare identity passes through unchanged.
