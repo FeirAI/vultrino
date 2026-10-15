@@ -18,6 +18,7 @@ pub const POSTURE_SCHEMA: u32 = 1;
 /// `default_deny` is the policy engine's live default (set from `[enforcement] default_action`),
 /// `policies` the policies the engine enforces right now (config plus stored).
 pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Policy]) -> Value {
+    let secret_fingerprints = secret_fingerprints(config);
     let key = config.govder.as_ref().map(|g| g.approval_key_posture());
     let mut observe_tenants: Vec<&str> = config
         .tenants
@@ -67,7 +68,39 @@ pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Pol
         "vault": {
             "format_version": crate::storage::STORAGE_VERSION,
         },
+        // FEI-40: keyed fingerprints of the shared secrets this process holds, per relationship
+        // (see crate::secret_fp). The verifier compares them with the other planes' to find a
+        // misaligned pair at deploy time. Never a secret value.
+        "secret_fingerprints": secret_fingerprints,
     })
+}
+
+/// Relationship names of the secret-alignment matrix this plane takes part in. They are the same
+/// strings in every plane and in feir-os `deploy/posture/evaluate.jq`, and part of the fingerprinted
+/// message.
+const REL_OUTBOX_POLL: &str = "vultrino-outbox-poll"; // A: vultrino signs its meter feed; leria verifies
+const REL_APPROVAL_PUSH: &str = "vultrino-approval-push"; // E: the same outbox secret signs approval pushes; govder verifies
+const REL_TENANT_ASSERTION: &str = "tenant-assertion"; // F: the edge/broker-signed tenant assertion (vultrino signs its calls to govder with it)
+const REL_APPROVER_KEY: &str = "approver-key"; // M: the key that verifies the broker's signed approver decisions
+
+/// The fingerprints of the secrets this process was configured with, per relationship. A
+/// relationship with no configured secret is omitted (an unset secret has no fingerprint).
+fn secret_fingerprints(config: &Config) -> Value {
+    use crate::secret_fp::fingerprint;
+    let mut out = serde_json::Map::new();
+    let mut add = |rel: &str, secret: Option<&str>| {
+        if let Some(fp) = secret.and_then(|s| fingerprint(s, rel)) {
+            out.insert(rel.to_string(), json!([fp]));
+        }
+    };
+    let outbox = config.outbox.hmac_secret.as_deref();
+    add(REL_OUTBOX_POLL, outbox);
+    add(REL_APPROVAL_PUSH, outbox);
+    if let Some(g) = config.govder.as_ref() {
+        add(REL_TENANT_ASSERTION, Some(g.assertion_secret.as_str()));
+        add(REL_APPROVER_KEY, g.approval_verification_secret());
+    }
+    Value::Object(out)
 }
 
 #[cfg(test)]
@@ -143,7 +176,9 @@ mod tests {
             v["approver_identity"]["key_distinct_from_govder_key"],
             false
         );
-        let text = v.to_string();
+        // The one field whose name says "secret" is the fingerprint map (FEI-40): keyed fingerprints,
+        // never a value (the test below checks that with real secrets configured).
+        let text = v.to_string().replace("secret_fingerprints", "");
         assert!(!text.contains("secret"), "no secret-named field: {text}");
     }
 
@@ -180,5 +215,67 @@ mod tests {
             assert_eq!(a["key_distinct_from_govder_key"], distinct, "{f}/{m:?}");
             assert_eq!(a["shared_key_escape"], escape, "{f}/{m:?}");
         }
+    }
+
+    // ---- FEI-40: secret-alignment fingerprints --------------------------------------------------
+
+    fn govder_cfg(m: Option<&str>) -> crate::govder::GovderConfig {
+        crate::govder::GovderConfig {
+            base_url: "http://govder.invalid".into(),
+            assertion_secret: "assertion-F".into(),
+            approval_assertion_secret: m.map(str::to_string),
+            allow_shared_approval_key: false,
+            assertion_ttl: std::time::Duration::from_secs(90),
+            http_timeout: std::time::Duration::from_secs(1),
+        }
+    }
+
+    /// The report carries one keyed fingerprint per relationship, from the values this process is
+    /// configured with: the outbox secret for both its feed and its approval pushes (one secret, two
+    /// relationships, so two different fingerprints), the tenant assertion secret it signs calls to
+    /// govder with, and the approver key. No secret value appears in the report.
+    #[test]
+    fn report_carries_a_fingerprint_per_relationship_and_no_secret() {
+        use crate::secret_fp::fingerprint;
+        let mut cfg = Config::default();
+        cfg.outbox.hmac_secret = Some("outbox-secret-A".into());
+        cfg.govder = Some(govder_cfg(Some("approver-key-M")));
+        let v = build_posture(&cfg, true, &[]);
+        let fp = &v["secret_fingerprints"];
+        assert_eq!(
+            fp["vultrino-outbox-poll"],
+            json!([fingerprint("outbox-secret-A", "vultrino-outbox-poll").unwrap()])
+        );
+        assert_eq!(
+            fp["vultrino-approval-push"],
+            json!([fingerprint("outbox-secret-A", "vultrino-approval-push").unwrap()])
+        );
+        assert_ne!(fp["vultrino-outbox-poll"], fp["vultrino-approval-push"]);
+        assert_eq!(
+            fp["tenant-assertion"],
+            json!([fingerprint("assertion-F", "tenant-assertion").unwrap()])
+        );
+        assert_eq!(
+            fp["approver-key"],
+            json!([fingerprint("approver-key-M", "approver-key").unwrap()])
+        );
+        let text = v.to_string();
+        for secret in ["outbox-secret-A", "assertion-F", "approver-key-M"] {
+            assert!(!text.contains(secret), "the report carries {secret}");
+        }
+    }
+
+    /// An unset secret has no fingerprint (the relationship is absent), and an approver key that is
+    /// not usable (equal to the shared key, so verified approvals are disabled) is not reported as
+    /// held.
+    #[test]
+    fn report_omits_unset_secrets_and_an_unusable_approver_key() {
+        let v = build_posture(&Config::default(), true, &[]);
+        assert_eq!(v["secret_fingerprints"], json!({}));
+        let mut cfg = Config::default();
+        cfg.govder = Some(govder_cfg(Some("assertion-F"))); // M equal to F: disabled
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"].get("approver-key").is_none());
+        assert!(v["secret_fingerprints"].get("tenant-assertion").is_some());
     }
 }
