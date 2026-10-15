@@ -307,8 +307,10 @@ mod tests {
     fn report_omits_unset_secrets_and_an_unusable_approver_key() {
         let v = build_posture(&Config::default(), true, &[]);
         assert_eq!(v["secret_fingerprints"], json!({}));
-        let mut cfg = Config::default();
-        cfg.govder = Some(govder_cfg(Some("assertion-F"))); // M equal to F: disabled
+        let cfg = Config {
+            govder: Some(govder_cfg(Some("assertion-F"))), // M equal to F: disabled
+            ..Config::default()
+        };
         let v = build_posture(&cfg, true, &[]);
         assert!(v["secret_fingerprints"].get("approver-key").is_none());
         assert!(v["secret_fingerprints"].get("tenant-assertion").is_some());
