@@ -61,6 +61,9 @@ dual_control_approvers = 2                          # distinct approvers for dua
 [approvals.telegram]                              # inline Approve / Deny buttons
 bot_token = "123456:ABC-DEF..."
 chat_id = "987654321"
+# callback_decisions = true                       # per-person attribution: needs a numeric chat_id
+# [approvals.telegram.approvers]                  # and a Telegram user id -> approver identity table
+# "11111111" = "alice@example.com"
 
 [approvals.webhook]                               # POST to any URL (email / Slack / ...)
 url = "https://hooks.example.com/vultrino-approvals"
@@ -80,6 +83,8 @@ credential_pattern = "pay-*"
 action_pattern = "*"
 class = "critical"
 ```
+
+**Decision links versus Telegram callback decisions.** An Approve/Deny link is a bearer capability and cannot tell the people in a chat apart: every link verdict is recorded as `oob_approver_identity`, so a second click is the same approver and a link can never complete a two-person action. With `callback_decisions = true` the buttons carry no link at all; Telegram reports who pressed, the press is recorded under that person's mapped identity, and two different people are two approvers. See [CONFIGURATION.md](../../dev/CONFIGURATION.md) for the bounds.
 
 If approvals are enabled but no notifier is configured, decisions can still be made from the admin panel; Vultrino logs a warning that out-of-band approval is unavailable.
 

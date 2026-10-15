@@ -26,6 +26,7 @@
 //! token travels in the link, set `public_base_url` to an HTTPS address and
 //! avoid logging request URIs at DEBUG.
 
+pub mod telegram_callbacks;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -3049,6 +3050,14 @@ impl ApprovalConfig {
 pub struct TelegramConfig {
     pub bot_token: String,
     pub chat_id: String,
+    /// Telegram API host. [`telegram_callbacks::TELEGRAM_API_BASE`] in production; tests point it
+    /// at a local server. Never read from configuration.
+    pub api_base: String,
+    /// FEI-16: when set, the notifier posts callback buttons (no decision token in the chat) and
+    /// [`telegram_callbacks::run_callback_loop`] attributes each press to the Telegram user who
+    /// pressed it. `None` keeps the URL buttons, whose verdicts all carry the one configured
+    /// `oob_approver_identity`.
+    pub callback: Option<telegram_callbacks::TelegramCallbackConfig>,
 }
 
 /// Generic webhook notifier config.
@@ -3141,8 +3150,8 @@ impl ApprovalNotifier for TelegramNotifier {
         links: &ApprovalLinks,
     ) -> Result<(), NotifyError> {
         let api = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.config.bot_token
+            "{}/bot{}/sendMessage",
+            self.config.api_base, self.config.bot_token
         );
 
         // V5: reflect escalation in the header so a re-ping reads as escalated.
@@ -3168,7 +3177,20 @@ impl ApprovalNotifier for TelegramNotifier {
             "parse_mode": "HTML",
             "disable_web_page_preview": true,
         });
-        if links.approve_url.starts_with("http") {
+        if self.config.callback.is_some() {
+            // FEI-16: callback buttons carry only the approval id. No bearer decision link is
+            // posted into the chat, and the person who presses is identified by Telegram.
+            let approve = telegram_callbacks::callback_data(true, &approval.id)
+                .map_err(NotifyError::Config)?;
+            let deny = telegram_callbacks::callback_data(false, &approval.id)
+                .map_err(NotifyError::Config)?;
+            body["reply_markup"] = serde_json::json!({
+                "inline_keyboard": [[
+                    { "text": "\u{2705} Approve", "callback_data": approve },
+                    { "text": "\u{274C} Deny", "callback_data": deny },
+                ]]
+            });
+        } else if links.approve_url.starts_with("http") {
             body["reply_markup"] = serde_json::json!({
                 "inline_keyboard": [[
                     { "text": "\u{2705} Approve", "url": links.approve_url },

@@ -392,8 +392,22 @@ kernels.
   ordinary policy denials through (logged + emitted as `policy.observed_denial`).
   Security/financial boundaries (halt, cross-tenant isolation, SpendCap/RateLimit)
   still enforce — but operators must understand observe mode is non-blocking for
-  ordinary denials. Separately, `[averin] mode = "observe"` remains fail-open for
-  reversible and undeclared work (missing/failed use seals do not block dispatch).
+  ordinary denials. Separately, `[averin] mode = "observe"` stays fail-open for
+  reversible and undeclared work: a missing or failed use seal does not block
+  dispatch. **Every receipt that does not reach Averin is recorded individually,
+  not only counted**: a failed or timed-out seal, a saturated async fan-out, oversize
+  params, a failed local durable enqueue, a durable receipt that exhausted its delivery
+  attempts and a lost seal task each become one `evidence.receipt_gap` event on the signed
+  outbox (subject = the use token id; payload = token id, project, request id, use
+  sequence number, one of `seal_failed`, `seal_task_lost`, `fanout_saturated`,
+  `params_oversize`, `enqueue_failed`, `durable_dead_lettered`, a clipped error text, and
+  `outcome: action_ran_without_receipt`; never params). The counters
+  `receipt_gaps` and `receipt_gaps_overflowed` are on `GET /api/v1/metrics`
+  (`averin_seal`). The record is queued in memory and appended to the outbox every two
+  seconds: a process killed inside that window loses the gaps it had not yet appended (and
+  the counters), and a sustained outbox write failure beyond 4096 pending gaps is counted in
+  `receipt_gaps_overflowed` but not recorded individually. A gap names an action that ran
+  without a receipt; it does not say whether the action's own side effect succeeded.
   A declared human-floor capability, or a bare canonical verb shared by configured
   business labels, does **not** inherit that availability knob: buffered and
   streaming dispatch require a live Averin client, a bound use token, grant
@@ -401,7 +415,8 @@ kernels.
   ordinary Observe/RequireEvidence posture. Unknown `[averin] mode` values are
   refused at config load rather than coerced into Observe. Undeclared actions in
   non-strict posture, reversible declarations, and deployments with Averin
-  disabled still have no record-existence guarantee.
+  disabled still have no record-existence guarantee (with Averin disabled there is no
+  receipt to fail, so no gap event either).
 - **An `internal_http` capability's HTTP verb is operator authority, and the agent
   may not send one.** The transport requires `method`, so a capability registered
   through the admin API must make it decidable: exactly one `target.methods` entry,

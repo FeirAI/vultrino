@@ -1343,6 +1343,24 @@ async fn run_web_server(
         enabled: true,
     };
 
+    // FEI-16: attribute Telegram button presses to the person who pressed them. Only when
+    // `[approvals.telegram] callback_decisions = true`; outbound long-poll, nothing exposed.
+    if config.approval.enabled {
+        if let Some(tg) = config
+            .approval
+            .telegram
+            .clone()
+            .filter(|t| t.callback.is_some())
+        {
+            tokio::spawn(vultrino::approval::telegram_callbacks::run_callback_loop(
+                tg,
+                exec_server.storage().clone(),
+                exec_server.clone(),
+                config.approval.enforce_separation_of_duty,
+            ));
+        }
+    }
+
     // Keep a vault handle for the auth-refresh loop; `storage` is moved into the
     // web server below.
     let auth_refresh_storage = storage.clone();

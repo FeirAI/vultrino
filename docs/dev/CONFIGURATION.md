@@ -416,6 +416,12 @@ dual_control_approvers      = 2      # distinct approvers for a dual-control req
 [approvals.telegram]
 bot_token = "123456:ABC-DEF..."
 chat_id   = "987654321"
+# Optional (FEI-16): attribute each button press to the Telegram user who pressed it.
+# Needs a NUMERIC chat_id (a group is negative) and the table below. Off by default.
+# callback_decisions = true
+# [approvals.telegram.approvers]       # Telegram user id = the named approver identity
+# "11111111" = "alice@example.com"
+# "22222222" = "bob@example.com"
 
 [approvals.webhook]
 url         = "https://hooks.example.com/vultrino-approvals"
@@ -436,6 +442,33 @@ Webhook approval payloads include the requesting `agent_label`. This lets a trus
 Slack, Telegram, or email bridge route approvals from several specialist agents into
 one owner-facing lead conversation without holding their use tokens. Treat the webhook
 as sensitive: first-request payloads also carry one-time decision links.
+
+**Who is the approver behind a chat decision (FEI-16).** Two modes, and they differ on
+purpose:
+
+- *Decision links* (the default Telegram URL buttons, and every webhook link). A link is a
+  bearer capability: whoever can read the channel can use it, and the clicker is not
+  identified. Every verdict is recorded as the one `oob_approver_identity`. A second click is
+  the same approver and is refused as a duplicate, so **a link can never complete a
+  two-person action**. Use the Approvals screen for those.
+- *Telegram callback decisions* (`callback_decisions = true`). The notifier posts callback
+  buttons, so **no decision link is posted into the chat**, and vultrino long-polls
+  `getUpdates` (outbound only, nothing exposed) for presses. Telegram itself reports which
+  user pressed, and the press is recorded under the identity the operator mapped that user id
+  to, with channel `telegram:<user id>`; so separation of duty, `exclude_owner` and the
+  distinct-approver count of a dual-control request all see the individual. A user who is not
+  in `[approvals.telegram.approvers]` is told so and nothing is recorded; a press outside the
+  configured chat is ignored. Config load refuses: a non-numeric `chat_id`, an empty table, two
+  Telegram users mapped to one identity (it would collapse two people into one approver), an
+  identity starting with `verified:` or `agg:` (reserved provenance prefixes), and an
+  `approvers` table without `callback_decisions = true`.
+
+Bounds of the callback mode: the identity is the operator's mapping from a Telegram user id, not
+an IdP assertion, so it is only as good as the Telegram account behind it; the press carries no
+approver class, so an approval gated by a govder recipe that names classes (senior, teammate)
+cannot be satisfied this way and still needs the broker's verified assertion; a bot allows one
+`getUpdates` consumer, so use a dedicated approvals bot (not one that another process polls or
+that has a webhook); only the web process (`vultrino web`) polls.
 
 **Validated at load (hard errors):** a Telegram/webhook notifier without a named
 `oob_approver_identity` is rejected (an out-of-band verdict would be

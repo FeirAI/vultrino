@@ -683,6 +683,13 @@ pub struct RawApprovalConfig {
 pub struct RawTelegramConfig {
     pub bot_token: String,
     pub chat_id: String,
+    /// FEI-16: attribute each button press to the Telegram user who pressed it. Needs a numeric
+    /// `chat_id` and `[approvals.telegram.approvers]`. Default off (URL buttons).
+    #[serde(default)]
+    pub callback_decisions: Option<bool>,
+    /// Telegram user id (as a string key) -> the named approver identity that person decides as.
+    #[serde(default)]
+    pub approvers: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -809,10 +816,36 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
             enabled,
             ttl_secs: raw.ttl_secs.unwrap_or(3600),
             public_base_url: raw.public_base_url,
-            telegram: raw.telegram.map(|t| crate::approval::TelegramConfig {
-                bot_token: t.bot_token,
-                chat_id: t.chat_id,
-            }),
+            telegram: raw
+                .telegram
+                .map(|t| -> Result<crate::approval::TelegramConfig, ConfigError> {
+                    let callback = if t.callback_decisions.unwrap_or(false) {
+                        let pairs: Vec<(String, String)> = t.approvers.into_iter().collect();
+                        Some(
+                            crate::approval::telegram_callbacks::TelegramCallbackConfig::build(
+                                &t.chat_id, &pairs,
+                            )
+                            .map_err(ConfigError::Invalid)?,
+                        )
+                    } else if !t.approvers.is_empty() {
+                        return Err(ConfigError::Invalid(
+                            "approvals.telegram.approvers is set but callback_decisions is not true; \
+                             the table would be ignored and every verdict would still be recorded as \
+                             oob_approver_identity. Set callback_decisions = true or remove the table"
+                                .to_string(),
+                        ));
+                    } else {
+                        None
+                    };
+                    Ok(crate::approval::TelegramConfig {
+                        bot_token: t.bot_token,
+                        chat_id: t.chat_id,
+                        api_base: crate::approval::telegram_callbacks::TELEGRAM_API_BASE
+                            .to_string(),
+                        callback,
+                    })
+                })
+                .transpose()?,
             webhook: raw.webhook.map(|w| crate::approval::WebhookConfig {
                 url: w.url,
                 auth_header: w.auth_header,
@@ -1423,5 +1456,60 @@ action = "deny"
         .unwrap();
         assert!(cfg.averin.durable);
         assert_eq!(cfg.averin.mode, crate::averin::AverinMode::Observe);
+    }
+
+    // ---- FEI-16: Telegram callback decisions ------------------------------------------
+
+    fn tg_cfg(extra: &str) -> String {
+        format!(
+            "[approvals]\noob_approver_identity = \"oncall@example.com\"\n\
+             [approvals.telegram]\nbot_token = \"123:abc\"\nchat_id = \"-1001\"\n{extra}"
+        )
+    }
+
+    #[test]
+    fn fei16_callback_decisions_parse_into_a_user_to_identity_table() {
+        let cfg = Config::parse(&tg_cfg(
+            "callback_decisions = true\n[approvals.telegram.approvers]\n\"11\" = \"alice@example.com\"\n\"22\" = \"bob@example.com\"\n",
+        ))
+        .unwrap();
+        let cb = cfg
+            .approval
+            .telegram
+            .unwrap()
+            .callback
+            .expect("callback mode on");
+        assert_eq!(cb.chat_id, -1001);
+        assert_eq!(cb.identity_for(11), Some("alice@example.com"));
+        assert_eq!(cb.identity_for(22), Some("bob@example.com"));
+    }
+
+    #[test]
+    fn fei16_default_is_the_url_buttons_with_one_identity() {
+        let cfg = Config::parse(&tg_cfg("")).unwrap();
+        assert!(cfg.approval.telegram.unwrap().callback.is_none());
+    }
+
+    #[test]
+    fn fei16_an_approvers_table_without_callback_decisions_is_refused() {
+        // Otherwise the table is silently ignored and every verdict stays one identity.
+        let err = Config::parse(&tg_cfg(
+            "[approvals.telegram.approvers]\n\"11\" = \"alice@example.com\"\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("callback_decisions"), "{err}");
+    }
+
+    #[test]
+    fn fei16_callback_mode_refuses_ambiguous_tables() {
+        // No approvers; a channel name; two people on one identity.
+        assert!(Config::parse(&tg_cfg("callback_decisions = true\n")).is_err());
+        let named = "[approvals]\noob_approver_identity = \"o@x\"\n[approvals.telegram]\nbot_token = \"1:a\"\nchat_id = \"@chan\"\ncallback_decisions = true\n[approvals.telegram.approvers]\n\"11\" = \"a@x\"\n";
+        assert!(Config::parse(named).is_err());
+        assert!(Config::parse(&tg_cfg(
+            "callback_decisions = true\n[approvals.telegram.approvers]\n\"11\" = \"a@x\"\n\"22\" = \"A@X\"\n"
+        ))
+        .is_err());
     }
 }

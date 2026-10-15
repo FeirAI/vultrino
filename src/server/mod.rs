@@ -7229,6 +7229,54 @@ mod averin_worker_tests {
         assert!(log[1].starts_with("use:"));
     }
 
+    /// FEI-33: a durable Observe receipt that exhausts its delivery attempts is a permanent gap in
+    /// the evidence trail, and is recorded individually (token, request id, use sequence), not only
+    /// as a quarantined queue row. A dead-lettered GRANT is not a receipt and records no gap.
+    #[tokio::test]
+    async fn fei33_dead_lettered_use_is_recorded_as_a_receipt_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, popkeys, deadletter) = test_stores(dir.path());
+        let (base_url, fake) = responding_averin().await;
+        let client = test_client(&base_url);
+        fake.fail_use_actions.lock().insert("action-A".to_string());
+        popkeys
+            .insert("tok-A", popkey_entry("action-A", "read:orders"))
+            .await
+            .unwrap();
+        queue
+            .append("tok-A", "averin.grant", grant_payload())
+            .unwrap();
+        queue
+            .append("tok-A", "averin.use", use_payload("p", "req-A-7", 7))
+            .unwrap();
+        // A second subject whose GRANT dead-letters: not a receipt, no gap.
+        fake.fail_grant_agents
+            .lock()
+            .insert("vultrino:tok-G".to_string());
+        popkeys
+            .insert("tok-G", popkey_entry("action-G", "read:orders"))
+            .await
+            .unwrap();
+        queue
+            .append("tok-G", "averin.grant", grant_payload())
+            .unwrap();
+
+        deliver_averin_outbox_once(&queue, &popkeys, &deadletter, &client, 1)
+            .await
+            .unwrap();
+
+        let gaps = client.take_receipt_gaps();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "one gap for the dead-lettered use only: {gaps:?}"
+        );
+        assert_eq!(gaps[0].token_id, "tok-A");
+        assert_eq!(gaps[0].reason, "durable_dead_lettered");
+        assert_eq!(gaps[0].request_id.as_deref(), Some("req-A-7"));
+        assert_eq!(gaps[0].use_sequence_number, Some(7));
+    }
+
     #[tokio::test]
     async fn averin_worker_deadletter_quarantines_one_subject_without_blocking_others() {
         let dir = tempfile::tempdir().unwrap();

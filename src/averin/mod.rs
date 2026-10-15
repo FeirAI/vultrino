@@ -1728,6 +1728,36 @@ mod tests {
         );
     }
 
+    /// A seal task that is lost (panicked or cancelled) before it records an outcome leaves a gap
+    /// record with the ids of the use it was sealing; a task that completed does not.
+    #[tokio::test]
+    async fn fei33_a_lost_seal_task_is_recorded_as_a_gap_and_a_completed_one_is_not() {
+        let client = client_with("http://127.0.0.1:9", 256, Duration::from_secs(5));
+        {
+            let mut g = InflightGuard::enter_for(&client, "vut_ok", "req-ok", 1);
+            g.complete();
+        }
+        assert!(
+            client.take_receipt_gaps().is_empty(),
+            "a completed task is not a gap"
+        );
+        {
+            let _lost = InflightGuard::enter_for(&client, "vut_lost", "req-lost", 4);
+        } // dropped without complete(): the task was cancelled or panicked
+        let gaps = client.take_receipt_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].reason, "seal_task_lost");
+        assert_eq!(gaps[0].token_id, "vut_lost");
+        assert_eq!(gaps[0].request_id.as_deref(), Some("req-lost"));
+        assert_eq!(gaps[0].use_sequence_number, Some(4));
+        assert_eq!(
+            client.metrics().failed,
+            1,
+            "the lost task is still counted as failed"
+        );
+        assert_eq!(client.metrics().receipt_gaps, 1);
+    }
+
     // ---- plan 087 FIX 3/4/5/6 -----------------------------------------------
 
     /// A client with a tiny params cap, for the oversize tests.
