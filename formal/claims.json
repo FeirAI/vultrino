@@ -543,6 +543,15 @@
     },
     "posture-unusable-approver-key-reported": {
       "tier": "fast"
+    },
+    "posture-averin-key-reported-while-seal-client-off": {
+      "tier": "fast"
+    },
+    "averin-enabled-config-accepts-empty-base-url": {
+      "tier": "fast"
+    },
+    "averin-enabled-config-accepts-empty-resource-id": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -2974,7 +2983,7 @@
     },
     {
       "id": "observe-receipt-gap-recorded",
-      "statement": "With [averin] enabled in Observe mode, every use receipt that does not reach Averin is recorded as an individual gap, not only counted: a failed or timed-out async seal, a seal dropped because the async fan-out was saturated, params over max_seal_params_bytes (async and durable paths), a failed local durable enqueue, a durable use receipt that exhausted its delivery attempts (a dead-lettered grant is not a receipt and records none), and a seal task lost before it recorded an outcome; each gap carries the token id, project, request id, use sequence number, one of six fixed reasons and a detail clipped to 200 characters, and never the params; the pending buffer holds at most 4096 gaps and a gap that does not fit is counted in receipt_gaps_overflowed; gaps returned for retry go back to the front in their original order; and flush_receipt_gaps_once appends each pending gap to the signed outbox as one evidence.receipt_gap event whose subject is the use token id, so the oldest gap is the first appended and a second flush appends nothing. The action itself is never blocked or failed by any of this.",
+      "statement": "With [averin] enabled in Observe mode, every use receipt that does not reach Averin is recorded as an individual gap, not only counted: a failed or timed-out async seal, a seal dropped because the async fan-out was saturated, params over max_seal_params_bytes (async and durable paths), a failed local durable enqueue, a durable use receipt that exhausted its delivery attempts (a dead-lettered grant is not a receipt and records none), and a seal task lost before it recorded an outcome; each gap carries the token id, project, request id, use sequence number, one of six fixed reasons and a detail clipped to 200 characters, and never the params; the pending buffer holds at most 4096 gaps and a gap that does not fit is counted in receipt_gaps_overflowed; gaps returned for retry go back to the front in their original order; and flush_receipt_gaps_once appends each pending gap to the signed outbox as one evidence.receipt_gap event whose subject is the use token id, so the oldest gap is the first appended and a second flush appends nothing. The action itself is never blocked or failed by any of this. An [averin] block with enabled = true and an empty base_url or resource_id does not load (config error naming the field and that no receipt would be recorded), so Observe cannot run silently without a seal client; a disabled block is not judged.",
       "method": "test",
       "artifacts": [
         "src/averin/mod.rs",
@@ -3025,6 +3034,11 @@
           "path": "src/server/mod.rs",
           "symbol": "deliver_averin_outbox_once",
           "sha256": "fff571e6352c6e8f23989f87fb1de59e6d8e9052b912d66113c09c4e1b8a1e1d"
+        },
+        {
+          "path": "src/config/types.rs",
+          "symbol": "AverinConfig::try_from",
+          "sha256": "d61a293177caf67c22b3933a445c50ba6daf202c87aa920bb9dffb6f8fc5d4bd"
         }
       ],
       "mutants": [
@@ -3034,10 +3048,11 @@
         "receipt-gap-requeue-reorders",
         "receipt-gap-enqueue-failure-not-recorded",
         "receipt-gap-dead-letter-not-recorded",
-        "receipt-gap-lost-task-not-recorded"
+        "receipt-gap-lost-task-not-recorded",
+        "averin-enabled-config-accepts-empty-base-url",
+        "averin-enabled-config-accepts-empty-resource-id"
       ],
-      "does_not_establish": "Gaps are held in memory and appended to the outbox every two seconds: a process that is killed before an append loses the gaps it had not yet written, and the counters with them. flush_receipt_gaps_once puts a gap back for retry when an outbox append fails, but no test makes an append fail, so that branch is not exercised here (the requeue order is). A gap says an action ran without a receipt; it does not say the action's own side effect succeeded, and it is not a proof that no other receipt is missing: a seal that Averin accepted but recorded wrongly, a seal that never started because Averin is disabled, undeclared actions, and receipts lost to a crash between the action and the seal enqueue are outside it. The on_execute (synchronous) Observe arms record gaps by the same call but are not exercised by a test here; only the production async and durable paths are. The outbox event reaches a consumer only if one polls or is pushed to; nothing here shows that anything alerts on it. The vacuity of the name filter: the detector selects tests whose name contains fei33_, so a renamed test drops out of it.",
-      "evidence_run": "38667982636"
+      "does_not_establish": "Gaps are held in memory and appended to the outbox every two seconds: a process that is killed before an append loses the gaps it had not yet written, and the counters with them. flush_receipt_gaps_once puts a gap back for retry when an outbox append fails, but no test makes an append fail, so that branch is not exercised here (the requeue order is). A gap says an action ran without a receipt; it does not say the action's own side effect succeeded, and it is not a proof that no other receipt is missing: a seal that Averin accepted but recorded wrongly, a seal that never started because Averin is disabled, undeclared actions, and receipts lost to a crash between the action and the seal enqueue are outside it. The on_execute (synchronous) Observe arms record gaps by the same call but are not exercised by a test here; only the production async and durable paths are. The outbox event reaches a consumer only if one polls or is pushed to; nothing here shows that anything alerts on it. The vacuity of the name filter: the detector selects tests whose name contains fei33_, so a renamed test drops out of it. The refusal covers the TOML block only: a block that parses but names an unreachable averin, or an AVERIN_API_KEY averin rejects, still starts, and every Observe action is then recorded as a receipt gap rather than refused."
     },
     {
       "id": "telegram-callback-attribution",
@@ -3097,12 +3112,11 @@
         "telegram-callback-mode-still-posts-url-buttons",
         "telegram-approvers-table-without-callback-is-ignored"
       ],
-      "does_not_establish": "The identity is the operator's mapping from a Telegram user id, taken from callback_query.from.id as Telegram's servers report it; the tests use a stand-in Telegram server, so they do not show what the real API sends, that its user ids are unforgeable in a chat (that is Telegram's property, not checked here), or that a Telegram account is held by the person the mapping names (a stolen or shared account is that person). A press carries no approver class, so an approval gated by a govder recipe that names classes cannot be satisfied this way; the tests do not run such a recipe. A bot can have one getUpdates consumer and a webhook disables polling: a second consumer or a set webhook makes the loop retry with backoff and log, and no test shows that. Only the web process starts the poll loop. The mapping to the IdP subject is an operator duty that nothing checks: a Telegram user mapped to an email is counted as a different person from the same human's verified panel sign-off. The webhook notifier's links are unchanged and still unattributed; the tests cover only the Telegram link route's behaviour for a two-person request. The callback path records the decision and resumes the action through the same functions as the link and panel paths, but the resume itself is not exercised here.",
-      "evidence_run": "38667982636"
+      "does_not_establish": "The identity is the operator's mapping from a Telegram user id, taken from callback_query.from.id as Telegram's servers report it; the tests use a stand-in Telegram server, so they do not show what the real API sends, that its user ids are unforgeable in a chat (that is Telegram's property, not checked here), or that a Telegram account is held by the person the mapping names (a stolen or shared account is that person). A press carries no approver class, so an approval gated by a govder recipe that names classes cannot be satisfied this way; the tests do not run such a recipe. A bot can have one getUpdates consumer and a webhook disables polling: a second consumer or a set webhook makes the loop retry with backoff and log, and no test shows that. Only the web process starts the poll loop. The mapping to the IdP subject is an operator duty that nothing checks: a Telegram user mapped to an email is counted as a different person from the same human's verified panel sign-off. The webhook notifier's links are unchanged and still unattributed; the tests cover only the Telegram link route's behaviour for a two-person request. The callback path records the decision and resumes the action through the same functions as the link and panel paths, but the resume itself is not exercised here."
     },
     {
       "id": "secret-fingerprint-report",
-      "statement": "The secret-alignment fingerprint is the first 16 bytes (32 lowercase hex characters) of HMAC-SHA256 keyed by the secret over `feir-secret-alignment/v1:` followed by the relationship name, reproduces every vector of vectors/secret-fingerprint.v1.json (generated by an independent Python reference, owned by feir-os), is different for two relationships under one secret, and does not exist for an empty secret; and GET /api/v1/posture reports, per relationship, the fingerprints of the values vultrino is configured with: vultrino-outbox-poll (the [outbox] hmac_secret), vultrino-approval-push (the same secret, only while push delivery is enabled and has a URL), tenant-assertion (the secret it signs calls to govder with) and approver-key (the key that verifies the broker's approver decisions, absent when that key is unset, equal to the shared key or blank), omits a relationship whose secret is unset, and carries no secret value in the body.",
+      "statement": "The secret-alignment fingerprint is the first 16 bytes (32 lowercase hex characters) of HMAC-SHA256 keyed by the secret over `feir-secret-alignment/v1:` followed by the relationship name, reproduces every vector of vectors/secret-fingerprint.v1.json (generated by an independent Python reference, owned by feir-os), is different for two relationships under one secret, and does not exist for an empty secret; and GET /api/v1/posture reports, per relationship, the fingerprints of the values vultrino is configured with: vultrino-outbox-poll (the [outbox] hmac_secret), vultrino-approval-push (the same secret, only while push delivery is enabled and has a URL), tenant-assertion (the secret it signs calls to govder with) averin-api-key (the AVERIN_API_KEY it sends to averin, only while the [averin] seal client is enabled) and approver-key (the key that verifies the broker's approver decisions, absent when that key is unset, equal to the shared key or blank), omits a relationship whose secret is unset, and carries no secret value in the body.",
       "method": "differential-vectors",
       "artifacts": [
         "src/secret_fp.rs",
@@ -3112,7 +3126,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- secret_fp::tests web::posture::tests::report_carries_a_fingerprint_per_relationship_and_no_secret web::posture::tests::report_omits_the_push_relationship_when_the_outbox_does_not_push web::posture::tests::report_omits_unset_secrets_and_an_unusable_approver_key",
+      "detector": "cargo test --locked --no-default-features --lib -- secret_fp::tests web::posture::tests::report_carries_a_fingerprint_per_relationship_and_no_secret web::posture::tests::report_omits_the_push_relationship_when_the_outbox_does_not_push web::posture::tests::report_omits_unset_secrets_and_an_unusable_approver_key web::posture::tests::report_carries_the_averin_key_fingerprint_only_while_the_seal_client_is_on",
       "covers": [
         {
           "path": "src/secret_fp.rs",
@@ -3122,7 +3136,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "secret_fingerprints",
-          "sha256": "7c1d488f2c2c55f78056c06b969b47fde1213b7bc4a5277baee0d3e608e3aa90"
+          "sha256": "82e4794c2ec294a4ad1518851833e294af6567267c63699035069aa9b282b1fe"
         },
         {
           "path": "src/web/posture.rs",
@@ -3134,10 +3148,10 @@
         "secret-fp-relationship-not-in-message",
         "secret-fp-digest-not-truncated",
         "posture-push-fingerprint-while-not-pushing",
-        "posture-unusable-approver-key-reported"
+        "posture-unusable-approver-key-reported",
+        "posture-averin-key-reported-while-seal-client-off"
       ],
-      "does_not_establish": "That two planes hold the same value: this is the report one plane makes, and the comparison is feir-os's verifier. The report reads the loaded configuration, so a value changed afterwards or read by another code path is not reflected; a vultrino whose outbox pushes somewhere other than govder still reports the push relationship, which the verifier then compares with govder's GOVDER_SIGNATURE_SECRET. The fingerprint is only as private as the secret is strong: someone who holds it can test guesses for a low-entropy secret offline, and the report is protected only by a global admin key. The route's key gate is covered by the posture-report claims, not here. The cross-plane check that real binaries emit what the verifier reads is govder's armed four-plane e2e (TestFourPlanePostureE2E, TestFourPlaneSecretMismatchE2E).",
-      "evidence_run": "38667982636"
+      "does_not_establish": "That two planes hold the same value: this is the report one plane makes, and the comparison is feir-os's verifier. The report reads the loaded configuration, so a value changed afterwards or read by another code path is not reflected; a vultrino whose outbox pushes somewhere other than govder still reports the push relationship, which the verifier then compares with govder's GOVDER_SIGNATURE_SECRET. The fingerprint is only as private as the secret is strong: someone who holds it can test guesses for a low-entropy secret offline, and the report is protected only by a global admin key. The route's key gate is covered by the posture-report claims, not here. The cross-plane check that real binaries emit what the verifier reads is govder's armed four-plane e2e (TestFourPlanePostureE2E, TestFourPlaneSecretMismatchE2E). The averin-api-key fingerprint says which key vultrino sends; that averin accepts it is checked by feir-os's verifier against averin's own report, and no four-plane run has a keyed averin."
     }
   ]
 }

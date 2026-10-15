@@ -1,0 +1,13 @@
+diff --git a/src/config/types.rs b/src/config/types.rs
+index da0117f..bd0ce7a 100644
+--- a/src/config/types.rs
++++ b/src/config/types.rs
+@@ -632,7 +632,7 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
+                     .to_string(),
+             ));
+         }
+-        if enabled && resource_id.trim().is_empty() {
++        if false && resource_id.trim().is_empty() {
+             return Err(ConfigError::Invalid(
+                 "[averin] enabled = true but resource_id is empty (it must equal averin's \
+                  AVERIN_RESOURCE_ID): the seal client cannot be built, so no action would be sealed \
