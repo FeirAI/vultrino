@@ -620,7 +620,8 @@
         "permit-authorize-skips-binding-check",
         "permit-approved-window-inclusive-expiry"
       ],
-      "does_not_establish": "Table and example tests over the kernel, not a proof. The gate inputs (the policy decision, whether observe mode downgrades a Deny, and the server's approval requirement) are computed outside the kernel and are trusted here. The rule digest is not recomputed from the payload; it is checked only where the permit is minted. Says nothing about which code builds the payload or about code that runs after authorize. Does not show that every plugin dispatch needs an authorized permit; only the structural refinement gate counts the two dispatch seams. The approved-permit path is exercised only through approved_gate here; the claim permit-binding-production exercises ExecutionPermit::approved with a real grant."
+      "does_not_establish": "Table and example tests over the kernel, not a proof. The gate inputs (the policy decision, whether observe mode downgrades a Deny, and the server's approval requirement) are computed outside the kernel and are trusted here. The rule digest is not recomputed from the payload; it is checked only where the permit is minted. Says nothing about which code builds the payload or about code that runs after authorize. Does not show that every plugin dispatch needs an authorized permit; only the structural refinement gate counts the two dispatch seams. The approved-permit path is exercised only through approved_gate here; the claim permit-binding-production exercises ExecutionPermit::approved with a real grant.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "kani-permit-kernel",
@@ -763,7 +764,8 @@
         "permit-evaluation-deny-as-allow",
         "permit-admit-approval-literal-false"
       ],
-      "does_not_establish": "The tests call the mint and authorize functions with production inputs; they do not run prepare_execution or resume_approved (the integration tests in tests/approval_token_integration.rs do, and the full-tier mutant permit-admit-approval-literal-false is detected by two of them). The kernel trusts its inputs: which policy rules matched, the tenant mode, and the server's approval requirement (credential flag, token, dual control, capability catalog). The binding's action is the canonical plugin.action the server resolved from the presented label, while the evaluation judged the label (ActionMatch); the kernel does not check that one resolves to the other. The rule digest is not recomputed from the payload. run_action unpacks the authorized payload and builds the plugin request after authorize; that code, and anything a plugin does with the payload, is not checked by the kernel. The params digest is over the serde_json bytes of the stored value, not over bytes an approver saw. authorize does not check the payload fields outside the binding: the credential record beyond its alias, the use token id, the evidence subject, the evidence action and whether Averin evidence is required; run_action acts on them after authorize. Covers only the two mint sites and their helpers by drift lock; other callers of the policy engine (for example list-time capability visibility) do not go through the kernel."
+      "does_not_establish": "The tests call the mint and authorize functions with production inputs; they do not run prepare_execution or resume_approved (the integration tests in tests/approval_token_integration.rs do, and the full-tier mutant permit-admit-approval-literal-false is detected by two of them). The kernel trusts its inputs: which policy rules matched, the tenant mode, and the server's approval requirement (credential flag, token, dual control, capability catalog). The binding's action is the canonical plugin.action the server resolved from the presented label, while the evaluation judged the label (ActionMatch); the kernel does not check that one resolves to the other. The rule digest is not recomputed from the payload. run_action unpacks the authorized payload and builds the plugin request after authorize; that code, and anything a plugin does with the payload, is not checked by the kernel. The params digest is over the serde_json bytes of the stored value, not over bytes an approver saw. authorize does not check the payload fields outside the binding: the credential record beyond its alias, the use token id, the evidence subject, the evidence action and whether Averin evidence is required; run_action acts on them after authorize. Covers only the two mint sites and their helpers by drift lock; other callers of the policy engine (for example list-time capability visibility) do not go through the kernel.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "recipe-unit-tests",
@@ -801,7 +803,8 @@
       "mutants": [
         "recipe-agent-reviewer-guard-removed"
       ],
-      "does_not_establish": "Three example-based tests. They do not cover every recipe shape (see the Kani claims for bounded exhaustive coverage), the sign-off collection and deduplication code, or the match between these rules and govder's recipe evaluator."
+      "does_not_establish": "Three example-based tests. They do not cover every recipe shape (see the Kani claims for bounded exhaustive coverage), the sign-off collection and deduplication code, or the match between these rules and govder's recipe evaluator.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "kani-recipe-safety",
@@ -936,7 +939,8 @@
         "ssrf-prefix-mask-off-by-one",
         "ssrf-6to4-embedded-ipv4-not-decoded"
       ],
-      "does_not_establish": "Table-driven tests over listed addresses, not an exhaustive check of the address space. The registry rows were transcribed by hand from IANA tables retrieved on one date. The drift lock covers the functions and the IPV4_BLOCKED and IPV6_BLOCKED tables, so an edited row needs a deliberate relock; the tests still check only the listed addresses of each row. DNS rebinding, redirects and proxies are separate controls this claim does not cover."
+      "does_not_establish": "Table-driven tests over listed addresses, not an exhaustive check of the address space. The registry rows were transcribed by hand from IANA tables retrieved on one date. The drift lock covers the functions and the IPV4_BLOCKED and IPV6_BLOCKED tables, so an edited row needs a deliberate relock; the tests still check only the listed addresses of each row. DNS rebinding, redirects and proxies are separate controls this claim does not cover.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "policy-refresh-ordering",
@@ -993,7 +997,8 @@
         "refresh-load-lock-removed",
         "refresh-vault-not-reloaded"
       ],
-      "does_not_establish": "Two scripted interleavings, not a model of all schedules. The wait check relies on a 150 ms sleep: on a very slow machine a mutant could survive, but the unmutated code cannot fail it, because the admin reload is blocked on the lock. The lock is per process: another process's write becomes visible only on the next refresh tick, so cross-process visibility is bounded-staleness, not instant. Cross-process visibility in the second test is the same bounded staleness: the test writes before the refresh re-read, it does not show the write is seen if it lands after. Removing only the ticket compare (the second guard) is not detected by this test. Does not cover other policy load paths that call load_policies directly (construction and tests) or a lost write in storage itself."
+      "does_not_establish": "Two scripted interleavings, not a model of all schedules. The wait check relies on a 150 ms sleep: on a very slow machine a mutant could survive, but the unmutated code cannot fail it, because the admin reload is blocked on the lock. The lock is per process: another process's write becomes visible only on the next refresh tick, so cross-process visibility is bounded-staleness, not instant. Cross-process visibility in the second test is the same bounded staleness: the test writes before the refresh re-read, it does not show the write is seen if it lands after. Removing only the ticket compare (the second guard) is not detected by this test. Does not cover other policy load paths that call load_policies directly (construction and tests) or a lost write in storage itself.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "rate-limiter-vectors",
@@ -1018,7 +1023,8 @@
       "mutants": [
         "rate-window-allows-one-past-max"
       ],
-      "does_not_establish": "The fixture is generated by the same function it checks, so it pins current behaviour against silent change; it is not an independent specification. A govder consumer of the same fixture exists only on an unmerged govder branch, so no cross-repo agreement is established. The Instant-based adapter that feeds window_elapsed is not covered."
+      "does_not_establish": "The fixture is generated by the same function it checks, so it pins current behaviour against silent change; it is not an independent specification. A govder consumer of the same fixture exists only on an unmerged govder branch, so no cross-repo agreement is established. The Instant-based adapter that feeds window_elapsed is not covered.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "sb02-minted-scrub",
@@ -1059,7 +1065,8 @@
         "sb02-minted-access-token-not-scrubbed",
         "sb02-minted-scrub-set-not-extended"
       ],
-      "does_not_establish": "Mock plugins reflecting fixed token shapes; other reflection encodings and other credential types are not tested here. The scrub-set extension is the drift-locked helper egress::scrub_set_with_minted; its two call sites in VultrinoServer::run_action and run_action_streaming (src/server/mod.rs) are not drift-locked, and the integration tests are their only guard. A plugin error path that echoes a minted secret is a documented residual in docs/dev/LIMITATIONS.md."
+      "does_not_establish": "Mock plugins reflecting fixed token shapes; other reflection encodings and other credential types are not tested here. The scrub-set extension is the drift-locked helper egress::scrub_set_with_minted; its two call sites in VultrinoServer::run_action and run_action_streaming (src/server/mod.rs) are not drift-locked, and the integration tests are their only guard. A plugin error path that echoes a minted secret is a documented residual in docs/dev/LIMITATIONS.md.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "egress-derived-forms",
@@ -1123,7 +1130,8 @@
         "sb04-shared-key-fallback-without-escape",
         "sb04-equal-key-counts-as-distinct"
       ],
-      "does_not_establish": "The unit tests cover the key-selection function. They pad only the shared key; the dedicated key is trimmed at load by approval_assertion_secret_from_env, which is not drift-locked and not exercised here. The 403 on the decision route (api_decide_approval) has route-level tests in tests/web_smoke.rs that run in the rust job, but they are not registered, not run by this detector and not drift-locked. Key strength, key distribution and whether the broker signs with the dedicated key are operational matters."
+      "does_not_establish": "The unit tests cover the key-selection function. They pad only the shared key; the dedicated key is trimmed at load by approval_assertion_secret_from_env, which is not drift-locked and not exercised here. The 403 on the decision route (api_decide_approval) has route-level tests in tests/web_smoke.rs that run in the rust job, but they are not registered, not run by this detector and not drift-locked. Key strength, key distribution and whether the broker signs with the dedicated key are operational matters.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "refinement-structural",
@@ -1149,7 +1157,8 @@
       "mutants": [
         "refinement-binding-field-dropped"
       ],
-      "does_not_establish": "Semantic refinement of Rust by the Lean model. It greps for strings and counts call sites; code can keep every string and still behave differently. The drift lock covers src/formal_kernel.rs only, while the script reads many other files."
+      "does_not_establish": "Semantic refinement of Rust by the Lean model. It greps for strings and counts call sites; code can keep every string and still behave differently. The drift lock covers src/formal_kernel.rs only, while the script reads many other files.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "lean-approval-execution",
@@ -1219,7 +1228,8 @@
       "mutants": [
         "vectors-leftover-senior-ignored"
       ],
-      "does_not_establish": "Agreement only on the committed vectors and on the sweep domain they were generated over. The govder half runs only in govder CI, not here: this claim shows vultrino matches the file, and the pinned hash shows the file did not change, not that govder currently matches it. Two implementations can agree and both be wrong (the exhaustive claims check correctness against an independent oracle over a bounded domain). Says nothing about sign-off collection or identity handling."
+      "does_not_establish": "Agreement only on the committed vectors and on the sweep domain they were generated over. The govder half runs only in govder CI, not here: this claim shows vultrino matches the file, and the pinned hash shows the file did not change, not that govder currently matches it. Two implementations can agree and both be wrong (the exhaustive claims check correctness against an independent oracle over a bounded domain). Says nothing about sign-off collection or identity handling.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "recipe-sweeps-exhaustive",
@@ -1253,7 +1263,8 @@
       "mutants": [
         "sweeps-zero-count-allowed"
       ],
-      "does_not_establish": "Only the sweep domains named in the vector file (small need and availability bounds plus the cap cliff). Not a proof for all counts. The oracle is a second hand-written implementation in the same test module, not an extracted specification. Sweeps check satisfaction, not sign-off collection."
+      "does_not_establish": "Only the sweep domains named in the vector file (small need and availability bounds plus the cap cliff). Not a proof for all counts. The oracle is a second hand-written implementation in the same test module, not an extracted specification. Sweeps check satisfaction, not sign-off collection.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "recipe-greedy-optimal-real-cap",
@@ -1286,7 +1297,8 @@
       "mutants": [
         "greedy-leftover-senior-ignored"
       ],
-      "does_not_establish": "Only the enumerated domain: a recipe with one senior term and one teammate term, no agent-reviewer slots (those are unsatisfiable by a fixed guard, covered by the vector claim). Availability above 65 is argued, not enumerated, to behave like 65; that argument and the finiteness of the recipe axis rest on recipe_well_formed's caps, which the Kani and vector claims cover, so this claim is a composition inside one plane. Recipes with several alternative terms are not enumerated here. The oracles are test-local code."
+      "does_not_establish": "Only the enumerated domain: a recipe with one senior term and one teammate term, no agent-reviewer slots (those are unsatisfiable by a fixed guard, covered by the vector claim). Availability above 65 is argued, not enumerated, to behave like 65; that argument and the finiteness of the recipe axis rest on recipe_well_formed's caps, which the Kani and vector claims cover, so this claim is a composition inside one plane. Recipes with several alternative terms are not enumerated here. The oracles are test-local code.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "approval-lifecycle-table",
@@ -1310,7 +1322,8 @@
         "stage1-closed-state-redecided",
         "stage1-blank-identity-accepted"
       ],
-      "does_not_establish": "Only the 720 enumerated states, with three identity shapes and two approver kinds; no recipe-gated or multi-approver sequences (the property claim samples those). The oracle is hand-written in the test file. Says nothing about persistence, concurrency or the API layer that calls the transition. The detector also runs an_unnamed_principal_fills_no_slot, but approval_rule_satisfied and the bare-identity drop are not drift-locked and no mutant targets them, so that test is not part of this claim."
+      "does_not_establish": "Only the 720 enumerated states, with three identity shapes and two approver kinds; no recipe-gated or multi-approver sequences (the property claim samples those). The oracle is hand-written in the test file. Says nothing about persistence, concurrency or the API layer that calls the transition. The detector also runs an_unnamed_principal_fills_no_slot, but approval_rule_satisfied and the bare-identity drop are not drift-locked and no mutant targets them, so that test is not part of this claim.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "approval-wire-tables",
@@ -1345,7 +1358,8 @@
         "stage1-unknown-class-parsed",
         "stage1-unusable-credential-not-blocked"
       ],
-      "does_not_establish": "Listed spellings only (ten risk-tier strings, six class strings, nine JSON shapes), not every possible string. The execution-state oracle is a restatement of the same rules in test code. Does not show the callers use these functions on every path, nor the Lean model of execution."
+      "does_not_establish": "Listed spellings only (ten risk-tier strings, six class strings, nine JSON shapes), not every possible string. The execution-state oracle is a restatement of the same rules in test code. Does not show the callers use these functions on every path, nor the Lean model of execution.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "approval-vault-roundtrip-property",
@@ -1373,7 +1387,8 @@
       "mutants": [
         "roundtrip-blank-identity-accepted"
       ],
-      "does_not_establish": "Random sampling with a fixed case count, not an exhaustive or symbolic check; decision sequences are at most 6 long with at most 3 required approvals. It checks that transition output satisfies validate_vault_shape, so a defect that both functions share would pass. Does not cover load-time handling of a tampered vault file beyond the shape check, nor state reached by paths other than approve and deny."
+      "does_not_establish": "Random sampling with a fixed case count, not an exhaustive or symbolic check; decision sequences are at most 6 long with at most 3 required approvals. It checks that transition output satisfies validate_vault_shape, so a defect that both functions share would pass. Does not cover load-time handling of a tampered vault file beyond the shape check, nor state reached by paths other than approve and deny.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "ssrf-link-local-config-check",
@@ -1403,7 +1418,8 @@
         "ssrf-metadata-v6-row-dropped",
         "ssrf-link-local-nat64-not-decoded"
       ],
-      "does_not_establish": "One example-based test over listed spellings, not the address space. This is a config-time defence in depth; the execute-time classifier is covered by ssrf-special-purpose. Hostnames that resolve to metadata addresses (DNS), redirects and a provider_base changed after validation are not covered. Loopback and RFC1918 provider bases are deliberately allowed."
+      "does_not_establish": "One example-based test over listed spellings, not the address space. This is a config-time defence in depth; the execute-time classifier is covered by ssrf-special-purpose. Hostnames that resolve to metadata addresses (DNS), redirects and a provider_base changed after validation are not covered. Loopback and RFC1918 provider bases are deliberately allowed.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "internal-http-allowlist",
@@ -1427,7 +1443,8 @@
         "internal-http-alibaba-metadata-admitted",
         "internal-http-aws-v6-metadata-admitted"
       ],
-      "does_not_establish": "Listed addresses only, not an exhaustive check of the address space. Says nothing about hostname resolution, redirects or connect-time rebinding for internal_http, nor the allowlist configured per capability. Other cloud metadata endpoints not on the list are not tested."
+      "does_not_establish": "Listed addresses only, not an exhaustive check of the address space. Says nothing about hostname resolution, redirects or connect-time rebinding for internal_http, nor the allowlist configured per capability. Other cloud metadata endpoints not on the list are not tested.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "lean-approval-authority",
@@ -1746,7 +1763,8 @@
         "policy-precedence-lazy-kill-precheck-dropped",
         "policy-precedence-engine-kill-flag-ignored"
       ],
-      "does_not_establish": "Only the precedence step. Whether a rule matches (URL, method, time window, rate limit, spend cap, action label) is outside it, and the domain is bounded at 4 outcomes and 3 policy defaults for the pure and lazy functions and at two policies of 48 shapes for the engine test. The engine test uses only always-matching rules and a fixed credential, so it does not cover rate-limit charging order beyond the lazy-scan check that no weaker tier is asked, and the first matching rule within a tier is chosen by storage order. The oracles are test code. The engine hands the lazy function at most one outcome per call by design; the multi-outcome equivalence is shown for membership of tiers, which is all the scan can observe. Layered Allow-RateLimit rules are still first-match, not conjunctive. The engine default applies only when no policy matches, and is not applied on top of a matching policy's default. The tail is shown to deny by the mapping test, not shown unreachable from the engine (it is unreachable only because any matching policy has a default action). The engine runs an unparseable-URL pre-check before the kill tier: a halted principal whose request URL cannot be canonicalised, under a policy with a URL deny or prompt rule, gets the unparseable reason instead of the halt reason. The outcome is still Deny and the pre-check is outside this claim."
+      "does_not_establish": "Only the precedence step. Whether a rule matches (URL, method, time window, rate limit, spend cap, action label) is outside it, and the domain is bounded at 4 outcomes and 3 policy defaults for the pure and lazy functions and at two policies of 48 shapes for the engine test. The engine test uses only always-matching rules and a fixed credential, so it does not cover rate-limit charging order beyond the lazy-scan check that no weaker tier is asked, and the first matching rule within a tier is chosen by storage order. The oracles are test code. The engine hands the lazy function at most one outcome per call by design; the multi-outcome equivalence is shown for membership of tiers, which is all the scan can observe. Layered Allow-RateLimit rules are still first-match, not conjunctive. The engine default applies only when no policy matches, and is not applied on top of a matching policy's default. The tail is shown to deny by the mapping test, not shown unreachable from the engine (it is unreachable only because any matching policy has a default action). The engine runs an unparseable-URL pre-check before the kill tier: a halted principal whose request URL cannot be canonicalised, under a policy with a URL deny or prompt rule, gets the unparseable reason instead of the halt reason. The outcome is still Deny and the pre-check is outside this claim.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "kani-policy-precedence",
@@ -1832,7 +1850,8 @@
         "rate-limit-default-deny-validation-removed",
         "policy-invalid-warning-dropped-on-refresh"
       ],
-      "does_not_establish": "Validation refuses only at config load and on the admin API. The engine's own load paths (add_policy, load_policies, load_policies_if_newer) only log a failing policy, once per policy id, name and error in each process; the refusal of a stored RateLimit policy with a non-deny default happens one layer up, where the server loads from the vault, and is the claim stored-rate-limit-refused-on-load. The engine itself does not validate, so a policy added through PolicyEngine::add_policy without validation is not refused. Example tests over a few condition shapes. Layered rate limits remain first-match. Default deny makes an over-limit request a denial only when no other rule matches it: the exhausted rule falls through to the other deny, prompt and allow rules of every matching policy first, so another allow rule (in this or another matching policy) still allows the request, and a rule whose only condition is a RateLimit allows every request on the credential until it is spent."
+      "does_not_establish": "Validation refuses only at config load and on the admin API. The engine's own load paths (add_policy, load_policies, load_policies_if_newer) only log a failing policy, once per policy id, name and error in each process; the refusal of a stored RateLimit policy with a non-deny default happens one layer up, where the server loads from the vault, and is the claim stored-rate-limit-refused-on-load. The engine itself does not validate, so a policy added through PolicyEngine::add_policy without validation is not refused. Example tests over a few condition shapes. Layered rate limits remain first-match. Default deny makes an over-limit request a denial only when no other rule matches it: the exhausted rule falls through to the other deny, prompt and allow rules of every matching policy first, so another allow rule (in this or another matching policy) still allows the request, and a rule whose only condition is a RateLimit allows every request on the credential until it is spent.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "url-match-canonical",
@@ -1967,7 +1986,8 @@
         "url-canon-scheme-prefix-exemption-too-broad",
         "url-canon-warning-overclaims-refusal"
       ],
-      "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or path case differently is not modelled). How a glob is matched part by part (scheme, host, port, rest) is the url-glob-part-wise claim, with its own limits; a glob * in the path or query still matches / and ?. Warned patterns only log a warning at load; the admin-API refusal of warned patterns on Deny and Prompt rules is the claim policy-write-refuses-warned-deny-prompt-patterns, and Allow rules are not refused. A glob whose host holds ? is not canonicalised. Only the http and hmac plugins send the canonical URL; internal_http sends the url-crate composition of the raw path and runs its own path allowlists on that composed path, so what it sends can differ from the evaluated form in percent-escape spelling (unreserved escapes, hex case, and the form encoding of the query map, such as + for a space); the wasm plugin egress, ssh and postgres plugins do not use params url. The hmac plugin adds timestamp, recvWindow and signature after evaluation, and AWS SigV4 re-sorts query pairs for signing; those additions are not judged. For UrlToken requests the sent bytes equal the evaluated string apart from the secret on the tested URLs only, and the refusal of other placeholder spellings is shown on the listed spellings only. The secret is inserted as is, and the url crate percent-encodes only the characters it must, so a secret holding /, ? or # changes the path or query that is sent (the substitution is checked for scheme and host only); a {credential} in a query-map value stays literal. The query map is merged only when it is a JSON object (a value that is not a string is judged as its JSON text; the http and hmac plugins refuse such a map). A prefix that ends in * inside a host (https://api.*, https://10.0.0*) is matched as the one host the parser reads from it, so a deny rule of that shape denies less than before (warned; refused on Deny and Prompt rules at admin-API write time, see policy-write-refuses-warned-deny-prompt-patterns; one already stored still loads). A pattern without a trailing * must match the query too, so a deny rule on an exact URL does not match the same URL with a query. The meaning-change warning compares against a loose normal form and is shown on examples only; it can miss a change. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested. The load-time warning is a log line and is not a refusal. The server call sites that build the judged URL (policy_url at request time and at approval resume) are not covered by the detector."
+      "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or path case differently is not modelled). How a glob is matched part by part (scheme, host, port, rest) is the url-glob-part-wise claim, with its own limits; a glob * in the path or query still matches / and ?. Warned patterns only log a warning at load; the admin-API refusal of warned patterns on Deny and Prompt rules is the claim policy-write-refuses-warned-deny-prompt-patterns, and Allow rules are not refused. A glob whose host holds ? is not canonicalised. Only the http and hmac plugins send the canonical URL; internal_http sends the url-crate composition of the raw path and runs its own path allowlists on that composed path, so what it sends can differ from the evaluated form in percent-escape spelling (unreserved escapes, hex case, and the form encoding of the query map, such as + for a space); the wasm plugin egress, ssh and postgres plugins do not use params url. The hmac plugin adds timestamp, recvWindow and signature after evaluation, and AWS SigV4 re-sorts query pairs for signing; those additions are not judged. For UrlToken requests the sent bytes equal the evaluated string apart from the secret on the tested URLs only, and the refusal of other placeholder spellings is shown on the listed spellings only. The secret is inserted as is, and the url crate percent-encodes only the characters it must, so a secret holding /, ? or # changes the path or query that is sent (the substitution is checked for scheme and host only); a {credential} in a query-map value stays literal. The query map is merged only when it is a JSON object (a value that is not a string is judged as its JSON text; the http and hmac plugins refuse such a map). A prefix that ends in * inside a host (https://api.*, https://10.0.0*) is matched as the one host the parser reads from it, so a deny rule of that shape denies less than before (warned; refused on Deny and Prompt rules at admin-API write time, see policy-write-refuses-warned-deny-prompt-patterns; one already stored still loads). A pattern without a trailing * must match the query too, so a deny rule on an exact URL does not match the same URL with a query. The meaning-change warning compares against a loose normal form and is shown on examples only; it can miss a change. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested. The load-time warning is a log line and is not a refusal. The server call sites that build the judged URL (policy_url at request time and at approval resume) are not covered by the detector.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "url-glob-part-wise",
@@ -2017,7 +2037,8 @@
         "url-glob-port-split-ignores-brackets",
         "url-glob-path-only-unmatched"
       ],
-      "does_not_establish": "Shown on the listed patterns and on 512 generated cases per run, not proved for every pattern or URL. Inside the host a wildcard still matches any run of host characters, dots included: https://*.example.com/x matches a.b.example.com and https://api.example.com*/x matches api.example.com.evil.net. Deny and Prompt globs match less than before: a glob without a port no longer matches a non-default port (https://*/admin misses https://h:8443/admin), and a glob without a scheme that does not start with * (ht*.example.com/x), which matched through the scheme before, now matches no URL with a host. A glob character class that spans a part boundary (a / or a : inside [...]) matches nothing, and the glob syntax reads an IPv6 literal written in a pattern host as a character class, not as that host. In a prefix pattern (trailing *) an earlier * is literal, so https://*.example.com/* matches no real host and a Deny or Prompt rule of that shape is dead (warned at load; the admin API refuses it on a Deny or Prompt rule when a policy is written, but one already stored or in the config file still loads). A wildcard in the path or query still matches / and ?. The matcher assumes a canonical URL (no userinfo, no fragment); canonicalisation and what the plugins send are the url-match-canonical claim."
+      "does_not_establish": "Shown on the listed patterns and on 512 generated cases per run, not proved for every pattern or URL. Inside the host a wildcard still matches any run of host characters, dots included: https://*.example.com/x matches a.b.example.com and https://api.example.com*/x matches api.example.com.evil.net. Deny and Prompt globs match less than before: a glob without a port no longer matches a non-default port (https://*/admin misses https://h:8443/admin), and a glob without a scheme that does not start with * (ht*.example.com/x), which matched through the scheme before, now matches no URL with a host. A glob character class that spans a part boundary (a / or a : inside [...]) matches nothing, and the glob syntax reads an IPv6 literal written in a pattern host as a character class, not as that host. In a prefix pattern (trailing *) an earlier * is literal, so https://*.example.com/* matches no real host and a Deny or Prompt rule of that shape is dead (warned at load; the admin API refuses it on a Deny or Prompt rule when a policy is written, but one already stored or in the config file still loads). A wildcard in the path or query still matches / and ?. The matcher assumes a canonical URL (no userinfo, no fragment); canonicalisation and what the plugins send are the url-match-canonical claim.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "argon2-kdf-known-answer",
@@ -2053,7 +2074,8 @@
       "mutants": [
         "argon2-default-time-cost-changed"
       ],
-      "does_not_establish": "Only the fixed cases above, not every password, salt or cost setting, so a different argon2 release could still differ elsewhere. The fixtures were generated by this repository with 0.5.3, they are not the published Argon2 test vectors and not a check against another implementation. It covers the master-key KDF only: admin passwords use bcrypt and API keys use SHA-256, neither is touched. It does not show the AES-GCM layer, the vault file format or key rotation (rekey) are correct, and the Lean and Kani artifacts do not model the KDF. The KDF output length is pinned to 32 bytes explicitly, and the test would not notice a later change that stores a different length elsewhere. Salts shorter than 8 bytes are rejected by argon2 and are not exercised. Key equality is inferred from AES-GCM authentication succeeding under the derived key; the key bytes are not compared directly. Salts longer than 48 bytes behave differently: 0.5.3 rejected them (its PHC salt string holds at most 64 Base64 characters) and 0.6 accepts them; vultrino generates 16-byte salts, so no vault written by 0.5.3 carries one, and this case is not tested."
+      "does_not_establish": "Only the fixed cases above, not every password, salt or cost setting, so a different argon2 release could still differ elsewhere. The fixtures were generated by this repository with 0.5.3, they are not the published Argon2 test vectors and not a check against another implementation. It covers the master-key KDF only: admin passwords use bcrypt and API keys use SHA-256, neither is touched. It does not show the AES-GCM layer, the vault file format or key rotation (rekey) are correct, and the Lean and Kani artifacts do not model the KDF. The KDF output length is pinned to 32 bytes explicitly, and the test would not notice a later change that stores a different length elsewhere. Salts shorter than 8 bytes are rejected by argon2 and are not exercised. Key equality is inferred from AES-GCM authentication succeeding under the derived key; the key bytes are not compared directly. Salts longer than 48 bytes behave differently: 0.5.3 rejected them (its PHC salt string holds at most 64 Base64 characters) and 0.6 accepts them; vultrino generates 16-byte salts, so no vault written by 0.5.3 carries one, and this case is not tested.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "policy-write-refuses-warned-deny-prompt-patterns",
@@ -2104,7 +2126,8 @@
         "policy-write-allow-negation-ignored",
         "policy-write-allow-not-parity-ignored"
       ],
-      "does_not_establish": "The refusal is as good as canonical_pattern's warnings: a pattern that matches less than it reads but draws no warning (a {a,b} glob, a glob without a port that misses a non-default port, an exact URL that misses a query) is accepted. Policies already stored keep loading with a warning and are enforced as written; config-file [[policies]] are only warned; the engine's add_policy and load paths do not refuse. An allow rule is refused only under an odd number of not; any other warned allow pattern is stored and only warned. A deny or prompt rule whose url_match sits under not is refused too, although a dead pattern under not denies more, not less. Shown on the listed patterns and shapes, not every pattern. Which deployed vaults hold such a stored policy is not checked."
+      "does_not_establish": "The refusal is as good as canonical_pattern's warnings: a pattern that matches less than it reads but draws no warning (a {a,b} glob, a glob without a port that misses a non-default port, an exact URL that misses a query) is accepted. Policies already stored keep loading with a warning and are enforced as written; config-file [[policies]] are only warned; the engine's add_policy and load paths do not refuse. An allow rule is refused only under an odd number of not; any other warned allow pattern is stored and only warned. A deny or prompt rule whose url_match sits under not is refused too, although a dead pattern under not denies more, not less. Shown on the listed patterns and shapes, not every pattern. Which deployed vaults hold such a stored policy is not checked.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "stored-rate-limit-refused-on-load",
@@ -2177,7 +2200,8 @@
         "stored-rate-limit-refresh-applies",
         "stored-rate-limit-startup-warns-only"
       ],
-      "does_not_establish": "Only that one shape is refused: a stored policy failing another validation rule (nested SpendCap, zero RateLimit dimension, degenerate TimeWindow) is still only warned and enforced as written. The engine's own add_policy and load paths do not refuse. The serve --mcp refusal is shown by one test with a stdin closed at start (a non-zero exit naming the policy), not by an MCP session. A running process that meets such a policy written by an older binary keeps its last good set and also stops picking up later valid changes in that vault until it is fixed. A reload after an admin write answers 500 reload_error while a refused policy is stored. Whether any deployed vault holds such a policy is not checked. The refusal does not change what a deny default means: an exhausted RateLimit still falls through to the other rules of every matching policy first."
+      "does_not_establish": "Only that one shape is refused: a stored policy failing another validation rule (nested SpendCap, zero RateLimit dimension, degenerate TimeWindow) is still only warned and enforced as written. The engine's own add_policy and load paths do not refuse. The serve --mcp refusal is shown by one test with a stdin closed at start (a non-zero exit naming the policy), not by an MCP session. A running process that meets such a policy written by an older binary keeps its last good set and also stops picking up later valid changes in that vault until it is fixed. A reload after an admin write answers 500 reload_error while a refused policy is stored. Whether any deployed vault holds such a policy is not checked. The refusal does not change what a deny default means: an exhausted RateLimit still falls through to the other rules of every matching policy first.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "tenant-assertion-differential-vectors",
@@ -2392,7 +2416,8 @@
       "mutants": [
         "policy-refresh-interval-cap-removed"
       ],
-      "does_not_establish": "Only the parse and the effective-value accessors, on the listed inputs. It does not show the refresh loop ticks at that interval, that a running process re-reads the variable (it is read at startup), or that every message quotes it (only the reload_error message does)."
+      "does_not_establish": "Only the parse and the effective-value accessors, on the listed inputs. It does not show the refresh loop ticks at that interval, that a running process re-reads the variable (it is read at startup), or that every message quotes it (only the reload_error message does).",
+      "evidence_run": "38694664010"
     },
     {
       "id": "approval-decision-route-refuses-opaquely",
@@ -2417,7 +2442,8 @@
       "mutants": [
         "approval-decision-reject-reason-exposed"
       ],
-      "does_not_establish": "Only the five listed failure shapes. Missing or duplicate assertion headers, an unconfigured approval secret (403 verified_approvals_disabled, a different and deliberately specific answer) and a wrong admin key are other branches and are not covered here. The log assertion relies on the test's tracing subscriber capturing the warning."
+      "does_not_establish": "Only the five listed failure shapes. Missing or duplicate assertion headers, an unconfigured approval secret (403 verified_approvals_disabled, a different and deliberately specific answer) and a wrong admin key are other branches and are not covered here. The log assertion relies on the test's tracing subscriber capturing the warning.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "approval-decision-replay-is-noop",
@@ -2449,7 +2475,8 @@
         "approval-replay-recorded-signoff-recounted",
         "approval-replay-after-decision-not-idempotent"
       ],
-      "does_not_establish": "Only the shown shape: one two-teammate recipe, the same approver replayed. It does not cover a replay by a different party who captured the assertion and is bound to the same approver identity (the assertion binds the approver), a replay after the assertion's TTL (refused by expiry, tested in the verifier vectors), a replay of a deny against an approved request, or a decision made after the approval expired. The no-op argument depends on sign-off distinctness; a future change that lets one identity sign twice would reopen it."
+      "does_not_establish": "Only the shown shape: one two-teammate recipe, the same approver replayed. It does not cover a replay by a different party who captured the assertion and is bound to the same approver identity (the assertion binds the approver), a replay after the assertion's TTL (refused by expiry, tested in the verifier vectors), a replay of a deny against an approved request, or a decision made after the approval expired. The no-op argument depends on sign-off distinctness; a future change that lets one identity sign twice would reopen it.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "pop-length-framing-exact",
@@ -2478,7 +2505,8 @@
       "mutants": [
         "pop-lp-length-truncates"
       ],
-      "does_not_establish": "The boundary is tested on the length function (0, 1, 255, 256, 65535, 65536, 2^32 - 2, 2^32 - 1 and several values at and above 2^32) and one framing example; no 4 GiB field is built, so the refusal inside lp is shown by construction of the same function, not by an oversized input. A bounded test, not a Kani proof or an exhaustive check over all lengths. The grant PoP v2 preimage has its own checked framing (lp_v2) and is not covered here."
+      "does_not_establish": "The boundary is tested on the length function (0, 1, 255, 256, 65535, 65536, 2^32 - 2, 2^32 - 1 and several values at and above 2^32) and one framing example; no 4 GiB field is built, so the refusal inside lp is shown by construction of the same function, not by an oversized input. A bounded test, not a Kani proof or an exhaustive check over all lengths. The grant PoP v2 preimage has its own checked framing (lp_v2) and is not covered here.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "params-commitment-vectors-match-reference",
@@ -2503,7 +2531,8 @@
       "mutants": [
         "pop-commit-nonce-uppercase-accepted"
       ],
-      "does_not_establish": "Only the listed inputs and only the input domain (vultrino never commits under another). Copy identity with averin's file is checked only by the local --peer run of check_vectors_lock.py, not by CI. It does not show the nonce is random or that the commitment hides a value."
+      "does_not_establish": "Only the listed inputs and only the input domain (vultrino never commits under another). Copy identity with averin's file is checked only by the local --peer run of check_vectors_lock.py, not by CI. It does not show the nonce is random or that the commitment hides a value.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "tenant-assertion-subsecond-ttl-parity",
@@ -2527,7 +2556,8 @@
       "mutants": [
         "tenant-ttl-subsecond-reads-as-unset"
       ],
-      "does_not_establish": "Only the ceiling arithmetic on a 500 ms value and three expiry offsets, in this repository's tests; govder pins the same behaviour in its own test, and the two are not compared by a shared vector (the shared vectors carry whole-second ceilings only). Not what ceiling the web route passes (govder.assertion_ttl capped by the broker maximum)."
+      "does_not_establish": "Only the ceiling arithmetic on a 500 ms value and three expiry offsets, in this repository's tests; govder pins the same behaviour in its own test, and the two are not compared by a shared vector (the shared vectors carry whole-second ceilings only). Not what ceiling the web route passes (govder.assertion_ttl capped by the broker maximum).",
+      "evidence_run": "38694664010"
     },
     {
       "id": "sod-default-with-verified-approvers",
@@ -2572,7 +2602,8 @@
         "xv10-sod-owner-axis-readded",
         "xv10-exclude-owner-ignored"
       ],
-      "does_not_establish": "That main.rs calls apply_sod_default with the live key posture before serving (a wiring line, covered by the four-plane e2e self-approval leg, not by this detector or a drift lock); that the approver identity is authenticated (the broker signs only under a real IdP; the dev escape VULTRINO_ALLOW_SHARED_APPROVAL_KEY and FEIR_OS_ALLOW_DEV_VERIFIED_APPROVERS are documented dev/test postures that weaken it); that requester and approver are compared on the same identity namespace (an agent identity that differs from the approver's IdP subject is not a self-approval); and nothing about [approvals] enabled. The same-aggregator-key refusal (one key filling two seats of a two-person rule) is independent of this flag and is not established by it. The CLI approve/deny path never enforces separation of duty regardless of this setting (decide_approval in src/main.rs passes false)."
+      "does_not_establish": "That main.rs calls apply_sod_default with the live key posture before serving (a wiring line, covered by the four-plane e2e self-approval leg, not by this detector or a drift lock); that the approver identity is authenticated (the broker signs only under a real IdP; the dev escape VULTRINO_ALLOW_SHARED_APPROVAL_KEY and FEIR_OS_ALLOW_DEV_VERIFIED_APPROVERS are documented dev/test postures that weaken it); that requester and approver are compared on the same identity namespace (an agent identity that differs from the approver's IdP subject is not a self-approval); and nothing about [approvals] enabled. The same-aggregator-key refusal (one key filling two seats of a two-person rule) is independent of this flag and is not established by it. The CLI approve/deny path never enforces separation of duty regardless of this setting (decide_approval in src/main.rs passes false).",
+      "evidence_run": "38694664010"
     },
     {
       "id": "vault-write-cost-per-changed-record",
@@ -3052,7 +3083,8 @@
         "averin-enabled-config-accepts-empty-base-url",
         "averin-enabled-config-accepts-empty-resource-id"
       ],
-      "does_not_establish": "Gaps are held in memory and appended to the outbox every two seconds: a process that is killed before an append loses the gaps it had not yet written, and the counters with them. flush_receipt_gaps_once puts a gap back for retry when an outbox append fails, but no test makes an append fail, so that branch is not exercised here (the requeue order is). A gap says an action ran without a receipt; it does not say the action's own side effect succeeded, and it is not a proof that no other receipt is missing: a seal that Averin accepted but recorded wrongly, a seal that never started because Averin is disabled, undeclared actions, and receipts lost to a crash between the action and the seal enqueue are outside it. The on_execute (synchronous) Observe arms record gaps by the same call but are not exercised by a test here; only the production async and durable paths are. The outbox event reaches a consumer only if one polls or is pushed to; nothing here shows that anything alerts on it. The vacuity of the name filter: the detector selects tests whose name contains fei33_, so a renamed test drops out of it. The refusal covers the TOML block only: a block that parses but names an unreachable averin, or an AVERIN_API_KEY averin rejects, still starts, and every Observe action is then recorded as a receipt gap rather than refused."
+      "does_not_establish": "Gaps are held in memory and appended to the outbox every two seconds: a process that is killed before an append loses the gaps it had not yet written, and the counters with them. flush_receipt_gaps_once puts a gap back for retry when an outbox append fails, but no test makes an append fail, so that branch is not exercised here (the requeue order is). A gap says an action ran without a receipt; it does not say the action's own side effect succeeded, and it is not a proof that no other receipt is missing: a seal that Averin accepted but recorded wrongly, a seal that never started because Averin is disabled, undeclared actions, and receipts lost to a crash between the action and the seal enqueue are outside it. The on_execute (synchronous) Observe arms record gaps by the same call but are not exercised by a test here; only the production async and durable paths are. The outbox event reaches a consumer only if one polls or is pushed to; nothing here shows that anything alerts on it. The vacuity of the name filter: the detector selects tests whose name contains fei33_, so a renamed test drops out of it. The refusal covers the TOML block only: a block that parses but names an unreachable averin, or an AVERIN_API_KEY averin rejects, still starts, and every Observe action is then recorded as a receipt gap rather than refused.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "telegram-callback-attribution",
@@ -3112,7 +3144,8 @@
         "telegram-callback-mode-still-posts-url-buttons",
         "telegram-approvers-table-without-callback-is-ignored"
       ],
-      "does_not_establish": "The identity is the operator's mapping from a Telegram user id, taken from callback_query.from.id as Telegram's servers report it; the tests use a stand-in Telegram server, so they do not show what the real API sends, that its user ids are unforgeable in a chat (that is Telegram's property, not checked here), or that a Telegram account is held by the person the mapping names (a stolen or shared account is that person). A press carries no approver class, so an approval gated by a govder recipe that names classes cannot be satisfied this way; the tests do not run such a recipe. A bot can have one getUpdates consumer and a webhook disables polling: a second consumer or a set webhook makes the loop retry with backoff and log, and no test shows that. Only the web process starts the poll loop. The mapping to the IdP subject is an operator duty that nothing checks: a Telegram user mapped to an email is counted as a different person from the same human's verified panel sign-off. The webhook notifier's links are unchanged and still unattributed; the tests cover only the Telegram link route's behaviour for a two-person request. The callback path records the decision and resumes the action through the same functions as the link and panel paths, but the resume itself is not exercised here."
+      "does_not_establish": "The identity is the operator's mapping from a Telegram user id, taken from callback_query.from.id as Telegram's servers report it; the tests use a stand-in Telegram server, so they do not show what the real API sends, that its user ids are unforgeable in a chat (that is Telegram's property, not checked here), or that a Telegram account is held by the person the mapping names (a stolen or shared account is that person). A press carries no approver class, so an approval gated by a govder recipe that names classes cannot be satisfied this way; the tests do not run such a recipe. A bot can have one getUpdates consumer and a webhook disables polling: a second consumer or a set webhook makes the loop retry with backoff and log, and no test shows that. Only the web process starts the poll loop. The mapping to the IdP subject is an operator duty that nothing checks: a Telegram user mapped to an email is counted as a different person from the same human's verified panel sign-off. The webhook notifier's links are unchanged and still unattributed; the tests cover only the Telegram link route's behaviour for a two-person request. The callback path records the decision and resumes the action through the same functions as the link and panel paths, but the resume itself is not exercised here.",
+      "evidence_run": "38694664010"
     },
     {
       "id": "secret-fingerprint-report",
@@ -3151,7 +3184,8 @@
         "posture-unusable-approver-key-reported",
         "posture-averin-key-reported-while-seal-client-off"
       ],
-      "does_not_establish": "That two planes hold the same value: this is the report one plane makes, and the comparison is feir-os's verifier. The report reads the loaded configuration, so a value changed afterwards or read by another code path is not reflected; a vultrino whose outbox pushes somewhere other than govder still reports the push relationship, which the verifier then compares with govder's GOVDER_SIGNATURE_SECRET. The fingerprint is only as private as the secret is strong: someone who holds it can test guesses for a low-entropy secret offline, and the report is protected only by a global admin key. The route's key gate is covered by the posture-report claims, not here. The cross-plane check that real binaries emit what the verifier reads is govder's armed four-plane e2e (TestFourPlanePostureE2E, TestFourPlaneSecretMismatchE2E). The averin-api-key fingerprint says which key vultrino sends; that averin accepts it is checked by feir-os's verifier against averin's own report, and no four-plane run has a keyed averin."
+      "does_not_establish": "That two planes hold the same value: this is the report one plane makes, and the comparison is feir-os's verifier. The report reads the loaded configuration, so a value changed afterwards or read by another code path is not reflected; a vultrino whose outbox pushes somewhere other than govder still reports the push relationship, which the verifier then compares with govder's GOVDER_SIGNATURE_SECRET. The fingerprint is only as private as the secret is strong: someone who holds it can test guesses for a low-entropy secret offline, and the report is protected only by a global admin key. The route's key gate is covered by the posture-report claims, not here. The cross-plane check that real binaries emit what the verifier reads is govder's armed four-plane e2e (TestFourPlanePostureE2E, TestFourPlaneSecretMismatchE2E). The averin-api-key fingerprint says which key vultrino sends; that averin accepts it is checked by feir-os's verifier against averin's own report, and no four-plane run has a keyed averin.",
+      "evidence_run": "38694664010"
     }
   ]
 }
