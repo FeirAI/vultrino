@@ -326,7 +326,8 @@ enum VaultCommands {
     /// Copy the snapshot, its .wal, the outbox and the averin stores together into a NEW empty
     /// directory, with a manifest of SHA-256 sums. Holds the exclusive vault lock for the copy (a
     /// running non-durable service waits for it, dispatches pause for that time); refuses at once
-    /// if the durable averin queue is in use. Stop the service first for a durable deployment.
+    /// if the durable averin queue is in use, or while `<vault>.restore-pending` exists (an earlier
+    /// restore did not finish). Stop the service first for a durable deployment.
     Backup {
         /// Destination directory (must not exist or be empty)
         dir: PathBuf,
@@ -335,6 +336,9 @@ enum VaultCommands {
     /// touching the target; refuses a partial backup; replaces an existing vault only with --force
     /// (the old files are moved aside, not deleted). STOP THE SERVICE FIRST: a running non-durable
     /// service holds the vault lock only per operation, so this command does not detect it.
+    /// A restore does not detect a rollback: restoring an older backup undoes every kill,
+    /// revocation and approval made after it, so re-apply those (and check Govder's kill state)
+    /// before starting the service.
     Restore {
         /// Directory holding the backup
         dir: PathBuf,
@@ -1027,9 +1031,6 @@ fn get_new_storage_password() -> Result<SecretString, Box<dyn std::error::Error>
     Ok(SecretString::from(first))
 }
 
-/// Re-key the file-backed vault to a new master password (offline, single-sided). Opens the vault with
-/// the CURRENT password (a wrong current password fails HERE, before any write), then re-encrypts the
-/// vault + outbox with a key derived from the new password. Only the `File` backend supports re-keying.
 async fn vault_backup_cmd(
     config: Config,
     cmd: VaultCommands,
@@ -1089,6 +1090,9 @@ async fn vault_backup_cmd(
     Ok(())
 }
 
+/// Re-key the file-backed vault to a new master password (offline, single-sided). Opens the vault with
+/// the CURRENT password (a wrong current password fails HERE, before any write), then re-encrypts the
+/// vault + outbox with a key derived from the new password. Only the `File` backend supports re-keying.
 async fn rekey_vault(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     match config.storage.backend {
         StorageBackendType::File => {

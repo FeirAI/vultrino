@@ -228,6 +228,15 @@ pub async fn backup(
     if !vault.is_file() {
         return Err(format!("no vault at {}", vault.display()).into());
     }
+    if restore_pending_path(vault).exists() {
+        return Err(format!(
+            "{} exists: an earlier `vault restore` did not finish, so the files on disk may pair a \
+             snapshot with a log from another moment. Re-run `vault restore` from a known-good \
+             backup before taking a new one",
+            restore_pending_path(vault).display()
+        )
+        .into());
+    }
     if dest.exists() && std::fs::read_dir(dest)?.next().is_some() {
         return Err(format!("{} is not empty; backups never overwrite", dest.display()).into());
     }
@@ -843,6 +852,18 @@ mod tests {
             .to_string();
         assert!(err.contains("unknown file"), "{err}");
         assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn backup_refuses_while_a_restore_is_pending() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("credentials.enc");
+        drop(FileStorage::new(&vault, &pw()).await.unwrap());
+        std::fs::write(restore_pending_path(&vault), b"x").unwrap();
+        let dest = dir.path().join("bk");
+        let err = backup(&vault, &dest, None).await.unwrap_err().to_string();
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(!dest.exists() || std::fs::read_dir(&dest).unwrap().next().is_none());
     }
 
     #[tokio::test]

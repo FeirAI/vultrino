@@ -552,6 +552,21 @@
     },
     "d8-reversible-no-fallback": {
       "tier": "fast"
+    },
+    "d8-fallback-any-error": {
+      "tier": "fast"
+    },
+    "d8-fallback-undeclared": {
+      "tier": "full"
+    },
+    "d8-streaming-guard-dropped": {
+      "tier": "full"
+    },
+    "d8-oversize-preflight-skipped": {
+      "tier": "full"
+    },
+    "vault-backup-ignores-restore-pending": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -704,12 +719,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "ece06d2c2987a99a7d9a2a53d5defa976f2304858e328b73265f956e073f74b1"
+          "sha256": "73055a36fe56f3c233908448bc73077062783c985e8ee15003f793691747e54b"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "ef1e0bb08feb54218255dcb6c94959607d9a8fbdb8faffa9651cf4bc8b301a0e"
+          "sha256": "b64cabab47e8958f932f503ffaa4f887dc3e684c56266567faa13a054c5586f6"
         },
         {
           "path": "src/server/mod.rs",
@@ -2307,22 +2322,22 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "ef1e0bb08feb54218255dcb6c94959607d9a8fbdb8faffa9651cf4bc8b301a0e"
+          "sha256": "b64cabab47e8958f932f503ffaa4f887dc3e684c56266567faa13a054c5586f6"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "2c888f0b882d3fb89f3de38e80b11549848314afd857714a8aa0a662aa89779b"
+          "sha256": "c42736e263870369bde271347d2062bed13c98ce6eb3c0642c21acc28188793e"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "310d5c3e3d35bcc463008801e9dc55be25844048299c2fca22151730a8b87c32"
+          "sha256": "c8bdcae15a1bab5265d02d6a61d5c91c46a8e9878f213299d4e98efc802498c1"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "ece06d2c2987a99a7d9a2a53d5defa976f2304858e328b73265f956e073f74b1"
+          "sha256": "73055a36fe56f3c233908448bc73077062783c985e8ee15003f793691747e54b"
         },
         {
           "path": "src/server/mod.rs",
@@ -3000,7 +3015,7 @@
     },
     {
       "id": "vault-backup-restore-consistent",
-      "statement": "vultrino vault backup copies the vault snapshot, its .wal, the outbox and the averin stores while holding the exclusive vault lock (released before the password open check, which runs the KDF on the copy), into a new empty directory, with a manifest of SHA-256 sums and sizes; it refuses a vault that has no .wal (a partial backup), a destination that is not empty, and checks the copy by re-reading it against the manifest and by opening it under the password. vultrino vault restore checks the manifest, every checksum and size, and that nothing is in the directory that the manifest does not list, requires the snapshot and the .wal in the manifest, and opens the copy, all before it touches the target; it refuses to replace an existing vault without --force (then moves the old files aside, never deletes them), stages every file before renaming any (the averin queue as a whole sibling directory, renamed into place after the old one is moved aside, so a target that already has a queue restores cleanly), accepts only manifest names a backup can contain (never an arbitrary name written into the vault directory), and while it runs leaves <vault>.restore-pending, which makes FileStorage refuse to open until the restore is re-run. A restored vault holds the kill that was in its .wal.",
+      "statement": "vultrino vault backup copies the vault snapshot, its .wal, the outbox and the averin stores while holding the exclusive vault lock (released before the password open check, which runs the KDF on the copy), into a new empty directory, with a manifest of SHA-256 sums and sizes; it refuses a vault that has no .wal (a partial backup), a destination that is not empty, and checks the copy by re-reading it against the manifest and by opening it under the password. vultrino vault restore checks the manifest, every checksum and size, and that nothing is in the directory that the manifest does not list, requires the snapshot and the .wal in the manifest, and opens the copy, all before it touches the target; it refuses to replace an existing vault without --force (then moves the old files aside, never deletes them), stages every file before renaming any (the averin queue as a whole sibling directory, renamed into place after the old one is moved aside, so a target that already has a queue restores cleanly), accepts only manifest names a backup can contain (never an arbitrary name written into the vault directory), and while it runs leaves <vault>.restore-pending, which makes FileStorage refuse to open until the restore is re-run. A restored vault holds the kill that was in its .wal. vault backup also refuses while <vault>.restore-pending exists, so a half-applied restore is never copied into a 'verified' backup.",
       "method": "test",
       "artifacts": [
         "src/storage/vault_backup.rs",
@@ -3016,7 +3031,7 @@
         {
           "path": "src/storage/vault_backup.rs",
           "symbol": "backup",
-          "sha256": "004443a68e04c5a8059a3b0eb4fa380bbb7d1ff45ef2cd52b6c6cdd6e3c5d754"
+          "sha256": "db23f8390c9c74c6d012e1601146edbe133403f8c96daa2551d442af5b52d264"
         },
         {
           "path": "src/storage/vault_backup.rs",
@@ -3053,10 +3068,10 @@
         "vault-restore-skips-checksum",
         "vault-backup-allows-missing-wal",
         "vault-open-ignores-restore-pending",
-        "vault-restore-stages-queue-in-live-dir"
+        "vault-restore-stages-queue-in-live-dir",
+        "vault-backup-ignores-restore-pending"
       ],
-      "does_not_establish": "Rollback to an older but self-consistent backup, or a backup tampered with together with its manifest by someone who can write the backup directory: the manifest is not signed. A backup taken while a process holds the vault or the durable averin queue is refused after 30 seconds (vault) or at once (queue), not tested with a second OS process. Power-loss durability of the restore renames: a crash between them is covered by the marker, which is tested only by presence, not by injecting a crash. The averin queue segments are copied as files and are not opened by the open check. Backups of a vault on a filesystem without flock semantics. Both commands expect the service to be stopped: a running non-durable service holds the vault lock only per operation, so restore does not detect it. Any CI run.",
-      "evidence_run": "38667588941"
+      "does_not_establish": "Rollback to an older but self-consistent backup, or a backup tampered with together with its manifest by someone who can write the backup directory: the manifest is not signed. A backup taken while a process holds the vault or the durable averin queue is refused after 30 seconds (vault) or at once (queue), not tested with a second OS process. Power-loss durability of the restore renames: a crash between them is covered by the marker, which is tested only by presence, not by injecting a crash. The averin queue segments are copied as files and are not opened by the open check. Backups of a vault on a filesystem without flock semantics. Both commands expect the service to be stopped: a running non-durable service holds the vault lock only per operation, so restore does not detect it. Any CI run. Restoring an older backup undoes every kill, revocation and approval made after it; the operator must re-apply them (documented, not detected)."
     },
     {
       "id": "vault-check-final-record",
@@ -3086,30 +3101,54 @@
     },
     {
       "id": "d8-evidence-floor-routine-keeps-running",
-      "statement": "With [averin] enabled, mode observe and d8_complete_evidence on (the FeirOS Solo posture), an action the trusted catalog declares non-reversible is refused before the plugin runs when Averin cannot begin the two-phase use evidence (the error says D8 before-act evidence failed). A reversible action whose two-phase evidence cannot be begun still runs, with one use receipt sealed through the mode's own rule, an AVERIN-D8-DEGRADED alarm line and a d8_degraded counter increment. With Averin up, the same reversible action gets use-intent before and use-outcome after the call and no degraded count.",
+      "statement": "With [averin] enabled, mode observe and d8_complete_evidence on (the FeirOS Solo posture), on both the buffered and the streaming tail, an action the trusted catalog declares non-reversible, and an action with no catalog declaration, is refused before the plugin runs when Averin cannot begin the two-phase use evidence (the error says D8 before-act evidence failed). Only a declared-Reversible action whose evidence cannot be begun because Averin is unavailable (unreachable, 5xx or 429) still runs, with one use receipt sealed through the mode's own rule, an AVERIN-D8-DEGRADED alarm line and a d8_degraded counter increment. A declared-Reversible action is refused, not degraded, when a live Averin answers 4xx, and when its params exceed max_seal_params_bytes (refused before the use token is spent). With Averin up, a reversible action gets use-intent before and use-outcome after the call and no degraded count.",
       "method": "test",
       "artifacts": [
-        "src/server/mod.rs",
+        "docs/dev/LIMITATIONS.md",
         "src/averin/mod.rs",
+        "src/server/mod.rs",
         "tests/approval_token_integration.rs",
-        "docs/dev/LIMITATIONS.md"
+        "tests/d8_degraded_guard.rs"
       ],
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact solo_posture_with_averin_down_refuses_irreversible_and_runs_reversible solo_posture_with_averin_up_gives_reversible_two_phase_evidence irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode reversible_approval_resume_remains_fail_open_when_observe_seal_is_missing",
+      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact solo_posture_with_averin_down_refuses_irreversible_and_runs_reversible solo_posture_with_averin_up_gives_reversible_two_phase_evidence irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode reversible_approval_resume_remains_fail_open_when_observe_seal_is_missing && cargo test --locked --no-default-features --test d8_degraded_guard",
       "covers": [
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "310d5c3e3d35bcc463008801e9dc55be25844048299c2fca22151730a8b87c32"
+          "sha256": "c8bdcae15a1bab5265d02d6a61d5c91c46a8e9878f213299d4e98efc802498c1"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action_streaming",
+          "sha256": "c42736e263870369bde271347d2062bed13c98ce6eb3c0642c21acc28188793e"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::begin_exact_or_degrade",
+          "sha256": "41cc02dd86729a86241c42395ea7ea5205fb909ba73898e3895e0dccbc81f6a4"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::validate_required_evidence_preflight",
+          "sha256": "f60f62658cfef73e98715d9b802265a40245ff44fe15140a5effac9af5ce1155"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinError::is_unavailable",
+          "sha256": "867b3a11c9ec473687ee7583ae5deb745115fe3e7a2f559f1a97ec621c2285b4"
         }
       ],
       "mutants": [
-        "d8-reversible-no-fallback"
+        "d8-reversible-no-fallback",
+        "d8-fallback-any-error",
+        "d8-fallback-undeclared",
+        "d8-streaming-guard-dropped",
+        "d8-oversize-preflight-skipped"
       ],
-      "does_not_establish": "Only actions the trusted catalog declares non-reversible are held to the evidence floor: an action with no declaration, in a non-strict posture, is treated as reversible (require_declared_capabilities = true would fail it closed; the shipped Solo template does not set it). The tests drive the approved-resume path of the buffered tail; the live-call and streaming tails carry the same code and are not separately tested or mutated. A fake Averin stands in for the real one; the four-plane end-to-end with the shipped template is a separate run. The routine action's seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. Any CI run.",
-      "evidence_run": "38667588941"
+      "does_not_establish": "Only an action the trusted catalog declares Reversible may degrade; whether an operator labeled the real side effect truthfully is not checked. Unavailable means a request error (connect or timeout), a 5xx or a 429; a live Averin that misbehaves in some other way refuses, which is the safe side. The approved-resume path is driven through the buffered tail in approval_token_integration and the direct path through both tails in d8_degraded_guard; a fake Averin stands in for the real one, and no four-plane end-to-end runs with [averin] enabled (a separate run). The routine action's one-phase seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. Any CI run other than the recorded one."
     }
   ]
 }

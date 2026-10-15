@@ -364,6 +364,19 @@ pub enum AverinError {
     BadResponse(String),
 }
 
+impl AverinError {
+    /// True only for a failure that means Averin could not be reached or is
+    /// overloaded: a connect or timeout error, a 5xx, or a 429. A 4xx, a bound
+    /// or shape error, a missing grant and a Pop error are refusals, not outages.
+    pub(crate) fn is_unavailable(&self) -> bool {
+        match self {
+            Self::Request(_) => true,
+            Self::Status { status, .. } => *status >= 500 || *status == 429,
+            _ => false,
+        }
+    }
+}
+
 /// The deterministic outputs of [`build_use_pop`]: `params_commitment` is exposed (not just
 /// consumed internally) so a unit test can assert it, byte-for-byte, alongside `use_sig` across
 /// two calls with the same inputs — plan 088 D5's determinism contract, the thing that makes a

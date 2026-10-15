@@ -526,6 +526,12 @@ struct ActionPayload {
     /// binding. When true, a committed Averin use receipt is a precondition of
     /// plugin dispatch, independent of the ordinary Observe posture.
     evidence_required: bool,
+    /// True only when trusted catalog authority declares the action Reversible.
+    /// It is the sole class that may fall back to a one-phase seal when Averin is
+    /// unavailable (VUL-38). Undeclared, ambiguous and human-floor actions never
+    /// fall back. Not part of the permit binding: it is set from the same trusted
+    /// resolution as `evidence_required` and is read only at the D8 seam.
+    d8_fallback_ok: bool,
     /// The kill fence subject (P3-KILL), checked against the vault immediately
     /// before the plugin call. Not part of the permit binding: it can only refuse.
     kill_fence: KillFenceSubject,
@@ -2009,6 +2015,7 @@ impl VultrinoServer {
             approved_execution: false,
             evidence_action: request.action.clone(),
             evidence_required,
+            d8_fallback_ok: matches!(irreversibility, IrreversibilityResolution::Reversible),
             kill_fence: KillFenceSubject {
                 principal: principal.clone(),
                 admitted_epoch,
@@ -2059,6 +2066,64 @@ impl VultrinoServer {
         }
     }
 
+    /// The D8 two-phase evidence seam shared by the buffered and streaming tails.
+    ///
+    /// VUL-38: a declared-Reversible action keeps running with a one-phase seal
+    /// ONLY when Averin is unavailable (connect/timeout failure, 5xx or 429).
+    /// Every other failure (an oversize bound, a malformed reply, a 4xx from a
+    /// live Averin, a Pop error) refuses, exactly as an irreversible, undeclared
+    /// or ambiguous action always does. The agent cannot choose the degraded path
+    /// by shaping its params, because the params bound is also checked before the
+    /// use token is consumed.
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_exact_or_degrade(
+        &self,
+        av: &Arc<crate::averin::AverinClient>,
+        token_id: &str,
+        credential_alias: &str,
+        evidence_action: &str,
+        params_bytes: Vec<u8>,
+        use_sequence_number: u32,
+        request_id: &str,
+        evidence_required: bool,
+        d8_fallback_ok: bool,
+    ) -> Result<Option<crate::averin::ExactUseEvidence>, RunError> {
+        match av
+            .begin_exact_use(
+                token_id,
+                credential_alias,
+                evidence_action,
+                &params_bytes,
+                request_id,
+            )
+            .await
+        {
+            Ok(evidence) => Ok(Some(evidence)),
+            Err(error) if d8_fallback_ok && !evidence_required && error.is_unavailable() => {
+                av.record_d8_degraded();
+                tracing::error!(
+                    target: "averin_seal",
+                    request_id = %request_id,
+                    error = %error,
+                    "AVERIN-D8-DEGRADED two-phase evidence unavailable for a reversible action; falling back to a one-phase seal"
+                );
+                self.seal_after_consume(
+                    av,
+                    token_id,
+                    params_bytes,
+                    use_sequence_number,
+                    request_id,
+                    evidence_required,
+                )
+                .await?;
+                Ok(None)
+            }
+            Err(error) => Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
+                "D8 before-act evidence failed: {error}; nothing ran"
+            )))),
+        }
+    }
+
     /// Validate the evidence prerequisites selected by trusted capability
     /// authority before a use token is consumed. A human-floor action may reach
     /// dispatch only with a concrete token, a live Averin client, bounded params,
@@ -2071,6 +2136,21 @@ impl VultrinoServer {
         params_len: usize,
     ) -> Result<(), RunError> {
         if !evidence_required {
+            // A routine action under D8 may degrade only when Averin is down. An
+            // oversize params body is the agent's doing, so refuse it before the
+            // token is consumed rather than letting it skip two-phase evidence.
+            if let Some(av) = self.averin.as_ref() {
+                if av.config().d8_complete_evidence
+                    && evidence_subject_id.is_some()
+                    && params_len > av.config().max_seal_params_bytes
+                {
+                    return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
+                        "D8 before-act evidence failed: parameters exceed the configured {} byte \
+                         evidence bound; nothing ran",
+                        av.config().max_seal_params_bytes
+                    ))));
+                }
+            }
             return Ok(());
         }
         let av = self.averin.as_ref().ok_or_else(|| {
@@ -2532,6 +2612,7 @@ impl VultrinoServer {
             approved_execution,
             evidence_action,
             evidence_required,
+            d8_fallback_ok,
             kill_fence,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
@@ -2687,45 +2768,20 @@ impl VultrinoServer {
             (&self.averin, evidence_subject_id, evidence_params)
         {
             if av.config().d8_complete_evidence || (approved_execution && evidence_required) {
-                match av
-                    .begin_exact_use(
+                exact_evidence = self
+                    .begin_exact_or_degrade(
+                        av,
                         tid,
                         &credential_alias,
                         &evidence_action,
-                        &params_bytes,
+                        params_bytes,
+                        use_sequence_number,
                         &request_id,
+                        evidence_required,
+                        d8_fallback_ok,
                     )
-                    .await
-                {
-                    Ok(evidence) => exact_evidence = Some((av.clone(), evidence)),
-                    // VUL-38: only an action the trusted catalog declares non-reversible
-                    // REQUIRES two-phase evidence. A reversible action keeps running when
-                    // Averin is down, with a visible gap (alarm line, counter, one-phase
-                    // seal through the mode's own fail-open or fail-closed rule).
-                    Err(error) if !evidence_required => {
-                        av.record_d8_degraded();
-                        tracing::error!(
-                            target: "averin_seal",
-                            request_id = %request_id,
-                            error = %error,
-                            "AVERIN-D8-DEGRADED two-phase evidence unavailable for a reversible action; falling back to a one-phase seal"
-                        );
-                        self.seal_after_consume(
-                            av,
-                            tid,
-                            params_bytes,
-                            use_sequence_number,
-                            &request_id,
-                            evidence_required,
-                        )
-                        .await?;
-                    }
-                    Err(error) => {
-                        return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
-                            "D8 before-act evidence failed: {error}; nothing ran"
-                        ))));
-                    }
-                }
+                    .await?
+                    .map(|evidence| (av.clone(), evidence));
             } else {
                 // Plan 087 FIX 1 — the mode-dependent seal hook now lives in ONE shared
                 // helper so the buffered and streaming execute paths cannot drift.
@@ -2979,6 +3035,7 @@ impl VultrinoServer {
             approved_execution,
             evidence_action,
             evidence_required,
+            d8_fallback_ok,
             kill_fence,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
@@ -3117,42 +3174,20 @@ impl VultrinoServer {
             (&self.averin, evidence_subject_id, evidence_params)
         {
             if av.config().d8_complete_evidence || (approved_execution && evidence_required) {
-                match av
-                    .begin_exact_use(
+                exact_evidence = self
+                    .begin_exact_or_degrade(
+                        av,
                         tid,
                         &credential_alias,
                         &evidence_action,
-                        &params_bytes,
+                        params_bytes,
+                        use_sequence_number,
                         &request_id,
+                        evidence_required,
+                        d8_fallback_ok,
                     )
-                    .await
-                {
-                    Ok(evidence) => exact_evidence = Some((av.clone(), evidence)),
-                    // VUL-38: see the buffered tail.
-                    Err(error) if !evidence_required => {
-                        av.record_d8_degraded();
-                        tracing::error!(
-                            target: "averin_seal",
-                            request_id = %request_id,
-                            error = %error,
-                            "AVERIN-D8-DEGRADED two-phase evidence unavailable for a reversible action; falling back to a one-phase seal"
-                        );
-                        self.seal_after_consume(
-                            av,
-                            tid,
-                            params_bytes,
-                            use_sequence_number,
-                            &request_id,
-                            evidence_required,
-                        )
-                        .await?;
-                    }
-                    Err(error) => {
-                        return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
-                            "D8 before-act evidence failed: {error}; nothing ran"
-                        ))));
-                    }
-                }
+                    .await?
+                    .map(|evidence| (av.clone(), evidence));
             } else {
                 self.seal_after_consume(
                     av,
@@ -3773,6 +3808,10 @@ impl VultrinoServer {
                 .clone()
                 .unwrap_or_else(|| approval.action.clone()),
             evidence_required,
+            d8_fallback_ok: matches!(
+                approval.capability_authority(),
+                Some(CapabilityAuthorityClass::Reversible)
+            ),
         };
         let authorized = permit.authorize(payload).map_err(|reason| {
             RunError::terminal(VultrinoError::PolicyDenied(format!(

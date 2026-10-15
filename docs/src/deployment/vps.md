@@ -221,6 +221,12 @@ a backup that lacks the `.wal`, and moves the old files aside (`*.pre-restore-*`
 `--force` replaces them. Keep `config.toml` and the password with the backup; the vault is
 useless without them.
 
+Restoring an older backup silently undoes every kill, revocation and approval made after
+it, and the tool cannot detect that. Before starting the service again, re-apply the kills
+and revocations made after the backup time and check Govder's kill state. `backup` refuses
+while `<vault>.restore-pending` exists (an earlier restore did not finish): re-run the
+restore from a known-good backup first.
+
 ### Backup by hand
 ```bash
 sudo systemctl stop vultrino-web

@@ -106,7 +106,11 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   non-durable service holds the vault lock only per operation, so restore does not
   detect it (backup is safe under a running non-durable service, it pauses
   dispatches for the copy; the durable averin queue refuses both). They do not detect
-  a rollback to an older but self-consistent backup. A damaged final `.wal` line
+  a rollback to an older but self-consistent backup, and restoring an older backup
+  silently undoes every kill, revocation and approval made after it: before starting
+  the service the operator must re-apply the kills and revocations made after the
+  backup time and check Govder's kill state. A backup is refused while
+  `<vault>.restore-pending` exists. A damaged final `.wal` line
   stops startup; `vultrino vault check` says whether removing exactly that one
   record makes the vault open, and `--truncate-final` cuts it (kept in a side file;
   the cut record is a lost mutation, so redo a kill or revocation that was in it).
@@ -426,14 +430,17 @@ kernels.
   posture, not an oversight: actions the trusted catalog declares non-reversible
   (money and irreversible actions) require committed two-phase evidence and are
   refused while Averin is down; reversible actions keep running. With
-  `d8_complete_evidence = true` (the FeirOS Solo setting) a reversible action gets
-  two-phase evidence while Averin is up, and when Averin is down it still runs with
-  a one-phase seal, an `AVERIN-D8-DEGRADED` alarm line and a `d8_degraded` counter
+  `d8_complete_evidence = true` (the FeirOS Solo setting) a catalog-declared
+  reversible action gets two-phase evidence while Averin is up. Only when Averin is
+  unavailable (unreachable, timed out, a 5xx or a 429) does it still run, with a
+  one-phase seal, an `AVERIN-D8-DEGRADED` alarm line and a `d8_degraded` counter
   (`averin_seal` in `/api/v1/metrics`); that seal can be dropped or lost in a crash,
-  and the plan 085 reconciliation detects the gap, it cannot recover it. An action
-  with no catalog declaration is treated as reversible in the default posture, so it
-  keeps running while Averin is down; `require_declared_capabilities = true` makes an
-  undeclared action fail closed, and the shipped Solo template does not set it.
+  and the plan 085 reconciliation detects the gap, it cannot recover it. Any other
+  evidence failure refuses, as it does for every other class: a 4xx from a live
+  Averin, a malformed reply, and params over `max_seal_params_bytes` (checked
+  before the use token is spent). An action with no catalog declaration is not
+  proven reversible, so with `d8_complete_evidence` on it is refused while Averin
+  is down, exactly like a non-reversible one.
 - **An `internal_http` capability's HTTP verb is operator authority, and the agent
   may not send one.** The transport requires `method`, so a capability registered
   through the admin API must make it decidable: exactly one `target.methods` entry,
