@@ -414,7 +414,10 @@ kernels.
   streaming dispatch require a live Averin client, a bound use token, grant
   material, and a committed use seal before `plugin.execute*`, independent of the
   ordinary Observe/RequireEvidence posture. Unknown `[averin] mode` values are
-  refused at config load rather than coerced into Observe. Undeclared actions in
+  refused at config load rather than coerced into Observe, and so is an `[averin]` block with
+  `enabled = true` and an empty `base_url` or `resource_id` (it used to start with the seal
+  client silently off, so no receipt and no gap event; a block that parses but names an
+  unreachable averin still starts and records every action as a receipt gap). Undeclared actions in
   non-strict posture, reversible declarations, and deployments with Averin
   disabled still have no record-existence guarantee (with Averin disabled there is no
   receipt to fail, so no gap event either).
