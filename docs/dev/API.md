@@ -710,7 +710,10 @@ request notification, the one-time approve/deny URLs.
 `approval.requested`, `approval.approved`, `approval.denied`, `approval.escalated`,
 `approval.expired`, `agent.halted`, `policy.changed`, `capability.changed`,
 `policy.denied`, `policy.observed_denial`, `credential.rotated`,
-`credential.revoked`, `meter.observed`.
+`credential.revoked`, `meter.observed`, `evidence.receipt_gap` (an Observe-mode action ran but
+its evidence receipt did not reach Averin; subject = the use token id; payload = token id, project,
+request id, use sequence number, reason code, clipped detail, `at`, `outcome`; never params. Like every
+event it is pruned after `[outbox] retention_secs`, delivered or not, so a consumer must store it: govder does).
 
 Admin audit (observability item 4 / #17) — ids-only `{actor, target_id, verb}`
 payload (see `admin_audit_payload`), emitted best-effort after a successful

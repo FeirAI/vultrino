@@ -409,6 +409,14 @@ kernels.
   `receipt_gaps_overflowed` but not recorded individually. A process that dies between the
   action and the enqueue of its seal leaves neither a receipt nor a gap. A gap names an action
   that ran without a receipt; it does not say whether the action's own side effect succeeded.
+  **The gap event is not a permanent record on vultrino's side.** The outbox prunes every event
+  older than `[outbox] retention_secs` (default **2 days**), delivered or not, so a gap nobody
+  consumed in that window is gone. The consumer is govder: it receives the signed push on its
+  approval webhook, stores each gap (in Postgres when configured, otherwise in memory) before it
+  acknowledges the delivery, and lists them per tenant on `GET /v1/evidence/receipt-gaps`. If
+  govder is down or unreachable for longer than the retention window, or has no push target
+  configured, the gaps in that window are lost. leria ignores the event type; nothing pages anyone
+  about a gap. See govder `docs/dev/API.md`.
   A declared human-floor capability, or a bare canonical verb shared by configured
   business labels, does **not** inherit that availability knob: buffered and
   streaming dispatch require a live Averin client, a bound use token, grant
