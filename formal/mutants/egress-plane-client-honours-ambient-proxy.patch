@@ -1,0 +1,12 @@
+diff --git a/src/averin/mod.rs b/src/averin/mod.rs
+index ff05e9a..a0b55aa 100644
+--- a/src/averin/mod.rs
++++ b/src/averin/mod.rs
+@@ -447,7 +447,6 @@ impl AverinClient {
+         let http = reqwest::Client::builder()
+             // The averin API key travels in the Authorization header: never to an ambient
+             // HTTP_PROXY / HTTPS_PROXY / ALL_PROXY (VUL-29).
+-            .no_proxy()
+             .timeout(cfg.timeout)
+             .build()
+             .map_err(AverinError::HttpBuild)?;

@@ -1,0 +1,16 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 625ff70..15cc85f 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -390,10 +390,7 @@ pub(crate) fn build_guarded_client() -> Client {
+                 builder = builder.add_root_certificate(cert);
+             }
+         }
+-        Ok(None) => {
+-            // A CA with no proxy would only widen trust for direct connections.
+-            panic!("{UPSTREAM_PROXY_CA_ENV} is set but {UPSTREAM_PROXY_ENV} is not");
+-        }
++        Ok(None) => {}
+         Err(msg) => {
+             // Fail closed at construction: a malformed opt-in must not silently fall back
+             // to a direct connection the operator did not intend.

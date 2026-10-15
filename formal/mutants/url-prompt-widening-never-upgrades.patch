@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index d4596c1..f3fa55c 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -747,7 +747,7 @@ impl PolicyEngine {
+         // VUL-32: the broadening of a Prompt rule only ever upgrades an Allow outcome.
+         let verdict = match verdict {
+             Verdict::Allow | Verdict::PolicyDefaultAllow | Verdict::EngineDefaultAllow
+-                if broadened_prompt.get() =>
++                if false && broadened_prompt.get() =>
+             {
+                 Verdict::Prompt
+             }

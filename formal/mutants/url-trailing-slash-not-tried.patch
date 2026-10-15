@@ -1,13 +1,17 @@
 diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
-index 371a9b4..bcdfc41 100644
+index 0638dde..2e4e79f 100644
 --- a/src/policy/url_canon.rs
 +++ b/src/policy/url_canon.rs
-@@ -549,7 +549,7 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool
-     }
-     // Many frameworks route `/x/` to the handler of `/x`, so the path without one trailing `/`
-     // is judged too, with and without the query.
--    let bases = [Some(base), base.strip_suffix('/')];
-+    let bases = [Some(base), None];
-     let hit = bases.into_iter().flatten().any(|b| {
+@@ -574,10 +574,9 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool
+     // path without them is judged as well.
+     let no_params = strip_path_params(base);
+     let mut bases: Vec<&str> = vec![base];
+-    bases.extend(base.strip_suffix('/'));
+-    bases.push(base.trim_end_matches('/'));
++
+     bases.push(&no_params);
+-    let no_params_trimmed = no_params.trim_end_matches('/').to_string();
++    let no_params_trimmed = no_params.clone();
+     bases.push(&no_params_trimmed);
+     bases.iter().any(|b| {
          cuts.iter()
-             .any(|&at| canonical_matches(&format!("{b}{}", &query[..at]), &p))

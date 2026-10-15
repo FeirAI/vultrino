@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index d4596c1..63a52bc 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -727,7 +727,7 @@ impl PolicyEngine {
+                                     if !narrow && wide {
+                                         broadened_prompt.set(true);
+                                     }
+-                                    narrow
++                                    narrow || wide
+                                 }
+                             },
+                         };

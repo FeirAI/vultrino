@@ -1,0 +1,16 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index 0638dde..284ae05 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -575,9 +575,9 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool
+     let no_params = strip_path_params(base);
+     let mut bases: Vec<&str> = vec![base];
+     bases.extend(base.strip_suffix('/'));
+-    bases.push(base.trim_end_matches('/'));
++    bases.push(base.strip_suffix('/').unwrap_or(base));
+     bases.push(&no_params);
+-    let no_params_trimmed = no_params.trim_end_matches('/').to_string();
++    let no_params_trimmed = no_params.strip_suffix('/').unwrap_or(&no_params).to_string();
+     bases.push(&no_params_trimmed);
+     bases.iter().any(|b| {
+         cuts.iter()
