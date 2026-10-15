@@ -95,7 +95,15 @@ fn secret_fingerprints(config: &Config) -> Value {
     };
     let outbox = config.outbox.hmac_secret.as_deref();
     add(REL_OUTBOX_POLL, outbox);
-    add(REL_APPROVAL_PUSH, outbox);
+    // The push relationship exists only while push delivery is on and has somewhere to go: an
+    // outbox that only serves GET /api/v1/events signs the feed (above) but sends no approval push.
+    let pushing = config.outbox.enabled
+        && config
+            .outbox
+            .url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty());
+    add(REL_APPROVAL_PUSH, outbox.filter(|_| pushing));
     if let Some(g) = config.govder.as_ref() {
         add(REL_TENANT_ASSERTION, Some(g.assertion_secret.as_str()));
         add(REL_APPROVER_KEY, g.approval_verification_secret());
@@ -239,6 +247,8 @@ mod tests {
         use crate::secret_fp::fingerprint;
         let mut cfg = Config::default();
         cfg.outbox.hmac_secret = Some("outbox-secret-A".into());
+        cfg.outbox.enabled = true;
+        cfg.outbox.url = Some("http://govder.invalid/webhooks/vultrino-approvals".into());
         cfg.govder = Some(govder_cfg(Some("approver-key-M")));
         let v = build_posture(&cfg, true, &[]);
         let fp = &v["secret_fingerprints"];
@@ -263,6 +273,31 @@ mod tests {
         for secret in ["outbox-secret-A", "assertion-F", "approver-key-M"] {
             assert!(!text.contains(secret), "the report carries {secret}");
         }
+    }
+
+    /// With push delivery off (or no URL), the outbox still signs the feed leria polls but sends no
+    /// approval push, so only the feed relationship is reported.
+    #[test]
+    fn report_omits_the_push_relationship_when_the_outbox_does_not_push() {
+        let mut cfg = Config::default();
+        cfg.outbox.hmac_secret = Some("outbox-secret-A".into());
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"]
+            .get("vultrino-outbox-poll")
+            .is_some());
+        assert!(v["secret_fingerprints"]
+            .get("vultrino-approval-push")
+            .is_none());
+        cfg.outbox.enabled = true; // enabled but no URL: still nowhere to push
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"]
+            .get("vultrino-approval-push")
+            .is_none());
+        cfg.outbox.url = Some("  ".into());
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"]
+            .get("vultrino-approval-push")
+            .is_none());
     }
 
     /// An unset secret has no fingerprint (the relationship is absent), and an approver key that is

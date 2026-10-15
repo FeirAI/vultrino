@@ -8863,6 +8863,40 @@ mod durable_enqueue_tests {
         );
     }
 
+    /// FEI-33: a failed local durable enqueue (disk full, fsync EIO) is recorded as an individual
+    /// gap with the ids, and the action is still not blocked.
+    #[tokio::test]
+    async fn fei33_durable_enqueue_failure_is_recorded_as_a_gap() {
+        let (_server, _storage, av) = durable_test_server(
+            true,
+            AverinMode::Observe,
+            "http://127.0.0.1:9",
+            Duration::from_millis(200),
+        )
+        .await;
+        let simulated = Err(crate::storage::StorageError::Io(std::io::Error::other(
+            "disk full (simulated)",
+        )));
+        let result = VultrinoServer::handle_durable_use_enqueue_result(
+            &av,
+            "tok-fault",
+            "req-fault",
+            9,
+            simulated,
+        );
+        assert!(
+            result.is_ok(),
+            "Observe must not block on an enqueue failure"
+        );
+        let gaps = av.take_receipt_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].reason, "enqueue_failed");
+        assert_eq!(gaps[0].token_id, "tok-fault");
+        assert_eq!(gaps[0].request_id.as_deref(), Some("req-fault"));
+        assert_eq!(gaps[0].use_sequence_number, Some(9));
+        assert_eq!(av.metrics().receipt_gaps, 1);
+    }
+
     /// FEI-33: end to end. An Observe action runs, its async receipt fails (no grant), and the
     /// failure is recorded as an individual `evidence.receipt_gap` event on the signed outbox
     /// (subject = the use token id), with ids and a reason and no params.
