@@ -2687,7 +2687,7 @@ impl VultrinoServer {
             (&self.averin, evidence_subject_id, evidence_params)
         {
             if av.config().d8_complete_evidence || (approved_execution && evidence_required) {
-                let evidence = av
+                match av
                     .begin_exact_use(
                         tid,
                         &credential_alias,
@@ -2696,12 +2696,36 @@ impl VultrinoServer {
                         &request_id,
                     )
                     .await
-                    .map_err(|error| {
-                        RunError::terminal(VultrinoError::PolicyDenied(format!(
+                {
+                    Ok(evidence) => exact_evidence = Some((av.clone(), evidence)),
+                    // VUL-38: only an action the trusted catalog declares non-reversible
+                    // REQUIRES two-phase evidence. A reversible action keeps running when
+                    // Averin is down, with a visible gap (alarm line, counter, one-phase
+                    // seal through the mode's own fail-open or fail-closed rule).
+                    Err(error) if !evidence_required => {
+                        av.record_d8_degraded();
+                        tracing::error!(
+                            target: "averin_seal",
+                            request_id = %request_id,
+                            error = %error,
+                            "AVERIN-D8-DEGRADED two-phase evidence unavailable for a reversible action; falling back to a one-phase seal"
+                        );
+                        self.seal_after_consume(
+                            av,
+                            tid,
+                            params_bytes,
+                            use_sequence_number,
+                            &request_id,
+                            evidence_required,
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
                             "D8 before-act evidence failed: {error}; nothing ran"
-                        )))
-                    })?;
-                exact_evidence = Some((av.clone(), evidence));
+                        ))));
+                    }
+                }
             } else {
                 // Plan 087 FIX 1 — the mode-dependent seal hook now lives in ONE shared
                 // helper so the buffered and streaming execute paths cannot drift.
@@ -3093,7 +3117,7 @@ impl VultrinoServer {
             (&self.averin, evidence_subject_id, evidence_params)
         {
             if av.config().d8_complete_evidence || (approved_execution && evidence_required) {
-                let evidence = av
+                match av
                     .begin_exact_use(
                         tid,
                         &credential_alias,
@@ -3102,12 +3126,33 @@ impl VultrinoServer {
                         &request_id,
                     )
                     .await
-                    .map_err(|error| {
-                        RunError::terminal(VultrinoError::PolicyDenied(format!(
+                {
+                    Ok(evidence) => exact_evidence = Some((av.clone(), evidence)),
+                    // VUL-38: see the buffered tail.
+                    Err(error) if !evidence_required => {
+                        av.record_d8_degraded();
+                        tracing::error!(
+                            target: "averin_seal",
+                            request_id = %request_id,
+                            error = %error,
+                            "AVERIN-D8-DEGRADED two-phase evidence unavailable for a reversible action; falling back to a one-phase seal"
+                        );
+                        self.seal_after_consume(
+                            av,
+                            tid,
+                            params_bytes,
+                            use_sequence_number,
+                            &request_id,
+                            evidence_required,
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
                             "D8 before-act evidence failed: {error}; nothing ran"
-                        )))
-                    })?;
-                exact_evidence = Some((av.clone(), evidence));
+                        ))));
+                    }
+                }
             } else {
                 self.seal_after_consume(
                     av,

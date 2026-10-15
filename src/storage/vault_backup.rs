@@ -8,7 +8,7 @@
 //! with a SHA-256 per file, and checks the copy by re-reading it and, when a password is given, by
 //! opening it. `restore` verifies the manifest and every checksum (and opens the copy) before it
 //! touches the target, refuses a backup that lacks the snapshot or the log, refuses to replace an
-//! existing vault without `force`, and stages every file before any rename. A restore that is
+//! existing vault without `force`, and stages every file (the averin queue as one sibling directory) before any rename. A restore that is
 //! interrupted leaves `<vault>.restore-pending`, which makes the vault refuse to open until
 //! `restore` is re-run.
 //!
@@ -231,7 +231,10 @@ pub async fn backup(
     if dest.exists() && std::fs::read_dir(dest)?.next().is_some() {
         return Err(format!("{} is not empty; backups never overwrite", dest.display()).into());
     }
-    let _held = lock_everything(vault)?;
+    // The locks are held only for the copy. The password open check below runs the Argon2 KDF
+    // and would otherwise block every dispatch and kill write for that long; it reads the copy,
+    // not the live vault, so it needs no lock.
+    let held = lock_everything(vault)?;
     let files = collect(vault)?;
     mkdir_private(dest)?;
     let mut entries = vec![];
@@ -254,6 +257,7 @@ pub async fn backup(
     })?;
     write_private(&dest.join(MANIFEST), &json)?;
     fsync_dir(dest)?;
+    drop(held);
     // Verify the copy itself, not the source.
     let copied: Vec<_> = files
         .iter()
@@ -282,6 +286,7 @@ fn verify_manifest(src: &Path) -> BackupResult<Manifest> {
         if e.path.contains("..") || e.path.starts_with('/') {
             return Err(format!("backup manifest has an unsafe path {}", e.path).into());
         }
+        target_for(Path::new("v/vault.enc"), &e.path)?;
         let p = src.join(&e.path);
         let (sha, size) = sha_of(&p).map_err(|err| format!("{}: {err}", e.path))?;
         if sha != e.sha256 || size != e.size {
@@ -312,13 +317,21 @@ fn verify_manifest(src: &Path) -> BackupResult<Manifest> {
     Ok(m)
 }
 
-fn target_for(vault: &Path, name: &str) -> PathBuf {
-    match name {
-        "vault.enc" => vault.to_path_buf(),
-        "vault.wal" => vault.with_extension("wal"),
-        n if n.starts_with(QUEUE_PREFIX) => queue_dir(vault).join(&n[QUEUE_PREFIX.len()..]),
-        n => vault.with_file_name(n),
+/// Where a manifest name lands. Only the names a backup can contain are accepted: a manifest is
+/// a file someone could edit, and it must not make restore write an arbitrary name into the vault
+/// directory.
+fn target_for(vault: &Path, name: &str) -> BackupResult<PathBuf> {
+    if let Some(f) = name.strip_prefix(QUEUE_PREFIX) {
+        if f.is_empty() || f.contains('/') || f.contains("..") || f == "queue.owner.lock" {
+            return Err(format!("backup manifest has an unsafe queue name {name}").into());
+        }
+        return Ok(queue_dir(vault).join(f));
     }
+    flat_layout(vault)
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, p)| p)
+        .ok_or_else(|| format!("backup manifest names an unknown file {name}").into())
 }
 
 /// Restore the backup in `src` over `vault`. Existing files are only replaced with `force`, and
@@ -362,22 +375,38 @@ pub async fn restore(
         std::fs::remove_file(&marker)?;
     }
     write_private(&marker, src.display().to_string().as_bytes())?;
-    // Stage every file next to its target first, so nothing is renamed until all are on disk.
+    // Stage every file next to its target first, so nothing is renamed until all are on disk. The
+    // averin queue is staged as a whole sibling directory (never inside the live one, which is
+    // about to be moved aside) and put in place with one directory rename.
     let mut staged = vec![];
+    let mut staged_queue = false;
     let stage_suffix = ".restore-tmp";
+    let queue_stage = {
+        let mut q = queue_dir(vault).into_os_string();
+        q.push(stage_suffix);
+        PathBuf::from(q)
+    };
+    if queue_stage.exists() {
+        std::fs::remove_dir_all(&queue_stage)?;
+    }
     for e in &manifest.files {
-        let dst = target_for(vault, &e.path);
-        let mut tmp = dst.clone().into_os_string();
-        tmp.push(stage_suffix);
-        let tmp = PathBuf::from(tmp);
-        if let Some(parent) = tmp.parent() {
-            mkdir_private(parent)?;
-        }
-        if tmp.exists() {
-            std::fs::remove_file(&tmp)?;
+        let dst = target_for(vault, &e.path)?;
+        let tmp = if let Some(f) = e.path.strip_prefix(QUEUE_PREFIX) {
+            mkdir_private(&queue_stage)?;
+            staged_queue = true;
+            queue_stage.join(f)
+        } else {
+            let mut t = dst.clone().into_os_string();
+            t.push(stage_suffix);
+            PathBuf::from(t)
+        };
+        if !e.path.starts_with(QUEUE_PREFIX) {
+            if tmp.exists() {
+                std::fs::remove_file(&tmp)?;
+            }
+            staged.push((tmp.clone(), dst));
         }
         write_private(&tmp, &std::fs::read(src.join(&e.path))?)?;
-        staged.push((tmp, dst));
     }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -392,10 +421,106 @@ pub async fn restore(
     for (tmp, dst) in &staged {
         std::fs::rename(tmp, dst)?;
     }
+    if staged_queue {
+        std::fs::rename(&queue_stage, queue_dir(vault))?;
+    }
     fsync_dir(&dir)?;
     std::fs::remove_file(&marker)?;
     fsync_dir(&dir)?;
     Ok(manifest.files.len())
+}
+
+/// What `vault check` found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// The vault opens as it is.
+    Healthy,
+    /// The vault does not open, and removing exactly the final complete `.wal` line makes it open.
+    /// That line is a committed record (possibly a kill or an approval): the operator decides.
+    /// `saved_to` is set when the line was cut out (`--truncate-final`) and kept in a side file.
+    FinalRecordDamaged {
+        removed_bytes: usize,
+        saved_to: Option<PathBuf>,
+    },
+}
+
+/// Open the snapshot plus the given log bytes in a scratch directory.
+async fn opens_with_log(vault: &Path, wal: &[u8], password: &SecretString) -> Result<(), String> {
+    let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let v = tmp.path().join("vault.enc");
+    std::fs::copy(vault, &v).map_err(|e| e.to_string())?;
+    std::fs::write(v.with_extension("wal"), wal).map_err(|e| e.to_string())?;
+    FileStorage::new(&v, password)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// `vault check`: tell a healthy vault from one with a damaged FINAL `.wal` record, and with
+/// `truncate_final` cut that one record out (keeping it in `<wal>.damaged-<nanos>`). It never
+/// guesses: the cut is made only when the vault opens without that record, so damage anywhere else
+/// (a middle line, the snapshot, a wrong password) is refused and nothing is touched. Cutting a
+/// committed record loses that mutation; if it was a kill or a revocation, redo it afterwards.
+/// Takes the exclusive locks, so stop the service first.
+pub async fn check(
+    vault: &Path,
+    password: &SecretString,
+    truncate_final: bool,
+) -> BackupResult<CheckOutcome> {
+    if !vault.is_file() {
+        return Err(format!("no vault at {}", vault.display()).into());
+    }
+    let _held = lock_everything(vault)?;
+    let wal_path = vault.with_extension("wal");
+    let wal = std::fs::read(&wal_path)
+        .map_err(|e| format!("{}: cannot read the log: {e}", wal_path.display()))?;
+    let first = match opens_with_log(vault, &wal, password).await {
+        Ok(()) => return Ok(CheckOutcome::Healthy),
+        Err(e) => e,
+    };
+    // Only complete (newline-terminated) lines can be cut: a torn tail is already ignored.
+    let Some(last_nl) = wal.iter().rposition(|b| *b == b'\n') else {
+        return Err(
+            format!("the vault does not open and its log has no record to cut: {first}").into(),
+        );
+    };
+    let start = wal[..last_nl]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |i| i + 1);
+    let kept = &wal[..start];
+    if let Err(e) = opens_with_log(vault, kept, password).await {
+        return Err(format!(
+            "the vault does not open, and removing the final log record does not fix it, so the \
+             damage is elsewhere (or the password is wrong); refusing to cut anything. open error: \
+             {first}; without the final record: {e}"
+        )
+        .into());
+    }
+    let removed = wal.len() - start;
+    if !truncate_final {
+        return Ok(CheckOutcome::FinalRecordDamaged {
+            removed_bytes: removed,
+            saved_to: None,
+        });
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let mut side = wal_path.clone().into_os_string();
+    side.push(format!(".damaged-{nanos}"));
+    let side = PathBuf::from(side);
+    write_private(&side, &wal[start..])?;
+    let f = std::fs::OpenOptions::new().write(true).open(&wal_path)?;
+    f.set_len(start as u64)?;
+    f.sync_all()?;
+    if let Some(dir) = wal_path.parent() {
+        fsync_dir(dir)?;
+    }
+    Ok(CheckOutcome::FinalRecordDamaged {
+        removed_bytes: removed,
+        saved_to: Some(side),
+    })
 }
 
 #[cfg(test)]
@@ -568,6 +693,156 @@ mod tests {
         let err = backup(&vault, &bk, None).await.unwrap_err().to_string();
         assert!(err.contains("partial backup"), "{err}");
         assert!(!bk.exists(), "nothing is created for a refused backup");
+    }
+
+    /// A vault with several committed records after the last snapshot.
+    async fn vault_with_records(path: &Path, n: usize) {
+        let s = FileStorage::new(path, &pw()).await.unwrap();
+        s.set_compact_min_bytes(u64::MAX);
+        for i in 0..n {
+            let (_p, t) = UseToken::create(NewUseToken {
+                name: format!("tok{i}"),
+                credential_scope: "*".into(),
+                action_scope: None,
+                max_uses: Some(5),
+                require_approval: false,
+                expires_in: None,
+            });
+            s.store_use_token(&t).await.unwrap();
+        }
+    }
+
+    fn damage_line(wal: &mut [u8], line_from_end: usize) {
+        // Flip one ciphertext byte inside the Nth complete line from the end, keep the newline.
+        let mut ends: Vec<usize> = wal
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == b'\n')
+            .map(|(i, _)| i)
+            .collect();
+        ends.reverse();
+        let end = ends[line_from_end];
+        wal[end - 3] = if wal[end - 3] == b'A' { b'B' } else { b'A' };
+    }
+
+    #[tokio::test]
+    async fn check_cuts_only_a_damaged_final_record_and_refuses_damage_elsewhere() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("credentials.enc");
+        vault_with_records(&vault, 3).await;
+        let wal_path = vault.with_extension("wal");
+        let good = std::fs::read(&wal_path).unwrap();
+        assert_eq!(
+            check(&vault, &pw(), false).await.unwrap(),
+            CheckOutcome::Healthy
+        );
+
+        // Damage in the MIDDLE: refused, nothing touched.
+        let mut mid = good.clone();
+        damage_line(&mut mid, 1);
+        std::fs::write(&wal_path, &mid).unwrap();
+        let err = check(&vault, &pw(), true).await.unwrap_err().to_string();
+        assert!(err.contains("damage is elsewhere"), "{err}");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), mid);
+
+        // Damage in the FINAL line: reported without --truncate-final, unchanged.
+        let mut last = good.clone();
+        damage_line(&mut last, 0);
+        std::fs::write(&wal_path, &last).unwrap();
+        assert!(FileStorage::new(&vault, &pw()).await.is_err());
+        let out = check(&vault, &pw(), false).await.unwrap();
+        assert!(
+            matches!(out, CheckOutcome::FinalRecordDamaged { saved_to: None, .. }),
+            "{out:?}"
+        );
+        assert_eq!(std::fs::read(&wal_path).unwrap(), last);
+
+        // A wrong password must not be mistaken for a damaged record.
+        let err = check(&vault, &SecretString::from("nope"), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("damage is elsewhere"), "{err}");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), last);
+
+        // With the flag: cut, kept aside, and the vault opens with the earlier records.
+        let out = check(&vault, &pw(), true).await.unwrap();
+        let CheckOutcome::FinalRecordDamaged {
+            saved_to: Some(side),
+            removed_bytes,
+        } = out
+        else {
+            panic!("{out:?}");
+        };
+        assert!(side.is_file());
+        assert_eq!(std::fs::read(&side).unwrap().len(), removed_bytes);
+        assert!(FileStorage::new(&vault, &pw()).await.is_ok());
+        assert_eq!(
+            std::fs::read(&wal_path).unwrap().len(),
+            good.len() - removed_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_over_an_existing_vault_with_an_averin_queue_succeeds_first_time() {
+        let src = tempdir().unwrap();
+        let vault = src.path().join("credentials.enc");
+        drop(vault_with_a_kill(&vault).await);
+        let q = queue_dir(&vault);
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(q.join("seg-0001.log"), b"from-the-backup").unwrap();
+        let bk = tempdir().unwrap().keep().join("bk");
+        backup(&vault, &bk, None).await.unwrap();
+        assert!(bk.join("averin-queue/seg-0001.log").is_file());
+
+        // The target already has a vault AND a queue directory holding different content.
+        let dst = tempdir().unwrap();
+        let target = dst.path().join("credentials.enc");
+        drop(FileStorage::new(&target, &pw()).await.unwrap());
+        let tq = queue_dir(&target);
+        std::fs::create_dir_all(&tq).unwrap();
+        std::fs::write(tq.join("seg-0009.log"), b"old").unwrap();
+
+        restore(&bk, &target, true, Some(&pw())).await.unwrap();
+        assert!(!restore_pending_path(&target).exists());
+        assert_eq!(
+            std::fs::read(tq.join("seg-0001.log")).unwrap(),
+            b"from-the-backup"
+        );
+        assert!(!tq.join("seg-0009.log").exists());
+        assert!(is_halted(&target).await);
+        let kept_old_queue = std::fs::read_dir(dst.path()).unwrap().any(|e| {
+            let p = e.unwrap().path();
+            p.to_string_lossy().contains("averin-queue.pre-restore-")
+                && p.join("seg-0009.log").is_file()
+        });
+        assert!(kept_old_queue, "the old queue is moved aside, not deleted");
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_a_manifest_that_names_an_unknown_file() {
+        let src = tempdir().unwrap();
+        let vault = src.path().join("credentials.enc");
+        drop(vault_with_a_kill(&vault).await);
+        let bk = tempdir().unwrap().keep().join("bk");
+        backup(&vault, &bk, None).await.unwrap();
+        std::fs::write(bk.join("evil.sh"), b"x").unwrap();
+        let (sha, size) = sha_of(&bk.join("evil.sh")).unwrap();
+        let mut m: Manifest =
+            serde_json::from_slice(&std::fs::read(bk.join(MANIFEST)).unwrap()).unwrap();
+        m.files.push(Entry {
+            path: "evil.sh".into(),
+            sha256: sha,
+            size,
+        });
+        std::fs::write(bk.join(MANIFEST), serde_json::to_vec(&m).unwrap()).unwrap();
+        let target = tempdir().unwrap().keep().join("v.enc");
+        let err = restore(&bk, &target, false, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown file"), "{err}");
+        assert!(!target.exists());
     }
 
     #[tokio::test]

@@ -314,6 +314,36 @@ macro_rules! lock_vault_exclusive {
     };
 }
 
+thread_local! {
+    /// How many gated shared reads this thread is inside (debug builds only check it).
+    static GATED_READ_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the span of one gated shared read. A second gated read on the same thread, inside the
+/// first, can deadlock against a waiting writer (the writer holds the gate and waits for the first
+/// read's vault lock; the nested read waits on the gate), so debug builds assert it never happens.
+struct GatedReadScope;
+
+impl GatedReadScope {
+    fn enter() -> Self {
+        GATED_READ_DEPTH.with(|d| {
+            debug_assert_eq!(
+                d.get(),
+                0,
+                "nested gated vault read: it can deadlock against a waiting kill write (VUL-06)"
+            );
+            d.set(d.get() + 1);
+        });
+        GatedReadScope
+    }
+}
+
+impl Drop for GatedReadScope {
+    fn drop(&mut self) {
+        GATED_READ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// File-based storage with AES-256-GCM encryption
 pub struct FileStorage {
     /// I/O accounting (see [`VaultIoStats`]).
@@ -2120,6 +2150,7 @@ impl FileStorage {
         &self,
         f: impl FnOnce(&StorageCache) -> T,
     ) -> Result<T, StorageError> {
+        let _scope = GatedReadScope::enter();
         self.pass_writer_gate()?;
         let flock = self.lock_file()?;
         let _guard = flock.read().map_err(StorageError::Io)?;
@@ -2153,9 +2184,10 @@ impl FileStorage {
     /// Reader side of the writer-intent turnstile (VUL-06): take the gate shared and release it at
     /// once, BEFORE the shared vault lock. A writer holding the gate exclusive (waiting for the
     /// vault lock) therefore holds new readers here, so a stream of overlapping shared holders
-    /// cannot starve it. A reader that already passed the gate finishes normally, so the writer's
-    /// wait is bounded by the readers in flight at the moment it arrived. Not re-entrant: never
-    /// call a locked read from inside another locked read.
+    /// cannot starve it. A reader that already passed the gate finishes normally. `flock` gives
+    /// no writer preference on the gate either, so taking the gate is fast in practice (readers
+    /// hold it for a few syscalls), not bounded. Not re-entrant: a locked read nested inside
+    /// another one can deadlock against a waiting writer, and debug builds assert it never happens.
     fn pass_writer_gate(&self) -> Result<(), StorageError> {
         let gate = self.gate_file()?;
         let _pass = gate.read().map_err(StorageError::Io)?;
@@ -2323,6 +2355,7 @@ impl FileStorage {
     }
 
     fn reload_blocking(&self) -> Result<(), StorageError> {
+        let _scope = GatedReadScope::enter();
         self.pass_writer_gate()?;
         let flock = self.lock_file()?;
         let _guard = flock.read().map_err(StorageError::Io)?;

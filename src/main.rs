@@ -324,21 +324,33 @@ enum Commands {
 #[derive(Subcommand)]
 enum VaultCommands {
     /// Copy the snapshot, its .wal, the outbox and the averin stores together into a NEW empty
-    /// directory, with a manifest of SHA-256 sums. Takes the exclusive vault lock for the copy and
-    /// refuses while a durable averin queue is in use (stop the service first).
+    /// directory, with a manifest of SHA-256 sums. Holds the exclusive vault lock for the copy (a
+    /// running non-durable service waits for it, dispatches pause for that time); refuses at once
+    /// if the durable averin queue is in use. Stop the service first for a durable deployment.
     Backup {
         /// Destination directory (must not exist or be empty)
         dir: PathBuf,
     },
     /// Restore a backup made by `vault backup`. Verifies every checksum and opens the copy before
     /// touching the target; refuses a partial backup; replaces an existing vault only with --force
-    /// (the old files are moved aside, not deleted).
+    /// (the old files are moved aside, not deleted). STOP THE SERVICE FIRST: a running non-durable
+    /// service holds the vault lock only per operation, so this command does not detect it.
     Restore {
         /// Directory holding the backup
         dir: PathBuf,
         /// Replace an existing vault
         #[arg(long)]
         force: bool,
+    },
+    /// Check that the vault opens. If it does not, and removing exactly the final .wal record makes
+    /// it open, say so; with --truncate-final cut that record out (kept in <wal>.damaged-<nanos>).
+    /// Damage anywhere else, or a wrong password, is refused and nothing is changed. A cut record
+    /// is a committed mutation that is lost: redo it (a kill, a revocation) afterwards. Stop the
+    /// service first.
+    Check {
+        /// Cut a damaged final record out of the .wal
+        #[arg(long)]
+        truncate_final: bool,
     },
 }
 
@@ -1040,6 +1052,30 @@ async fn vault_backup_cmd(
                 path.display(),
                 dir.display()
             );
+        }
+        VaultCommands::Check { truncate_final } => {
+            use vultrino::storage::vault_backup::CheckOutcome;
+            match vault_backup::check(&path, &password, truncate_final).await? {
+                CheckOutcome::Healthy => println!("vault ok: {}", path.display()),
+                CheckOutcome::FinalRecordDamaged {
+                    removed_bytes,
+                    saved_to: None,
+                } => {
+                    println!(
+                        "the vault does not open, but it does without its final .wal record \
+                         ({removed_bytes} bytes). Re-run with --truncate-final to cut it out."
+                    );
+                    std::process::exit(2);
+                }
+                CheckOutcome::FinalRecordDamaged {
+                    removed_bytes,
+                    saved_to: Some(side),
+                } => println!(
+                    "cut the damaged final .wal record ({removed_bytes} bytes), kept in {}. \
+                     Redo any kill or revocation that was in it.",
+                    side.display()
+                ),
+            }
         }
         VaultCommands::Restore { dir, force } => {
             let n = vault_backup::restore(&dir, &path, force, Some(&password)).await?;

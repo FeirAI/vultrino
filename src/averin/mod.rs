@@ -63,6 +63,9 @@ pub struct SealMetrics {
     /// because an enqueue failure never even reaches the network — it is a LOCAL persistence
     /// problem, and `plugin.execute` still proceeds fail-open exactly like every other Observe drop.
     enqueue_failed: AtomicU64,
+    /// VUL-38 — reversible actions that ran with one-phase evidence only because D8 begin-use
+    /// failed (Averin unreachable). Paired with the `AVERIN-D8-DEGRADED` alarm line.
+    d8_degraded: AtomicU64,
     /// Plan 087 FIX 5 — monotonic-ms (relative to the client's start `Instant`) at
     /// which the last `AVERIN-SEAL-DROPPED` line was emitted; 0 = never (so the very
     /// first drop always logs). Rate-limits ONLY the log line; `dropped` still counts
@@ -84,6 +87,9 @@ impl SealMetrics {
     /// Plan 088 D7 — a durable enqueue attempt failed (local I/O, never a network round-trip).
     fn record_enqueue_failed(&self) {
         self.enqueue_failed.fetch_add(1, Ordering::Relaxed);
+    }
+    fn record_d8_degraded(&self) {
+        self.d8_degraded.fetch_add(1, Ordering::Relaxed);
     }
     fn enter_inflight(&self) {
         let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
@@ -113,6 +119,7 @@ impl SealMetrics {
             in_flight: self.in_flight.load(Ordering::Relaxed),
             max_in_flight: self.max_in_flight.load(Ordering::Relaxed),
             enqueue_failed: self.enqueue_failed.load(Ordering::Relaxed),
+            d8_degraded: self.d8_degraded.load(Ordering::Relaxed),
         }
     }
 }
@@ -166,6 +173,9 @@ pub struct SealMetricsSnapshot {
     /// Plan 088 D7 — durable enqueue attempts (Observe + `durable = true`) that failed locally
     /// (disk full, fsync EIO, …) and were dropped fail-open. See [`SealMetrics::enqueue_failed`].
     pub enqueue_failed: u64,
+    /// VUL-38 — reversible actions that fell back to a one-phase receipt because the D8
+    /// two-phase evidence could not be begun. Never counts an evidence-required action.
+    pub d8_degraded: u64,
 }
 
 /// Fail-mode on `/execute` when the synchronous seal fails or averin is
@@ -510,6 +520,11 @@ impl AverinClient {
     /// Snapshot the fail-open seal counters (for `GET /api/v1/metrics` + tests).
     pub fn metrics(&self) -> SealMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// VUL-38 — count a reversible action that ran without two-phase D8 evidence.
+    pub(crate) fn record_d8_degraded(&self) {
+        self.metrics.record_d8_degraded();
     }
 
     /// Plan 088 D7 — bump the durable-enqueue-failure counter. `pub(crate)` so

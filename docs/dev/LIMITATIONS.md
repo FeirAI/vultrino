@@ -113,11 +113,12 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   fence, not only the read cache). A waiting writer holds the
   sidecar `<vault>.gate` file exclusively while it waits for the vault lock, and every
   shared reader passes through that gate before taking the vault lock, so new fence
-  reads queue behind a waiting kill write instead of starving it. The wait is bounded
-  by the reads already in flight when the writer arrived (each short), not by the
-  traffic that follows; it is tested under eight looping readers, not measured as a
-  latency figure, and it relies on `flock` semantics on a local filesystem (not NFS,
-  FUSE or Windows). Writers still serialise one at a time on the gate. In-process lock-free readers (`get`, `get_by_alias`,
+  reads queue behind a waiting kill write instead of starving it. Readers hold
+  the gate for a few syscalls, so a writer gets it quickly in practice, but `flock`
+  gives no writer preference on the gate itself, so that is observed, not a bound
+  (a probe with 32 looping readers saw kill writes wait 11 to 29 ms; the test uses
+  eight looping readers). It relies on `flock` semantics on a local filesystem (not
+  NFS, FUSE or Windows). Writers still serialise one at a time on the gate. In-process lock-free readers (`get`, `get_by_alias`,
   `get_policy`, the fence epoch) block for one log fsync per write and for a
   whole-snapshot encrypt and fsync on the write that triggers compaction; a fence
   catch-up after a foreign write validates and re-indexes the whole vault under the
