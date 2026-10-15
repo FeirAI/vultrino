@@ -580,7 +580,10 @@ pub struct RawAverinConfig {
     /// with `mode = "require_evidence"` is REJECTED at load (D6)** — see this module's `TryFrom`.
     pub durable: Option<bool>,
     /// Emit exact single-operation, two-phase D8 evidence for every invocation.
-    /// Default false. The before-act intent is synchronous and fail-closed.
+    /// Default false. The before-act intent is synchronous. It fails closed for an action the
+    /// trusted catalog declares non-reversible; a reversible action whose intent cannot be begun
+    /// (Averin down) still runs with a one-phase seal, an `AVERIN-D8-DEGRADED` alarm and the
+    /// `d8_degraded` counter (VUL-38).
     pub d8_complete_evidence: Option<bool>,
 }
 

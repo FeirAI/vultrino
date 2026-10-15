@@ -3108,7 +3108,7 @@
       "mutants": [
         "d8-reversible-no-fallback"
       ],
-      "does_not_establish": "Only actions the trusted catalog declares non-reversible are held to the evidence floor: an action with no declaration, in a non-strict posture, is treated as reversible (the Solo template sets require_declared_capabilities so an undeclared action fails closed). The tests drive the approved-resume path of the buffered tail; the live-call and streaming tails carry the same code and are not separately tested or mutated. A fake Averin stands in for the real one; the four-plane end-to-end with the shipped template is a separate run. The routine action's seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. Any CI run.",
+      "does_not_establish": "Only actions the trusted catalog declares non-reversible are held to the evidence floor: an action with no declaration, in a non-strict posture, is treated as reversible (require_declared_capabilities = true would fail it closed; the shipped Solo template does not set it). The tests drive the approved-resume path of the buffered tail; the live-call and streaming tails carry the same code and are not separately tested or mutated. A fake Averin stands in for the real one; the four-plane end-to-end with the shipped template is a separate run. The routine action's seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. Any CI run.",
       "evidence_run": "1"
     }
   ]

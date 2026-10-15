@@ -431,8 +431,9 @@ kernels.
   a one-phase seal, an `AVERIN-D8-DEGRADED` alarm line and a `d8_degraded` counter
   (`averin_seal` in `/api/v1/metrics`); that seal can be dropped or lost in a crash,
   and the plan 085 reconciliation detects the gap, it cannot recover it. An action
-  with no catalog declaration is treated as reversible unless
-  `require_declared_capabilities = true`, which the Solo config sets.
+  with no catalog declaration is treated as reversible in the default posture, so it
+  keeps running while Averin is down; `require_declared_capabilities = true` makes an
+  undeclared action fail closed, and the shipped Solo template does not set it.
 - **An `internal_http` capability's HTTP verb is operator authority, and the agent
   may not send one.** The transport requires `method`, so a capability registered
   through the admin API must make it decidable: exactly one `target.methods` entry,
