@@ -3071,7 +3071,8 @@
         "vault-restore-stages-queue-in-live-dir",
         "vault-backup-ignores-restore-pending"
       ],
-      "does_not_establish": "Rollback to an older but self-consistent backup, or a backup tampered with together with its manifest by someone who can write the backup directory: the manifest is not signed. A backup taken while a process holds the vault or the durable averin queue is refused after 30 seconds (vault) or at once (queue), not tested with a second OS process. Power-loss durability of the restore renames: a crash between them is covered by the marker, which is tested only by presence, not by injecting a crash. The averin queue segments are copied as files and are not opened by the open check. Backups of a vault on a filesystem without flock semantics. Both commands expect the service to be stopped: a running non-durable service holds the vault lock only per operation, so restore does not detect it. Any CI run. Restoring an older backup undoes every kill, revocation and approval made after it; the operator must re-apply them (documented, not detected)."
+      "does_not_establish": "Rollback to an older but self-consistent backup, or a backup tampered with together with its manifest by someone who can write the backup directory: the manifest is not signed. A backup taken while a process holds the vault or the durable averin queue is refused after 30 seconds (vault) or at once (queue), not tested with a second OS process. Power-loss durability of the restore renames: a crash between them is covered by the marker, which is tested only by presence, not by injecting a crash. The averin queue segments are copied as files and are not opened by the open check. Backups of a vault on a filesystem without flock semantics. Both commands expect the service to be stopped: a running non-durable service holds the vault lock only per operation, so restore does not detect it. Any CI run. Restoring an older backup undoes every kill, revocation and approval made after it; the operator must re-apply them (documented, not detected).",
+      "evidence_run": "38676181898"
     },
     {
       "id": "vault-check-final-record",
@@ -3148,7 +3149,8 @@
         "d8-streaming-guard-dropped",
         "d8-oversize-preflight-skipped"
       ],
-      "does_not_establish": "Only an action the trusted catalog declares Reversible may degrade; whether an operator labeled the real side effect truthfully is not checked. Unavailable means a request error (connect or timeout), a 5xx or a 429; a live Averin that misbehaves in some other way refuses, which is the safe side. The approved-resume path is driven through the buffered tail in approval_token_integration and the direct path through both tails in d8_degraded_guard; a fake Averin stands in for the real one, and no four-plane end-to-end runs with [averin] enabled (a separate run). The routine action's one-phase seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. Any CI run other than the recorded one."
+      "does_not_establish": "Only an action the trusted catalog declares Reversible may degrade; whether an operator labeled the real side effect truthfully is not checked. Unavailable means a request error (connect or timeout), a 5xx or a 429; a live Averin that misbehaves in some other way refuses, which is the safe side. The approved-resume path is driven through the buffered tail in approval_token_integration and the direct path through both tails in d8_degraded_guard; a fake Averin stands in for the real one, and no four-plane end-to-end runs with [averin] enabled (a separate run). The routine action's one-phase seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. Any CI run other than the recorded one.",
+      "evidence_run": "38676181898"
     }
   ]
 }
