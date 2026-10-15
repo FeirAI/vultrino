@@ -2741,7 +2741,7 @@
         "vault-writer-skips-writer-gate"
       ],
       "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation is not bounded by proof: flock gives no writer preference on the gate either, so taking the gate is fast in practice (readers hold it for a few syscalls; a probe with 32 looping readers saw 5 kill writes wait 11 to 29 ms), not guaranteed. The test uses handles in one process (eight looping readers, five seconds), not several OS processes, and it relies on flock on a local filesystem. A locked read nested inside another locked read on one thread can deadlock against a waiting writer; only a debug assertion guards it. Writers queue one at a time on the gate. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
-      "evidence_run": "38652676871"
+      "evidence_run": "38667588941"
     },
     {
       "id": "vault-log-loss-fails-closed",
@@ -3056,7 +3056,7 @@
         "vault-restore-stages-queue-in-live-dir"
       ],
       "does_not_establish": "Rollback to an older but self-consistent backup, or a backup tampered with together with its manifest by someone who can write the backup directory: the manifest is not signed. A backup taken while a process holds the vault or the durable averin queue is refused after 30 seconds (vault) or at once (queue), not tested with a second OS process. Power-loss durability of the restore renames: a crash between them is covered by the marker, which is tested only by presence, not by injecting a crash. The averin queue segments are copied as files and are not opened by the open check. Backups of a vault on a filesystem without flock semantics. Both commands expect the service to be stopped: a running non-durable service holds the vault lock only per operation, so restore does not detect it. Any CI run.",
-      "evidence_run": "38652676871"
+      "evidence_run": "38667588941"
     },
     {
       "id": "vault-check-final-record",
@@ -3082,7 +3082,7 @@
         "vault-check-cuts-without-reopen-test"
       ],
       "does_not_establish": "That the cut record was unimportant: it is a committed mutation (possibly a kill or a revocation) and is lost, so the operator must redo it; the command prints that and keeps the removed bytes. Damage in the snapshot, in a middle record, or a torn tail beyond the final record (a torn tail is already ignored at open). Concurrent use: it takes the exclusive locks and expects the service to be stopped. One damaged final line only; two damaged final lines need the command run twice and are refused if the first cut does not make the vault open. Any CI run.",
-      "evidence_run": "1"
+      "evidence_run": "38667588941"
     },
     {
       "id": "d8-evidence-floor-routine-keeps-running",
@@ -3109,7 +3109,7 @@
         "d8-reversible-no-fallback"
       ],
       "does_not_establish": "Only actions the trusted catalog declares non-reversible are held to the evidence floor: an action with no declaration, in a non-strict posture, is treated as reversible (require_declared_capabilities = true would fail it closed; the shipped Solo template does not set it). The tests drive the approved-resume path of the buffered tail; the live-call and streaming tails carry the same code and are not separately tested or mutated. A fake Averin stands in for the real one; the four-plane end-to-end with the shipped template is a separate run. The routine action's seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. Any CI run.",
-      "evidence_run": "1"
+      "evidence_run": "38667588941"
     }
   ]
 }
