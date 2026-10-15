@@ -528,6 +528,15 @@
     },
     "vault-file-gone-compact-rename-unchecked": {
       "tier": "fast"
+    },
+    "receipt-gap-async-seal-failure-not-recorded": {
+      "tier": "fast"
+    },
+    "receipt-gap-dead-letter-not-recorded": {
+      "tier": "full"
+    },
+    "telegram-callback-unlisted-user-falls-back-to-shared-identity": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -2133,7 +2142,7 @@
         {
           "path": "src/main.rs",
           "symbol": "run_web_server",
-          "sha256": "801726ec90b0c88d2a366686dc62ab37dcf72d3d1aaec8b47b66a243dca477f6"
+          "sha256": "257447edab9addf2e1e36783a1ab96b82d5689107e39f2f7ce4543da33a87eb6"
         },
         {
           "path": "src/main.rs",
@@ -2143,7 +2152,7 @@
         {
           "path": "src/main.rs",
           "symbol": "run_mcp_server",
-          "sha256": "9cca123afa27f04a4b0da83752183d3e697e6eea8fff57a621f96f6fc6d3e728"
+          "sha256": "891779c621f0e0d318550a3745f8656d5cf162f1f36c477ba32e35c25e6dbf75"
         }
       ],
       "mutants": [
@@ -2956,6 +2965,132 @@
       ],
       "does_not_establish": "That the process enforces what it reports beyond the code paths those fields are read from: the report reads the engine and config objects the request handlers use, it does not re-run a policy decision. It does not prove the approver key is strong, rotated or known only to the broker, that the vault file on disk is at the reported format version (the field is the version this binary writes, a vault is migrated when opened), that no second vultrino process shares the vault (a process cannot see its peers), or that a deployment actually calls the endpoint: that is the feir-os posture verifier. The git commit is the one the build script saw; a build from an archive reports unknown. The detector runs the endpoint against an in-memory test router, not a deployed binary.",
       "evidence_run": "38200796647"
+    },
+    {
+      "id": "observe-receipt-gap-recorded",
+      "statement": "With [averin] enabled in Observe mode, every use receipt that does not reach Averin is recorded as an individual gap, not only counted: a failed or timed-out async seal, a seal dropped because the async fan-out was saturated, params over max_seal_params_bytes (async and durable paths), a failed local durable enqueue, a durable use receipt that exhausted its delivery attempts (a dead-lettered grant is not a receipt and records none), and a seal task lost before it recorded an outcome; each gap carries the token id, project, request id, use sequence number, one of six fixed reasons and a detail clipped to 200 characters, and never the params; the pending buffer holds at most 4096 gaps and a gap that does not fit is counted in receipt_gaps_overflowed; gaps returned for retry go back to the front in their original order; and flush_receipt_gaps_once appends each pending gap to the signed outbox as one evidence.receipt_gap event whose subject is the use token id, so the oldest gap is the first appended and a second flush appends nothing. The action itself is never blocked or failed by any of this.",
+      "method": "test",
+      "artifacts": [
+        "src/averin/mod.rs",
+        "src/server/mod.rs",
+        "src/outbox.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- fei33_",
+      "covers": [
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::record_receipt_gap",
+          "sha256": "a341536f9b3066e713406ad4d8c362a27900c06c23b323f04b21b73c07f5fcd9"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::requeue_receipt_gaps",
+          "sha256": "cd5a4b179989a91f7c478dfa87ec5ebf73b144a34e2e7158f8a32b2270565b9f"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::spawn_use_seal",
+          "sha256": "acd1763d818778d411199c17c0feff2d700fd16e98aa8d13f90b42d122abeea6"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::durable_use_oversize_drop",
+          "sha256": "0b981b07102c5ece889c597c2ecb4f92e105409247ddd5d5a9057507068bf4de"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "Drop for InflightGuard::drop",
+          "sha256": "f815e0cb5c613f01d321d3ff415151c0d7457089aa6c38e6895eac561c63def9"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::handle_durable_use_enqueue_result",
+          "sha256": "a496618812f65765a0ce34c93d0147c97c790a602b9cebd04b48d8981e0555db"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "flush_receipt_gaps_once",
+          "sha256": "04503f3ed512865ee2499f19118f50f544c1018f2ef31975e3c6d7c429fe1e5d"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "deliver_averin_outbox_once",
+          "sha256": "fff571e6352c6e8f23989f87fb1de59e6d8e9052b912d66113c09c4e1b8a1e1d"
+        }
+      ],
+      "mutants": [
+        "receipt-gap-async-seal-failure-not-recorded",
+        "receipt-gap-oversize-drop-not-recorded",
+        "receipt-gap-buffer-unbounded",
+        "receipt-gap-requeue-reorders",
+        "receipt-gap-enqueue-failure-not-recorded",
+        "receipt-gap-dead-letter-not-recorded",
+        "receipt-gap-lost-task-not-recorded"
+      ],
+      "does_not_establish": "Gaps are held in memory and appended to the outbox every two seconds: a process that is killed before an append loses the gaps it had not yet written, and the counters with them. flush_receipt_gaps_once puts a gap back for retry when an outbox append fails, but no test makes an append fail, so that branch is not exercised here (the requeue order is). A gap says an action ran without a receipt; it does not say the action's own side effect succeeded, and it is not a proof that no other receipt is missing: a seal that Averin accepted but recorded wrongly, a seal that never started because Averin is disabled, undeclared actions, and receipts lost to a crash between the action and the seal enqueue are outside it. The on_execute (synchronous) Observe arms record gaps by the same call but are not exercised by a test here; only the production async and durable paths are. The outbox event reaches a consumer only if one polls or is pushed to; nothing here shows that anything alerts on it. The vacuity of the name filter: the detector selects tests whose name contains fei33_, so a renamed test drops out of it."
+    },
+    {
+      "id": "telegram-callback-attribution",
+      "statement": "With [approvals.telegram] callback_decisions = true, the Telegram notifier posts callback buttons carrying only the approval id (no decision link or token is in the message), and a button press is decided as the person Telegram reports: a user listed in [approvals.telegram.approvers] is recorded under their mapped identity with channel telegram:<user id>, so two different users are two approvers and complete a dual-control request only together, and the same user pressing twice is one approver; a user who is not listed, a press from outside the configured chat, data that is not this module's, an unknown approval and an approval that is already decided each record nothing and answer the presser; config load refuses a non-numeric chat id, an empty approvers table, two Telegram users mapped to one identity (compared case-insensitively), a user listed twice, a non-positive or non-numeric user id, a blank identity, an identity with the reserved verified: or agg: prefix, and an approvers table without callback_decisions = true; and the default URL buttons are unchanged, whose decision-link route records the single oob_approver_identity so two clicks never complete a two-person action.",
+      "method": "test",
+      "artifacts": [
+        "src/approval/telegram_callbacks.rs",
+        "src/approval/mod.rs",
+        "src/config/types.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- approval::telegram_callbacks:: config::types::tests::fei16_ && cargo test --locked --no-default-features --test web_smoke -- fei16_decision_links_cannot_complete_a_two_person_action",
+      "covers": [
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "handle_callback_query",
+          "sha256": "ede92696a52c85aeb0927e8e124b2626f104603116a26827bff71eb3e4ef13da"
+        },
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "TelegramCallbackConfig::build",
+          "sha256": "616d4f6832707200dda6ebc841aa3a42afc341fbd725241e2691e56bfeca5fb8"
+        },
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "callback_data",
+          "sha256": "7e69813ba2c84f763a99d67a2a47e5219433c77cc0ee19cefefd92fdfb0ddf75"
+        },
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "parse_callback_data",
+          "sha256": "6feeabadbd3a9857164fb1aead4c61a8acf3ffad6a7bffd63ed6e8c0f923309c"
+        },
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "run_callback_loop",
+          "sha256": "b6ac59f6e06e9e28d764d4ae87b8c232460960e5774b9706e9815217163deaec"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalNotifier for TelegramNotifier::notify",
+          "sha256": "ca7f617527cf5a5ca838676f666209b8038d37702dee9906c4d8155f4d1495a7"
+        },
+        {
+          "path": "src/config/types.rs",
+          "symbol": "ApprovalConfig::try_from",
+          "sha256": "380b162177d9215fc5f62fb809cceb5d814b09524f0c795ba14e48cc0f295cab"
+        }
+      ],
+      "mutants": [
+        "telegram-callback-unlisted-user-falls-back-to-shared-identity",
+        "telegram-callback-chat-not-checked",
+        "telegram-callback-config-allows-shared-identity",
+        "telegram-callback-mode-still-posts-url-buttons",
+        "telegram-approvers-table-without-callback-is-ignored"
+      ],
+      "does_not_establish": "The identity is the operator's mapping from a Telegram user id, taken from callback_query.from.id as Telegram's servers report it; the tests use a stand-in Telegram server, so they do not show what the real API sends, that its user ids are unforgeable in a chat (that is Telegram's property, not checked here), or that a Telegram account is held by the person the mapping names (a stolen or shared account is that person). A press carries no approver class, so an approval gated by a govder recipe that names classes cannot be satisfied this way; the tests do not run such a recipe. A bot can have one getUpdates consumer and a webhook disables polling: a second consumer or a set webhook makes the loop retry with backoff and log, and no test shows that. Only the web process starts the poll loop. The webhook notifier's links are unchanged and still unattributed; the tests cover only the Telegram link route's behaviour for a two-person request. The callback path records the decision and resumes the action through the same functions as the link and panel paths, but the resume itself is not exercised here."
     }
   ]
 }

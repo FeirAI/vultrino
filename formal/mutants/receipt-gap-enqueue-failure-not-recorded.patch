@@ -1,0 +1,18 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index bf93d19..f7e702b 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -2405,13 +2405,6 @@ impl VultrinoServer {
+             Ok(_seq) => Ok(()),
+             Err(e) => {
+                 av.record_enqueue_failed();
+-                av.record_receipt_gap(
+-                    token_id,
+-                    Some(request_id),
+-                    Some(use_sequence_number),
+-                    "enqueue_failed",
+-                    &e.to_string(),
+-                );
+                 tracing::warn!(
+                     target: "averin_seal",
+                     token_id,

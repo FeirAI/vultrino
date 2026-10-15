@@ -1,0 +1,13 @@
+diff --git a/src/approval/telegram_callbacks.rs b/src/approval/telegram_callbacks.rs
+index 401f981..f67cd45 100644
+--- a/src/approval/telegram_callbacks.rs
++++ b/src/approval/telegram_callbacks.rs
+@@ -232,7 +232,7 @@ pub async fn handle_callback_query(
+     };
+     // 3. Only a listed person. The identity comes from Telegram's `from.id`, not from anything
+     //    the clicker typed.
+-    let Some(identity) = cb.identity_for(q.from.id) else {
++    let Some(identity) = cb.identity_for(q.from.id).or(Some("oncall")) else {
+         warn!(
+             telegram_user = q.from.id,
+             "telegram approval press from a user who is not in [approvals.telegram.approvers]; refused"
