@@ -2240,7 +2240,12 @@ impl VultrinoServer {
                         // fact. Fail-open: count + alarm (token/project context only, never
                         // params), enqueue nothing, and let the action proceed exactly like an 087
                         // drop would.
-                        if av.durable_use_oversize_drop(token_id, params_bytes.len()) {
+                        if av.durable_use_oversize_drop(
+                            token_id,
+                            params_bytes.len(),
+                            request_id,
+                            use_sequence_number,
+                        ) {
                             return Ok(());
                         }
                         // D5 — bind the freshness nonces ONCE, here, at enqueue time. The worker
@@ -2271,7 +2276,13 @@ impl VultrinoServer {
                         let result = run_averin_queue_blocking(|| {
                             queue.append(token_id, "averin.use", payload)
                         });
-                        return Self::handle_durable_use_enqueue_result(av, token_id, result);
+                        return Self::handle_durable_use_enqueue_result(
+                            av,
+                            token_id,
+                            request_id,
+                            use_sequence_number,
+                            result,
+                        );
                     }
                     // This process does not own the durable queue (Step 3a graceful
                     // degradation) — fall back to the 087 async path for THIS process only.
@@ -2386,12 +2397,21 @@ impl VultrinoServer {
     fn handle_durable_use_enqueue_result(
         av: &crate::averin::AverinClient,
         token_id: &str,
+        request_id: &str,
+        use_sequence_number: u32,
         result: Result<u64, crate::storage::StorageError>,
     ) -> Result<(), RunError> {
         match result {
             Ok(_seq) => Ok(()),
             Err(e) => {
                 av.record_enqueue_failed();
+                av.record_receipt_gap(
+                    token_id,
+                    Some(request_id),
+                    Some(use_sequence_number),
+                    "enqueue_failed",
+                    &e.to_string(),
+                );
                 tracing::warn!(
                     target: "averin_seal",
                     token_id,
@@ -4919,6 +4939,69 @@ pub async fn deliver_outbox_once(
     Ok(())
 }
 
+/// FEI-33: how often pending Observe receipt gaps are appended to the signed outbox.
+pub const RECEIPT_GAP_FLUSH_SECS: u64 = 2;
+
+/// FEI-33: append every pending Observe receipt gap to the signed outbox as an
+/// `evidence.receipt_gap` event (subject = the use token id). Returns how many were recorded. An
+/// outbox write failure puts the failed gap and the rest back in the pending buffer and stops the
+/// pass (counted and retried next tick, never silently dropped).
+pub async fn flush_receipt_gaps_once(
+    storage: &Arc<dyn StorageBackend>,
+    averin: &crate::averin::AverinClient,
+) -> usize {
+    let mut gaps = averin.take_receipt_gaps();
+    let mut recorded = 0usize;
+    while !gaps.is_empty() {
+        let gap = gaps.remove(0);
+        let payload = serde_json::json!({
+            "token_id": gap.token_id,
+            "project_id": gap.project_id,
+            "request_id": gap.request_id,
+            "use_sequence_number": gap.use_sequence_number,
+            "reason": gap.reason,
+            "detail": gap.detail,
+            "at": gap.at.to_rfc3339(),
+            "outcome": "action_ran_without_receipt",
+        });
+        match storage
+            .append_event(
+                &gap.token_id,
+                crate::outbox::EVENT_EVIDENCE_RECEIPT_GAP,
+                payload,
+            )
+            .await
+        {
+            Ok(_) => recorded += 1,
+            Err(e) => {
+                error!(
+                    target: "averin_seal",
+                    error = %e,
+                    pending = gaps.len() + 1,
+                    "AVERIN-RECEIPT-GAP-UNRECORDED could not append evidence.receipt_gap to the \
+                     outbox; will retry"
+                );
+                gaps.insert(0, gap);
+                averin.requeue_receipt_gaps(gaps);
+                return recorded;
+            }
+        }
+    }
+    recorded
+}
+
+/// FEI-33: the background loop around [`flush_receipt_gaps_once`].
+pub async fn flush_receipt_gaps_periodically(
+    storage: Arc<dyn StorageBackend>,
+    averin: Arc<crate::averin::AverinClient>,
+    interval: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        flush_receipt_gaps_once(&storage, &averin).await;
+    }
+}
+
 /// Background loop driving outbox delivery + periodic GC (V9). Always runs (when
 /// the feature is wired) so the always-on event log is bounded by retention even
 /// if push delivery is unconfigured; it pushes only when a URL + secret are set.
@@ -5435,6 +5518,25 @@ pub async fn deliver_averin_outbox_once(
                 // `delivery`) rather than reusing the pre-attempt `event` snapshot, then MOVE it
                 // into quarantine (D4). Never logs `params`/`pop_seed` — token/project context only.
                 let final_event = queue.get(sequence).unwrap_or(event);
+                if final_event.event_type == "averin.use" {
+                    // FEI-33: a durable Observe receipt that exhausted its delivery attempts is a
+                    // permanent gap in the evidence trail: record it individually, not only as a
+                    // quarantined queue row.
+                    averin_client.record_receipt_gap(
+                        &final_event.subject,
+                        final_event
+                            .payload
+                            .get("request_id")
+                            .and_then(|v| v.as_str()),
+                        final_event
+                            .payload
+                            .get("use_sequence_number")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|v| u32::try_from(v).ok()),
+                        "durable_dead_lettered",
+                        "the durable use receipt exhausted its delivery attempts",
+                    );
+                }
                 error!(
                     target: "averin_seal",
                     subject = %final_event.subject,
@@ -8713,6 +8815,80 @@ mod durable_enqueue_tests {
         );
     }
 
+    /// FEI-33: end to end. An Observe action runs, its async receipt fails (no grant), and the
+    /// failure is recorded as an individual `evidence.receipt_gap` event on the signed outbox
+    /// (subject = the use token id), with ids and a reason and no params.
+    #[tokio::test]
+    async fn fei33_failed_observe_receipt_becomes_an_outbox_event() {
+        let (server, storage, av) = durable_test_server(
+            false,
+            AverinMode::Observe,
+            "http://127.0.0.1:9",
+            Duration::from_millis(200),
+        )
+        .await;
+        let result = server
+            .seal_after_consume(
+                &av,
+                "vut_no_grant",
+                br#"{"amount":"123.45"}"#.to_vec(),
+                2,
+                "req-gap-1",
+                false,
+            )
+            .await;
+        assert!(result.is_ok(), "Observe stays non-blocking");
+        for _ in 0..200 {
+            if av.metrics().receipt_gaps >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(super::flush_receipt_gaps_once(&storage, &av).await, 1);
+        let events = storage.list_events_after(0, 100).await.unwrap();
+        let gaps: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == crate::outbox::EVENT_EVIDENCE_RECEIPT_GAP)
+            .collect();
+        assert_eq!(gaps.len(), 1, "one event per failed receipt: {events:?}");
+        assert_eq!(gaps[0].subject, "vut_no_grant");
+        assert_eq!(gaps[0].payload["request_id"], "req-gap-1");
+        assert_eq!(gaps[0].payload["use_sequence_number"], 2);
+        assert_eq!(gaps[0].payload["reason"], "seal_failed");
+        assert_eq!(gaps[0].payload["outcome"], "action_ran_without_receipt");
+        assert!(
+            !gaps[0].payload.to_string().contains("123.45"),
+            "params never reach the gap record"
+        );
+        // Flushing again records nothing new.
+        assert_eq!(super::flush_receipt_gaps_once(&storage, &av).await, 0);
+    }
+
+    /// FEI-33: the oversize durable drop is an individual gap event too.
+    #[tokio::test]
+    async fn fei33_oversize_durable_drop_becomes_an_outbox_event() {
+        let (server, storage, av) = durable_test_server(
+            true,
+            AverinMode::Observe,
+            "http://127.0.0.1:9",
+            Duration::from_millis(200),
+        )
+        .await;
+        let oversize = vec![b'x'; av.config().max_seal_params_bytes + 1];
+        assert!(server
+            .seal_after_consume(&av, "tok-big", oversize, 1, "req-big", false)
+            .await
+            .is_ok());
+        assert_eq!(super::flush_receipt_gaps_once(&storage, &av).await, 1);
+        let events = storage.list_events_after(0, 100).await.unwrap();
+        let g = events
+            .iter()
+            .find(|e| e.event_type == crate::outbox::EVENT_EVIDENCE_RECEIPT_GAP)
+            .expect("gap event");
+        assert_eq!(g.payload["reason"], "params_oversize");
+        assert_eq!(g.payload["request_id"], "req-big");
+    }
+
     /// Plan 088 Step 5 (D3) — the durable MINT enqueue: `seal_mint` persists a `PopKeyEntry` keyed
     /// by `token.id` (seed/action/scope/use_limit populated, capability/grant_id still `None`) AND
     /// appends an `"averin.grant"` event with `subject = token.id` — never a synchronous
@@ -8773,7 +8949,13 @@ mod durable_enqueue_tests {
         let simulated = Err(crate::storage::StorageError::Io(std::io::Error::other(
             "disk full (simulated D7 fault injection)",
         )));
-        let result = VultrinoServer::handle_durable_use_enqueue_result(&av, "tok-fault", simulated);
+        let result = VultrinoServer::handle_durable_use_enqueue_result(
+            &av,
+            "tok-fault",
+            "req-fault",
+            1,
+            simulated,
+        );
 
         assert!(
             result.is_ok(),
@@ -8787,5 +8969,10 @@ mod durable_enqueue_tests {
         // Never touches the ordinary async 087 counters — this is a DIFFERENT failure mode.
         assert_eq!(av.metrics().failed, 0);
         assert_eq!(av.metrics().sealed, 0);
+        // FEI-33: the failure is also an individual gap record with the ids.
+        let gaps = av.take_receipt_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].reason, "enqueue_failed");
+        assert_eq!(gaps[0].request_id.as_deref(), Some("req-fault"));
     }
 }

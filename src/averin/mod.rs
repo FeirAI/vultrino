@@ -63,6 +63,14 @@ pub struct SealMetrics {
     /// because an enqueue failure never even reaches the network — it is a LOCAL persistence
     /// problem, and `plugin.execute` still proceeds fail-open exactly like every other Observe drop.
     enqueue_failed: AtomicU64,
+    /// FEI-33: Observe-mode receipts that were NOT sealed for any reason (failed, timed out,
+    /// dropped, oversize, local enqueue failure, durable dead-letter). Every one of these is also
+    /// queued as an individual [`ReceiptGap`] record (see [`AverinClient::take_receipt_gaps`]),
+    /// which the server turns into an `evidence.receipt_gap` outbox event.
+    receipt_gaps: AtomicU64,
+    /// FEI-33: gap records that could not be queued because the bounded pending buffer was full
+    /// (the server had not drained it). The gap is still counted in `receipt_gaps` and logged.
+    receipt_gaps_overflowed: AtomicU64,
     /// Plan 087 FIX 5 — monotonic-ms (relative to the client's start `Instant`) at
     /// which the last `AVERIN-SEAL-DROPPED` line was emitted; 0 = never (so the very
     /// first drop always logs). Rate-limits ONLY the log line; `dropped` still counts
@@ -113,6 +121,8 @@ impl SealMetrics {
             in_flight: self.in_flight.load(Ordering::Relaxed),
             max_in_flight: self.max_in_flight.load(Ordering::Relaxed),
             enqueue_failed: self.enqueue_failed.load(Ordering::Relaxed),
+            receipt_gaps: self.receipt_gaps.load(Ordering::Relaxed),
+            receipt_gaps_overflowed: self.receipt_gaps_overflowed.load(Ordering::Relaxed),
         }
     }
 }
@@ -127,14 +137,40 @@ impl SealMetrics {
 struct InflightGuard {
     metrics: Arc<SealMetrics>,
     completed: bool,
+    /// FEI-33: what to record if the task is lost before it records an outcome.
+    gap: Option<(AverinClient, String, String, u32)>,
 }
 
 impl InflightGuard {
+    #[cfg(test)]
     fn enter(metrics: Arc<SealMetrics>) -> Self {
         metrics.enter_inflight();
         Self {
             metrics,
             completed: false,
+            gap: None,
+        }
+    }
+
+    /// As [`Self::enter`], and if the task is lost before recording an outcome, also record the
+    /// receipt gap (FEI-33) with the ids of the use it was sealing.
+    fn enter_for(
+        client: &AverinClient,
+        token_id: &str,
+        request_id: &str,
+        use_sequence_number: u32,
+    ) -> Self {
+        let metrics = client.metrics.clone();
+        metrics.enter_inflight();
+        Self {
+            metrics,
+            completed: false,
+            gap: Some((
+                client.clone(),
+                token_id.to_string(),
+                request_id.to_string(),
+                use_sequence_number,
+            )),
         }
     }
     /// Mark the seal task as having recorded its own outcome (sealed OR failed), so
@@ -151,6 +187,15 @@ impl Drop for InflightGuard {
             // The task panicked/was cancelled before recording an outcome — count the
             // lost seal so the `failed` counter and its alarm reflect reality.
             self.metrics.record_failed();
+            if let Some((client, token_id, request_id, seq)) = self.gap.take() {
+                client.record_receipt_gap(
+                    &token_id,
+                    Some(&request_id),
+                    Some(seq),
+                    "seal_task_lost",
+                    "the seal task panicked or was cancelled before recording an outcome",
+                );
+            }
         }
     }
 }
@@ -166,7 +211,36 @@ pub struct SealMetricsSnapshot {
     /// Plan 088 D7 — durable enqueue attempts (Observe + `durable = true`) that failed locally
     /// (disk full, fsync EIO, …) and were dropped fail-open. See [`SealMetrics::enqueue_failed`].
     pub enqueue_failed: u64,
+    /// FEI-33: Observe-mode receipts that were not sealed (each also recorded individually as an
+    /// `evidence.receipt_gap` outbox event). Equals the sum of every way an Observe receipt can be
+    /// lost, so a reader no longer has to add `failed + dropped + enqueue_failed` by hand.
+    pub receipt_gaps: u64,
+    /// FEI-33: gaps whose individual record was lost to a full pending buffer (still counted above).
+    pub receipt_gaps_overflowed: u64,
 }
+
+/// FEI-33: one Observe-mode receipt that did not reach Averin. Observe stays non-blocking (the
+/// action already ran), but each failed receipt is recorded individually instead of only being
+/// counted: the server turns each into an `evidence.receipt_gap` event on the signed outbox.
+/// Carries ids and a short error class only: never params, never a PoP seed or token secret.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReceiptGap {
+    pub token_id: String,
+    pub project_id: String,
+    pub request_id: Option<String>,
+    pub use_sequence_number: Option<u32>,
+    /// A fixed vocabulary: `seal_failed`, `seal_task_lost`, `fanout_saturated`, `params_oversize`,
+    /// `enqueue_failed`, `durable_dead_lettered`.
+    pub reason: &'static str,
+    pub detail: String,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Cap on pending, not yet drained gap records. A sustained Averin outage under load produces one
+/// per action; the server drains every couple of seconds, so this only overflows if the outbox
+/// itself is unwritable. Overflow is counted and logged, never silent.
+const MAX_PENDING_RECEIPT_GAPS: usize = 4096;
+const MAX_GAP_DETAIL_CHARS: usize = 200;
 
 /// Fail-mode on `/execute` when the synchronous seal fails or averin is
 /// unreachable. Mint is always fail-open (a token must not depend on averin).
@@ -325,6 +399,9 @@ pub struct AverinClient {
     /// `clone` (all clones share the same instant value), so `since.elapsed()` is a
     /// consistent process-wide clock for `drop_log_last_ms`.
     since: std::time::Instant,
+    /// FEI-33: individual records of Observe receipts that were not sealed, drained by the server
+    /// into `evidence.receipt_gap` outbox events. Shared across clones.
+    pending_gaps: Arc<Mutex<std::collections::VecDeque<ReceiptGap>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -458,6 +535,7 @@ impl AverinClient {
             seal_permits: Arc::new(Semaphore::new(permits)),
             metrics: Arc::new(SealMetrics::default()),
             since: std::time::Instant::now(),
+            pending_gaps: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }))
     }
 
@@ -483,6 +561,75 @@ impl AverinClient {
             Some(self.metrics.dropped.load(Ordering::Relaxed))
         } else {
             None
+        }
+    }
+
+    /// FEI-33: record one Observe receipt that did not reach Averin. Always counted and logged;
+    /// queued for the server to emit as an `evidence.receipt_gap` outbox event unless the bounded
+    /// pending buffer is full (then `receipt_gaps_overflowed` counts the lost record). Never blocks,
+    /// never fails the action, never carries params or secrets.
+    pub(crate) fn record_receipt_gap(
+        &self,
+        token_id: &str,
+        request_id: Option<&str>,
+        use_sequence_number: Option<u32>,
+        reason: &'static str,
+        detail: &str,
+    ) {
+        self.metrics.receipt_gaps.fetch_add(1, Ordering::Relaxed);
+        let detail: String = detail.chars().take(MAX_GAP_DETAIL_CHARS).collect();
+        let gap = ReceiptGap {
+            token_id: token_id.to_string(),
+            project_id: self.cfg.project_id.clone(),
+            request_id: request_id.map(str::to_string),
+            use_sequence_number,
+            reason,
+            detail,
+            at: chrono::Utc::now(),
+        };
+        let mut q = self.pending_gaps.lock();
+        if q.len() >= MAX_PENDING_RECEIPT_GAPS {
+            drop(q);
+            let total = self
+                .metrics
+                .receipt_gaps_overflowed
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if let Some(_logged) = self.claim_drop_log() {
+                tracing::error!(
+                    target: "averin_seal",
+                    token_id,
+                    project_id = %self.cfg.project_id,
+                    reason,
+                    overflowed_total = total,
+                    "AVERIN-RECEIPT-GAP-OVERFLOW the pending gap buffer is full; this gap is counted \
+                     (receipt_gaps) but its individual record was not queued"
+                );
+            }
+            return;
+        }
+        q.push_back(gap);
+    }
+
+    /// FEI-33: drain every queued [`ReceiptGap`] (oldest first). The server calls this on a short
+    /// interval and appends each as an `evidence.receipt_gap` event on the signed outbox.
+    pub fn take_receipt_gaps(&self) -> Vec<ReceiptGap> {
+        self.pending_gaps.lock().drain(..).collect()
+    }
+
+    /// FEI-33: put gaps back at the FRONT of the pending buffer when the outbox could not take them,
+    /// so a transient outbox write failure loses nothing. Beyond the cap the excess is counted in
+    /// `receipt_gaps_overflowed`, never silently discarded.
+    pub(crate) fn requeue_receipt_gaps(&self, gaps: Vec<ReceiptGap>) {
+        let mut q = self.pending_gaps.lock();
+        for gap in gaps.into_iter().rev() {
+            if q.len() >= MAX_PENDING_RECEIPT_GAPS {
+                self.metrics
+                    .receipt_gaps_overflowed
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                q.push_front(gap);
+            }
         }
     }
 
@@ -533,11 +680,24 @@ impl AverinClient {
     /// fail-open — Observe must never block (or durably retain oversize data) on a params size the
     /// operator has bounded. Returns `false` when params are within the cap (enqueue proceeds
     /// normally).
-    pub(crate) fn durable_use_oversize_drop(&self, token_id: &str, params_len: usize) -> bool {
+    pub(crate) fn durable_use_oversize_drop(
+        &self,
+        token_id: &str,
+        params_len: usize,
+        request_id: &str,
+        use_sequence_number: u32,
+    ) -> bool {
         if params_len <= self.cfg.max_seal_params_bytes {
             return false;
         }
         self.metrics.record_dropped();
+        self.record_receipt_gap(
+            token_id,
+            Some(request_id),
+            Some(use_sequence_number),
+            "params_oversize",
+            "params exceed max_seal_params_bytes; the receipt was not sealed",
+        );
         if let Some(total) = self.claim_drop_log() {
             tracing::warn!(
                 target: "averin_seal",
@@ -718,6 +878,13 @@ impl AverinClient {
                 }
                 AverinMode::Observe => {
                     self.metrics.record_dropped();
+                    self.record_receipt_gap(
+                        token_id,
+                        Some(request_id),
+                        Some(use_sequence_number),
+                        "params_oversize",
+                        "params exceed max_seal_params_bytes; the receipt was not sealed",
+                    );
                     tracing::warn!(target: "averin_seal", token_id, project_id = %self.cfg.project_id, params_bytes = params.len(), cap = self.cfg.max_seal_params_bytes, "AVERIN-SEAL-DROPPED-oversize params exceed max_seal_params_bytes (observe/fail-open) — action proceeds");
                     Ok(())
                 }
@@ -742,6 +909,13 @@ impl AverinClient {
                 }
                 AverinMode::Observe => {
                     self.metrics.record_failed();
+                    self.record_receipt_gap(
+                        token_id,
+                        Some(request_id),
+                        Some(use_sequence_number),
+                        "seal_failed",
+                        &e.to_string(),
+                    );
                     tracing::warn!(target: "averin_seal", token_id, project_id = %self.cfg.project_id, error = %e, "AVERIN-SEAL-FAILED averin use seal failed (observe/fail-open) — action proceeds");
                     Ok(())
                 }
@@ -846,6 +1020,13 @@ impl AverinClient {
         // BEFORE claiming a permit so an oversize flood cannot even occupy the fan-out.
         if params.len() > self.cfg.max_seal_params_bytes {
             self.metrics.record_dropped();
+            self.record_receipt_gap(
+                token_id,
+                Some(request_id),
+                Some(use_sequence_number),
+                "params_oversize",
+                "params exceed max_seal_params_bytes; the receipt was not sealed",
+            );
             if let Some(total) = self.claim_drop_log() {
                 tracing::warn!(
                     target: "averin_seal",
@@ -864,6 +1045,13 @@ impl AverinClient {
             Ok(p) => p,
             Err(_) => {
                 self.metrics.record_dropped();
+                self.record_receipt_gap(
+                    token_id,
+                    Some(request_id),
+                    Some(use_sequence_number),
+                    "fanout_saturated",
+                    "the async seal fan-out cap was saturated; the receipt was not sealed",
+                );
                 // FIX 5 — the counter always bumps (above); the LOG is rate-limited so a
                 // sustained outage can't storm the hot path with a warn per dropped seal.
                 if let Some(total) = self.claim_drop_log() {
@@ -888,7 +1076,8 @@ impl AverinClient {
             // FIX 6 — RAII: `in_flight` is decremented (and a failure counted) even if
             // this task panics or is cancelled mid-await. `complete()` on the normal
             // arms stops `Drop` from double-counting a failure.
-            let mut guard = InflightGuard::enter(this.metrics.clone());
+            let mut guard =
+                InflightGuard::enter_for(&this, &token_id, &request_id, use_sequence_number);
             let outcome = this
                 .seal_use(&token_id, &params, use_sequence_number, &request_id)
                 .await;
@@ -900,6 +1089,13 @@ impl AverinClient {
                 }
                 Err(e) => {
                     this.metrics.record_failed();
+                    this.record_receipt_gap(
+                        &token_id,
+                        Some(&request_id),
+                        Some(use_sequence_number),
+                        "seal_failed",
+                        &e.to_string(),
+                    );
                     guard.complete();
                     // ALARM: token/project context only — params are never logged.
                     tracing::warn!(
@@ -1425,6 +1621,111 @@ mod tests {
         );
         assert_eq!(m.sealed, 0);
         assert_eq!(m.dropped, 0);
+    }
+
+    // ---- FEI-33: every failed Observe receipt is recorded individually ---------
+
+    /// A failed async seal is counted AND queued as an individual gap carrying the ids and the
+    /// reason, never the params.
+    #[tokio::test]
+    async fn fei33_failed_async_seal_is_recorded_as_a_gap() {
+        let client = client_with("http://127.0.0.1:9", 256, Duration::from_secs(5));
+        client.insert_test_grant("vut_bad", "nodothere"); // MalformedCapability: no network
+        client.spawn_use_seal("vut_bad", br#"{"secret_param":"x"}"#.to_vec(), 3, "req-bad");
+        for _ in 0..100 {
+            if client.metrics().receipt_gaps >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let gaps = client.take_receipt_gaps();
+        assert_eq!(gaps.len(), 1, "exactly one gap for one failed receipt");
+        let g = &gaps[0];
+        assert_eq!(g.token_id, "vut_bad");
+        assert_eq!(g.request_id.as_deref(), Some("req-bad"));
+        assert_eq!(g.use_sequence_number, Some(3));
+        assert_eq!(g.reason, "seal_failed");
+        let rendered = serde_json::to_string(g).unwrap();
+        assert!(
+            !rendered.contains("secret_param"),
+            "a gap record must never carry params: {rendered}"
+        );
+        assert_eq!(client.metrics().receipt_gaps, 1);
+        assert!(client.take_receipt_gaps().is_empty(), "drained once");
+    }
+
+    /// An oversize drop is a gap too (it used to be only a counter).
+    #[tokio::test]
+    async fn fei33_oversize_drop_is_recorded_as_a_gap() {
+        let client = client_capped(AverinMode::Observe, 8);
+        client.spawn_use_seal("vut_big", vec![b'x'; 64], 1, "req-big");
+        let gaps = client.take_receipt_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].reason, "params_oversize");
+        assert_eq!(gaps[0].request_id.as_deref(), Some("req-big"));
+    }
+
+    /// Saturation drops are gaps: every surplus seal is one record, not just a count.
+    #[tokio::test]
+    async fn fei33_saturation_drops_are_recorded_one_gap_each() {
+        let base = blocked_averin().await;
+        let cap = 4usize;
+        let total = 40usize;
+        let client = client_with(&base, cap, Duration::from_secs(30));
+        for i in 0..total {
+            client.insert_test_grant(&format!("vut_{i}"), "AAAA.sig");
+        }
+        for i in 0..total {
+            client.spawn_use_seal(&format!("vut_{i}"), b"{}".to_vec(), 1, &format!("req-{i}"));
+        }
+        let m = client.metrics();
+        let gaps = client.take_receipt_gaps();
+        assert_eq!(gaps.len() as u64, m.dropped, "one gap per dropped seal");
+        assert!(gaps.iter().all(|g| g.reason == "fanout_saturated"));
+        assert!(m.dropped >= (total - cap) as u64);
+    }
+
+    /// The pending buffer is bounded; overflow is counted in the metric, never silent.
+    #[test]
+    fn fei33_pending_gap_buffer_is_bounded_and_overflow_is_counted() {
+        let client = client_with("http://127.0.0.1:9", 256, Duration::from_secs(5));
+        for i in 0..(MAX_PENDING_RECEIPT_GAPS + 10) {
+            client.record_receipt_gap("t", Some(&format!("r{i}")), Some(1), "seal_failed", "x");
+        }
+        let m = client.metrics();
+        assert_eq!(m.receipt_gaps, (MAX_PENDING_RECEIPT_GAPS + 10) as u64);
+        assert_eq!(m.receipt_gaps_overflowed, 10);
+        assert_eq!(client.take_receipt_gaps().len(), MAX_PENDING_RECEIPT_GAPS);
+    }
+
+    /// Requeue puts gaps back in order at the front (an outbox write failure loses nothing).
+    #[test]
+    fn fei33_requeue_preserves_order() {
+        let client = client_with("http://127.0.0.1:9", 256, Duration::from_secs(5));
+        client.record_receipt_gap("t", Some("r1"), Some(1), "seal_failed", "x");
+        client.record_receipt_gap("t", Some("r2"), Some(1), "seal_failed", "x");
+        let mut gaps = client.take_receipt_gaps();
+        client.record_receipt_gap("t", Some("r3"), Some(1), "seal_failed", "x");
+        let first = gaps.remove(0);
+        gaps.insert(0, first);
+        client.requeue_receipt_gaps(gaps);
+        let order: Vec<_> = client
+            .take_receipt_gaps()
+            .into_iter()
+            .map(|g| g.request_id.unwrap())
+            .collect();
+        assert_eq!(order, vec!["r1", "r2", "r3"]);
+    }
+
+    /// A long error string is clipped so a gap record stays small.
+    #[test]
+    fn fei33_gap_detail_is_clipped() {
+        let client = client_with("http://127.0.0.1:9", 256, Duration::from_secs(5));
+        client.record_receipt_gap("t", None, None, "seal_failed", &"e".repeat(5000));
+        assert_eq!(
+            client.take_receipt_gaps()[0].detail.chars().count(),
+            MAX_GAP_DETAIL_CHARS
+        );
     }
 
     // ---- plan 087 FIX 3/4/5/6 -----------------------------------------------

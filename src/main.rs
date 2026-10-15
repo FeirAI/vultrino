@@ -1221,6 +1221,15 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     // AND this process actually owns the durable queue (Step 3a's single-writer-process lock) —
     // default OFF, byte-identical to every build before this plan.
     let _ = spawn_averin_worker_if_enabled(&server, averin_enabled, averin_durable);
+    if let Some(av) = server.averin() {
+        // FEI-33: every Observe receipt that did not reach Averin becomes an individual
+        // `evidence.receipt_gap` event on the signed outbox.
+        tokio::spawn(vultrino::server::flush_receipt_gaps_periodically(
+            server.storage().clone(),
+            av,
+            std::time::Duration::from_secs(vultrino::server::RECEIPT_GAP_FLUSH_SECS),
+        ));
+    }
     // Reconcile any intent-staged events an inline drain left behind (D1 safety net) so a committed
     // approval decision's signed event is delivered within a tick, not only on the next restart.
     tokio::spawn(vultrino::server::drain_pending_events_periodically(
@@ -1315,6 +1324,14 @@ async fn run_web_server(
     // default OFF, byte-identical to every build before this plan.
     let _ =
         spawn_averin_worker_if_enabled(&exec_server, config.averin.enabled, config.averin.durable);
+    if let Some(av) = exec_server.averin() {
+        // FEI-33: see the other call site.
+        tokio::spawn(vultrino::server::flush_receipt_gaps_periodically(
+            exec_server.storage().clone(),
+            av,
+            std::time::Duration::from_secs(vultrino::server::RECEIPT_GAP_FLUSH_SECS),
+        ));
+    }
     // Reconcile any intent-staged events an inline drain left behind (D1 safety net).
     tokio::spawn(vultrino::server::drain_pending_events_periodically(
         exec_server.storage().clone(),
