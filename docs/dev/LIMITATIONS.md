@@ -406,8 +406,9 @@ kernels.
   (`averin_seal`). The record is queued in memory and appended to the outbox every two
   seconds: a process killed inside that window loses the gaps it had not yet appended (and
   the counters), and a sustained outbox write failure beyond 4096 pending gaps is counted in
-  `receipt_gaps_overflowed` but not recorded individually. A gap names an action that ran
-  without a receipt; it does not say whether the action's own side effect succeeded.
+  `receipt_gaps_overflowed` but not recorded individually. A process that dies between the
+  action and the enqueue of its seal leaves neither a receipt nor a gap. A gap names an action
+  that ran without a receipt; it does not say whether the action's own side effect succeeded.
   A declared human-floor capability, or a bare canonical verb shared by configured
   business labels, does **not** inherit that availability knob: buffered and
   streaming dispatch require a live Averin client, a bound use token, grant
