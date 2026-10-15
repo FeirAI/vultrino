@@ -3161,6 +3161,11 @@
           "path": "src/plugins/http.rs",
           "symbol": "upstream_proxy_ca_path",
           "sha256": "108572b062f636631e229b90cbb05ca4c50d08acfaeb609319ab49aa0007bcc0"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::new",
+          "sha256": "cc6944b9aa90f2689bc52b10e76a6def46c71359b83c8f17d261192c15e01199"
         }
       ],
       "mutants": [
