@@ -80,10 +80,6 @@ impl Want {
         narrow: false,
         wide: true,
     };
-    const BOTH: Want = Want {
-        narrow: true,
-        wide: true,
-    };
 }
 
 fn same(v: bool) -> (bool, bool) {
@@ -722,9 +718,17 @@ impl PolicyEngine {
                                 // broadening can turn an Allow into a Prompt but never a
                                 // Deny into one.
                                 PolicyAction::Prompt => {
-                                    let (narrow, wide) =
-                                        self.eval_pair(other, input, record, Want::BOTH);
-                                    if !narrow && wide {
+                                    //
+                                    // The rate limit is charged by the unbroadened reading
+                                    // only, as before the broadening: a request that ends
+                                    // Denied through a URL variant must never burn the rule's
+                                    // slot. The wide reading runs without recording, so a
+                                    // rate limit counts as within its limit there (wider,
+                                    // fail-closed: it can only upgrade an Allow to a Prompt).
+                                    let narrow =
+                                        self.eval_pair(other, input, record, Want::NARROW).0;
+                                    if !narrow && self.eval_pair(other, input, false, Want::WIDE).1
+                                    {
                                         broadened_prompt.set(true);
                                     }
                                     narrow

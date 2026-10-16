@@ -71,6 +71,9 @@ pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Pol
             // The URL is never reported (it can carry proxy credentials).
             "upstream_proxy_configured": crate::plugins::upstream_proxy_configured(),
             "plugin_ambient_proxy_honoured": false,
+            // The CA is trusted for every https target of the guarded client while the proxy
+            // is set; the path is never reported.
+            "upstream_proxy_ca_configured": crate::plugins::upstream_proxy_ca_configured(),
         },
         "policies": {
             "total": policies.len(),

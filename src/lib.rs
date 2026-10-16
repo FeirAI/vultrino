@@ -19,6 +19,7 @@ pub mod govder;
 pub mod identity;
 pub mod mcp;
 pub mod outbox;
+pub mod plain_http;
 pub mod plugins;
 pub mod policy;
 pub mod revocation;

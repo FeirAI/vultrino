@@ -179,7 +179,10 @@ approval notifier, the outbox pusher and the request CLI each call `.no_proxy()`
 proxy can neither see an injected credential nor skip the connect-time resolver guard.
 **The HTTP plugin refuses a plain `http://` target in every mode** (every target it can reach is
 public, so a credential would cross the network in clear text); operator-pinned internal
-destinations use `internal_http`. An
+destinations use `internal_http`. The other secret-bearing clients (averin, govder, outbox pusher,
+approval webhook, request CLI) take an operator-configured URL: `https://` anywhere, `http://` only
+for a loopback or private address, checked at client build or config load and by a connect-time
+resolver that returns only loopback or private addresses (`src/plain_http.rs`). An
 operator who must route egress through a proxy sets `VULTRINO_UPSTREAM_PROXY` to an `http://`
 or `https://` proxy URL (an invalid value stops the process at client construction). Only
 `https://` targets go through it (a CONNECT tunnel, the credential inside TLS), and

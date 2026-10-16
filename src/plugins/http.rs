@@ -432,6 +432,11 @@ pub(crate) fn upstream_proxy_from(raw: Option<&str>) -> Result<Option<url::Url>,
 /// Optional PEM file naming the private CA of the opt-in proxy's certificates.
 pub const UPSTREAM_PROXY_CA_ENV: &str = "VULTRINO_UPSTREAM_PROXY_CA_FILE";
 
+/// Whether `VULTRINO_UPSTREAM_PROXY_CA_FILE` is set (a trust-widening setting).
+pub fn upstream_proxy_ca_configured() -> bool {
+    upstream_proxy_ca_path().is_some()
+}
+
 fn upstream_proxy_ca_path() -> Option<String> {
     std::env::var(UPSTREAM_PROXY_CA_ENV)
         .ok()

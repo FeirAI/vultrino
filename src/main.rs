@@ -2918,7 +2918,11 @@ async fn make_request_via_api(
     // Build the API request
     // No ambient proxy: the vk_ key goes to VULTRINO_API_URL directly, never through an
     // HTTP_PROXY that would see it in clear text.
-    let client = reqwest::Client::builder().no_proxy().build()?;
+    // The key never crosses a public network in clear text (VUL-29).
+    vultrino::plain_http::check(&api_url).map_err(|e| format!("VULTRINO_API_URL: {e}"))?;
+    let client = vultrino::plain_http::guard(reqwest::Client::builder(), &api_url)
+        .no_proxy()
+        .build()?;
     let api_response = client
         .post(format!("{}/api/v1/execute", api_url))
         .header("Authorization", format!("Bearer {}", api_key))

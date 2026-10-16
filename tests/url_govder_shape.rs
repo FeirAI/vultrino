@@ -96,3 +96,88 @@ fn a_second_policys_allow_cannot_skip_the_exact_prompt_but_never_makes_a_deny_a_
         assert_eq!(decide(&e, "https://api.payments.example/v1/other"), "allow");
     }
 }
+
+/// govder compiles a rate-limited gated action as `and(action_match, url_match, method,
+/// rate_limit)` Prompt under a Deny default. A request that ends Denied through a URL variant
+/// must never charge the rule's rate limit, or probing locks the agent out of its own gated
+/// action for the window.
+#[test]
+fn denied_url_variants_do_not_charge_a_prompt_rules_rate_limit() {
+    use vultrino::policy::EvalInput;
+    let url = "https://api.payments.example/v1/refunds";
+    let mut p = Policy::allow_all("govder-gated", "*");
+    p.default_action = PolicyAction::Deny;
+    p.rules = vec![PolicyRule {
+        condition: PolicyCondition::And(vec![
+            PolicyCondition::ActionMatch("payments.refund".to_string()),
+            PolicyCondition::UrlMatch(url.to_string()),
+            PolicyCondition::MethodMatch(vec!["POST".to_string()]),
+            PolicyCondition::RateLimit {
+                max: 2,
+                window_secs: 3600,
+            },
+        ]),
+        action: PolicyAction::Prompt,
+    }];
+    let e = PolicyEngine::new();
+    e.add_policy(p);
+    let eval = |u: &str| {
+        let input = EvalInput {
+            credential_alias: "cred",
+            url: Some(u),
+            method: Some("POST"),
+            action: Some("payments.refund"),
+            principal: None,
+            spend: None,
+        };
+        match e.evaluate_full(&input) {
+            PolicyDecision::Allow => "allow",
+            PolicyDecision::Prompt => "prompt",
+            PolicyDecision::Deny(_) => "deny",
+        }
+    };
+    for _ in 0..5 {
+        assert_eq!(eval(&format!("{url}?to=evil")), "deny");
+        assert_eq!(eval(&format!("{url}/")), "deny");
+    }
+    assert_eq!(eval(url), "prompt", "variants must not have used the slot");
+    assert_eq!(eval(url), "prompt");
+    assert_eq!(eval(url), "deny", "the real limit still applies");
+}
+
+/// Reverse proxies merge repeated slashes and some servers decode `%2F`: a Deny written for
+/// the plain path covers those spellings too (VUL-32).
+#[test]
+fn empty_segments_and_encoded_slashes_stay_denied() {
+    for (pat, urls) in [
+        (
+            "https://api.example.com/v1/refunds*",
+            &[
+                "https://api.example.com//v1/refunds",
+                "https://api.example.com/v1//refunds",
+                "https://api.example.com/v1%2Frefunds",
+                "https://api.example.com/v1%2frefunds?x=1",
+            ][..],
+        ),
+        (
+            "https://api.example.com/admin*",
+            &[
+                "https://api.example.com//admin",
+                "https://api.example.com/%2Fadmin",
+                "https://api.example.com/;x=1/admin",
+                "https://api.example.com/x/..%2Fadmin",
+            ][..],
+        ),
+    ] {
+        for u in urls {
+            let e = PolicyEngine::new();
+            let mut p = Policy::allow_all("p", "*");
+            p.rules = vec![PolicyRule {
+                condition: PolicyCondition::UrlMatch(pat.to_string()),
+                action: PolicyAction::Deny,
+            }];
+            e.add_policy(p);
+            assert_eq!(decide(&e, u), "deny", "{pat} vs {u}");
+        }
+    }
+}

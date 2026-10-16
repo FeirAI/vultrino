@@ -419,7 +419,9 @@ impl GovderClient {
             })
             .ok_or_else(|| GovderError::BadUrl("missing host".to_string()))?;
         // The tenant assertion travels in a header: never via an ambient proxy (VUL-29).
-        let http = Client::builder()
+        crate::plain_http::check(&cfg.base_url)
+            .map_err(|e| GovderError::BadUrl(format!("{}: {e}", cfg.base_url)))?;
+        let http = crate::plain_http::guard(Client::builder(), &cfg.base_url)
             .no_proxy()
             .timeout(cfg.http_timeout)
             .build()?;

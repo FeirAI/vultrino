@@ -4967,12 +4967,15 @@ pub async fn deliver_outbox_periodically(
 ) {
     // A per-request timeout so one slow consumer can't stall the whole pass; the
     // lease (re-claimable once stale) covers an event whose POST times out.
-    let client = reqwest::Client::builder()
-        // Outbox payloads carry signed approval events: never via an ambient proxy (VUL-29).
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap_or_default();
+    let client = crate::plain_http::guard(
+        reqwest::Client::builder(),
+        config.url.as_deref().unwrap_or(""),
+    )
+    // Outbox payloads carry signed approval events: never via an ambient proxy (VUL-29).
+    .no_proxy()
+    .timeout(std::time::Duration::from_secs(15))
+    .build()
+    .unwrap_or_default();
     let mut ticks: u64 = 0;
     loop {
         tokio::time::sleep(interval).await;

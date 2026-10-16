@@ -541,14 +541,15 @@ between its own would slip past it: write the path and a trailing `*`
 (`https://api.example.com/v1/transfer*`); `vultrino policy fix-url-patterns`
 rewrites a stored one to that prefix form. The same widening also drops trailing
 `/` characters and `;name=value` path parameters (Java servlet containers and Spring
-route `/x;jsessionid=1` to `/x`). A Prompt under a single `not` is outside this (it
-prompts every URL except the pattern's). The widening of a Prompt rule can only turn
+route `/x;jsessionid=1` to `/x`), and reads `%2F` as `/` and collapses repeated `/`
+in the path (reverse proxies merge `//v1/refunds` into `/v1/refunds`). The widening of a Prompt rule can only turn
 an Allow into a Prompt, never a Deny into one: the exact-URL Prompt that govder compiles
 (an and of url and method, default deny) still prompts only on the exact URL, and its
-query and trailing-slash variants stay denied, as before. Spellings the widening does
-not cover still slip past a Deny pattern written without them: an empty path segment
-(`/x//y`), an encoded slash (`%2F`), a doubled trailing slash before a query, and any
-other rewrite a particular backend applies. The refusal is
+query and trailing-slash variants stay denied, as before. The wide reading of a Prompt
+rule does not charge its rate limit (only the exact reading does), so a request that ends
+Denied never uses up the slot. Spellings the widening does not cover still slip past a
+Deny pattern written without them: any other rewrite a particular backend applies
+(case folding of the path, unicode normalisation, backslashes). The refusal is
 as good as the warnings: a glob without a port that misses a non-default port is
 not refused.
 A glob whose host part holds `?`

@@ -533,6 +533,29 @@ fn strip_path_params(base: &str) -> String {
     }
 }
 
+/// The URL with `%2F` read as `/` and every run of `/` in its path collapsed to one, then
+/// canonicalised again so a dot segment the decoding exposes (`..%2Fadmin`) is resolved. Reverse
+/// proxies merge slashes (nginx `merge_slashes`) and some servers decode `%2F`, so
+/// `//v1/refunds` and `/v1%2Frefunds` reach `/v1/refunds` behind them (VUL-32). Wide reading only.
+fn fold_slashes(base: &str) -> String {
+    let (head, path) = match base.find("://").map(|i| i + 3) {
+        Some(a) => match base[a..].find('/') {
+            Some(i) => base.split_at(a + i),
+            None => return base.to_string(),
+        },
+        None => ("", base),
+    };
+    let decoded = path.replace("%2F", "/").replace("%2f", "/");
+    let mut out = String::with_capacity(decoded.len());
+    for c in decoded.chars() {
+        if !(c == '/' && out.ends_with('/')) {
+            out.push(c);
+        }
+    }
+    let joined = format!("{head}{out}");
+    canonical_url(&joined).unwrap_or(joined)
+}
+
 fn strip_segments(path: &str) -> String {
     path.split('/')
         .map(|seg| seg.split(';').next().unwrap_or(""))
@@ -579,6 +602,15 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool 
     bases.push(&no_params);
     let no_params_trimmed = no_params.trim_end_matches('/').to_string();
     bases.push(&no_params_trimmed);
+    let folded: Vec<String> = [base, &no_params]
+        .iter()
+        .flat_map(|b| {
+            let f = fold_slashes(b);
+            let t = f.trim_end_matches('/').to_string();
+            [f, t]
+        })
+        .collect();
+    bases.extend(folded.iter().map(String::as_str));
     bases.iter().any(|b| {
         cuts.iter()
             .any(|&at| canonical_matches(&format!("{b}{}", &query[..at]), &p))

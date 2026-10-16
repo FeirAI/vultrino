@@ -134,12 +134,6 @@ fn a_query_suffix_never_weakens_an_accepted_policy() {
             PolicyAction::Deny,
         ] {
             for shape in 0..5 {
-                // A Prompt under a single not is outside the property: it prompts every URL
-                // except the pattern's, so with a deny default the query form moves from the
-                // default Deny to Prompt. That is a different rule, not a slipped one.
-                if shape == 4 && action == PolicyAction::Prompt {
-                    continue;
-                }
                 for allow_rule in [false, true] {
                     for p in PATTERNS {
                         let mut pol = Policy::allow_all("p", "*");
