@@ -192,6 +192,10 @@ impl TryFrom<RawOutboxConfig> for crate::outbox::OutboxConfig {
                     "outbox: `url` is required when delivery is enabled".to_string(),
                 ));
             }
+            if let Some(u) = raw.url.as_deref() {
+                crate::plain_http::check(u)
+                    .map_err(|e| ConfigError::Invalid(format!("outbox: `url`: {e}")))?;
+            }
             if raw.hmac_secret.as_deref().unwrap_or("").trim().is_empty() {
                 return Err(ConfigError::Invalid(
                     "outbox: `hmac_secret` is required when delivery is enabled (deliveries are signed)".to_string(),
@@ -754,6 +758,13 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
                  duty requires an attributable approver)"
                     .to_string(),
             ));
+        }
+
+        // The webhook payload carries approve/deny capability links and an optional auth
+        // header: never over plain http:// to a public address (VUL-29).
+        if let Some(w) = &raw.webhook {
+            crate::plain_http::check(&w.url)
+                .map_err(|e| ConfigError::Invalid(format!("approvals.webhook: `url`: {e}")))?;
         }
 
         // Per-class SLA overrides — reject zero windows (a 0s window auto-denies

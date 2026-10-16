@@ -1,11 +1,11 @@
 diff --git a/src/policy/mod.rs b/src/policy/mod.rs
-index fd81f06..1ab3c1e 100644
+index d222db6..4f1f83e 100644
 --- a/src/policy/mod.rs
 +++ b/src/policy/mod.rs
-@@ -1025,10 +1025,7 @@ pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
-         let (action, found) = match rule.action {
-             PolicyAction::Deny => ("deny", first_warned_url_pattern(&rule.condition)),
-             PolicyAction::Prompt => ("prompt", first_warned_url_pattern(&rule.condition)),
+@@ -1053,10 +1053,7 @@ pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
+                     policy.default_action == PolicyAction::Deny,
+                 ),
+             ),
 -            PolicyAction::Allow => (
 -                "allow",
 -                first_negated_warned_url_pattern(&rule.condition, false),

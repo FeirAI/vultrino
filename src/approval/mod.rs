@@ -3102,8 +3102,11 @@ pub fn build_notifiers(cfg: &ApprovalConfig) -> Vec<std::sync::Arc<dyn ApprovalN
 /// the agent-egress private-IP SSRF resolver here. But we DO disable redirects: a 3xx
 /// from the configured endpoint must not carry the decision token / auth header to an
 /// unintended target (Codex medium).
-fn approval_notifier_client() -> reqwest::Client {
-    reqwest::Client::builder()
+fn approval_notifier_client(url: &str) -> reqwest::Client {
+    crate::plain_http::guard(reqwest::Client::builder(), url)
+        // Never an ambient HTTP_PROXY/HTTPS_PROXY: the payloads carry approve/deny capability
+        // tokens, which must not cross a proxy the operator did not name (VUL-29).
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         // Bound both connect and total time: a stalled Telegram/webhook endpoint
         // must never hang an approval-decision notification. This client never
@@ -3124,7 +3127,7 @@ impl TelegramNotifier {
     pub fn new(config: TelegramConfig) -> Self {
         Self {
             config,
-            client: approval_notifier_client(),
+            client: approval_notifier_client("https://api.telegram.org"),
         }
     }
 }
@@ -3260,8 +3263,8 @@ pub struct WebhookNotifier {
 impl WebhookNotifier {
     pub fn new(config: WebhookConfig) -> Self {
         Self {
+            client: approval_notifier_client(&config.url),
             config,
-            client: approval_notifier_client(),
         }
     }
 }

@@ -88,7 +88,7 @@ impl HmacPlugin {
     }
 
     /// Validate URL for SSRF protection
-    fn validate_url_ssrf(url_str: &str) -> Result<url::Url, PluginError> {
+    pub(crate) fn validate_url_ssrf(url_str: &str) -> Result<url::Url, PluginError> {
         let url = url::Url::parse(url_str)
             .map_err(|e| PluginError::InvalidParams(format!("Invalid URL: {}", e)))?;
 
@@ -119,15 +119,21 @@ impl HmacPlugin {
         let port = url.port_or_known_default().unwrap_or(443);
         let socket_addr = format!("{}:{}", host, port);
 
-        if let Ok(addrs) = socket_addr.to_socket_addrs() {
-            for addr in addrs {
-                if crate::plugins::HttpPlugin::is_private_ip(&addr.ip()) {
-                    return Err(PluginError::InvalidParams(format!(
-                        "Host '{}' resolves to private/internal IP address",
-                        host
-                    )));
+        match socket_addr.to_socket_addrs() {
+            Ok(addrs) => {
+                let mut any = false;
+                for addr in addrs {
+                    any = true;
+                    if crate::plugins::HttpPlugin::is_private_ip(&addr.ip()) {
+                        return Err(PluginError::InvalidParams(format!(
+                            "Host '{}' resolves to private/internal IP address",
+                            host
+                        )));
+                    }
                 }
+                crate::plugins::http::proxy_needs_resolution(any, host)?;
             }
+            Err(_) => crate::plugins::http::proxy_needs_resolution(false, host)?,
         }
 
         Ok(url)

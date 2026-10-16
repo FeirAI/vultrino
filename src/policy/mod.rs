@@ -21,7 +21,15 @@ pub use url_canon::{canonical_pattern, canonical_url, effective_url, policy_url,
 
 pub use types::*;
 
-use precedence::{decision_for, resolve_lazily, RuleOutcome};
+/// The exact, unbroadened `url_match` of a request URL against a pattern. Test support: the
+/// oracle in `tests/url_query_never_weakens.rs` compares the engine against rules that match
+/// exactly what they say.
+#[doc(hidden)]
+pub fn url_matches_exact(raw_url: &str, raw_pattern: &str) -> bool {
+    url_canon::url_matches_for(raw_url, raw_pattern, false)
+}
+
+use precedence::{decision_for, resolve_lazily, RuleOutcome, Verdict};
 
 use crate::RequestContext;
 use glob::Pattern;
@@ -30,7 +38,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use url_canon::url_matches;
+use url_canon::url_matches_for;
 
 /// Policy-related errors
 #[derive(Error, Debug)]
@@ -54,6 +62,28 @@ pub enum PolicyDecision {
     Deny(String),
     /// Request requires user prompt (future feature)
     Prompt,
+}
+
+/// Which components of an `eval_pair` result the caller reads.
+#[derive(Clone, Copy)]
+struct Want {
+    narrow: bool,
+    wide: bool,
+}
+
+impl Want {
+    const NARROW: Want = Want {
+        narrow: true,
+        wide: false,
+    };
+    const WIDE: Want = Want {
+        narrow: false,
+        wide: true,
+    };
+}
+
+fn same(v: bool) -> (bool, bool) {
+    (v, v)
 }
 
 /// What the execute path asks the engine to judge for one request (VUL-05).
@@ -640,6 +670,7 @@ impl PolicyEngine {
         // evaluated first and is authoritative). Making layered RateLimit Allow rules
         // conjunctive is tracked in LIMITATIONS.md.
         let mut deny_policy: Option<&str> = None;
+        let broadened_prompt = std::cell::Cell::new(false);
         let policy_defaults: Vec<PolicyAction> =
             matching_policies.iter().map(|p| p.default_action).collect();
         let kill = matching_policies.iter().any(|p| p.kill);
@@ -672,7 +703,37 @@ impl PolicyEngine {
                                     record, // check the cap on the live path; skip on resume
                                 )
                             }
-                            other => self.evaluate_condition(other, input, record),
+                            other => match rule.action {
+                                // Allow rules match exactly what they say.
+                                PolicyAction::Allow => {
+                                    self.eval_pair(other, input, record, Want::NARROW).0
+                                }
+                                // Deny rules are broadened: matching more is stricter.
+                                PolicyAction::Deny => {
+                                    self.eval_pair(other, input, record, Want::WIDE).1
+                                }
+                                // Prompt rules: an exact match is a Prompt. A match that
+                                // only the broadening produces is held back and used only
+                                // when the unbroadened verdict is Allow (VUL-32), so the
+                                // broadening can turn an Allow into a Prompt but never a
+                                // Deny into one.
+                                PolicyAction::Prompt => {
+                                    //
+                                    // The rate limit is charged by the unbroadened reading
+                                    // only, as before the broadening: a request that ends
+                                    // Denied through a URL variant must never burn the rule's
+                                    // slot. The wide reading runs without recording, so a
+                                    // rate limit counts as within its limit there (wider,
+                                    // fail-closed: it can only upgrade an Allow to a Prompt).
+                                    let narrow =
+                                        self.eval_pair(other, input, record, Want::NARROW).0;
+                                    if !narrow && self.eval_pair(other, input, false, Want::WIDE).1
+                                    {
+                                        broadened_prompt.set(true);
+                                    }
+                                    narrow
+                                }
+                            },
                         };
                         if matched {
                             if tier == RuleOutcome::Deny {
@@ -687,6 +748,15 @@ impl PolicyEngine {
             &policy_defaults,
             self.default_deny.load(Ordering::SeqCst),
         );
+        // VUL-32: the broadening of a Prompt rule only ever upgrades an Allow outcome.
+        let verdict = match verdict {
+            Verdict::Allow | Verdict::PolicyDefaultAllow | Verdict::EngineDefaultAllow
+                if broadened_prompt.get() =>
+            {
+                Verdict::Prompt
+            }
+            v => v,
+        };
         let default_deny_policy = matching_policies
             .iter()
             .find(|p| p.default_action == PolicyAction::Deny)
@@ -700,29 +770,46 @@ impl PolicyEngine {
     }
 
     /// Evaluate a single condition against the request input.
-    fn evaluate_condition(
+    ///
+    /// Returns `(narrow, wide)`. `narrow` is the condition as written. `wide` also lets a
+    /// `url_match` match the URL with its query removed or one trailing `/` dropped, so a
+    /// pattern written without a query (`/v1/*/delete`, `/admi[n]`) cannot be slipped past
+    /// by appending `?x=1` (VUL-32). `narrow` implies `wide` at every node: `Not` swaps and
+    /// inverts the pair. Only the components in `want` are guaranteed to be computed, and a
+    /// rate limit is charged at most once, only on a path a wanted component still reaches.
+    #[allow(clippy::only_used_in_recursion)]
+    fn eval_pair(
         &self,
         condition: &PolicyCondition,
         input: &EvalInput,
         record: bool,
-    ) -> bool {
+        want: Want,
+    ) -> (bool, bool) {
         match condition {
-            PolicyCondition::UrlMatch(pattern) => {
-                input.url.map(|u| url_matches(u, pattern)).unwrap_or(false)
-            }
+            PolicyCondition::UrlMatch(pattern) => match input.url {
+                Some(u) => {
+                    let narrow = url_matches_for(u, pattern, false);
+                    (narrow, narrow || url_matches_for(u, pattern, true))
+                }
+                None => (false, false),
+            },
 
-            PolicyCondition::MethodMatch(methods) => input
-                .method
-                .map(|m| methods.iter().any(|x| x.eq_ignore_ascii_case(m)))
-                .unwrap_or(false),
+            PolicyCondition::MethodMatch(methods) => same(
+                input
+                    .method
+                    .map(|m| methods.iter().any(|x| x.eq_ignore_ascii_case(m)))
+                    .unwrap_or(false),
+            ),
 
-            PolicyCondition::ActionMatch(pattern) => input
-                .action
-                .map(|a| match glob::Pattern::new(pattern) {
-                    Ok(p) => p.matches(a),
-                    Err(_) => pattern == a, // malformed glob -> exact-match fallback
-                })
-                .unwrap_or(false),
+            PolicyCondition::ActionMatch(pattern) => same(
+                input
+                    .action
+                    .map(|a| match glob::Pattern::new(pattern) {
+                        Ok(p) => p.matches(a),
+                        Err(_) => pattern == a, // malformed glob -> exact-match fallback
+                    })
+                    .unwrap_or(false),
+            ),
 
             PolicyCondition::TimeWindow { start, end } => {
                 let now = chrono::Local::now().time();
@@ -733,28 +820,26 @@ impl PolicyEngine {
                 // could NEVER match, silently failing an overnight Deny **open** —
                 // the dangerous direction. `start == end` is rejected at load
                 // (`Policy::validate`) as ambiguous (empty vs. all-day).
-                if start <= end {
+                same(if start <= end {
                     now >= *start && now <= *end
                 } else {
                     now >= *start || now <= *end
-                }
+                })
             }
 
-            PolicyCondition::RateLimit { max, window_secs } => {
-                if record {
-                    self.check_rate_limit(
-                        input.credential_alias,
-                        input.principal.map(rate_limit_principal),
-                        *max,
-                        *window_secs,
-                    )
-                } else {
-                    // Deferred (post-approval) evaluation: the slot was taken when
-                    // the request first opened the approval; re-applying the limit
-                    // would wrongly deny an already-approved action.
-                    true
-                }
-            }
+            PolicyCondition::RateLimit { max, window_secs } => same(if record {
+                self.check_rate_limit(
+                    input.credential_alias,
+                    input.principal.map(rate_limit_principal),
+                    *max,
+                    *window_secs,
+                )
+            } else {
+                // Deferred (post-approval) evaluation: the slot was taken when
+                // the request first opened the approval; re-applying the limit
+                // would wrongly deny an already-approved action.
+                true
+            }),
 
             PolicyCondition::SpendCap {
                 asset,
@@ -764,20 +849,49 @@ impl PolicyEngine {
                 // which Policy::validate rejects at load. Evaluate it purely as a
                 // safety net — the authoritative check is a top-level SpendCap rule
                 // in evaluate_inner.
-                self.spend_within_cap(input.spend, asset, *per_action_max, record)
+                same(self.spend_within_cap(input.spend, asset, *per_action_max, record))
             }
 
-            PolicyCondition::And(conditions) => conditions
-                .iter()
-                .all(|c| self.evaluate_condition(c, input, record)),
+            PolicyCondition::And(conditions) => {
+                let mut acc = (true, true);
+                for c in conditions {
+                    let r = self.eval_pair(c, input, record, want);
+                    acc = (acc.0 && r.0, acc.1 && r.1);
+                    // Stop once no wanted component can still be true.
+                    if !((want.narrow && acc.0) || (want.wide && acc.1)) {
+                        break;
+                    }
+                }
+                acc
+            }
 
-            PolicyCondition::Or(conditions) => conditions
-                .iter()
-                .any(|c| self.evaluate_condition(c, input, record)),
+            PolicyCondition::Or(conditions) => {
+                let mut acc = (false, false);
+                for c in conditions {
+                    let r = self.eval_pair(c, input, record, want);
+                    acc = (acc.0 || r.0, acc.1 || r.1);
+                    // Stop once every wanted component is already true.
+                    if (!want.narrow || acc.0) && (!want.wide || acc.1) {
+                        break;
+                    }
+                }
+                acc
+            }
 
-            PolicyCondition::Not(inner) => !self.evaluate_condition(inner, input, record),
+            PolicyCondition::Not(inner) => {
+                let (n, w) = self.eval_pair(
+                    inner,
+                    input,
+                    record,
+                    Want {
+                        narrow: want.wide,
+                        wide: want.narrow,
+                    },
+                );
+                (!w, !n)
+            }
 
-            PolicyCondition::Always => true,
+            PolicyCondition::Always => (true, true),
         }
     }
 
@@ -955,16 +1069,27 @@ fn contains_negated_url_match(c: &PolicyCondition, negated: bool) -> bool {
 
 /// The first `url_match` pattern in a condition tree that [`canonical_pattern`]
 /// warns about, at any depth (`and`, `or`, `not`), with its warnings.
-fn first_warned_url_pattern(c: &PolicyCondition) -> Option<(&str, url_canon::CanonPattern)> {
+fn first_warned_url_pattern(
+    c: &PolicyCondition,
+    exact_ok: bool,
+) -> Option<(&str, url_canon::CanonPattern)> {
     match c {
         PolicyCondition::UrlMatch(p) => {
-            let canon = canonical_pattern(p);
+            let mut canon = canonical_pattern(p);
+            if exact_ok {
+                canon.warnings.retain(|w| {
+                    !matches!(
+                        w,
+                        PatternWarning::ExactUrlMissesQuery | PatternWarning::QueryInPattern
+                    )
+                });
+            }
             (!canon.warnings.is_empty()).then_some((p.as_str(), canon))
         }
         PolicyCondition::And(v) | PolicyCondition::Or(v) => {
-            v.iter().find_map(first_warned_url_pattern)
+            v.iter().find_map(|c| first_warned_url_pattern(c, exact_ok))
         }
-        PolicyCondition::Not(b) => first_warned_url_pattern(b),
+        PolicyCondition::Not(b) => first_warned_url_pattern(b, exact_ok),
         _ => None,
     }
 }
@@ -1007,6 +1132,20 @@ fn pattern_warning_reason(w: &PatternWarning, canonical: &str) -> String {
         PatternWarning::Unparseable => "the pattern is not a parseable URL or path and is compared \
             as literal text"
             .to_string(),
+        PatternWarning::ExactUrlMissesQuery => "the pattern is an exact URL with no query, so the \
+            same URL with a query string appended (?x=1) is matched too on a deny or prompt rule, so \
+            this is refused as belt and braces; write the prefix form with a trailing * (for \
+            example https://api.example.com/admin*)"
+            .to_string(),
+        PatternWarning::QueryInPattern => "the pattern has a ?: a query in a pattern is slipped \
+            past by inserting or reordering a parameter (?x=1&confirm=true), and a bare ? matches \
+            neither the path nor the path with a query; write the path and a trailing * (for \
+            example https://api.example.com/v1/transfer*)"
+            .to_string(),
+        PatternWarning::BracesAreLiteral => "the pattern has { or }: a glob has no {a,b} \
+            alternation, the braces are literal and the pattern matches nothing; write one \
+            url_match per alternative inside an or"
+            .to_string(),
     }
 }
 
@@ -1024,8 +1163,19 @@ pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
         // An Allow rule is refused only when the warned pattern sits under an odd
         // number of `not`: there a dead pattern allows every URL (wave-1 close-out).
         let (action, found) = match rule.action {
-            PolicyAction::Deny => ("deny", first_warned_url_pattern(&rule.condition)),
-            PolicyAction::Prompt => ("prompt", first_warned_url_pattern(&rule.condition)),
+            PolicyAction::Deny => ("deny", first_warned_url_pattern(&rule.condition, false)),
+            // A Prompt on an exact URL (govder's compiled shape, an AND of action, URL and
+            // method) is safe in a default-deny policy: the same URL with a query appended
+            // matches nothing and falls to the deny default instead of skipping a gate. It
+            // is refused when the policy default is not deny (it would fall to allow or
+            // prompt). Another policy that allows the query form is not considered.
+            PolicyAction::Prompt => (
+                "prompt",
+                first_warned_url_pattern(
+                    &rule.condition,
+                    policy.default_action == PolicyAction::Deny,
+                ),
+            ),
             PolicyAction::Allow => (
                 "allow",
                 first_negated_warned_url_pattern(&rule.condition, false),
@@ -1055,6 +1205,91 @@ pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
 /// The error names every refused policy and the fix. Callers that load from the
 /// vault (`VultrinoServer::reload_policies`, the periodic refresh) call this
 /// before they apply anything, so a refused set never replaces the live one.
+/// Rewrite a stored policy's refused `url_match` patterns on Deny and Prompt rules into a form
+/// that matches at least what they read (`vultrino policy fix-url-patterns <id>`): an exact URL
+/// with no query becomes the prefix `<url>*` (it denies or prompts on more, never less) and a
+/// `{a,b}` alternation becomes an `or` of its alternatives. Returns the number of patterns
+/// rewritten. Errors, and stores nothing, when a refused pattern remains afterwards (for
+/// example a `*` in a host, which only the operator can fix).
+pub async fn fix_stored_policy_url_patterns(
+    storage: &dyn crate::storage::StorageBackend,
+    id: &str,
+) -> Result<usize, crate::VultrinoError> {
+    let Some(mut policy) = storage.get_policy(id).await? else {
+        return Err(crate::VultrinoError::InvalidRequest(format!(
+            "no stored policy with id '{id}'"
+        )));
+    };
+    let mut changed = 0usize;
+    for rule in policy.rules.iter_mut() {
+        let exact_ok =
+            rule.action == PolicyAction::Prompt && policy.default_action == PolicyAction::Deny;
+        if matches!(rule.action, PolicyAction::Deny | PolicyAction::Prompt) {
+            rule.condition = fix_condition(rule.condition.clone(), &mut changed, exact_ok);
+        }
+    }
+    refuse_warned_url_patterns(&policy).map_err(|e| {
+        crate::VultrinoError::InvalidRequest(format!(
+            "after the automatic rewrite a pattern is still refused and nothing was stored; edit \
+             the policy by hand: {e}"
+        ))
+    })?;
+    if changed > 0 {
+        storage.store_policy(&policy).await?;
+    }
+    Ok(changed)
+}
+
+fn fix_condition(c: PolicyCondition, changed: &mut usize, exact_ok: bool) -> PolicyCondition {
+    match c {
+        PolicyCondition::UrlMatch(p) => {
+            if url_canon::braces_are_literal(&p) {
+                if let Some(alts) = url_canon::expand_brace_alternation(&p) {
+                    *changed += 1;
+                    let each = alts
+                        .into_iter()
+                        .map(|a| fix_condition(PolicyCondition::UrlMatch(a), changed, exact_ok))
+                        .collect();
+                    return PolicyCondition::Or(each);
+                }
+                return PolicyCondition::UrlMatch(p);
+            }
+            if !exact_ok {
+                if let Some((head, _)) = p.split_once('?') {
+                    // A query in a pattern: the prefix up to it, denying or prompting on more.
+                    *changed += 1;
+                    return PolicyCondition::UrlMatch(format!("{head}*"));
+                }
+            }
+            if !exact_ok && url_canon::exact_url_misses_query(&p) {
+                *changed += 1;
+                return PolicyCondition::UrlMatch(format!("{p}*"));
+            }
+            PolicyCondition::UrlMatch(p)
+        }
+        PolicyCondition::And(v) => PolicyCondition::And(
+            v.into_iter()
+                .map(|c| fix_condition(c, changed, exact_ok))
+                .collect(),
+        ),
+        PolicyCondition::Or(v) => PolicyCondition::Or(
+            v.into_iter()
+                .map(|c| fix_condition(c, changed, exact_ok))
+                .collect(),
+        ),
+        // Under a `not` the direction flips: leave it for the operator.
+        other => other,
+    }
+}
+
+/// Every stored policy the servers would refuse to load, with the reason. `vultrino policy check`.
+pub fn stored_policy_refusals(stored: &[Policy]) -> Vec<String> {
+    stored
+        .iter()
+        .filter_map(Policy::stored_load_refusal)
+        .collect()
+}
+
 pub fn refuse_unloadable_stored_policies(stored: &[Policy]) -> Result<(), String> {
     let refusals: Vec<String> = stored
         .iter()
@@ -1102,6 +1337,11 @@ fn warn_url_patterns(policy: &Policy) {
                 PolicyCondition::UrlMatch(p) => {
                     let canon = canonical_pattern(p);
                     for w in &canon.warnings {
+                        // An exact URL on an allow rule allows less, never more: not a
+                        // risk worth a log line (under `not` the write path refuses it).
+                        if !refused_on_write && *w == PatternWarning::ExactUrlMissesQuery {
+                            continue;
+                        }
                         // The refresh loop reloads the same policies every
                         // interval: warn once per (policy, pattern, warning, rule kind).
                         static SEEN: std::sync::OnceLock<

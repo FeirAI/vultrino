@@ -88,7 +88,10 @@ A request that carries **no** principal never matches a policy that sets
 Restrict to specific URLs or patterns:
 
 ```toml
-# Exact match
+# Exact match (for an allow rule only: on a deny rule, and on a prompt rule in a policy
+# whose default is not deny, an exact URL with no query is refused when the policy is
+# written, and a stored one stops `vultrino web` from starting. Write the prefix form,
+# for example "https://api.github.com/user*")
 condition = { url_match = "https://api.github.com/user" }
 
 # Wildcard pattern
