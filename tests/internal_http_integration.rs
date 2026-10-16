@@ -1575,3 +1575,47 @@ async fn a_gated_internal_http_action_runs_when_the_approval_is_granted() {
         "the vault credential must be injected on the RESUME path too"
     );
 }
+
+/// VUL-32: what the sandbox receives is the canonical string policy judged, not a second
+/// spelling the `url` crate builds. A space in a `query` value is `%20` (the canonical form),
+/// not the form-encoded `+`, and a `*` is escaped the same way.
+#[tokio::test]
+async fn internal_http_sends_the_canonical_string_that_policy_judged() {
+    let (port, rec) = start_sandbox().await;
+    let (server, storage) = build_server(permissive_config(port)).await;
+    let token = seed(
+        &storage,
+        "finsandbox-refund",
+        Some("finsandbox"),
+        "money.refund",
+    )
+    .await;
+    run(
+        &server,
+        &token,
+        refund_request(
+            "finsandbox-refund",
+            serde_json::json!({
+                "url": "/v1/ledger",
+                "method": "GET",
+                "query": {"memo": "a b*c", "z": "1"}
+            }),
+        ),
+    )
+    .await
+    .expect("request succeeds");
+    let hits = rec.hits.lock().unwrap().clone();
+    let judged = vultrino::policy::effective_url(
+        "/v1/ledger",
+        &[
+            ("memo".to_string(), "a b*c".to_string()),
+            ("z".to_string(), "1".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+    assert_eq!(hits[0].1, judged, "sent bytes must equal the judged string");
+    assert!(hits[0].1.contains("a%20b"), "{}", hits[0].1);
+    assert!(!hits[0].1.contains('+'), "{}", hits[0].1);
+}

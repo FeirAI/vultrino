@@ -1,0 +1,13 @@
+diff --git a/src/plugins/internal_http.rs b/src/plugins/internal_http.rs
+index abd725f..9d8dd3d 100644
+--- a/src/plugins/internal_http.rs
++++ b/src/plugins/internal_http.rs
+@@ -542,7 +542,7 @@ impl InternalHttpPlugin {
+                     .to_string(),
+             )
+         })?;
+-        let target = Self::compose(dest, &judged)?;
++        let target = Self::compose(dest, &params.url)?;
+ 
+         // 4. Operator allowlists, on the NORMALIZED path.
+         if !dest.method_allowed(&method_str) {

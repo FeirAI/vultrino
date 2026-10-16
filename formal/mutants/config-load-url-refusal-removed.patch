@@ -1,0 +1,13 @@
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+index da5645d..13137e9 100644
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -603,7 +603,7 @@ impl Config {
+         for p in &policies {
+             p.validate().map_err(ConfigError::Invalid)?;
+             // VUL-32: the same url_match refusal the admin API applies on write.
+-            crate::policy::refuse_warned_url_patterns(p).map_err(ConfigError::Invalid)?;
++            let _ = crate::policy::refuse_warned_url_patterns(p);
+         }
+ 
+         let outbox = raw

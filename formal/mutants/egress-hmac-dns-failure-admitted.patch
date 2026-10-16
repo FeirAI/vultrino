@@ -1,0 +1,13 @@
+diff --git a/src/plugins/hmac.rs b/src/plugins/hmac.rs
+index ce0bd67..b29327f 100644
+--- a/src/plugins/hmac.rs
++++ b/src/plugins/hmac.rs
+@@ -133,7 +133,7 @@ impl HmacPlugin {
+                 }
+                 crate::plugins::http::proxy_needs_resolution(any, host)?;
+             }
+-            Err(_) => crate::plugins::http::proxy_needs_resolution(false, host)?,
++            Err(_) => {}
+         }
+ 
+         Ok(url)

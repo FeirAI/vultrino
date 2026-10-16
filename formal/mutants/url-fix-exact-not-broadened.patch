@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index d222db6..39dd4b9 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -1133,7 +1133,7 @@ fn fix_condition(c: PolicyCondition, changed: &mut usize, exact_ok: bool) -> Pol
+             }
+             if !exact_ok && url_canon::exact_url_misses_query(&p) {
+                 *changed += 1;
+-                return PolicyCondition::UrlMatch(format!("{p}*"));
++                return PolicyCondition::UrlMatch(p);
+             }
+             PolicyCondition::UrlMatch(p)
+         }

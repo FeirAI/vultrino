@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index 371a9b4..b7648dd 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -217,7 +217,7 @@ pub fn canonical_pattern(pattern: &str) -> CanonPattern {
+     if exact_url_misses_query(pattern) {
+         canon.warnings.push(PatternWarning::ExactUrlMissesQuery);
+     }
+-    if pattern.contains('?') {
++    if false && pattern.contains('?') {
+         canon.warnings.push(PatternWarning::QueryInPattern);
+     }
+     canon

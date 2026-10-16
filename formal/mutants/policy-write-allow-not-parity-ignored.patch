@@ -1,8 +1,8 @@
 diff --git a/src/policy/mod.rs b/src/policy/mod.rs
-index fd81f06..37139b9 100644
+index d222db6..7b38816 100644
 --- a/src/policy/mod.rs
 +++ b/src/policy/mod.rs
-@@ -982,7 +982,7 @@ fn first_negated_warned_url_pattern(
+@@ -991,7 +991,7 @@ fn first_negated_warned_url_pattern(
          PolicyCondition::And(v) | PolicyCondition::Or(v) => v
              .iter()
              .find_map(|x| first_negated_warned_url_pattern(x, negated)),
