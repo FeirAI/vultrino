@@ -596,21 +596,14 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool 
     // and Spring drop `;name=value` path parameters (`/x;jsessionid=1` reaches `/x`), so the
     // path without them is judged as well.
     let no_params = strip_path_params(base);
-    let mut bases: Vec<&str> = vec![base];
-    bases.extend(base.strip_suffix('/'));
-    bases.push(base.trim_end_matches('/'));
-    bases.push(&no_params);
-    let no_params_trimmed = no_params.trim_end_matches('/').to_string();
-    bases.push(&no_params_trimmed);
-    let folded: Vec<String> = [base, &no_params]
-        .iter()
-        .flat_map(|b| {
-            let f = fold_slashes(b);
-            let t = f.trim_end_matches('/').to_string();
-            [f, t]
-        })
-        .collect();
-    bases.extend(folded.iter().map(String::as_str));
+    let folded = fold_slashes(base);
+    let folded_no_params = fold_slashes(&no_params);
+    let mut bases: Vec<String> = Vec::new();
+    for b in [base, &no_params, &folded, &folded_no_params] {
+        bases.push(b.to_string());
+        bases.extend(b.strip_suffix('/').map(str::to_string));
+        bases.push(b.trim_end_matches('/').to_string());
+    }
     bases.iter().any(|b| {
         cuts.iter()
             .any(|&at| canonical_matches(&format!("{b}{}", &query[..at]), &p))
