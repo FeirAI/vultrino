@@ -1,0 +1,17 @@
+diff --git a/src/main.rs b/src/main.rs
+index 4333389..7c989b6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1756,11 +1756,7 @@ fn refuse_identity_without_key(config: &Config) -> Result<(), Box<dyn std::error
+             }
+         }
+     }
+-    if config
+-        .identity
+-        .as_ref()
+-        .is_some_and(|i| i.verification_key.is_none())
+-    {
++    if false {
+         return Err(
+             "[identity] is enabled but VULTRINO_IDENTITY_SECRET (or _FILE) is not set: the \
+              inbound identity header cannot be verified, so vultrino refuses to start. Set \

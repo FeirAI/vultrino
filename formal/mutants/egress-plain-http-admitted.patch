@@ -1,0 +1,13 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 625ff70..5a207fe 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -1026,7 +1026,7 @@ impl HttpPlugin {
+         // http:// request would put the credential on the public network in clear text,
+         // whether it goes direct or through a proxy, so it is refused in every mode.
+         // Operator-pinned internal destinations use the internal_http plugin instead.
+-        if url.scheme() == "http" {
++        if false {
+             return Err(PluginError::InvalidParams(
+                 "plain http:// is refused: this plugin sends a credential, which must not \
+                  cross a public network in clear text. Use https://."

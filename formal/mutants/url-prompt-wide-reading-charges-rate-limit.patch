@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 45888b9..16996b3 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -727,7 +727,7 @@ impl PolicyEngine {
+                                     // fail-closed: it can only upgrade an Allow to a Prompt).
+                                     let narrow =
+                                         self.eval_pair(other, input, record, Want::NARROW).0;
+-                                    if !narrow && self.eval_pair(other, input, false, Want::WIDE).1
++                                    if !narrow && self.eval_pair(other, input, record, Want::WIDE).1
+                                     {
+                                         broadened_prompt.set(true);
+                                     }

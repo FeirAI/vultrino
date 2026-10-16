@@ -333,6 +333,8 @@ pub enum AverinError {
     MissingBaseUrl,
     #[error("averin resource_id is required when [averin] enabled = true")]
     MissingResourceId,
+    #[error("averin base_url refused: {0}")]
+    PlainHttp(String),
     #[error("http client build failed: {0}")]
     HttpBuild(#[source] reqwest::Error),
     #[error("averin request failed: {0}")]
@@ -444,7 +446,13 @@ impl AverinClient {
         if cfg.resource_id.trim().is_empty() {
             return Err(AverinError::MissingResourceId);
         }
-        let http = reqwest::Client::builder()
+        // The API key travels in the Authorization header: never over plain http:// to a public
+        // address (VUL-29).
+        crate::plain_http::check(&cfg.base_url).map_err(AverinError::PlainHttp)?;
+        let http = crate::plain_http::guard(reqwest::Client::builder(), &cfg.base_url)
+            // The averin API key travels in the Authorization header: never to an ambient
+            // HTTP_PROXY / HTTPS_PROXY / ALL_PROXY (VUL-29).
+            .no_proxy()
             .timeout(cfg.timeout)
             .build()
             .map_err(AverinError::HttpBuild)?;

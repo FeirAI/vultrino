@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index d222db6..cb8c28a 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -1050,7 +1050,7 @@ pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
+                 "prompt",
+                 first_warned_url_pattern(
+                     &rule.condition,
+-                    policy.default_action == PolicyAction::Deny,
++                    false,
+                 ),
+             ),
+             PolicyAction::Allow => (
