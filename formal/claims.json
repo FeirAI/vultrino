@@ -3205,6 +3205,11 @@
           "path": "src/govder/mod.rs",
           "symbol": "GovderClient::new",
           "sha256": "e9358d7e185f0fc33dddbe40ff6964d64e5b8c356dbccaf972556288f0408aaf"
+        },
+        {
+          "path": "src/config/types.rs",
+          "symbol": "ApprovalConfig::try_from",
+          "sha256": "f681ba90e4aeed2df6e0bdd2d5c0038b7548cadbbc3d2264b4a8dfcddbe17c8c"
         }
       ],
       "mutants": [
