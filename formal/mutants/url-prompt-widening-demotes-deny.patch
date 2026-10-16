@@ -1,13 +1,13 @@
 diff --git a/src/policy/mod.rs b/src/policy/mod.rs
-index d4596c1..63a52bc 100644
+index 45888b9..28845c9 100644
 --- a/src/policy/mod.rs
 +++ b/src/policy/mod.rs
-@@ -727,7 +727,7 @@ impl PolicyEngine {
-                                     if !narrow && wide {
+@@ -731,7 +731,7 @@ impl PolicyEngine {
+                                     {
                                          broadened_prompt.set(true);
                                      }
 -                                    narrow
-+                                    narrow || wide
++                                    narrow || self.eval_pair(other, input, false, Want::WIDE).1
                                  }
                              },
                          };

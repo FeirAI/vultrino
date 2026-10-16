@@ -1,15 +1,13 @@
 diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
-index 0638dde..03bb3bd 100644
+index 7226986..2d726dd 100644
 --- a/src/policy/url_canon.rs
 +++ b/src/policy/url_canon.rs
-@@ -576,8 +576,8 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool
-     let mut bases: Vec<&str> = vec![base];
-     bases.extend(base.strip_suffix('/'));
-     bases.push(base.trim_end_matches('/'));
--    bases.push(&no_params);
--    let no_params_trimmed = no_params.trim_end_matches('/').to_string();
-+
-+    let no_params_trimmed = base.trim_end_matches('/').to_string();
-     bases.push(&no_params_trimmed);
-     bases.iter().any(|b| {
-         cuts.iter()
+@@ -595,7 +595,7 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool
+     // is judged too (one, or all of them), with and without the query. Servlet containers
+     // and Spring drop `;name=value` path parameters (`/x;jsessionid=1` reaches `/x`), so the
+     // path without them is judged as well.
+-    let no_params = strip_path_params(base);
++    let no_params = base.to_string();
+     let folded = fold_slashes(base);
+     let folded_no_params = fold_slashes(&no_params);
+     let mut bases: Vec<String> = Vec::new();
