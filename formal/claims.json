@@ -3225,7 +3225,7 @@
         "egress-webhook-url-unchecked"
       ],
       "does_not_establish": "That a proxy chosen with VULTRINO_UPSTREAM_PROXY behaves: it resolves the target host itself, so the connect-time resolver guard does not cover that hop (the admission-time URL check still runs) and the operator trusts the proxy, and a CA named with VULTRINO_UPSTREAM_PROXY_CA_FILE is trusted for every https target of the guarded client while the proxy is set. The https route through a real CONNECT tunnel is not exercised by this detector, only that the client hands https targets to the proxy and that the CA settings fail closed; the four-plane credential-canary e2e drives real tunnels with a test CA. The plain http:// refusal for agent-chosen URLs is on HttpPlugin::validate_url_ssrf (the http plugin, which the LLM proxy and capabilities use); for the operator-configured endpoints it is plain_http::check at build or config load plus the connect-time private-only resolver. A private or loopback http:// endpoint is still allowed and carries its secret in clear text on that network (a compose network or loopback), and a name that resolves to a private address and an https certificate are not otherwise validated. The scan of client builders is textual, like the no_proxy scan, and the request CLI is checked by a source assertion, not by running it. The no_proxy scan is a textual scan of the non-test source for a client builder, so a client built some other way (a helper that constructs the builder elsewhere, a WASM plugin's egress) is not covered, and it shows the call is present, not that each client is exercised with an ambient proxy set. The wiring of the guarded client is shown on the shared builder, not on each plugin that calls it. The window between vultrino's lookup and the proxy's own lookup is not closed: a name that resolves here can resolve to an internal address at the proxy. The OAuth token-URL check shares the helper but is not shown by this detector.",
-      "evidence_run": "38762181897"
+      "evidence_run": "38834394415"
     },
     {
       "id": "request-log-no-capability-token",
@@ -3502,7 +3502,7 @@
         "url-slash-fold-not-tried"
       ],
       "does_not_establish": "Only the listed patterns, URLs and shapes, not every pattern; a property of the engine decision, not a proof. A pattern holding a ? is refused on Deny and Prompt rules, not matched; an Allow rule with a ? is accepted and only narrows. Trailing slashes, ;name=value path parameters, repeated / and %2F are tried; any other rewrite a particular backend applies (case folding of the path, unicode normalisation, backslashes) is not, so a Deny pattern can still be slipped past by those spellings. A server that treats the trailing-slash path as a different resource is over-denied, not under-denied. The Prompt widening can upgrade an Allow to a Prompt, so a request an Allow rule alone would have let through can reach an approver. A Prompt rule's exact reading charges its rate limit once and its wide reading does not charge, so under the wide reading a rate limit counts as within its limit (wider, fail-closed); a widened Prompt match that turns an Allow into a Prompt has already charged the Allow rule's rate limit. Other policies and rule kinds (rate limits, principal or time conditions) are not in the grid. Which deployed vaults hold a policy relying on the old narrower matching is not checked.",
-      "evidence_run": "38762181897"
+      "evidence_run": "38834394415"
     }
   ]
 }
