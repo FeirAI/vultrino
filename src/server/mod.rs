@@ -166,9 +166,14 @@ enum EffectiveEvidenceFloor {
 }
 
 impl EffectiveEvidenceFloor {
-    fn from_config(cfg: &crate::config::Config) -> Self {
+    /// `client_present` is whether a live Averin client was built from the config. Without
+    /// one there is no evidence path at all (no seal, no degraded alarm, no counter), so the
+    /// routine fallback is not available and the committed-evidence floor stands.
+    fn from_config(cfg: &crate::config::Config, client_present: bool) -> Self {
         use crate::averin::D8EvidenceFloor;
-        if cfg.averin.d8_complete_evidence
+        if client_present
+            && cfg.averin.enabled
+            && cfg.averin.d8_complete_evidence
             && cfg.averin.d8_evidence_floor == D8EvidenceFloor::MoneyAndIrreversible
         {
             Self::MoneyAndIrreversible
@@ -1808,7 +1813,10 @@ impl VultrinoServer {
             action_label.as_deref(),
         ]);
         let evidence_required = irreversibility
-            .requires_committed_evidence(EffectiveEvidenceFloor::from_config(&self.config), money);
+            .requires_committed_evidence(
+            EffectiveEvidenceFloor::from_config(&self.config, self.averin.is_some()),
+            money,
+        );
 
         // VUL-05: the pure admission gate decides between direct execution,
         // human approval and refusal from the evaluation and `needs_approval`.
@@ -3873,7 +3881,7 @@ impl VultrinoServer {
             Some(approval.action.as_str()),
             approval.action_label.as_deref(),
         ]);
-        let floor = EffectiveEvidenceFloor::from_config(&self.config);
+        let floor = EffectiveEvidenceFloor::from_config(&self.config, self.averin.is_some());
         let evidence_required = match approval.capability_authority() {
             Some(CapabilityAuthorityClass::HumanFloor)
             | Some(CapabilityAuthorityClass::AmbiguousCanonical) => true,

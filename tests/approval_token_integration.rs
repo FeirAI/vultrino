@@ -1171,6 +1171,15 @@ async fn floor_run(
     reversibility: &str,
     floor: D8EvidenceFloor,
 ) -> (bool, String, usize, u64) {
+    floor_run_url(label, reversibility, floor, "http://127.0.0.1:9").await
+}
+
+async fn floor_run_url(
+    label: Option<&str>,
+    reversibility: &str,
+    floor: D8EvidenceFloor,
+    base_url: &str,
+) -> (bool, String, usize, u64) {
     let f = open_approved_fixture_floor(
         label,
         reversibility,
@@ -1178,7 +1187,7 @@ async fn floor_run(
         Some(AverinMode::Observe),
         true,
         floor,
-        "http://127.0.0.1:9".to_string(),
+        base_url.to_string(),
     )
     .await;
     let resumed = f
@@ -1226,6 +1235,26 @@ async fn default_floor_degrades_a_partially_reversible_write_but_refuses_money_a
         &floor_run(Some("money.notify"), "partially-reversible", d).await,
         "money.notify (partially-reversible, money class)",
     );
+    // A reversible-class money action never degrades either.
+    assert_floor_refused(
+        &floor_run(Some("money.refund"), "reversible", d).await,
+        "money.refund (reversible, money class)",
+    );
+}
+
+/// With no Averin client (empty base_url, so none is built) there is no evidence path at all:
+/// the routine fallback must not run the action silently, in the default mode too.
+#[tokio::test]
+async fn default_floor_refuses_a_partially_reversible_write_when_no_averin_client_exists() {
+    let r = floor_run_url(
+        Some("session.update"),
+        "partially-reversible",
+        D8EvidenceFloor::MoneyAndIrreversible,
+        "",
+    )
+    .await;
+    assert!(!r.0, "must be refused with no evidence client");
+    assert_eq!((r.2, r.3), (0, 0), "nothing may run or degrade");
 }
 
 #[tokio::test]
@@ -1242,6 +1271,10 @@ async fn human_floor_mode_refuses_every_partially_reversible_action() {
     assert_floor_refused(
         &floor_run(Some("session.cancel"), "irreversible", h).await,
         "irreversible",
+    );
+    assert_floor_refused(
+        &floor_run(Some("money.refund"), "reversible", h).await,
+        "money.refund (reversible, money class)",
     );
     // Reversible keeps running in both modes.
     let r = floor_run(Some("data.read"), "reversible", h).await;

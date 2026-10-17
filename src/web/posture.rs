@@ -18,6 +18,11 @@ pub const POSTURE_SCHEMA: u32 = 1;
 /// `default_deny` is the policy engine's live default (set from `[enforcement] default_action`),
 /// `policies` the policies the engine enforces right now (config plus stored).
 pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Policy]) -> Value {
+    // Same condition the server uses to build its Averin client.
+    let averin_client_present = matches!(
+        crate::averin::AverinClient::new(config.averin.clone()),
+        Ok(Some(_))
+    );
     let key = config.govder.as_ref().map(|g| g.approval_key_posture());
     let mut observe_tenants: Vec<&str> = config
         .tenants
@@ -84,7 +89,10 @@ pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Pol
             "d8_complete_evidence": config.averin.d8_complete_evidence,
             // VUL-38: the configured floor; it only takes effect with d8_complete_evidence on.
             "d8_evidence_floor": config.averin.d8_evidence_floor.as_str(),
-            "d8_evidence_floor_effective": if config.averin.d8_complete_evidence {
+            // Effective only with a live client, enabled and d8_complete_evidence on.
+            "d8_evidence_floor_effective": if averin_client_present
+                && config.averin.d8_complete_evidence
+            {
                 config.averin.d8_evidence_floor.as_str()
             } else {
                 "human_floor"
@@ -154,7 +162,7 @@ mod tests {
         assert_eq!(v["averin"]["d8_evidence_floor_effective"], "human_floor");
         let cfg = Config::parse(
             "[averin]\nenabled = true\nbase_url = \"http://127.0.0.1:1\"\n\
-             d8_complete_evidence = true\n",
+             resource_id = \"r\"\nd8_complete_evidence = true\n",
         )
         .unwrap();
         let v = build_posture(&cfg, true, &[]);
@@ -162,6 +170,17 @@ mod tests {
             v["averin"]["d8_evidence_floor_effective"],
             "money_and_irreversible"
         );
+        // No client can be built (resource_id empty, or averin disabled): there is no evidence
+        // path, so the configured floor is not in force and the report says human_floor.
+        for toml in [
+            "[averin]\nenabled = true\nbase_url = \"http://127.0.0.1:1\"\n\
+             d8_complete_evidence = true\n",
+            "[averin]\nenabled = false\nbase_url = \"http://127.0.0.1:1\"\n\
+             resource_id = \"r\"\nd8_complete_evidence = true\n",
+        ] {
+            let v = build_posture(&Config::parse(toml).unwrap(), true, &[]);
+            assert_eq!(v["averin"]["d8_evidence_floor_effective"], "human_floor");
+        }
     }
 
     #[test]
