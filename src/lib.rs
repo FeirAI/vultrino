@@ -705,6 +705,36 @@ pub struct Credential {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Credential metadata key holding the operator-set Anthropic workspace id. An
+/// org-level (not workspace-scoped) Anthropic key needs an `anthropic-workspace-id`
+/// header; billing, rate limits and data retention are per workspace, so the value
+/// belongs to the credential, never to the agent. See
+/// [`plugins::apply_workspace_scope`].
+pub const ANTHROPIC_WORKSPACE_META: &str = "anthropic_workspace_id";
+
+/// Whether `id` is an acceptable Anthropic workspace id: `wrkspc_` then 8 to 64
+/// ASCII letters or digits. Strict on purpose: the value becomes an HTTP header
+/// value, so whitespace, control characters and separators are refused.
+pub fn is_valid_anthropic_workspace_id(id: &str) -> bool {
+    match id.strip_prefix("wrkspc_") {
+        Some(rest) => {
+            (8..=64).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// Validate one credential metadata entry at write time (CLI `vultrino meta
+/// set`, `POST /api/v1/credentials`). Only keys with a format contract are checked.
+pub fn validate_credential_metadata_entry(key: &str, value: &str) -> Result<(), String> {
+    if key == ANTHROPIC_WORKSPACE_META && !is_valid_anthropic_workspace_id(value) {
+        return Err(format!(
+            "metadata {ANTHROPIC_WORKSPACE_META} must be 'wrkspc_' followed by 8 to 64 ASCII letters or digits"
+        ));
+    }
+    Ok(())
+}
+
 /// Whether a `UrlToken` secret can be put into a URL path without changing the URL's
 /// structure (VUL-32). A `/`, `?`, `#` or `\\` would add a path segment, start a query or a
 /// fragment, and whitespace or a control character is re-encoded or stripped, so the bytes sent

@@ -73,6 +73,12 @@ pub enum PluginError {
     #[error("Invalid parameters: {0}")]
     InvalidParams(String),
 
+    /// The credential's own stored configuration is unusable (for example an
+    /// invalid `anthropic_workspace_id`). An operator problem, not the caller's
+    /// parameters and not an upstream failure; refused before any upstream call.
+    #[error("Credential configuration error: {0}")]
+    CredentialConfig(String),
+
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
 
@@ -93,6 +99,60 @@ pub enum PluginError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Header carrying the Anthropic workspace id. Operator-owned: never taken from a caller.
+pub const ANTHROPIC_WORKSPACE_HEADER: &str = "anthropic-workspace-id";
+
+/// Make the `anthropic-workspace-id` header on an outgoing request the operator's, on
+/// every path that reaches a plugin (`/llm`, `/api/v1/execute`, MCP `http_request`,
+/// approval replay). Any caller-supplied header of that name is removed first
+/// (case-insensitively); then the value stored on the credential
+/// (`anthropic_workspace_id` metadata), if any, is written. A credential with none
+/// sends none, so a key spanning several workspaces fails closed at the provider
+/// rather than letting the caller choose one. A stored value that is not a valid
+/// workspace id is refused (`Err`), never written into a header.
+pub fn apply_workspace_scope(
+    headers: &mut std::collections::HashMap<String, String>,
+    metadata: &std::collections::HashMap<String, String>,
+) -> Result<(), PluginError> {
+    headers.retain(|k, _| !k.eq_ignore_ascii_case(ANTHROPIC_WORKSPACE_HEADER));
+    if let Some(ws) = metadata.get(crate::ANTHROPIC_WORKSPACE_META) {
+        if !crate::is_valid_anthropic_workspace_id(ws) {
+            return Err(PluginError::CredentialConfig(format!(
+                "credential metadata {} is not a valid workspace id",
+                crate::ANTHROPIC_WORKSPACE_META
+            )));
+        }
+        headers.insert(ANTHROPIC_WORKSPACE_HEADER.to_string(), ws.clone());
+    }
+    Ok(())
+}
+
+/// [`apply_workspace_scope`] on a plugin request's `params.headers` (JSON object),
+/// when the params carry one. Other param shapes are left to the plugin's own
+/// parameter validation.
+pub fn apply_workspace_scope_to_params(
+    params: &mut serde_json::Value,
+    metadata: &std::collections::HashMap<String, String>,
+) -> Result<(), PluginError> {
+    let Some(obj) = params.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(serde_json::Value::Object(h)) = obj.get_mut("headers") {
+        h.retain(|k, _| !k.eq_ignore_ascii_case(ANTHROPIC_WORKSPACE_HEADER));
+    }
+    let mut ours = std::collections::HashMap::new();
+    apply_workspace_scope(&mut ours, metadata)?;
+    if let Some(ws) = ours.remove(ANTHROPIC_WORKSPACE_HEADER) {
+        let h = obj
+            .entry("headers")
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        if let serde_json::Value::Object(h) = h {
+            h.insert(ANTHROPIC_WORKSPACE_HEADER.to_string(), ws.into());
+        }
+    }
+    Ok(())
 }
 
 /// Request to a plugin

@@ -4433,6 +4433,14 @@ pub async fn api_create_credential(
                 serde_json::json!({"code":"invalid_credential","error":"alias must not be empty"}),
             );
         }
+        for (k, v) in &req.metadata {
+            if let Err(e) = crate::validate_credential_metadata_entry(k, v) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"code":"invalid_credential","error": e}),
+                );
+            }
+        }
         // Seed-time validation, BOTH halves. The structural pass
         // (`validate_vault_shape`: no blank required field, no empty secret) is
         // the one that otherwise runs only at vault OPEN, where it is fatal to
