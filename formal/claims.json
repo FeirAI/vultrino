@@ -2473,12 +2473,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "f2263d493b2ba62bf93c1cb95e9e109b6c53e048cc4429fe786663cb18271784"
+          "sha256": "5e4de6d9405a64d629a1b57336c5f07da7fcf80c5b223005058c470f6df2049d"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "4a3163f0ad23cac8208d80193fbf04e1e62716bc506038bc6dfa0d0018445fe9"
+          "sha256": "ea0a1b068599318776348fcc1675a8bbacebfc91b23f5ea6067c2016d6c2ec15"
         },
         {
           "path": "src/server/mod.rs",
@@ -3569,6 +3569,11 @@
           "path": "src/lib.rs",
           "symbol": "validate_credential_metadata_entry",
           "sha256": "03d29f336aa209d2625c5e2ae85a34903bd67ccfaf3c6ed776f1a2902af384ee"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action",
+          "sha256": "ea0a1b068599318776348fcc1675a8bbacebfc91b23f5ea6067c2016d6c2ec15"
         }
       ],
       "mutants": [
