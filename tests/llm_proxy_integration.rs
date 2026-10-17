@@ -117,6 +117,7 @@ impl Plugin for MockLlmPlugin {
                 "object": "chat.completion",
                 "provider_key_echo": injected_key,
                 "received_max_tokens": received_max_tokens,
+                "received_headers": request.params.get("headers").cloned().unwrap_or(serde_json::Value::Null),
                 "choices": [{ "message": { "role": "assistant", "content": "hi" } }],
                 "usage": { "prompt_tokens": 57, "completion_tokens": 13, "total_tokens": 70 }
             })
@@ -1834,4 +1835,113 @@ async fn sb02_streamed_compressed_short_minted_token_withholds_like_buffered() {
         CredentialType::OAuth2,
         "the minted credential must be persisted even when the response is withheld"
     );
+}
+
+// ===========================================================================
+// Gateway-owned anthropic-workspace-id (FeirAI/vultrino#76, feir-ops#2).
+// ===========================================================================
+
+const WORKSPACE_ID: &str = "wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ";
+
+/// Run one `anthropic-messages` /llm call through the mock upstream with the given
+/// configured workspace id and optional client-sent workspace header; returns the
+/// headers the upstream plugin actually received.
+async fn run_anthropic_workspace(
+    configured: Option<&str>,
+    client_header: Option<&str>,
+) -> serde_json::Value {
+    let (status, h) = run_anthropic_workspace_raw(configured, client_header, true).await;
+    assert_eq!(status, StatusCode::OK);
+    h
+}
+
+async fn run_anthropic_workspace_raw(
+    configured: Option<&str>,
+    client_header: Option<&str>,
+    validate: bool,
+) -> (StatusCode, serde_json::Value) {
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    unsafe { std::env::set_var("VULTRINO_PROVIDER_ANTHROPIC_ENABLED", "true") };
+    srv.plugins().register(Arc::new(MockLlmPlugin));
+    store_provider_credential(&storage, "cred-anthropic").await;
+    let cap = Capability {
+        id: "cap-llm".to_string(),
+        tool_name: "model_proxy".to_string(),
+        description: "anthropic channel".to_string(),
+        action: "mockllm.chat".to_string(),
+        plugin: None,
+        target: CapabilityTarget::default(),
+        credential_ref: "cred-anthropic".to_string(),
+        input_schema: serde_json::Value::Null,
+        reversibility: "reversible".to_string(),
+        llm: Some(LlmProxy {
+            protocol: "anthropic-messages".to_string(),
+            provider_base: "https://api.anthropic.com".to_string(),
+            anthropic_workspace_id: configured.map(str::to_string),
+            ..Default::default()
+        }),
+        approval_preview: None,
+    };
+    if validate {
+        cap.validate().unwrap();
+    }
+    storage.store_capability(&cap).await.unwrap();
+    let token = mint_token(&storage, "cred-anthropic", Some("mockllm.chat")).await;
+    let mut req = llm_req(
+        Some(&token),
+        "v1/messages",
+        serde_json::json!({ "model": "claude-haiku-4-5", "max_tokens": 16, "messages": [] }),
+    );
+    req.headers_mut()
+        .insert("anthropic-version", "2023-06-01".parse().unwrap());
+    if let Some(v) = client_header {
+        req.headers_mut()
+            .insert("anthropic-workspace-id", v.parse().unwrap());
+    }
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let returned: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    (status, returned["received_headers"].clone())
+}
+
+#[tokio::test]
+async fn anthropic_workspace_id_configured_is_injected_upstream() {
+    let h = run_anthropic_workspace(Some(WORKSPACE_ID), None).await;
+    assert_eq!(h["anthropic-workspace-id"], WORKSPACE_ID);
+    assert_eq!(
+        h["anthropic-version"], "2023-06-01",
+        "allowlisted headers still pass"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_workspace_id_client_header_cannot_override_the_configured_one() {
+    let h = run_anthropic_workspace(Some(WORKSPACE_ID), Some("wrkspc_attacker0000000")).await;
+    assert_eq!(h["anthropic-workspace-id"], WORKSPACE_ID);
+}
+
+#[tokio::test]
+async fn anthropic_workspace_id_client_header_is_dropped_when_none_configured() {
+    let h = run_anthropic_workspace(None, Some("wrkspc_attacker0000000")).await;
+    let obj = h.as_object().unwrap();
+    assert!(
+        !obj.keys()
+            .any(|k| k.eq_ignore_ascii_case("anthropic-workspace-id")),
+        "a client-sent workspace id must never reach upstream: {h}"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_workspace_id_unset_adds_no_header() {
+    let h = run_anthropic_workspace(None, None).await;
+    assert!(h.get("anthropic-workspace-id").is_none());
+}
+
+#[tokio::test]
+async fn anthropic_workspace_id_invalid_stored_value_refuses_before_upstream() {
+    let (status, h) =
+        run_anthropic_workspace_raw(Some("not a workspace\r\nx-evil: 1"), None, false).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(h.is_null(), "no upstream call may happen: {h}");
 }

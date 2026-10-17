@@ -147,6 +147,29 @@ fn forward_provider_headers(inbound: &HeaderMap, fwd: &mut HashMap<String, Strin
     }
 }
 
+/// Header carrying the Anthropic workspace id. Gateway-owned: it is deliberately
+/// NOT in [`FORWARDED_PROVIDER_HEADERS`].
+const ANTHROPIC_WORKSPACE_HEADER: &str = "anthropic-workspace-id";
+
+/// Apply the operator-set, gateway-owned headers AFTER the client's. Any client
+/// value for a gateway-owned header is removed first (case-insensitively), then the
+/// configured value is written, so the agent can never choose or override it.
+fn apply_gateway_headers(
+    capability: &crate::capability::Capability,
+    fwd: &mut HashMap<String, String>,
+) -> Result<(), ()> {
+    fwd.retain(|k, _| !k.eq_ignore_ascii_case(ANTHROPIC_WORKSPACE_HEADER));
+    if let Some(ws) = capability.llm_anthropic_workspace_id() {
+        // Re-check at use time: a stored capability is validated at write, but a
+        // value that reached the vault another way must still never become a header.
+        if !crate::capability::is_valid_anthropic_workspace_id(ws) {
+            return Err(());
+        }
+        fwd.insert(ANTHROPIC_WORKSPACE_HEADER.to_string(), ws.to_string());
+    }
+    Ok(())
+}
+
 /// Whether the RESOLVED UPSTREAM URL targets an OpenAI **chat/completions**-style
 /// endpoint (so `stream_options.include_usage` injection is appropriate). Matches
 /// `…/chat/completions` and the legacy `…/completions`; excludes `/v1/responses` and
@@ -716,6 +739,14 @@ async fn llm_proxy_impl(
     let mut fwd_headers: HashMap<String, String> = HashMap::new();
     fwd_headers.insert("Content-Type".to_string(), "application/json".to_string());
     forward_provider_headers(&headers, &mut fwd_headers);
+    if apply_gateway_headers(&capability, &mut fwd_headers).is_err() {
+        tracing::error!(capability = %capability.id, "llm.anthropic_workspace_id is invalid; refusing the request");
+        return llm_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "This model channel is misconfigured",
+        );
+    }
 
     // 5. Drive the action through the SAME enforced path the named tools use. The
     //    capability's action label (V8) is enforced + resolved by execute_gated;

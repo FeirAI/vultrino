@@ -1,0 +1,20 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index d273c8e..a154190 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -98,6 +98,7 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+ /// - `openai-beta` / `openai-organization` / `openai-project` route/scope an
+ ///   OpenAI request when the SDK sets them.
+ const FORWARDED_PROVIDER_HEADERS: &[&str] = &[
++    "anthropic-workspace-id",
+     "anthropic-version",
+     "anthropic-beta",
+     "openai-beta",
+@@ -158,7 +159,6 @@ fn apply_gateway_headers(
+     capability: &crate::capability::Capability,
+     fwd: &mut HashMap<String, String>,
+ ) -> Result<(), ()> {
+-    fwd.retain(|k, _| !k.eq_ignore_ascii_case(ANTHROPIC_WORKSPACE_HEADER));
+     if let Some(ws) = capability.llm_anthropic_workspace_id() {
+         // Re-check at use time: a stored capability is validated at write, but a
+         // value that reached the vault another way must still never become a header.

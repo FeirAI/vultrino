@@ -159,6 +159,16 @@ pub struct LlmProxy {
     /// than `none`. `None`/absent = today's behavior, the proxy touches nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// When set, the gateway-owned Anthropic workspace id. The `/llm` proxy injects
+    /// it as the `anthropic-workspace-id` header on every upstream request for this
+    /// channel, AFTER the client headers, so an org-level (non-workspace-scoped)
+    /// Anthropic key works and the agent can neither choose nor change the
+    /// workspace (billing, rate limits and data retention are per workspace). A
+    /// client-sent `anthropic-workspace-id` is never forwarded. Only valid on
+    /// `llm.protocol` `anthropic-messages`; format `wrkspc_` + 8 to 64 ASCII
+    /// letters or digits. Absent = no header (workspace-scoped keys).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_workspace_id: Option<String>,
 }
 
 fn default_llm_protocol() -> String {
@@ -174,6 +184,18 @@ pub const LLM_REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium",
 /// Declaring `llm.reasoning_effort` on any other protocol is a configuration
 /// error: the proxy would have nowhere to write it, and silently ignoring a spend
 /// control is the forbidden direction.
+/// Whether `id` is an acceptable Anthropic workspace id: `wrkspc_` then 8 to 64
+/// ASCII letters or digits. Strict on purpose: the value becomes an HTTP header
+/// value, so whitespace, control characters and separators are refused.
+pub fn is_valid_anthropic_workspace_id(id: &str) -> bool {
+    match id.strip_prefix("wrkspc_") {
+        Some(rest) => {
+            (8..=64).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
 pub const LLM_REASONING_EFFORT_PROTOCOLS: &[&str] = &["openai-chat", "openai-responses"];
 
 /// Operator-declared approval-preview SPEC on a [`Capability`]: which fields of
@@ -302,6 +324,7 @@ impl Default for LlmProxy {
             allowed_models: Vec::new(),
             max_output_tokens: None,
             reasoning_effort: None,
+            anthropic_workspace_id: None,
         }
     }
 }
@@ -389,6 +412,20 @@ impl Capability {
                         LLM_REASONING_EFFORT_PROTOCOLS.join(" or "),
                         llm.protocol
                     ));
+                }
+            }
+            if let Some(ws) = &llm.anthropic_workspace_id {
+                if llm.protocol != "anthropic-messages" {
+                    return Err(format!(
+                        "capability llm.anthropic_workspace_id is only supported on llm.protocol anthropic-messages (got '{}')",
+                        llm.protocol
+                    ));
+                }
+                if !is_valid_anthropic_workspace_id(ws) {
+                    return Err(
+                        "capability llm.anthropic_workspace_id must be 'wrkspc_' followed by 8 to 64 ASCII letters or digits"
+                            .to_string(),
+                    );
                 }
             }
             let base = llm.provider_base.trim();
@@ -602,6 +639,13 @@ impl Capability {
         self.llm
             .as_ref()
             .and_then(|l| l.reasoning_effort.as_deref())
+    }
+
+    /// The gateway-owned Anthropic workspace id, if the operator configured one.
+    pub fn llm_anthropic_workspace_id(&self) -> Option<&str> {
+        self.llm
+            .as_ref()
+            .and_then(|l| l.anthropic_workspace_id.as_deref())
     }
 
     /// Build the upstream provider URL for an LLM-proxy `tools` call: the
@@ -1879,5 +1923,45 @@ mod tests {
         let params = serde_json::json!({ "body": { "to": "a@b.com" } });
         let preview = extract_preview(&spec, &params);
         assert!(preview.fields.is_empty());
+    }
+
+    #[test]
+    fn anthropic_workspace_id_validation() {
+        let build = |protocol: &str, ws: Option<&str>| {
+            let mut c = llm_cap("https://api.anthropic.com");
+            let l = c.llm.as_mut().unwrap();
+            l.protocol = protocol.to_string();
+            l.anthropic_workspace_id = ws.map(str::to_string);
+            c
+        };
+        assert!(build("anthropic-messages", None).validate().is_ok());
+        assert!(build(
+            "anthropic-messages",
+            Some("wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ")
+        )
+        .validate()
+        .is_ok());
+        for bad in [
+            "",
+            " ",
+            "wrkspc_",
+            "wrkspc_a",
+            "01JwQvzr7rXLA5AGx3HKfFUJ",
+            "wrkspc_01Jw QvzrX",
+            "wrkspc_01JwQvzr\r\nx-evil: 1",
+            "wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ ",
+            "WRKSPC_01JwQvzr7rXLA5AGx3HKfFUJ",
+            "wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ-+",
+        ] {
+            let err = build("anthropic-messages", Some(bad))
+                .validate()
+                .unwrap_err();
+            assert!(err.contains("anthropic_workspace_id"), "{bad:?}: {err}");
+        }
+        // Only meaningful on the Anthropic wire: refuse elsewhere rather than ignore.
+        let err = build("openai-chat", Some("wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ"))
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("anthropic-messages"), "{err}");
     }
 }

@@ -604,6 +604,12 @@ the buffered-vs-streaming branch, so a `{"stream": true}` request cannot evade i
   The Responses API does not read `max_tokens`, so injecting the wrong field would
   leave the per-call ceiling unenforced on a Responses request that omits its own
   limit.
+- **Anthropic workspace (gateway-owned):** when the capability sets
+  `llm.anthropic_workspace_id` (`wrkspc_` plus 8 to 64 ASCII letters or digits;
+  only on `llm.protocol` `anthropic-messages`, refused otherwise), Vultrino sends it
+  upstream as the `anthropic-workspace-id` header, which an org-level (not
+  workspace-scoped) Anthropic key requires. A client-sent `anthropic-workspace-id`
+  is dropped and cannot override it; with the field unset no header is added.
 - **Reasoning effort (gateway-owned):** when the capability sets
   `llm.reasoning_effort` (one of `none`, `minimal`, `low`, `medium`, `high`),
   Vultrino WRITES it into the body, **overwriting a client-supplied value of any

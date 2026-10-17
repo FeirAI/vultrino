@@ -169,6 +169,17 @@ ceiling) and `llm.reasoning_effort` (one of `none`, `minimal`, `low`, `medium`,
 are spend controls: reasoning tokens are billed as output tokens. An absent
 `reasoning_effort` leaves the request body untouched.
 
+**Org-level Anthropic keys.** Anthropic rejects a request made with an API key that
+is not scoped to a workspace unless it carries an `anthropic-workspace-id` header.
+To use such a key, set `llm.anthropic_workspace_id` on the capability (only on
+`llm.protocol` `anthropic-messages`; the value is `wrkspc_` followed by 8 to 64
+ASCII letters or digits, anything else is refused when the capability is written).
+Vultrino then sends `anthropic-workspace-id: <id>` on every upstream request for
+that channel. The workspace is fixed by the operator, not by the agent: a client
+that sends its own `anthropic-workspace-id` header has it dropped, never forwarded,
+and it cannot override the configured one. Without the setting no header is added,
+so workspace-scoped keys keep working unchanged.
+
 ### `[[policies]]` — static declarative policies
 
 ```toml

@@ -668,6 +668,18 @@
     "egress-webhook-url-unchecked": {
       "tier": "fast",
       "claim": "egress-no-ambient-proxy"
+    },
+    "llm-workspace-id-client-forwarded": {
+      "tier": "fast",
+      "claim": "llm-anthropic-workspace-id-gateway-owned"
+    },
+    "llm-workspace-id-not-injected": {
+      "tier": "fast",
+      "claim": "llm-anthropic-workspace-id-gateway-owned"
+    },
+    "llm-workspace-id-validation-removed": {
+      "tier": "fast",
+      "claim": "llm-anthropic-workspace-id-gateway-owned"
     }
   },
   "claims": [
@@ -1512,7 +1524,7 @@
         {
           "path": "src/capability/mod.rs",
           "symbol": "Capability::validate",
-          "sha256": "511dada4c8fdd8d7739caa694e6ca9b7c713509e935aa968fdc3bee49ce4376e"
+          "sha256": "29ae29a2da451e079b660c5219e38066a950f8fba3103d007f50938b8bc21eee"
         }
       ],
       "mutants": [
@@ -3503,6 +3515,49 @@
       ],
       "does_not_establish": "Only the listed patterns, URLs and shapes, not every pattern; a property of the engine decision, not a proof. A pattern holding a ? is refused on Deny and Prompt rules, not matched; an Allow rule with a ? is accepted and only narrows. Trailing slashes, ;name=value path parameters, repeated / and %2F are tried; any other rewrite a particular backend applies (case folding of the path, unicode normalisation, backslashes) is not, so a Deny pattern can still be slipped past by those spellings. A server that treats the trailing-slash path as a different resource is over-denied, not under-denied. The Prompt widening can upgrade an Allow to a Prompt, so a request an Allow rule alone would have let through can reach an approver. A Prompt rule's exact reading charges its rate limit once and its wide reading does not charge, so under the wide reading a rate limit counts as within its limit (wider, fail-closed); a widened Prompt match that turns an Allow into a Prompt has already charged the Allow rule's rate limit. Other policies and rule kinds (rate limits, principal or time conditions) are not in the grid. Which deployed vaults hold a policy relying on the old narrower matching is not checked.",
       "evidence_run": "38834394415"
+    },
+    {
+      "id": "llm-anthropic-workspace-id-gateway-owned",
+      "statement": "The Anthropic workspace of an /llm channel is fixed by the operator, never by the agent. When a capability sets llm.anthropic_workspace_id, every upstream request for it (buffered and streamed share the same header map) carries exactly that anthropic-workspace-id header, and a client-sent anthropic-workspace-id is removed first and cannot override it; with the field unset no such header is sent and a client-sent one is dropped. The id must be wrkspc_ plus 8 to 64 ASCII letters or digits and is accepted only on llm.protocol anthropic-messages; Capability::validate refuses anything else, and the proxy re-checks the value before use and answers 500 without an upstream call when a stored value is invalid.",
+      "method": "test",
+      "artifacts": [
+        "src/web/llm_proxy.rs",
+        "src/capability/mod.rs",
+        "tests/llm_proxy_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration anthropic_workspace_id; cargo test --locked --no-default-features --lib -- capability::tests::anthropic_workspace_id_validation",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "apply_gateway_headers",
+          "sha256": "db695560439bf0b4d8bc7c30a834d1d8dd99dfbe3fcc91989f7d3eb42066d11d"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "forward_provider_headers",
+          "sha256": "0251da6e0e53f8d678a1f99518a540be605a18a6649e0e086a076ecf4ba1418a"
+        },
+        {
+          "path": "src/capability/mod.rs",
+          "symbol": "is_valid_anthropic_workspace_id",
+          "sha256": "b03ae8bb15c0bdb6e60ec58d8470b3026fc4757f0c9308c05714ddf2698c3694"
+        },
+        {
+          "path": "src/capability/mod.rs",
+          "symbol": "Capability::llm_anthropic_workspace_id",
+          "sha256": "75b52c300c68f6ca786e6d1cab06f3fcea1953420c57d353975946a5da111e45"
+        }
+      ],
+      "mutants": [
+        "llm-workspace-id-client-forwarded",
+        "llm-workspace-id-not-injected",
+        "llm-workspace-id-validation-removed"
+      ],
+      "does_not_establish": "That Anthropic accepts the configured workspace id, that the id belongs to the key's organization, or that the real upstream sees the header: the tests drive a stub upstream plugin and read the headers handed to it, not a live Anthropic request. The id format is an operator-facing sanity check (prefix, length, character set), not Anthropic's own validation. Other provider headers are governed by the allowlist in forward_provider_headers and are not individually covered here."
     }
   ]
 }
