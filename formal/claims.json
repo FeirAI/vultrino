@@ -859,12 +859,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "66a095dead658a5ba9fe693cdcbf4c84abe78d340e2686c4852213938e3fd306"
+          "sha256": "147753ad5c235fb7d8d93f69d570bd64cf0dd16a542a7a10f29ad6c03c9662a8"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "e79f4e8fd6139404a4a45a946a809c329dc915fb9ee49897175ae0de0ffd8e14"
+          "sha256": "e805ff78c78bda642a69a073d3bb3862017c1f511c6d773124680c7f2e368cfc"
         },
         {
           "path": "src/server/mod.rs",
@@ -2483,7 +2483,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "e79f4e8fd6139404a4a45a946a809c329dc915fb9ee49897175ae0de0ffd8e14"
+          "sha256": "e805ff78c78bda642a69a073d3bb3862017c1f511c6d773124680c7f2e368cfc"
         },
         {
           "path": "src/server/mod.rs",
@@ -2498,7 +2498,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "66a095dead658a5ba9fe693cdcbf4c84abe78d340e2686c4852213938e3fd306"
+          "sha256": "147753ad5c235fb7d8d93f69d570bd64cf0dd16a542a7a10f29ad6c03c9662a8"
         },
         {
           "path": "src/server/mod.rs",
@@ -3145,7 +3145,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "821abb6431f1286d1d7feada0b06ebfa2bc3b3d04987de928b35eb429924f4fa"
+          "sha256": "98d0c68d70d9c963cbda393a1a5323857bb0dbc72a6f91039115d0060176ef98"
         },
         {
           "path": "src/web/api.rs",
@@ -3649,7 +3649,7 @@
     },
     {
       "id": "d8-evidence-floor-routine-keeps-running",
-      "statement": "With [averin] enabled, mode observe and d8_complete_evidence on (the FeirOS Solo posture), on both the buffered and the streaming tail, the action classes refused before the plugin runs when Averin cannot begin the two-phase use evidence depend on the operator setting [averin] d8_evidence_floor. In both modes an action with no catalog declaration is refused with the error D8 before-act evidence failed, and a declared-irreversible action never runs or degrades. Money is an action in the money.* namespace or one the catalog declares irreversible. Default money_and_irreversible: money actions are refused, including a partially-reversible one such as money.notify, while a partially-reversible non-money action and a declared-Reversible action whose evidence cannot be begun because Averin is unavailable (unreachable, 5xx or 429) still run, with one use receipt sealed through the mode's own rule, an AVERIN-D8-DEGRADED alarm line and a d8_degraded counter increment. human_floor: every partially-reversible action is refused as well, and only a declared-Reversible action still degrades. A declared non-reversible action is human-floor for approval: on the direct path it is sent to approval (the error says approval is required) and never runs or degrades before approval, and the D8 before-act evidence refusal and the degrade of a partially-reversible action are shown on the approved buffered resume only, not on the streaming tail. A declared-Reversible action is refused, not degraded, when a live Averin answers 4xx, and when its params exceed max_seal_params_bytes (refused before the use token is spent). With d8_complete_evidence off the setting has no effect and every non-reversible approved action keeps its committed-evidence requirement. An unknown d8_evidence_floor value is refused at config load, the default parses to money_and_irreversible, and the running mode is reported in the posture. With Averin up, a reversible action gets use-intent before and use-outcome after the call and no degraded count.",
+      "statement": "With [averin] enabled, mode observe and d8_complete_evidence on (the FeirOS Solo posture), on both the buffered and the streaming tail, the action classes refused before the plugin runs when Averin cannot begin the two-phase use evidence depend on the operator setting [averin] d8_evidence_floor. In both modes an action with no catalog declaration is refused with the error D8 before-act evidence failed, and a declared-irreversible action never runs or degrades. Money is an action in the money.* namespace or one the catalog declares irreversible. Default money_and_irreversible: money actions are refused, including a partially-reversible one such as money.notify, while a partially-reversible non-money action and a declared-Reversible action whose evidence cannot be begun because Averin is unavailable (unreachable, 5xx or 429) still run, with one use receipt sealed through the mode's own rule, an AVERIN-D8-DEGRADED alarm line and a d8_degraded counter increment. human_floor: every partially-reversible action is refused as well, and only a declared-Reversible action still degrades. A declared non-reversible action is human-floor for approval: on the direct path it is sent to approval (the error says approval is required) and never runs or degrades before approval, and the D8 before-act evidence refusal and the degrade of a partially-reversible action are shown on the approved buffered resume only, not on the streaming tail. A declared-Reversible action is refused, not degraded, when a live Averin answers 4xx, and when its params exceed max_seal_params_bytes (refused before the use token is spent). The default floor is only in force with a live Averin client (averin enabled, base_url and resource_id set, no plain http to a public host) and d8_complete_evidence on; with no client there is no evidence path, so a partially-reversible action is refused rather than run with no seal, and the posture reports human_floor. A reversible-class action named money.* is refused, never degraded. With d8_complete_evidence off the setting has no effect and every non-reversible approved action keeps its committed-evidence requirement. An unknown d8_evidence_floor value is refused at config load, the default parses to money_and_irreversible, and the running mode is reported in the posture. With Averin up, a reversible action gets use-intent before and use-outcome after the call and no degraded count.",
       "method": "test",
       "artifacts": [
         "docs/dev/CONFIGURATION.md",
@@ -3665,7 +3665,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact solo_posture_with_averin_down_refuses_irreversible_and_runs_reversible solo_posture_with_averin_up_gives_reversible_two_phase_evidence irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode reversible_approval_resume_remains_fail_open_when_observe_seal_is_missing default_floor_degrades_a_partially_reversible_write_but_refuses_money_and_irreversible human_floor_mode_refuses_every_partially_reversible_action floor_setting_has_no_effect_without_d8_complete_evidence && cargo test --locked --no-default-features --test d8_degraded_guard && cargo test --locked --no-default-features --test solo_evidence_posture",
+      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact solo_posture_with_averin_down_refuses_irreversible_and_runs_reversible solo_posture_with_averin_up_gives_reversible_two_phase_evidence irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode reversible_approval_resume_remains_fail_open_when_observe_seal_is_missing default_floor_degrades_a_partially_reversible_write_but_refuses_money_and_irreversible default_floor_refuses_a_partially_reversible_write_when_no_averin_client_exists human_floor_mode_refuses_every_partially_reversible_action floor_setting_has_no_effect_without_d8_complete_evidence && cargo test --locked --no-default-features --test d8_degraded_guard && cargo test --locked --no-default-features --test solo_evidence_posture",
       "covers": [
         {
           "path": "src/server/mod.rs",
@@ -3710,7 +3710,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "EffectiveEvidenceFloor::from_config",
-          "sha256": "4460adccb52e826636397ddd7b0f5f657425211191e7a7c455d5a0c41cee2656"
+          "sha256": "d61cbaf7e2b49463f389604a94f76c53f6b4526abca40f31e2be68639a3ab411"
         },
         {
           "path": "src/config/types.rs",
@@ -3732,7 +3732,9 @@
         "d8-floor-default-human-floor",
         "d8-floor-money-namespace-ignored",
         "d8-floor-undeclared-degrades",
-        "d8-floor-mode-ignored"
+        "d8-floor-mode-ignored",
+        "d8-floor-client-presence-dropped",
+        "d8-floor-money-fallback-allowed"
       ],
       "does_not_establish": "Only an action the trusted catalog declares Reversible or partially-reversible may degrade, and in the default mode only when it is not money; whether an operator declared the real side effect truthfully, or named a money action under money.*, is not checked, and a reversible catalog entry named money.* requested under another label is not recognised as money. Unavailable means a request error (connect or timeout), a 5xx or a 429; a live Averin that misbehaves in some other way refuses, which is the safe side. In the default mode a degraded partially-reversible write has no before-act record. The approved-resume path (including every partially-reversible case) is driven through the buffered tail in approval_token_integration and the direct path through both tails in d8_degraded_guard; the D8 evidence refusal of a declared non-reversible action on the streaming tail is not driven by any test; a fake Averin stands in for the real one, and the four-plane evidence-gate end-to-end is a separate run. The routine action's one-phase seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. An approval opened under an older build for a partially-reversible action is refused on resume. Any CI run other than the recorded one.",
       "evidence_run": "38676181898"

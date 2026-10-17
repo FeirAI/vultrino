@@ -1,16 +1,18 @@
 diff --git a/src/server/mod.rs b/src/server/mod.rs
-index 3b2332e..c8618b1 100644
+index 4b6affa..53788f0 100644
 --- a/src/server/mod.rs
 +++ b/src/server/mod.rs
-@@ -168,9 +168,8 @@ enum EffectiveEvidenceFloor {
- impl EffectiveEvidenceFloor {
-     fn from_config(cfg: &crate::config::Config) -> Self {
+@@ -171,11 +171,8 @@ impl EffectiveEvidenceFloor {
+     /// routine fallback is not available and the committed-evidence floor stands.
+     fn from_config(cfg: &crate::config::Config, client_present: bool) -> Self {
          use crate::averin::D8EvidenceFloor;
--        if cfg.averin.d8_complete_evidence
+-        if client_present
+-            && cfg.averin.enabled
+-            && cfg.averin.d8_complete_evidence
 -            && cfg.averin.d8_evidence_floor == D8EvidenceFloor::MoneyAndIrreversible
 -        {
 +        let _ = D8EvidenceFloor::HumanFloor;
-+        if cfg.averin.d8_complete_evidence {
++        if client_present && cfg.averin.enabled && cfg.averin.d8_complete_evidence {
              Self::MoneyAndIrreversible
          } else {
              Self::HumanFloor
