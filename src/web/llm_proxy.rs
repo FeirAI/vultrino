@@ -308,15 +308,47 @@ fn unpriced_modifier(body: &serde_json::Value) -> Option<String> {
             return Some("inference_geo other than \"global\" carries a price premium the card does not hold".to_string());
         }
     }
-    // OpenAI / Anthropic service tiers: priority bills above standard; flex, auto, default
-    // and standard_only never bill above it.
-    if let Some(v) = body.get("service_tier") {
-        if !matches!(
-            text(v).as_deref(),
-            Some("auto" | "default" | "standard_only" | "flex")
-        ) {
-            return Some("a service_tier other than auto, default, standard_only or flex is priced above the card".to_string());
+    // Service tiers, in both spellings (OpenAI / Anthropic `service_tier`, Gemini's REST
+    // `serviceTier`; protobuf JSON takes either on Gemini): priority bills above standard.
+    // A string must be one that never bills above standard; Bedrock's object shape
+    // (`{"type": ...}`) must be default or flex. Any other shape is refused.
+    for key in ["service_tier", "serviceTier"] {
+        let Some(v) = body.get(key) else {
+            continue;
+        };
+        let ok = match v {
+            serde_json::Value::String(t) => {
+                matches!(
+                    t.as_str(),
+                    "auto" | "default" | "standard" | "standard_only" | "flex"
+                )
+            }
+            serde_json::Value::Object(o) => matches!(
+                o.get("type").and_then(serde_json::Value::as_str),
+                Some("default" | "flex")
+            ),
+            _ => false,
+        };
+        if !ok {
+            return Some(format!(
+                "a {key} other than auto, default, standard, standard_only or flex is priced above the card"
+            ));
         }
+    }
+    // Server-side extra model calls: the advisor tool runs a second model inside the request
+    // (billed at that model's rates, reported only in usage.iterations) and `fallbacks`
+    // reruns a refused attempt on another model (the refused attempt is billed but not in
+    // the returned usage). The token event books one model, so refuse both outright.
+    for key in ["fallbacks", "fallback_credit_token"] {
+        if body.get(key).is_some() {
+            return Some(format!(
+                "`{key}` runs the request on further models whose usage the token event does not book"
+            ));
+        }
+    }
+    // OpenAI Chat Completions search-preview models bill each search.
+    if body.get("web_search_options").is_some() {
+        return Some("web_search_options bills per search on top of tokens".to_string());
     }
     // Bedrock: latency-optimized inference and the priority tier bill a premium.
     if let Some(v) = body.get("performanceConfig").and_then(|p| p.get("latency")) {
@@ -335,42 +367,59 @@ fn unpriced_modifier(body: &serde_json::Value) -> Option<String> {
             );
         }
     }
-    // Server-side tools bill per use on top of tokens (web search, code execution, file
-    // search, grounding); the token event does not carry them.
-    const TOOL_TYPE_PREFIXES: &[&str] = &[
-        "web_search",
-        "code_execution",
-        "code_interpreter",
-        "file_search",
-        "image_generation",
-        "google_search",
-        "google_maps",
+    // Tools: an allowlist, fail closed. Only shapes known to bill tokens alone pass; any
+    // other typed tool or tool key (a server tool the provider adds later, an advisor,
+    // grounding, search, code execution) is refused. The Bedrock Converse tools live in
+    // `toolConfig.tools`.
+    let tool_lists = [
+        body.get("tools"),
+        body.get("toolConfig").and_then(|c| c.get("tools")),
     ];
-    const TOOL_KEYS: &[&str] = &[
-        "google_search",
-        "googleSearch",
-        "google_search_retrieval",
-        "googleSearchRetrieval",
-        "google_maps",
-        "googleMaps",
-        "code_execution",
-        "codeExecution",
-    ];
-    if let Some(tools) = body.get("tools").and_then(serde_json::Value::as_array) {
-        for tool in tools {
-            let Some(obj) = tool.as_object() else {
-                continue;
-            };
-            let typed = obj
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|t| TOOL_TYPE_PREFIXES.iter().any(|p| t.starts_with(p)));
-            if typed || TOOL_KEYS.iter().any(|k| obj.contains_key(*k)) {
-                return Some("a server-side tool (web search, code execution, file search, grounding) bills per use on top of tokens and is not metered".to_string());
-            }
+    for tools in tool_lists.into_iter().flatten() {
+        let ok = tools
+            .as_array()
+            .is_some_and(|list| list.iter().all(tool_bills_tokens_only));
+        if !ok {
+            return Some("a tool that is not a known client-side tool (function, custom, bash, text editor, memory, computer, web fetch, tool search, Gemini functionDeclarations or urlContext) may run extra models or bill per use on top of tokens, which the token event does not carry".to_string());
         }
     }
     None
+}
+
+/// Whether one `tools` entry is a shape that bills tokens alone: OpenAI `function` or
+/// `custom`; an Anthropic client tool (an `input_schema` and no server type) or the
+/// schema-less client types (`bash_*`, `text_editor_*`, `memory_*`, `computer_*`); the free
+/// Anthropic `web_fetch_*` and `tool_search_*`; Gemini `functionDeclarations` and
+/// `urlContext`; Bedrock `toolSpec` and `cachePoint`. Everything else is refused.
+fn tool_bills_tokens_only(tool: &serde_json::Value) -> bool {
+    const TYPE_PREFIXES: &[&str] = &[
+        "bash_",
+        "text_editor_",
+        "memory_",
+        "computer_",
+        "web_fetch_",
+        "tool_search_",
+    ];
+    const UNTYPED_KEYS: &[&str] = &[
+        "functionDeclarations",
+        "function_declarations",
+        "urlContext",
+        "url_context",
+        "toolSpec",
+        "cachePoint",
+    ];
+    let Some(obj) = tool.as_object() else {
+        return false;
+    };
+    match obj.get("type") {
+        Some(t) => t.as_str().is_some_and(|t| {
+            t == "function" || t == "custom" || TYPE_PREFIXES.iter().any(|p| t.starts_with(p))
+        }),
+        None => {
+            obj.contains_key("input_schema")
+                || (!obj.is_empty() && obj.keys().all(|k| UNTYPED_KEYS.contains(&k.as_str())))
+        }
+    }
 }
 
 /// A JSON error response shaped like an OpenAI API error so the harness's model
@@ -797,11 +846,24 @@ async fn llm_proxy_impl(
     //     `llm.allowed_models`; the deny happens BEFORE any upstream call. It runs
     //     ABOVE the streaming decision (4d) so a `stream:true` request can NOT evade
     //     the model allowlist — buffered and streaming enforce identically.
+    // The body's model is checked here only where the body picks the model. Where the
+    // resolved upstream URL selects it (Gemini, Vertex, Bedrock, Azure) the body names none
+    // or an ignored one, and the allowlist is applied to the routed model below.
     let requested_model = request_body
         .as_ref()
         .and_then(|b| b.get("model"))
         .and_then(|m| m.as_str());
-    if !capability.llm_model_allowed(requested_model) {
+    let url_picks_model = request_body.is_some()
+        && matches!(
+            url_model(
+                &llm.protocol,
+                &upstream,
+                requested_model,
+                &state.config.llm_proxy.azure_deployments,
+            ),
+            UrlModel::Names { .. }
+        );
+    if !url_picks_model && !capability.llm_model_allowed(requested_model) {
         return llm_error(
             StatusCode::FORBIDDEN,
             "permission_error",
@@ -856,8 +918,14 @@ async fn llm_proxy_impl(
         UrlModel::Unresolvable(why) => (body_model.map(str::to_string), Some(why.clone())),
     };
     // The allowlist applies to the model the URL selects too, not only the body's.
-    if let UrlModel::Names { model, .. } = &route {
-        if !capability.llm_model_allowed(Some(model)) {
+    // Azure: the operator may list the deployment name (what the caller sends) or the model it
+    // maps to.
+    if let UrlModel::Names { model, body_ok } = &route {
+        if !capability.llm_model_allowed(Some(model))
+            && !body_ok
+                .as_deref()
+                .is_some_and(|d| capability.llm_model_allowed(Some(d)))
+        {
             return llm_error(
                 StatusCode::FORBIDDEN,
                 "permission_error",
@@ -1860,6 +1928,26 @@ mod tests {
             json!({"tools": [{"type": "function", "name": "f"}, {"type": "file_search"}]}),
             json!({"tools": [{"google_search": {}}]}),
             json!({"tools": [{"googleSearchRetrieval": {}}]}),
+            // Gemini's REST spelling of the tier, and the Bedrock object shape.
+            json!({"serviceTier": "priority"}),
+            json!({"service_tier": {"type": "priority"}}),
+            json!({"serviceTier": {"type": "priority"}}),
+            json!({"serviceTier": 1}),
+            // Vertex grounding that bills per grounded request, and a tool nobody listed.
+            json!({"tools": [{"retrieval": {"vertexAiSearch": {"datastore": "d"}}}]}),
+            json!({"tools": [{"enterpriseWebSearch": {}}]}),
+            json!({"tools": [{"type": "quantum_lookup_20271201", "name": "q"}]}),
+            json!({"tools": [{"future_server_tool": {}}]}),
+            json!({"tools": [{}]}),
+            json!({"tools": ["web_search"]}),
+            json!({"tools": {"type": "web_search"}}),
+            json!({"web_search_options": {}}),
+            // The advisor tool runs a second model outside the top-level usage.
+            json!({"tools": [{"type": "advisor_20260301", "name": "advisor", "model": "m"}]}),
+            // Server-side fallbacks rerun the request on another model.
+            json!({"fallbacks": [{"model": "m"}]}),
+            json!({"fallback_credit_token": "t"}),
+            json!({"toolConfig": {"tools": [{"systemTool": {"name": "nova_grounding"}}]}}),
         ] {
             assert!(unpriced_modifier(&body).is_some(), "{body}");
         }
@@ -1875,6 +1963,18 @@ mod tests {
             json!({"serviceTier": {"type": "default"}}),
             json!({"tools": [{"type": "function", "function": {"name": "web_search_helper"}}]}),
             json!({"tools": [{"name": "get_weather", "input_schema": {}}]}),
+            json!({"serviceTier": "default"}),
+            json!({"serviceTier": "flex"}),
+            json!({"service_tier": "flex"}),
+            json!({"tools": [{"type": "custom", "name": "c", "input_schema": {}}]}),
+            json!({"tools": [{"type": "bash_20250124", "name": "bash"}]}),
+            json!({"tools": [{"type": "text_editor_20250728", "name": "e"}]}),
+            json!({"tools": [{"type": "memory_20250818", "name": "memory"}]}),
+            json!({"tools": [{"type": "computer_20250124", "name": "computer"}]}),
+            json!({"tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]}),
+            json!({"tools": [{"type": "tool_search_tool_regex_20251119", "name": "t"}]}),
+            json!({"tools": [{"functionDeclarations": []}, {"urlContext": {}}]}),
+            json!({"toolConfig": {"tools": [{"toolSpec": {"name": "f"}}, {"cachePoint": {}}]}}),
         ] {
             assert_eq!(unpriced_modifier(&body), None, "{body}");
         }

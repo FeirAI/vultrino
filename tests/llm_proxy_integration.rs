@@ -3394,6 +3394,178 @@ async fn v2b_a_request_that_sets_a_price_the_card_cannot_hold_is_refused_before_
     assert_eq!(calls_of(&calls), 1);
 }
 
+#[tokio::test]
+async fn v2b_an_advisor_tool_or_server_fallbacks_is_refused_before_the_upstream() {
+    // The advisor tool runs a second model inside the request and bills it at that model's
+    // rates outside the top-level usage; `fallbacks` reruns a refused request on another
+    // model. The token event books one model, so both would be unbooked spend: refuse.
+    let (router, _storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let mut variants = Vec::new();
+    for (name, key, value) in [
+        (
+            "unpriced advisor",
+            "tools",
+            serde_json::json!([{"type": "advisor_20260301", "name": "advisor", "model": "claude-fable-5-1"}]),
+        ),
+        (
+            "priced advisor",
+            "tools",
+            serde_json::json!([{"type": "advisor_20260301", "name": "advisor", "model": "claude-haiku-4-5"}]),
+        ),
+        (
+            "unpriced fallback",
+            "fallbacks",
+            serde_json::json!([{"model": "claude-unpriced-9"}]),
+        ),
+        (
+            "priced fallback",
+            "fallbacks",
+            serde_json::json!([{"model": "claude-haiku-4-5"}]),
+        ),
+        (
+            "fallback credit token",
+            "fallback_credit_token",
+            serde_json::json!("tok"),
+        ),
+    ] {
+        let mut body = messages("claude-haiku-4-5");
+        body[key] = value;
+        variants.push((name, body));
+    }
+    for (name, body) in variants {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), "v1/messages", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{name}");
+    }
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+}
+
+#[tokio::test]
+async fn v2b_an_unknown_future_server_tool_type_is_refused_and_client_tools_pass() {
+    let (router, _storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let mut body = messages("claude-haiku-4-5");
+    body["tools"] = serde_json::json!([{"type": "quantum_lookup_20271201", "name": "q"}]);
+    let resp = router
+        .clone()
+        .oneshot(llm_req(Some(&token), "v1/messages", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "modifier_unpriced");
+    assert_eq!(calls_of(&calls), 0);
+    // A client tool (input_schema, no server type) bills tokens alone.
+    let mut ok = messages("claude-haiku-4-5");
+    ok["tools"] = serde_json::json!([{"name": "get_weather", "input_schema": {"type": "object"}}]);
+    let resp = router
+        .oneshot(llm_req(Some(&token), "v1/messages", ok))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+}
+
+#[tokio::test]
+async fn v2b_gemini_camel_case_tier_and_billed_grounding_tools_are_refused() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let (router, _storage, token, calls) = proto_stack_models(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        &path,
+        "gemini",
+        GEMINI_BASE,
+        "VULTRINO_PROVIDER_GEMINI_ENABLED",
+        Vec::new(),
+    )
+    .await;
+    let route = "v1beta/models/gemini-2.5-flash:generateContent";
+    for (name, body) in [
+        (
+            "camelCase serviceTier",
+            serde_json::json!({"contents": [], "serviceTier": "priority"}),
+        ),
+        (
+            "vertex ai search retrieval",
+            serde_json::json!({"contents": [], "tools": [{"retrieval": {"vertexAiSearch": {"datastore": "d"}}}]}),
+        ),
+        (
+            "enterprise web search",
+            serde_json::json!({"contents": [], "tools": [{"enterpriseWebSearch": {}}]}),
+        ),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), route, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{name}");
+    }
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+    // Function declarations and url context bill tokens alone.
+    let ok = serde_json::json!({"contents": [], "tools": [{"functionDeclarations": []}, {"urlContext": {}}]});
+    let resp = router
+        .oneshot(llm_req(Some(&token), route, ok))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+}
+
+#[tokio::test]
+async fn v2b_an_allowlist_matches_the_model_the_url_selects_when_the_body_names_none() {
+    // Gemini, Vertex and Bedrock bodies carry no model; the allowlist must still be able to
+    // permit the model in the path (and still refuse one outside the list).
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let (router, _storage, token, calls) = proto_stack_models(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        &path,
+        "gemini",
+        GEMINI_BASE,
+        "VULTRINO_PROVIDER_GEMINI_ENABLED",
+        vec!["gemini-2.5-flash".to_string()],
+    )
+    .await;
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-2.5-flash:generateContent",
+            serde_json::json!({ "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-2.5-pro:generateContent",
+            serde_json::json!({ "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "permission_error");
+    assert_eq!(calls_of(&calls), 1);
+}
+
 // ---------------------------------------------------------------------------
 // V2 outage window, end to end: a real metered call while the outbox cannot be written.
 // The call is still admitted (stated in LIMITATIONS), every meter event it could not append
