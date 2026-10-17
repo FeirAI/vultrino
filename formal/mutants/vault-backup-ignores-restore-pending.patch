@@ -1,0 +1,13 @@
+diff --git a/src/storage/vault_backup.rs b/src/storage/vault_backup.rs
+index de99cf0..6ce498d 100644
+--- a/src/storage/vault_backup.rs
++++ b/src/storage/vault_backup.rs
+@@ -228,7 +228,7 @@ pub async fn backup(
+     if !vault.is_file() {
+         return Err(format!("no vault at {}", vault.display()).into());
+     }
+-    if restore_pending_path(vault).exists() {
++    if false && restore_pending_path(vault).exists() {
+         return Err(format!(
+             "{} exists: an earlier `vault restore` did not finish, so the files on disk may pair a \
+              snapshot with a log from another moment. Re-run `vault restore` from a known-good \

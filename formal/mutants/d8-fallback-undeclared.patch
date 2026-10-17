@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 0e1cfe6..c2efca5 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -2102,7 +2102,7 @@ impl VultrinoServer {
+             .await
+         {
+             Ok(evidence) => Ok(Some(evidence)),
+-            Err(error) if d8_fallback_ok && !evidence_required && error.is_unavailable() => {
++            Err(error) if !evidence_required && error.is_unavailable() => {
+                 av.record_d8_degraded();
+                 tracing::error!(
+                     target: "averin_seal",

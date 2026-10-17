@@ -63,6 +63,9 @@ pub struct SealMetrics {
     /// because an enqueue failure never even reaches the network — it is a LOCAL persistence
     /// problem, and `plugin.execute` still proceeds fail-open exactly like every other Observe drop.
     enqueue_failed: AtomicU64,
+    /// VUL-38 — reversible actions that ran with one-phase evidence only because D8 begin-use
+    /// failed (Averin unreachable). Paired with the `AVERIN-D8-DEGRADED` alarm line.
+    d8_degraded: AtomicU64,
     /// Plan 087 FIX 5 — monotonic-ms (relative to the client's start `Instant`) at
     /// which the last `AVERIN-SEAL-DROPPED` line was emitted; 0 = never (so the very
     /// first drop always logs). Rate-limits ONLY the log line; `dropped` still counts
@@ -84,6 +87,9 @@ impl SealMetrics {
     /// Plan 088 D7 — a durable enqueue attempt failed (local I/O, never a network round-trip).
     fn record_enqueue_failed(&self) {
         self.enqueue_failed.fetch_add(1, Ordering::Relaxed);
+    }
+    fn record_d8_degraded(&self) {
+        self.d8_degraded.fetch_add(1, Ordering::Relaxed);
     }
     fn enter_inflight(&self) {
         let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
@@ -113,6 +119,7 @@ impl SealMetrics {
             in_flight: self.in_flight.load(Ordering::Relaxed),
             max_in_flight: self.max_in_flight.load(Ordering::Relaxed),
             enqueue_failed: self.enqueue_failed.load(Ordering::Relaxed),
+            d8_degraded: self.d8_degraded.load(Ordering::Relaxed),
         }
     }
 }
@@ -166,6 +173,9 @@ pub struct SealMetricsSnapshot {
     /// Plan 088 D7 — durable enqueue attempts (Observe + `durable = true`) that failed locally
     /// (disk full, fsync EIO, …) and were dropped fail-open. See [`SealMetrics::enqueue_failed`].
     pub enqueue_failed: u64,
+    /// VUL-38 — reversible actions that fell back to a one-phase receipt because the D8
+    /// two-phase evidence could not be begun. Never counts an evidence-required action.
+    pub d8_degraded: u64,
 }
 
 /// Fail-mode on `/execute` when the synchronous seal fails or averin is
@@ -244,6 +254,38 @@ pub struct AverinConfig {
     /// as the D8 grant. Default false; enabling it is an explicit availability
     /// trade-off because the before-act evidence write is fail-closed.
     pub d8_complete_evidence: bool,
+    /// VUL-38 evidence floor while Averin cannot begin two-phase evidence. See
+    /// [`D8EvidenceFloor`]. Default [`D8EvidenceFloor::MoneyAndIrreversible`].
+    pub d8_evidence_floor: D8EvidenceFloor,
+}
+
+/// VUL-38: which declared-non-reversible actions are refused while Averin cannot begin the
+/// two-phase D8 evidence (operator setting `[averin] d8_evidence_floor`). An action with no
+/// catalog declaration is refused in both modes, and a reversible action degrades in both
+/// (unless it is money, below).
+///
+/// Money, for Vultrino, is an action in the `money.*` namespace OR one the catalog declares
+/// irreversible. Money is refused in both modes, whatever its reversibility declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum D8EvidenceFloor {
+    /// Default. Money and irreversible actions are refused; other partially-reversible and
+    /// reversible actions keep running with a one-phase seal, the `AVERIN-D8-DEGRADED` alarm
+    /// and the `d8_degraded` counter.
+    #[default]
+    MoneyAndIrreversible,
+    /// Every partially-reversible action is refused as well; only reversible non-money actions
+    /// degrade.
+    HumanFloor,
+}
+
+impl D8EvidenceFloor {
+    /// The config spelling, also reported in `/api/v1/posture`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MoneyAndIrreversible => "money_and_irreversible",
+            Self::HumanFloor => "human_floor",
+        }
+    }
 }
 
 impl Default for AverinConfig {
@@ -275,6 +317,7 @@ impl Default for AverinConfig {
             // per-deployment opt-in, never a default flip.
             durable: false,
             d8_complete_evidence: false,
+            d8_evidence_floor: D8EvidenceFloor::MoneyAndIrreversible,
         }
     }
 }
@@ -354,6 +397,19 @@ pub enum AverinError {
     Pop(#[source] pop::PopError),
     #[error("malformed averin response: {0}")]
     BadResponse(String),
+}
+
+impl AverinError {
+    /// True only for a failure that means Averin could not be reached or is
+    /// overloaded: a connect or timeout error, a 5xx, or a 429. A 4xx, a bound
+    /// or shape error, a missing grant and a Pop error are refusals, not outages.
+    pub(crate) fn is_unavailable(&self) -> bool {
+        match self {
+            Self::Request(_) => true,
+            Self::Status { status, .. } => *status >= 500 || *status == 429,
+            _ => false,
+        }
+    }
 }
 
 /// The deterministic outputs of [`build_use_pop`]: `params_commitment` is exposed (not just
@@ -518,6 +574,11 @@ impl AverinClient {
     /// Snapshot the fail-open seal counters (for `GET /api/v1/metrics` + tests).
     pub fn metrics(&self) -> SealMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// VUL-38 — count a reversible action that ran without two-phase D8 evidence.
+    pub(crate) fn record_d8_degraded(&self) {
+        self.metrics.record_d8_degraded();
     }
 
     /// Plan 088 D7 — bump the durable-enqueue-failure counter. `pub(crate)` so
