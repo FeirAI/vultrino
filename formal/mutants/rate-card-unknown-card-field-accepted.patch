@@ -1,0 +1,12 @@
+diff --git a/src/ratecard.rs b/src/ratecard.rs
+index 59f166c..1a6467e 100644
+--- a/src/ratecard.rs
++++ b/src/ratecard.rs
+@@ -63,7 +63,6 @@ pub struct RateCard {
+ }
+ 
+ #[derive(Deserialize)]
+-#[serde(deny_unknown_fields)]
+ struct WireCard {
+     #[serde(default)]
+     rate_card_version: String,

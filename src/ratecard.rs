@@ -740,6 +740,9 @@ mod tests {
             // An unknown field (a typo of a price field), on an entry and on the card.
             r#"{"rate_card_version":"a","entries":[{"model_ref":"m","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unti":5}]}"#,
             r#"{"rate_card_version":"a","entires":[],"entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1}]}"#,
+            // An unknown field with every price valid: only the field itself is wrong.
+            r#"{"rate_card_version":"a","entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1,"price_micros_per_unti":1}]}"#,
+            r#"{"rate_card_version":"a","note":"x","entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1}]}"#,
             // A missing or empty version.
             r#"{"entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1}]}"#,
             r#"{"rate_card_version":"","entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1}]}"#,

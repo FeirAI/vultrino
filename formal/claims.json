@@ -844,6 +844,10 @@
     "rate-card-one-sided-price-accepted": {
       "tier": "full",
       "claim": "rate-card-reload-only-narrows"
+    },
+    "rate-card-unknown-card-field-accepted": {
+      "tier": "full",
+      "claim": "rate-card-reload-only-narrows"
     }
   },
   "claims": [
@@ -4105,7 +4109,8 @@
         "rate-card-reload-widens",
         "rate-card-unknown-field-accepted",
         "rate-card-version-optional",
-        "rate-card-one-sided-price-accepted"
+        "rate-card-one-sided-price-accepted",
+        "rate-card-unknown-card-field-accepted"
       ],
       "does_not_establish": "That the two planes read the same bytes at start: the deploy mounts one file and verify-posture compares the sha256 values, vultrino does not compare them itself. A leria restart onto a newer file is matched here only by a vultrino restart. Rust parsing is stricter than leria's in places (field names are case-sensitive here, a duplicate entry is refused in every card form), so a file leria accepts may be refused here; the reverse is what the claim is about. Prices are not read beyond being positive. A change is noticed by size and modified time. The test files are temporary files in one process, not a mounted ConfigMap."
     }
