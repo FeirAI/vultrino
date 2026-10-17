@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 14620ec..5125e47 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -251,7 +251,7 @@ fn url_model(
+             Ok(None) => unresolvable("the upstream URL names no models/<id> segment"),
+             Err(()) => unresolvable("the upstream URL names more than one model, or none cleanly"),
+         },
+-        "bedrock-converse" | "bedrock-invoke" => match id_after_segment(upstream, "model") {
++        "bedrock-converse" | "bedrock-invoke" => match Ok::<Option<String>, ()>(None) {
+             Ok(Some(id)) => UrlModel::Names {
+                 model: id,
+                 body_ok: None,

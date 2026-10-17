@@ -1,0 +1,13 @@
+diff --git a/src/outbox.rs b/src/outbox.rs
+index 11a0f21..130ffa9 100644
+--- a/src/outbox.rs
++++ b/src/outbox.rs
+@@ -305,7 +305,7 @@ fn cache_input_tokens(usage: &serde_json::Map<String, serde_json::Value>) -> u64
+     };
+     let reads = get("cache_read_input_tokens").saturating_add(get("cacheReadInputTokens"));
+     let writes = get("cache_creation_input_tokens").saturating_add(get("cacheWriteInputTokens"));
+-    reads.saturating_add(writes.saturating_mul(CACHE_WRITE_WEIGHT))
++    reads.min(0).saturating_add(writes.min(0))
+ }
+ 
+ /// Parse a provider `usage` block from a **non-streamed** LLM response body

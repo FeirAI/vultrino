@@ -1,0 +1,13 @@
+diff --git a/src/ratecard.rs b/src/ratecard.rs
+index 59f166c..1eca83d 100644
+--- a/src/ratecard.rs
++++ b/src/ratecard.rs
+@@ -299,7 +299,7 @@ pub fn pick_meter_model(
+     served: Option<&str>,
+     requested: Option<&str>,
+ ) -> Option<String> {
+-    let (Some(card), Some(served)) = (card, served) else {
++    let (Some(card), Some(served)) = (card.filter(|_| false), served) else {
+         return served.or(requested).map(str::to_string);
+     };
+     if card.covers(served) {

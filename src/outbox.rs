@@ -85,6 +85,47 @@ pub const EVENT_POLICY_DENIED: &str = "policy.denied";
 /// slot stays govder's).
 pub const EVENT_METER_OBSERVED: &str = "meter.observed";
 
+/// A gap marker (VUL-02): the outbox failed to append one or more events (disk full, I/O
+/// error) and this is the first successful append after the failure. The payload carries
+/// `lost_count`, `first_lost_at`, `last_lost_at` and the distinct `event_types` that were
+/// lost, never a body. Because a failed append mints no sequence the stored stream stays
+/// contiguous, so this event is the only in-band evidence of the hole; a consumer that
+/// meters from the feed (leria) must treat it as "usage may be missing" and fail closed.
+pub const EVENT_METER_LOST: &str = "meter.lost";
+
+/// Most distinct lost event types a gap marker names (the rest are counted, not listed).
+pub const METER_LOST_MAX_TYPES: usize = 16;
+
+/// Point-in-time view of the append-loss counters, for `/api/v1/health`, `/api/v1/ready`
+/// and `/api/v1/posture`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MeterLossSnapshot {
+    /// Appends that failed since this process started (never reset).
+    pub lost_total: u64,
+    /// Failed appends whose gap marker has not been appended yet. Non-zero means the
+    /// outbox is failing right now or has not seen a successful append since it failed.
+    pub gap_pending: u64,
+    /// Gap markers appended since this process started.
+    pub markers_emitted: u64,
+    /// When the most recent failure happened.
+    pub last_lost_at: Option<DateTime<Utc>>,
+}
+
+/// Build the [`EVENT_METER_LOST`] payload.
+pub fn meter_lost_payload(
+    lost_count: u64,
+    first_lost_at: DateTime<Utc>,
+    last_lost_at: DateTime<Utc>,
+    event_types: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "lost_count": lost_count,
+        "first_lost_at": first_lost_at,
+        "last_lost_at": last_lost_at,
+        "event_types": event_types,
+    })
+}
+
 /// Delivery state of an outbox event (V9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -237,6 +278,36 @@ pub struct TokenUsage {
     pub output_tokens: u64,
 }
 
+/// Weight given to a cache WRITE token when it is added to the input count. Anthropic bills a
+/// cache write at 1.25x the input price (5-minute cache) or 2x (1-hour cache), and the usage
+/// block does not say which TTL a write used unless the caller reads
+/// `cache_creation.ephemeral_*`. Counting each written token twice is an upper bound for both
+/// TTLs: the booking is never below the real charge for a write, and over-counts a 5-minute
+/// write by up to 1.6x. Bedrock's `cacheWriteInputTokens` is billed at 1.25x and is counted
+/// the same way.
+const CACHE_WRITE_WEIGHT: u64 = 2;
+
+/// Input tokens a provider reports OUTSIDE its plain input count: Anthropic's
+/// `cache_creation_input_tokens` and `cache_read_input_tokens` (and Bedrock Converse's
+/// `cacheReadInputTokens` / `cacheWriteInputTokens`). They are billed input but are not
+/// part of `input_tokens`, so leaving them out under-counts the spend (the dangerous
+/// direction). The rate card has one input price per model, so they are charged in input
+/// tokens: a cache READ at 1x (the provider bills it at about 0.1x, so a read is OVER-counted
+/// up to 10x) and a cache WRITE at [`CACHE_WRITE_WEIGHT`] (the provider bills 1.25x or 2x, so
+/// a write is never under-counted, and is over-counted when the cache was the 5-minute one).
+/// OpenAI's `prompt_tokens` already includes cached tokens and is not touched.
+fn cache_input_tokens(usage: &serde_json::Map<String, serde_json::Value>) -> u64 {
+    let get = |k: &str| {
+        usage
+            .get(k)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let reads = get("cache_read_input_tokens").saturating_add(get("cacheReadInputTokens"));
+    let writes = get("cache_creation_input_tokens").saturating_add(get("cacheWriteInputTokens"));
+    reads.saturating_add(writes.saturating_mul(CACHE_WRITE_WEIGHT))
+}
+
 /// Parse a provider `usage` block from a **non-streamed** LLM response body
 /// (V13b). Best-effort: returns `None` for any body that isn't a JSON object
 /// carrying a recognized `usage` shape (a streamed response without a usage
@@ -272,18 +343,17 @@ pub struct TokenUsage {
 pub fn parse_token_usage(raw_body: &[u8]) -> Option<TokenUsage> {
     let json: serde_json::Value = serde_json::from_slice(raw_body).ok()?;
 
-    // Gemini API / Vertex AI generateContent.
+    // Gemini API / Vertex AI generateContent. Output is the candidates plus the thinking
+    // tokens (billed as output); input is the prompt plus the tool-use prompt. A block with
+    // a prompt count and no candidates (a blocked response) still books its prompt.
     if let Some(usage) = json.get("usageMetadata").and_then(|v| v.as_object()) {
-        let input = usage
-            .get("promptTokenCount")
-            .and_then(serde_json::Value::as_u64);
-        let output = usage
-            .get("candidatesTokenCount")
-            .and_then(serde_json::Value::as_u64);
-        if let (Some(input_tokens), Some(output_tokens)) = (input, output) {
+        let read = |k: &str| usage.get(k).and_then(serde_json::Value::as_u64);
+        if let Some(prompt) = read("promptTokenCount") {
             return Some(TokenUsage {
-                input_tokens,
-                output_tokens,
+                input_tokens: prompt.saturating_add(read("toolUsePromptTokenCount").unwrap_or(0)),
+                output_tokens: read("candidatesTokenCount")
+                    .unwrap_or(0)
+                    .saturating_add(read("thoughtsTokenCount").unwrap_or(0)),
             });
         }
     }
@@ -305,14 +375,14 @@ pub fn parse_token_usage(raw_body: &[u8]) -> Option<TokenUsage> {
     }
     if let (Some(input), Some(output)) = (read("input_tokens"), read("output_tokens")) {
         return Some(TokenUsage {
-            input_tokens: input,
+            input_tokens: input.saturating_add(cache_input_tokens(usage)),
             output_tokens: output,
         });
     }
     // Amazon Bedrock Converse uses camelCase counts.
     if let (Some(input), Some(output)) = (read("inputTokens"), read("outputTokens")) {
         return Some(TokenUsage {
-            input_tokens: input,
+            input_tokens: input.saturating_add(cache_input_tokens(usage)),
             output_tokens: output,
         });
     }
@@ -405,6 +475,13 @@ pub fn maybe_inject_stream_usage(body: &mut serde_json::Value) -> bool {
 ///   the final delta is authoritative; never summed).
 pub struct UsageAccumulator {
     input_tokens: Option<u64>,
+    /// Billed input outside `input_tokens` (see [`cache_input_tokens`]); cumulative on the
+    /// provider side, so the largest value seen wins. Added to the input count on read.
+    cache_input_tokens: u64,
+    /// Gemini `toolUsePromptTokenCount` (billed input, cumulative: largest wins) and
+    /// `thoughtsTokenCount` (billed output, cumulative: largest wins).
+    tool_prompt_tokens: u64,
+    thoughts_tokens: u64,
     output_tokens: Option<u64>,
     model: Option<String>,
     /// Carry for a partial trailing SSE line split across chunks.
@@ -413,23 +490,66 @@ pub struct UsageAccumulator {
     /// call just meters V13a-only — safe) rather than buffer unbounded.
     max_line: usize,
     capped: bool,
+    /// True once a usage block that carries the FINAL counts has been parsed (a top-level or
+    /// `response` usage block with an output count: OpenAI's terminal chunk, Anthropic's
+    /// `message_delta`, OpenAI Responses' `response.completed`, Gemini's `usageMetadata`).
+    /// Anthropic's `message_start` carries `input_tokens` and a provisional `output_tokens`
+    /// under `message.usage`; that alone must NOT count as final (VUL-01).
+    final_usage: bool,
+    /// Bytes of generated text seen in `delta` objects (text, tool arguments, reasoning).
+    delta_bytes: u64,
+    /// Every raw byte pushed, used only when a giant line stopped delta parsing.
+    raw_bytes: u64,
 }
 
 impl UsageAccumulator {
     pub fn new(max_line: usize) -> Self {
         Self {
             input_tokens: None,
+            cache_input_tokens: 0,
+            tool_prompt_tokens: 0,
+            thoughts_tokens: 0,
             output_tokens: None,
             model: None,
             line_buf: Vec::new(),
             max_line,
             capped: false,
+            final_usage: false,
+            delta_bytes: 0,
+            raw_bytes: 0,
         }
+    }
+
+    /// True when both counts were read from a usage block that carries the final counts, so
+    /// the stream's own numbers (not an estimate) can be charged.
+    pub fn is_complete(&self) -> bool {
+        self.final_usage && self.input_tokens.is_some() && self.output_tokens.is_some()
+    }
+
+    /// The input count to charge: the provider's `input_tokens` plus cache tokens (cache
+    /// writes weighted, see [`CACHE_WRITE_WEIGHT`]) plus Gemini tool-use prompt tokens.
+    fn input_total(&self) -> Option<u64> {
+        self.input_tokens.map(|i| {
+            i.saturating_add(self.cache_input_tokens)
+                .saturating_add(self.tool_prompt_tokens)
+        })
+    }
+
+    /// The output count to charge: the provider's count plus Gemini thinking tokens.
+    fn output_total(&self) -> Option<u64> {
+        self.output_tokens
+            .map(|o| o.saturating_add(self.thoughts_tokens))
+    }
+
+    /// The model the stream itself reported, if any (without consuming it).
+    pub fn stream_model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     /// Feed one RAW upstream chunk (pre-scrub). Parses every complete line it
     /// completes; a trailing partial line is carried to the next chunk.
     pub fn push(&mut self, chunk: &[u8]) {
+        self.raw_bytes = self.raw_bytes.saturating_add(chunk.len() as u64);
         if self.capped {
             return;
         }
@@ -450,14 +570,19 @@ impl UsageAccumulator {
         }
     }
 
-    /// Flush any trailing partial line and return the final `(usage, model)`. A
-    /// usage split is returned only when BOTH input and output counts were seen.
-    pub fn finish(&mut self) -> (Option<TokenUsage>, Option<String>) {
+    /// Parse a trailing partial line (no final newline) without consuming the model.
+    pub fn flush(&mut self) {
         if !self.line_buf.is_empty() {
             let line = std::mem::take(&mut self.line_buf);
             self.process_line(&line);
         }
-        let usage = match (self.input_tokens, self.output_tokens) {
+    }
+
+    /// Flush any trailing partial line and return the final `(usage, model)`. A
+    /// usage split is returned only when BOTH input and output counts were seen.
+    pub fn finish(&mut self) -> (Option<TokenUsage>, Option<String>) {
+        self.flush();
+        let usage = match (self.input_total(), self.output_total()) {
             (Some(input_tokens), Some(output_tokens)) => Some(TokenUsage {
                 input_tokens,
                 output_tokens,
@@ -476,7 +601,7 @@ impl UsageAccumulator {
     /// partial line buffer or take the model (it clones it), so it is safe to call every
     /// chunk; a complete split only materializes once the trailer line is fully parsed.
     pub fn snapshot(&self) -> Option<(TokenUsage, Option<String>)> {
-        match (self.input_tokens, self.output_tokens) {
+        match (self.input_total(), self.output_total()) {
             (Some(input_tokens), Some(output_tokens)) => Some((
                 TokenUsage {
                     input_tokens,
@@ -503,8 +628,14 @@ impl UsageAccumulator {
             return;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(rest) else {
+            // A data line that is not JSON still carries generated bytes; count them so an
+            // estimate is never lower than what was actually received.
+            self.delta_bytes = self.delta_bytes.saturating_add(rest.len() as u64);
             return;
         };
+        self.delta_bytes = self
+            .delta_bytes
+            .saturating_add(delta_string_bytes(&value, false));
         self.absorb(&value);
     }
 
@@ -537,10 +668,37 @@ impl UsageAccumulator {
             v.get("response").and_then(|r| r.get("usage")),
             v.get("usageMetadata"),
         ];
-        for usage in carriers.into_iter().flatten() {
+        for (idx, usage) in carriers.into_iter().enumerate() {
+            let Some(usage) = usage else {
+                continue;
+            };
             let Some(obj) = usage.as_object() else {
                 continue;
             };
+            // Carrier 1 is `message.usage` (Anthropic `message_start`): provisional.
+            let carries_final_counts = idx != 1
+                && [
+                    "completion_tokens",
+                    "output_tokens",
+                    "outputTokens",
+                    "candidatesTokenCount",
+                ]
+                .iter()
+                .any(|k| obj.get(*k).and_then(serde_json::Value::as_u64).is_some());
+            if carries_final_counts {
+                self.final_usage = true;
+            }
+            self.cache_input_tokens = self.cache_input_tokens.max(cache_input_tokens(obj));
+            self.tool_prompt_tokens = self.tool_prompt_tokens.max(
+                obj.get("toolUsePromptTokenCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            );
+            self.thoughts_tokens = self.thoughts_tokens.max(
+                obj.get("thoughtsTokenCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            );
             // INPUT tokens: FIRST-wins. The prompt count is reported once and early
             // (OpenAI's terminal usage chunk; Anthropic's `message_start`); a stray
             // `input_tokens` in a later event must not clobber the real prompt count.
@@ -584,6 +742,83 @@ impl UsageAccumulator {
     }
 }
 
+/// Bytes of generated text under any `delta` key of a parsed stream event (OpenAI
+/// `choices[].delta.content` / tool-call arguments / reasoning, Anthropic `delta.text` and
+/// `delta.partial_json`, OpenAI Responses `*.delta`). Only string lengths count; keys,
+/// ids and framing do not.
+fn delta_string_bytes(v: &serde_json::Value, inside_delta: bool) -> u64 {
+    match v {
+        serde_json::Value::String(s) if inside_delta => s.len() as u64,
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, val)| delta_string_bytes(val, inside_delta || k == "delta"))
+            .fold(0u64, u64::saturating_add),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|val| delta_string_bytes(val, inside_delta))
+            .fold(0u64, u64::saturating_add),
+        _ => 0,
+    }
+}
+
+/// Bytes per token used for a stream estimate. Real text is about four bytes per token;
+/// code and non-Latin scripts are lower. Three over-estimates typical text on purpose: an
+/// estimate that is too low lets a budget be evaded, one that is too high only charges early.
+pub const ESTIMATE_BYTES_PER_TOKEN: u64 = 3;
+
+/// A stream-usage estimate (VUL-01): what to charge when a streamed call ends without a
+/// complete usage trailer (client left and the drain hit a cap, the stream was cut, the agent
+/// was halted, or the provider cannot send a trailer with tools).
+///
+/// - input: the provider's own count if one was parsed, else the request body size over
+///   [`ESTIMATE_BYTES_PER_TOKEN`];
+/// - output: the larger of the provider's partial count and the generated text received over
+///   [`ESTIMATE_BYTES_PER_TOKEN`] (at least 1), capped by the request's own output limit when
+///   it set one (the provider cannot generate more than that).
+pub fn estimate_stream_usage(
+    acc: &UsageAccumulator,
+    prompt_bytes: u64,
+    max_output_tokens: Option<u64>,
+) -> TokenUsage {
+    let input_tokens = acc.input_total().unwrap_or_else(|| {
+        prompt_bytes
+            .div_ceil(ESTIMATE_BYTES_PER_TOKEN)
+            .saturating_add(acc.cache_input_tokens)
+            .saturating_add(acc.tool_prompt_tokens)
+    });
+    let generated = if acc.capped {
+        acc.raw_bytes
+    } else {
+        acc.delta_bytes
+    };
+    let mut output = generated.div_ceil(ESTIMATE_BYTES_PER_TOKEN).max(1);
+    if let Some(cap) = max_output_tokens {
+        output = output.min(cap.max(1));
+    }
+    TokenUsage {
+        input_tokens,
+        output_tokens: output.max(
+            acc.output_tokens
+                .unwrap_or(0)
+                .saturating_add(acc.thoughts_tokens),
+        ),
+    }
+}
+
+/// The request's own output-token limit, if it set one (`max_tokens`,
+/// `max_completion_tokens`, `max_output_tokens`, or Gemini's
+/// `generationConfig.maxOutputTokens`).
+pub fn request_max_output_tokens(body: &serde_json::Value) -> Option<u64> {
+    ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+        .iter()
+        .find_map(|k| body.get(*k).and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            body.get("generationConfig")
+                .and_then(|g| g.get("maxOutputTokens"))
+                .and_then(serde_json::Value::as_u64)
+        })
+}
+
 /// Build the V13b token meter event payload — a second `MeterEvent`-shaped body
 /// emitted for a non-streamed LLM call alongside the V13a `api-calls=1` event for
 /// the **same** call (same `event_id`/`correlation_id`/`principal`/`dims`).
@@ -623,7 +858,40 @@ pub fn meter_tokens_payload(
     model: Option<&str>,
     usage: TokenUsage,
 ) -> serde_json::Value {
+    meter_tokens_payload_marked(
+        request_id,
+        principal,
+        occurred_at,
+        tenant,
+        credential_alias,
+        model,
+        usage,
+        false,
+    )
+}
+
+/// [`meter_tokens_payload`] with the VUL-01 estimate marker: when `estimated` is true the
+/// counts come from [`estimate_stream_usage`], not from the provider, and the event carries
+/// `dims.estimated = "true"` (a plain dim, so leria ingests and prices it like any other
+/// token event and keeps the marker on the ledger entry).
+#[allow(clippy::too_many_arguments)]
+pub fn meter_tokens_payload_marked(
+    request_id: &str,
+    principal: &str,
+    occurred_at: DateTime<Utc>,
+    tenant: Option<&str>,
+    credential_alias: &str,
+    model: Option<&str>,
+    usage: TokenUsage,
+    estimated: bool,
+) -> serde_json::Value {
     let mut dims = serde_json::Map::new();
+    if estimated {
+        dims.insert(
+            "estimated".to_string(),
+            serde_json::Value::String("true".to_string()),
+        );
+    }
     if let Some(t) = tenant {
         dims.insert(
             "tenant".to_string(),
@@ -913,6 +1181,125 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_cache_tokens_are_added_to_the_input_count() {
+        // cache_creation and cache_read are billed input outside `input_tokens`.
+        let body = br#"{"model":"m","usage":{"input_tokens":10,
+            "cache_creation_input_tokens":100,"cache_read_input_tokens":1000,"output_tokens":5}}"#;
+        let u = parse_token_usage(body).unwrap();
+        // 10 plain + 100 cache writes counted twice + 1000 cache reads once.
+        assert_eq!(u.input_tokens, 1210);
+        assert_eq!(u.output_tokens, 5);
+        // Only one of the two present.
+        let body =
+            br#"{"usage":{"input_tokens":10,"cache_read_input_tokens":7,"output_tokens":5}}"#;
+        assert_eq!(parse_token_usage(body).unwrap().input_tokens, 17);
+        // Bedrock Converse spells them in camelCase.
+        let body = br#"{"usage":{"inputTokens":4,"cacheReadInputTokens":3,"cacheWriteInputTokens":2,"outputTokens":1}}"#;
+        // 4 + 3 reads + 2 writes counted twice.
+        assert_eq!(parse_token_usage(body).unwrap().input_tokens, 11);
+        // OpenAI's prompt_tokens already includes cached tokens: nothing is added.
+        let body = br#"{"usage":{"prompt_tokens":50,"completion_tokens":5,
+            "cache_read_input_tokens":999}}"#;
+        assert_eq!(parse_token_usage(body).unwrap().input_tokens, 50);
+        // An absurd value saturates instead of wrapping to a small count.
+        let body = format!(
+            r#"{{"usage":{{"input_tokens":1,"cache_read_input_tokens":{},"output_tokens":1}}}}"#,
+            u64::MAX
+        );
+        assert_eq!(
+            parse_token_usage(body.as_bytes()).unwrap().input_tokens,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn cache_writes_are_counted_at_twice_the_input_price_never_less() {
+        // A write is billed at 1.25x (5-minute cache) or 2x (1-hour cache); the usage block
+        // does not say which, so the upper bound is booked. Only writes, so the weight is
+        // visible on its own.
+        let body =
+            br#"{"usage":{"input_tokens":0,"cache_creation_input_tokens":100,"output_tokens":1}}"#;
+        assert_eq!(parse_token_usage(body).unwrap().input_tokens, 200);
+        let body = br#"{"usage":{"inputTokens":0,"cacheWriteInputTokens":100,"outputTokens":1}}"#;
+        assert_eq!(parse_token_usage(body).unwrap().input_tokens, 200);
+        // A read stays at the full input price (over-counted; the provider bills about 0.1x).
+        let body =
+            br#"{"usage":{"input_tokens":0,"cache_read_input_tokens":100,"output_tokens":1}}"#;
+        assert_eq!(parse_token_usage(body).unwrap().input_tokens, 100);
+        // Doubling saturates instead of wrapping.
+        let body = format!(
+            r#"{{"usage":{{"input_tokens":1,"cache_creation_input_tokens":{},"output_tokens":1}}}}"#,
+            u64::MAX
+        );
+        assert_eq!(
+            parse_token_usage(body.as_bytes()).unwrap().input_tokens,
+            u64::MAX
+        );
+        // Streamed: the largest cumulative write count wins, weighted once.
+        let mut acc = UsageAccumulator::new(1 << 20);
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"cache_creation_input_tokens\":100,\"output_tokens\":1}}}\n\n",
+        );
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_delta\",\"usage\":{\"cache_creation_input_tokens\":100,\"output_tokens\":5}}\n\n",
+        );
+        assert_eq!(acc.snapshot().unwrap().0.input_tokens, 200);
+    }
+
+    #[test]
+    fn gemini_thinking_and_tool_use_prompt_tokens_are_counted() {
+        // thoughtsTokenCount is billed as output, toolUsePromptTokenCount as input.
+        let body = br#"{"usageMetadata":{"promptTokenCount":30,"candidatesTokenCount":9,
+            "thoughtsTokenCount":400,"toolUsePromptTokenCount":50,"totalTokenCount":489}}"#;
+        assert_eq!(
+            parse_token_usage(body),
+            Some(TokenUsage {
+                input_tokens: 80,
+                output_tokens: 409
+            })
+        );
+    }
+
+    #[test]
+    fn a_gemini_block_without_candidates_still_books_its_prompt() {
+        // A blocked response has a prompt count and no candidatesTokenCount: the prompt was
+        // processed and billed, so it must not book nothing.
+        let body = br#"{"usageMetadata":{"promptTokenCount":42,"totalTokenCount":42},"promptFeedback":{"blockReason":"SAFETY"}}"#;
+        assert_eq!(
+            parse_token_usage(body),
+            Some(TokenUsage {
+                input_tokens: 42,
+                output_tokens: 0
+            })
+        );
+        // Thinking tokens alone (no visible candidates) are output.
+        let body = br#"{"usageMetadata":{"promptTokenCount":42,"thoughtsTokenCount":100}}"#;
+        assert_eq!(parse_token_usage(body).unwrap().output_tokens, 100);
+    }
+
+    #[test]
+    fn a_gemini_stream_counts_thinking_and_tool_use_tokens_once() {
+        let mut acc = UsageAccumulator::new(1 << 20);
+        feed(
+            &mut acc,
+            "data: {\"usageMetadata\":{\"promptTokenCount\":30,\"candidatesTokenCount\":2,\"thoughtsTokenCount\":100,\"toolUsePromptTokenCount\":10}}\n\n",
+        );
+        // Cumulative repeat in the final chunk: the largest value wins, never summed.
+        feed(
+            &mut acc,
+            "data: {\"usageMetadata\":{\"promptTokenCount\":30,\"candidatesTokenCount\":9,\"thoughtsTokenCount\":400,\"toolUsePromptTokenCount\":50}}\n\n",
+        );
+        let (usage, _) = acc.snapshot().unwrap();
+        assert_eq!(usage.input_tokens, 80);
+        assert_eq!(usage.output_tokens, 409);
+        // An estimate keeps the thinking tokens it saw as a floor.
+        let est = estimate_stream_usage(&acc, 0, None);
+        assert!(est.output_tokens >= 409);
+    }
+
+    #[test]
     fn test_parse_token_usage_none_for_no_usage_block() {
         // No usage block (streamed response without a usage trailer, or a non-LLM
         // action) → None → caller emits only the V13a api-calls=1 event.
@@ -1195,6 +1582,169 @@ mod tests {
         // Non-consuming: finish() still returns the same complete split afterward.
         let (again, _) = acc.finish();
         assert_eq!(again.map(|u| u.output_tokens), Some(22));
+    }
+
+    // --- VUL-01: stream usage completeness and estimates -------------------
+
+    fn feed(acc: &mut UsageAccumulator, text: &str) {
+        acc.push(text.as_bytes());
+    }
+
+    #[test]
+    fn streamed_anthropic_cache_tokens_are_added_to_the_input_count() {
+        let mut acc = UsageAccumulator::new(1 << 20);
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":1000,\"output_tokens\":1}}}\n\n",
+        );
+        // Provisional: not final yet, but the input already includes the cache tokens.
+        assert!(!acc.is_complete());
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        );
+        assert!(acc.is_complete());
+        let (usage, _) = acc.snapshot().unwrap();
+        assert_eq!(usage.input_tokens, 1210);
+        assert_eq!(usage.output_tokens, 5);
+        let (usage, _) = acc.finish();
+        assert_eq!(usage.unwrap().input_tokens, 1210);
+    }
+
+    #[test]
+    fn a_later_cumulative_cache_count_is_not_summed_with_the_first() {
+        // Newer Anthropic message_delta blocks repeat the cumulative cache counts: the
+        // largest value wins, they are never added again.
+        let mut acc = UsageAccumulator::new(1 << 20);
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":1000,\"output_tokens\":1}}}\n\n",
+        );
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":1000,\"output_tokens\":5}}\n\n",
+        );
+        assert_eq!(acc.snapshot().unwrap().0.input_tokens, 1010);
+    }
+
+    #[test]
+    fn an_estimate_keeps_the_cache_tokens_it_saw() {
+        let mut acc = UsageAccumulator::new(1 << 20);
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":90,\"output_tokens\":1}}}\n\n",
+        );
+        // No final trailer: an estimate, but the provider's input count (with cache) stands.
+        assert!(!acc.is_complete());
+        // 10 plain + 90 cache writes counted twice.
+        assert_eq!(estimate_stream_usage(&acc, 3000, None).input_tokens, 190);
+    }
+
+    #[test]
+    fn anthropic_message_start_usage_is_provisional_until_the_final_delta() {
+        let mut acc = UsageAccumulator::new(4096);
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":40,\"output_tokens\":1}}}\n\n",
+        );
+        assert!(acc.snapshot().is_some(), "both counts are present");
+        assert!(!acc.is_complete(), "but they are provisional");
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":77}}\n\n",
+        );
+        assert!(acc.is_complete());
+        assert_eq!(acc.snapshot().unwrap().0.output_tokens, 77);
+    }
+
+    #[test]
+    fn openai_trailer_and_responses_completed_are_complete_but_a_null_usage_is_not() {
+        let mut acc = UsageAccumulator::new(4096);
+        feed(
+            &mut acc,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n",
+        );
+        assert!(!acc.is_complete());
+        feed(
+            &mut acc,
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}\n\n",
+        );
+        assert!(acc.is_complete());
+        let mut acc = UsageAccumulator::new(4096);
+        feed(&mut acc, "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"m\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\n\n");
+        assert!(acc.is_complete());
+    }
+
+    #[test]
+    fn estimate_counts_generated_text_not_framing_and_prefers_real_counts() {
+        let mut acc = UsageAccumulator::new(4096);
+        // 300 generated bytes inside two deltas, plus framing that must not count.
+        let a = "a".repeat(120);
+        let b = "b".repeat(180);
+        feed(&mut acc, &format!("data: {{\"id\":\"chatcmpl-1\",\"choices\":[{{\"delta\":{{\"content\":\"{a}\"}}}}]}}\n\n"));
+        feed(&mut acc, &format!("event: x\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"text\":\"{b}\"}}}}\n\n"));
+        let est = estimate_stream_usage(&acc, 900, None);
+        assert_eq!(est.output_tokens, 100, "300 bytes / 3");
+        assert_eq!(
+            est.input_tokens, 300,
+            "900 prompt bytes / 3 when the provider gave none"
+        );
+        // The request's own output limit caps the estimate.
+        assert_eq!(estimate_stream_usage(&acc, 900, Some(40)).output_tokens, 40);
+        // A real partial count above the estimate wins, and a real input count replaces the guess.
+        feed(
+            &mut acc,
+            "data: {\"message\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":500}}}\n\n",
+        );
+        let est = estimate_stream_usage(&acc, 900, Some(40));
+        assert_eq!(est.input_tokens, 7);
+        assert_eq!(est.output_tokens, 500);
+        // Never zero output.
+        let empty = UsageAccumulator::new(4096);
+        assert_eq!(estimate_stream_usage(&empty, 0, None).output_tokens, 1);
+    }
+
+    #[test]
+    fn estimate_falls_back_to_raw_bytes_when_a_giant_line_stopped_parsing() {
+        let mut acc = UsageAccumulator::new(16);
+        acc.push(&[b'x'; 300]);
+        assert_eq!(estimate_stream_usage(&acc, 0, None).output_tokens, 100);
+    }
+
+    #[test]
+    fn request_output_limit_is_read_from_every_provider_shape() {
+        use serde_json::json;
+        assert_eq!(
+            request_max_output_tokens(&json!({"max_tokens": 9})),
+            Some(9)
+        );
+        assert_eq!(
+            request_max_output_tokens(&json!({"max_completion_tokens": 8})),
+            Some(8)
+        );
+        assert_eq!(
+            request_max_output_tokens(&json!({"max_output_tokens": 7})),
+            Some(7)
+        );
+        assert_eq!(
+            request_max_output_tokens(&json!({"generationConfig": {"maxOutputTokens": 6}})),
+            Some(6)
+        );
+        assert_eq!(request_max_output_tokens(&json!({})), None);
+    }
+
+    #[test]
+    fn estimated_token_payload_carries_the_marker_and_the_normal_one_does_not() {
+        let usage = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+        };
+        let now = chrono::Utc::now();
+        let est = meter_tokens_payload_marked("r", "p", now, None, "c", Some("m"), usage, true);
+        assert_eq!(est["dims"]["estimated"], "true");
+        let exact = meter_tokens_payload("r", "p", now, None, "c", Some("m"), usage);
+        assert!(exact["dims"].get("estimated").is_none());
+        assert_eq!(est["tokens"], exact["tokens"]);
     }
 
     // --- maybe_inject_stream_usage -----------------------------------------

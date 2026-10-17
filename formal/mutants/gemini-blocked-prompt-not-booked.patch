@@ -1,0 +1,13 @@
+diff --git a/src/outbox.rs b/src/outbox.rs
+index 11a0f21..ed89ac1 100644
+--- a/src/outbox.rs
++++ b/src/outbox.rs
+@@ -348,7 +348,7 @@ pub fn parse_token_usage(raw_body: &[u8]) -> Option<TokenUsage> {
+     // a prompt count and no candidates (a blocked response) still books its prompt.
+     if let Some(usage) = json.get("usageMetadata").and_then(|v| v.as_object()) {
+         let read = |k: &str| usage.get(k).and_then(serde_json::Value::as_u64);
+-        if let Some(prompt) = read("promptTokenCount") {
++        if let (Some(prompt), Some(_)) = (read("promptTokenCount"), read("candidatesTokenCount")) {
+             return Some(TokenUsage {
+                 input_tokens: prompt.saturating_add(read("toolUsePromptTokenCount").unwrap_or(0)),
+                 output_tokens: read("candidatesTokenCount")

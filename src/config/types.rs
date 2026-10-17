@@ -527,6 +527,9 @@ pub struct RawLlmProxyConfig {
     pub stream_total_timeout_secs: Option<u64>,
     pub stream_max_bytes: Option<u64>,
     pub stream_max_line_bytes: Option<usize>,
+    pub require_priced_model: Option<bool>,
+    pub rate_card_path: Option<String>,
+    pub azure_deployments: Option<std::collections::HashMap<String, String>>,
 }
 
 impl From<RawLlmProxyConfig> for LlmProxyConfig {
@@ -548,6 +551,11 @@ impl From<RawLlmProxyConfig> for LlmProxyConfig {
                 .stream_max_line_bytes
                 .filter(|&n| n > 0)
                 .unwrap_or(d.stream_max_line_bytes),
+            require_priced_model: raw.require_priced_model.unwrap_or(d.require_priced_model),
+            // The card itself is opened by `Config::from_raw`, which can fail.
+            rate_card_path: None,
+            rate_card: crate::ratecard::RateCardHandle::unconfigured(),
+            azure_deployments: raw.azure_deployments.unwrap_or_default(),
         }
     }
 }
@@ -988,6 +996,60 @@ impl TryFrom<RawPolicyCondition> for PolicyCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llm_proxy_requires_a_priced_model_by_default_and_with_no_card() {
+        let config = Config::parse("").unwrap();
+        assert!(config.llm_proxy.require_priced_model);
+        assert!(config.llm_proxy.rate_card_path.is_none());
+        assert!(!config.llm_proxy.rate_card.is_configured());
+        // A block that never mentions it keeps the default.
+        let config = Config::parse("[llm_proxy]\nstreaming_enabled = false\n").unwrap();
+        assert!(config.llm_proxy.require_priced_model);
+    }
+
+    #[test]
+    fn llm_proxy_reads_the_opt_out_and_the_card_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = dir.path().join("card.json");
+        std::fs::write(
+            &card,
+            r#"{"rate_card_version":"t","entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1}]}"#,
+        )
+        .unwrap();
+        let toml = format!(
+            "[llm_proxy]\nrequire_priced_model = false\nrate_card_path = {:?}\n\n[llm_proxy.azure_deployments]\nprod = \"m\"\n",
+            card.to_str().unwrap()
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert!(!config.llm_proxy.require_priced_model);
+        assert!(config.llm_proxy.rate_card.covers("m"));
+        assert!(!config.llm_proxy.rate_card.covers("other"));
+        assert_eq!(
+            config
+                .llm_proxy
+                .azure_deployments
+                .get("prod")
+                .map(String::as_str),
+            Some("m")
+        );
+        // No table: no deployment is mapped.
+        assert!(Config::default().llm_proxy.azure_deployments.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_or_invalid_rate_card_is_a_startup_error() {
+        let missing = "[llm_proxy]\nrate_card_path = \"/nonexistent/vultrino-card.json\"\n";
+        assert!(Config::parse(missing).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "{ not json").unwrap();
+        let toml = format!(
+            "[llm_proxy]\nrate_card_path = {:?}\n",
+            bad.to_str().unwrap()
+        );
+        assert!(Config::parse(&toml).is_err());
+    }
 
     #[test]
     fn test_parse_config() {

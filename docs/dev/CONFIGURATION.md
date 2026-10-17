@@ -144,18 +144,27 @@ stream_idle_timeout_secs = 120         # default 120 (0 disables)
 stream_total_timeout_secs = 1800       # default 1800 (0 disables)
 stream_max_bytes         = 268435456   # default 256 MiB (0 disables)
 stream_max_line_bytes    = 4194304     # default 4 MiB (must be > 0)
+require_priced_model     = true        # default true: refuse a model the rate card does not price
+rate_card_path           = "/etc/vultrino/rate-card.json"   # the SAME file leria reads
+
+[llm_proxy.azure_deployments]            # Azure deployment name -> the priced model it serves
+prod-4o = "gpt-4o"
 ```
 
-Every key is optional; an absent key falls back to the streaming-on default.
+Every key is optional; an absent key falls back to the default (streaming on, priced models only, no Azure deployment mapped).
 
 | Key | Default | Behavior |
 |-----|---------|----------|
 | `streaming_enabled` | `true` | Master switch for incremental SSE. When `false`, a `{"stream": true}` request still works — Vultrino strips the stream flags and serves it on the buffered path (disabling streaming de-streams a client, never breaks it). |
-| `inject_stream_usage` | `true` | When a streamed **OpenAI-chat** request omits `stream_options.include_usage`, force it to `true` so the provider emits a terminal usage chunk and V13b token metering fires. An explicit client value (true **or** false) is honored, never overwritten. Anthropic `/v1/messages` and OpenAI `/v1/responses` report usage natively and are excluded. |
+| `inject_stream_usage` | `true` | When `true`, a streamed **OpenAI-chat** request is forced to `stream_options.include_usage = true` (a missing value is added and a client `false` is **overwritten**: the flag is gateway-owned, so a client cannot opt out of token metering) so the provider emits a terminal usage chunk and V13b token metering fires. When `false`, nothing is injected and a stream without a trailer is charged an estimate (`dims.estimated = "true"`). Anthropic `/v1/messages` and OpenAI `/v1/responses` report usage natively and are excluded. |
 | `stream_idle_timeout_secs` | `120` | Abort a stream idle this many seconds (slow-loris upstream). `0` disables. |
 | `stream_total_timeout_secs` | `1800` | Abort a stream running longer than this in total. `0` disables. |
 | `stream_max_bytes` | `268435456` (256 MiB) | Abort a stream once it has forwarded more than this many bytes. `0` disables. |
 | `stream_max_line_bytes` | `4194304` (4 MiB) | Fail closed if a single un-delimited SSE line / scrub carry-buffer would exceed this. A `0`/absent value falls back to the default (a 0 cap would fail every chunk). |
+| `require_priced_model` | `true` | Refuse an LLM-proxy request whose model the rate card at `rate_card_path` does not price: `403 model_unpriced`, before any upstream call (so the mock or real upstream sees no request). A model no entry covers books $0 in leria (its token event is rejected as unpriced), so a budget cap would never trip for it. A request that carries a body but names no model is refused too (it cannot be shown to be priced); a bodiless request (a model list) is not a billed call and is not gated. The model is the one the upstream URL selects where the URL picks it (Gemini and Vertex `models/<id>`, Bedrock `model/<id>`, Azure `deployments/<name>` through `[llm_proxy.azure_deployments]`; a deployment that is not mapped is refused), else the JSON body's `model`. A body `model` that differs from the URL's is refused, as is a request that sets a price the card cannot hold (`403 modifier_unpriced`: `speed` other than `standard`, `inference_geo` other than `global`, a priority `service_tier`, Bedrock latency-optimized or priority inference, a server-side tool such as web search). With **no card configured nothing is priced, so every model-bearing call is refused**: set `rate_card_path`, or set this to `false` to opt out explicitly (posture reports it). |
+| `rate_card_path` | unset | The rate-card JSON file leria prices with (`LERIA_RATE_CARD_FILE`): mount one file for both planes. Read at start (an unreadable, empty or malformed file, an unknown field, a missing `rate_card_version`, a one-sided input or output price, or a zero token price, is a startup error, as in leria) and re-read when its size or modified time changes. leria reads the file only at start, so a change can only narrow coverage: vultrino serves the intersection of the card it read at start and the latest good file until it restarts. A changed file that cannot be used keeps the previous card and is reported as `rate_card.last_error` in `/api/v1/posture`. Only coverage is read: an entry with `model_ref` covers exactly that id; an entry with `model_ref_prefix` covers a dated id, the prefix followed by `-` or `@` and more text (`claude-haiku-4-5-20251001`), and a dated id matches no other way. Entries of another asset than `tokens` price nothing. Prices are not used by vultrino. |
+
+When a card is configured the token meter event is booked under the model the provider served if the card prices it, else the model the request named only when the served id is a dated form of it (so a dated snapshot of a priced alias is still priced); any other served model is booked under its own id. `/api/v1/posture` reports `rate_card.sha256` (the sha256 of the card read at start, the same digest leria reports for the same file) and `rate_card.file_sha256` (the file as last read), so a deploy check can compare the two planes and see a drift.
 
 The provider-protocol gate (`VULTRINO_PROVIDER_*_ENABLED`, above) is separate from
 these streaming tunables and governs which protocols may carry traffic at all.

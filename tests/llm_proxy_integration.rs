@@ -235,14 +235,65 @@ fn allow_policy(credential_pattern: &str) -> Policy {
 /// Build the router + the shared storage + the shared exec server (so a test can
 /// register the stub plugin and read the outbox back).
 async fn build_stack(
+    mut config: Config,
+) -> (axum::Router, Arc<dyn StorageBackend>, Arc<VultrinoServer>) {
+    // The production default refuses a model no rate card prices (and with no card nothing
+    // is priced). The suite's models are priced by one shared test card unless a test
+    // brings its own card or goes through `build_stack_raw`.
+    if config.llm_proxy.rate_card_path.is_none() && config.llm_proxy.require_priced_model {
+        config.llm_proxy = config
+            .llm_proxy
+            .clone()
+            .with_rate_card_path(test_card_path())
+            .unwrap();
+    }
+    build_stack_raw(config).await
+}
+
+/// The test card: every model this suite names. `claude-haiku-4-5` also has a prefix entry
+/// so a dated id is priced.
+fn test_card_path() -> std::path::PathBuf {
+    static CARD: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    CARD.get_or_init(|| {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("card.json");
+        std::mem::forget(dir);
+        std::fs::write(&path, TEST_CARD).unwrap();
+        path
+    })
+    .clone()
+}
+
+const TEST_CARD: &str = r#"[{"rate_card_version":"t-1","entries":[
+ {"model_ref":"gpt-4o-mini","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":2},
+ {"model_ref":"gpt-4o","asset":"tokens","input_price_micros_per_unit":3,"output_price_micros_per_unit":9},
+ {"model_ref":"gpt-3.5-turbo","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":2},
+ {"model_ref":"x","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":2},
+ {"model_ref":"claude-haiku-4-5","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":5},
+ {"model_ref_prefix":"claude-haiku-4-5","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":5},
+ {"model_ref":"gemini-2.5-flash","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":3},
+ {"model_ref":"anthropic.claude-3-haiku-20240307-v1:0","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":5}
+]}]"#;
+
+/// [`build_stack`] without the shared test card: the config is used as given.
+async fn build_stack_raw(
     config: Config,
+) -> (axum::Router, Arc<dyn StorageBackend>, Arc<VultrinoServer>) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    build_stack_at(config, &path).await
+}
+
+/// [`build_stack_raw`] with the vault (and its sibling outbox) in `dir`.
+async fn build_stack_at(
+    config: Config,
+    dir: &std::path::Path,
 ) -> (axum::Router, Arc<dyn StorageBackend>, Arc<VultrinoServer>) {
     // The production default is fail-closed. This suite explicitly opts into
     // the OpenAI wire family it exercises; every test writes the same value.
     unsafe { std::env::set_var("VULTRINO_PROVIDER_OPENAI_ENABLED", "true") };
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("store.enc");
-    std::mem::forget(dir);
+    let path = dir.join("store.enc");
 
     let password = SecretString::from("test-password");
     let storage: Arc<dyn StorageBackend> =
@@ -1034,7 +1085,7 @@ async fn llm_max_output_tokens_ceiling_clamps_the_forwarded_request() {
 }
 
 #[tokio::test]
-async fn llm_streamed_emits_api_calls_only_no_token_count() {
+async fn llm_streamed_without_a_usage_trailer_is_charged_an_estimate() {
     let (router, storage, srv) =
         build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
     srv.plugins().register(Arc::new(MockLlmPlugin));
@@ -1076,10 +1127,17 @@ async fn llm_streamed_emits_api_calls_only_no_token_count() {
         1,
         "a streamed call still meters api-calls=1: {events:?}"
     );
-    assert!(
-        token_events.is_empty(),
-        "a streamed response (no usage trailer) must NOT emit a token event: {events:?}"
+    // VUL-01: a stream that ends without a usage trailer is no longer free. It is charged
+    // an ESTIMATE, marked `dims.estimated = "true"`, so leria still counts it.
+    assert_eq!(
+        token_events.len(),
+        1,
+        "a streamed response with no usage trailer is charged an estimate: {events:?}"
     );
+    assert_eq!(token_events[0]["dims"]["estimated"], "true");
+    assert_eq!(token_events[0]["dims"]["model_ref"], "gpt-4o-mini");
+    assert!(token_events[0]["tokens"]["input_tokens"].as_u64().unwrap() > 0);
+    assert!(token_events[0]["tokens"]["output_tokens"].as_u64().unwrap() >= 1);
 }
 
 // ===========================================================================
@@ -1293,8 +1351,8 @@ async fn llm_streamed_halt_cancels_midstream() {
         "no key leak on the halted stream"
     );
 
-    // A halted streamed call still meters V13a api-calls=1, but NOT V13b (a halted
-    // stream has no trustworthy usage trailer — never under-count).
+    // A halted streamed call meters V13a api-calls=1 and, because a halt closes the upstream
+    // (stopping generation) rather than draining it, an ESTIMATED V13b event (VUL-01).
     let events = meter_events(&storage).await;
     let api_calls: Vec<_> = events
         .iter()
@@ -1306,10 +1364,265 @@ async fn llm_streamed_halt_cancels_midstream() {
         1,
         "a halted streamed call still meters api-calls=1: {events:?}"
     );
-    assert!(
-        token_events.is_empty(),
-        "a halted stream emits no V13b token event: {events:?}"
+    assert_eq!(
+        token_events.len(),
+        1,
+        "a halted stream is charged an estimated token event: {events:?}"
     );
+    assert_eq!(token_events[0]["dims"]["estimated"], "true");
+}
+
+// ===========================================================================
+// VUL-01: a client that hangs up before the usage trailer is still charged
+// ===========================================================================
+
+/// How the gated upstream ends its stream once the test releases the gate.
+#[derive(Clone, Copy)]
+enum GatedEnd {
+    /// OpenAI-style terminal usage chunk (prompt 11, completion 22), then `[DONE]`.
+    OpenAiTrailer,
+    /// Anthropic-shaped: `message_start` carries input 40 and a provisional output 1; the
+    /// final `message_delta` after the gate carries output 77.
+    AnthropicFinalDelta,
+    /// The stream just ends, with no usage anywhere (the NVIDIA tool-call shape).
+    NoTrailer,
+}
+
+/// An upstream that sends one chunk immediately and the rest only after `gate` is released,
+/// so a test can hang up while the upstream is still producing.
+struct GatedStreamingPlugin {
+    end: GatedEnd,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl Plugin for GatedStreamingPlugin {
+    fn name(&self) -> &str {
+        "mockgate"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["chat"]
+    }
+    async fn execute(&self, _request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        Ok(ExecuteResponse::new(200, HashMap::new(), b"{}".to_vec()))
+    }
+    async fn execute_streaming(
+        &self,
+        _request: PluginRequest,
+    ) -> Result<vultrino::StreamingResponse, PluginError> {
+        use futures::StreamExt;
+        let text = "x".repeat(3000);
+        let (first, rest) = match self.end {
+            GatedEnd::OpenAiTrailer => (
+                format!("data: {{\"model\":\"gpt-4o-mini\",\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n"),
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\ndata: [DONE]\n\n".to_string(),
+            ),
+            GatedEnd::AnthropicFinalDelta => (
+                format!(
+                    "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"model\":\"gpt-4o-mini\",\"usage\":{{\"input_tokens\":40,\"output_tokens\":1}}}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n"
+                ),
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":77}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+            ),
+            GatedEnd::NoTrailer => (
+                format!("data: {{\"model\":\"gpt-4o-mini\",\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n"),
+                "data: [DONE]\n\n".to_string(),
+            ),
+        };
+        let gate = Arc::clone(&self.gate);
+        let tail = futures::stream::once(async move {
+            gate.acquire().await.unwrap().forget();
+            Ok::<bytes::Bytes, PluginError>(bytes::Bytes::from(rest))
+        });
+        let body = futures::stream::iter(vec![Ok(bytes::Bytes::from(first))]).chain(tail);
+        Ok(vultrino::StreamingResponse::new(
+            200,
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]),
+            Box::pin(body),
+        ))
+    }
+    fn validate_params(
+        &self,
+        _action: &str,
+        _params: &serde_json::Value,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+/// Start a gated stream, hang up before the gate opens, optionally release the gate, and
+/// return the token event once it appears (or `None` after `wait`).
+async fn hang_up_midstream(
+    end: GatedEnd,
+    release_gate: bool,
+    config: Config,
+    wait: std::time::Duration,
+) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
+    hang_up_midstream_then(end, release_gate, false, config, wait).await
+}
+
+/// As [`hang_up_midstream`], optionally halting the agent after the hang-up (V6).
+async fn hang_up_midstream_then(
+    end: GatedEnd,
+    release_gate: bool,
+    halt_after_hangup: bool,
+    config: Config,
+    wait: std::time::Duration,
+) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
+    let (router, storage, srv) = build_stack(config).await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    srv.plugins().register(Arc::new(GatedStreamingPlugin {
+        end,
+        gate: Arc::clone(&gate),
+    }));
+    store_provider_credential(&storage, "cred-openai").await;
+    register_llm_capability(
+        &storage,
+        "cred-openai",
+        "mockgate.chat",
+        "https://api.openai.com",
+    )
+    .await;
+    let token = mint_token(&storage, "cred-openai", Some("mockgate.chat")).await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/chat/completions",
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": true, "messages": [{"role": "user", "content": "hello"}] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The client hangs up here, with the upstream still producing.
+    drop(resp);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    if halt_after_hangup {
+        let token_id = storage
+            .list_use_tokens()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+        let outcome = srv.halt_agent(&token_id).await.unwrap();
+        assert_eq!(
+            outcome.in_flight.len(),
+            1,
+            "the draining session is still registered"
+        );
+    }
+    if release_gate {
+        gate.add_permits(1);
+    }
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let events = meter_events(&storage).await;
+        if let Some(t) = events.iter().find(|p| p["asset"] == "usd") {
+            let t = t.clone();
+            return (events, Some(t));
+        }
+        if tokio::time::Instant::now() > deadline {
+            return (events, None);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn vul01_disconnect_before_the_trailer_still_charges_the_providers_exact_count() {
+    let (events, token) = hang_up_midstream(
+        GatedEnd::OpenAiTrailer,
+        true,
+        config_with_policies(vec![allow_policy("cred-*")]),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let token = token.unwrap_or_else(|| panic!("no token event after a disconnect: {events:?}"));
+    assert_eq!(token["tokens"]["input_tokens"], 11);
+    assert_eq!(token["tokens"]["output_tokens"], 22);
+    assert!(
+        token["dims"].get("estimated").is_none(),
+        "the drained trailer is the provider's own count, not an estimate: {token}"
+    );
+    assert_eq!(
+        events.iter().filter(|p| p["asset"] == "api-calls").count(),
+        1,
+        "still exactly one api-calls event"
+    );
+}
+
+#[tokio::test]
+async fn vul01_a_provisional_anthropic_output_count_is_not_charged_as_final() {
+    // message_start said output_tokens = 1. Before the fix a disconnect here charged 1 token for
+    // an answer of 77. The drain reaches message_delta and charges the real count.
+    let (events, token) = hang_up_midstream(
+        GatedEnd::AnthropicFinalDelta,
+        true,
+        config_with_policies(vec![allow_policy("cred-*")]),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let token = token.unwrap_or_else(|| panic!("no token event: {events:?}"));
+    assert_eq!(token["tokens"]["input_tokens"], 40);
+    assert_eq!(token["tokens"]["output_tokens"], 77);
+    assert!(token["dims"].get("estimated").is_none());
+}
+
+#[tokio::test]
+async fn vul01_a_stream_that_ends_without_any_trailer_is_charged_an_estimate() {
+    let (events, token) = hang_up_midstream(
+        GatedEnd::NoTrailer,
+        true,
+        config_with_policies(vec![allow_policy("cred-*")]),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let token = token.unwrap_or_else(|| panic!("no token event: {events:?}"));
+    assert_eq!(token["dims"]["estimated"], "true");
+    assert_eq!(token["dims"]["model_ref"], "gpt-4o-mini");
+    // 3000 generated bytes at 3 bytes per token.
+    assert_eq!(token["tokens"]["output_tokens"], 1000);
+    assert!(token["tokens"]["input_tokens"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn vul01_the_drain_is_bounded_by_the_idle_cap_and_then_estimates() {
+    // The gate is never released: the upstream goes silent after the hang-up. The drain must
+    // give up at the idle cap instead of waiting forever, and charge an estimate.
+    let mut config = config_with_policies(vec![allow_policy("cred-*")]);
+    config.llm_proxy.stream_idle_timeout_secs = 1;
+    let (events, token) = hang_up_midstream(
+        GatedEnd::OpenAiTrailer,
+        false,
+        config,
+        std::time::Duration::from_secs(15),
+    )
+    .await;
+    let token = token.unwrap_or_else(|| panic!("no token event: {events:?}"));
+    // The wait is 15 s from the hang-up and the default idle cap is 120 s, so a charge inside
+    // the wait means the drain stopped at the 1 s cap. (Setup time is not part of the wait.)
+    assert_eq!(token["dims"]["estimated"], "true");
+}
+
+#[tokio::test]
+async fn vul01_a_halt_after_the_hangup_closes_the_draining_upstream_at_once() {
+    // The gate is never released and the idle cap is 120 s: without the abort arm in the
+    // drain the upstream stays open (the provider keeps generating) until that cap.
+    let (events, token) = hang_up_midstream_then(
+        GatedEnd::OpenAiTrailer,
+        false,
+        true,
+        config_with_policies(vec![allow_policy("cred-*")]),
+        // The wait starts after the halt; the idle cap is 120 s, so only the abort arm can
+        // produce the charge in time.
+        std::time::Duration::from_secs(3),
+    )
+    .await;
+    let token = token.unwrap_or_else(|| panic!("a halt must end the drain and charge: {events:?}"));
+    assert_eq!(token["dims"]["estimated"], "true");
 }
 
 // ===========================================================================
@@ -2195,4 +2508,1174 @@ fn anthropic_workspace_id_metadata_is_validated_at_write() {
             "{bad:?}"
         );
     }
+}
+
+// ===========================================================================
+// V2b (feir-ops#6): a model the rate card does not price is refused before the upstream
+// call, because it would book $0 and a budget cap would never trip; Anthropic cache tokens
+// are counted at the full input price; a token event always names the model.
+// ===========================================================================
+
+/// A buffered Anthropic-shaped upstream that counts how many requests reached it. It answers
+/// with `served_model` (an id the request did not name, to exercise the priced-model pick)
+/// and a usage block carrying cache tokens.
+struct CountingAnthropicPlugin {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    served_model: &'static str,
+}
+
+#[async_trait]
+impl Plugin for CountingAnthropicPlugin {
+    fn name(&self) -> &str {
+        "countllm"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["chat"]
+    }
+    async fn execute(&self, _request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let body = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "model": self.served_model,
+            "content": [{ "type": "text", "text": "hi" }],
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 1000,
+                "output_tokens": 5
+            }
+        });
+        Ok(ExecuteResponse::new(
+            200,
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            serde_json::to_vec(&body).unwrap(),
+        ))
+    }
+    async fn execute_streaming(
+        &self,
+        _request: PluginRequest,
+    ) -> Result<vultrino::StreamingResponse, PluginError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Anthropic SSE: message_start carries the input and cache counts, message_delta the
+        // final output count.
+        let chunk = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"model\":\"{}\",\"usage\":{{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":1000,\"output_tokens\":1}}}}}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":5}}}}\n\n",
+            self.served_model
+        );
+        let body = futures::stream::iter(vec![Ok(bytes::Bytes::from(chunk))]);
+        Ok(vultrino::StreamingResponse::new(
+            200,
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]),
+            Box::pin(body),
+        ))
+    }
+    fn validate_params(
+        &self,
+        _action: &str,
+        _params: &serde_json::Value,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+/// A stack whose upstream is a [`CountingAnthropicPlugin`], reached through an
+/// anthropic-messages LLM channel. Returns the router, storage, token and call counter.
+async fn anthropic_stack(
+    config: Config,
+    served_model: &'static str,
+) -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    anthropic_stack_at(config, served_model, &path).await
+}
+
+/// [`anthropic_stack`] with the vault (and its sibling outbox) in `dir`.
+async fn anthropic_stack_at(
+    config: Config,
+    served_model: &'static str,
+    dir: &std::path::Path,
+) -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    proto_stack_at(
+        config,
+        served_model,
+        dir,
+        "anthropic-messages",
+        "https://api.anthropic.com",
+        "VULTRINO_PROVIDER_ANTHROPIC_ENABLED",
+    )
+    .await
+}
+
+/// A counting-upstream stack behind an LLM channel of any `protocol` and `provider_base`.
+async fn proto_stack(
+    config: Config,
+    served_model: &'static str,
+    protocol: &str,
+    provider_base: &str,
+    env_flag: &str,
+) -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    proto_stack_at(
+        config,
+        served_model,
+        &path,
+        protocol,
+        provider_base,
+        env_flag,
+    )
+    .await
+}
+
+async fn proto_stack_at(
+    config: Config,
+    served_model: &'static str,
+    dir: &std::path::Path,
+    protocol: &str,
+    provider_base: &str,
+    env_flag: &str,
+) -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    proto_stack_models(
+        config,
+        served_model,
+        dir,
+        protocol,
+        provider_base,
+        env_flag,
+        Vec::new(),
+    )
+    .await
+}
+
+/// [`proto_stack_at`] with a per-model allowlist on the capability (empty = any model).
+async fn proto_stack_models(
+    mut config: Config,
+    served_model: &'static str,
+    dir: &std::path::Path,
+    protocol: &str,
+    provider_base: &str,
+    env_flag: &str,
+    allowed_models: Vec<String>,
+) -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    unsafe { std::env::set_var(env_flag, "true") };
+    if config.llm_proxy.rate_card_path.is_none() && config.llm_proxy.require_priced_model {
+        config.llm_proxy = config
+            .llm_proxy
+            .clone()
+            .with_rate_card_path(test_card_path())
+            .unwrap();
+    }
+    let (router, storage, srv) = build_stack_at(config, dir).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    srv.plugins().register(Arc::new(CountingAnthropicPlugin {
+        calls: Arc::clone(&calls),
+        served_model,
+    }));
+    store_provider_credential(&storage, "cred-anthropic").await;
+    let cap = Capability {
+        id: "cap-llm".to_string(),
+        tool_name: "model_proxy".to_string(),
+        description: "counting channel".to_string(),
+        action: "countllm.chat".to_string(),
+        plugin: None,
+        target: CapabilityTarget::default(),
+        credential_ref: "cred-anthropic".to_string(),
+        input_schema: serde_json::Value::Null,
+        reversibility: "reversible".to_string(),
+        llm: Some(LlmProxy {
+            protocol: protocol.to_string(),
+            provider_base: provider_base.to_string(),
+            allowed_models,
+            ..Default::default()
+        }),
+        approval_preview: None,
+    };
+    cap.validate().unwrap();
+    storage.store_capability(&cap).await.unwrap();
+    let token = mint_token(&storage, "cred-anthropic", Some("countllm.chat")).await;
+    (router, storage, token, calls)
+}
+
+fn calls_of(calls: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+    calls.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+async fn error_type(resp: axum::response::Response) -> String {
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    body["error"]["type"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn messages(model: &str) -> serde_json::Value {
+    serde_json::json!({ "model": model, "max_tokens": 10, "messages": [{"role":"user","content":"hi"}] })
+}
+
+#[tokio::test]
+async fn v2b_an_unpriced_model_is_refused_and_the_upstream_sees_no_request() {
+    let (router, _storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("claude-opus-9-9"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+}
+
+#[tokio::test]
+async fn v2b_an_unpriced_streamed_request_is_refused_before_the_upstream_too() {
+    let (router, storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let mut body = messages("claude-opus-9-9");
+    body["stream"] = serde_json::json!(true);
+    let resp = router
+        .oneshot(llm_req(Some(&token), "v1/messages", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(calls_of(&calls), 0);
+    assert!(
+        meter_events(&storage).await.is_empty(),
+        "a refused call meters nothing"
+    );
+}
+
+#[tokio::test]
+async fn v2b_a_request_naming_no_model_is_refused() {
+    let (router, _storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            serde_json::json!({ "max_tokens": 10, "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(calls_of(&calls), 0);
+}
+
+#[tokio::test]
+async fn v2b_a_priced_model_passes_and_is_metered() {
+    let (router, storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("claude-haiku-4-5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+    let events = meter_events(&storage).await;
+    let token_event = events.iter().find(|p| p["asset"] == "usd").unwrap();
+    assert_eq!(token_event["dims"]["model_ref"], "claude-haiku-4-5");
+}
+
+#[tokio::test]
+async fn v2b_a_dated_id_is_priced_only_through_an_explicit_prefix_entry() {
+    let (router, _storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    // claude-haiku-4-5 has a prefix entry: the dated id passes.
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("claude-haiku-4-5-20251001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+    // gpt-4o has only an exact entry: its dated id is unpriced.
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("gpt-4o-2024-08-06"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(
+        calls_of(&calls),
+        1,
+        "the refused dated id never reached the upstream"
+    );
+}
+
+#[tokio::test]
+async fn v2b_with_no_card_configured_every_model_is_refused() {
+    unsafe { std::env::set_var("VULTRINO_PROVIDER_ANTHROPIC_ENABLED", "true") };
+    let (router, storage, srv) =
+        build_stack_raw(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    srv.plugins().register(Arc::new(CountingAnthropicPlugin {
+        calls: Arc::clone(&calls),
+        served_model: "claude-haiku-4-5",
+    }));
+    store_provider_credential(&storage, "cred-anthropic").await;
+    let cap = Capability {
+        id: "cap-llm".to_string(),
+        tool_name: "model_proxy".to_string(),
+        description: "anthropic channel".to_string(),
+        action: "countllm.chat".to_string(),
+        plugin: None,
+        target: CapabilityTarget::default(),
+        credential_ref: "cred-anthropic".to_string(),
+        input_schema: serde_json::Value::Null,
+        reversibility: "reversible".to_string(),
+        llm: Some(LlmProxy {
+            protocol: "anthropic-messages".to_string(),
+            provider_base: "https://api.anthropic.com".to_string(),
+            ..Default::default()
+        }),
+        approval_preview: None,
+    };
+    cap.validate().unwrap();
+    storage.store_capability(&cap).await.unwrap();
+    let token = mint_token(&storage, "cred-anthropic", Some("countllm.chat")).await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("claude-haiku-4-5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(calls_of(&calls), 0);
+}
+
+#[tokio::test]
+async fn v2b_the_operator_opt_out_lets_an_unpriced_model_through() {
+    let mut config = config_with_policies(vec![allow_policy("cred-*")]);
+    config.llm_proxy.require_priced_model = false;
+    let (router, _storage, token, calls) = anthropic_stack(config, "claude-opus-9-9").await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("claude-opus-9-9"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+}
+
+#[tokio::test]
+async fn v2b_a_gemini_model_in_the_path_is_gated_too() {
+    let (router, _storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    // The body names no model; the path does, and it is unpriced.
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-9-pro:generateContent",
+            serde_json::json!({ "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(calls_of(&calls), 0);
+}
+
+#[tokio::test]
+async fn v2b_buffered_anthropic_cache_tokens_are_counted_as_input() {
+    let (router, storage, token, _calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("claude-haiku-4-5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events = meter_events(&storage).await;
+    let t = events.iter().find(|p| p["asset"] == "usd").unwrap();
+    // 10 plain + 100 cache writes counted twice + 1000 cache reads.
+    assert_eq!(t["tokens"]["input_tokens"], 1210);
+    assert_eq!(t["tokens"]["output_tokens"], 5);
+}
+
+#[tokio::test]
+async fn v2b_streamed_anthropic_cache_tokens_are_counted_as_input() {
+    let (router, storage, token, _calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let mut body = messages("claude-haiku-4-5");
+    body["stream"] = serde_json::json!(true);
+    let resp = router
+        .oneshot(llm_req(Some(&token), "v1/messages", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = body_bytes(resp).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let t = loop {
+        let events = meter_events(&storage).await;
+        if let Some(t) = events.iter().find(|p| p["asset"] == "usd") {
+            break t.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no token event: {events:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(t["tokens"]["input_tokens"], 1210);
+    assert_eq!(t["tokens"]["output_tokens"], 5);
+    assert!(t["dims"].get("estimated").is_none());
+}
+
+#[tokio::test]
+async fn v2b_the_token_event_names_a_priced_model_when_the_served_id_is_not_priced() {
+    // The provider answers with a dated id the card does not cover (gpt-4o has no prefix
+    // entry); the request named a priced model. The event must carry the model the card
+    // prices, or the metering plane would reject it as unpriced and book $0.
+    let (router, storage, token, _calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gpt-4o-2024-08-06",
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(Some(&token), "v1/messages", messages("gpt-4o")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events = meter_events(&storage).await;
+    let t = events.iter().find(|p| p["asset"] == "usd").unwrap();
+    assert_eq!(t["dims"]["model_ref"], "gpt-4o");
+}
+
+#[tokio::test]
+async fn v2b_a_streamed_token_event_names_a_priced_model_when_the_served_id_is_not_priced() {
+    let (router, storage, token, _calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gpt-4o-2024-08-06",
+    )
+    .await;
+    let mut body = messages("gpt-4o");
+    body["stream"] = serde_json::json!(true);
+    let resp = router
+        .oneshot(llm_req(Some(&token), "v1/messages", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = body_bytes(resp).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let t = loop {
+        let events = meter_events(&storage).await;
+        if let Some(t) = events.iter().find(|p| p["asset"] == "usd") {
+            break t.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no token event: {events:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(t["dims"]["model_ref"], "gpt-4o");
+}
+
+// ---------------------------------------------------------------------------
+// feir-ops#6 review round 1: the model the upstream URL selects is the one that is gated and
+// booked, and a request that sets a price the card cannot hold is refused.
+// ---------------------------------------------------------------------------
+
+const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com";
+const BEDROCK_BASE: &str = "https://bedrock-runtime.us-east-1.amazonaws.com";
+
+async fn gemini_stack(
+    config: Config,
+    served: &'static str,
+    base: &str,
+) -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    proto_stack(
+        config,
+        served,
+        "gemini",
+        base,
+        "VULTRINO_PROVIDER_GEMINI_ENABLED",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn v2b_the_model_in_the_path_decides_not_the_one_in_the_body() {
+    // The probe from the review: the body names a priced model, the path an unpriced one.
+    // The upstream serves the path's model and ignores the body field, so the request must
+    // be refused, not booked at the body model's price.
+    let (router, _storage, token, calls) = gemini_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+        GEMINI_BASE,
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-9-pro:generateContent",
+            serde_json::json!({ "model": "claude-haiku-4-5", "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+}
+
+#[tokio::test]
+async fn v2b_a_body_model_that_differs_from_a_priced_path_model_is_refused() {
+    // Both are priced, but they disagree: which one is billed is the upstream's choice, so
+    // the call cannot be shown to be priced as booked.
+    let (router, _storage, token, calls) = gemini_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        GEMINI_BASE,
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-2.5-flash:generateContent",
+            serde_json::json!({ "model": "claude-haiku-4-5", "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(calls_of(&calls), 0);
+}
+
+#[tokio::test]
+async fn v2b_a_priced_path_model_passes_and_is_booked_under_that_model() {
+    let (router, storage, token, calls) = gemini_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        GEMINI_BASE,
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-2.5-flash:generateContent",
+            serde_json::json!({ "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+    let events = meter_events(&storage).await;
+    let t = events.iter().find(|p| p["asset"] == "usd").unwrap();
+    assert_eq!(t["dims"]["model_ref"], "gemini-2.5-flash");
+}
+
+#[tokio::test]
+async fn v2b_a_model_baked_into_provider_base_is_the_routed_model() {
+    // The capability's provider_base already names an unpriced model; the request path adds
+    // nothing about it and the body names a priced one.
+    let base = format!("{GEMINI_BASE}/v1beta/models/gemini-9-pro");
+    let (router, _storage, token, calls) = gemini_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+        &base,
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "generate",
+            serde_json::json!({ "model": "claude-haiku-4-5", "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(calls_of(&calls), 0);
+}
+
+#[tokio::test]
+async fn v2b_bedrock_takes_the_model_from_the_path_and_a_priced_one_passes() {
+    // A legitimate Bedrock call carries no model in the body; it used to be refused.
+    let (router, storage, token, calls) = proto_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "anthropic.claude-3-haiku-20240307-v1:0",
+        "bedrock-converse",
+        BEDROCK_BASE,
+        "VULTRINO_PROVIDER_BEDROCK_ENABLED",
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "model/anthropic.claude-3-haiku-20240307-v1%3A0/converse",
+            serde_json::json!({ "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+    let events = meter_events(&storage).await;
+    let t = events.iter().find(|p| p["asset"] == "usd").unwrap();
+    assert_eq!(
+        t["dims"]["model_ref"],
+        "anthropic.claude-3-haiku-20240307-v1:0"
+    );
+}
+
+#[tokio::test]
+async fn v2b_bedrock_refuses_an_unpriced_path_model_whatever_the_body_says() {
+    let (router, _storage, token, calls) = proto_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+        "bedrock-converse",
+        BEDROCK_BASE,
+        "VULTRINO_PROVIDER_BEDROCK_ENABLED",
+    )
+    .await;
+    for (path, body) in [
+        (
+            "model/anthropic.claude-opus-9-v1%3A0/converse",
+            serde_json::json!({ "model": "claude-haiku-4-5", "messages": [] }),
+        ),
+        // No model segment at all: nothing to price.
+        (
+            "foundation-models/x",
+            serde_json::json!({ "model": "claude-haiku-4-5", "messages": [] }),
+        ),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), path, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(error_type(resp).await, "model_unpriced", "{path}");
+    }
+    assert_eq!(calls_of(&calls), 0);
+}
+
+#[tokio::test]
+async fn v2b_azure_deployments_are_priced_only_through_the_operators_map() {
+    let mut config = config_with_policies(vec![allow_policy("cred-*")]);
+    config
+        .llm_proxy
+        .azure_deployments
+        .insert("prod-4o".to_string(), "gpt-4o".to_string());
+    config
+        .llm_proxy
+        .azure_deployments
+        .insert("shadow".to_string(), "gpt-9-unpriced".to_string());
+    let (router, _storage, token, calls) = proto_stack(
+        config,
+        "gpt-4o",
+        "azure-openai",
+        "https://acme.openai.azure.com/openai",
+        "VULTRINO_PROVIDER_AZURE_OPENAI_ENABLED",
+    )
+    .await;
+    let body = serde_json::json!({ "messages": [] });
+    // Mapped to a priced model: passes.
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            "deployments/prod-4o/chat/completions",
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+    // Not in the map, mapped to an unpriced model, or a body model that is neither the
+    // deployment nor its model: refused, and the upstream sees nothing more.
+    for (path, body) in [
+        ("deployments/unknown/chat/completions", body.clone()),
+        // An unmapped deployment is not priced by its NAME, even when the name is a priced
+        // model's id.
+        (
+            "deployments/claude-haiku-4-5/chat/completions",
+            body.clone(),
+        ),
+        ("deployments/shadow/chat/completions", body.clone()),
+        (
+            "deployments/prod-4o/chat/completions",
+            serde_json::json!({ "model": "claude-haiku-4-5", "messages": [] }),
+        ),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), path, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(error_type(resp).await, "model_unpriced", "{path}");
+    }
+    assert_eq!(calls_of(&calls), 1);
+}
+
+#[tokio::test]
+async fn v2b_the_allowlist_applies_to_the_model_the_url_selects() {
+    // The body names the one allowed model; the path selects another, which the upstream
+    // serves. The gate is off here so only the allowlist can stop it.
+    let mut config = config_with_policies(vec![allow_policy("cred-*")]);
+    config.llm_proxy.require_priced_model = false;
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let (router, _storage, token, calls) = proto_stack_models(
+        config,
+        "gemini-2.5-flash",
+        &path,
+        "gemini",
+        GEMINI_BASE,
+        "VULTRINO_PROVIDER_GEMINI_ENABLED",
+        vec!["claude-haiku-4-5".to_string()],
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-2.5-flash:generateContent",
+            serde_json::json!({ "model": "claude-haiku-4-5", "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "permission_error");
+    assert_eq!(calls_of(&calls), 0);
+}
+
+#[tokio::test]
+async fn v2b_a_served_model_that_is_not_a_dated_form_of_the_request_is_booked_under_its_own_id() {
+    // The probe from the review: the request named Haiku, the upstream served Opus (not on
+    // the card). The event must name the served model, so leria counts it unpriced and holds
+    // its watermark, instead of booking Opus spend at Haiku's price.
+    let (router, storage, token, _calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-opus-4-1-20250805",
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("claude-haiku-4-5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events = meter_events(&storage).await;
+    let t = events.iter().find(|p| p["asset"] == "usd").unwrap();
+    assert_eq!(t["dims"]["model_ref"], "claude-opus-4-1-20250805");
+}
+
+#[tokio::test]
+async fn v2b_a_request_that_sets_a_price_the_card_cannot_hold_is_refused_before_the_upstream() {
+    // Fast mode (a multiple of the card price), a regional inference geo, a priority tier
+    // and a metered server tool all reach a provider price the card has no entry for.
+    let (router, _storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let mut variants = Vec::new();
+    for (key, value) in [
+        ("speed", serde_json::json!("fast")),
+        ("inference_geo", serde_json::json!("us")),
+        ("service_tier", serde_json::json!("priority")),
+        (
+            "tools",
+            serde_json::json!([{"type": "web_search_20250305", "name": "web_search"}]),
+        ),
+    ] {
+        let mut body = messages("claude-haiku-4-5");
+        body[key] = value;
+        variants.push((key, body));
+    }
+    for (key, body) in variants {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), "v1/messages", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{key}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{key}");
+    }
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+    // Standard speed and the global geo are what the card prices.
+    let mut ok = messages("claude-haiku-4-5");
+    ok["speed"] = serde_json::json!("standard");
+    ok["inference_geo"] = serde_json::json!("global");
+    let resp = router
+        .oneshot(llm_req(Some(&token), "v1/messages", ok))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+}
+
+#[tokio::test]
+async fn v2b_an_advisor_tool_or_server_fallbacks_is_refused_before_the_upstream() {
+    // The advisor tool runs a second model inside the request and bills it at that model's
+    // rates outside the top-level usage; `fallbacks` reruns a refused request on another
+    // model. The token event books one model, so both would be unbooked spend: refuse.
+    let (router, _storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let mut variants = Vec::new();
+    for (name, key, value) in [
+        (
+            "unpriced advisor",
+            "tools",
+            serde_json::json!([{"type": "advisor_20260301", "name": "advisor", "model": "claude-fable-5-1"}]),
+        ),
+        (
+            "priced advisor",
+            "tools",
+            serde_json::json!([{"type": "advisor_20260301", "name": "advisor", "model": "claude-haiku-4-5"}]),
+        ),
+        (
+            "unpriced fallback",
+            "fallbacks",
+            serde_json::json!([{"model": "claude-unpriced-9"}]),
+        ),
+        (
+            "priced fallback",
+            "fallbacks",
+            serde_json::json!([{"model": "claude-haiku-4-5"}]),
+        ),
+        (
+            "fallback credit token",
+            "fallback_credit_token",
+            serde_json::json!("tok"),
+        ),
+    ] {
+        let mut body = messages("claude-haiku-4-5");
+        body[key] = value;
+        variants.push((name, body));
+    }
+    for (name, body) in variants {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), "v1/messages", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{name}");
+    }
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+}
+
+#[tokio::test]
+async fn v2b_an_unknown_future_server_tool_type_is_refused_and_client_tools_pass() {
+    let (router, _storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let mut body = messages("claude-haiku-4-5");
+    body["tools"] = serde_json::json!([{"type": "quantum_lookup_20271201", "name": "q"}]);
+    let resp = router
+        .clone()
+        .oneshot(llm_req(Some(&token), "v1/messages", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "modifier_unpriced");
+    assert_eq!(calls_of(&calls), 0);
+    // A client tool (input_schema, no server type) bills tokens alone.
+    let mut ok = messages("claude-haiku-4-5");
+    ok["tools"] = serde_json::json!([{"name": "get_weather", "input_schema": {"type": "object"}}]);
+    let resp = router
+        .oneshot(llm_req(Some(&token), "v1/messages", ok))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+}
+
+#[tokio::test]
+async fn v2b_gemini_camel_case_tier_and_billed_grounding_tools_are_refused() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let (router, _storage, token, calls) = proto_stack_models(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        &path,
+        "gemini",
+        GEMINI_BASE,
+        "VULTRINO_PROVIDER_GEMINI_ENABLED",
+        Vec::new(),
+    )
+    .await;
+    let route = "v1beta/models/gemini-2.5-flash:generateContent";
+    for (name, body) in [
+        (
+            "camelCase serviceTier",
+            serde_json::json!({"contents": [], "serviceTier": "priority"}),
+        ),
+        (
+            "vertex ai search retrieval",
+            serde_json::json!({"contents": [], "tools": [{"retrieval": {"vertexAiSearch": {"datastore": "d"}}}]}),
+        ),
+        (
+            "enterprise web search",
+            serde_json::json!({"contents": [], "tools": [{"enterpriseWebSearch": {}}]}),
+        ),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), route, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{name}");
+    }
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+    // Function declarations and url context bill tokens alone.
+    let ok = serde_json::json!({"contents": [], "tools": [{"functionDeclarations": []}, {"urlContext": {}}]});
+    let resp = router
+        .oneshot(llm_req(Some(&token), route, ok))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+}
+
+#[tokio::test]
+async fn v2b_an_allowlist_matches_the_model_the_url_selects_when_the_body_names_none() {
+    // Gemini, Vertex and Bedrock bodies carry no model; the allowlist must still be able to
+    // permit the model in the path (and still refuse one outside the list).
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let (router, _storage, token, calls) = proto_stack_models(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        &path,
+        "gemini",
+        GEMINI_BASE,
+        "VULTRINO_PROVIDER_GEMINI_ENABLED",
+        vec!["gemini-2.5-flash".to_string()],
+    )
+    .await;
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-2.5-flash:generateContent",
+            serde_json::json!({ "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-2.5-pro:generateContent",
+            serde_json::json!({ "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "permission_error");
+    assert_eq!(calls_of(&calls), 1);
+}
+
+// ---------------------------------------------------------------------------
+// V2 outage window, end to end: a real metered call while the outbox cannot be written.
+// The call is still admitted (stated in LIMITATIONS), every meter event it could not append
+// is counted, the feed and health say so while the outage lasts, and the next successful
+// append is followed by one `meter.lost` marker that names the count and the event type.
+// Without this wiring a poller (leria) that freezes its watermark on `meter_gap_pending`
+// would see an idle, healthy feed during exactly the outage it exists for.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn v2_a_metered_call_during_an_outbox_outage_is_counted_announced_and_marked() {
+    let dir = tempdir().unwrap();
+    // The admin key must be in the vault before the web server builds its auth manager.
+    let (admin_key, key_rec) = AuthManager::new()
+        .create_api_key("admin-key", vultrino::auth::ROLE_ADMIN, None)
+        .unwrap();
+    {
+        let seed = FileStorage::new(
+            &dir.path().join("store.enc"),
+            &SecretString::from("test-password"),
+        )
+        .await
+        .unwrap();
+        seed.store_api_key(&key_rec).await.unwrap();
+    }
+    let (router, _storage, token, calls) = anthropic_stack_at(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+        dir.path(),
+    )
+    .await;
+
+    let get = |router: axum::Router, uri: &'static str| {
+        let admin_key = admin_key.clone();
+        async move {
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {admin_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            serde_json::from_slice::<serde_json::Value>(&body_bytes(resp).await).unwrap()
+        }
+    };
+
+    // The disk fails the way a full one does: a directory sits where the outbox writer
+    // wants its temp file.
+    let tmp = dir.path().join("outbox.tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("claude-haiku-4-5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the call is still admitted during the outage"
+    );
+    assert_eq!(calls_of(&calls), 1);
+
+    // Both meter events of the call (api-calls and the priced token event) failed to append
+    // and are counted, not dropped silently.
+    let feed = get(router.clone(), "/api/v1/events?after=0").await;
+    assert_eq!(feed["meter_gap_pending"], 2, "{feed}");
+    assert!(feed["events"].as_array().unwrap().is_empty());
+    let health = get(router.clone(), "/api/v1/health").await;
+    assert_eq!(health["meter_gap_pending"], 2, "{health}");
+    assert_eq!(health["meter_lost_total"], 2);
+
+    // The disk recovers; the next metered call appends and is followed by one marker.
+    std::fs::remove_dir(&tmp).unwrap();
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("claude-haiku-4-5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let feed = get(router.clone(), "/api/v1/events?after=0").await;
+    assert_eq!(feed["meter_gap_pending"], 0, "{feed}");
+    let types: Vec<String> = feed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["body"]["event"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        types,
+        ["meter.observed", "meter.lost", "meter.observed"],
+        "the marker follows the first successful append of the second call: {feed}"
+    );
+    let marker = &feed["events"].as_array().unwrap()[1];
+    assert_eq!(marker["body"]["payload"]["lost_count"], 2, "{marker}");
+    assert_eq!(
+        marker["body"]["payload"]["event_types"],
+        serde_json::json!(["meter.observed"])
+    );
 }

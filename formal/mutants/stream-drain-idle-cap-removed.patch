@@ -1,0 +1,17 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 552feb4..ccd7ef9 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -170,10 +170,8 @@ async fn drain_upstream_for_usage<S>(
+                 }
+             } => None,
+             _ = async {
+-                match idle {
+-                    Some(idle) => tokio::time::sleep(idle).await,
+-                    None => std::future::pending::<()>().await,
+-                }
++                let _ = idle;
++                std::future::pending::<()>().await
+             } => None,
+             result = &mut next => result,
+         };

@@ -1,0 +1,14 @@
+diff --git a/src/storage/outbox_store.rs b/src/storage/outbox_store.rs
+index 1f5cd88..812beb3 100644
+--- a/src/storage/outbox_store.rs
++++ b/src/storage/outbox_store.rs
+@@ -120,6 +120,9 @@ impl OutboxStore {
+     /// event. If the marker append itself fails the counts are put back (and are not
+     /// counted a second time), so the next success retries it.
+     async fn flush_loss_marker(&self) {
++        if true {
++            return;
++        }
+         let taken = {
+             let mut loss = self.loss.lock();
+             if loss.count == 0 {

@@ -187,6 +187,241 @@ fn normalize_nvidia_tool_stream_options(provider: &str, body: &mut serde_json::V
     true
 }
 
+/// How the resolved upstream URL picks the model, which for some providers is not the
+/// body's `model` (the upstream ignores that field): Gemini and Vertex AI name it in a
+/// `models/<id>[:<method>]` segment, Amazon Bedrock in `model/<id>/...`, Azure OpenAI by
+/// `deployments/<name>`. The gate, the allowlist and the meter all use the model this
+/// returns, never one the agent can choose in the body.
+#[derive(Debug, PartialEq, Eq)]
+enum UrlModel {
+    /// The body's `model` is what the upstream serves (OpenAI, Anthropic, NVIDIA, and the
+    /// OpenAI-compatible endpoints of Gemini and Vertex).
+    BodyPicks,
+    /// The URL selects `model`. A body `model` is accepted only if it equals `model` or
+    /// `body_ok` (an Azure deployment name).
+    Names {
+        model: String,
+        body_ok: Option<String>,
+    },
+    /// The URL does not name exactly one model (or names one the operator has not
+    /// mapped): the request cannot be shown to be priced.
+    Unresolvable(String),
+}
+
+/// The percent-decoded id following the single path segment equal to `key`. `Ok(None)` when
+/// the path has no such segment, `Err` when it has several or an empty id (ambiguous: the
+/// upstream's choice cannot be known here).
+fn id_after_segment(upstream: &str, key: &str) -> Result<Option<String>, ()> {
+    let Ok(url) = url::Url::parse(upstream) else {
+        return Err(());
+    };
+    let segments: Vec<&str> = url.path_segments().map(|s| s.collect()).unwrap_or_default();
+    let mut found: Option<String> = None;
+    for (i, seg) in segments.iter().enumerate() {
+        if *seg != key {
+            continue;
+        }
+        let Some(id) = segments.get(i + 1) else {
+            return Err(());
+        };
+        let id = urlencoding::decode(id).map_err(|_| ())?.into_owned();
+        if id.is_empty() || found.is_some() {
+            return Err(());
+        }
+        found = Some(id);
+    }
+    Ok(found)
+}
+
+fn url_model(
+    protocol: &str,
+    upstream: &str,
+    body_model: Option<&str>,
+    azure_deployments: &HashMap<String, String>,
+) -> UrlModel {
+    let unresolvable = |why: &str| UrlModel::Unresolvable(why.to_string());
+    match protocol {
+        "gemini" | "vertex-ai" => match id_after_segment(upstream, "models") {
+            Ok(Some(id)) => UrlModel::Names {
+                model: id.split(':').next().unwrap_or(&id).to_string(),
+                body_ok: None,
+            },
+            // The OpenAI-compatible endpoint takes the model from the body.
+            Ok(None) if is_openai_chat_endpoint(upstream) => UrlModel::BodyPicks,
+            Ok(None) => unresolvable("the upstream URL names no models/<id> segment"),
+            Err(()) => unresolvable("the upstream URL names more than one model, or none cleanly"),
+        },
+        "bedrock-converse" | "bedrock-invoke" => match id_after_segment(upstream, "model") {
+            Ok(Some(id)) => UrlModel::Names {
+                model: id,
+                body_ok: None,
+            },
+            Ok(None) => unresolvable("the upstream URL names no model/<id> segment"),
+            Err(()) => unresolvable("the upstream URL names more than one model, or none cleanly"),
+        },
+        "azure-openai" => {
+            let name = match id_after_segment(upstream, "deployments") {
+                Ok(Some(name)) => name,
+                Ok(None) => match body_model {
+                    Some(m) => m.to_string(),
+                    None => {
+                        return unresolvable("no deployment in the URL and no model in the body")
+                    }
+                },
+                Err(()) => {
+                    return unresolvable(
+                        "the upstream URL names more than one deployment, or none cleanly",
+                    )
+                }
+            };
+            match azure_deployments.get(&name) {
+                Some(model) => UrlModel::Names {
+                    model: model.clone(),
+                    body_ok: Some(name),
+                },
+                None => UrlModel::Unresolvable(format!(
+                    "deployment '{name}' is not mapped to a priced model in [llm_proxy.azure_deployments]"
+                )),
+            }
+        }
+        _ => UrlModel::BodyPicks,
+    }
+}
+
+/// A request field that raises the provider's price beyond what the rate card prices (one
+/// price per model, input and output). The card cannot express these, so a request that
+/// sets one would be booked below what it costs and a budget cap would trip late: refuse
+/// it (`403 modifier_unpriced`). Returns what was found.
+fn unpriced_modifier(body: &serde_json::Value) -> Option<String> {
+    let text = |v: &serde_json::Value| v.as_str().map(str::to_string);
+    // Anthropic fast mode: `speed: "fast"` bills at a multiple of the standard price.
+    if let Some(v) = body.get("speed") {
+        if text(v).as_deref() != Some("standard") {
+            return Some(
+                "speed other than \"standard\" (fast mode) is priced above the card".to_string(),
+            );
+        }
+    }
+    // Anthropic data residency: `inference_geo` other than global bills a premium.
+    if let Some(v) = body.get("inference_geo") {
+        if text(v).as_deref() != Some("global") {
+            return Some("inference_geo other than \"global\" carries a price premium the card does not hold".to_string());
+        }
+    }
+    // Service tiers, in both spellings (OpenAI / Anthropic `service_tier`, Gemini's REST
+    // `serviceTier`; protobuf JSON takes either on Gemini): priority bills above standard.
+    // A string must be one that never bills above standard; Bedrock's object shape
+    // (`{"type": ...}`) must be default or flex. Any other shape is refused.
+    for key in ["service_tier", "serviceTier"] {
+        let Some(v) = body.get(key) else {
+            continue;
+        };
+        let ok = match v {
+            serde_json::Value::String(t) => {
+                matches!(
+                    t.as_str(),
+                    "auto" | "default" | "standard" | "standard_only" | "flex"
+                )
+            }
+            serde_json::Value::Object(o) => matches!(
+                o.get("type").and_then(serde_json::Value::as_str),
+                Some("default" | "flex")
+            ),
+            _ => false,
+        };
+        if !ok {
+            return Some(format!(
+                "a {key} other than auto, default, standard, standard_only or flex is priced above the card"
+            ));
+        }
+    }
+    // Server-side extra model calls: the advisor tool runs a second model inside the request
+    // (billed at that model's rates, reported only in usage.iterations) and `fallbacks`
+    // reruns a refused attempt on another model (the refused attempt is billed but not in
+    // the returned usage). The token event books one model, so refuse both outright.
+    for key in ["fallbacks", "fallback_credit_token"] {
+        if body.get(key).is_some() {
+            return Some(format!(
+                "`{key}` runs the request on further models whose usage the token event does not book"
+            ));
+        }
+    }
+    // OpenAI Chat Completions search-preview models bill each search.
+    if body.get("web_search_options").is_some() {
+        return Some("web_search_options bills per search on top of tokens".to_string());
+    }
+    // Bedrock: latency-optimized inference and the priority tier bill a premium.
+    if let Some(v) = body.get("performanceConfig").and_then(|p| p.get("latency")) {
+        if text(v).as_deref() != Some("standard") {
+            return Some(
+                "performanceConfig.latency other than \"standard\" is priced above the card"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(v) = body.get("serviceTier").and_then(|t| t.get("type")) {
+        if !matches!(text(v).as_deref(), Some("default" | "flex")) {
+            return Some(
+                "a Bedrock serviceTier other than default or flex is priced above the card"
+                    .to_string(),
+            );
+        }
+    }
+    // Tools: an allowlist, fail closed. Only shapes known to bill tokens alone pass; any
+    // other typed tool or tool key (a server tool the provider adds later, an advisor,
+    // grounding, search, code execution) is refused. The Bedrock Converse tools live in
+    // `toolConfig.tools`.
+    let tool_lists = [
+        body.get("tools"),
+        body.get("toolConfig").and_then(|c| c.get("tools")),
+    ];
+    for tools in tool_lists.into_iter().flatten() {
+        let ok = tools
+            .as_array()
+            .is_some_and(|list| list.iter().all(tool_bills_tokens_only));
+        if !ok {
+            return Some("a tool that is not a known client-side tool (function, custom, bash, text editor, memory, computer, web fetch, tool search, Gemini functionDeclarations or urlContext) may run extra models or bill per use on top of tokens, which the token event does not carry".to_string());
+        }
+    }
+    None
+}
+
+/// Whether one `tools` entry is a shape that bills tokens alone: OpenAI `function` or
+/// `custom`; an Anthropic client tool (an `input_schema` and no server type) or the
+/// schema-less client types (`bash_*`, `text_editor_*`, `memory_*`, `computer_*`); the free
+/// Anthropic `web_fetch_*` and `tool_search_*`; Gemini `functionDeclarations` and
+/// `urlContext`; Bedrock `toolSpec` and `cachePoint`. Everything else is refused.
+fn tool_bills_tokens_only(tool: &serde_json::Value) -> bool {
+    const TYPE_PREFIXES: &[&str] = &[
+        "bash_",
+        "text_editor_",
+        "memory_",
+        "computer_",
+        "web_fetch_",
+        "tool_search_",
+    ];
+    const UNTYPED_KEYS: &[&str] = &[
+        "functionDeclarations",
+        "function_declarations",
+        "urlContext",
+        "url_context",
+        "toolSpec",
+        "cachePoint",
+    ];
+    let Some(obj) = tool.as_object() else {
+        return false;
+    };
+    match obj.get("type") {
+        Some(t) => t.as_str().is_some_and(|t| {
+            t == "function" || t == "custom" || TYPE_PREFIXES.iter().any(|p| t.starts_with(p))
+        }),
+        None => {
+            obj.contains_key("input_schema")
+                || (!obj.is_empty() && obj.keys().all(|k| UNTYPED_KEYS.contains(&k.as_str())))
+        }
+    }
+}
+
 /// A JSON error response shaped like an OpenAI API error so the harness's model
 /// client surfaces it cleanly rather than as an opaque transport failure.
 fn llm_error(status: StatusCode, kind: &str, message: &str) -> Response {
@@ -611,11 +846,24 @@ async fn llm_proxy_impl(
     //     `llm.allowed_models`; the deny happens BEFORE any upstream call. It runs
     //     ABOVE the streaming decision (4d) so a `stream:true` request can NOT evade
     //     the model allowlist — buffered and streaming enforce identically.
+    // The body's model is checked here only where the body picks the model. Where the
+    // resolved upstream URL selects it (Gemini, Vertex, Bedrock, Azure) the body names none
+    // or an ignored one, and the allowlist is applied to the routed model below.
     let requested_model = request_body
         .as_ref()
         .and_then(|b| b.get("model"))
         .and_then(|m| m.as_str());
-    if !capability.llm_model_allowed(requested_model) {
+    let url_picks_model = request_body.is_some()
+        && matches!(
+            url_model(
+                &llm.protocol,
+                &upstream,
+                requested_model,
+                &state.config.llm_proxy.azure_deployments,
+            ),
+            UrlModel::Names { .. }
+        );
+    if !url_picks_model && !capability.llm_model_allowed(requested_model) {
         return llm_error(
             StatusCode::FORBIDDEN,
             "permission_error",
@@ -626,6 +874,105 @@ async fn llm_proxy_impl(
                     .unwrap_or_else(|| "(unspecified)".to_string()),
             ),
         );
+    }
+
+    // 4b-bis. Priced models only (`[llm_proxy] require_priced_model`, default on). A model
+    //     the rate card does not price books $0 in the metering plane (its token event is
+    //     rejected as unpriced), so a budget cap would never trip for it: refuse it here,
+    //     BEFORE any upstream call, exactly where the allowlist above refuses. Fail closed
+    //     both ways: a request that carries a body but names no model cannot be shown to be
+    //     priced, and with no card configured nothing is. A bodiless request (a model list,
+    //     a health probe) is not a billed call and is not gated.
+    //
+    //     WHICH model: the one the resolved upstream URL selects where the URL picks it
+    //     (Gemini/Vertex `models/<id>`, Bedrock `model/<id>`, Azure `deployments/<name>`
+    //     through the operator's map; see `url_model`), else the body's. The upstream
+    //     ignores a body `model` that disagrees with its URL, so a body model that differs
+    //     from the URL's is refused, and the allowlist, the gate and the meter all use the
+    //     routed model. Without this an agent could name a priced model in the body and
+    //     reach an unpriced one through the path.
+    let body_model = request_body
+        .as_ref()
+        .and_then(|b| b.get("model"))
+        .and_then(|m| m.as_str());
+    let route = if request_body.is_some() {
+        url_model(
+            &llm.protocol,
+            &upstream,
+            body_model,
+            &state.config.llm_proxy.azure_deployments,
+        )
+    } else {
+        UrlModel::BodyPicks
+    };
+    let (gated_model, route_refusal): (Option<String>, Option<String>) = match &route {
+        UrlModel::BodyPicks => (body_model.map(str::to_string), None),
+        UrlModel::Names { model, body_ok } => (
+            Some(model.clone()),
+            body_model
+                .filter(|b| *b != model && Some(*b) != body_ok.as_deref())
+                .map(|b| {
+                    format!("the body names model '{b}' but the upstream URL selects '{model}'")
+                }),
+        ),
+        UrlModel::Unresolvable(why) => (body_model.map(str::to_string), Some(why.clone())),
+    };
+    // The allowlist applies to the model the URL selects too, not only the body's.
+    // Azure: the operator may list the deployment name (what the caller sends) or the model it
+    // maps to.
+    if let UrlModel::Names { model, body_ok } = &route {
+        if !capability.llm_model_allowed(Some(model))
+            && !body_ok
+                .as_deref()
+                .is_some_and(|d| capability.llm_model_allowed(Some(d)))
+        {
+            return llm_error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                &format!("Model '{model}' is not permitted for this LLM-proxy capability"),
+            );
+        }
+    }
+    if state.config.llm_proxy.require_priced_model && request_body.is_some() {
+        let priced = route_refusal.is_none()
+            && gated_model
+                .as_deref()
+                .is_some_and(|m| state.config.llm_proxy.rate_card.covers(m));
+        if !priced {
+            tracing::warn!(
+                model = gated_model.as_deref().unwrap_or("(unspecified)"),
+                card_configured = state.config.llm_proxy.rate_card.is_configured(),
+                route_refusal = route_refusal.as_deref().unwrap_or(""),
+                "LLM request refused: model is not priced by the rate card"
+            );
+            return llm_error(
+                StatusCode::FORBIDDEN,
+                "model_unpriced",
+                &format!(
+                    "Model {} is not priced by the rate card, so its spend could not be metered against a budget; the request was not sent{}",
+                    gated_model
+                        .as_deref()
+                        .map(|m| format!("'{m}'"))
+                        .unwrap_or_else(|| "(unspecified)".to_string()),
+                    route_refusal
+                        .as_deref()
+                        .map(|r| format!(" ({r})"))
+                        .unwrap_or_default(),
+                ),
+            );
+        }
+        // The card prices tokens at one input and one output price per model. A request
+        // field that raises the provider's price beyond that would be booked too low.
+        if let Some(found) = request_body.as_ref().and_then(unpriced_modifier) {
+            tracing::warn!(found = %found, "LLM request refused: it sets a price modifier the rate card does not hold");
+            return llm_error(
+                StatusCode::FORBIDDEN,
+                "modifier_unpriced",
+                &format!(
+                    "The request sets a price modifier the rate card does not hold, so its spend could not be metered against a budget; the request was not sent ({found})"
+                ),
+            );
+        }
     }
 
     // 4c. Per-call output-token ceiling (rate_companion per-call leg, P1-8): clamp the
@@ -683,8 +1030,9 @@ async fn llm_proxy_impl(
     }
     // NVIDIA hangs when `stream_options` accompanies a non-empty OpenAI `tools` array.
     // Normalize only that known-incompatible provider shape, including a client-supplied
-    // stream_options, and intentionally meter it V13a-only. Other providers' tool
-    // streams (and NVIDIA streams without tools) retain the usage trailer.
+    // stream_options. NVIDIA cannot send a usage trailer with tools, so that stream is
+    // charged an ESTIMATE (`dims.estimated = "true"`, VUL-01) rather than exact counts.
+    // Other providers' tool streams (and NVIDIA streams without tools) retain the trailer.
     let nvidia_tool_stream = use_streaming
         && request_body
             .as_mut()
@@ -733,6 +1081,7 @@ async fn llm_proxy_impl(
             "_feir_provider": provider,
             "_feir_region": region,
             "_feir_channel": channel_name,
+            "_feir_request_model": gated_model,
         }),
     };
 
@@ -878,7 +1227,7 @@ mod tests {
     use super::{
         apply_reasoning_effort, clamp_max_output_tokens, default_output_token_field,
         is_openai_chat_endpoint, normalize_nvidia_tool_stream_options, provider_feature_enabled,
-        reasoning_effort_shape, ReasoningEffortShape,
+        reasoning_effort_shape, unpriced_modifier, url_model, ReasoningEffortShape, UrlModel,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -1366,6 +1715,268 @@ mod tests {
             );
             // ...but the same capability WITHOUT the field is still fine.
             assert!(build(protocol, None, base).validate().is_ok());
+        }
+    }
+
+    // ---- feir-ops#6 review round 1: the routed model and price modifiers -----------------
+
+    fn names(model: &str) -> UrlModel {
+        UrlModel::Names {
+            model: model.to_string(),
+            body_ok: None,
+        }
+    }
+
+    fn no_map() -> std::collections::HashMap<String, String> {
+        Default::default()
+    }
+
+    #[test]
+    fn gemini_and_vertex_take_the_model_from_the_url_not_the_body() {
+        let g =
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-9-pro:generateContent";
+        // The body names a different model: the URL's is the routed one.
+        assert_eq!(
+            url_model("gemini", g, Some("claude-haiku-4-5"), &no_map()),
+            names("gemini-9-pro")
+        );
+        let v = "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/publishers/anthropic/models/claude-opus-5:rawPredict";
+        assert_eq!(
+            url_model("vertex-ai", v, None, &no_map()),
+            names("claude-opus-5")
+        );
+        // A model baked into provider_base (no method suffix) is the same segment.
+        let baked = "https://generativelanguage.googleapis.com/v1beta/models/gemini-9-pro/x";
+        assert_eq!(
+            url_model("gemini", baked, None, &no_map()),
+            names("gemini-9-pro")
+        );
+        // Two model segments, or a dangling one, are ambiguous: refused, not guessed.
+        let two = "https://h.example/v1/models/a/models/b:generateContent";
+        assert!(matches!(
+            url_model("gemini", two, None, &no_map()),
+            UrlModel::Unresolvable(_)
+        ));
+        let dangling = "https://h.example/v1/models";
+        assert!(matches!(
+            url_model("gemini", dangling, None, &no_map()),
+            UrlModel::Unresolvable(_)
+        ));
+        // No models segment: only the OpenAI-compatible endpoint takes the body's model.
+        let compat = "https://h.example/v1beta/openai/chat/completions";
+        assert_eq!(
+            url_model("gemini", compat, Some("m"), &no_map()),
+            UrlModel::BodyPicks
+        );
+        let tuned = "https://h.example/v1/endpoints/123:predict";
+        assert!(matches!(
+            url_model("vertex-ai", tuned, Some("m"), &no_map()),
+            UrlModel::Unresolvable(_)
+        ));
+    }
+
+    #[test]
+    fn bedrock_takes_the_percent_decoded_model_from_the_model_segment() {
+        let base = "https://bedrock-runtime.us-east-1.amazonaws.com";
+        for proto in ["bedrock-converse", "bedrock-invoke"] {
+            assert_eq!(
+                url_model(
+                    proto,
+                    &format!("{base}/model/anthropic.claude-3-haiku-20240307-v1%3A0/converse"),
+                    None,
+                    &no_map()
+                ),
+                names("anthropic.claude-3-haiku-20240307-v1:0")
+            );
+        }
+        // A literal colon (also legal in a path) is not a method separator here.
+        assert_eq!(
+            url_model(
+                "bedrock-invoke",
+                &format!("{base}/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"),
+                None,
+                &no_map()
+            ),
+            names("anthropic.claude-3-haiku-20240307-v1:0")
+        );
+        // An inference-profile id with an encoded slash stays one segment.
+        assert_eq!(
+            url_model(
+                "bedrock-converse",
+                &format!("{base}/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A1%3Ainference-profile%2Fp/converse"),
+                None,
+                &no_map()
+            ),
+            names("arn:aws:bedrock:us-east-1:1:inference-profile/p")
+        );
+        // No model segment, or an empty one: refused, even with a body model.
+        for url in [
+            format!("{base}/foundation-models"),
+            format!("{base}/model//converse"),
+        ] {
+            assert!(
+                matches!(
+                    url_model("bedrock-converse", &url, Some("anything"), &no_map()),
+                    UrlModel::Unresolvable(_)
+                ),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_names_a_deployment_that_only_the_operators_map_can_price() {
+        let map: std::collections::HashMap<String, String> =
+            [("prod-4o".to_string(), "gpt-4o".to_string())].into();
+        let base = "https://acme.openai.azure.com/openai";
+        assert_eq!(
+            url_model(
+                "azure-openai",
+                &format!("{base}/deployments/prod-4o/chat/completions"),
+                None,
+                &map
+            ),
+            UrlModel::Names {
+                model: "gpt-4o".to_string(),
+                body_ok: Some("prod-4o".to_string())
+            }
+        );
+        // An unmapped deployment cannot be priced.
+        assert!(matches!(
+            url_model(
+                "azure-openai",
+                &format!("{base}/deployments/other/chat/completions"),
+                None,
+                &map
+            ),
+            UrlModel::Unresolvable(_)
+        ));
+        // The v1 API has no deployment segment: the body's model is the deployment name.
+        assert_eq!(
+            url_model(
+                "azure-openai",
+                &format!("{base}/v1/chat/completions"),
+                Some("prod-4o"),
+                &map
+            ),
+            UrlModel::Names {
+                model: "gpt-4o".to_string(),
+                body_ok: Some("prod-4o".to_string())
+            }
+        );
+        assert!(matches!(
+            url_model(
+                "azure-openai",
+                &format!("{base}/v1/chat/completions"),
+                None,
+                &map
+            ),
+            UrlModel::Unresolvable(_)
+        ));
+        // With no map nothing is priced.
+        assert!(matches!(
+            url_model(
+                "azure-openai",
+                &format!("{base}/deployments/prod-4o/chat/completions"),
+                None,
+                &no_map()
+            ),
+            UrlModel::Unresolvable(_)
+        ));
+    }
+
+    #[test]
+    fn body_routed_protocols_use_the_body_model() {
+        for proto in [
+            "openai-chat",
+            "openai-responses",
+            "anthropic-messages",
+            "nvidia",
+        ] {
+            assert_eq!(
+                url_model(
+                    proto,
+                    "https://api.example/v1/messages",
+                    Some("m"),
+                    &no_map()
+                ),
+                UrlModel::BodyPicks
+            );
+        }
+    }
+
+    #[test]
+    fn a_premium_price_modifier_is_not_one_the_card_can_price() {
+        // Fast mode and a non-global inference geo (Anthropic).
+        for body in [
+            json!({"speed": "fast"}),
+            json!({"speed": "turbo"}),
+            json!({"speed": null}),
+            json!({"inference_geo": "us"}),
+            json!({"inference_geo": "eu"}),
+            json!({"inference_geo": 1}),
+            // Service tiers above standard (OpenAI priority, a spelling nothing knows).
+            json!({"service_tier": "priority"}),
+            json!({"service_tier": "scale"}),
+            // Bedrock latency-optimized inference and the priority tier.
+            json!({"performanceConfig": {"latency": "optimized"}}),
+            json!({"serviceTier": {"type": "priority"}}),
+            // Server-side tools that bill per use on top of tokens.
+            json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}]}),
+            json!({"tools": [{"type": "web_search_preview"}]}),
+            json!({"tools": [{"type": "code_execution_20250522", "name": "code_execution"}]}),
+            json!({"tools": [{"type": "function", "name": "f"}, {"type": "file_search"}]}),
+            json!({"tools": [{"google_search": {}}]}),
+            json!({"tools": [{"googleSearchRetrieval": {}}]}),
+            // Gemini's REST spelling of the tier, and the Bedrock object shape.
+            json!({"serviceTier": "priority"}),
+            json!({"service_tier": {"type": "priority"}}),
+            json!({"serviceTier": {"type": "priority"}}),
+            json!({"serviceTier": 1}),
+            // Vertex grounding that bills per grounded request, and a tool nobody listed.
+            json!({"tools": [{"retrieval": {"vertexAiSearch": {"datastore": "d"}}}]}),
+            json!({"tools": [{"enterpriseWebSearch": {}}]}),
+            json!({"tools": [{"type": "quantum_lookup_20271201", "name": "q"}]}),
+            json!({"tools": [{"future_server_tool": {}}]}),
+            json!({"tools": [{}]}),
+            json!({"tools": ["web_search"]}),
+            json!({"tools": {"type": "web_search"}}),
+            json!({"web_search_options": {}}),
+            // The advisor tool runs a second model outside the top-level usage.
+            json!({"tools": [{"type": "advisor_20260301", "name": "advisor", "model": "m"}]}),
+            // Server-side fallbacks rerun the request on another model.
+            json!({"fallbacks": [{"model": "m"}]}),
+            json!({"fallback_credit_token": "t"}),
+            json!({"toolConfig": {"tools": [{"systemTool": {"name": "nova_grounding"}}]}}),
+        ] {
+            assert!(unpriced_modifier(&body).is_some(), "{body}");
+        }
+        // What the card does price: standard speed, the global geo, ordinary tiers and
+        // client-side function tools.
+        for body in [
+            json!({"model": "m", "messages": []}),
+            json!({"speed": "standard", "inference_geo": "global"}),
+            json!({"service_tier": "auto"}),
+            json!({"service_tier": "standard_only"}),
+            json!({"service_tier": "flex"}),
+            json!({"performanceConfig": {"latency": "standard"}}),
+            json!({"serviceTier": {"type": "default"}}),
+            json!({"tools": [{"type": "function", "function": {"name": "web_search_helper"}}]}),
+            json!({"tools": [{"name": "get_weather", "input_schema": {}}]}),
+            json!({"serviceTier": "default"}),
+            json!({"serviceTier": "flex"}),
+            json!({"service_tier": "flex"}),
+            json!({"tools": [{"type": "custom", "name": "c", "input_schema": {}}]}),
+            json!({"tools": [{"type": "bash_20250124", "name": "bash"}]}),
+            json!({"tools": [{"type": "text_editor_20250728", "name": "e"}]}),
+            json!({"tools": [{"type": "memory_20250818", "name": "memory"}]}),
+            json!({"tools": [{"type": "computer_20250124", "name": "computer"}]}),
+            json!({"tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]}),
+            json!({"tools": [{"type": "tool_search_tool_regex_20251119", "name": "t"}]}),
+            json!({"tools": [{"functionDeclarations": []}, {"urlContext": {}}]}),
+            json!({"toolConfig": {"tools": [{"toolSpec": {"name": "f"}}, {"cachePoint": {}}]}}),
+        ] {
+            assert_eq!(unpriced_modifier(&body), None, "{body}");
         }
     }
 }

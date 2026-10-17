@@ -1,0 +1,12 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index f778932..333e754 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -166,7 +166,6 @@ async fn drain_upstream_for_usage<S>(
+             biased;
+             // A V6 halt landing during the drain closes the upstream at once (the
+             // provider stops generating); the caller then charges an estimate.
+-            _ = abort.notified() => None,
+             _ = async {
+                 match deadline {
+                     Some(deadline) => tokio::time::sleep_until(deadline).await,

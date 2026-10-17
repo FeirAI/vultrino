@@ -1,0 +1,13 @@
+diff --git a/src/outbox.rs b/src/outbox.rs
+index 75019c1..8a2417e 100644
+--- a/src/outbox.rs
++++ b/src/outbox.rs
+@@ -622,7 +622,7 @@ impl UsageAccumulator {
+                 continue;
+             };
+             // Carrier 1 is `message.usage` (Anthropic `message_start`): provisional.
+-            let carries_final_counts = idx != 1
++            let carries_final_counts = true
+                 && [
+                     "completion_tokens",
+                     "output_tokens",

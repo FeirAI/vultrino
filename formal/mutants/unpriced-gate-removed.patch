@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 14620ec..fa1e2ae 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -865,7 +865,7 @@ async fn llm_proxy_impl(
+             );
+         }
+     }
+-    if state.config.llm_proxy.require_priced_model && request_body.is_some() {
++    if false && state.config.llm_proxy.require_priced_model && request_body.is_some() {
+         let priced = route_refusal.is_none()
+             && gated_model
+                 .as_deref()
