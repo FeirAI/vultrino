@@ -8975,10 +8975,10 @@ mod durable_enqueue_tests {
         }
         // Disabled stays a valid start with no client.
         let resolver = CredentialResolver::new(storage.clone());
-        let ok = VultrinoServer::try_new(Config::default(), storage.clone(), resolver)
-            .ok()
-            .expect("a disabled averin block starts");
-        assert!(ok.averin().is_none());
+        match VultrinoServer::try_new(Config::default(), storage.clone(), resolver) {
+            Ok(server) => assert!(server.averin().is_none()),
+            Err(e) => panic!("a disabled averin block must start: {e}"),
+        }
     }
 
     /// FEI-33: a failed local durable enqueue (disk full, fsync EIO) is recorded as an individual
