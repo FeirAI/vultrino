@@ -15,7 +15,7 @@ use vultrino::approval::{
     ApprovalRequest, ApprovalStatus, ApproverClass, Decision, NewApproval, RequesterInfo,
 };
 use vultrino::auth::{AuthResult, NewUseToken, UseToken};
-use vultrino::averin::{AverinConfig, AverinMode};
+use vultrino::averin::{AverinConfig, AverinMode, D8EvidenceFloor};
 use vultrino::config::Config;
 use vultrino::govder::GovderConfig;
 use vultrino::plugins::{Plugin, PluginError, PluginRequest};
@@ -369,6 +369,31 @@ async fn open_approved_fixture_d8(
     d8_complete_evidence: bool,
     averin_base_url: String,
 ) -> MutableRecipeApprovalFixture {
+    open_approved_fixture_floor(
+        None,
+        catalog_reversibility,
+        authoritative_irreversible,
+        averin_mode,
+        d8_complete_evidence,
+        D8EvidenceFloor::default(),
+        averin_base_url,
+    )
+    .await
+}
+
+/// The same again with the governed action label (`None` = the plain `count.run`) and the
+/// VUL-38 `[averin] d8_evidence_floor` chosen.
+#[allow(clippy::too_many_arguments)]
+async fn open_approved_fixture_floor(
+    label: Option<&str>,
+    catalog_reversibility: &str,
+    authoritative_irreversible: bool,
+    averin_mode: Option<AverinMode>,
+    d8_complete_evidence: bool,
+    floor: D8EvidenceFloor,
+    averin_base_url: String,
+) -> MutableRecipeApprovalFixture {
+    let action = label.unwrap_or("count.run");
     let one_teammate = serde_json::json!({
         "has_rule": true,
         "risk_tier": "High",
@@ -401,8 +426,13 @@ async fn open_approved_fixture_d8(
             resource_id: "orders-db".to_string(),
             mode,
             d8_complete_evidence,
+            d8_evidence_floor: floor,
             ..AverinConfig::default()
         };
+    }
+    if let Some(label) = label {
+        config.action_labels =
+            std::collections::HashMap::from([(label.to_string(), "count.run".to_string())]);
     }
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
@@ -413,7 +443,7 @@ async fn open_approved_fixture_d8(
     store_credential(&storage, "mutable-recipe-cred", false).await;
     set_count_capability_reversibility_for_credential(
         &storage,
-        "count.run",
+        action,
         "mutable-recipe-cred",
         catalog_reversibility,
     )
@@ -422,7 +452,7 @@ async fn open_approved_fixture_d8(
     let (_plaintext, mut token) = UseToken::create(NewUseToken {
         name: "recipe-bound-executor".to_string(),
         credential_scope: "mutable-recipe-cred".to_string(),
-        action_scope: Some("count.run".to_string()),
+        action_scope: Some(action.to_string()),
         max_uses: Some(1),
         require_approval: true,
         expires_in: None,
@@ -433,7 +463,7 @@ async fn open_approved_fixture_d8(
 
     let approval = match server
         .execute_gated(
-            count_request("mutable-recipe-cred"),
+            count_request_for_action("mutable-recipe-cred", action),
             ExecAuth::from_use_token(token),
         )
         .await
@@ -1130,6 +1160,124 @@ async fn solo_posture_with_averin_down_refuses_irreversible_and_runs_reversible(
         Some(1),
         "the gap must be counted"
     );
+}
+
+/// VUL-38 configurable floor, Averin DOWN, Solo posture, approved resume. Default mode: money and
+/// irreversible are refused, a partially-reversible non-money write keeps running with a counted
+/// gap, money.notify (money-class partially-reversible) stays refused. human_floor: the write is
+/// refused too.
+async fn floor_run(
+    label: Option<&str>,
+    reversibility: &str,
+    floor: D8EvidenceFloor,
+) -> (bool, String, usize, u64) {
+    let f = open_approved_fixture_floor(
+        label,
+        reversibility,
+        reversibility != "reversible",
+        Some(AverinMode::Observe),
+        true,
+        floor,
+        "http://127.0.0.1:9".to_string(),
+    )
+    .await;
+    let resumed = f
+        .server
+        .check_and_resume_approval(&f.approval_id, None)
+        .await
+        .unwrap();
+    (
+        resumed.executed && resumed.result_error.is_none(),
+        resumed.result_error.unwrap_or_default(),
+        f.calls.load(std::sync::atomic::Ordering::SeqCst),
+        f.server.averin().map_or(0, |a| a.metrics().d8_degraded),
+    )
+}
+
+fn assert_floor_refused(r: &(bool, String, usize, u64), what: &str) {
+    assert!(!r.0, "{what} must be refused while Averin is down");
+    assert!(
+        r.1.contains("D8 before-act evidence failed"),
+        "{what}: {}",
+        r.1
+    );
+    assert_eq!((r.2, r.3), (0, 0), "{what}: nothing may run or degrade");
+}
+
+#[tokio::test]
+async fn default_floor_degrades_a_partially_reversible_write_but_refuses_money_and_irreversible() {
+    let d = D8EvidenceFloor::MoneyAndIrreversible;
+    let write = floor_run(Some("session.update"), "partially-reversible", d).await;
+    assert!(
+        write.0,
+        "a non-money partially-reversible write must keep running: {}",
+        write.1
+    );
+    assert_eq!((write.2, write.3), (1, 1), "the gap must be counted");
+    assert_floor_refused(
+        &floor_run(Some("session.cancel"), "irreversible", d).await,
+        "irreversible",
+    );
+    assert_floor_refused(
+        &floor_run(Some("money.refund"), "irreversible", d).await,
+        "money.refund",
+    );
+    assert_floor_refused(
+        &floor_run(Some("money.notify"), "partially-reversible", d).await,
+        "money.notify (partially-reversible, money class)",
+    );
+}
+
+#[tokio::test]
+async fn human_floor_mode_refuses_every_partially_reversible_action() {
+    let h = D8EvidenceFloor::HumanFloor;
+    assert_floor_refused(
+        &floor_run(Some("session.update"), "partially-reversible", h).await,
+        "a partially-reversible write in human_floor mode",
+    );
+    assert_floor_refused(
+        &floor_run(Some("money.notify"), "partially-reversible", h).await,
+        "money.notify",
+    );
+    assert_floor_refused(
+        &floor_run(Some("session.cancel"), "irreversible", h).await,
+        "irreversible",
+    );
+    // Reversible keeps running in both modes.
+    let r = floor_run(Some("data.read"), "reversible", h).await;
+    assert!(r.0, "{}", r.1);
+    assert_eq!((r.2, r.3), (1, 1));
+}
+
+/// Without two-phase evidence the floor setting has no effect: a partially-reversible approved
+/// action keeps the committed-evidence requirement it always had, in either mode.
+#[tokio::test]
+async fn floor_setting_has_no_effect_without_d8_complete_evidence() {
+    for floor in [
+        D8EvidenceFloor::MoneyAndIrreversible,
+        D8EvidenceFloor::HumanFloor,
+    ] {
+        let f = open_approved_fixture_floor(
+            Some("session.update"),
+            "partially-reversible",
+            true,
+            Some(AverinMode::Observe),
+            false,
+            floor,
+            "http://127.0.0.1:9".to_string(),
+        )
+        .await;
+        let resumed = f
+            .server
+            .check_and_resume_approval(&f.approval_id, None)
+            .await
+            .unwrap();
+        assert!(
+            resumed.result_error.is_some(),
+            "{floor:?}: must refuse without committed evidence"
+        );
+        assert_eq!(f.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 }
 
 /// VUL-38, the same posture with Averin UP: a reversible action still gets two-phase evidence

@@ -444,14 +444,18 @@ use token remains the authorization envelope; it is not reused as the D8 grant.
 
 This mode is deliberately default-off and availability-coupled to Averin. A
 failed grant or intent write denies before the plugin can act, with one
-exception (VUL-38): a catalog-declared Reversible action whose evidence cannot
+exception (VUL-38): a catalog-declared Reversible action (and, in the default
+`d8_evidence_floor`, a non-money partially-reversible one) whose evidence cannot
 be begun because Averin is unavailable (unreachable, timed out, a 5xx or a 429)
 runs with a one-phase seal, logs `AVERIN-D8-DEGRADED` and counts `d8_degraded`.
-Every other class refuses while Averin is down: irreversible and
-partially-reversible (human-floor) actions, and actions with no catalog
-declaration. A 4xx from a live Averin and params over `max_seal_params_bytes`
-refuse for every class. A degraded action has no two-phase evidence, so D8
-completeness is not earned for it. The claim
+Which other classes refuse while Averin is down is the `[averin] d8_evidence_floor`
+setting. Default `money_and_irreversible`: money (`money.*` or declared irreversible)
+and irreversible actions refuse, other partially-reversible actions degrade like
+reversible ones. `human_floor`: every partially-reversible action refuses too.
+Actions with no catalog declaration refuse in both modes, and the setting has an effect
+only with `d8_complete_evidence = true`. A 4xx from a live Averin and params over
+`max_seal_params_bytes` refuse for every class. A degraded action has no two-phase
+evidence, so D8 completeness is not earned for it. The claim
 `d8-evidence-floor-routine-keeps-running` records what is tested. If a plugin
 returns an error, Vultrino records an `error` outcome; if an action completes
 but its outcome cannot be recorded, the client receives a committed error and

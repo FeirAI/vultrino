@@ -254,6 +254,38 @@ pub struct AverinConfig {
     /// as the D8 grant. Default false; enabling it is an explicit availability
     /// trade-off because the before-act evidence write is fail-closed.
     pub d8_complete_evidence: bool,
+    /// VUL-38 evidence floor while Averin cannot begin two-phase evidence. See
+    /// [`D8EvidenceFloor`]. Default [`D8EvidenceFloor::MoneyAndIrreversible`].
+    pub d8_evidence_floor: D8EvidenceFloor,
+}
+
+/// VUL-38: which declared-non-reversible actions are refused while Averin cannot begin the
+/// two-phase D8 evidence (operator setting `[averin] d8_evidence_floor`). An action with no
+/// catalog declaration is refused in both modes, and a reversible action degrades in both
+/// (unless it is money, below).
+///
+/// Money, for Vultrino, is an action in the `money.*` namespace OR one the catalog declares
+/// irreversible. Money is refused in both modes, whatever its reversibility declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum D8EvidenceFloor {
+    /// Default. Money and irreversible actions are refused; other partially-reversible and
+    /// reversible actions keep running with a one-phase seal, the `AVERIN-D8-DEGRADED` alarm
+    /// and the `d8_degraded` counter.
+    #[default]
+    MoneyAndIrreversible,
+    /// Every partially-reversible action is refused as well; only reversible non-money actions
+    /// degrade.
+    HumanFloor,
+}
+
+impl D8EvidenceFloor {
+    /// The config spelling, also reported in `/api/v1/posture`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MoneyAndIrreversible => "money_and_irreversible",
+            Self::HumanFloor => "human_floor",
+        }
+    }
 }
 
 impl Default for AverinConfig {
@@ -285,6 +317,7 @@ impl Default for AverinConfig {
             // per-deployment opt-in, never a default flip.
             durable: false,
             d8_complete_evidence: false,
+            d8_evidence_floor: D8EvidenceFloor::MoneyAndIrreversible,
         }
     }
 }

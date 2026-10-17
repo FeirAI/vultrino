@@ -859,12 +859,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "73055a36fe56f3c233908448bc73077062783c985e8ee15003f793691747e54b"
+          "sha256": "66a095dead658a5ba9fe693cdcbf4c84abe78d340e2686c4852213938e3fd306"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "b64cabab47e8958f932f503ffaa4f887dc3e684c56266567faa13a054c5586f6"
+          "sha256": "e79f4e8fd6139404a4a45a946a809c329dc915fb9ee49897175ae0de0ffd8e14"
         },
         {
           "path": "src/server/mod.rs",
@@ -2483,7 +2483,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "b64cabab47e8958f932f503ffaa4f887dc3e684c56266567faa13a054c5586f6"
+          "sha256": "e79f4e8fd6139404a4a45a946a809c329dc915fb9ee49897175ae0de0ffd8e14"
         },
         {
           "path": "src/server/mod.rs",
@@ -2498,7 +2498,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "73055a36fe56f3c233908448bc73077062783c985e8ee15003f793691747e54b"
+          "sha256": "66a095dead658a5ba9fe693cdcbf4c84abe78d340e2686c4852213938e3fd306"
         },
         {
           "path": "src/server/mod.rs",
@@ -3127,7 +3127,7 @@
     },
     {
       "id": "posture-report-live",
-      "statement": "GET /api/v1/posture answers only to a global (untenanted) admin key and reports, from the running process, the policy engine's live default (deny or allow), whether separation of duty is enforced, whether the approver-identity key is configured, distinct from the govder key, or on the shared-key escape, which tenants are in observe mode, which enforced policies have a RateLimit condition with a non-deny default, whether an explicit upstream proxy is configured (never its URL) and that the plugin egress client does not honour the ambient proxy variables (the field plugin_ambient_proxy_honoured; the approval notifier client also ignores them, the outbox, govder and averin clients still do), whether an inbound [identity] header is configured and its signing key is present, the vault format version this binary writes, and the rustc and git commit it was built with. The report holds booleans, counts and identifiers only.",
+      "statement": "GET /api/v1/posture answers only to a global (untenanted) admin key and reports, from the running process, the policy engine's live default (deny or allow), whether separation of duty is enforced, whether the approver-identity key is configured, distinct from the govder key, or on the shared-key escape, which tenants are in observe mode, which enforced policies have a RateLimit condition with a non-deny default, whether an explicit upstream proxy is configured (never its URL) and that the plugin egress client does not honour the ambient proxy variables (the field plugin_ambient_proxy_honoured; the approval notifier client also ignores them, the outbox, govder and averin clients still do), whether an inbound [identity] header is configured and its signing key is present, the [averin] D8 evidence floor mode as configured and as in effect (it takes effect only with d8_complete_evidence on), the vault format version this binary writes, and the rustc and git commit it was built with. The report holds booleans, counts and identifiers only.",
       "method": "test",
       "artifacts": [
         "src/web/posture.rs",
@@ -3145,7 +3145,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "78735f2a6145684624e7509f444e3299c0ba953e6c77c557767fdedc9d18f3c3"
+          "sha256": "821abb6431f1286d1d7feada0b06ebfa2bc3b3d04987de928b35eb429924f4fa"
         },
         {
           "path": "src/web/api.rs",
@@ -3649,19 +3649,23 @@
     },
     {
       "id": "d8-evidence-floor-routine-keeps-running",
-      "statement": "With [averin] enabled, mode observe and d8_complete_evidence on (the FeirOS Solo posture), on both the buffered and the streaming tail, an action the trusted catalog declares non-reversible (irreversible or partially-reversible, which in Solo covers money and most write actions), and an action with no catalog declaration, is refused before the plugin runs when Averin cannot begin the two-phase use evidence. An undeclared action is refused with the error D8 before-act evidence failed on both tails. A declared non-reversible action is human-floor: on the direct path it is sent to approval (the error says approval is required) and never runs or degrades, and the D8 before-act evidence refusal for it is shown on the approved buffered resume only, not on the streaming tail. Only a declared-Reversible action whose evidence cannot be begun because Averin is unavailable (unreachable, 5xx or 429) still runs, with one use receipt sealed through the mode's own rule, an AVERIN-D8-DEGRADED alarm line and a d8_degraded counter increment. A declared-Reversible action is refused, not degraded, when a live Averin answers 4xx, and when its params exceed max_seal_params_bytes (refused before the use token is spent). With Averin up, a reversible action gets use-intent before and use-outcome after the call and no degraded count.",
+      "statement": "With [averin] enabled, mode observe and d8_complete_evidence on (the FeirOS Solo posture), on both the buffered and the streaming tail, the action classes refused before the plugin runs when Averin cannot begin the two-phase use evidence depend on the operator setting [averin] d8_evidence_floor. In both modes an action with no catalog declaration is refused with the error D8 before-act evidence failed, and a declared-irreversible action never runs or degrades. Money is an action in the money.* namespace or one the catalog declares irreversible. Default money_and_irreversible: money actions are refused, including a partially-reversible one such as money.notify, while a partially-reversible non-money action and a declared-Reversible action whose evidence cannot be begun because Averin is unavailable (unreachable, 5xx or 429) still run, with one use receipt sealed through the mode's own rule, an AVERIN-D8-DEGRADED alarm line and a d8_degraded counter increment. human_floor: every partially-reversible action is refused as well, and only a declared-Reversible action still degrades. A declared non-reversible action is human-floor for approval: on the direct path it is sent to approval (the error says approval is required) and never runs or degrades before approval, and the D8 before-act evidence refusal and the degrade of a partially-reversible action are shown on the approved buffered resume only, not on the streaming tail. A declared-Reversible action is refused, not degraded, when a live Averin answers 4xx, and when its params exceed max_seal_params_bytes (refused before the use token is spent). With d8_complete_evidence off the setting has no effect and every non-reversible approved action keeps its committed-evidence requirement. An unknown d8_evidence_floor value is refused at config load, the default parses to money_and_irreversible, and the running mode is reported in the posture. With Averin up, a reversible action gets use-intent before and use-outcome after the call and no degraded count.",
       "method": "test",
       "artifacts": [
+        "docs/dev/CONFIGURATION.md",
         "docs/dev/LIMITATIONS.md",
         "src/averin/mod.rs",
+        "src/config/types.rs",
         "src/server/mod.rs",
+        "src/web/posture.rs",
         "tests/approval_token_integration.rs",
-        "tests/d8_degraded_guard.rs"
+        "tests/d8_degraded_guard.rs",
+        "tests/solo_evidence_posture.rs"
       ],
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact solo_posture_with_averin_down_refuses_irreversible_and_runs_reversible solo_posture_with_averin_up_gives_reversible_two_phase_evidence irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode reversible_approval_resume_remains_fail_open_when_observe_seal_is_missing && cargo test --locked --no-default-features --test d8_degraded_guard",
+      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact solo_posture_with_averin_down_refuses_irreversible_and_runs_reversible solo_posture_with_averin_up_gives_reversible_two_phase_evidence irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode reversible_approval_resume_remains_fail_open_when_observe_seal_is_missing default_floor_degrades_a_partially_reversible_write_but_refuses_money_and_irreversible human_floor_mode_refuses_every_partially_reversible_action floor_setting_has_no_effect_without_d8_complete_evidence && cargo test --locked --no-default-features --test d8_degraded_guard && cargo test --locked --no-default-features --test solo_evidence_posture",
       "covers": [
         {
           "path": "src/server/mod.rs",
@@ -3687,6 +3691,36 @@
           "path": "src/averin/mod.rs",
           "symbol": "AverinError::is_unavailable",
           "sha256": "867b3a11c9ec473687ee7583ae5deb745115fe3e7a2f559f1a97ec621c2285b4"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "IrreversibilityResolution::d8_fallback_ok",
+          "sha256": "aedee9d76bc3bb72d18988df0e86fdb33fd235a998065cc8c744b276047a4cb5"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "IrreversibilityResolution::requires_committed_evidence",
+          "sha256": "f735c1706dc012e051668e73f5850b6abaa4d783cf1f8b03f835437098f69d46"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "is_money_action",
+          "sha256": "77ce143c46b39bbd54b5e629f6c0d3413223b717e1789c260f67bb5b20c6c82d"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "EffectiveEvidenceFloor::from_config",
+          "sha256": "4460adccb52e826636397ddd7b0f5f657425211191e7a7c455d5a0c41cee2656"
+        },
+        {
+          "path": "src/config/types.rs",
+          "symbol": "TryFrom<RawAverinConfig> for crate::averin::AverinConfig::try_from",
+          "sha256": "33910a5cd143f25b29e9a6f13a50d4b6041d4d3514fee1cdebf480c4eae26238"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "Default for AverinConfig::default",
+          "sha256": "85e032ae98d8589521480d6b23016311b77669af0c3bfb15e74e499ea8308627"
         }
       ],
       "mutants": [
@@ -3694,9 +3728,13 @@
         "d8-fallback-any-error",
         "d8-fallback-undeclared",
         "d8-streaming-guard-dropped",
-        "d8-oversize-preflight-skipped"
+        "d8-oversize-preflight-skipped",
+        "d8-floor-default-human-floor",
+        "d8-floor-money-namespace-ignored",
+        "d8-floor-undeclared-degrades",
+        "d8-floor-mode-ignored"
       ],
-      "does_not_establish": "Only an action the trusted catalog declares Reversible may degrade; whether an operator labeled the real side effect truthfully is not checked. Unavailable means a request error (connect or timeout), a 5xx or a 429; a live Averin that misbehaves in some other way refuses, which is the safe side. The approved-resume path is driven through the buffered tail in approval_token_integration and the direct path through both tails in d8_degraded_guard; the D8 evidence refusal of a declared non-reversible action on the streaming tail is not driven by any test; a fake Averin stands in for the real one, and no four-plane end-to-end runs with [averin] enabled (a separate run). The routine action's one-phase seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. Any CI run other than the recorded one.",
+      "does_not_establish": "Only an action the trusted catalog declares Reversible or partially-reversible may degrade, and in the default mode only when it is not money; whether an operator declared the real side effect truthfully, or named a money action under money.*, is not checked, and a reversible catalog entry named money.* requested under another label is not recognised as money. Unavailable means a request error (connect or timeout), a 5xx or a 429; a live Averin that misbehaves in some other way refuses, which is the safe side. In the default mode a degraded partially-reversible write has no before-act record. The approved-resume path (including every partially-reversible case) is driven through the buffered tail in approval_token_integration and the direct path through both tails in d8_degraded_guard; the D8 evidence refusal of a declared non-reversible action on the streaming tail is not driven by any test; a fake Averin stands in for the real one, and the four-plane evidence-gate end-to-end is a separate run. The routine action's one-phase seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. An approval opened under an older build for a partially-reversible action is refused on resume. Any CI run other than the recorded one.",
       "evidence_run": "38676181898"
     }
   ]

@@ -1,0 +1,16 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 3b2332e..c8618b1 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -168,9 +168,8 @@ enum EffectiveEvidenceFloor {
+ impl EffectiveEvidenceFloor {
+     fn from_config(cfg: &crate::config::Config) -> Self {
+         use crate::averin::D8EvidenceFloor;
+-        if cfg.averin.d8_complete_evidence
+-            && cfg.averin.d8_evidence_floor == D8EvidenceFloor::MoneyAndIrreversible
+-        {
++        let _ = D8EvidenceFloor::HumanFloor;
++        if cfg.averin.d8_complete_evidence {
+             Self::MoneyAndIrreversible
+         } else {
+             Self::HumanFloor

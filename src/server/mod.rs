@@ -149,14 +149,51 @@ where
 enum IrreversibilityResolution {
     Reversible,
     HumanFloor,
+    /// Declared partially-reversible and nothing stricter (VUL-38 evidence floor).
+    PartiallyReversible,
     Undeclared,
     AmbiguousCanonical,
     Unavailable,
 }
 
+/// The VUL-38 floor in force. `[averin] d8_evidence_floor` only applies with
+/// `d8_complete_evidence` on (the two-phase mode the fallback belongs to); with it off every
+/// partially-reversible action keeps the committed-evidence floor it always had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveEvidenceFloor {
+    MoneyAndIrreversible,
+    HumanFloor,
+}
+
+impl EffectiveEvidenceFloor {
+    fn from_config(cfg: &crate::config::Config) -> Self {
+        use crate::averin::D8EvidenceFloor;
+        if cfg.averin.d8_complete_evidence
+            && cfg.averin.d8_evidence_floor == D8EvidenceFloor::MoneyAndIrreversible
+        {
+            Self::MoneyAndIrreversible
+        } else {
+            Self::HumanFloor
+        }
+    }
+}
+
+/// Vultrino's money definition for the VUL-38 floor: any of the action names the request
+/// carries is in the `money.*` namespace. (A catalog-declared irreversible action is the other
+/// half of the definition and is already `HumanFloor`.)
+fn is_money_action(names: &[Option<&str>]) -> bool {
+    names
+        .iter()
+        .flatten()
+        .any(|n| n.trim().to_ascii_lowercase().starts_with("money."))
+}
+
 impl IrreversibilityResolution {
     fn automatically_requires_approval(self) -> bool {
-        matches!(self, Self::HumanFloor | Self::AmbiguousCanonical)
+        matches!(
+            self,
+            Self::HumanFloor | Self::PartiallyReversible | Self::AmbiguousCanonical
+        )
     }
 
     /// Anything not proven reversible. Used for inconclusive-recipe refusal and
@@ -171,14 +208,25 @@ impl IrreversibilityResolution {
     /// posture keep the historical availability knobs (including Observe
     /// fail-open); only a declared human floor or an erased shared-canonical
     /// verb forces a committed use seal before dispatch.
-    fn requires_committed_evidence(self) -> bool {
-        matches!(self, Self::HumanFloor | Self::AmbiguousCanonical)
+    fn requires_committed_evidence(self, floor: EffectiveEvidenceFloor, money: bool) -> bool {
+        match self {
+            Self::HumanFloor | Self::AmbiguousCanonical => true,
+            Self::PartiallyReversible => money || floor == EffectiveEvidenceFloor::HumanFloor,
+            _ => false,
+        }
+    }
+
+    /// VUL-38: whether the one-phase fallback may run when Averin is unavailable. Money never
+    /// degrades, whatever its declaration; the other gate is `requires_committed_evidence`.
+    fn d8_fallback_ok(self, money: bool) -> bool {
+        matches!(self, Self::Reversible | Self::PartiallyReversible) && !money
     }
 
     fn authority_class(self) -> Option<CapabilityAuthorityClass> {
         match self {
             Self::Reversible => Some(CapabilityAuthorityClass::Reversible),
             Self::HumanFloor => Some(CapabilityAuthorityClass::HumanFloor),
+            Self::PartiallyReversible => Some(CapabilityAuthorityClass::PartiallyReversible),
             Self::Undeclared => Some(CapabilityAuthorityClass::Undeclared),
             Self::AmbiguousCanonical => Some(CapabilityAuthorityClass::AmbiguousCanonical),
             Self::Unavailable => None,
@@ -1754,7 +1802,13 @@ impl VultrinoServer {
         // declared human-floor capability or an ambiguous shared canonical verb
         // forces a committed use seal. Both answers come from this one snapshot.
         let trusted_irreversible = irreversibility.trusted_human_floor();
-        let evidence_required = irreversibility.requires_committed_evidence();
+        let money = is_money_action(&[
+            Some(request.action.as_str()),
+            Some(full_action.as_str()),
+            action_label.as_deref(),
+        ]);
+        let evidence_required = irreversibility
+            .requires_committed_evidence(EffectiveEvidenceFloor::from_config(&self.config), money);
 
         // VUL-05: the pure admission gate decides between direct execution,
         // human approval and refusal from the evaluation and `needs_approval`.
@@ -2050,7 +2104,7 @@ impl VultrinoServer {
             approved_execution: false,
             evidence_action: request.action.clone(),
             evidence_required,
-            d8_fallback_ok: matches!(irreversibility, IrreversibilityResolution::Reversible),
+            d8_fallback_ok: irreversibility.d8_fallback_ok(money),
             kill_fence: KillFenceSubject {
                 principal: principal.clone(),
                 admitted_epoch,
@@ -3815,9 +3869,17 @@ impl VultrinoServer {
         // Prefer the frozen catalog class: undeclared approvals may carry the
         // broader trusted_irreversible stamp for recipe refusal without forcing
         // Averin evidence. Legacy rows without a class keep the stamp fail-closed.
+        let money = is_money_action(&[
+            Some(approval.action.as_str()),
+            approval.action_label.as_deref(),
+        ]);
+        let floor = EffectiveEvidenceFloor::from_config(&self.config);
         let evidence_required = match approval.capability_authority() {
             Some(CapabilityAuthorityClass::HumanFloor)
             | Some(CapabilityAuthorityClass::AmbiguousCanonical) => true,
+            Some(CapabilityAuthorityClass::PartiallyReversible) => {
+                money || floor == EffectiveEvidenceFloor::HumanFloor
+            }
             Some(_) => false,
             None => approval.trusted_irreversible,
         };
@@ -3843,10 +3905,12 @@ impl VultrinoServer {
                 .clone()
                 .unwrap_or_else(|| approval.action.clone()),
             evidence_required,
-            d8_fallback_ok: matches!(
-                approval.capability_authority(),
-                Some(CapabilityAuthorityClass::Reversible)
-            ),
+            d8_fallback_ok: !money
+                && matches!(
+                    approval.capability_authority(),
+                    Some(CapabilityAuthorityClass::Reversible)
+                        | Some(CapabilityAuthorityClass::PartiallyReversible)
+                ),
         };
         let authorized = permit.authorize(payload).map_err(|reason| {
             RunError::terminal(VultrinoError::PolicyDenied(format!(
@@ -4437,11 +4501,21 @@ impl VultrinoServer {
                 .collect();
             if matching.is_empty() {
                 IrreversibilityResolution::Undeclared
+            } else if matching.iter().any(|cap| {
+                // Irreversible, or a spelling nothing recognises: fail closed. A declared
+                // partially-reversible money.* action is money, so it is human floor too.
+                !matches!(
+                    cap.reversibility.trim(),
+                    "reversible" | "partially-reversible"
+                ) || (cap.reversibility.trim() == "partially-reversible"
+                    && is_money_action(&[Some(cap.action.as_str())]))
+            }) {
+                IrreversibilityResolution::HumanFloor
             } else if matching
                 .iter()
                 .any(|cap| crate::approval::reversibility_requires_human_floor(&cap.reversibility))
             {
-                IrreversibilityResolution::HumanFloor
+                IrreversibilityResolution::PartiallyReversible
             } else {
                 IrreversibilityResolution::Reversible
             }

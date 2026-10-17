@@ -429,22 +429,33 @@ kernels.
   refused at config load rather than coerced into Observe. Undeclared actions in
   non-strict posture, reversible declarations, and deployments with Averin
   disabled still have no record-existence guarantee. That split is the intended
-  posture, not an oversight: actions the trusted catalog declares non-reversible
-  (irreversible and partially-reversible actions, which is the human-floor class:
-  money, and in the Solo pack most write actions such as session create, update and
-  cancel, attendance update and learner messages) require committed two-phase
-  evidence and are refused while Averin is down; only reversible actions keep running. With
-  `d8_complete_evidence = true` (the FeirOS Solo setting) a catalog-declared
-  reversible action gets two-phase evidence while Averin is up. Only when Averin is
+  posture, not an oversight. While Averin cannot begin two-phase evidence, which
+  actions are refused is the operator setting `[averin] d8_evidence_floor`
+  (CONFIGURATION). In the default `money_and_irreversible` mode, money (an action in
+  the `money.*` namespace, or one the catalog declares irreversible) and irreversible
+  actions are refused, including a partially-reversible money action such as
+  `money.notify`; other partially-reversible actions (in the Solo pack most write
+  actions such as session create, update and cancel, attendance update and learner
+  messages) and reversible actions keep running. In `human_floor` mode every
+  partially-reversible action is refused as well and only reversible non-money
+  actions keep running. Actions with no catalog declaration are refused in both
+  modes. The setting has an effect only with `d8_complete_evidence = true`. With
+  `d8_complete_evidence = true` (the FeirOS Solo setting) an action that may run gets
+  two-phase evidence while Averin is up. Only when Averin is
   unavailable (unreachable, timed out, a 5xx or a 429) does it still run, with a
   one-phase seal, an `AVERIN-D8-DEGRADED` alarm line and a `d8_degraded` counter
   (`averin_seal` in `/api/v1/metrics`); that seal can be dropped or lost in a crash,
-  and the plan 085 reconciliation detects the gap, it cannot recover it. Any other
+  and the plan 085 reconciliation detects the gap, it cannot recover it. In the
+  default mode a degraded partially-reversible write therefore has no before-act
+  record: that is the accepted trade of running routine writes through an Averin
+  outage, and `human_floor` is the setting that closes it. Any other
   evidence failure refuses, as it does for every other class: a 4xx from a live
   Averin, a malformed reply, and params over `max_seal_params_bytes` (checked
   before the use token is spent). An action with no catalog declaration is not
   proven reversible, so with `d8_complete_evidence` on it is refused while Averin
-  is down, exactly like a non-reversible one.
+  is down in both modes. Whether an operator declared the real side effect
+  truthfully is not checked, so the default mode's money line is only as good as the
+  catalog's `reversibility` and the `money.*` naming.
 - **An `internal_http` capability's HTTP verb is operator authority, and the agent
   may not send one.** The transport requires `method`, so a capability registered
   through the admin API must make it decidable: exactly one `target.methods` entry,
