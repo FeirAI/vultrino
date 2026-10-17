@@ -30,6 +30,13 @@ pub(crate) fn build_posture(
         crate::averin::AverinClient::new(config.averin.clone()),
         Ok(Some(_))
     );
+    let averin_key_sent = config.averin.enabled
+        && config
+            .averin
+            .api_key
+            .as_deref()
+            .and_then(|k| crate::secret_fp::fingerprint(k, REL_AVERIN_API_KEY))
+            .is_some();
     let key = config.govder.as_ref().map(|g| g.approval_key_posture());
     let mut observe_tenants: Vec<&str> = config
         .tenants
@@ -94,6 +101,10 @@ pub(crate) fn build_posture(
                 crate::averin::AverinMode::RequireEvidence => "require_evidence",
             },
             "d8_complete_evidence": config.averin.d8_complete_evidence,
+            // FEI-40 relationship I: the seal client is on and a non-empty key is set, the same
+            // condition as the averin-api-key fingerprint (the key is read but never sent while
+            // the client is off). feir-os's verifier reads this beside the fingerprint.
+            "api_key_configured": averin_key_sent,
             // VUL-38: the configured floor; it only takes effect with d8_complete_evidence on.
             "d8_evidence_floor": config.averin.d8_evidence_floor.as_str(),
             // Effective only with a live client, enabled and d8_complete_evidence on.
@@ -432,6 +443,31 @@ mod tests {
         cfg.averin.api_key = None;
         let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
         assert!(v["secret_fingerprints"].get("averin-api-key").is_none());
+    }
+
+    /// The posture `averin` object carries `api_key_configured` (feir-os averin_use_checks reads it
+    /// for a keyed averin): true only with the seal client on and a non-empty key, the same
+    /// condition as the fingerprint, and the key itself never appears.
+    #[test]
+    fn report_carries_averin_api_key_configured_with_the_fingerprint_condition() {
+        let mut cfg = Config::default();
+        let flag = |c: &Config| {
+            build_posture(c, true, &[], &WorkloadVerifier::Disabled)["averin"]["api_key_configured"]
+                .clone()
+        };
+        // Present as a boolean in every state, not omitted.
+        assert_eq!(flag(&cfg), json!(false));
+        cfg.averin.api_key = Some("averin-project-bearer".into());
+        cfg.averin.enabled = false;
+        assert_eq!(flag(&cfg), json!(false));
+        cfg.averin.enabled = true;
+        assert_eq!(flag(&cfg), json!(true));
+        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        assert!(!v.to_string().contains("averin-project-bearer"));
+        cfg.averin.api_key = Some(String::new());
+        assert_eq!(flag(&cfg), json!(false));
+        cfg.averin.api_key = None;
+        assert_eq!(flag(&cfg), json!(false));
     }
 
     /// An unset secret has no fingerprint (the relationship is absent), and an approver key that is
