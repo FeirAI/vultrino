@@ -668,6 +668,30 @@
     "egress-webhook-url-unchecked": {
       "tier": "fast",
       "claim": "egress-no-ambient-proxy"
+    },
+    "workspace-scope-server-strip-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-plugin-strip-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-not-injected": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-use-time-recheck-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-applied-after-consume": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-id-format-check-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
     }
   },
   "claims": [
@@ -820,7 +844,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "ece06d2c2987a99a7d9a2a53d5defa976f2304858e328b73265f956e073f74b1"
+          "sha256": "19356bef86981483bd90747704ccff0d3c09dd55a368d67c435cc7991396d714"
         },
         {
           "path": "src/server/mod.rs",
@@ -2449,17 +2473,17 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "d606ca2f97c875b77887f69016d15323aa9cb8a444fd8d9ec02a3a816148762b"
+          "sha256": "5e4de6d9405a64d629a1b57336c5f07da7fcf80c5b223005058c470f6df2049d"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "0e32c230ad5ef4a55817a90f0d0e05b23b4447873cbead8df62fba5e8887ed3d"
+          "sha256": "ea0a1b068599318776348fcc1675a8bbacebfc91b23f5ea6067c2016d6c2ec15"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "ece06d2c2987a99a7d9a2a53d5defa976f2304858e328b73265f956e073f74b1"
+          "sha256": "19356bef86981483bd90747704ccff0d3c09dd55a368d67c435cc7991396d714"
         },
         {
           "path": "src/server/mod.rs",
@@ -3503,6 +3527,65 @@
       ],
       "does_not_establish": "Only the listed patterns, URLs and shapes, not every pattern; a property of the engine decision, not a proof. A pattern holding a ? is refused on Deny and Prompt rules, not matched; an Allow rule with a ? is accepted and only narrows. Trailing slashes, ;name=value path parameters, repeated / and %2F are tried; any other rewrite a particular backend applies (case folding of the path, unicode normalisation, backslashes) is not, so a Deny pattern can still be slipped past by those spellings. A server that treats the trailing-slash path as a different resource is over-denied, not under-denied. The Prompt widening can upgrade an Allow to a Prompt, so a request an Allow rule alone would have let through can reach an approver. A Prompt rule's exact reading charges its rate limit once and its wide reading does not charge, so under the wide reading a rate limit counts as within its limit (wider, fail-closed); a widened Prompt match that turns an Allow into a Prompt has already charged the Allow rule's rate limit. Other policies and rule kinds (rate limits, principal or time conditions) are not in the grid. Which deployed vaults hold a policy relying on the old narrower matching is not checked.",
       "evidence_run": "38834394415"
+    },
+    {
+      "id": "anthropic-workspace-id-operator-owned",
+      "statement": "The Anthropic workspace on an outgoing request is the operator's, never the caller's, on every path that reaches a plugin: /llm, POST /api/v1/execute, the MCP http_request tool and approval replay. The workspace id is stored on the credential (metadata key anthropic_workspace_id). Before dispatch, any caller-supplied anthropic-workspace-id header (any case) is removed from the request, and the credential's value, if it has one, is written; a credential with none sends none, so the caller cannot choose a workspace with the same bearer on any of these paths. The http plugin repeats the same removal and write on its own parameters. The id must be wrkspc_ plus 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no meter event, and before the use token is consumed, shown by its use count staying 0) instead of being written into a header. The refusal is a credential configuration error, not an upstream failure: /llm answers 500 with a message naming the misconfigured credential metadata, and an approval-gated request refuses at approval open (no approval is stored) rather than opening an approval that could only fail on resume.",
+      "method": "test",
+      "artifacts": [
+        "src/plugins/mod.rs",
+        "src/plugins/http.rs",
+        "src/server/mod.rs",
+        "src/lib.rs",
+        "tests/llm_proxy_integration.rs",
+        "tests/approval_token_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration anthropic_workspace_id; cargo test --locked --no-default-features --test approval_token_integration workspace; cargo test --locked --no-default-features --lib -- plugins::http::tests::plugin_drops_agent_workspace_header",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope",
+          "sha256": "fa35061fe506c3b5b8a3c3ad4a5b7590b664ac52a33ffa6b06b65deeee51b632"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope_to_params",
+          "sha256": "b4b2ff2c408d390c8569f2d8f4d91eff32180041bf73a41c6308c7bbcfbd5430"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "HttpPlugin::scoped_params",
+          "sha256": "7825547c7a1618d027179dfdc2ae4cb6e566af51822162c77902512622929c7c"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_valid_anthropic_workspace_id",
+          "sha256": "b03ae8bb15c0bdb6e60ec58d8470b3026fc4757f0c9308c05714ddf2698c3694"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "validate_credential_metadata_entry",
+          "sha256": "03d29f336aa209d2625c5e2ae85a34903bd67ccfaf3c6ed776f1a2902af384ee"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action",
+          "sha256": "ea0a1b068599318776348fcc1675a8bbacebfc91b23f5ea6067c2016d6c2ec15"
+        }
+      ],
+      "mutants": [
+        "workspace-scope-server-strip-removed",
+        "workspace-scope-plugin-strip-removed",
+        "workspace-scope-not-injected",
+        "workspace-scope-use-time-recheck-removed",
+        "workspace-scope-applied-after-consume",
+        "workspace-id-format-check-removed"
+      ],
+      "does_not_establish": "That Anthropic accepts the configured workspace id, that the id belongs to the key's organization, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential holding an org-level key and no workspace id sends no workspace header, so Anthropic decides what that does. The buffered and the streaming dispatch in the server call the same helper, but only the buffered one is driven by a test for dispatch (the streaming path is driven only for the invalid-stored-value refusal). Other plugins (internal_http, WASM) get the server-side removal but have no workspace-id injection of their own. The header name is matched exactly (case-insensitively); other provider headers, and the pre-existing gap that /api/v1/execute does not apply a capability's model allowlist or token ceiling, are not covered here. The format check is an operator-facing sanity check, not Anthropic's own validation."
     }
   ]
 }

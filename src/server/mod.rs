@@ -1787,6 +1787,17 @@ impl VultrinoServer {
                     .validate_params(action_name, &request.params)
                     .map_err(VultrinoError::from)?;
             }
+            // The operator-owned workspace scope is applied at execution (and again
+            // on resume, from the live credential), never stored in the approval.
+            // Check it here on a copy so a credential whose stored workspace id is
+            // invalid refuses before any approval-open side effect instead of
+            // opening an approval that can only fail on resume.
+            let mut scoped_probe = request.params.clone();
+            crate::plugins::apply_workspace_scope_to_params(
+                &mut scoped_probe,
+                &credential.metadata,
+            )
+            .map_err(VultrinoError::from)?;
 
             // Open an approval request. Bearer capacity is converted into the
             // durable exact-request grant below, before the request is published.
@@ -2584,6 +2595,13 @@ impl VultrinoServer {
         plugin
             .validate_params(action_name, &params)
             .map_err(|e| RunError::terminal(e.into()))?;
+        // The workspace header is the operator's on every path (the credential's
+        // `anthropic_workspace_id` metadata, or none), never the caller's. Applied
+        // in the preflight, so a bad stored value is refused before any use token
+        // is consumed or D8 evidence begun, and evidence binds the dispatched params.
+        let mut params = params;
+        crate::plugins::apply_workspace_scope_to_params(&mut params, &credential.metadata)
+            .map_err(|e| RunError::terminal(e.into()))?;
 
         // Serialize once before token consumption. Trusted human-floor actions
         // fail closed here if no evidence path/grant exists; reversible actions
@@ -3004,6 +3022,13 @@ impl VultrinoServer {
         })?;
         plugin
             .validate_params(action_name, &params)
+            .map_err(|e| RunError::terminal(e.into()))?;
+        // The workspace header is the operator's on every path (the credential's
+        // `anthropic_workspace_id` metadata, or none), never the caller's. Applied
+        // in the preflight, so a bad stored value is refused before any use token
+        // is consumed or D8 evidence begun, and evidence binds the dispatched params.
+        let mut params = params;
+        crate::plugins::apply_workspace_scope_to_params(&mut params, &credential.metadata)
             .map_err(|e| RunError::terminal(e.into()))?;
 
         // The streaming path shares the exact same pre-consume evidence

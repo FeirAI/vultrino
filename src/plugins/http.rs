@@ -1042,6 +1042,17 @@ impl HttpPlugin {
         Ok(url)
     }
 
+    /// Parse the request params and make the `anthropic-workspace-id` header the
+    /// operator's: any caller-supplied one is dropped and the credential's own value
+    /// (metadata), if any, is written. This is the plugin-level seam, so it holds for
+    /// every caller of the plugin, whatever the path that reached it.
+    fn scoped_params(request: &PluginRequest) -> Result<HttpRequestParams, PluginError> {
+        let mut params: HttpRequestParams = serde_json::from_value(request.params.clone())
+            .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+        super::apply_workspace_scope(&mut params.headers, &request.credential.metadata)?;
+        Ok(params)
+    }
+
     /// Build the guarded outbound request shared by the buffered and streaming
     /// paths: SSRF-validate the URL, OAuth-refresh if needed, inject the vault
     /// credential, force client-managed encoding, and attach headers/query/body.
@@ -1327,8 +1338,7 @@ impl Plugin for HttpPlugin {
     async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
         match request.action.as_str() {
             "request" => {
-                let params: HttpRequestParams = serde_json::from_value(request.params)
-                    .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+                let params = Self::scoped_params(&request)?;
 
                 self.execute_request(params, &request.credential.data).await
             }
@@ -1342,8 +1352,7 @@ impl Plugin for HttpPlugin {
     ) -> Result<crate::StreamingResponse, PluginError> {
         match request.action.as_str() {
             "request" => {
-                let params: HttpRequestParams = serde_json::from_value(request.params)
-                    .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+                let params = Self::scoped_params(&request)?;
 
                 self.execute_request_streaming(params, &request.credential.data)
                     .await
@@ -1558,6 +1567,64 @@ mod tests {
             "the vault credential wins"
         );
         assert_eq!(headers.get("X-Other").map(String::as_str), Some("ok"));
+    }
+
+    fn scoped_request(
+        headers: serde_json::Value,
+        stored: Option<&str>,
+    ) -> Result<HashMap<String, String>, PluginError> {
+        let mut cred = crate::Credential::new(
+            "c".to_string(),
+            CredentialData::ApiKey {
+                key: Secret::new("k"),
+                header_name: "x-api-key".to_string(),
+                header_prefix: String::new(),
+            },
+        );
+        if let Some(v) = stored {
+            cred = cred.with_metadata(crate::ANTHROPIC_WORKSPACE_META, v);
+        }
+        let request = PluginRequest {
+            credential: cred,
+            action: "request".to_string(),
+            params: serde_json::json!({
+                "method": "POST",
+                "url": "https://api.anthropic.com/v1/messages",
+                "headers": headers,
+            }),
+            context: crate::RequestContext::new(),
+        };
+        HttpPlugin::scoped_params(&request).map(|p| p.headers)
+    }
+
+    #[test]
+    fn plugin_drops_agent_workspace_header_and_writes_the_credentials() {
+        let ws = "wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ";
+        let agent = serde_json::json!({
+            "Anthropic-Workspace-Id": "wrkspc_attacker0000000",
+            "anthropic-workspace-id": "wrkspc_attacker1111111",
+            "x-keep": "1"
+        });
+        let h = scoped_request(agent.clone(), Some(ws)).unwrap();
+        assert_eq!(
+            h.get("anthropic-workspace-id").map(String::as_str),
+            Some(ws)
+        );
+        assert_eq!(
+            h.keys()
+                .filter(|k| k.eq_ignore_ascii_case("anthropic-workspace-id"))
+                .count(),
+            1
+        );
+        assert_eq!(h.get("x-keep").map(String::as_str), Some("1"));
+        // No stored value: the agent's header is dropped and none is sent.
+        let h = scoped_request(agent.clone(), None).unwrap();
+        assert!(!h
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("anthropic-workspace-id")));
+        assert_eq!(h.get("x-keep").map(String::as_str), Some("1"));
+        // An invalid stored value is refused, never written into a header.
+        assert!(scoped_request(agent, Some("bad\r\nx-evil: 1")).is_err());
     }
 
     #[test]
