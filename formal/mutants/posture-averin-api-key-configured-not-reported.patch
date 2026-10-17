@@ -1,0 +1,13 @@
+diff --git a/src/web/posture.rs b/src/web/posture.rs
+index 0d70b8a..a8d9a9f 100644
+--- a/src/web/posture.rs
++++ b/src/web/posture.rs
+@@ -104,7 +104,7 @@ pub(crate) fn build_posture(
+             // FEI-40 relationship I: the seal client is on and a non-empty key is set, the same
+             // condition as the averin-api-key fingerprint (the key is read but never sent while
+             // the client is off). feir-os's verifier reads this beside the fingerprint.
+-            "api_key_configured": averin_key_sent,
++            // mutant
+             // VUL-38: the configured floor; it only takes effect with d8_complete_evidence on.
+             "d8_evidence_floor": config.averin.d8_evidence_floor.as_str(),
+             // Effective only with a live client, enabled and d8_complete_evidence on.
