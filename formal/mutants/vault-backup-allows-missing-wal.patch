@@ -1,0 +1,13 @@
+diff --git a/src/storage/vault_backup.rs b/src/storage/vault_backup.rs
+index 20ea640..b4e8c40 100644
+--- a/src/storage/vault_backup.rs
++++ b/src/storage/vault_backup.rs
+@@ -168,7 +168,7 @@ fn collect(vault: &Path) -> BackupResult<Vec<(String, PathBuf)>> {
+     for (name, p) in flat_layout(vault) {
+         if p.is_file() {
+             out.push((name.to_string(), p));
+-        } else if name == "vault.enc" || name == "vault.wal" {
++        } else if name == "vault.enc" {
+             return Err(format!(
+                 "{} is missing: a v10 vault is a snapshot plus its .wal, refusing a partial backup",
+                 p.display()

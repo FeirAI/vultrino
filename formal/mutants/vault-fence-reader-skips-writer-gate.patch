@@ -1,0 +1,12 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index fbc65a0..b561e32 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -2151,7 +2151,6 @@ impl FileStorage {
+         f: impl FnOnce(&StorageCache) -> T,
+     ) -> Result<T, StorageError> {
+         let _scope = GatedReadScope::enter();
+-        self.pass_writer_gate()?;
+         let flock = self.lock_file()?;
+         let _guard = flock.read().map_err(StorageError::Io)?;
+         {

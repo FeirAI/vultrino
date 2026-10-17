@@ -94,14 +94,39 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   offline `.wal` tail truncation without a durable anchor is an accepted limitation,
   because filesystem write access is outside the threat model),
   and they do not defend against an attacker who can write the vault directory:
-  such an attacker can also put back an older copy of the vault. Backups must therefore take the
-  two files together and be tested by restoring them.
+  such an attacker can also put back an older copy of the vault. Use `vultrino vault backup <dir>`
+  and `vultrino vault restore <dir>` rather than copying files by hand (the Solo VPS
+  nightly backup does): backup holds the exclusive vault lock while it copies the
+  snapshot, the `.wal`, the outbox and the averin stores together with a SHA-256
+  manifest, then checks the copy; restore verifies the manifest, every checksum and an
+  open of the copy before touching the target, refuses a backup without the snapshot
+  or the `.wal`, replaces an existing vault only with `--force` (moving the old
+  files aside), and leaves `<vault>.restore-pending` if interrupted, which stops the
+  vault opening until the restore is re-run. Stop the service before a restore: a
+  non-durable service holds the vault lock only per operation, so restore does not
+  detect it (backup is safe under a running non-durable service, it pauses
+  dispatches for the copy; the durable averin queue refuses both). They do not detect
+  a rollback to an older but self-consistent backup, and restoring an older backup
+  silently undoes every kill, revocation and approval made after it: before starting
+  the service the operator must re-apply the kills and revocations made after the
+  backup time and check Govder's kill state. A backup is refused while
+  `<vault>.restore-pending` exists. A damaged final `.wal` line
+  stops startup; `vultrino vault check` says whether removing exactly that one
+  record makes the vault open, and `--truncate-final` cuts it (kept in a side file;
+  the cut record is a lost mutation, so redo a kill or revocation that was in it).
+  Damage anywhere else is refused, not guessed at.
 - **Vault change detection and lock behaviour.** Another process's commit is noticed
   through the snapshot's (mtime, length, inode) token plus the log length; a
   filesystem with coarse timestamps is unsupported (this now covers writes and the
-  fence, not only the read cache). `flock` does not prefer a waiting writer, so
-  under sustained overlapping dispatches a kill write can wait without bound against
-  the caller's timeout. In-process lock-free readers (`get`, `get_by_alias`,
+  fence, not only the read cache). A waiting writer holds the
+  sidecar `<vault>.gate` file exclusively while it waits for the vault lock, and every
+  shared reader passes through that gate before taking the vault lock, so new fence
+  reads queue behind a waiting kill write instead of starving it. Readers hold
+  the gate for a few syscalls, so a writer gets it quickly in practice, but `flock`
+  gives no writer preference on the gate itself, so that is observed, not a bound
+  (a probe with 32 looping readers saw kill writes wait 11 to 29 ms; the test uses
+  eight looping readers). It relies on `flock` semantics on a local filesystem (not
+  NFS, FUSE or Windows). Writers still serialise one at a time on the gate. In-process lock-free readers (`get`, `get_by_alias`,
   `get_policy`, the fence epoch) block for one log fsync per write and for a
   whole-snapshot encrypt and fsync on the write that triggers compaction; a fence
   catch-up after a foreign write validates and re-indexes the whole vault under the
@@ -403,7 +428,34 @@ kernels.
   ordinary Observe/RequireEvidence posture. Unknown `[averin] mode` values are
   refused at config load rather than coerced into Observe. Undeclared actions in
   non-strict posture, reversible declarations, and deployments with Averin
-  disabled still have no record-existence guarantee.
+  disabled still have no record-existence guarantee. That split is the intended
+  posture, not an oversight. While Averin cannot begin two-phase evidence, which
+  actions are refused is the operator setting `[averin] d8_evidence_floor`
+  (CONFIGURATION). In the default `money_and_irreversible` mode, money (an action in
+  the `money.*` namespace, or one the catalog declares irreversible) and irreversible
+  actions are refused, including a partially-reversible money action such as
+  `money.notify`; other partially-reversible actions (in the Solo pack most write
+  actions such as session create, update and cancel, attendance update and learner
+  messages) and reversible actions keep running. In `human_floor` mode every
+  partially-reversible action is refused as well and only reversible non-money
+  actions keep running. Actions with no catalog declaration are refused in both
+  modes. The setting has an effect only with `d8_complete_evidence = true`. With
+  `d8_complete_evidence = true` (the FeirOS Solo setting) an action that may run gets
+  two-phase evidence while Averin is up. Only when Averin is
+  unavailable (unreachable, timed out, a 5xx or a 429) does it still run, with a
+  one-phase seal, an `AVERIN-D8-DEGRADED` alarm line and a `d8_degraded` counter
+  (`averin_seal` in `/api/v1/metrics`); that seal can be dropped or lost in a crash,
+  and the plan 085 reconciliation detects the gap, it cannot recover it. In the
+  default mode a degraded partially-reversible write therefore has no before-act
+  record: that is the accepted trade of running routine writes through an Averin
+  outage, and `human_floor` is the setting that closes it. Any other
+  evidence failure refuses, as it does for every other class: a 4xx from a live
+  Averin, a malformed reply, and params over `max_seal_params_bytes` (checked
+  before the use token is spent). An action with no catalog declaration is not
+  proven reversible, so with `d8_complete_evidence` on it is refused while Averin
+  is down in both modes. Whether an operator declared the real side effect
+  truthfully is not checked, so the default mode's money line is only as good as the
+  catalog's `reversibility` and the `money.*` naming.
 - **An `internal_http` capability's HTTP verb is operator authority, and the agent
   may not send one.** The transport requires `method`, so a capability registered
   through the admin API must make it decidable: exactly one `target.methods` entry,

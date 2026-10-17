@@ -669,6 +669,45 @@
       "tier": "fast",
       "claim": "egress-no-ambient-proxy"
     },
+    "vault-fence-reader-skips-writer-gate": {
+      "tier": "full"
+    },
+    "vault-writer-skips-writer-gate": {
+      "tier": "full"
+    },
+    "vault-restore-skips-checksum": {
+      "tier": "full"
+    },
+    "vault-backup-allows-missing-wal": {
+      "tier": "full"
+    },
+    "vault-open-ignores-restore-pending": {
+      "tier": "full"
+    },
+    "vault-restore-stages-queue-in-live-dir": {
+      "tier": "full"
+    },
+    "vault-check-cuts-without-reopen-test": {
+      "tier": "full"
+    },
+    "d8-reversible-no-fallback": {
+      "tier": "fast"
+    },
+    "d8-fallback-any-error": {
+      "tier": "fast"
+    },
+    "d8-fallback-undeclared": {
+      "tier": "full"
+    },
+    "d8-streaming-guard-dropped": {
+      "tier": "full"
+    },
+    "d8-oversize-preflight-skipped": {
+      "tier": "full"
+    },
+    "vault-backup-ignores-restore-pending": {
+      "tier": "full"
+    },
     "workspace-scope-server-strip-removed": {
       "tier": "fast",
       "claim": "anthropic-workspace-id-operator-owned"
@@ -844,12 +883,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "19356bef86981483bd90747704ccff0d3c09dd55a368d67c435cc7991396d714"
+          "sha256": "4460399dd199775af57252df9efc19bffc4202c1b9f2991fa33a926c949ba1c5"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "ef1e0bb08feb54218255dcb6c94959607d9a8fbdb8faffa9651cf4bc8b301a0e"
+          "sha256": "e805ff78c78bda642a69a073d3bb3862017c1f511c6d773124680c7f2e368cfc"
         },
         {
           "path": "src/server/mod.rs",
@@ -2468,22 +2507,22 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "ef1e0bb08feb54218255dcb6c94959607d9a8fbdb8faffa9651cf4bc8b301a0e"
+          "sha256": "e805ff78c78bda642a69a073d3bb3862017c1f511c6d773124680c7f2e368cfc"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "5e4de6d9405a64d629a1b57336c5f07da7fcf80c5b223005058c470f6df2049d"
+          "sha256": "6af082064dcf672d5b4c3c52d83f6256b1d5f5e461644511c7bc6d79c721a28c"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "ea0a1b068599318776348fcc1675a8bbacebfc91b23f5ea6067c2016d6c2ec15"
+          "sha256": "5d86b259fec4ecb97f70b3da7e85c9bb7b0289e6a302dbfbb7e3a1e86732727b"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "19356bef86981483bd90747704ccff0d3c09dd55a368d67c435cc7991396d714"
+          "sha256": "4460399dd199775af57252df9efc19bffc4202c1b9f2991fa33a926c949ba1c5"
         },
         {
           "path": "src/server/mod.rs",
@@ -2753,7 +2792,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_mutate_blocking",
-          "sha256": "def20882b09da8fce842394ca4f467bd011f97f30d854d404b790ef577f738d5"
+          "sha256": "86f5b2cd913cbc439850cac5659f6396f67d467f580a7d1588816fa22e43a1be"
         },
         {
           "path": "src/storage/file.rs",
@@ -2800,7 +2839,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_mutate_blocking",
-          "sha256": "def20882b09da8fce842394ca4f467bd011f97f30d854d404b790ef577f738d5"
+          "sha256": "86f5b2cd913cbc439850cac5659f6396f67d467f580a7d1588816fa22e43a1be"
         },
         {
           "path": "src/storage/file.rs",
@@ -2845,11 +2884,11 @@
         "vault-panic-skips-rollback"
       ],
       "does_not_establish": "Power-loss durability of any real filesystem or disk: a crash is an injected error at a named step that leaves the files exactly as written (the page cache is not dropped, fsync is assumed honest). Crashes at steps the injection points do not name, or inside the standard library. Detection of a vault rolled back by replacing the snapshot and log with older copies, or of a log truncated at a record boundary: both are accepted by the format, as a replaced vault file always was. A terminated final line damaged by a crash or bit rot fails the open closed instead of being recovered; an operator must truncate it after checking. Behaviour under concurrent writers in several real processes beyond what the advisory lock already serialises. Any CI run. The take-back of a failed append is best effort: if the truncate itself fails after an fsync error, the line may remain and be read as committed by the next reader. A panic raised inside the commit itself (as opposed to the mutation closure) is rolled back by the same path but has no dedicated test. An invalid record in a delta replay drops the process's whole in-memory view (readers see nothing and deny) and forces a full reload; this is not covered by a test.",
-      "evidence_run": "38219467303"
+      "evidence_run": "38652676871"
     },
     {
       "id": "vault-fence-shared-lock-delta-read",
-      "statement": "The dispatch kill-fence read takes the cross-process vault lock shared, not exclusive, and reads only what changed since this process last looked. An unchanged vault costs the fence zero decrypts, zero bytes written and zero fsyncs; after another handle appends one record the fence decrypts exactly that one record and sees the kill it carries; another handle's kill and its lift are seen without a reload (the lifted kill still refuses work admitted before it); a compaction by another handle is picked up. A fence read completes while another handle holds the lock shared, and waits while another handle holds it exclusive, so committed state is still what the fence sees. A v9 process rewriting the snapshot under a running v10 process is refused (fail closed), including right after a compaction when the log is empty and its length equals the process offset, so the snapshot version is the only sign.",
+      "statement": "The dispatch kill-fence read takes the cross-process vault lock shared, not exclusive, and reads only what changed since this process last looked. An unchanged vault costs the fence zero decrypts, zero bytes written and zero fsyncs; after another handle appends one record the fence decrypts exactly that one record and sees the kill it carries; another handle's kill and its lift are seen without a reload (the lifted kill still refuses work admitted before it); a compaction by another handle is picked up. A fence read completes while another handle holds the lock shared, and waits while another handle holds it exclusive, so committed state is still what the fence sees. A v9 process rewriting the snapshot under a running v10 process is refused (fail closed), including right after a compaction when the log is empty and its length equals the process offset, so the snapshot version is the only sign. A kill write that is waiting for the vault lock holds the writer-intent gate (a sidecar lock file taken exclusively before the vault lock, released once the vault lock is held), and every fence read passes through that gate before its shared lock, so a fence read that starts after a waiting kill write queues behind it and the write commits first; with eight handles looping fence reads, a kill write on another handle completes within five seconds.",
       "method": "test",
       "artifacts": [
         "src/storage/file.rs",
@@ -2860,12 +2899,12 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::an_unchanged_vault_fence_read_decrypts_nothing storage::file::vault_tests::a_fence_read_after_a_foreign_write_decrypts_only_that_record storage::file::vault_tests::the_fence_sees_another_handles_kill_and_its_lift_without_a_reload storage::file::vault_tests::fence_reads_hold_the_lock_shared_so_dispatches_do_not_serialize storage::file::vault_tests::a_writer_still_excludes_fence_readers storage::file::vault_tests::another_handles_compaction_is_picked_up_by_the_fence storage::file::vault_tests::an_older_build_rewriting_the_snapshot_under_a_running_process_is_refused storage::file::vault_tests::an_older_build_rewriting_the_snapshot_after_compaction_is_refused",
+      "detector": "cargo test --locked --no-default-features --lib -- storage::file::vault_tests::an_unchanged_vault_fence_read_decrypts_nothing storage::file::vault_tests::a_fence_read_after_a_foreign_write_decrypts_only_that_record storage::file::vault_tests::the_fence_sees_another_handles_kill_and_its_lift_without_a_reload storage::file::vault_tests::fence_reads_hold_the_lock_shared_so_dispatches_do_not_serialize storage::file::vault_tests::a_writer_still_excludes_fence_readers storage::file::vault_tests::another_handles_compaction_is_picked_up_by_the_fence storage::file::vault_tests::an_older_build_rewriting_the_snapshot_under_a_running_process_is_refused storage::file::vault_tests::an_older_build_rewriting_the_snapshot_after_compaction_is_refused storage::file::vault_tests::a_waiting_kill_write_holds_new_fence_readers_behind_it storage::file::vault_tests::a_kill_write_completes_in_bounded_time_under_a_stream_of_fence_reads",
       "covers": [
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_read_blocking",
-          "sha256": "3edb202d541c7b2235798e571ffc01a8a6a3ef7b8e6de808f3e9a42090b88446"
+          "sha256": "068794c6a959000aeb14193c10e0f823027d3d192e4f9040f5cdfe38eb9a1283"
         },
         {
           "path": "src/storage/file.rs",
@@ -2876,16 +2915,33 @@
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::sync_locked",
           "sha256": "613c23120fc3e0e64f548c5d90e98c437205b0c69099ed3a28ecbbda4eb056b4"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::pass_writer_gate",
+          "sha256": "dea6bcc8ecf529155257f5db5dbf85db81f52852e9d00740f9834c60bb4beaa4"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::gate_file",
+          "sha256": "4ae29370c0d90baaf48e8f7729a9dbbd0cb5277fcdee82a5a59ab282d9f7d1d8"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::locked_mutate_blocking",
+          "sha256": "86f5b2cd913cbc439850cac5659f6396f67d467f580a7d1588816fa22e43a1be"
         }
       ],
       "mutants": [
         "vault-fence-read-skips-lock",
         "vault-fence-read-takes-exclusive-lock",
         "vault-fence-ignores-appended-records",
-        "vault-v9-rewrite-accepted-after-compaction"
+        "vault-v9-rewrite-accepted-after-compaction",
+        "vault-fence-reader-skips-writer-gate",
+        "vault-writer-skips-writer-gate"
       ],
-      "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation: flock does not prefer a waiting writer, so under sustained overlapping dispatches a kill write can wait without bound against the caller's timeout. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
-      "evidence_run": "38332553597"
+      "does_not_establish": "The TLA+ model govder formal/tla/KillFence.tla was not re-run: its assumption (a fence read observes every kill write committed before it) is argued to be preserved because writers still commit under the exclusive lock and a shared read excludes them, not re-checked mechanically. Handles in one process stand in for processes: the lock is a flock on separate file descriptors, which conflicts between descriptors in one process exactly as between processes, but no test starts a second OS process. Lock behaviour on network filesystems, FUSE or Windows. The in-memory kill epoch read at admission, which is not synced from disk (it can only be stale-low, which refuses more). Dispatch throughput or contention, which is not measured. Any CI run. Detection of another process's commit relies on the snapshot's (mtime, length, inode) token plus the log length, so a filesystem with coarse timestamps that rewrites a snapshot to the same length within one tick is not supported (before the log this affected only the read cache; it now covers writes and the fence). Writer starvation is not bounded by proof: flock gives no writer preference on the gate either, so taking the gate is fast in practice (readers hold it for a few syscalls; a probe with 32 looping readers saw 5 kill writes wait 11 to 29 ms), not guaranteed. The test uses handles in one process (eight looping readers, five seconds), not several OS processes, and it relies on flock on a local filesystem. A locked read nested inside another locked read on one thread can deadlock against a waiting writer; only a debug assertion guards it. Writers queue one at a time on the gate. In-process lock-free readers (get, get_by_alias, get_policy, kill_fence_epoch) block for the duration of a write, including one log fsync, and for a whole-snapshot encrypt and fsync when the write triggers compaction; a fence catch-up after a foreign write runs shape validation and index rebuild over the whole vault under the in-process cache lock.",
+      "evidence_run": "38667588941"
     },
     {
       "id": "vault-log-loss-fails-closed",
@@ -2994,7 +3050,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::locked_mutate_blocking",
-          "sha256": "def20882b09da8fce842394ca4f467bd011f97f30d854d404b790ef577f738d5"
+          "sha256": "86f5b2cd913cbc439850cac5659f6396f67d467f580a7d1588816fa22e43a1be"
         }
       ],
       "mutants": [
@@ -3067,7 +3123,7 @@
         {
           "path": "src/storage/file.rs",
           "symbol": "FileStorage::bootstrap_locked",
-          "sha256": "aaadedc4cc24f26cd2679736c8b575ec2145d3ce2f81d66762180c459063e7c3"
+          "sha256": "0e78a12496efea4ae9bcc212853510b9212ebc001c58c7002c39d18bd9a53d1f"
         },
         {
           "path": "src/storage/file.rs",
@@ -3095,7 +3151,7 @@
     },
     {
       "id": "posture-report-live",
-      "statement": "GET /api/v1/posture answers only to a global (untenanted) admin key and reports, from the running process, the policy engine's live default (deny or allow), whether separation of duty is enforced, whether the approver-identity key is configured, distinct from the govder key, or on the shared-key escape, which tenants are in observe mode, which enforced policies have a RateLimit condition with a non-deny default, whether an explicit upstream proxy is configured (never its URL) and that the plugin egress client does not honour the ambient proxy variables (the field plugin_ambient_proxy_honoured; the approval notifier client also ignores them, the outbox, govder and averin clients still do), whether an inbound [identity] header is configured and its signing key is present, the vault format version this binary writes, and the rustc and git commit it was built with. The report holds booleans, counts and identifiers only.",
+      "statement": "GET /api/v1/posture answers only to a global (untenanted) admin key and reports, from the running process, the policy engine's live default (deny or allow), whether separation of duty is enforced, whether the approver-identity key is configured, distinct from the govder key, or on the shared-key escape, which tenants are in observe mode, which enforced policies have a RateLimit condition with a non-deny default, whether an explicit upstream proxy is configured (never its URL) and that the plugin egress client does not honour the ambient proxy variables (the field plugin_ambient_proxy_honoured; the approval notifier client also ignores them, the outbox, govder and averin clients still do), whether an inbound [identity] header is configured and its signing key is present, the [averin] D8 evidence floor mode as configured and as in effect (it takes effect only with d8_complete_evidence on), the vault format version this binary writes, and the rustc and git commit it was built with. The report holds booleans, counts and identifiers only.",
       "method": "test",
       "artifacts": [
         "src/web/posture.rs",
@@ -3113,7 +3169,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "78735f2a6145684624e7509f444e3299c0ba953e6c77c557767fdedc9d18f3c3"
+          "sha256": "98d0c68d70d9c963cbda393a1a5323857bb0dbc72a6f91039115d0060176ef98"
         },
         {
           "path": "src/web/api.rs",
@@ -3529,6 +3585,191 @@
       "evidence_run": "38834394415"
     },
     {
+      "id": "vault-backup-restore-consistent",
+      "statement": "vultrino vault backup copies the vault snapshot, its .wal, the outbox and the averin stores while holding the exclusive vault lock (released before the password open check, which runs the KDF on the copy), into a new empty directory, with a manifest of SHA-256 sums and sizes; it refuses a vault that has no .wal (a partial backup), a destination that is not empty, and checks the copy by re-reading it against the manifest and by opening it under the password. vultrino vault restore checks the manifest, every checksum and size, and that nothing is in the directory that the manifest does not list, requires the snapshot and the .wal in the manifest, and opens the copy, all before it touches the target; it refuses to replace an existing vault without --force (then moves the old files aside, never deletes them), stages every file before renaming any (the averin queue as a whole sibling directory, renamed into place after the old one is moved aside, so a target that already has a queue restores cleanly), accepts only manifest names a backup can contain (never an arbitrary name written into the vault directory), and while it runs leaves <vault>.restore-pending, which makes FileStorage refuse to open until the restore is re-run. A restored vault holds the kill that was in its .wal. vault backup also refuses while <vault>.restore-pending exists, so a half-applied restore is never copied into a 'verified' backup.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/vault_backup.rs",
+        "src/storage/file.rs",
+        "src/main.rs",
+        "docs/dev/LIMITATIONS.md"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::vault_backup::tests",
+      "covers": [
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "backup",
+          "sha256": "db23f8390c9c74c6d012e1601146edbe133403f8c96daa2551d442af5b52d264"
+        },
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "restore",
+          "sha256": "3c8bc252f61e5c97607a88c2d3ec0f9af1984cb9e3878c33ae6012f93eaa09ff"
+        },
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "verify_manifest",
+          "sha256": "0b0147291e81e08f70d155f0d23f767342253cde466dc250cd699e42c4f4722d"
+        },
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "collect",
+          "sha256": "6241d0cdf6add0c384b0956296dceea5dcd9731f0c2700e3e9cfe3c0d0ba00a8"
+        },
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "lock_everything",
+          "sha256": "d37f0513b900ecbd2ade166f236b55faa671e306c62ab6cace8b4dce22a26474"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "FileStorage::open_inner",
+          "sha256": "99eaa0c2456e91045d09715d93ae1a179ccf474807c2f259d94c45919630551a"
+        },
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "target_for",
+          "sha256": "4e36441d6ba99fb9da6bcc9bc1206c7ef73bd2734ec141fb6c8ccd687548b011"
+        }
+      ],
+      "mutants": [
+        "vault-restore-skips-checksum",
+        "vault-backup-allows-missing-wal",
+        "vault-open-ignores-restore-pending",
+        "vault-restore-stages-queue-in-live-dir",
+        "vault-backup-ignores-restore-pending"
+      ],
+      "does_not_establish": "Rollback to an older but self-consistent backup, or a backup tampered with together with its manifest by someone who can write the backup directory: the manifest is not signed. A backup taken while a process holds the vault or the durable averin queue is refused after 30 seconds (vault) or at once (queue), not tested with a second OS process. Power-loss durability of the restore renames: a crash between them is covered by the marker, which is tested only by presence, not by injecting a crash. The averin queue segments are copied as files and are not opened by the open check. Backups of a vault on a filesystem without flock semantics. Both commands expect the service to be stopped: a running non-durable service holds the vault lock only per operation, so restore does not detect it. Any CI run. Restoring an older backup undoes every kill, revocation and approval made after it; the operator must re-apply them (documented, not detected).",
+      "evidence_run": "38676181898"
+    },
+    {
+      "id": "vault-check-final-record",
+      "statement": "vultrino vault check opens the snapshot and a copy of the .wal in a scratch directory. A vault that opens is reported healthy. A vault that does not open is reported as having a damaged final record only when removing exactly the last complete .wal line makes it open; then, only with --truncate-final, that line is written to <wal>.damaged-<nanos> and cut from the .wal. Damage in a middle line, or a wrong password, makes the vault fail to open even without the final line, so the command refuses and the .wal is unchanged.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/vault_backup.rs",
+        "src/main.rs",
+        "docs/dev/LIMITATIONS.md"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- storage::vault_backup::tests::check_cuts_only_a_damaged_final_record_and_refuses_damage_elsewhere",
+      "covers": [
+        {
+          "path": "src/storage/vault_backup.rs",
+          "symbol": "check",
+          "sha256": "cf26b2556d103a6c89f574ad06248d486f3ea3b8876a559ba949b43e18d0ecf4"
+        }
+      ],
+      "mutants": [
+        "vault-check-cuts-without-reopen-test"
+      ],
+      "does_not_establish": "That the cut record was unimportant: it is a committed mutation (possibly a kill or a revocation) and is lost, so the operator must redo it; the command prints that and keeps the removed bytes. Damage in the snapshot, in a middle record, or a torn tail beyond the final record (a torn tail is already ignored at open). Concurrent use: it takes the exclusive locks and expects the service to be stopped. One damaged final line only; two damaged final lines need the command run twice and are refused if the first cut does not make the vault open. Any CI run.",
+      "evidence_run": "38667588941"
+    },
+    {
+      "id": "d8-evidence-floor-routine-keeps-running",
+      "statement": "With [averin] enabled, mode observe and d8_complete_evidence on (the FeirOS Solo posture), on both the buffered and the streaming tail, the action classes refused before the plugin runs when Averin cannot begin the two-phase use evidence depend on the operator setting [averin] d8_evidence_floor. In both modes an action with no catalog declaration is refused with the error D8 before-act evidence failed, and a declared-irreversible action never runs or degrades. Money is an action in the money.* namespace or one the catalog declares irreversible. Default money_and_irreversible: money actions are refused, including a partially-reversible one such as money.notify, while a partially-reversible non-money action and a declared-Reversible action whose evidence cannot be begun because Averin is unavailable (unreachable, 5xx or 429) still run, with one use receipt sealed through the mode's own rule, an AVERIN-D8-DEGRADED alarm line and a d8_degraded counter increment. human_floor: every partially-reversible action is refused as well, and only a declared-Reversible action still degrades. A declared non-reversible action is human-floor for approval: on the direct path it is sent to approval (the error says approval is required) and never runs or degrades before approval, and the D8 before-act evidence refusal and the degrade of a partially-reversible action are shown on the approved buffered resume only, not on the streaming tail. A declared-Reversible action is refused, not degraded, when a live Averin answers 4xx, and when its params exceed max_seal_params_bytes (refused before the use token is spent). The default floor is only in force with a live Averin client (averin enabled, base_url and resource_id set, no plain http to a public host) and d8_complete_evidence on; with no client there is no evidence path, so a partially-reversible action is refused rather than run with no seal, and the posture reports human_floor. A reversible-class action named money.* is refused, never degraded. With d8_complete_evidence off the setting has no effect and every non-reversible approved action keeps its committed-evidence requirement. An unknown d8_evidence_floor value is refused at config load, the default parses to money_and_irreversible, and the running mode is reported in the posture. With Averin up, a reversible action gets use-intent before and use-outcome after the call and no degraded count.",
+      "method": "test",
+      "artifacts": [
+        "docs/dev/CONFIGURATION.md",
+        "docs/dev/LIMITATIONS.md",
+        "src/averin/mod.rs",
+        "src/config/types.rs",
+        "src/server/mod.rs",
+        "src/web/posture.rs",
+        "tests/approval_token_integration.rs",
+        "tests/d8_degraded_guard.rs",
+        "tests/solo_evidence_posture.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test approval_token_integration -- --exact solo_posture_with_averin_down_refuses_irreversible_and_runs_reversible solo_posture_with_averin_up_gives_reversible_two_phase_evidence irreversible_approval_resume_refuses_failed_seal_even_in_observe_mode reversible_approval_resume_remains_fail_open_when_observe_seal_is_missing default_floor_degrades_a_partially_reversible_write_but_refuses_money_and_irreversible default_floor_refuses_a_partially_reversible_write_when_no_averin_client_exists human_floor_mode_refuses_every_partially_reversible_action floor_setting_has_no_effect_without_d8_complete_evidence && cargo test --locked --no-default-features --test d8_degraded_guard && cargo test --locked --no-default-features --test solo_evidence_posture",
+      "covers": [
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action",
+          "sha256": "5d86b259fec4ecb97f70b3da7e85c9bb7b0289e6a302dbfbb7e3a1e86732727b"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action_streaming",
+          "sha256": "6af082064dcf672d5b4c3c52d83f6256b1d5f5e461644511c7bc6d79c721a28c"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::begin_exact_or_degrade",
+          "sha256": "41cc02dd86729a86241c42395ea7ea5205fb909ba73898e3895e0dccbc81f6a4"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::validate_required_evidence_preflight",
+          "sha256": "f60f62658cfef73e98715d9b802265a40245ff44fe15140a5effac9af5ce1155"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinError::is_unavailable",
+          "sha256": "867b3a11c9ec473687ee7583ae5deb745115fe3e7a2f559f1a97ec621c2285b4"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::resume_approved",
+          "sha256": "e805ff78c78bda642a69a073d3bb3862017c1f511c6d773124680c7f2e368cfc"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "IrreversibilityResolution::d8_fallback_ok",
+          "sha256": "aedee9d76bc3bb72d18988df0e86fdb33fd235a998065cc8c744b276047a4cb5"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "IrreversibilityResolution::requires_committed_evidence",
+          "sha256": "f735c1706dc012e051668e73f5850b6abaa4d783cf1f8b03f835437098f69d46"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "is_money_action",
+          "sha256": "77ce143c46b39bbd54b5e629f6c0d3413223b717e1789c260f67bb5b20c6c82d"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "EffectiveEvidenceFloor::from_config",
+          "sha256": "d61cbaf7e2b49463f389604a94f76c53f6b4526abca40f31e2be68639a3ab411"
+        },
+        {
+          "path": "src/config/types.rs",
+          "symbol": "TryFrom<RawAverinConfig> for crate::averin::AverinConfig::try_from",
+          "sha256": "33910a5cd143f25b29e9a6f13a50d4b6041d4d3514fee1cdebf480c4eae26238"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "Default for AverinConfig::default",
+          "sha256": "85e032ae98d8589521480d6b23016311b77669af0c3bfb15e74e499ea8308627"
+        }
+      ],
+      "mutants": [
+        "d8-reversible-no-fallback",
+        "d8-fallback-any-error",
+        "d8-fallback-undeclared",
+        "d8-streaming-guard-dropped",
+        "d8-oversize-preflight-skipped",
+        "d8-floor-default-human-floor",
+        "d8-floor-money-namespace-ignored",
+        "d8-floor-undeclared-degrades",
+        "d8-floor-mode-ignored",
+        "d8-floor-client-presence-dropped",
+        "d8-floor-money-fallback-direct",
+        "d8-floor-money-fallback-resume"
+      ],
+      "does_not_establish": "Only an action the trusted catalog declares Reversible or partially-reversible may degrade, and in the default mode only when it is not money; whether an operator declared the real side effect truthfully, or named a money action under money.*, is not checked, and a reversible catalog entry named money.* requested under another label is not recognised as money. Unavailable means a request error (connect or timeout), a 5xx or a 429; a live Averin that misbehaves in some other way refuses, which is the safe side. In the default mode a degraded partially-reversible write has no before-act record. The approved-resume path (including every partially-reversible case) is driven through the buffered tail in approval_token_integration and the direct path through both tails in d8_degraded_guard; the D8 evidence refusal of a declared non-reversible action on the streaming tail is not driven by any test; a fake Averin stands in for the real one, and the four-plane evidence-gate end-to-end is a separate run. The routine action's one-phase seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. An approval opened under an older build for a partially-reversible action is refused on resume. Any CI run other than the recorded one.",
+      "evidence_run": "38676181898"
+    },
+    {
       "id": "anthropic-workspace-id-operator-owned",
       "statement": "The Anthropic workspace on an outgoing request is the operator's, never the caller's, on every path that reaches a plugin: /llm, POST /api/v1/execute, the MCP http_request tool and approval replay. The workspace id is stored on the credential (metadata key anthropic_workspace_id). Before dispatch, any caller-supplied anthropic-workspace-id header (any case) is removed from the request, and the credential's value, if it has one, is written; a credential with none sends none, so the caller cannot choose a workspace with the same bearer on any of these paths. The http plugin repeats the same removal and write on its own parameters. The id must be wrkspc_ plus 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no meter event, and before the use token is consumed, shown by its use count staying 0) instead of being written into a header. The refusal is a credential configuration error, not an upstream failure: /llm answers 500 with a message naming the misconfigured credential metadata, and an approval-gated request refuses at approval open (no approval is stored) rather than opening an approval that could only fail on resume.",
       "method": "test",
@@ -3574,7 +3815,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "ea0a1b068599318776348fcc1675a8bbacebfc91b23f5ea6067c2016d6c2ec15"
+          "sha256": "5d86b259fec4ecb97f70b3da7e85c9bb7b0289e6a302dbfbb7e3a1e86732727b"
         }
       ],
       "mutants": [

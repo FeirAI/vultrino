@@ -584,8 +584,17 @@ pub struct RawAverinConfig {
     /// with `mode = "require_evidence"` is REJECTED at load (D6)** — see this module's `TryFrom`.
     pub durable: Option<bool>,
     /// Emit exact single-operation, two-phase D8 evidence for every invocation.
-    /// Default false. The before-act intent is synchronous and fail-closed.
+    /// Default false. The before-act intent is synchronous. It fails closed for an action the
+    /// trusted catalog declares non-reversible; a reversible action whose intent cannot be begun
+    /// (Averin down) still runs with a one-phase seal, an `AVERIN-D8-DEGRADED` alarm and the
+    /// `d8_degraded` counter (VUL-38).
     pub d8_complete_evidence: Option<bool>,
+    /// VUL-38 evidence floor while Averin is unavailable: `"money_and_irreversible"` (default)
+    /// refuses money (`money.*` or declared irreversible) and irreversible actions and lets
+    /// other partially-reversible and reversible actions degrade; `"human_floor"` also refuses
+    /// every partially-reversible action. Unknown values are refused at load. See
+    /// [`crate::averin::D8EvidenceFloor`].
+    pub d8_evidence_floor: Option<String>,
 }
 
 impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
@@ -600,6 +609,19 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
                 return Err(ConfigError::Invalid(format!(
                     "unknown [averin] mode {other:?}; expected \"observe\" or \
                      \"require_evidence\" (refusing to turn a typo into fail-open evidence)"
+                )))
+            }
+        };
+        let d8_evidence_floor = match raw.d8_evidence_floor.as_deref() {
+            None | Some("money_and_irreversible") => {
+                crate::averin::D8EvidenceFloor::MoneyAndIrreversible
+            }
+            Some("human_floor") => crate::averin::D8EvidenceFloor::HumanFloor,
+            Some(other) => {
+                return Err(ConfigError::Invalid(format!(
+                    "unknown [averin] d8_evidence_floor {other:?}; expected \
+                     \"money_and_irreversible\" or \"human_floor\" (refusing to turn a typo \
+                     into a weaker evidence floor)"
                 )))
             }
         };
@@ -649,6 +671,7 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
                 .unwrap_or(d.max_seal_params_bytes),
             durable,
             d8_complete_evidence,
+            d8_evidence_floor,
         })
     }
 }

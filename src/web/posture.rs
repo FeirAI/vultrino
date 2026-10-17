@@ -18,6 +18,11 @@ pub const POSTURE_SCHEMA: u32 = 1;
 /// `default_deny` is the policy engine's live default (set from `[enforcement] default_action`),
 /// `policies` the policies the engine enforces right now (config plus stored).
 pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Policy]) -> Value {
+    // Same condition the server uses to build its Averin client.
+    let averin_client_present = matches!(
+        crate::averin::AverinClient::new(config.averin.clone()),
+        Ok(Some(_))
+    );
     let key = config.govder.as_ref().map(|g| g.approval_key_posture());
     let mut observe_tenants: Vec<&str> = config
         .tenants
@@ -75,6 +80,24 @@ pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Pol
             // is set; the path is never reported.
             "upstream_proxy_ca_configured": crate::plugins::upstream_proxy_ca_configured(),
         },
+        "averin": {
+            "enabled": config.averin.enabled,
+            "mode": match config.averin.mode {
+                crate::averin::AverinMode::Observe => "observe",
+                crate::averin::AverinMode::RequireEvidence => "require_evidence",
+            },
+            "d8_complete_evidence": config.averin.d8_complete_evidence,
+            // VUL-38: the configured floor; it only takes effect with d8_complete_evidence on.
+            "d8_evidence_floor": config.averin.d8_evidence_floor.as_str(),
+            // Effective only with a live client, enabled and d8_complete_evidence on.
+            "d8_evidence_floor_effective": if averin_client_present
+                && config.averin.d8_complete_evidence
+            {
+                config.averin.d8_evidence_floor.as_str()
+            } else {
+                "human_floor"
+            },
+        },
         "policies": {
             "total": policies.len(),
             "rate_limit_default_not_deny": fail_open_rate_limits,
@@ -120,6 +143,44 @@ mod tests {
             json!(["rl-open"])
         );
         assert_eq!(v["policies"]["total"], 2);
+    }
+
+    #[test]
+    fn report_names_the_vul38_evidence_floor_mode() {
+        let v = build_posture(&Config::default(), true, &[]);
+        assert_eq!(v["averin"]["d8_evidence_floor"], "money_and_irreversible");
+        // With two-phase evidence off the floor setting has no effect: every non-reversible
+        // action keeps the committed-evidence floor, and the report says so.
+        assert_eq!(v["averin"]["d8_evidence_floor_effective"], "human_floor");
+        let cfg = Config::parse(
+            "[averin]\nenabled = true\nbase_url = \"http://127.0.0.1:1\"\n\
+             d8_complete_evidence = true\nd8_evidence_floor = \"human_floor\"\n",
+        )
+        .unwrap();
+        let v = build_posture(&cfg, true, &[]);
+        assert_eq!(v["averin"]["d8_evidence_floor"], "human_floor");
+        assert_eq!(v["averin"]["d8_evidence_floor_effective"], "human_floor");
+        let cfg = Config::parse(
+            "[averin]\nenabled = true\nbase_url = \"http://127.0.0.1:1\"\n\
+             resource_id = \"r\"\nd8_complete_evidence = true\n",
+        )
+        .unwrap();
+        let v = build_posture(&cfg, true, &[]);
+        assert_eq!(
+            v["averin"]["d8_evidence_floor_effective"],
+            "money_and_irreversible"
+        );
+        // No client can be built (resource_id empty, or averin disabled): there is no evidence
+        // path, so the configured floor is not in force and the report says human_floor.
+        for toml in [
+            "[averin]\nenabled = true\nbase_url = \"http://127.0.0.1:1\"\n\
+             d8_complete_evidence = true\n",
+            "[averin]\nenabled = false\nbase_url = \"http://127.0.0.1:1\"\n\
+             resource_id = \"r\"\nd8_complete_evidence = true\n",
+        ] {
+            let v = build_posture(&Config::parse(toml).unwrap(), true, &[]);
+            assert_eq!(v["averin"]["d8_evidence_floor_effective"], "human_floor");
+        }
     }
 
     #[test]

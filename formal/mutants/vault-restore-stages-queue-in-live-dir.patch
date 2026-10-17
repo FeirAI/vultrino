@@ -1,0 +1,13 @@
+diff --git a/src/storage/vault_backup.rs b/src/storage/vault_backup.rs
+index 6f7b5ba..9fade10 100644
+--- a/src/storage/vault_backup.rs
++++ b/src/storage/vault_backup.rs
+@@ -383,7 +383,7 @@ pub async fn restore(
+     let stage_suffix = ".restore-tmp";
+     let queue_stage = {
+         let mut q = queue_dir(vault).into_os_string();
+-        q.push(stage_suffix);
++        let _ = stage_suffix;
+         PathBuf::from(q)
+     };
+     if queue_stage.exists() {

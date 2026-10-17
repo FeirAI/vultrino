@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index f2dfe9f..a956ed0 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -3912,7 +3912,7 @@ impl VultrinoServer {
+                 .clone()
+                 .unwrap_or_else(|| approval.action.clone()),
+             evidence_required,
+-            d8_fallback_ok: !money
++            d8_fallback_ok: true
+                 && matches!(
+                     approval.capability_authority(),
+                     Some(CapabilityAuthorityClass::Reversible)
