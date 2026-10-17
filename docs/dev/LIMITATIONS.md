@@ -38,14 +38,17 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   serves a different one: the token event is booked under the served model, priced or not
   (the requested id stands in only for a dated form of it), so an unpriced served model is
   counted by leria as unpriced and holds its watermark rather than being booked at another
-  model's price, but that call has already been made. The card cannot hold price modifiers:
-  a request with fast mode, a non-global `inference_geo`, a priority tier (either
-  spelling), `fallbacks`, or any tool off the allowlist of token-only shapes (this includes the
-  advisor tool, which runs a second model) is refused (`modifier_unpriced`); the
-  regional-endpoint premium of a Vertex or Bedrock deployment, and any price-modifier field
-  the refusal list does not name, are booked at the base price (an under-count).
-  `usage.iterations` is not read, so extra-model usage is kept out by refusing the request,
-  not metered. Server-tool fees are refused, not metered. The card is
+  model's price, but that call has already been made. Unknown request
+  features are refused: the proxy admits only the top-level request fields, `anthropic-beta`
+  values and plain client tool shapes it knows bill tokens alone (a per-protocol allowlist in
+  the code), and answers `403 modifier_unpriced` to anything else, including compaction,
+  `context_management`, `fallbacks`, fast mode, `inference_geo`, any service tier in any
+  casing, search options and server tools. Operators widen the allowlist only by a code change
+  (the rate card has no entry for a priced variant); a pricing decision, not a setting. The
+  contents of an allowed field are not inspected, and the regional-endpoint premium of a Vertex
+  or Bedrock deployment is booked at the base price (an under-count). Every entry of
+  `usage.iterations` is counted (the larger of the top-level figure and the sum of the entries,
+  per direction), at the request model's price. Server-tool fees are refused, not metered. The card is
   read from a file and a change can only NARROW coverage: vultrino serves the intersection
   of the card it read at start and the latest good file until it restarts, because leria
   reads the file only at start (so a model added to the file after leria started is refused

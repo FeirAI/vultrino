@@ -1,12 +1,13 @@
 diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
-index 751d1c0..e3cfe5d 100644
+index 423671c..9511412 100644
 --- a/src/web/llm_proxy.rs
 +++ b/src/web/llm_proxy.rs
-@@ -373,7 +373,6 @@ fn unpriced_modifier(body: &serde_json::Value) -> Option<String> {
-     // `toolConfig.tools`.
-     let tool_lists = [
-         body.get("tools"),
--        body.get("toolConfig").and_then(|c| c.get("tools")),
-     ];
-     for tools in tool_lists.into_iter().flatten() {
-         let ok = tools
+@@ -689,7 +689,7 @@ fn field_is_priced(kind: Kind, dialect: Dialect, value: &serde_json::Value) -> b
+                 })
+             })
+         }),
+-        ConverseToolConfig => value.as_object().is_some_and(|c| {
++        ConverseToolConfig => value.as_object().is_some_and(|_c| true) || value.as_object().is_some_and(|c| {
+             only_keys(c, &["tools", "toolChoice"])
+                 && c.get("tools").is_none_or(|t| {
+                     t.as_array()

@@ -1,0 +1,13 @@
+diff --git a/src/outbox.rs b/src/outbox.rs
+index 9941631..c8f7db9 100644
+--- a/src/outbox.rs
++++ b/src/outbox.rs
+@@ -319,7 +319,7 @@ fn iterations_total(usage: &serde_json::Map<String, serde_json::Value>) -> (u64,
+     let mut input = 0u64;
+     let mut output = 0u64;
+     for entry in usage
+-        .get("iterations")
++        .get("iterations-ignored")
+         .and_then(serde_json::Value::as_array)
+         .into_iter()
+         .flatten()

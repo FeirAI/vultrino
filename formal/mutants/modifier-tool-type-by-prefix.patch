@@ -1,0 +1,17 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 423671c..62ab859 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -568,7 +568,11 @@ fn tool_is_plain(dialect: Dialect, tool: &serde_json::Value) -> bool {
+                         .get("input_schema")
+                         .is_some_and(serde_json::Value::is_object)
+             }
+-            Some(Some(t)) if ANTHROPIC_CLIENT_TOOL_TYPES.contains(&t) => {
++            Some(Some(t))
++                if ANTHROPIC_CLIENT_TOOL_TYPES
++                    .iter()
++                    .any(|p| t.starts_with(p.split('_').next().unwrap_or(p))) =>
++            {
+                 only_keys(
+                     obj,
+                     &[

@@ -789,18 +789,6 @@
       "tier": "full",
       "claim": "unpriced-model-refused"
     },
-    "modifier-fast-speed-allowed": {
-      "tier": "full",
-      "claim": "unpriced-model-refused"
-    },
-    "modifier-inference-geo-allowed": {
-      "tier": "full",
-      "claim": "unpriced-model-refused"
-    },
-    "modifier-priority-tier-allowed": {
-      "tier": "full",
-      "claim": "unpriced-model-refused"
-    },
     "modifier-gate-not-applied": {
       "tier": "full",
       "claim": "unpriced-model-refused"
@@ -845,23 +833,7 @@
       "tier": "full",
       "claim": "rate-card-reload-only-narrows"
     },
-    "modifier-service-tier-camel-case-skipped": {
-      "tier": "full",
-      "claim": "unpriced-model-refused"
-    },
     "modifier-unknown-tool-type-allowed": {
-      "tier": "full",
-      "claim": "unpriced-model-refused"
-    },
-    "modifier-unknown-tool-key-allowed": {
-      "tier": "full",
-      "claim": "unpriced-model-refused"
-    },
-    "modifier-advisor-tool-allowed": {
-      "tier": "full",
-      "claim": "unpriced-model-refused"
-    },
-    "modifier-fallbacks-allowed": {
       "tier": "full",
       "claim": "unpriced-model-refused"
     },
@@ -872,6 +844,42 @@
     "route-allowlist-checks-body-model-first": {
       "tier": "full",
       "claim": "unpriced-model-refused"
+    },
+    "modifier-allowlist-default-allow": {
+      "tier": "fast",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-beta-header-unchecked": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-beta-body-unchecked": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-tool-foreign-key-allowed": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-tool-type-by-prefix": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-gemini-service-tier-listed": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-non-object-body-passes": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "iterations-not-counted": {
+      "tier": "full",
+      "claim": "llm-token-event-complete-and-priced"
+    },
+    "iterations-not-counted-streamed": {
+      "tier": "full",
+      "claim": "llm-token-event-complete-and-priced"
     }
   },
   "claims": [
@@ -3438,7 +3446,7 @@
         {
           "path": "src/outbox.rs",
           "symbol": "UsageAccumulator::absorb",
-          "sha256": "18e84e3a6c1833156a659964e3d346fe0208ae1393815565282c4e4acdf05c55"
+          "sha256": "49782486e06f1a4e70864e64ef018a06bfc045fc5783b48e752c37e057f6be46"
         },
         {
           "path": "src/outbox.rs",
@@ -3448,7 +3456,7 @@
         {
           "path": "src/outbox.rs",
           "symbol": "estimate_stream_usage",
-          "sha256": "64c7d7237fdb190ce92ea13a0d9cd86cf1eb27a2bb48b30f6547913b44f16ec1"
+          "sha256": "7906a3ac5bcce7929a35ca54afe8d5fb077c7347c5aaae052841f6d3200c0538"
         },
         {
           "path": "src/outbox.rs",
@@ -3928,7 +3936,7 @@
     },
     {
       "id": "unpriced-model-refused",
-      "statement": "An LLM-proxy request whose model the rate card does not price is refused with 403 model_unpriced before any upstream call, because leria rejects an unpriced token event and the call would book $0 so a budget cap would never trip. With the shipped default [llm_proxy] require_priced_model = true and a rate card read from rate_card_path (the file leria reads): a model the card lacks is refused for a buffered and a streamed request and the test upstream sees no request and no meter event is written; a request with a body that names no model is refused; with no card configured every model-bearing call is refused; a priced model passes and is metered; a dated id passes only through an explicit model_ref_prefix entry, the prefix followed by - or @ and more text (claude-haiku-4-5-20251001 and claude-haiku-4-5@20251001 pass, claude-haiku-4-50, the bare prefix and an id with no prefix entry do not); an entry of another asset than tokens, a zero or negative token price, an empty or malformed file and a card with no token entry are refused when the file is read; the operator opt-out require_priced_model = false lets an unpriced model through; an unreadable file is a startup error. The model that is gated, checked against the allowlist and booked is the one the resolved upstream URL selects where the URL picks it, not the body's: Gemini and Vertex AI take models/<id> (a model baked into provider_base counts; two model segments, or none outside the OpenAI-compatible endpoint, are refused), Bedrock takes the percent-decoded model/<id> (a Bedrock call with no body model passes when the path model is priced; no model segment is refused), Azure OpenAI takes deployments/<name> (or the body model as the deployment name on the v1 API) through the operator's [llm_proxy.azure_deployments] map and an unmapped deployment is refused even when its name is a priced model's id; a body model that differs from the URL's model is refused; with the URL naming an unpriced model and the body a priced one the request is refused and the upstream is not called; the capability allowlist is applied to the URL's model where the URL selects it (a Gemini, Vertex or Bedrock call whose body names no model passes an allowlist that lists the path model and is refused when it does not; an Azure call passes when the allowlist lists the mapped model or the deployment name) and to the body's model where the body picks it. A request that sets a price the card cannot hold, or runs a model the card was not checked for, is refused with 403 modifier_unpriced before any upstream call: speed other than standard, inference_geo other than global, a service_tier or serviceTier string (both spellings) other than auto, default, standard, standard_only or flex, a service_tier or serviceTier object (Bedrock) whose type is not default or flex, Bedrock performanceConfig.latency other than standard, a top-level fallbacks or fallback_credit_token (server-side fallbacks rerun the request on another model), web_search_options, and any tool that is not on an allowlist of shapes that bill tokens alone, in tools and in Bedrock toolConfig.tools: type function or custom, an Anthropic client tool (an input_schema and no server type), the schema-less client types bash_*, text_editor_*, memory_* and computer_*, the free web_fetch_* and tool_search_*, Gemini functionDeclarations and urlContext, Bedrock toolSpec and cachePoint. Every other typed tool or tool key is refused, so the advisor tool (advisor_*, which runs a second model that bills outside the top-level usage), web search, code execution, file search, Vertex grounding (retrieval, enterpriseWebSearch), Google search or maps grounding and a server tool added later are refused, while standard speed, the global geo and ordinary client tools pass. GET /api/v1/posture reports rate_card.require_priced_model, configured, entries, last_error, sha256 (of the card read at start, the digest leria reports for the same file), file_sha256 (the file as last read) and never the path.",
+      "statement": "An LLM-proxy request whose model the rate card does not price is refused with 403 model_unpriced before any upstream call, because leria rejects an unpriced token event and the call would book $0 so a budget cap would never trip. With the shipped default [llm_proxy] require_priced_model = true and a rate card read from rate_card_path (the file leria reads): a model the card lacks is refused for a buffered and a streamed request and the test upstream sees no request and no meter event is written; a request with a body that names no model is refused; with no card configured every model-bearing call is refused; a priced model passes and is metered; a dated id passes only through an explicit model_ref_prefix entry, the prefix followed by - or @ and more text (claude-haiku-4-5-20251001 and claude-haiku-4-5@20251001 pass, claude-haiku-4-50, the bare prefix and an id with no prefix entry do not); an entry of another asset than tokens, a zero or negative token price, an empty or malformed file and a card with no token entry are refused when the file is read; the operator opt-out require_priced_model = false lets an unpriced model through; an unreadable file is a startup error. The model that is gated, checked against the allowlist and booked is the one the resolved upstream URL selects where the URL picks it, not the body's: Gemini and Vertex AI take models/<id> (a model baked into provider_base counts; two model segments, or none outside the OpenAI-compatible endpoint, are refused), Bedrock takes the percent-decoded model/<id> (a Bedrock call with no body model passes when the path model is priced; no model segment is refused), Azure OpenAI takes deployments/<name> (or the body model as the deployment name on the v1 API) through the operator's [llm_proxy.azure_deployments] map and an unmapped deployment is refused even when its name is a priced model's id; a body model that differs from the URL's model is refused; with the URL naming an unpriced model and the body a priced one the request is refused and the upstream is not called; the capability allowlist is applied to the URL's model where the URL selects it (a Gemini, Vertex or Bedrock call whose body names no model passes an allowlist that lists the path model and is refused when it does not; an Azure call passes when the allowlist lists the mapped model or the deployment name) and to the body's model where the body picks it. A request that the proxy cannot show to bill tokens alone is refused with 403 modifier_unpriced before any upstream call, by an ALLOWLIST (default-deny), per provider protocol (anthropic-messages, openai-chat and nvidia, openai-responses, azure-openai, gemini and vertex-ai including the OpenAI-compatible and Anthropic-on-Vertex bodies, bedrock-converse, bedrock-invoke; any other protocol admits no field): (1) every top-level request field must be on the protocol's table of fields that cannot change the price per token (model, messages, system, max_tokens, sampling parameters, stop sequences, stream, metadata, tools, tool_choice and the like); any other field, including compaction, context_management, fallbacks, speed, inference_geo, web_search_options, guardrailConfig and a service tier in any casing (service_tier, serviceTier, ServiceTier), is refused, and a body that is not a JSON object is refused; the card format has no entry for a priced variant, so only a code change widens a table; (2) the anthropic-beta header (every line, comma separated) and a body anthropic_beta (Bedrock InvokeModel, Vertex Anthropic) may name only betas on a priced list, any other value is refused; (3) a tool must be exactly a plain client tool of the protocol (Anthropic: an untyped or custom object with name, input_schema and no key beyond description, cache_control and strict, or an exact versioned client type bash, text_editor, memory or computer; OpenAI chat and responses: function or custom with the documented keys only; Gemini: functionDeclarations entries; Bedrock Converse: toolSpec or cachePoint with the documented keys only, in toolConfig.tools); server tools, advisor, web search and fetch, tool search, code execution, file search, grounding, urlContext, a typed tool not on the list and a tool with a foreign key are refused. A plain priced request passes. GET /api/v1/posture reports rate_card.require_priced_model, configured, entries, last_error, sha256 (of the card read at start, the digest leria reports for the same file), file_sha256 (the file as last read) and never the path.",
       "method": "test",
       "artifacts": [
         "src/ratecard.rs",
@@ -3941,12 +3949,12 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- ratecard::tests config::types::tests::llm_proxy_requires_a_priced_model_by_default_and_with_no_card config::types::tests::llm_proxy_reads_the_opt_out_and_the_card_path config::types::tests::an_unreadable_or_invalid_rate_card_is_a_startup_error web::posture::tests::report_carries_the_rate_card_fingerprint_and_the_priced_model_gate web::llm_proxy::tests::gemini_and_vertex_take_the_model_from_the_url web::llm_proxy::tests::bedrock_takes_the_percent_decoded_model web::llm_proxy::tests::azure_names_a_deployment web::llm_proxy::tests::body_routed_protocols_use_the_body_model web::llm_proxy::tests::a_premium_price_modifier_is_not_one_the_card_can_price && cargo test --locked --no-default-features --test llm_proxy_integration -- v2b_an_unpriced v2b_a_request_naming_no_model v2b_a_priced_model_passes v2b_a_dated_id v2b_with_no_card v2b_the_operator_opt_out v2b_a_gemini_model v2b_the_model_in_the_path v2b_a_body_model_that_differs v2b_a_priced_path_model v2b_a_model_baked v2b_bedrock v2b_azure v2b_the_allowlist_applies v2b_a_request_that_sets_a_price v2b_an_advisor v2b_an_unknown_future v2b_gemini_camel v2b_an_allowlist_matches",
+      "detector": "cargo test --locked --no-default-features --lib -- ratecard::tests config::types::tests::llm_proxy_requires_a_priced_model_by_default_and_with_no_card config::types::tests::llm_proxy_reads_the_opt_out_and_the_card_path config::types::tests::an_unreadable_or_invalid_rate_card_is_a_startup_error web::posture::tests::report_carries_the_rate_card_fingerprint_and_the_priced_model_gate web::llm_proxy::tests::gemini_and_vertex_take_the_model_from_the_url web::llm_proxy::tests::bedrock_takes_the_percent_decoded_model web::llm_proxy::tests::azure_names_a_deployment web::llm_proxy::tests::body_routed_protocols_use_the_body_model web::llm_proxy::tests::an_unlisted_top_level_field web::llm_proxy::tests::a_plain_priced_request_passes web::llm_proxy::tests::only_plain_client_tools web::llm_proxy::tests::an_anthropic_beta_in_the_body web::llm_proxy::tests::the_anthropic_beta_header && cargo test --locked --no-default-features --test llm_proxy_integration -- v2b_an_unpriced v2b_a_request_naming_no_model v2b_a_priced_model_passes v2b_a_dated_id v2b_with_no_card v2b_the_operator_opt_out v2b_a_gemini_model v2b_the_model_in_the_path v2b_a_body_model_that_differs v2b_a_priced_path_model v2b_a_model_baked v2b_bedrock v2b_azure v2b_the_allowlist_applies v2b_a_request_that_sets_a_price v2b_an_advisor v2b_an_unknown_future v2b_gemini_camel v2b_round4 v2b_an_allowlist_matches",
       "covers": [
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "llm_proxy_impl",
-          "sha256": "f9aceb965006aabc5da93d10784291f8735dcfb31701c619d6ec5fcc7f932748"
+          "sha256": "d930ba8dd6286d779e8341ae23e0b6e2af1cec664cc75ba164851fe7d851879d"
         },
         {
           "path": "src/ratecard.rs",
@@ -3991,12 +3999,27 @@
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "unpriced_modifier",
-          "sha256": "0a9ebef4ee6acd896a9a627ddf802efdb34c2dbfbc6546cf52f80629c529b4b0"
+          "sha256": "145d9f181ce9766730d5b632e46cc8afec1a6314e874eca82253c6caebe4f7b3"
         },
         {
           "path": "src/web/llm_proxy.rs",
-          "symbol": "tool_bills_tokens_only",
-          "sha256": "4df7328a32877e4f708e10b0b9227bcb19b6330610324f68a04b0fd131b36fa1"
+          "symbol": "tool_is_plain",
+          "sha256": "a3e2a1c4aeff9e5ee56364204dc714d1286e0ad6526510612932a4a580ab9fb3"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "field_is_priced",
+          "sha256": "c664bf3347630f025649e60ff471e2286290e7e456870112465c9037b868ba45"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "request_tables",
+          "sha256": "8b6ad1fa1e89886cdd5d40f212bb5b2b459bd22f5aa4beb715366857d70806e2"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "unpriced_beta_header",
+          "sha256": "65c7c6bbab7fadcf45b6dd3dd80a9d9a5f06551361ab60df5866469e03438b44"
         }
       ],
       "mutants": [
@@ -4010,23 +4033,23 @@
         "route-bedrock-path-model-not-read",
         "route-azure-unmapped-deployment-priced-by-name",
         "route-allowlist-ignores-url-model",
-        "modifier-fast-speed-allowed",
-        "modifier-inference-geo-allowed",
-        "modifier-priority-tier-allowed",
         "modifier-gate-not-applied",
-        "modifier-service-tier-camel-case-skipped",
         "modifier-unknown-tool-type-allowed",
-        "modifier-unknown-tool-key-allowed",
-        "modifier-advisor-tool-allowed",
-        "modifier-fallbacks-allowed",
         "modifier-bedrock-tool-config-unchecked",
-        "route-allowlist-checks-body-model-first"
+        "route-allowlist-checks-body-model-first",
+        "modifier-allowlist-default-allow",
+        "modifier-beta-header-unchecked",
+        "modifier-beta-body-unchecked",
+        "modifier-tool-foreign-key-allowed",
+        "modifier-tool-type-by-prefix",
+        "modifier-gemini-service-tier-listed",
+        "modifier-non-object-body-passes"
       ],
-      "does_not_establish": "Only the /llm proxy is gated: a model call through POST /api/v1/execute, an MCP http.request or a named tool is not refused here (leria still rejects its unpriced token event and books $0). The model is the one the upstream URL or the body names; it does not show which model the provider bills if it serves a different one (the token event then carries the served id, see llm-token-event-complete-and-priced). Azure deployment names are mapped to models by the operator, and a wrong map entry prices the wrong model. The tool rule is an allowlist and fails closed, but the price-modifier fields are a denylist (speed, inference_geo, the tier fields, performanceConfig.latency, fallbacks, web_search_options): a request field that raises the price and is not named here, a client tool shape the allowlist wrongly treats as free, the regional-endpoint premium of a Vertex or Bedrock deployment reached through provider_base, and a price the provider changes without a request field are booked at the base price (an under-count). Advisor and fallback calls are refused rather than metered: the response usage.iterations array is not read, so a provider that runs extra model calls without a request field naming them would be booked for the top-level usage only. The card is read for coverage only: prices are not checked beyond being positive, the file is not compared with the copy leria loaded (the posture fingerprint is what a deploy check compares), a change is noticed by size and modified time, and a file edited back to the same size within the filesystem's timestamp granularity is not re-read. Staleness of a card is not enforced. What happens when the file changes after start is rate-card-reload-only-narrows. The upstream is a test double, not a live provider."
+      "does_not_establish": "Only the /llm proxy is gated: a model call through POST /api/v1/execute, an MCP http.request or a named tool is not refused here (leria still rejects its unpriced token event and books $0). The model is the one the upstream URL or the body names; it does not show which model the provider bills if it serves a different one (the token event then carries the served id, see llm-token-event-complete-and-priced). Azure deployment names are mapped to models by the operator, and a wrong map entry prices the wrong model. The allowlist is checked on top-level field names and on tool and beta values; the contents of an allowed field (for example generationConfig, thinking, response_format, inferenceConfig, metadata) are not inspected, so a provider that prices a nested option is booked at the base price (an under-count) until its table entry is reviewed; a field on a table is a human pricing judgment, not a proof. The OpenAI-Beta header and the other forwarded provider headers are not on a beta allowlist. The regional-endpoint premium of a Vertex or Bedrock deployment reached through provider_base and a price the provider changes without a request field are booked at the base price. The card is read for coverage only: prices are not checked beyond being positive, the file is not compared with the copy leria loaded (the posture fingerprint is what a deploy check compares), a change is noticed by size and modified time, and a file edited back to the same size within the filesystem's timestamp granularity is not re-read. Staleness of a card is not enforced. What happens when the file changes after start is rate-card-reload-only-narrows. The upstream is a test double, not a live provider."
     },
     {
       "id": "llm-token-event-complete-and-priced",
-      "statement": "A metered LLM call is charged for all billed input and output that the top-level usage block reports, and under a model the rate card prices. A request that would run a further model inside the call (the advisor tool, server-side fallbacks) is refused before the upstream (unpriced-model-refused), so the top-level usage is the call's whole bill. Anthropic cache_creation_input_tokens (Bedrock cacheWriteInputTokens) are added to the input count at TWICE the input price, an upper bound for both cache lifetimes (the provider bills 1.25x and 2x), and cache_read_input_tokens (cacheReadInputTokens) at the full input price: for a buffered response with usage input 10, cache creation 100, cache read 1000 the token event carries input_tokens 1210; the same for an Anthropic stream, where the cache counts of message_start are added once (a cumulative repeat in message_delta is not summed again) and an estimate keeps the cache tokens it saw; OpenAI prompt_tokens, which already includes cached tokens, is not changed, and a huge cache count saturates instead of wrapping. Gemini usageMetadata books promptTokenCount plus toolUsePromptTokenCount as input and candidatesTokenCount plus thoughtsTokenCount as output (streamed: the largest cumulative value of each, never summed twice, and the thinking tokens are a floor of an estimate), and a block with a prompt count and no candidates (a blocked response) still books its prompt. With a rate card configured the token event's dims.model_ref is the model the provider served when the card prices it; the requested model (the one the gate checked, which for Gemini, Vertex, Bedrock and Azure is the one the URL selects) is used only when the served id is a dated form of it (the requested id followed by - or @ and more text) and the card prices the requested one; any other served model, priced or not, is booked under its own id, so a served Opus is never booked at a requested Haiku's price. This holds for buffered and streamed calls. With no card, or with neither covered, it is the served model, then the requested one.",
+      "statement": "A metered LLM call is charged for all billed input and output that the top-level usage block reports, and under a model the rate card prices. Every entry of usage.iterations (one per sampling step, including server-side compaction and advisor steps that the top-level counts leave out) is counted: per direction the booked count is the larger of the top-level figure and the sum over the iterations (each entry's cache tokens included, cache writes at twice), so no step is counted twice and none is left out, for a buffered response and for a stream (the largest cumulative list wins; an estimate keeps it as a floor). A request that runs features the card does not price is refused before the upstream (unpriced-model-refused). Anthropic cache_creation_input_tokens (Bedrock cacheWriteInputTokens) are added to the input count at TWICE the input price, an upper bound for both cache lifetimes (the provider bills 1.25x and 2x), and cache_read_input_tokens (cacheReadInputTokens) at the full input price: for a buffered response with usage input 10, cache creation 100, cache read 1000 the token event carries input_tokens 1210; the same for an Anthropic stream, where the cache counts of message_start are added once (a cumulative repeat in message_delta is not summed again) and an estimate keeps the cache tokens it saw; OpenAI prompt_tokens, which already includes cached tokens, is not changed, and a huge cache count saturates instead of wrapping. Gemini usageMetadata books promptTokenCount plus toolUsePromptTokenCount as input and candidatesTokenCount plus thoughtsTokenCount as output (streamed: the largest cumulative value of each, never summed twice, and the thinking tokens are a floor of an estimate), and a block with a prompt count and no candidates (a blocked response) still books its prompt. With a rate card configured the token event's dims.model_ref is the model the provider served when the card prices it; the requested model (the one the gate checked, which for Gemini, Vertex, Bedrock and Azure is the one the URL selects) is used only when the served id is a dated form of it (the requested id followed by - or @ and more text) and the card prices the requested one; any other served model, priced or not, is booked under its own id, so a served Opus is never booked at a requested Haiku's price. This holds for buffered and streamed calls. With no card, or with neither covered, it is the served model, then the requested one.",
       "method": "test",
       "artifacts": [
         "src/outbox.rs",
@@ -4037,7 +4060,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- outbox::tests::anthropic_cache_tokens_are_added_to_the_input_count outbox::tests::streamed_anthropic_cache_tokens_are_added_to_the_input_count outbox::tests::a_later_cumulative_cache_count_is_not_summed_with_the_first outbox::tests::an_estimate_keeps_the_cache_tokens_it_saw outbox::tests::cache_writes_are_counted_at_twice outbox::tests::gemini_thinking_and_tool_use outbox::tests::a_gemini_block_without_candidates outbox::tests::a_gemini_stream_counts ratecard::tests::pick_prefers_a_priced_served_model_then_a_priced_requested_one ratecard::tests::a_different_served_model server::routed_model_tests && cargo test --locked --no-default-features --test llm_proxy_integration -- v2b_buffered_anthropic_cache v2b_streamed_anthropic_cache v2b_the_token_event_names v2b_a_streamed_token_event_names v2b_a_served_model_that_is_not_a_dated_form v2b_a_priced_path_model",
+      "detector": "cargo test --locked --no-default-features --lib -- outbox::tests::anthropic_cache_tokens_are_added_to_the_input_count outbox::tests::streamed_anthropic_cache_tokens_are_added_to_the_input_count outbox::tests::a_later_cumulative_cache_count_is_not_summed_with_the_first outbox::tests::an_estimate_keeps_the_cache_tokens_it_saw outbox::tests::cache_writes_are_counted_at_twice outbox::tests::every_usage_iteration outbox::tests::gemini_thinking_and_tool_use outbox::tests::a_gemini_block_without_candidates outbox::tests::a_gemini_stream_counts ratecard::tests::pick_prefers_a_priced_served_model_then_a_priced_requested_one ratecard::tests::a_different_served_model server::routed_model_tests && cargo test --locked --no-default-features --test llm_proxy_integration -- v2b_buffered_anthropic_cache v2b_streamed_anthropic_cache v2b_the_token_event_names v2b_a_streamed_token_event_names v2b_a_served_model_that_is_not_a_dated_form v2b_a_priced_path_model",
       "covers": [
         {
           "path": "src/outbox.rs",
@@ -4047,12 +4070,12 @@
         {
           "path": "src/outbox.rs",
           "symbol": "parse_token_usage",
-          "sha256": "f6983f43696de96f795dbe3fc15336f1947ce679ca8d5a367d015b8869a3d3d0"
+          "sha256": "6a852f53dfd6537d786372d4151b40cf8217cb67096b6dc0d8b98080ec9c82c0"
         },
         {
           "path": "src/outbox.rs",
           "symbol": "UsageAccumulator::input_total",
-          "sha256": "4d0c46ef343a9c721d0a1d126063a2c4166f7308d3d0a029281144826f8dc93d"
+          "sha256": "dd6685b36955a386e73241722d800f7748c5b8d44c7e7f227948f040b823f3c3"
         },
         {
           "path": "src/ratecard.rs",
@@ -4077,12 +4100,17 @@
         {
           "path": "src/outbox.rs",
           "symbol": "UsageAccumulator::output_total",
-          "sha256": "57b30e019c821c5f4b90ef7f8b1c5db3a64a89cdd44e8703aa1030b1cc3fbce5"
+          "sha256": "6b59d59fe5c70720b753ac1c90ed46ee28157b26fa1906bd2117d25b1d10b6ea"
         },
         {
           "path": "src/outbox.rs",
           "symbol": "UsageAccumulator::absorb",
-          "sha256": "18e84e3a6c1833156a659964e3d346fe0208ae1393815565282c4e4acdf05c55"
+          "sha256": "49782486e06f1a4e70864e64ef018a06bfc045fc5783b48e752c37e057f6be46"
+        },
+        {
+          "path": "src/outbox.rs",
+          "symbol": "iterations_total",
+          "sha256": "87cf2d47f864659b22bf2f4bb67436e2c21e420bc12fb68728b5fb28062494b5"
         }
       ],
       "mutants": [
@@ -4092,9 +4120,11 @@
         "anthropic-cache-write-single-weight",
         "gemini-thoughts-not-counted",
         "gemini-tool-use-prompt-not-counted",
-        "gemini-blocked-prompt-not-booked"
+        "gemini-blocked-prompt-not-booked",
+        "iterations-not-counted",
+        "iterations-not-counted-streamed"
       ],
-      "does_not_establish": "The cache tokens are booked as input tokens because the card has one input price per model: a cache read is OVER-counted (the provider bills about 0.1x) and a cache write is never under-counted but is over-counted for the 5-minute cache (1.25x billed, 2x booked); it does not model provider cache pricing and does not read cache_creation.ephemeral_* to split the lifetimes. Only the Anthropic, Bedrock and Gemini spellings are read, and a provider that reports cache tokens or reasoning tokens elsewhere (OpenAI reasoning inside completion_tokens is already counted by the provider) is not counted beyond what its usage block reports. Server-tool fees and price modifiers are not metered (the proxy refuses the ones it names and every tool off its allowlist, see unpriced-model-refused). usage.iterations is not read: advisor and fallback calls are kept out by refusing the request, not by metering them, so a response that carried extra-model usage some other way is booked for the top-level usage only. A served model the card does not price is booked under its own id and leria then rejects the event as unpriced and holds its watermark; the gate is what prevents that on /llm for the model the request names, not for a provider that substitutes a different one. The upstream is a test double, not a live provider. Says nothing about leria pricing the event."
+      "does_not_establish": "The cache tokens are booked as input tokens because the card has one input price per model: a cache read is OVER-counted (the provider bills about 0.1x) and a cache write is never under-counted but is over-counted for the 5-minute cache (1.25x billed, 2x booked); it does not model provider cache pricing and does not read cache_creation.ephemeral_* to split the lifetimes. Only the Anthropic, Bedrock and Gemini spellings are read, and a provider that reports cache tokens or reasoning tokens elsewhere (OpenAI reasoning inside completion_tokens is already counted by the provider) is not counted beyond what its usage block reports. Server-tool fees and price modifiers are not metered (the proxy refuses every request field, beta and tool off its allowlist, see unpriced-model-refused). usage.iterations entries are charged at the request model's input and output price whatever model an entry names (an advisor step on a dearer model is under-priced, which is why the advisor tool stays refused); only the Anthropic and Bedrock spellings of the list are read. A served model the card does not price is booked under its own id and leria then rejects the event as unpriced and holds its watermark; the gate is what prevents that on /llm for the model the request names, not for a provider that substitutes a different one. The upstream is a test double, not a live provider. Says nothing about leria pricing the event."
     },
     {
       "id": "rate-card-reload-only-narrows",

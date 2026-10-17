@@ -143,31 +143,47 @@ Two provider shapes are recognized (both nested under top-level `usage`):
   is `candidatesTokenCount` plus `thoughtsTokenCount` (thinking tokens bill as output). A block
   with a prompt count and no candidates (a blocked response) still books its prompt tokens.
 
-**Prices the card cannot hold.** The card has one input and one output price per model. A request
-that sets a field which raises the provider's price beyond that is refused before the upstream
-call (`403 modifier_unpriced`): Anthropic `speed` other than `standard` (fast mode) and
-`inference_geo` other than `global`, a `service_tier` or `serviceTier` (both spellings, Gemini's
-REST field is the camelCase one) string other than `auto`, `default`, `standard`, `standard_only`
-or `flex`, a Bedrock `serviceTier` object whose `type` is not `default` or `flex`, Bedrock
-`performanceConfig.latency` other than `standard`, `web_search_options`, and any tool that is not
-on an allowlist of shapes known to bill tokens alone (in `tools` and in Bedrock
-`toolConfig.tools`): `function` and `custom`, an Anthropic client tool (an `input_schema` and no
-server type), `bash_*`, `text_editor_*`, `memory_*`, `computer_*`, the free `web_fetch_*` and
-`tool_search_*`, Gemini `functionDeclarations` and `urlContext`, Bedrock `toolSpec` and
-`cachePoint`. Every other typed tool or tool key is refused, including web search, code
-execution, file search, Vertex grounding and any server tool a provider adds later.
+**Unknown request features are refused.** The card has one input and one output price per
+model, so the proxy admits only what it knows bills tokens alone, per provider protocol, and
+refuses the rest before the upstream call (`403 modifier_unpriced`, default-deny):
 
-**Extra model calls inside one request.** The Anthropic advisor tool (`advisor_*`) runs a second
-model, billed at its own rates and reported only in `usage.iterations`; server-side `fallbacks`
-rerun a refused request on another model, and the refused attempt is billed but not in the
-returned usage. The token event books one model from the top-level usage, so a request that
-carries an `advisor_*` tool, `fallbacks` or `fallback_credit_token` is refused
-(`403 modifier_unpriced`). `usage.iterations` is not read: the proxy keeps these calls out by
-refusing the request, it does not meter them. Not covered, so booked below the real price: the
-regional-endpoint premium of a Vertex or Bedrock deployment the operator points `provider_base`
-at, a price change the provider makes without a request field, a modifier field this list does
-not name (the tool rule is an allowlist, the field list is not), and extra model usage a
-provider reports without any request field naming it.
+- Request fields: the top-level field names of each protocol are an allowlist (one table per
+  protocol in `src/web/llm_proxy.rs`: model, messages, system, `max_tokens`, sampling
+  parameters, stop sequences, `stream`, metadata, tools, `tool_choice` and the like). Any other
+  field is refused: `compaction`, `context_management`, `fallbacks`, `fallback_credit_token`,
+  `speed`, `inference_geo`, `web_search_options`, Bedrock `performanceConfig` and
+  `guardrailConfig`, and a service tier under any name or casing (`service_tier`, `serviceTier`,
+  `ServiceTier`), even with a value that looks standard. A body that is not a JSON object is
+  refused. The contents of an allowed field are not inspected.
+- Betas: the `anthropic-beta` header (every line, comma separated) and a body `anthropic_beta`
+  (Bedrock InvokeModel, Vertex Anthropic) may name only betas on a short list of those that do
+  not change a token's price; any other value is refused, so the header is never forwarded with
+  an unpriced beta.
+- Tools: only plain client tools in the exact shape the protocol defines. Anthropic: an untyped
+  or `custom` object with a `name`, an `input_schema` and no key beyond `description`,
+  `cache_control` and `strict`, or an exact versioned client type (`bash_*`, `text_editor_*`,
+  `memory_*`, `computer_*`, matched by full type string, not prefix). OpenAI: `function` or
+  `custom` with the documented keys only. Gemini: `functionDeclarations` entries. Bedrock
+  Converse (`toolConfig.tools`): `toolSpec` or `cachePoint` with the documented keys only.
+  Server tools (web search and fetch, code execution, file search, grounding, tool search,
+  `urlContext`, the advisor) and any typed tool not on the list are refused.
+
+Operators cannot widen the allowlist with a rate-card entry (the card format has no entry for a
+priced variant of a request field, and the parser mirrors leria's); a field, beta or tool shape
+is added by a code change, and adding one is a pricing decision.
+
+**Extra sampling steps inside one request.** Anthropic's `usage.iterations` lists every
+sampling step the request ran, including server-side compaction and advisor steps that the
+top-level counts leave out. Every entry is counted (input, output and cache tokens, cache
+writes at twice): per direction the booked count is the larger of the top-level figure and the
+sum over the entries, so no step is counted twice and none is left out. This holds buffered and
+streamed (the largest cumulative list wins, and an estimate keeps it as a floor). Entries are
+charged at the request model's price whatever model an entry names, which is why the advisor
+tool and `fallbacks` stay refused rather than metered. Not covered, so booked below the real
+price: the regional-endpoint premium of a Vertex or Bedrock deployment the operator points
+`provider_base` at, a price change the provider makes without a request field, a nested option
+inside an allowed field that a provider prices, and the `OpenAI-Beta` header (not on a beta
+allowlist).
 
 Negative/float/oversized counts are rejected (`as_u64`), and a body missing a
 recognized count pair yields no token event. The `model` is taken from the

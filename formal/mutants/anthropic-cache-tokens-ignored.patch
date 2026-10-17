@@ -1,5 +1,5 @@
 diff --git a/src/outbox.rs b/src/outbox.rs
-index 11a0f21..130ffa9 100644
+index 9941631..3ff6f21 100644
 --- a/src/outbox.rs
 +++ b/src/outbox.rs
 @@ -305,7 +305,7 @@ fn cache_input_tokens(usage: &serde_json::Map<String, serde_json::Value>) -> u64
@@ -10,4 +10,4 @@ index 11a0f21..130ffa9 100644
 +    reads.min(0).saturating_add(writes.min(0))
  }
  
- /// Parse a provider `usage` block from a **non-streamed** LLM response body
+ /// The input and output tokens of every entry of `usage.iterations` (Anthropic: one entry per
