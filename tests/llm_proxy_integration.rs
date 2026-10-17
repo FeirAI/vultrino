@@ -2113,6 +2113,39 @@ async fn anthropic_workspace_id_invalid_stored_value_refuses_before_upstream() {
         "no upstream call may happen on /execute"
     );
     assert!(via_mcp(&st, None).await.is_err());
+
+    // A refusal for a bad stored value must not burn a use.
+    let (full, tok) = UseToken::create(NewUseToken {
+        name: "once".to_string(),
+        credential_scope: "cred-anthropic".to_string(),
+        action_scope: None,
+        max_uses: Some(1),
+        require_approval: false,
+        expires_in: None,
+    });
+    st.storage.store_use_token(&tok).await.unwrap();
+    let mut req = llm_req(
+        Some(&full),
+        "v1/messages",
+        serde_json::json!({ "model": "claude-haiku-4-5", "max_tokens": 16, "messages": [] }),
+    );
+    req.headers_mut()
+        .insert("anthropic-version", "2023-06-01".parse().unwrap());
+    let resp = st.router.clone().oneshot(req).await.unwrap();
+    assert_ne!(resp.status(), StatusCode::OK);
+    let uses = st
+        .storage
+        .list_use_tokens()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == tok.id)
+        .unwrap()
+        .uses;
+    assert_eq!(
+        uses, 0,
+        "a refused bad stored value must not consume the use token"
+    );
 }
 
 #[test]

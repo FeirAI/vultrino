@@ -685,6 +685,10 @@
       "tier": "fast",
       "claim": "anthropic-workspace-id-operator-owned"
     },
+    "workspace-scope-applied-after-consume": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
     "workspace-id-format-check-removed": {
       "tier": "fast",
       "claim": "anthropic-workspace-id-operator-owned"
@@ -3526,7 +3530,7 @@
     },
     {
       "id": "anthropic-workspace-id-operator-owned",
-      "statement": "The Anthropic workspace on an outgoing request is the operator's, never the caller's, on every path that reaches a plugin: /llm, POST /api/v1/execute, the MCP http_request tool and approval replay. The workspace id is stored on the credential (metadata key anthropic_workspace_id). Before dispatch, any caller-supplied anthropic-workspace-id header (any case) is removed from the request, and the credential's value, if it has one, is written; a credential with none sends none, so the caller cannot choose a workspace with the same bearer on any of these paths. The http plugin repeats the same removal and write on its own parameters. The id must be wrkspc_ plus 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no meter event) instead of being written into a header.",
+      "statement": "The Anthropic workspace on an outgoing request is the operator's, never the caller's, on every path that reaches a plugin: /llm, POST /api/v1/execute, the MCP http_request tool and approval replay. The workspace id is stored on the credential (metadata key anthropic_workspace_id). Before dispatch, any caller-supplied anthropic-workspace-id header (any case) is removed from the request, and the credential's value, if it has one, is written; a credential with none sends none, so the caller cannot choose a workspace with the same bearer on any of these paths. The http plugin repeats the same removal and write on its own parameters. The id must be wrkspc_ plus 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no meter event, and before the use token is consumed, shown by its use count staying 0) instead of being written into a header.",
       "method": "test",
       "artifacts": [
         "src/plugins/mod.rs",
@@ -3572,6 +3576,7 @@
         "workspace-scope-plugin-strip-removed",
         "workspace-scope-not-injected",
         "workspace-scope-use-time-recheck-removed",
+        "workspace-scope-applied-after-consume",
         "workspace-id-format-check-removed"
       ],
       "does_not_establish": "That Anthropic accepts the configured workspace id, that the id belongs to the key's organization, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential holding an org-level key and no workspace id sends no workspace header, so Anthropic decides what that does. The buffered and the streaming dispatch in the server call the same helper, but only the buffered one is driven by a test. Other plugins (internal_http, WASM) get the server-side removal but have no workspace-id injection of their own. The header name is matched exactly (case-insensitively); other provider headers, and the pre-existing gap that /api/v1/execute does not apply a capability's model allowlist or token ceiling, are not covered here. The format check is an operator-facing sanity check, not Anthropic's own validation."

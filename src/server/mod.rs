@@ -2584,6 +2584,13 @@ impl VultrinoServer {
         plugin
             .validate_params(action_name, &params)
             .map_err(|e| RunError::terminal(e.into()))?;
+        // The workspace header is the operator's on every path (the credential's
+        // `anthropic_workspace_id` metadata, or none), never the caller's. Applied
+        // in the preflight, so a bad stored value is refused before any use token
+        // is consumed or D8 evidence begun, and evidence binds the dispatched params.
+        let mut params = params;
+        crate::plugins::apply_workspace_scope_to_params(&mut params, &credential.metadata)
+            .map_err(|e| RunError::terminal(e.into()))?;
 
         // Serialize once before token consumption. Trusted human-floor actions
         // fail closed here if no evidence path/grant exists; reversible actions
@@ -2763,11 +2770,6 @@ impl VultrinoServer {
             exact_evidence.as_ref(),
         )
         .await?;
-        // The workspace header is the operator's on every path (the credential's
-        // `anthropic_workspace_id` metadata, or none), never the caller's.
-        let mut params = params;
-        crate::plugins::apply_workspace_scope_to_params(&mut params, &credential.metadata)
-            .map_err(|e| RunError::terminal(e.into()))?;
         let plugin_request = crate::plugins::PluginRequest {
             credential,
             action: action_name.to_string(),
@@ -3010,6 +3012,13 @@ impl VultrinoServer {
         plugin
             .validate_params(action_name, &params)
             .map_err(|e| RunError::terminal(e.into()))?;
+        // The workspace header is the operator's on every path (the credential's
+        // `anthropic_workspace_id` metadata, or none), never the caller's. Applied
+        // in the preflight, so a bad stored value is refused before any use token
+        // is consumed or D8 evidence begun, and evidence binds the dispatched params.
+        let mut params = params;
+        crate::plugins::apply_workspace_scope_to_params(&mut params, &credential.metadata)
+            .map_err(|e| RunError::terminal(e.into()))?;
 
         // The streaming path shares the exact same pre-consume evidence
         // preflight as buffered execution. A strict failure occurs before the
@@ -3170,11 +3179,6 @@ impl VultrinoServer {
             exact_evidence.as_ref(),
         )
         .await?;
-        // The workspace header is the operator's on every path (the credential's
-        // `anthropic_workspace_id` metadata, or none), never the caller's.
-        let mut params = params;
-        crate::plugins::apply_workspace_scope_to_params(&mut params, &credential.metadata)
-            .map_err(|e| RunError::terminal(e.into()))?;
         let plugin_request = crate::plugins::PluginRequest {
             credential,
             action: action_name.to_string(),

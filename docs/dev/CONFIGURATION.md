@@ -172,7 +172,7 @@ are spend controls: reasoning tokens are billed as output tokens. An absent
 **Org-level Anthropic keys.** Anthropic rejects a request made with an API key that
 is not scoped to a workspace unless it carries an `anthropic-workspace-id` header.
 To use such a key, set the credential's `anthropic_workspace_id` metadata, for
-example `vultrino credentials metadata set <alias> anthropic_workspace_id
+example `vultrino meta set <alias> anthropic_workspace_id
 wrkspc_...` (or the `metadata` map on `POST /api/v1/credentials`). The value is
 `wrkspc_` followed by 8 to 64 ASCII letters or digits; anything else is refused when
 it is set, and a stored value that fails the same check at use time makes the request
