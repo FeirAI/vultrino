@@ -317,7 +317,10 @@ pub async fn run_callback_loop(
     let Some(cb) = tg.callback.clone() else {
         return;
     };
-    let client = match reqwest::Client::builder()
+    // The bot token is in every request path and each press is a decision: same rules as every
+    // other secret-bearing client (plain http only to a private address, never an ambient proxy).
+    let client = match crate::plain_http::guard(reqwest::Client::builder(), &tg.api_base)
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(40))
