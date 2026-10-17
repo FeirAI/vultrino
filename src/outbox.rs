@@ -64,6 +64,12 @@ pub const EVENT_TOKEN_CHANGED: &str = "token.changed";
 pub const EVENT_KEY_CHANGED: &str = "key.changed";
 /// A policy denial that an observe-only tenant did NOT enforce (V11).
 pub const EVENT_POLICY_OBSERVED_DENIAL: &str = "policy.observed_denial";
+/// FEI-33: an Observe-mode evidence receipt did NOT reach Averin (seal failed or timed out, the
+/// async fan-out was saturated, params were oversize, the local durable enqueue failed, or a
+/// durable receipt exhausted its delivery attempts). Observe stays non-blocking: the action already
+/// ran. This event is the individual, signed record of each missing receipt. Subject is the use
+/// token id; the payload carries ids and a short reason, never params or secrets.
+pub const EVENT_EVIDENCE_RECEIPT_GAP: &str = "evidence.receipt_gap";
 /// An enforce-mode denial — a DETECT signal (R3/V12a). Its `created_at` is the
 /// per-incident `detected_at`, to pair with a later [`EVENT_AGENT_HALTED`]
 /// `contained_at` (same subject) for an MTTD/MTTC measurement.

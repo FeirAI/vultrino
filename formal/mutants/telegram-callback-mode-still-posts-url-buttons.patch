@@ -1,0 +1,13 @@
+diff --git a/src/approval/mod.rs b/src/approval/mod.rs
+index 971b0cb..2c16486 100644
+--- a/src/approval/mod.rs
++++ b/src/approval/mod.rs
+@@ -3177,7 +3177,7 @@ impl ApprovalNotifier for TelegramNotifier {
+             "parse_mode": "HTML",
+             "disable_web_page_preview": true,
+         });
+-        if self.config.callback.is_some() {
++        if false {
+             // FEI-16: callback buttons carry only the approval id. No bearer decision link is
+             // posted into the chat, and the person who presses is identified by Telegram.
+             let approve = telegram_callbacks::callback_data(true, &approval.id)

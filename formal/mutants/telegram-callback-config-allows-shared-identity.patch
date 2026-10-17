@@ -1,0 +1,13 @@
+diff --git a/src/approval/telegram_callbacks.rs b/src/approval/telegram_callbacks.rs
+index 401f981..b5929f3 100644
+--- a/src/approval/telegram_callbacks.rs
++++ b/src/approval/telegram_callbacks.rs
+@@ -98,7 +98,7 @@ impl TelegramCallbackConfig {
+                     "approvals.telegram.approvers: Telegram user {user_id} is listed twice"
+                 ));
+             }
+-            if let Some(other) = seen_identities.insert(lower, user_id) {
++            if let Some(other) = seen_identities.insert(lower, user_id).filter(|_| false) {
+                 return Err(format!(
+                     "approvals.telegram.approvers: Telegram users {other} and {user_id} map to the same identity '{identity}'; \
+                      two people sharing one approver identity would collapse into one approver"

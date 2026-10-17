@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index bf93d19..8c1db28 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -5518,7 +5518,7 @@ pub async fn deliver_averin_outbox_once(
+                 // `delivery`) rather than reusing the pre-attempt `event` snapshot, then MOVE it
+                 // into quarantine (D4). Never logs `params`/`pop_seed` — token/project context only.
+                 let final_event = queue.get(sequence).unwrap_or(event);
+-                if final_event.event_type == "averin.use" {
++                if false && final_event.event_type == "averin.use" {
+                     // FEI-33: a durable Observe receipt that exhausted its delivery attempts is a
+                     // permanent gap in the evidence trail: record it individually, not only as a
+                     // quarantined queue row.

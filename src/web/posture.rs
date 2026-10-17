@@ -18,6 +18,7 @@ pub const POSTURE_SCHEMA: u32 = 1;
 /// `default_deny` is the policy engine's live default (set from `[enforcement] default_action`),
 /// `policies` the policies the engine enforces right now (config plus stored).
 pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Policy]) -> Value {
+    let secret_fingerprints = secret_fingerprints(config);
     let key = config.govder.as_ref().map(|g| g.approval_key_posture());
     let mut observe_tenants: Vec<&str> = config
         .tenants
@@ -82,7 +83,57 @@ pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Pol
         "vault": {
             "format_version": crate::storage::STORAGE_VERSION,
         },
+        // FEI-40: keyed fingerprints of the shared secrets this process holds, per relationship
+        // (see crate::secret_fp). The verifier compares them with the other planes' to find a
+        // misaligned pair at deploy time. Never a secret value.
+        "secret_fingerprints": secret_fingerprints,
     })
+}
+
+/// Relationship names of the secret-alignment matrix this plane takes part in. They are the same
+/// strings in every plane and in feir-os `deploy/posture/evaluate.jq`, and part of the fingerprinted
+/// message.
+const REL_OUTBOX_POLL: &str = "vultrino-outbox-poll"; // A: vultrino signs its meter feed; leria verifies
+const REL_APPROVAL_PUSH: &str = "vultrino-approval-push"; // E: the same outbox secret signs approval pushes; govder verifies
+const REL_TENANT_ASSERTION: &str = "tenant-assertion"; // F: the edge/broker-signed tenant assertion (vultrino signs its calls to govder with it)
+const REL_AVERIN_API_KEY: &str = "averin-api-key"; // I: the project bearer vultrino sends to averin (averin accepts a list)
+const REL_APPROVER_KEY: &str = "approver-key"; // M: the key that verifies the broker's signed approver decisions
+
+/// The fingerprints of the secrets this process was configured with, per relationship. A
+/// relationship with no configured secret is omitted (an unset secret has no fingerprint).
+fn secret_fingerprints(config: &Config) -> Value {
+    use crate::secret_fp::fingerprint;
+    let mut out = serde_json::Map::new();
+    let mut add = |rel: &str, secret: Option<&str>| {
+        if let Some(fp) = secret.and_then(|s| fingerprint(s, rel)) {
+            out.insert(rel.to_string(), json!([fp]));
+        }
+    };
+    let outbox = config.outbox.hmac_secret.as_deref();
+    add(REL_OUTBOX_POLL, outbox);
+    // The push relationship exists only while push delivery is on and has somewhere to go: an
+    // outbox that only serves GET /api/v1/events signs the feed (above) but sends no approval push.
+    let pushing = config.outbox.enabled
+        && config
+            .outbox
+            .url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty());
+    add(REL_APPROVAL_PUSH, outbox.filter(|_| pushing));
+    // Reported only while the seal client is on: AVERIN_API_KEY is read but never sent otherwise.
+    add(
+        REL_AVERIN_API_KEY,
+        config
+            .averin
+            .api_key
+            .as_deref()
+            .filter(|_| config.averin.enabled),
+    );
+    if let Some(g) = config.govder.as_ref() {
+        add(REL_TENANT_ASSERTION, Some(g.assertion_secret.as_str()));
+        add(REL_APPROVER_KEY, g.approval_verification_secret());
+    }
+    Value::Object(out)
 }
 
 #[cfg(test)]
@@ -158,7 +209,9 @@ mod tests {
             v["approver_identity"]["key_distinct_from_govder_key"],
             false
         );
-        let text = v.to_string();
+        // The one field whose name says "secret" is the fingerprint map (FEI-40): keyed fingerprints,
+        // never a value (the test below checks that with real secrets configured).
+        let text = v.to_string().replace("secret_fingerprints", "");
         assert!(!text.contains("secret"), "no secret-named field: {text}");
     }
 
@@ -195,5 +248,118 @@ mod tests {
             assert_eq!(a["key_distinct_from_govder_key"], distinct, "{f}/{m:?}");
             assert_eq!(a["shared_key_escape"], escape, "{f}/{m:?}");
         }
+    }
+
+    // ---- FEI-40: secret-alignment fingerprints --------------------------------------------------
+
+    fn govder_cfg(m: Option<&str>) -> crate::govder::GovderConfig {
+        crate::govder::GovderConfig {
+            base_url: "http://govder.invalid".into(),
+            assertion_secret: "assertion-F".into(),
+            approval_assertion_secret: m.map(str::to_string),
+            allow_shared_approval_key: false,
+            assertion_ttl: std::time::Duration::from_secs(90),
+            http_timeout: std::time::Duration::from_secs(1),
+        }
+    }
+
+    /// The report carries one keyed fingerprint per relationship, from the values this process is
+    /// configured with: the outbox secret for both its feed and its approval pushes (one secret, two
+    /// relationships, so two different fingerprints), the tenant assertion secret it signs calls to
+    /// govder with, and the approver key. No secret value appears in the report.
+    #[test]
+    fn report_carries_a_fingerprint_per_relationship_and_no_secret() {
+        use crate::secret_fp::fingerprint;
+        let mut cfg = Config::default();
+        cfg.outbox.hmac_secret = Some("outbox-secret-A".into());
+        cfg.outbox.enabled = true;
+        cfg.outbox.url = Some("http://govder.invalid/webhooks/vultrino-approvals".into());
+        cfg.govder = Some(govder_cfg(Some("approver-key-M")));
+        let v = build_posture(&cfg, true, &[]);
+        let fp = &v["secret_fingerprints"];
+        assert_eq!(
+            fp["vultrino-outbox-poll"],
+            json!([fingerprint("outbox-secret-A", "vultrino-outbox-poll").unwrap()])
+        );
+        assert_eq!(
+            fp["vultrino-approval-push"],
+            json!([fingerprint("outbox-secret-A", "vultrino-approval-push").unwrap()])
+        );
+        assert_ne!(fp["vultrino-outbox-poll"], fp["vultrino-approval-push"]);
+        assert_eq!(
+            fp["tenant-assertion"],
+            json!([fingerprint("assertion-F", "tenant-assertion").unwrap()])
+        );
+        assert_eq!(
+            fp["approver-key"],
+            json!([fingerprint("approver-key-M", "approver-key").unwrap()])
+        );
+        let text = v.to_string();
+        for secret in ["outbox-secret-A", "assertion-F", "approver-key-M"] {
+            assert!(!text.contains(secret), "the report carries {secret}");
+        }
+    }
+
+    /// With push delivery off (or no URL), the outbox still signs the feed leria polls but sends no
+    /// approval push, so only the feed relationship is reported.
+    #[test]
+    fn report_omits_the_push_relationship_when_the_outbox_does_not_push() {
+        let mut cfg = Config::default();
+        cfg.outbox.hmac_secret = Some("outbox-secret-A".into());
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"]
+            .get("vultrino-outbox-poll")
+            .is_some());
+        assert!(v["secret_fingerprints"]
+            .get("vultrino-approval-push")
+            .is_none());
+        cfg.outbox.enabled = true; // enabled but no URL: still nowhere to push
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"]
+            .get("vultrino-approval-push")
+            .is_none());
+        cfg.outbox.url = Some("  ".into());
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"]
+            .get("vultrino-approval-push")
+            .is_none());
+    }
+
+    /// FEI-40 relationship I: vultrino reports the averin key it sends, only while the seal client
+    /// is enabled, and never the key.
+    #[test]
+    fn report_carries_the_averin_key_fingerprint_only_while_the_seal_client_is_on() {
+        use crate::secret_fp::fingerprint;
+        let mut cfg = Config::default();
+        cfg.averin.api_key = Some("averin-project-bearer".into());
+        cfg.averin.enabled = false;
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"].get("averin-api-key").is_none());
+        cfg.averin.enabled = true;
+        let v = build_posture(&cfg, true, &[]);
+        assert_eq!(
+            v["secret_fingerprints"]["averin-api-key"],
+            json!([fingerprint("averin-project-bearer", "averin-api-key").unwrap()])
+        );
+        assert!(!v.to_string().contains("averin-project-bearer"));
+        cfg.averin.api_key = None;
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"].get("averin-api-key").is_none());
+    }
+
+    /// An unset secret has no fingerprint (the relationship is absent), and an approver key that is
+    /// not usable (equal to the shared key, so verified approvals are disabled) is not reported as
+    /// held.
+    #[test]
+    fn report_omits_unset_secrets_and_an_unusable_approver_key() {
+        let v = build_posture(&Config::default(), true, &[]);
+        assert_eq!(v["secret_fingerprints"], json!({}));
+        let cfg = Config {
+            govder: Some(govder_cfg(Some("assertion-F"))), // M equal to F: disabled
+            ..Config::default()
+        };
+        let v = build_posture(&cfg, true, &[]);
+        assert!(v["secret_fingerprints"].get("approver-key").is_none());
+        assert!(v["secret_fingerprints"].get("tenant-assertion").is_some());
     }
 }

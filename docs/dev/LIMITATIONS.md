@@ -394,16 +394,43 @@ kernels.
   ordinary policy denials through (logged + emitted as `policy.observed_denial`).
   Security/financial boundaries (halt, cross-tenant isolation, SpendCap/RateLimit)
   still enforce — but operators must understand observe mode is non-blocking for
-  ordinary denials. Separately, `[averin] mode = "observe"` remains fail-open for
-  reversible and undeclared work (missing/failed use seals do not block dispatch).
+  ordinary denials. Separately, `[averin] mode = "observe"` stays fail-open for
+  reversible and undeclared work: a missing or failed use seal does not block
+  dispatch. **Every receipt that does not reach Averin is recorded individually,
+  not only counted**: a failed or timed-out seal, a saturated async fan-out, oversize
+  params, a failed local durable enqueue, a durable receipt that exhausted its delivery
+  attempts and a lost seal task each become one `evidence.receipt_gap` event on the signed
+  outbox (subject = the use token id; payload = token id, project, request id, use
+  sequence number, one of `seal_failed`, `seal_task_lost`, `fanout_saturated`,
+  `params_oversize`, `enqueue_failed`, `durable_dead_lettered`, a clipped error text, and
+  `outcome: action_ran_without_receipt`; never params). The counters
+  `receipt_gaps` and `receipt_gaps_overflowed` are on `GET /api/v1/metrics`
+  (`averin_seal`). The record is queued in memory and appended to the outbox every two
+  seconds: a process killed inside that window loses the gaps it had not yet appended (and
+  the counters), and a sustained outbox write failure beyond 4096 pending gaps is counted in
+  `receipt_gaps_overflowed` but not recorded individually. A process that dies between the
+  action and the enqueue of its seal leaves neither a receipt nor a gap. A gap names an action
+  that ran without a receipt; it does not say whether the action's own side effect succeeded.
+  **The gap event is not a permanent record on vultrino's side.** The outbox prunes every event
+  older than `[outbox] retention_secs` (default **2 days**), delivered or not, so a gap nobody
+  consumed in that window is gone. The consumer is govder: it receives the signed push on its
+  approval webhook, stores each gap (in Postgres when configured, otherwise in memory) before it
+  acknowledges the delivery, and lists them per tenant on `GET /v1/evidence/receipt-gaps`. If
+  govder is down or unreachable for longer than the retention window, or has no push target
+  configured, the gaps in that window are lost. leria ignores the event type; nothing pages anyone
+  about a gap. See govder `docs/dev/API.md`.
   A declared human-floor capability, or a bare canonical verb shared by configured
   business labels, does **not** inherit that availability knob: buffered and
   streaming dispatch require a live Averin client, a bound use token, grant
   material, and a committed use seal before `plugin.execute*`, independent of the
   ordinary Observe/RequireEvidence posture. Unknown `[averin] mode` values are
-  refused at config load rather than coerced into Observe. Undeclared actions in
+  refused at config load rather than coerced into Observe, and so is an `[averin]` block with
+  `enabled = true` and an empty `base_url` or `resource_id` (it used to start with the seal
+  client silently off, so no receipt and no gap event; a block that parses but names an
+  unreachable averin still starts and records every action as a receipt gap). Undeclared actions in
   non-strict posture, reversible declarations, and deployments with Averin
-  disabled still have no record-existence guarantee.
+  disabled still have no record-existence guarantee (with Averin disabled there is no
+  receipt to fail, so no gap event either).
 - **An `internal_http` capability's HTTP verb is operator authority, and the agent
   may not send one.** The transport requires `method`, so a capability registered
   through the admin API must make it decidable: exactly one `target.methods` entry,

@@ -21,6 +21,11 @@
       "file": "tenant-assertion.v1.json",
       "owner": "govder",
       "sha256": "3f623a4e2fa45144d0dae27265dd725769d6d9bb59122b7611ff6a3eb8193084"
+    },
+    {
+      "file": "secret-fingerprint.v1.json",
+      "owner": "feir-os",
+      "sha256": "70029b247125e27494217a228c7e674cea7617e606586fa5bba0307fc51eb2fd"
     }
   ]
 }

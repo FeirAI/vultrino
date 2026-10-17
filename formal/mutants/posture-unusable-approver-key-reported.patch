@@ -1,0 +1,13 @@
+diff --git a/src/web/posture.rs b/src/web/posture.rs
+index c1a181d..10f91e8 100644
+--- a/src/web/posture.rs
++++ b/src/web/posture.rs
+@@ -116,7 +116,7 @@ fn secret_fingerprints(config: &Config) -> Value {
+     );
+     if let Some(g) = config.govder.as_ref() {
+         add(REL_TENANT_ASSERTION, Some(g.assertion_secret.as_str()));
+-        add(REL_APPROVER_KEY, g.approval_verification_secret());
++        add(REL_APPROVER_KEY, g.approval_assertion_secret.as_deref());
+     }
+     Value::Object(out)
+ }

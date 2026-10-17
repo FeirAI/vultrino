@@ -1,0 +1,13 @@
+diff --git a/src/averin/mod.rs b/src/averin/mod.rs
+index 8f70357..18e3538 100644
+--- a/src/averin/mod.rs
++++ b/src/averin/mod.rs
+@@ -588,7 +588,7 @@ impl AverinClient {
+             at: chrono::Utc::now(),
+         };
+         let mut q = self.pending_gaps.lock();
+-        if q.len() >= MAX_PENDING_RECEIPT_GAPS {
++        if false && q.len() >= MAX_PENDING_RECEIPT_GAPS {
+             drop(q);
+             let total = self
+                 .metrics
