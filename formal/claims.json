@@ -4077,7 +4077,7 @@
         {
           "path": "src/ratecard.rs",
           "symbol": "RateCard::parse",
-          "sha256": "4b9fef1d87d9df586f8da4ba15ff109e7cbb2037464c0b7457b9d4f8209d720b"
+          "sha256": "ef91fe20b0892eb1ddb402e92fe0b374b85700b2b43db4e4cf7c3666ea156698"
         },
         {
           "path": "src/ratecard.rs",
@@ -4103,6 +4103,11 @@
           "path": "src/ratecard.rs",
           "symbol": "RateCardHandle::status",
           "sha256": "ab8a86867009fe80611b42441a327cc3768341fd21d46a4df40cafa573eca783"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "refuse_unknown_fields",
+          "sha256": "e7ceb1c75b05ed87c15b6ab7296d6772d75dbf882edc580f01cc5e203b3a7e94"
         }
       ],
       "mutants": [

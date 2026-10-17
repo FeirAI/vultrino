@@ -1,12 +1,13 @@
 diff --git a/src/ratecard.rs b/src/ratecard.rs
-index 59f166c..7a846ea 100644
+index b06ba14..b7493a9 100644
 --- a/src/ratecard.rs
 +++ b/src/ratecard.rs
-@@ -78,7 +78,6 @@ struct WireCard {
- }
- 
- #[derive(Deserialize)]
--#[serde(deny_unknown_fields)]
- struct WireEntry {
-     #[serde(default)]
-     model_ref: Option<String>,
+@@ -126,7 +126,7 @@ fn refuse_unknown_fields(card: &serde_json::Value) -> Result<(), RateCardError>
+         let Some(fields) = entry.as_object() else {
+             continue;
+         };
+-        if let Some(k) = fields.keys().find(|k| !ENTRY_FIELDS.contains(&k.as_str())) {
++        if let Some(k) = fields.keys().find(|k| false && !ENTRY_FIELDS.contains(&k.as_str())) {
+             return Err(RateCardError(format!("unknown field {k:?} on an entry")));
+         }
+     }
