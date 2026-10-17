@@ -1787,6 +1787,17 @@ impl VultrinoServer {
                     .validate_params(action_name, &request.params)
                     .map_err(VultrinoError::from)?;
             }
+            // The operator-owned workspace scope is applied at execution (and again
+            // on resume, from the live credential), never stored in the approval.
+            // Check it here on a copy so a credential whose stored workspace id is
+            // invalid refuses before any approval-open side effect instead of
+            // opening an approval that can only fail on resume.
+            let mut scoped_probe = request.params.clone();
+            crate::plugins::apply_workspace_scope_to_params(
+                &mut scoped_probe,
+                &credential.metadata,
+            )
+            .map_err(VultrinoError::from)?;
 
             // Open an approval request. Bearer capacity is converted into the
             // durable exact-request grant below, before the request is published.

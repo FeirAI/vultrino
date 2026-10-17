@@ -2095,12 +2095,33 @@ async fn anthropic_workspace_id_mcp_http_request_cannot_choose_workspace() {
 async fn anthropic_workspace_id_invalid_stored_value_refuses_before_upstream() {
     let bad = "not a workspace\r\nx-evil: 1";
     let st = ws_stack(Some(bad)).await;
-    let (status, _) = via_llm(&st, None).await;
-    assert_ne!(
-        status,
-        StatusCode::OK,
-        "an invalid stored value must refuse"
-    );
+    // A clear configuration error, not a 502 "upstream request failed": nothing
+    // was sent upstream, and the message says what to fix.
+    for stream in [false, true] {
+        let mut req = llm_req(
+            Some(&st.token),
+            "v1/messages",
+            serde_json::json!({ "model": "claude-haiku-4-5", "max_tokens": 16, "messages": [], "stream": stream }),
+        );
+        req.headers_mut()
+            .insert("anthropic-version", "2023-06-01".parse().unwrap());
+        let resp = st.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stream={stream}"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("misconfigured") && msg.contains("anthropic_workspace_id"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("evil") && !msg.contains("upstream request failed"),
+            "{msg}"
+        );
+    }
     // A call that reaches the upstream emits the api-calls meter event; none may exist.
     assert!(
         meter_events(&st.storage).await.is_empty(),

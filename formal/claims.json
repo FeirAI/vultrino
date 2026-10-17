@@ -844,7 +844,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "ece06d2c2987a99a7d9a2a53d5defa976f2304858e328b73265f956e073f74b1"
+          "sha256": "19356bef86981483bd90747704ccff0d3c09dd55a368d67c435cc7991396d714"
         },
         {
           "path": "src/server/mod.rs",
@@ -2483,7 +2483,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "ece06d2c2987a99a7d9a2a53d5defa976f2304858e328b73265f956e073f74b1"
+          "sha256": "19356bef86981483bd90747704ccff0d3c09dd55a368d67c435cc7991396d714"
         },
         {
           "path": "src/server/mod.rs",
@@ -3530,25 +3530,26 @@
     },
     {
       "id": "anthropic-workspace-id-operator-owned",
-      "statement": "The Anthropic workspace on an outgoing request is the operator's, never the caller's, on every path that reaches a plugin: /llm, POST /api/v1/execute, the MCP http_request tool and approval replay. The workspace id is stored on the credential (metadata key anthropic_workspace_id). Before dispatch, any caller-supplied anthropic-workspace-id header (any case) is removed from the request, and the credential's value, if it has one, is written; a credential with none sends none, so the caller cannot choose a workspace with the same bearer on any of these paths. The http plugin repeats the same removal and write on its own parameters. The id must be wrkspc_ plus 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no meter event, and before the use token is consumed, shown by its use count staying 0) instead of being written into a header.",
+      "statement": "The Anthropic workspace on an outgoing request is the operator's, never the caller's, on every path that reaches a plugin: /llm, POST /api/v1/execute, the MCP http_request tool and approval replay. The workspace id is stored on the credential (metadata key anthropic_workspace_id). Before dispatch, any caller-supplied anthropic-workspace-id header (any case) is removed from the request, and the credential's value, if it has one, is written; a credential with none sends none, so the caller cannot choose a workspace with the same bearer on any of these paths. The http plugin repeats the same removal and write on its own parameters. The id must be wrkspc_ plus 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no meter event, and before the use token is consumed, shown by its use count staying 0) instead of being written into a header. The refusal is a credential configuration error, not an upstream failure: /llm answers 500 with a message naming the misconfigured credential metadata, and an approval-gated request refuses at approval open (no approval is stored) rather than opening an approval that could only fail on resume.",
       "method": "test",
       "artifacts": [
         "src/plugins/mod.rs",
         "src/plugins/http.rs",
         "src/server/mod.rs",
         "src/lib.rs",
-        "tests/llm_proxy_integration.rs"
+        "tests/llm_proxy_integration.rs",
+        "tests/approval_token_integration.rs"
       ],
       "gates": [
         "rust"
       ],
-      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration anthropic_workspace_id; cargo test --locked --no-default-features --lib -- plugins::http::tests::plugin_drops_agent_workspace_header",
+      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration anthropic_workspace_id; cargo test --locked --no-default-features --test approval_token_integration workspace; cargo test --locked --no-default-features --lib -- plugins::http::tests::plugin_drops_agent_workspace_header",
       "detector_kind": "cargo",
       "covers": [
         {
           "path": "src/plugins/mod.rs",
           "symbol": "apply_workspace_scope",
-          "sha256": "acc695af3760471c3fe190ead0645566b8b5c8a87de9f13473040a564a7dcc11"
+          "sha256": "fa35061fe506c3b5b8a3c3ad4a5b7590b664ac52a33ffa6b06b65deeee51b632"
         },
         {
           "path": "src/plugins/mod.rs",
@@ -3584,7 +3585,7 @@
         "workspace-scope-applied-after-consume",
         "workspace-id-format-check-removed"
       ],
-      "does_not_establish": "That Anthropic accepts the configured workspace id, that the id belongs to the key's organization, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential holding an org-level key and no workspace id sends no workspace header, so Anthropic decides what that does. The buffered and the streaming dispatch in the server call the same helper, but only the buffered one is driven by a test. Other plugins (internal_http, WASM) get the server-side removal but have no workspace-id injection of their own. The header name is matched exactly (case-insensitively); other provider headers, and the pre-existing gap that /api/v1/execute does not apply a capability's model allowlist or token ceiling, are not covered here. The format check is an operator-facing sanity check, not Anthropic's own validation."
+      "does_not_establish": "That Anthropic accepts the configured workspace id, that the id belongs to the key's organization, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential holding an org-level key and no workspace id sends no workspace header, so Anthropic decides what that does. The buffered and the streaming dispatch in the server call the same helper, but only the buffered one is driven by a test for dispatch (the streaming path is driven only for the invalid-stored-value refusal). Other plugins (internal_http, WASM) get the server-side removal but have no workspace-id injection of their own. The header name is matched exactly (case-insensitively); other provider headers, and the pre-existing gap that /api/v1/execute does not apply a capability's model allowlist or token ceiling, are not covered here. The format check is an operator-facing sanity check, not Anthropic's own validation."
     }
   ]
 }

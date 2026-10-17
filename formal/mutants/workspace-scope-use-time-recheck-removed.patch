@@ -8,6 +8,6 @@ index 0b726ef..0db08e4 100644
      if let Some(ws) = metadata.get(crate::ANTHROPIC_WORKSPACE_META) {
 -        if !crate::is_valid_anthropic_workspace_id(ws) {
 +        if false && !crate::is_valid_anthropic_workspace_id(ws) {
-             return Err(PluginError::InvalidParams(format!(
+             return Err(PluginError::CredentialConfig(format!(
                  "credential metadata {} is not a valid workspace id",
                  crate::ANTHROPIC_WORKSPACE_META

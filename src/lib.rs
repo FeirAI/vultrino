@@ -724,7 +724,7 @@ pub fn is_valid_anthropic_workspace_id(id: &str) -> bool {
     }
 }
 
-/// Validate one credential metadata entry at write time (CLI `credentials metadata
+/// Validate one credential metadata entry at write time (CLI `vultrino meta
 /// set`, `POST /api/v1/credentials`). Only keys with a format contract are checked.
 pub fn validate_credential_metadata_entry(key: &str, value: &str) -> Result<(), String> {
     if key == ANTHROPIC_WORKSPACE_META && !is_valid_anthropic_workspace_id(value) {

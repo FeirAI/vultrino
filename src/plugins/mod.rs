@@ -73,6 +73,12 @@ pub enum PluginError {
     #[error("Invalid parameters: {0}")]
     InvalidParams(String),
 
+    /// The credential's own stored configuration is unusable (for example an
+    /// invalid `anthropic_workspace_id`). An operator problem, not the caller's
+    /// parameters and not an upstream failure; refused before any upstream call.
+    #[error("Credential configuration error: {0}")]
+    CredentialConfig(String),
+
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
 
@@ -113,7 +119,7 @@ pub fn apply_workspace_scope(
     headers.retain(|k, _| !k.eq_ignore_ascii_case(ANTHROPIC_WORKSPACE_HEADER));
     if let Some(ws) = metadata.get(crate::ANTHROPIC_WORKSPACE_META) {
         if !crate::is_valid_anthropic_workspace_id(ws) {
-            return Err(PluginError::InvalidParams(format!(
+            return Err(PluginError::CredentialConfig(format!(
                 "credential metadata {} is not a valid workspace id",
                 crate::ANTHROPIC_WORKSPACE_META
             )));
