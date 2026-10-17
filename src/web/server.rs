@@ -487,7 +487,7 @@ impl WebServer {
             ))
             // Session layer
             .layer(session_layer)
-            .layer(TraceLayer::new_for_http())
+            .layer(TraceLayer::new_for_http().make_span_with(request_span))
             .with_state(self.app_state.clone())
     }
 
@@ -586,4 +586,17 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received, draining in-flight requests");
+}
+
+/// Per-request tracing span (VUL-39). The stock `DefaultMakeSpan` records the whole request
+/// URI, and an out-of-band approval link carries its single-use capability token in the
+/// query string (`/approvals/{id}/decide?token=...`), so at DEBUG the token reached the
+/// logs. Record only the method and the path: the query is never logged, at any level.
+pub(crate) fn request_span<B>(req: &axum::http::Request<B>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %req.method(),
+        path = %req.uri().path(),
+        version = ?req.version(),
+    )
 }

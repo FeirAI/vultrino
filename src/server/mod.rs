@@ -977,6 +977,8 @@ pub struct VultrinoServer {
 struct InboundIdentity {
     /// Lower-cased header name carrying the verified document/claims.
     header: String,
+    /// Key the edge signs the document with (VUL-20). `None`: nothing can verify.
+    key: Option<secrecy::SecretString>,
     resolver: Arc<dyn crate::identity::IdentityResolver>,
 }
 
@@ -1088,6 +1090,7 @@ impl VultrinoServer {
             };
             InboundIdentity {
                 header: ic.header.clone(),
+                key: ic.verification_key.clone(),
                 resolver,
             }
         });
@@ -1325,6 +1328,12 @@ impl VultrinoServer {
         }
     }
 
+    /// The header carrying the edge's signature over the identity document (VUL-20).
+    pub fn identity_signature_header(&self) -> Option<String> {
+        self.identity_header()
+            .map(crate::identity::signature_header_name)
+    }
+
     /// The inbound header to read a verified workload-identity document from, if a
     /// resolver is wired (V10/R6). Lower-cased for case-insensitive matching.
     pub fn identity_header(&self) -> Option<&str> {
@@ -1336,8 +1345,34 @@ impl VultrinoServer {
     /// resolver is wired or the document is malformed / untrusted (logged) — the
     /// caller then falls back to the static `vk_`/`vut_` principal (fail-safe: a
     /// bad document can't elevate, only fail to refine).
-    pub fn resolve_identity(&self, document: &str) -> Option<crate::identity::WorkloadIdentity> {
+    pub fn resolve_identity(
+        &self,
+        document: &str,
+        signature: Option<&str>,
+        bearer: &str,
+    ) -> Option<crate::identity::WorkloadIdentity> {
         let inbound = self.inbound_identity.as_ref()?;
+        // VUL-20: the header is believed only when the edge signed it for THIS bearer.
+        use secrecy::ExposeSecret;
+        let verified = match (inbound.key.as_ref(), signature) {
+            (Some(key), Some(sig)) => crate::identity::verify_identity_signature(
+                key.expose_secret(),
+                document,
+                bearer,
+                sig,
+                chrono::Utc::now().timestamp(),
+            ),
+            (None, _) => Err(crate::identity::IdentityError::BadSignature(
+                "no verification key configured".to_string(),
+            )),
+            (_, None) => Err(crate::identity::IdentityError::BadSignature(
+                "no signature header".to_string(),
+            )),
+        };
+        if let Err(e) = verified {
+            warn!(error = %e, "inbound workload-identity header not verified — using static principal");
+            return None;
+        }
         match inbound.resolver.resolve(document) {
             Ok(id) => Some(id),
             Err(e) => {
@@ -1752,6 +1787,17 @@ impl VultrinoServer {
                     .validate_params(action_name, &request.params)
                     .map_err(VultrinoError::from)?;
             }
+            // The operator-owned workspace scope is applied at execution (and again
+            // on resume, from the live credential), never stored in the approval.
+            // Check it here on a copy so a credential whose stored workspace id is
+            // invalid refuses before any approval-open side effect instead of
+            // opening an approval that can only fail on resume.
+            let mut scoped_probe = request.params.clone();
+            crate::plugins::apply_workspace_scope_to_params(
+                &mut scoped_probe,
+                &credential.metadata,
+            )
+            .map_err(VultrinoError::from)?;
 
             // Open an approval request. Bearer capacity is converted into the
             // durable exact-request grant below, before the request is published.
@@ -2569,6 +2615,13 @@ impl VultrinoServer {
         plugin
             .validate_params(action_name, &params)
             .map_err(|e| RunError::terminal(e.into()))?;
+        // The workspace header is the operator's on every path (the credential's
+        // `anthropic_workspace_id` metadata, or none), never the caller's. Applied
+        // in the preflight, so a bad stored value is refused before any use token
+        // is consumed or D8 evidence begun, and evidence binds the dispatched params.
+        let mut params = params;
+        crate::plugins::apply_workspace_scope_to_params(&mut params, &credential.metadata)
+            .map_err(|e| RunError::terminal(e.into()))?;
 
         // Serialize once before token consumption. Trusted human-floor actions
         // fail closed here if no evidence path/grant exists; reversible actions
@@ -2989,6 +3042,13 @@ impl VultrinoServer {
         })?;
         plugin
             .validate_params(action_name, &params)
+            .map_err(|e| RunError::terminal(e.into()))?;
+        // The workspace header is the operator's on every path (the credential's
+        // `anthropic_workspace_id` metadata, or none), never the caller's. Applied
+        // in the preflight, so a bad stored value is refused before any use token
+        // is consumed or D8 evidence begun, and evidence binds the dispatched params.
+        let mut params = params;
+        crate::plugins::apply_workspace_scope_to_params(&mut params, &credential.metadata)
             .map_err(|e| RunError::terminal(e.into()))?;
 
         // The streaming path shares the exact same pre-consume evidence
@@ -5015,10 +5075,15 @@ pub async fn deliver_outbox_periodically(
 ) {
     // A per-request timeout so one slow consumer can't stall the whole pass; the
     // lease (re-claimable once stale) covers an event whose POST times out.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap_or_default();
+    let client = crate::plain_http::guard(
+        reqwest::Client::builder(),
+        config.url.as_deref().unwrap_or(""),
+    )
+    // Outbox payloads carry signed approval events: never via an ambient proxy (VUL-29).
+    .no_proxy()
+    .timeout(std::time::Duration::from_secs(15))
+    .build()
+    .unwrap_or_default();
     let mut ticks: u64 = 0;
     loop {
         tokio::time::sleep(interval).await;

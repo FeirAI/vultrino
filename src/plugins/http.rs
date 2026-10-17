@@ -351,13 +351,120 @@ const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
 ///     The buffered path applies its own total read timeout per request instead.
 ///     (H4/timeouts, ported from fix/agent-boundary-hardening, streaming-reconciled.)
 pub(crate) fn build_guarded_client() -> Client {
-    Client::builder()
+    let mut builder = Client::builder()
         .user_agent("vultrino/0.1.0")
         .redirect(reqwest::redirect::Policy::none())
         .dns_resolver(std::sync::Arc::new(SsrfGuardResolver))
         .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .expect("Failed to create HTTP client")
+        // VUL-29: never honour the ambient HTTP_PROXY / HTTPS_PROXY / ALL_PROXY. A proxy
+        // would receive the injected credential (in clear for http://) and the connect-time
+        // resolver guard would not see the target. The only proxy is the explicit opt-in
+        // below.
+        .no_proxy();
+    match upstream_proxy_from(std::env::var(UPSTREAM_PROXY_ENV).ok().as_deref()) {
+        Ok(None) if upstream_proxy_ca_path().is_none() => {}
+        Ok(Some(proxy_url)) => {
+            // Only https targets are routed through the proxy (a CONNECT tunnel: the
+            // credential is inside TLS). An http:// target is never handed to the proxy,
+            // and validate_url_ssrf refuses a plain http:// target in every mode.
+            builder = builder.proxy(reqwest::Proxy::custom(move |target| {
+                if target.scheme() == "https" {
+                    Some(proxy_url.clone())
+                } else {
+                    None
+                }
+            }));
+            // A TLS-inspecting or test egress proxy presents certificates from a private CA.
+            // The operator names that CA here; it is trusted in addition to the built-in
+            // roots, and only together with the proxy opt-in.
+            if let Some(pem_path) = upstream_proxy_ca_path() {
+                let pem = std::fs::read(&pem_path).unwrap_or_else(|e| {
+                    panic!("{UPSTREAM_PROXY_CA_ENV} could not be read ({pem_path}): {e}")
+                });
+                if !String::from_utf8_lossy(&pem).contains("-----BEGIN CERTIFICATE-----") {
+                    panic!("{UPSTREAM_PROXY_CA_ENV} is not a PEM certificate ({pem_path})");
+                }
+                let cert = reqwest::Certificate::from_pem(&pem).unwrap_or_else(|e| {
+                    panic!("{UPSTREAM_PROXY_CA_ENV} is not a PEM certificate ({pem_path}): {e}")
+                });
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        Ok(None) => {
+            // A CA with no proxy would only widen trust for direct connections.
+            panic!("{UPSTREAM_PROXY_CA_ENV} is set but {UPSTREAM_PROXY_ENV} is not");
+        }
+        Err(msg) => {
+            // Fail closed at construction: a malformed opt-in must not silently fall back
+            // to a direct connection the operator did not intend.
+            panic!("{UPSTREAM_PROXY_ENV} is invalid: {msg}");
+        }
+    }
+    builder.build().expect("Failed to create HTTP client")
+}
+
+/// The explicit opt-in upstream proxy for secret-bearing outbound calls (VUL-29). Unset
+/// means a direct, guarded connection. The ambient proxy variables are never read.
+pub const UPSTREAM_PROXY_ENV: &str = "VULTRINO_UPSTREAM_PROXY";
+
+/// Parse the opt-in proxy value. `None`/empty is "no proxy"; anything else must be an
+/// `http://` or `https://` URL with a host.
+pub(crate) fn upstream_proxy_from(raw: Option<&str>) -> Result<Option<url::Url>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let u = url::Url::parse(raw).map_err(|e| format!("not a URL ({e})"))?;
+    if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() {
+        return Err("must be an http:// or https:// URL with a host".to_string());
+    }
+    // The guarded client resolves a proxy named by host name through the target SSRF guard, so
+    // a name for an internal proxy could never connect. Only an IP literal works; refuse the rest.
+    if !matches!(u.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_))) {
+        return Err(
+            "the proxy host must be an IP address literal (a host name is resolved \
+                    through the target SSRF guard and would fail for an internal proxy)"
+                .to_string(),
+        );
+    }
+    Ok(Some(u))
+}
+
+/// Optional PEM file naming the private CA of the opt-in proxy's certificates.
+pub const UPSTREAM_PROXY_CA_ENV: &str = "VULTRINO_UPSTREAM_PROXY_CA_FILE";
+
+/// Whether `VULTRINO_UPSTREAM_PROXY_CA_FILE` is set (a trust-widening setting).
+pub fn upstream_proxy_ca_configured() -> bool {
+    upstream_proxy_ca_path().is_some()
+}
+
+fn upstream_proxy_ca_path() -> Option<String> {
+    std::env::var(UPSTREAM_PROXY_CA_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// With the explicit upstream proxy configured, the proxy (not reqwest) resolves the target, so
+/// the admission-time lookup is the only local look at the host: a name this host cannot resolve
+/// to at least one address is refused instead of handed to the proxy's own, possibly internal,
+/// DNS view. Without the proxy a failed lookup fails again at connect time, so it is not refused.
+/// The window between this lookup and the proxy's own is not closed (see SECURITY.md).
+pub(crate) fn proxy_needs_resolution(resolved_any: bool, host: &str) -> Result<(), PluginError> {
+    if upstream_proxy_configured() && !resolved_any {
+        return Err(PluginError::InvalidParams(format!(
+            "host '{host}' does not resolve to any address on this host, and {UPSTREAM_PROXY_ENV} \
+             is set: the proxy would resolve it in its own DNS view, so it is refused"
+        )));
+    }
+    Ok(())
+}
+
+/// True when the explicit upstream proxy is configured (valid or not: an invalid value is
+/// treated as configured so every caller stays on the stricter path).
+pub fn upstream_proxy_configured() -> bool {
+    std::env::var(UPSTREAM_PROXY_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Total read timeout for a BUFFERED outbound request (applied per-request so it
@@ -441,15 +548,21 @@ impl HttpPlugin {
         let port = url.port_or_known_default().unwrap_or(443);
         let socket_addr = format!("{}:{}", host, port);
 
-        if let Ok(addrs) = socket_addr.to_socket_addrs() {
-            for addr in addrs {
-                if Self::is_private_ip(&addr.ip()) {
-                    return Err(PluginError::InvalidParams(format!(
-                        "Token URL host '{}' resolves to private/internal IP address, which is not allowed",
-                        host
-                    )));
+        match socket_addr.to_socket_addrs() {
+            Ok(addrs) => {
+                let mut any = false;
+                for addr in addrs {
+                    any = true;
+                    if Self::is_private_ip(&addr.ip()) {
+                        return Err(PluginError::InvalidParams(format!(
+                            "Token URL host '{}' resolves to private/internal IP address, which is not allowed",
+                            host
+                        )));
+                    }
                 }
+                proxy_needs_resolution(any, host)?;
             }
+            Err(_) => proxy_needs_resolution(false, host)?,
         }
 
         Ok(url)
@@ -718,6 +831,16 @@ impl HttpPlugin {
         let before = url::Url::parse(url_str)
             .map_err(|e| PluginError::InvalidParams(format!("Invalid URL: {}", e)))?;
 
+        // VUL-32: a secret holding `/`, `?`, `#`, `%` or whitespace would change the path or
+        // query that is sent (a `%` can also spell a placeholder or a dot segment). Refuse
+        // rather than send a URL other than the one policy judged.
+        if !crate::url_token_secret_is_path_safe(token.expose()) {
+            return Err(PluginError::InvalidParams(
+                "UrlToken secret holds a character ('/', '?', '#', '\\', '%', whitespace or a \
+                 control character) that would change the URL structure; the request is refused"
+                    .to_string(),
+            ));
+        }
         let substituted = url_str.replace(PLACEHOLDER, token.expose());
 
         // Re-parse the substituted URL to check it's still well-formed and to
@@ -850,7 +973,10 @@ impl HttpPlugin {
 
         // Only allow http and https schemes
         match url.scheme() {
-            "http" | "https" => {}
+            // Refused below, after the host checks, so a private or loopback target keeps
+            // its own message.
+            "http" => {}
+            "https" => {}
             scheme => {
                 return Err(PluginError::InvalidParams(format!(
                     "URL scheme '{}' not allowed. Only http and https are permitted.",
@@ -877,15 +1003,21 @@ impl HttpPlugin {
         let port = url.port_or_known_default().unwrap_or(80);
         let socket_addr = format!("{}:{}", host, port);
 
-        if let Ok(addrs) = socket_addr.to_socket_addrs() {
-            for addr in addrs {
-                if Self::is_private_ip(&addr.ip()) {
-                    return Err(PluginError::InvalidParams(format!(
-                        "Host '{}' resolves to private/internal IP address, which is not allowed",
-                        host
-                    )));
+        match socket_addr.to_socket_addrs() {
+            Ok(addrs) => {
+                let mut any = false;
+                for addr in addrs {
+                    any = true;
+                    if Self::is_private_ip(&addr.ip()) {
+                        return Err(PluginError::InvalidParams(format!(
+                            "Host '{}' resolves to private/internal IP address, which is not allowed",
+                            host
+                        )));
+                    }
                 }
+                proxy_needs_resolution(any, host)?;
             }
+            Err(_) => proxy_needs_resolution(false, host)?,
         }
         // This is the REQUEST-time check (fast reject of obvious private targets +
         // IP literals). The DNS-rebinding TOCTOU it cannot close on its own — a host
@@ -894,7 +1026,31 @@ impl HttpPlugin {
         // the two together cover both the request-time and connect-time windows; a
         // DNS *failure* here is not a fail-open (reqwest's connect resolves + fails too).
 
+        // This plugin injects a secret into every request, and every target that reaches this
+        // point is public (private and loopback addresses were refused above). A plain
+        // http:// request would put the credential on the public network in clear text,
+        // whether it goes direct or through a proxy, so it is refused in every mode.
+        // Operator-pinned internal destinations use the internal_http plugin instead.
+        if url.scheme() == "http" {
+            return Err(PluginError::InvalidParams(
+                "plain http:// is refused: this plugin sends a credential, which must not \
+                 cross a public network in clear text. Use https://."
+                    .to_string(),
+            ));
+        }
+
         Ok(url)
+    }
+
+    /// Parse the request params and make the `anthropic-workspace-id` header the
+    /// operator's: any caller-supplied one is dropped and the credential's own value
+    /// (metadata), if any, is written. This is the plugin-level seam, so it holds for
+    /// every caller of the plugin, whatever the path that reached it.
+    fn scoped_params(request: &PluginRequest) -> Result<HttpRequestParams, PluginError> {
+        let mut params: HttpRequestParams = serde_json::from_value(request.params.clone())
+            .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+        super::apply_workspace_scope(&mut params.headers, &request.credential.metadata)?;
+        Ok(params)
     }
 
     /// Build the guarded outbound request shared by the buffered and streaming
@@ -1182,8 +1338,7 @@ impl Plugin for HttpPlugin {
     async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
         match request.action.as_str() {
             "request" => {
-                let params: HttpRequestParams = serde_json::from_value(request.params)
-                    .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+                let params = Self::scoped_params(&request)?;
 
                 self.execute_request(params, &request.credential.data).await
             }
@@ -1197,8 +1352,7 @@ impl Plugin for HttpPlugin {
     ) -> Result<crate::StreamingResponse, PluginError> {
         match request.action.as_str() {
             "request" => {
-                let params: HttpRequestParams = serde_json::from_value(request.params)
-                    .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+                let params = Self::scoped_params(&request)?;
 
                 self.execute_request_streaming(params, &request.credential.data)
                     .await
@@ -1255,6 +1409,26 @@ impl Plugin for HttpPlugin {
     }
 }
 
+/// Test-only entry points for the integration tests in `tests/upstream_proxy.rs`, which
+/// need the real guarded client and the real URL admission check but run in their own
+/// process because they mutate the environment.
+#[doc(hidden)]
+pub mod proxy_test_support {
+    pub fn guarded_client() -> reqwest::Client {
+        super::build_guarded_client()
+    }
+    pub fn admit_hmac_url(url: &str) -> Result<(), String> {
+        crate::plugins::HmacPlugin::validate_url_ssrf(url)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    pub fn admit_url(url: &str) -> Result<(), String> {
+        super::HttpPlugin::validate_url_ssrf(url)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1283,6 +1457,52 @@ mod tests {
             format!("{err:?}").contains("cap"),
             "want a cap-exceeded error, got {err:?}"
         );
+    }
+
+    /// VUL-32: a UrlToken secret that would change the path or query that is sent is refused.
+    #[test]
+    fn url_token_secret_that_changes_the_url_structure_is_refused() {
+        for bad in [
+            "a/b", "a?x=1", "a#f", "a\\b", "a%2Fb", "a b", "a\nb", "", ".", "..",
+        ] {
+            let token = Secret::new(bad);
+            let err = HttpPlugin::url_token_send_url(
+                "https://api.telegram.org/bot{credential}/sendMessage",
+                &HashMap::new(),
+                &token,
+            )
+            .expect_err(bad);
+            assert!(!format!("{err}").contains("a/b"), "no secret in the error");
+        }
+        let ok = HttpPlugin::url_token_send_url(
+            "https://api.telegram.org/bot{credential}/sendMessage",
+            &HashMap::new(),
+            &Secret::new("123456:ABC-def_GHI"),
+        )
+        .unwrap();
+        assert_eq!(
+            ok,
+            "https://api.telegram.org/bot123456:ABC-def_GHI/sendMessage"
+        );
+    }
+
+    #[test]
+    fn upstream_proxy_value_is_parsed_strictly() {
+        assert!(upstream_proxy_from(None).unwrap().is_none());
+        assert!(upstream_proxy_from(Some("  ")).unwrap().is_none());
+        assert!(upstream_proxy_from(Some("http://10.1.2.3:3128"))
+            .unwrap()
+            .is_some());
+        assert!(upstream_proxy_from(Some("https://[2001:db8::1]"))
+            .unwrap()
+            .is_some());
+        // A host name is refused: it would resolve through the target SSRF guard.
+        for named in ["http://proxy.corp:3128", "http://localhost:3128"] {
+            assert!(upstream_proxy_from(Some(named)).is_err(), "{named}");
+        }
+        for bad in ["socks5://p:1", "proxy.corp:3128", "ftp://p", "http://"] {
+            assert!(upstream_proxy_from(Some(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -1347,6 +1567,64 @@ mod tests {
             "the vault credential wins"
         );
         assert_eq!(headers.get("X-Other").map(String::as_str), Some("ok"));
+    }
+
+    fn scoped_request(
+        headers: serde_json::Value,
+        stored: Option<&str>,
+    ) -> Result<HashMap<String, String>, PluginError> {
+        let mut cred = crate::Credential::new(
+            "c".to_string(),
+            CredentialData::ApiKey {
+                key: Secret::new("k"),
+                header_name: "x-api-key".to_string(),
+                header_prefix: String::new(),
+            },
+        );
+        if let Some(v) = stored {
+            cred = cred.with_metadata(crate::ANTHROPIC_WORKSPACE_META, v);
+        }
+        let request = PluginRequest {
+            credential: cred,
+            action: "request".to_string(),
+            params: serde_json::json!({
+                "method": "POST",
+                "url": "https://api.anthropic.com/v1/messages",
+                "headers": headers,
+            }),
+            context: crate::RequestContext::new(),
+        };
+        HttpPlugin::scoped_params(&request).map(|p| p.headers)
+    }
+
+    #[test]
+    fn plugin_drops_agent_workspace_header_and_writes_the_credentials() {
+        let ws = "wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ";
+        let agent = serde_json::json!({
+            "Anthropic-Workspace-Id": "wrkspc_attacker0000000",
+            "anthropic-workspace-id": "wrkspc_attacker1111111",
+            "x-keep": "1"
+        });
+        let h = scoped_request(agent.clone(), Some(ws)).unwrap();
+        assert_eq!(
+            h.get("anthropic-workspace-id").map(String::as_str),
+            Some(ws)
+        );
+        assert_eq!(
+            h.keys()
+                .filter(|k| k.eq_ignore_ascii_case("anthropic-workspace-id"))
+                .count(),
+            1
+        );
+        assert_eq!(h.get("x-keep").map(String::as_str), Some("1"));
+        // No stored value: the agent's header is dropped and none is sent.
+        let h = scoped_request(agent.clone(), None).unwrap();
+        assert!(!h
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("anthropic-workspace-id")));
+        assert_eq!(h.get("x-keep").map(String::as_str), Some("1"));
+        // An invalid stored value is refused, never written into a header.
+        assert!(scoped_request(agent, Some("bad\r\nx-evil: 1")).is_err());
     }
 
     #[test]
@@ -1887,9 +2165,9 @@ mod tests {
     }
 
     #[test]
-    fn test_ssrf_allows_http() {
+    fn test_ssrf_refuses_plain_http_to_a_public_host() {
         let result = HttpPlugin::validate_url_ssrf("http://api.example.com/v1");
-        assert!(result.is_ok());
+        assert!(result.unwrap_err().to_string().contains("plain http://"));
     }
 
     #[test]

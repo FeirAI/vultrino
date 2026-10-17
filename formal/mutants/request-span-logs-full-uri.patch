@@ -1,0 +1,13 @@
+diff --git a/src/web/server.rs b/src/web/server.rs
+index a48337a..b3f3a12 100644
+--- a/src/web/server.rs
++++ b/src/web/server.rs
+@@ -596,7 +596,7 @@ pub(crate) fn request_span<B>(req: &axum::http::Request<B>) -> tracing::Span {
+     tracing::debug_span!(
+         "request",
+         method = %req.method(),
+-        path = %req.uri().path(),
++        path = %req.uri(),
+         version = ?req.version(),
+     )
+ }

@@ -1,0 +1,13 @@
+diff --git a/src/policy/types.rs b/src/policy/types.rs
+index 9ca5434..a6667a1 100644
+--- a/src/policy/types.rs
++++ b/src/policy/types.rs
+@@ -289,7 +289,7 @@ impl Policy {
+         // VUL-32: a stored Deny or Prompt rule whose url_match pattern reads as more than it
+         // matches (an exact URL a query string slips past, a dead {a,b} glob, ...) is refused
+         // like the RateLimit case below, so a deny is never silently weaker than it reads.
+-        if let Err(e) = super::refuse_warned_url_patterns(self) {
++        if let Err(e) = Ok::<(), String>(()) {
+             return Some(format!(
+                 "stored policy '{name}' (id {id}) is refused: {e}. Fix: run `vultrino policy \
+                  check` to list every such policy, then `vultrino policy fix-url-patterns {id}` \

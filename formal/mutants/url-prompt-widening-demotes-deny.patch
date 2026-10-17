@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 45888b9..28845c9 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -731,7 +731,7 @@ impl PolicyEngine {
+                                     {
+                                         broadened_prompt.set(true);
+                                     }
+-                                    narrow
++                                    narrow || self.eval_pair(other, input, false, Want::WIDE).1
+                                 }
+                             },
+                         };

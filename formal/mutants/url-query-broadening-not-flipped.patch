@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index d4596c1..9af0893 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -884,7 +884,7 @@ impl PolicyEngine {
+                         wide: want.narrow,
+                     },
+                 );
+-                (!w, !n)
++                (!n, !w)
+             }
+ 
+             PolicyCondition::Always => (true, true),

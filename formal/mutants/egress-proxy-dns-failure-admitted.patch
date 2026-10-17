@@ -1,0 +1,13 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 2178b68..b2851ad 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -1009,7 +1009,7 @@ impl HttpPlugin {
+                 }
+                 proxy_needs_resolution(any, host)?;
+             }
+-            Err(_) => proxy_needs_resolution(false, host)?,
++            Err(_) => {}
+         }
+         // This is the REQUEST-time check (fast reject of obvious private targets +
+         // IP literals). The DNS-rebinding TOCTOU it cannot close on its own — a host
