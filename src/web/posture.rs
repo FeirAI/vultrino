@@ -38,6 +38,8 @@ pub(crate) fn build_posture(
         .collect();
     fail_open_rate_limits.sort_unstable();
 
+    let card = config.llm_proxy.rate_card.status();
+
     json!({
         "schema": POSTURE_SCHEMA,
         "plane": "vultrino",
@@ -86,6 +88,17 @@ pub(crate) fn build_posture(
         },
         "vault": {
             "format_version": crate::storage::STORAGE_VERSION,
+        },
+        // The priced-model gate. `sha256` is the fingerprint of the rate-card file read
+        // (the same file leria prices with, so a deploy check can compare the planes);
+        // `last_error` is set when a changed file could not be used and the previous card
+        // is still serving. The path is never reported.
+        "rate_card": {
+            "require_priced_model": config.llm_proxy.require_priced_model,
+            "configured": card.configured,
+            "sha256": card.sha256,
+            "entries": card.entries,
+            "last_error": card.last_error,
         },
         // VUL-02: failed event appends. `gap_pending > 0` means the outbox is failing (or
         // has not had a successful append since it failed) and consumers may be missing
@@ -170,6 +183,36 @@ mod tests {
         assert_eq!(failing["meter"]["gap_pending"], 2);
         assert_eq!(failing["meter"]["gap_markers_emitted"], 1);
         assert!(failing["meter"]["last_failure_at"].is_string());
+    }
+
+    #[test]
+    fn report_carries_the_rate_card_fingerprint_and_the_priced_model_gate() {
+        use sha2::Digest;
+        // No card: the gate is on (the default) and nothing is configured.
+        let v = build_posture(&Config::default(), true, &[], &Default::default());
+        assert_eq!(v["rate_card"]["require_priced_model"], true);
+        assert_eq!(v["rate_card"]["configured"], false);
+        assert!(v["rate_card"]["sha256"].is_null());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card.json");
+        let doc = br#"{"entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1},
+            {"model_ref_prefix":"m","asset":"tokens","price_micros_per_unit":1}]}"#;
+        std::fs::write(&path, doc).unwrap();
+        let mut cfg = Config::default();
+        cfg.llm_proxy = cfg.llm_proxy.with_rate_card_path(&path).unwrap();
+        cfg.llm_proxy.require_priced_model = false;
+        let v = build_posture(&cfg, true, &[], &Default::default());
+        assert_eq!(v["rate_card"]["require_priced_model"], false);
+        assert_eq!(v["rate_card"]["configured"], true);
+        assert_eq!(v["rate_card"]["entries"], 2);
+        // The same digest `sha256sum` prints for the file: what leria reports for it.
+        assert_eq!(
+            v["rate_card"]["sha256"],
+            hex::encode(sha2::Sha256::digest(doc))
+        );
+        // The path is never reported.
+        assert!(!v.to_string().contains("card.json"));
     }
 
     #[test]

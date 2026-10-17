@@ -365,6 +365,33 @@ pub struct LlmProxyConfig {
     /// make every stream for that capability fail closed. The 4 MiB default is far
     /// above any real secret.
     pub stream_max_line_bytes: usize,
+    /// Refuse a model the rate card does not price (default `true`). A model no entry
+    /// covers books `$0` in leria (its token event is rejected as unpriced), so a budget
+    /// cap would never trip for it: with this on, an LLM-proxy request whose model is not
+    /// covered by the card at `rate_card_path` is refused `403 model_unpriced` before any
+    /// upstream call. With no card configured nothing is covered, so every model-bearing
+    /// call is refused (fail closed). `false` is an explicit operator opt-out that
+    /// `/api/v1/posture` reports.
+    pub require_priced_model: bool,
+    /// The rate-card file the metering plane (leria) prices with, the same file (see
+    /// [`crate::ratecard`]). Read at start (an unreadable or invalid file is a startup
+    /// error) and re-read when it changes.
+    pub rate_card_path: Option<PathBuf>,
+    /// The card read from `rate_card_path` (empty when none is configured).
+    pub rate_card: crate::ratecard::RateCardHandle,
+}
+
+impl LlmProxyConfig {
+    /// Point the proxy at the rate-card file at `path` (reads it now).
+    pub fn with_rate_card_path(
+        mut self,
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, crate::ratecard::RateCardError> {
+        let path = path.into();
+        self.rate_card = crate::ratecard::RateCardHandle::open(&path)?;
+        self.rate_card_path = Some(path);
+        Ok(self)
+    }
 }
 
 impl Default for LlmProxyConfig {
@@ -380,6 +407,9 @@ impl Default for LlmProxyConfig {
             // completion, low enough to stop an unbounded/OOM stream.
             stream_max_bytes: 256 * 1024 * 1024,
             stream_max_line_bytes: 4 * 1024 * 1024,
+            require_priced_model: true,
+            rate_card_path: None,
+            rate_card: crate::ratecard::RateCardHandle::unconfigured(),
         }
     }
 }
@@ -693,7 +723,22 @@ impl Config {
             })
             .transpose()?;
 
-        let llm_proxy = raw.llm_proxy.map(Into::into).unwrap_or_default();
+        let llm_proxy = match raw.llm_proxy {
+            Some(raw_llm) => {
+                let path = raw_llm
+                    .rate_card_path
+                    .clone()
+                    .filter(|p| !p.trim().is_empty());
+                let cfg: LlmProxyConfig = raw_llm.into();
+                match path {
+                    Some(p) => cfg.with_rate_card_path(p).map_err(|e| {
+                        ConfigError::Invalid(format!("llm_proxy.rate_card_path: {e}"))
+                    })?,
+                    None => cfg,
+                }
+            }
+            None => LlmProxyConfig::default(),
+        };
 
         // Operator-pinned internal destinations (plan 103 D8/F8). Validated here so
         // a malformed/over-broad destination is a startup failure, never a

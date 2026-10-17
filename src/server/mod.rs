@@ -619,6 +619,19 @@ impl crate::formal_kernel::Dispatch for ActionPayload {
     }
 }
 
+/// The model a request names, for metering: the JSON body's `model`, else a top-level
+/// `model` param, else `_feir_request_model`, which the LLM proxy sets when the model is
+/// carried in the URL path (Gemini `models/<id>:generateContent`).
+fn request_model_of(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("body")
+        .and_then(|b| b.get("model"))
+        .or_else(|| params.get("model"))
+        .or_else(|| params.get("_feir_request_model"))
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+}
+
 /// Metering attribution captured before `context`/`credential` move into the
 /// plugin request, so the streamed-stream finalizer can emit the V13a/V13b
 /// `meter.observed` events after the stream ends — the same subject/timestamp the
@@ -773,16 +786,20 @@ struct StreamEstimateContext {
     /// The request-side model: the rate-card key when the stream echoes none. Without a
     /// model leria cannot price a token event, so no estimate is emitted (V13a only).
     request_model: Option<String>,
+    /// The rate card at the start of the call, to pick a priced model (see
+    /// [`crate::ratecard::pick_meter_model`]).
+    card: Option<Arc<crate::ratecard::RateCard>>,
 }
 
 impl StreamEstimateContext {
     /// The charge for the stream as it stands. A complete trailer is exact; anything else
     /// is an estimate, provided a model is known to price it with.
     fn state(&self, acc: &crate::outbox::UsageAccumulator) -> Option<StreamMeterState> {
-        let model = acc
-            .stream_model()
-            .map(str::to_string)
-            .or_else(|| self.request_model.clone());
+        let model = crate::ratecard::pick_meter_model(
+            self.card.as_deref(),
+            acc.stream_model(),
+            self.request_model.as_deref(),
+        );
         if acc.is_complete() {
             let (usage, _) = acc.snapshot()?;
             return Some(StreamMeterState {
@@ -2790,12 +2807,7 @@ impl VultrinoServer {
         // into the plugin request. The model selects leria's rate card; we prefer
         // the model the provider echoes in the RESPONSE (parsed below, pre-scrub),
         // falling back to this request-side value.
-        let meter_request_model = params
-            .get("body")
-            .and_then(|b| b.get("model"))
-            .or_else(|| params.get("model"))
-            .and_then(|m| m.as_str())
-            .map(str::to_string);
+        let meter_request_model = request_model_of(&params);
         let meter_provider = params
             .get("_feir_provider")
             .and_then(|v| v.as_str())
@@ -2949,9 +2961,17 @@ impl VultrinoServer {
         // V13a api-calls=1 event fires for that call). A non-LLM action (no `usage`
         // block) likewise yields None.
         let meter_token_usage = crate::outbox::parse_token_usage(&response.body);
+        // With a rate card configured the model that books the tokens is one the card
+        // prices: the model the provider served when covered, else the model the request
+        // named (which the proxy checked), so a dated served id the card lacks cannot turn
+        // a priced call into an unpriced `$0` one.
+        let meter_card = self.config.llm_proxy.rate_card.current();
         let meter_model = meter_token_usage.and_then(|_| {
-            crate::outbox::extract_model(&response.body, &serde_json::Value::Null)
-                .or_else(|| meter_request_model.clone())
+            crate::ratecard::pick_meter_model(
+                meter_card.as_deref(),
+                crate::outbox::extract_model(&response.body, &serde_json::Value::Null).as_deref(),
+                meter_request_model.as_deref(),
+            )
         });
 
         // V7 egress controls (before the body ever reaches the agent): fail
@@ -3229,12 +3249,7 @@ impl VultrinoServer {
         // top-level `model`; without this fallback V13b would emit no `dims.model_ref`
         // and leria would price the call CLOSED → token under-count (the dangerous
         // direction). The buffered path already falls back this way.
-        let meter_request_model = params
-            .get("body")
-            .and_then(|b| b.get("model"))
-            .or_else(|| params.get("model"))
-            .and_then(|m| m.as_str())
-            .map(str::to_string);
+        let meter_request_model = request_model_of(&params);
         // VUL-01: what an estimate needs if the stream ends without a usage trailer.
         let estimate_ctx = StreamEstimateContext {
             prompt_bytes: params
@@ -3245,6 +3260,7 @@ impl VultrinoServer {
                 .get("body")
                 .and_then(crate::outbox::request_max_output_tokens),
             request_model: meter_request_model.clone(),
+            card: self.config.llm_proxy.rate_card.current(),
         };
         // Capture the credential's secret material to scrub from the streamed body
         // + headers, before `credential` moves into the plugin request.

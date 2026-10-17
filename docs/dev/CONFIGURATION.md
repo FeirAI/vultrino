@@ -144,9 +144,11 @@ stream_idle_timeout_secs = 120         # default 120 (0 disables)
 stream_total_timeout_secs = 1800       # default 1800 (0 disables)
 stream_max_bytes         = 268435456   # default 256 MiB (0 disables)
 stream_max_line_bytes    = 4194304     # default 4 MiB (must be > 0)
+require_priced_model     = true        # default true: refuse a model the rate card does not price
+rate_card_path           = "/etc/vultrino/rate-card.json"   # the SAME file leria reads
 ```
 
-Every key is optional; an absent key falls back to the streaming-on default.
+Every key is optional; an absent key falls back to the default (streaming on, priced models only).
 
 | Key | Default | Behavior |
 |-----|---------|----------|
@@ -156,6 +158,10 @@ Every key is optional; an absent key falls back to the streaming-on default.
 | `stream_total_timeout_secs` | `1800` | Abort a stream running longer than this in total. `0` disables. |
 | `stream_max_bytes` | `268435456` (256 MiB) | Abort a stream once it has forwarded more than this many bytes. `0` disables. |
 | `stream_max_line_bytes` | `4194304` (4 MiB) | Fail closed if a single un-delimited SSE line / scrub carry-buffer would exceed this. A `0`/absent value falls back to the default (a 0 cap would fail every chunk). |
+| `require_priced_model` | `true` | Refuse an LLM-proxy request whose model the rate card at `rate_card_path` does not price: `403 model_unpriced`, before any upstream call (so the mock or real upstream sees no request). A model no entry covers books $0 in leria (its token event is rejected as unpriced), so a budget cap would never trip for it. A request that carries a body but names no model is refused too (it cannot be shown to be priced); a bodiless request (a model list) is not a billed call and is not gated. The model is the JSON body's `model`, else the id in a Gemini-style `models/<id>:<method>` path. With **no card configured nothing is priced, so every model-bearing call is refused**: set `rate_card_path`, or set this to `false` to opt out explicitly (posture reports it). |
+| `rate_card_path` | unset | The rate-card JSON file leria prices with (`LERIA_RATE_CARD_FILE`): mount one file for both planes. Read at start (an unreadable, empty or malformed file, or a zero token price, is a startup error) and re-read when its size or modified time changes; a changed file that cannot be used keeps the previous card and is reported as `rate_card.last_error` in `/api/v1/posture`. Only coverage is read: an entry with `model_ref` covers exactly that id; an entry with `model_ref_prefix` covers a dated id, the prefix followed by `-` or `@` and more text (`claude-haiku-4-5-20251001`), and a dated id matches no other way. Entries of another asset than `tokens` price nothing. Prices are not used by vultrino. |
+
+When a card is configured the token meter event is booked under a model the card prices: the model the provider served if covered, else the model the request named (which the gate checked), so a dated served id the card lacks cannot turn a priced call into an unpriced $0 one. `/api/v1/posture` reports `rate_card.sha256` (the sha256 of the file bytes, the same digest leria reports) so a deploy check can compare the two planes.
 
 The provider-protocol gate (`VULTRINO_PROVIDER_*_ENABLED`, above) is separate from
 these streaming tunables and governs which protocols may carry traffic at all.

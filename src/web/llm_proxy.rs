@@ -187,6 +187,21 @@ fn normalize_nvidia_tool_stream_options(provider: &str, body: &mut serde_json::V
     true
 }
 
+/// The model a Gemini-style URL path names: `.../models/<id>:<method>` (also
+/// `.../models/<id>`). `None` for any other path. The id is taken up to the first `:`
+/// or `/`.
+fn model_from_path(path: &str) -> Option<String> {
+    let mut segments = path.split('/');
+    while let Some(seg) = segments.next() {
+        if seg == "models" {
+            let id = segments.next()?;
+            let id = id.split(':').next().unwrap_or(id);
+            return (!id.is_empty()).then(|| id.to_string());
+        }
+    }
+    None
+}
+
 /// A JSON error response shaped like an OpenAI API error so the harness's model
 /// client surfaces it cleanly rather than as an opaque transport failure.
 fn llm_error(status: StatusCode, kind: &str, message: &str) -> Response {
@@ -628,6 +643,44 @@ async fn llm_proxy_impl(
         );
     }
 
+    // 4b-bis. Priced models only (`[llm_proxy] require_priced_model`, default on). A model
+    //     the rate card does not price books $0 in the metering plane (its token event is
+    //     rejected as unpriced), so a budget cap would never trip for it: refuse it here,
+    //     BEFORE any upstream call, exactly where the allowlist above refuses. Fail closed
+    //     both ways: a request that carries a body but names no model cannot be shown to be
+    //     priced, and with no card configured nothing is. A bodiless request (a model list,
+    //     a health probe) is not a billed call and is not gated. The model is the JSON
+    //     body's, else the one in a Gemini-style `models/<id>:<method>` path.
+    let gated_model = request_body.as_ref().and_then(|b| {
+        b.get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .or_else(|| model_from_path(&path))
+    });
+    if state.config.llm_proxy.require_priced_model && request_body.is_some() {
+        let priced = gated_model
+            .as_deref()
+            .is_some_and(|m| state.config.llm_proxy.rate_card.covers(m));
+        if !priced {
+            tracing::warn!(
+                model = gated_model.as_deref().unwrap_or("(unspecified)"),
+                card_configured = state.config.llm_proxy.rate_card.is_configured(),
+                "LLM request refused: model is not priced by the rate card"
+            );
+            return llm_error(
+                StatusCode::FORBIDDEN,
+                "model_unpriced",
+                &format!(
+                    "Model {} is not priced by the rate card, so its spend could not be metered against a budget; the request was not sent",
+                    gated_model
+                        .as_deref()
+                        .map(|m| format!("'{m}'"))
+                        .unwrap_or_else(|| "(unspecified)".to_string()),
+                ),
+            );
+        }
+    }
+
     // 4c. Per-call output-token ceiling (rate_companion per-call leg, P1-8): clamp the
     //     request body's `max_tokens` to the capability's ceiling — `min(requested,
     //     ceiling)`, and SET it to the ceiling when the request omits it so the
@@ -734,6 +787,7 @@ async fn llm_proxy_impl(
             "_feir_provider": provider,
             "_feir_region": region,
             "_feir_channel": channel_name,
+            "_feir_request_model": gated_model,
         }),
     };
 

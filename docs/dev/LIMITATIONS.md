@@ -24,6 +24,21 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   complete on its first chunk. The estimate needs a
   request model to price with; a stream with no model meters the V13a `api-calls=1`
   event only. See [METERING.md](METERING.md).
+- **The priced-model gate covers the LLM proxy only, and trusts the request's model.**
+  `[llm_proxy] require_priced_model` (default on) refuses an `/llm` request whose model the
+  rate card does not price, before the upstream call. It does not gate a model call made
+  through `POST /api/v1/execute`, an MCP `http.request` or a named tool: those are metered
+  (the event carries whatever model the body names) but an unpriced model there is still
+  rejected by leria as unpriced and books $0, so budgeted agents should reach models through
+  `/llm` only (the capability and policy for the credential decide that). The gate reads the
+  model the request names (body `model`, or the id in a Gemini-style `models/<id>:` path);
+  it cannot know which model the provider really bills if it serves a different one. The
+  token event is then booked under the served model when the card prices it, else the
+  requested one, so a provider that silently serves a costlier unpriced model is booked at
+  the requested model's price. The card is read from a file: vultrino notices a change by
+  size and modified time, and the two planes agree only while both read the same bytes (the
+  posture `rate_card.sha256` is what a deploy check compares; vultrino does not compare it
+  itself). Cache tokens are charged at the full input price (an over-count for cached reads).
 - **The meter emit is fail-open / out-of-band.** A failed `append_event` still does
   not fail the action it describes, and it mints no sequence, so the stored stream
   stays contiguous. It is no longer silent: every failed append is counted (reported

@@ -103,7 +103,12 @@ Key facts (each load-bearing for the consumer's pricing):
   namespaced `(source, event_id)` dedup. They share the same `correlation_id` (the
   occurrence handle threading both observations onto the same call).
 - `dims.model_ref` selects the rate card. Omitted (no phantom dim) when the model
-  is unknown — the token event still emits, just without `model_ref`.
+  is unknown: the token event still emits, just without `model_ref`. It is present
+  whenever the request named a model, for exact, streamed and estimated events alike. With a rate card configured
+  (`[llm_proxy] rate_card_path`) it is a model the card prices: the model the provider served
+  if covered, else the model the request named. An LLM-proxy request whose model the card does not
+  price is refused (`403 model_unpriced`) before any upstream call, because leria rejects an
+  unpriced token event and the call would book $0 (see CONFIGURATION.md `[llm_proxy]`).
 - No `currency` field (usd is the consumer's single-base default).
 
 ### Parsing — RAW body, BEFORE scrub
@@ -118,7 +123,14 @@ cumulative ceiling below its limit → budgets never fire → unbounded spend). 
 Two provider shapes are recognized (both nested under top-level `usage`):
 
 - **OpenAI-style:** `usage.{prompt_tokens, completion_tokens}` → input/output.
-- **Anthropic-style:** `usage.{input_tokens, output_tokens}` → input/output.
+- **Anthropic-style:** `usage.{input_tokens, output_tokens}` → input/output. Anthropic's
+  `cache_creation_input_tokens` and `cache_read_input_tokens` are billed input that
+  `input_tokens` does not include, so they are **added to the input count** (Bedrock
+  Converse's `cacheReadInputTokens` and `cacheWriteInputTokens` likewise). They are charged at
+  the full input price: the card has one input price per model and a cached read is cheaper at
+  the provider, so this over-counts rather than under-counts. OpenAI's `prompt_tokens` already
+  includes cached tokens and is left alone. In a stream the cache counts of `message_start`
+  are added (the largest value seen wins, never summed twice).
 
 Negative/float/oversized counts are rejected (`as_u64`), and a body missing a
 recognized count pair yields no token event. The `model` is taken from the

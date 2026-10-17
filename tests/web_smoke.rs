@@ -2527,7 +2527,10 @@ async fn test_event_feed_reports_pending_meter_gap_while_appends_fail() {
         serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()
     };
 
-    assert_eq!(feed(router.clone(), key.clone()).await["meter_gap_pending"], 0);
+    assert_eq!(
+        feed(router.clone(), key.clone()).await["meter_gap_pending"],
+        0
+    );
 
     let tmp = dir.path().join("outbox.tmp");
     std::fs::create_dir_all(&tmp).unwrap();
@@ -2536,7 +2539,10 @@ async fn test_event_feed_reports_pending_meter_gap_while_appends_fail() {
         .await
         .is_err());
     let body = feed(router.clone(), key.clone()).await;
-    assert_eq!(body["meter_gap_pending"], 1, "failing appends are visible on the feed");
+    assert_eq!(
+        body["meter_gap_pending"], 1,
+        "failing appends are visible on the feed"
+    );
     assert!(body["events"].as_array().unwrap().is_empty());
 
     std::fs::remove_dir(&tmp).unwrap();

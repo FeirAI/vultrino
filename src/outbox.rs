@@ -278,6 +278,26 @@ pub struct TokenUsage {
     pub output_tokens: u64,
 }
 
+/// Input tokens a provider reports OUTSIDE its plain input count: Anthropic's
+/// `cache_creation_input_tokens` and `cache_read_input_tokens` (and Bedrock Converse's
+/// `cacheReadInputTokens` / `cacheWriteInputTokens`). They are billed input but are not
+/// part of `input_tokens`, so leaving them out under-counts the spend (the dangerous
+/// direction). They are charged at the full input price: the rate card has one input price
+/// per model, and a cached read is cheaper at the provider, so this over-counts rather
+/// than under-counts. OpenAI's `prompt_tokens` already includes cached tokens and is not
+/// touched.
+fn cache_input_tokens(usage: &serde_json::Map<String, serde_json::Value>) -> u64 {
+    [
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "cacheReadInputTokens",
+        "cacheWriteInputTokens",
+    ]
+    .iter()
+    .filter_map(|k| usage.get(*k).and_then(serde_json::Value::as_u64))
+    .fold(0u64, u64::saturating_add)
+}
+
 /// Parse a provider `usage` block from a **non-streamed** LLM response body
 /// (V13b). Best-effort: returns `None` for any body that isn't a JSON object
 /// carrying a recognized `usage` shape (a streamed response without a usage
@@ -346,14 +366,14 @@ pub fn parse_token_usage(raw_body: &[u8]) -> Option<TokenUsage> {
     }
     if let (Some(input), Some(output)) = (read("input_tokens"), read("output_tokens")) {
         return Some(TokenUsage {
-            input_tokens: input,
+            input_tokens: input.saturating_add(cache_input_tokens(usage)),
             output_tokens: output,
         });
     }
     // Amazon Bedrock Converse uses camelCase counts.
     if let (Some(input), Some(output)) = (read("inputTokens"), read("outputTokens")) {
         return Some(TokenUsage {
-            input_tokens: input,
+            input_tokens: input.saturating_add(cache_input_tokens(usage)),
             output_tokens: output,
         });
     }
@@ -446,6 +466,9 @@ pub fn maybe_inject_stream_usage(body: &mut serde_json::Value) -> bool {
 ///   the final delta is authoritative; never summed).
 pub struct UsageAccumulator {
     input_tokens: Option<u64>,
+    /// Billed input outside `input_tokens` (see [`cache_input_tokens`]); cumulative on the
+    /// provider side, so the largest value seen wins. Added to the input count on read.
+    cache_input_tokens: u64,
     output_tokens: Option<u64>,
     model: Option<String>,
     /// Carry for a partial trailing SSE line split across chunks.
@@ -470,6 +493,7 @@ impl UsageAccumulator {
     pub fn new(max_line: usize) -> Self {
         Self {
             input_tokens: None,
+            cache_input_tokens: 0,
             output_tokens: None,
             model: None,
             line_buf: Vec::new(),
@@ -485,6 +509,12 @@ impl UsageAccumulator {
     /// the stream's own numbers (not an estimate) can be charged.
     pub fn is_complete(&self) -> bool {
         self.final_usage && self.input_tokens.is_some() && self.output_tokens.is_some()
+    }
+
+    /// The input count to charge: the provider's `input_tokens` plus cache tokens.
+    fn input_total(&self) -> Option<u64> {
+        self.input_tokens
+            .map(|i| i.saturating_add(self.cache_input_tokens))
     }
 
     /// The model the stream itself reported, if any (without consuming it).
@@ -528,7 +558,7 @@ impl UsageAccumulator {
     /// usage split is returned only when BOTH input and output counts were seen.
     pub fn finish(&mut self) -> (Option<TokenUsage>, Option<String>) {
         self.flush();
-        let usage = match (self.input_tokens, self.output_tokens) {
+        let usage = match (self.input_total(), self.output_tokens) {
             (Some(input_tokens), Some(output_tokens)) => Some(TokenUsage {
                 input_tokens,
                 output_tokens,
@@ -547,7 +577,7 @@ impl UsageAccumulator {
     /// partial line buffer or take the model (it clones it), so it is safe to call every
     /// chunk; a complete split only materializes once the trailer line is fully parsed.
     pub fn snapshot(&self) -> Option<(TokenUsage, Option<String>)> {
-        match (self.input_tokens, self.output_tokens) {
+        match (self.input_total(), self.output_tokens) {
             (Some(input_tokens), Some(output_tokens)) => Some((
                 TokenUsage {
                     input_tokens,
@@ -634,6 +664,7 @@ impl UsageAccumulator {
             if carries_final_counts {
                 self.final_usage = true;
             }
+            self.cache_input_tokens = self.cache_input_tokens.max(cache_input_tokens(obj));
             // INPUT tokens: FIRST-wins. The prompt count is reported once and early
             // (OpenAI's terminal usage chunk; Anthropic's `message_start`); a stray
             // `input_tokens` in a later event must not clobber the real prompt count.
@@ -715,9 +746,11 @@ pub fn estimate_stream_usage(
     prompt_bytes: u64,
     max_output_tokens: Option<u64>,
 ) -> TokenUsage {
-    let input_tokens = acc
-        .input_tokens
-        .unwrap_or_else(|| prompt_bytes.div_ceil(ESTIMATE_BYTES_PER_TOKEN));
+    let input_tokens = acc.input_total().unwrap_or_else(|| {
+        prompt_bytes
+            .div_ceil(ESTIMATE_BYTES_PER_TOKEN)
+            .saturating_add(acc.cache_input_tokens)
+    });
     let generated = if acc.capped {
         acc.raw_bytes
     } else {
@@ -1109,6 +1142,36 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_cache_tokens_are_added_to_the_input_count() {
+        // cache_creation and cache_read are billed input outside `input_tokens`.
+        let body = br#"{"model":"m","usage":{"input_tokens":10,
+            "cache_creation_input_tokens":100,"cache_read_input_tokens":1000,"output_tokens":5}}"#;
+        let u = parse_token_usage(body).unwrap();
+        assert_eq!(u.input_tokens, 1110);
+        assert_eq!(u.output_tokens, 5);
+        // Only one of the two present.
+        let body =
+            br#"{"usage":{"input_tokens":10,"cache_read_input_tokens":7,"output_tokens":5}}"#;
+        assert_eq!(parse_token_usage(body).unwrap().input_tokens, 17);
+        // Bedrock Converse spells them in camelCase.
+        let body = br#"{"usage":{"inputTokens":4,"cacheReadInputTokens":3,"cacheWriteInputTokens":2,"outputTokens":1}}"#;
+        assert_eq!(parse_token_usage(body).unwrap().input_tokens, 9);
+        // OpenAI's prompt_tokens already includes cached tokens: nothing is added.
+        let body = br#"{"usage":{"prompt_tokens":50,"completion_tokens":5,
+            "cache_read_input_tokens":999}}"#;
+        assert_eq!(parse_token_usage(body).unwrap().input_tokens, 50);
+        // An absurd value saturates instead of wrapping to a small count.
+        let body = format!(
+            r#"{{"usage":{{"input_tokens":1,"cache_read_input_tokens":{},"output_tokens":1}}}}"#,
+            u64::MAX
+        );
+        assert_eq!(
+            parse_token_usage(body.as_bytes()).unwrap().input_tokens,
+            u64::MAX
+        );
+    }
+
+    #[test]
     fn test_parse_token_usage_none_for_no_usage_block() {
         // No usage block (streamed response without a usage trailer, or a non-LLM
         // action) → None → caller emits only the V13a api-calls=1 event.
@@ -1397,6 +1460,55 @@ mod tests {
 
     fn feed(acc: &mut UsageAccumulator, text: &str) {
         acc.push(text.as_bytes());
+    }
+
+    #[test]
+    fn streamed_anthropic_cache_tokens_are_added_to_the_input_count() {
+        let mut acc = UsageAccumulator::new(1 << 20);
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":1000,\"output_tokens\":1}}}\n\n",
+        );
+        // Provisional: not final yet, but the input already includes the cache tokens.
+        assert!(!acc.is_complete());
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        );
+        assert!(acc.is_complete());
+        let (usage, _) = acc.snapshot().unwrap();
+        assert_eq!(usage.input_tokens, 1110);
+        assert_eq!(usage.output_tokens, 5);
+        let (usage, _) = acc.finish();
+        assert_eq!(usage.unwrap().input_tokens, 1110);
+    }
+
+    #[test]
+    fn a_later_cumulative_cache_count_is_not_summed_with_the_first() {
+        // Newer Anthropic message_delta blocks repeat the cumulative cache counts: the
+        // largest value wins, they are never added again.
+        let mut acc = UsageAccumulator::new(1 << 20);
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":1000,\"output_tokens\":1}}}\n\n",
+        );
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":1000,\"output_tokens\":5}}\n\n",
+        );
+        assert_eq!(acc.snapshot().unwrap().0.input_tokens, 1010);
+    }
+
+    #[test]
+    fn an_estimate_keeps_the_cache_tokens_it_saw() {
+        let mut acc = UsageAccumulator::new(1 << 20);
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":90,\"output_tokens\":1}}}\n\n",
+        );
+        // No final trailer: an estimate, but the provider's input count (with cache) stands.
+        assert!(!acc.is_complete());
+        assert_eq!(estimate_stream_usage(&acc, 3000, None).input_tokens, 100);
     }
 
     #[test]
