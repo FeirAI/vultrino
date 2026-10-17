@@ -358,6 +358,12 @@ fn verifier_secrets() -> Result<Vec<Zeroizing<Vec<u8>>>, &'static str> {
                 .map_err(|_| "workload assertion verifier is not configured")?,
         },
     );
+    parse_verifier_secrets(&value)
+}
+
+/// The verifier list from its configured text: shared by the exchange (which verifies with it) and the
+/// posture report (which fingerprints each entry), so the two can never disagree about the list.
+pub(crate) fn parse_verifier_secrets(value: &str) -> Result<Vec<Zeroizing<Vec<u8>>>, &'static str> {
     // A comma-separated LIST of verifier secrets (dual-secret overlap for rotation); a single value is a
     // 1-element list = the pre-rotation behavior. Each non-blank entry is trimmed and must be >= 32
     // bytes. An all-blank/empty configuration yields no secrets → fail closed (never verify against no
@@ -397,6 +403,19 @@ impl WorkloadVerifier {
         match verifier_secrets() {
             Ok(secrets) => Self::Configured(Arc::new(secrets)),
             Err(message) => Self::Invalid(message),
+        }
+    }
+
+    /// The keyed fingerprint (FEI-40 relationship L) of every verifier secret the exchange accepts,
+    /// in list order; empty while the exchange is disabled or invalid. Never a secret.
+    pub(crate) fn fingerprints(&self, relationship: &str) -> Vec<String> {
+        match self {
+            Self::Configured(secrets) => secrets
+                .iter()
+                .filter_map(|s| std::str::from_utf8(s).ok())
+                .filter_map(|s| crate::secret_fp::fingerprint(s, relationship))
+                .collect(),
+            Self::Disabled | Self::Invalid(_) => Vec::new(),
         }
     }
 

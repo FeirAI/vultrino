@@ -644,6 +644,17 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
                     .to_string(),
             ));
         }
+        // The same URL parse and plain-http refusal (VUL-29) the client constructor applies: a base_url
+        // that cannot be parsed, or plain http:// to a public address, makes `AverinClient::new` fail.
+        if enabled {
+            if let Err(why) = crate::plain_http::check(&base_url) {
+                return Err(ConfigError::Invalid(format!(
+                    "[averin] enabled = true but base_url {base_url:?} is refused ({why}): the seal \
+                     client cannot be built, so no action would be sealed and no receipt gap would \
+                     be recorded. Fix base_url, or set enabled = false."
+                )));
+            }
+        }
         Ok(Self {
             enabled,
             base_url,
@@ -1478,6 +1489,39 @@ action = "deny"
             "[averin]\nenabled = true\nbase_url = \"http://x\"\nresource_id = \"r\""
         )
         .is_ok());
+    }
+
+    /// FEI-33 (review round 1): a base_url the seal client constructor refuses (it does not parse, or
+    /// it is plain http:// to a public address, VUL-29) used to start the server with the client off
+    /// behind a warn line. It must not load. The same values on a disabled block are not judged, and
+    /// https or a private http address still load.
+    #[test]
+    fn fei33_enabled_averin_with_an_unusable_base_url_refuses_to_load() {
+        for url in [
+            "averin:8080",
+            "not a url",
+            "http://203.0.113.9:8080",
+            "ftp://10.0.0.1/",
+        ] {
+            let toml = format!("[averin]\nenabled = true\nbase_url = {url:?}\nresource_id = \"r\"");
+            let msg = Config::parse(&toml)
+                .expect_err("an enabled averin block with an unusable base_url must refuse")
+                .to_string();
+            assert!(
+                msg.contains("base_url") && msg.contains("receipt"),
+                "{url}: {msg}"
+            );
+            let off = toml.replace("enabled = true", "enabled = false");
+            assert!(Config::parse(&off).is_ok(), "{url} on a disabled block");
+        }
+        for url in [
+            "https://averin.example.com",
+            "http://10.0.0.5:8080",
+            "http://127.0.0.1:8080",
+        ] {
+            let toml = format!("[averin]\nenabled = true\nbase_url = {url:?}\nresource_id = \"r\"");
+            assert!(Config::parse(&toml).is_ok(), "{url}");
+        }
     }
 
     #[test]

@@ -294,7 +294,9 @@ credential: `schema`, `plane`, `build` (`version`, `rustc`, `git_sha`, `git_dirt
 `RateLimit` condition and a non-deny default), `vault.format_version` (the version this binary writes; a vault is
 migrated when it is opened), and `secret_fingerprints`: an object from relationship name to a list of keyed
 fingerprints of the shared secrets this process holds, for `vultrino-outbox-poll` and `vultrino-approval-push` (the
-`[outbox] hmac_secret`, one value fingerprinted once per relationship), `tenant-assertion` (the secret it signs
+`[outbox] hmac_secret`, one value fingerprinted once per relationship), `workload-assertion` (one fingerprint per verifier secret the workload exchange accepts, the same
+list it verifies with, so a rotation overlap reports both; present only while the exchange is configured),
+`tenant-assertion` (the secret it signs
 calls to govder with) and `approver-key` (the key that verifies the broker's signed approver decisions; absent when
 that key is not usable). A fingerprint is the first 16 bytes of HMAC-SHA256 keyed by the secret over
 `feir-secret-alignment/v1:<relationship>`: not the secret, but only as private as the secret is strong. An unset

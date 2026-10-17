@@ -307,6 +307,80 @@ async fn dual_secret_list_accepts_either_secret() {
     );
 }
 
+/// FEI-40 relationship L, against the real router: the secrets `GET /api/v1/posture` fingerprints are
+/// exactly the secrets the exchange verifies with. A secret the report fingerprints signs an assertion
+/// the exchange accepts; one it does not fingerprint is refused. So a verifier that compares a runtime-edge
+/// fingerprint with this report is comparing against what the exchange really accepts.
+#[tokio::test]
+// The guard intentionally spans the `.await`s below: it holds the env stable
+// (see the ENV_LOCK doc comment) for the whole request, not just setup.
+#[allow(clippy::await_holding_lock)]
+async fn posture_reports_exactly_the_secrets_the_exchange_verifies_with() {
+    use vultrino::secret_fp::fingerprint;
+    const REL: &str = "workload-assertion";
+    let listed = [VERIFIER_SECRET, WRONG_SECRET];
+    let outsider: &[u8] = b"outsider-secret-0123456789abcdefghij";
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("VULTRINO_WORKLOAD_EXCHANGE_ENABLED", "1");
+        std::env::set_var(
+            "VULTRINO_WORKLOAD_ASSERTION_SECRET",
+            format!(
+                " {} , {} ,",
+                String::from_utf8_lossy(listed[0]),
+                String::from_utf8_lossy(listed[1])
+            ),
+        );
+        std::env::remove_var("VULTRINO_WORKLOAD_ASSERTION_SECRET_FILE");
+    }
+    let (router, _storage, admin_key) = build_router().await;
+    author_grant(&router, &admin_key).await;
+
+    let posture = |router: axum::Router| {
+        let admin_key = admin_key.clone();
+        async move {
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/posture")
+                        .header("authorization", format!("Bearer {admin_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        }
+    };
+    let report = posture(router.clone()).await;
+    let reported = report["secret_fingerprints"][REL].clone();
+    let fp = |s: &[u8]| fingerprint(std::str::from_utf8(s).unwrap(), REL).unwrap();
+    assert_eq!(reported, serde_json::json!([fp(listed[0]), fp(listed[1])]));
+    assert!(!report
+        .to_string()
+        .contains(&String::from_utf8_lossy(listed[0]).to_string()));
+    let reported: Vec<String> = serde_json::from_value(reported).unwrap();
+
+    for (i, secret) in listed.iter().enumerate() {
+        assert!(reported.contains(&fp(secret)));
+        let a = mint_assertion(secret, valid_claims(&format!("jti-posture-{i}")));
+        let resp = router.clone().oneshot(exchange_req(&a)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "listed secret {i} must verify"
+        );
+    }
+    assert!(!reported.contains(&fp(outsider)));
+    let a = mint_assertion(outsider, valid_claims("jti-posture-outsider"));
+    let resp = router.oneshot(exchange_req(&a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// A secret NOT in the verifier list is still rejected 401 — the list widens the accept set to exactly
 /// the configured secrets, no further (the overlap is a bounded, temporary rotation window).
 #[tokio::test]

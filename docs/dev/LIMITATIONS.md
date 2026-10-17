@@ -425,9 +425,14 @@ kernels.
   material, and a committed use seal before `plugin.execute*`, independent of the
   ordinary Observe/RequireEvidence posture. Unknown `[averin] mode` values are
   refused at config load rather than coerced into Observe, and so is an `[averin]` block with
-  `enabled = true` and an empty `base_url` or `resource_id` (it used to start with the seal
-  client silently off, so no receipt and no gap event; a block that parses but names an
-  unreachable averin still starts and records every action as a receipt gap). Undeclared actions in
+  `enabled = true` and an empty `resource_id`, or a `base_url` that is empty, does not parse, or is plain
+  `http://` to a public address (the same refusals the seal client applies when it is built; it used
+  to start with the seal client silently off, so no receipt and no gap event). The server
+  constructor refuses too if the client still cannot be built (`VultrinoServer::try_new`; the
+  binary reports it as a startup error). A block that parses and builds but names an unreachable
+  averin, or a key averin rejects, still starts and records every action as a receipt gap. The
+  plain-http check resolves a host name at load time; a name that resolves differently later is
+  caught only by the connect-time guard. Undeclared actions in
   non-strict posture, reversible declarations, and deployments with Averin
   disabled still have no record-existence guarantee (with Averin disabled there is no
   receipt to fail, so no gap event either).

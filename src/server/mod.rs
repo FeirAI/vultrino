@@ -996,12 +996,27 @@ struct DurableMintSeed<'a> {
 }
 
 impl VultrinoServer {
-    /// Create a new Vultrino server
+    /// Create a new Vultrino server. Panics (a refusal to start) when `[averin] enabled = true` but the
+    /// seal client cannot be built (FEI-33); the binary uses [`Self::try_new`] to report it as an error.
     pub fn new(
         config: Config,
         storage: Arc<dyn StorageBackend>,
         resolver: CredentialResolver,
     ) -> Self {
+        match Self::try_new(config, storage, resolver) {
+            Ok(server) => server,
+            Err(e) => panic!("refusing to start: {e}"),
+        }
+    }
+
+    /// Create a new Vultrino server, or say why it must not start: an `[averin]` block with
+    /// `enabled = true` whose seal client cannot be built would run every Observe action with no
+    /// receipt and no `evidence.receipt_gap` event, so it is an error and never a warning.
+    pub fn try_new(
+        config: Config,
+        storage: Arc<dyn StorageBackend>,
+        resolver: CredentialResolver,
+    ) -> Result<Self, String> {
         let plugins = Arc::new(PluginRegistry::new());
         // Plan 103 D8/F8 — the operator-pinned internal-destination plugin. Always
         // registered, even with ZERO declared destinations: a capability routed to
@@ -1098,14 +1113,13 @@ impl VultrinoServer {
         // averin seal-client (plan 086). Built once here (before `config` moves
         // into Self) so the SAME instance — and its shared PoP map — backs both
         // the mint hook and the execute hook. `Ok(None)` when disabled (the
-        // default) → no-op hooks; an init error disables it (never fails startup).
-        let averin = match crate::averin::AverinClient::new(config.averin.clone()) {
-            Ok(client) => client.map(Arc::new),
-            Err(e) => {
-                warn!(error = %e, "averin seal-client disabled: config invalid");
-                None
-            }
-        };
+        // default) → no-op hooks. An enabled block that cannot build a client refuses to start
+        // (FEI-33): silently running with the client off records no receipt and no gap.
+        let averin = crate::averin::AverinClient::new(config.averin.clone())
+            .map_err(|e| {
+                format!("[averin] enabled = true but the seal client cannot be built: {e}")
+            })?
+            .map(Arc::new);
 
         // Govder gate-rule client (plan 100 P2 Phase D). `None` when unconfigured or
         // invalid — approval RECIPES are then unenforceable, so every approval-open
@@ -1167,7 +1181,7 @@ impl VultrinoServer {
             );
         }
 
-        Self {
+        Ok(Self {
             config,
             resolver,
             plugins,
@@ -1185,7 +1199,7 @@ impl VultrinoServer {
             outbox_metrics: Arc::new(OutboxMetrics::default()),
             averin,
             govder,
-        }
+        })
     }
 
     /// The averin seal-client, if `[averin] enabled = true`. `None` otherwise
@@ -8926,6 +8940,45 @@ mod durable_enqueue_tests {
             "an oversize durable use must never be enqueued at all — not even a truncated or \
              quarantined record"
         );
+    }
+
+    /// FEI-33 (review round 1): an `[averin]` block with `enabled = true` whose seal client cannot be
+    /// built must not start the server with the client silently off. Config load refuses the usual
+    /// causes; this is the constructor's own guard for a config that reached it anyway (a value the
+    /// load check does not see, or a `Config` built in code).
+    #[tokio::test]
+    async fn fei33_server_refuses_to_start_when_the_enabled_seal_client_cannot_be_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::FileStorage::new(
+                &dir.path().join("vault.enc"),
+                &secrecy::SecretString::from("test-password"),
+            )
+            .await
+            .unwrap(),
+        );
+        for base_url in ["averin:8080", "http://203.0.113.9:8080"] {
+            let config = Config {
+                averin: AverinConfig {
+                    enabled: true,
+                    base_url: base_url.to_string(),
+                    resource_id: "orders-db".to_string(),
+                    ..AverinConfig::default()
+                },
+                ..Default::default()
+            };
+            let resolver = CredentialResolver::new(storage.clone());
+            let err = VultrinoServer::try_new(config, storage.clone(), resolver)
+                .err()
+                .unwrap_or_else(|| panic!("{base_url}: started with the seal client off"));
+            assert!(err.contains("seal client cannot be built"), "{err}");
+        }
+        // Disabled stays a valid start with no client.
+        let resolver = CredentialResolver::new(storage.clone());
+        let ok = VultrinoServer::try_new(Config::default(), storage.clone(), resolver)
+            .ok()
+            .expect("a disabled averin block starts");
+        assert!(ok.averin().is_none());
     }
 
     /// FEI-33: a failed local durable enqueue (disk full, fsync EIO) is recorded as an individual

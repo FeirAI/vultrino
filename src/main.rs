@@ -1202,7 +1202,7 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     let averin_enabled = config.averin.enabled;
     let averin_durable = config.averin.durable;
     let resolver = CredentialResolver::new(storage.clone());
-    let server = VultrinoServer::new(config, storage, resolver);
+    let server = VultrinoServer::try_new(config, storage, resolver)?;
 
     // Load installed plugins
     if let Err(e) = server.load_plugins().await {
@@ -1316,7 +1316,7 @@ async fn run_web_server(
     // `load_plugins()` did pick it up, at the cost of a full WASM re-scan on
     // every request). Restart the web server after `vultrino plugin install`.
     let resolver = CredentialResolver::new(storage.clone());
-    let exec_server = VultrinoServer::new(config.clone(), storage.clone(), resolver);
+    let exec_server = VultrinoServer::try_new(config.clone(), storage.clone(), resolver)?;
     if let Err(e) = exec_server.load_plugins().await {
         warn!("Failed to load plugins: {}", e);
     }
@@ -2723,7 +2723,7 @@ async fn approval_status(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config).await?;
     let resolver = CredentialResolver::new(storage.clone());
-    let server = VultrinoServer::new(config, storage, resolver);
+    let server = VultrinoServer::try_new(config, storage, resolver)?;
     server.load_plugins().await?;
     // Apply admin-API-managed policies (V1) so the CLI enforces the same set.
     server.reload_policies().await?;

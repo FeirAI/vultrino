@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use crate::config::{Config, TenantMode};
 use crate::policy::Policy;
+use crate::web::workload_exchange::WorkloadVerifier;
 
 /// Schema version of the report; the verifier refuses a version it does not know.
 pub const POSTURE_SCHEMA: u32 = 1;
@@ -17,8 +18,13 @@ pub const POSTURE_SCHEMA: u32 = 1;
 ///
 /// `default_deny` is the policy engine's live default (set from `[enforcement] default_action`),
 /// `policies` the policies the engine enforces right now (config plus stored).
-pub(crate) fn build_posture(config: &Config, default_deny: bool, policies: &[Policy]) -> Value {
-    let secret_fingerprints = secret_fingerprints(config);
+pub(crate) fn build_posture(
+    config: &Config,
+    default_deny: bool,
+    policies: &[Policy],
+    workload: &WorkloadVerifier,
+) -> Value {
+    let secret_fingerprints = secret_fingerprints(config, workload);
     let key = config.govder.as_ref().map(|g| g.approval_key_posture());
     let mut observe_tenants: Vec<&str> = config
         .tenants
@@ -97,11 +103,12 @@ const REL_OUTBOX_POLL: &str = "vultrino-outbox-poll"; // A: vultrino signs its m
 const REL_APPROVAL_PUSH: &str = "vultrino-approval-push"; // E: the same outbox secret signs approval pushes; govder verifies
 const REL_TENANT_ASSERTION: &str = "tenant-assertion"; // F: the edge/broker-signed tenant assertion (vultrino signs its calls to govder with it)
 const REL_AVERIN_API_KEY: &str = "averin-api-key"; // I: the project bearer vultrino sends to averin (averin accepts a list)
+const REL_WORKLOAD_ASSERTION: &str = "workload-assertion"; // L: the secret feir-runtime-edge signs workload assertions with; vultrino verifies (a list, for rotation)
 const REL_APPROVER_KEY: &str = "approver-key"; // M: the key that verifies the broker's signed approver decisions
 
 /// The fingerprints of the secrets this process was configured with, per relationship. A
 /// relationship with no configured secret is omitted (an unset secret has no fingerprint).
-fn secret_fingerprints(config: &Config) -> Value {
+fn secret_fingerprints(config: &Config, workload: &WorkloadVerifier) -> Value {
     use crate::secret_fp::fingerprint;
     let mut out = serde_json::Map::new();
     let mut add = |rel: &str, secret: Option<&str>| {
@@ -132,6 +139,13 @@ fn secret_fingerprints(config: &Config) -> Value {
     if let Some(g) = config.govder.as_ref() {
         add(REL_TENANT_ASSERTION, Some(g.assertion_secret.as_str()));
         add(REL_APPROVER_KEY, g.approval_verification_secret());
+    }
+    // L: one fingerprint per verifier secret the exchange accepts (the same comma-split, trimmed list
+    // it verifies with, so a rotation overlap reports both). Reported only while the exchange is
+    // configured and valid: a disabled or invalid exchange verifies nothing.
+    let workload_fps = workload.fingerprints(REL_WORKLOAD_ASSERTION);
+    if !workload_fps.is_empty() {
+        out.insert(REL_WORKLOAD_ASSERTION.to_string(), json!(workload_fps));
     }
     Value::Object(out)
 }
@@ -165,7 +179,12 @@ mod tests {
             rate_limited("rl-open", PolicyAction::Allow),
             rate_limited("rl-closed", PolicyAction::Deny),
         ];
-        let v = build_posture(&Config::default(), true, &policies);
+        let v = build_posture(
+            &Config::default(),
+            true,
+            &policies,
+            &WorkloadVerifier::Disabled,
+        );
         assert_eq!(
             v["policies"]["rate_limit_default_not_deny"],
             json!(["rl-open"])
@@ -175,9 +194,9 @@ mod tests {
 
     #[test]
     fn report_reflects_the_live_engine_default_and_never_claims_deny_it_was_not_given() {
-        let v = build_posture(&Config::default(), false, &[]);
+        let v = build_posture(&Config::default(), false, &[], &WorkloadVerifier::Disabled);
         assert_eq!(v["engine"]["default_deny"], false);
-        let v = build_posture(&Config::default(), true, &[]);
+        let v = build_posture(&Config::default(), true, &[], &WorkloadVerifier::Disabled);
         assert_eq!(v["engine"]["default_deny"], true);
     }
 
@@ -187,18 +206,18 @@ mod tests {
         cfg.tenants.insert("b".into(), TenantMode::Observe);
         cfg.tenants.insert("a".into(), TenantMode::Observe);
         cfg.tenants.insert("c".into(), TenantMode::Enforce);
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
         assert_eq!(v["engine"]["tenants_in_observe_mode"], json!(["a", "b"]));
         assert_eq!(v["engine"]["unlisted_tenant_mode"], "enforce");
     }
 
     #[test]
     fn report_carries_the_sod_flag_and_the_vault_format_and_no_secret_material() {
-        let v = build_posture(&Config::default(), true, &[]);
+        let v = build_posture(&Config::default(), true, &[], &WorkloadVerifier::Disabled);
         assert_eq!(v["approvals"]["enforce_separation_of_duty"], false);
         let mut cfg = Config::default();
         cfg.approval.enforce_separation_of_duty = true;
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
         assert_eq!(v["approvals"]["enforce_separation_of_duty"], true);
         assert_eq!(
             v["vault"]["format_version"],
@@ -241,7 +260,7 @@ mod tests {
                 govder: Some(govder(f, m, esc)),
                 ..Config::default()
             };
-            let v = build_posture(&cfg, true, &[]);
+            let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
             let a = &v["approver_identity"];
             assert_eq!(a["govder_configured"], true);
             assert_eq!(a["key_configured"], configured, "{f}/{m:?}");
@@ -275,7 +294,7 @@ mod tests {
         cfg.outbox.enabled = true;
         cfg.outbox.url = Some("http://govder.invalid/webhooks/vultrino-approvals".into());
         cfg.govder = Some(govder_cfg(Some("approver-key-M")));
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
         let fp = &v["secret_fingerprints"];
         assert_eq!(
             fp["vultrino-outbox-poll"],
@@ -306,7 +325,7 @@ mod tests {
     fn report_omits_the_push_relationship_when_the_outbox_does_not_push() {
         let mut cfg = Config::default();
         cfg.outbox.hmac_secret = Some("outbox-secret-A".into());
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
         assert!(v["secret_fingerprints"]
             .get("vultrino-outbox-poll")
             .is_some());
@@ -314,12 +333,12 @@ mod tests {
             .get("vultrino-approval-push")
             .is_none());
         cfg.outbox.enabled = true; // enabled but no URL: still nowhere to push
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
         assert!(v["secret_fingerprints"]
             .get("vultrino-approval-push")
             .is_none());
         cfg.outbox.url = Some("  ".into());
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
         assert!(v["secret_fingerprints"]
             .get("vultrino-approval-push")
             .is_none());
@@ -333,17 +352,17 @@ mod tests {
         let mut cfg = Config::default();
         cfg.averin.api_key = Some("averin-project-bearer".into());
         cfg.averin.enabled = false;
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
         assert!(v["secret_fingerprints"].get("averin-api-key").is_none());
         cfg.averin.enabled = true;
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
         assert_eq!(
             v["secret_fingerprints"]["averin-api-key"],
             json!([fingerprint("averin-project-bearer", "averin-api-key").unwrap()])
         );
         assert!(!v.to_string().contains("averin-project-bearer"));
         cfg.averin.api_key = None;
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
         assert!(v["secret_fingerprints"].get("averin-api-key").is_none());
     }
 
@@ -352,14 +371,41 @@ mod tests {
     /// held.
     #[test]
     fn report_omits_unset_secrets_and_an_unusable_approver_key() {
-        let v = build_posture(&Config::default(), true, &[]);
+        let v = build_posture(&Config::default(), true, &[], &WorkloadVerifier::Disabled);
         assert_eq!(v["secret_fingerprints"], json!({}));
         let cfg = Config {
             govder: Some(govder_cfg(Some("assertion-F"))), // M equal to F: disabled
             ..Config::default()
         };
-        let v = build_posture(&cfg, true, &[]);
+        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
         assert!(v["secret_fingerprints"].get("approver-key").is_none());
         assert!(v["secret_fingerprints"].get("tenant-assertion").is_some());
+    }
+
+    /// FEI-40 relationship L: vultrino reports one fingerprint per verifier secret the workload
+    /// exchange accepts (the comma-split, trimmed list it verifies with, so a rotation overlap
+    /// reports both), only while the exchange is configured, and never a secret.
+    #[test]
+    fn report_carries_a_workload_assertion_fingerprint_per_verifier_secret() {
+        use crate::secret_fp::fingerprint;
+        use crate::web::workload_exchange::parse_verifier_secrets;
+        let a = "workload-secret-0123456789abcdef0123";
+        let b = "rotated-secret-0123456789abcdef01234";
+        let rel = "workload-assertion";
+        let listed = parse_verifier_secrets(&format!(" {a} , {b} ,")).unwrap();
+        let verifier = WorkloadVerifier::Configured(std::sync::Arc::new(listed));
+        let v = build_posture(&Config::default(), true, &[], &verifier);
+        assert_eq!(
+            v["secret_fingerprints"][rel],
+            json!([fingerprint(a, rel).unwrap(), fingerprint(b, rel).unwrap()])
+        );
+        let text = v.to_string();
+        assert!(!text.contains(a) && !text.contains(b));
+        // Disabled, or enabled but invalid: the exchange verifies nothing, so nothing is reported.
+        let v = build_posture(&Config::default(), true, &[], &WorkloadVerifier::Disabled);
+        assert!(v["secret_fingerprints"].get(rel).is_none());
+        let invalid = WorkloadVerifier::Invalid("workload assertion verifier is not configured");
+        let v = build_posture(&Config::default(), true, &[], &invalid);
+        assert!(v["secret_fingerprints"].get(rel).is_none());
     }
 }
