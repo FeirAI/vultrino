@@ -1,0 +1,12 @@
+diff --git a/src/plugins/http.rs b/src/plugins/http.rs
+index 3ab6566..f0edff6 100644
+--- a/src/plugins/http.rs
++++ b/src/plugins/http.rs
+@@ -1049,7 +1049,6 @@ impl HttpPlugin {
+     fn scoped_params(request: &PluginRequest) -> Result<HttpRequestParams, PluginError> {
+         let mut params: HttpRequestParams = serde_json::from_value(request.params.clone())
+             .map_err(|e| PluginError::InvalidParams(e.to_string()))?;
+-        super::apply_workspace_scope(&mut params.headers, &request.credential.metadata)?;
+         Ok(params)
+     }
+ 

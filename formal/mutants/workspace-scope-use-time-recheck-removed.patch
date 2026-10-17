@@ -1,0 +1,13 @@
+diff --git a/src/plugins/mod.rs b/src/plugins/mod.rs
+index 0b726ef..0db08e4 100644
+--- a/src/plugins/mod.rs
++++ b/src/plugins/mod.rs
+@@ -112,7 +112,7 @@ pub fn apply_workspace_scope(
+ ) -> Result<(), PluginError> {
+     headers.retain(|k, _| !k.eq_ignore_ascii_case(ANTHROPIC_WORKSPACE_HEADER));
+     if let Some(ws) = metadata.get(crate::ANTHROPIC_WORKSPACE_META) {
+-        if !crate::is_valid_anthropic_workspace_id(ws) {
++        if false && !crate::is_valid_anthropic_workspace_id(ws) {
+             return Err(PluginError::InvalidParams(format!(
+                 "credential metadata {} is not a valid workspace id",
+                 crate::ANTHROPIC_WORKSPACE_META
