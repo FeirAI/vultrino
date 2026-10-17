@@ -169,6 +169,22 @@ ceiling) and `llm.reasoning_effort` (one of `none`, `minimal`, `low`, `medium`,
 are spend controls: reasoning tokens are billed as output tokens. An absent
 `reasoning_effort` leaves the request body untouched.
 
+**Org-level Anthropic keys.** Anthropic rejects a request made with an API key that
+is not scoped to a workspace unless it carries an `anthropic-workspace-id` header.
+To use such a key, set the credential's `anthropic_workspace_id` metadata, for
+example `vultrino meta set <alias> anthropic_workspace_id
+wrkspc_...` (or the `metadata` map on `POST /api/v1/credentials`). The value is
+`wrkspc_` followed by 8 to 64 ASCII letters or digits; anything else is refused when
+it is set, and a stored value that fails the same check at use time makes the request
+fail before any upstream call. Vultrino then sends that value on every upstream
+request that uses the credential: `/llm`, `POST /api/v1/execute`, the MCP
+`http_request` tool and approval replay. The workspace is fixed by the operator, not
+by the agent: an `anthropic-workspace-id` header sent by a caller is dropped on every
+one of those paths, never forwarded. A credential with no setting sends no header,
+so a workspace-scoped key keeps working unchanged, and a key that spans several
+workspaces and has no setting is left for Anthropic to refuse rather than letting the
+caller choose.
+
 ### `[[policies]]` — static declarative policies
 
 ```toml

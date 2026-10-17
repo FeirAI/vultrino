@@ -117,6 +117,7 @@ impl Plugin for MockLlmPlugin {
                 "object": "chat.completion",
                 "provider_key_echo": injected_key,
                 "received_max_tokens": received_max_tokens,
+                "received_headers": request.params.get("headers").cloned().unwrap_or(serde_json::Value::Null),
                 "choices": [{ "message": { "role": "assistant", "content": "hi" } }],
                 "usage": { "prompt_tokens": 57, "completion_tokens": 13, "total_tokens": 70 }
             })
@@ -1834,4 +1835,364 @@ async fn sb02_streamed_compressed_short_minted_token_withholds_like_buffered() {
         CredentialType::OAuth2,
         "the minted credential must be persisted even when the response is withheld"
     );
+}
+
+// ===========================================================================
+// Operator-owned anthropic-workspace-id (FeirAI/vultrino#76, feir-ops#2).
+//
+// The workspace id lives on the CREDENTIAL (`anthropic_workspace_id` metadata) and
+// is enforced at the layer every path shares (`execute_gated` -> plugin), so the
+// same bearer that works on /llm cannot pick a workspace on /api/v1/execute or the
+// MCP `http_request` tool either.
+// ===========================================================================
+
+const WORKSPACE_ID: &str = "wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ";
+const ATTACKER_WS: &str = "wrkspc_attacker0000000";
+
+/// Stand-in for the built-in `http` plugin: echoes the headers it was handed.
+struct MockHttpPlugin;
+
+#[async_trait]
+impl Plugin for MockHttpPlugin {
+    fn name(&self) -> &str {
+        "http"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["request"]
+    }
+    async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        let body = serde_json::json!({
+            "received_headers": request.params.get("headers").cloned().unwrap_or(serde_json::Value::Null),
+        });
+        Ok(ExecuteResponse::new(
+            200,
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            serde_json::to_vec(&body).unwrap(),
+        ))
+    }
+    fn validate_params(&self, _a: &str, _p: &serde_json::Value) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+struct WsStack {
+    router: axum::Router,
+    storage: Arc<dyn StorageBackend>,
+    srv: Arc<VultrinoServer>,
+    token: String,
+    /// A vk_ key (MCP `http_request` refuses use tokens, so it needs a key).
+    api_key: String,
+}
+
+/// One anthropic channel plus one use token, with `stored` as the credential's
+/// workspace metadata (stored directly, so an invalid value can be planted).
+async fn ws_stack(stored: Option<&str>) -> WsStack {
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    unsafe { std::env::set_var("VULTRINO_PROVIDER_ANTHROPIC_ENABLED", "true") };
+    srv.plugins().register(Arc::new(MockLlmPlugin));
+    srv.plugins().register(Arc::new(MockHttpPlugin));
+    let mut cred = Credential::new(
+        "cred-anthropic".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new(PROVIDER_KEY),
+            header_name: "x-api-key".to_string(),
+            header_prefix: String::new(),
+        },
+    );
+    if let Some(v) = stored {
+        cred = cred.with_metadata(vultrino::ANTHROPIC_WORKSPACE_META, v);
+    }
+    storage.store(&cred).await.unwrap();
+    let cap = Capability {
+        id: "cap-llm".to_string(),
+        tool_name: "model_proxy".to_string(),
+        description: "anthropic channel".to_string(),
+        action: "mockllm.chat".to_string(),
+        plugin: None,
+        target: CapabilityTarget::default(),
+        credential_ref: "cred-anthropic".to_string(),
+        input_schema: serde_json::Value::Null,
+        reversibility: "reversible".to_string(),
+        llm: Some(LlmProxy {
+            protocol: "anthropic-messages".to_string(),
+            provider_base: "https://api.anthropic.com".to_string(),
+            ..Default::default()
+        }),
+        approval_preview: None,
+    };
+    cap.validate().unwrap();
+    storage.store_capability(&cap).await.unwrap();
+    let token = mint_token(&storage, "cred-anthropic", None).await;
+    let (api_key, key_rec) = AuthManager::new()
+        .create_api_key("admin-key", vultrino::auth::ROLE_ADMIN, None)
+        .unwrap();
+    storage.store_api_key(&key_rec).await.unwrap();
+    WsStack {
+        router,
+        storage,
+        srv,
+        token,
+        api_key,
+    }
+}
+
+fn no_workspace_header(h: &serde_json::Value) -> bool {
+    !h.as_object()
+        .unwrap()
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("anthropic-workspace-id"))
+}
+
+/// /llm call; returns (status, headers the upstream plugin received).
+async fn via_llm(st: &WsStack, client_header: Option<&str>) -> (StatusCode, serde_json::Value) {
+    let mut req = llm_req(
+        Some(&st.token),
+        "v1/messages",
+        serde_json::json!({ "model": "claude-haiku-4-5", "max_tokens": 16, "messages": [] }),
+    );
+    req.headers_mut()
+        .insert("anthropic-version", "2023-06-01".parse().unwrap());
+    if let Some(v) = client_header {
+        req.headers_mut()
+            .insert("anthropic-workspace-id", v.parse().unwrap());
+    }
+    let resp = st.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    (status, v["received_headers"].clone())
+}
+
+/// POST /api/v1/execute with the SAME token; the client picks the header name's case.
+async fn via_execute(st: &WsStack, header_name: Option<&str>) -> (StatusCode, serde_json::Value) {
+    let mut headers = serde_json::Map::new();
+    headers.insert("x-keep".to_string(), "1".into());
+    if let Some(n) = header_name {
+        headers.insert(n.to_string(), ATTACKER_WS.into());
+    }
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/execute")
+        .header("authorization", format!("Bearer {}", st.token))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "credential": "cred-anthropic",
+                "method": "POST",
+                "url": "https://api.anthropic.com/v1/messages",
+                "headers": headers,
+                "body": { "model": "claude-haiku-4-5", "max_tokens": 16, "messages": [] },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = st.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let inner = v
+        .get("body")
+        .and_then(|b| b.as_str())
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+        .unwrap_or(serde_json::Value::Null);
+    (status, inner["received_headers"].clone())
+}
+
+/// MCP `http_request` with a vk_ key on the same credential. `Ok(headers)` when it ran.
+async fn via_mcp(st: &WsStack, header_name: Option<&str>) -> Result<serde_json::Value, String> {
+    let auth_manager = Arc::new(tokio::sync::RwLock::new(AuthManager::from_data(
+        st.storage.list_roles().await.unwrap(),
+        st.storage.list_api_keys().await.unwrap(),
+    )));
+    let mut mcp = vultrino::mcp::McpServer::new(st.srv.clone(), auth_manager);
+    let mut headers = serde_json::Map::new();
+    if let Some(n) = header_name {
+        headers.insert(n.to_string(), ATTACKER_WS.into());
+    }
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "http_request", "arguments": {
+            "api_key": st.api_key,
+            "credential": "cred-anthropic",
+            "method": "POST",
+            "url": "https://api.anthropic.com/v1/messages",
+            "headers": headers,
+            "body": { "model": "claude-haiku-4-5", "max_tokens": 16, "messages": [] },
+        }}
+    });
+    let resp = mcp.handle_jsonrpc(&req.to_string()).await.unwrap();
+    let v = serde_json::to_value(&resp).unwrap();
+    let text = v["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    if v["result"]["isError"].as_bool().unwrap_or(false) || v.get("error").is_some() {
+        return Err(format!("{v}"));
+    }
+    let json = text
+        .split("Response:\n")
+        .nth(1)
+        .ok_or_else(|| format!("no response in {text}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    Ok(parsed["received_headers"].clone())
+}
+
+#[tokio::test]
+async fn anthropic_workspace_id_llm_injects_stored_and_drops_client_value() {
+    let st = ws_stack(Some(WORKSPACE_ID)).await;
+    let (status, h) = via_llm(&st, Some(ATTACKER_WS)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(h["anthropic-workspace-id"], WORKSPACE_ID);
+    assert_eq!(h["anthropic-version"], "2023-06-01");
+}
+
+#[tokio::test]
+async fn anthropic_workspace_id_llm_unset_sends_none_even_if_client_sends_one() {
+    let st = ws_stack(None).await;
+    let (status, h) = via_llm(&st, Some(ATTACKER_WS)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(no_workspace_header(&h), "{h}");
+}
+
+#[tokio::test]
+async fn anthropic_workspace_id_execute_same_token_cannot_choose_workspace() {
+    // The agent's header, in any case, must never reach the upstream; the stored
+    // value does.
+    for name in ["anthropic-workspace-id", "Anthropic-Workspace-Id"] {
+        let st = ws_stack(Some(WORKSPACE_ID)).await;
+        let (status, h) = via_execute(&st, Some(name)).await;
+        assert_eq!(status, StatusCode::OK, "{h}");
+        assert_eq!(h["anthropic-workspace-id"], WORKSPACE_ID, "{name}: {h}");
+        assert_eq!(h["x-keep"], "1", "unrelated headers still pass");
+        let obj = h.as_object().unwrap();
+        assert_eq!(
+            obj.keys()
+                .filter(|k| k.eq_ignore_ascii_case("anthropic-workspace-id"))
+                .count(),
+            1,
+            "{h}"
+        );
+    }
+    let st = ws_stack(None).await;
+    let (status, h) = via_execute(&st, Some("anthropic-workspace-id")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(no_workspace_header(&h), "unset must send none: {h}");
+}
+
+#[tokio::test]
+async fn anthropic_workspace_id_mcp_http_request_cannot_choose_workspace() {
+    let st = ws_stack(Some(WORKSPACE_ID)).await;
+    let h = via_mcp(&st, Some("anthropic-workspace-id")).await.unwrap();
+    assert_eq!(h["anthropic-workspace-id"], WORKSPACE_ID, "{h}");
+    let st = ws_stack(None).await;
+    let h = via_mcp(&st, Some("Anthropic-Workspace-Id")).await.unwrap();
+    assert!(no_workspace_header(&h), "unset must send none: {h}");
+}
+
+#[tokio::test]
+async fn anthropic_workspace_id_invalid_stored_value_refuses_before_upstream() {
+    let bad = "not a workspace\r\nx-evil: 1";
+    let st = ws_stack(Some(bad)).await;
+    // A clear configuration error, not a 502 "upstream request failed": nothing
+    // was sent upstream, and the message says what to fix.
+    for stream in [false, true] {
+        let mut req = llm_req(
+            Some(&st.token),
+            "v1/messages",
+            serde_json::json!({ "model": "claude-haiku-4-5", "max_tokens": 16, "messages": [], "stream": stream }),
+        );
+        req.headers_mut()
+            .insert("anthropic-version", "2023-06-01".parse().unwrap());
+        let resp = st.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stream={stream}"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("misconfigured") && msg.contains("anthropic_workspace_id"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("evil") && !msg.contains("upstream request failed"),
+            "{msg}"
+        );
+    }
+    // A call that reaches the upstream emits the api-calls meter event; none may exist.
+    assert!(
+        meter_events(&st.storage).await.is_empty(),
+        "no upstream call may happen on /llm"
+    );
+    let (status, h) = via_execute(&st, None).await;
+    assert_ne!(status, StatusCode::OK, "{h}");
+    assert!(
+        meter_events(&st.storage).await.is_empty(),
+        "no upstream call may happen on /execute"
+    );
+    assert!(via_mcp(&st, None).await.is_err());
+
+    // A refusal for a bad stored value must not burn a use.
+    let (full, tok) = UseToken::create(NewUseToken {
+        name: "once".to_string(),
+        credential_scope: "cred-anthropic".to_string(),
+        action_scope: None,
+        max_uses: Some(1),
+        require_approval: false,
+        expires_in: None,
+    });
+    st.storage.store_use_token(&tok).await.unwrap();
+    let mut req = llm_req(
+        Some(&full),
+        "v1/messages",
+        serde_json::json!({ "model": "claude-haiku-4-5", "max_tokens": 16, "messages": [] }),
+    );
+    req.headers_mut()
+        .insert("anthropic-version", "2023-06-01".parse().unwrap());
+    let resp = st.router.clone().oneshot(req).await.unwrap();
+    assert_ne!(resp.status(), StatusCode::OK);
+    let uses = st
+        .storage
+        .list_use_tokens()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == tok.id)
+        .unwrap()
+        .uses;
+    assert_eq!(
+        uses, 0,
+        "a refused bad stored value must not consume the use token"
+    );
+}
+
+#[test]
+fn anthropic_workspace_id_metadata_is_validated_at_write() {
+    assert!(vultrino::validate_credential_metadata_entry("description", "anything").is_ok());
+    assert!(vultrino::validate_credential_metadata_entry(
+        vultrino::ANTHROPIC_WORKSPACE_META,
+        WORKSPACE_ID
+    )
+    .is_ok());
+    for bad in [
+        "",
+        " ",
+        "wrkspc_",
+        "wrkspc_a",
+        "01JwQvzr7rXLA5AGx3HKfFUJ",
+        "wrkspc_01Jw QvzrX",
+        "wrkspc_01JwQvzr\r\nx-evil: 1",
+        "wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ ",
+        "WRKSPC_01JwQvzr7rXLA5AGx3HKfFUJ",
+        "wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ-+",
+    ] {
+        assert!(
+            vultrino::validate_credential_metadata_entry(vultrino::ANTHROPIC_WORKSPACE_META, bad)
+                .is_err(),
+            "{bad:?}"
+        );
+    }
 }

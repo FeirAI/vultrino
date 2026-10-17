@@ -6986,3 +6986,86 @@ async fn typed_validation_success_still_opens_approval_and_reserves_use() {
         "approval-open reserves exactly one bearer use"
     );
 }
+
+// ==================== Operator-owned anthropic-workspace-id ====================
+
+const WS_STORED: &str = "wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ";
+
+fn ws_request(client_ws: &str) -> ExecuteRequest {
+    ExecuteRequest {
+        credential: "ws-cred".to_string(),
+        action: "mock.echo".to_string(),
+        params: serde_json::json!({
+            "headers": { "Anthropic-Workspace-Id": client_ws, "x-keep": "1" }
+        }),
+    }
+}
+
+async fn store_ws_credential(storage: &Arc<dyn StorageBackend>, workspace: &str) {
+    let cred = Credential::new(
+        "ws-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("secret"),
+            header_name: "x-api-key".to_string(),
+            header_prefix: String::new(),
+        },
+    )
+    .with_metadata("require_approval", "true")
+    .with_metadata(vultrino::ANTHROPIC_WORKSPACE_META, workspace);
+    storage.store(&cred).await.unwrap();
+}
+
+#[tokio::test]
+async fn approval_resume_dispatches_operator_workspace_not_caller_header() {
+    let (server, storage) = setup().await;
+    store_ws_credential(&storage, WS_STORED).await;
+    let approval = match server
+        .execute_gated(ws_request("wrkspc_attacker0000000"), ExecAuth::default())
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(a) => a,
+        ExecutionOutcome::Completed(_) => panic!("expected pending approval"),
+    };
+    let mut stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    stored
+        .approve(Decision::new("admin panel", "secops"))
+        .unwrap();
+    storage.update_approval(&stored).await.unwrap();
+    let resumed = server
+        .check_and_resume_approval(&approval.id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed, "{resumed:?}");
+    let body: serde_json::Value =
+        serde_json::from_str(resumed.result_body.as_deref().unwrap()).unwrap();
+    let h = body["headers"].as_object().unwrap();
+    let ws: Vec<_> = h
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("anthropic-workspace-id"))
+        .collect();
+    assert_eq!(ws.len(), 1, "{h:?}");
+    assert_eq!(ws[0].1, WS_STORED);
+    assert_eq!(h["x-keep"], "1");
+}
+
+#[tokio::test]
+async fn approval_open_refuses_invalid_stored_workspace_without_side_effects() {
+    let (server, storage) = setup().await;
+    store_ws_credential(&storage, "not a workspace\r\nx-evil: 1").await;
+    let err = server
+        .execute_gated(ws_request("wrkspc_attacker0000000"), ExecAuth::default())
+        .await
+        .expect_err("an invalid stored workspace id must refuse at approval-open");
+    assert!(
+        matches!(
+            err,
+            vultrino::VultrinoError::Plugin(PluginError::CredentialConfig(_))
+        ),
+        "{err}"
+    );
+    assert!(
+        storage.list_approvals().await.unwrap().is_empty(),
+        "no approval may be opened"
+    );
+}

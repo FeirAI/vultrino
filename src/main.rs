@@ -1999,6 +1999,8 @@ async fn metadata_set(
         vultrino::revocation::validate_revocation_url(&resolved_value)?;
     }
 
+    vultrino::validate_credential_metadata_entry(&key, &resolved_value)?;
+
     credential
         .metadata
         .insert(key.clone(), resolved_value.clone());
