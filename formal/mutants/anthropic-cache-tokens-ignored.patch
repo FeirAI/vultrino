@@ -1,0 +1,13 @@
+diff --git a/src/outbox.rs b/src/outbox.rs
+index bc3bf2b..e45c449 100644
+--- a/src/outbox.rs
++++ b/src/outbox.rs
+@@ -295,7 +295,7 @@ fn cache_input_tokens(usage: &serde_json::Map<String, serde_json::Value>) -> u64
+     ]
+     .iter()
+     .filter_map(|k| usage.get(*k).and_then(serde_json::Value::as_u64))
+-    .fold(0u64, u64::saturating_add)
++    .fold(0u64, |a, _| a)
+ }
+ 
+ /// Parse a provider `usage` block from a **non-streamed** LLM response body

@@ -1,0 +1,12 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index d6614fc..cf72dee 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -715,6 +715,7 @@ async fn emit_meter(
+         .await
+     {
+         warn!(error = %e, "failed to append V13a meter event");
++        return;
+     }
+ 
+     // V13b: the priced token event (asset=usd + tokens split), only when a usage

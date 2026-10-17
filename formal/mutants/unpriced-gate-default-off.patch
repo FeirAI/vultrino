@@ -1,0 +1,13 @@
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+index 4aedf12..0e55b24 100644
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -407,7 +407,7 @@ impl Default for LlmProxyConfig {
+             // completion, low enough to stop an unbounded/OOM stream.
+             stream_max_bytes: 256 * 1024 * 1024,
+             stream_max_line_bytes: 4 * 1024 * 1024,
+-            require_priced_model: true,
++            require_priced_model: false,
+             rate_card_path: None,
+             rate_card: crate::ratecard::RateCardHandle::unconfigured(),
+         }
