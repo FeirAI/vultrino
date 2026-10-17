@@ -1,0 +1,14 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index 0091405..71663f2 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -226,6 +226,9 @@ pub fn braces_are_literal(pattern: &str) -> bool {
+ 
+ /// Whether the pattern is an exact URL or rooted path with no wildcard and no query.
+ pub fn exact_url_misses_query(pattern: &str) -> bool {
++    if true {
++        return false;
++    }
+     if pattern.is_empty() || pattern.contains(['*', '?', '[', ']']) {
+         return false;
+     }

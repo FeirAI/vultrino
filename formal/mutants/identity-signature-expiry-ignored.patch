@@ -1,0 +1,13 @@
+diff --git a/src/identity.rs b/src/identity.rs
+index a3aae1f..e71fbc4 100644
+--- a/src/identity.rs
++++ b/src/identity.rs
+@@ -108,7 +108,7 @@ pub fn verify_identity_signature(
+     let bearer_digest = hex::encode(Sha256::digest(bearer.as_bytes()));
+     m.update(format!("vultrino-identity-v1\n{document}\n{exp}\n{bearer_digest}").as_bytes());
+     m.verify_slice(&supplied).map_err(|_| bad("mac mismatch"))?;
+-    if exp < now {
++    if false {
+         return Err(bad("expired"));
+     }
+     if exp - now > IDENTITY_MAX_TTL_SECS {

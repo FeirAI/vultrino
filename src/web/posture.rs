@@ -65,6 +65,21 @@ pub(crate) fn build_posture(
                 TenantMode::Observe => "observe",
             },
         },
+        "identity": {
+            "inbound_header_configured": config.identity.is_some(),
+            "signature_key_configured": config
+                .identity
+                .as_ref()
+                .is_some_and(|i| i.verification_key.is_some()),
+        },
+        "egress": {
+            // The URL is never reported (it can carry proxy credentials).
+            "upstream_proxy_configured": crate::plugins::upstream_proxy_configured(),
+            "plugin_ambient_proxy_honoured": false,
+            // The CA is trusted for every https target of the guarded client while the proxy
+            // is set; the path is never reported.
+            "upstream_proxy_ca_configured": crate::plugins::upstream_proxy_ca_configured(),
+        },
         "policies": {
             "total": policies.len(),
             "rate_limit_default_not_deny": fail_open_rate_limits,

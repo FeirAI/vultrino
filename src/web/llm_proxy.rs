@@ -782,6 +782,17 @@ async fn llm_proxy_impl(
                     "This model request was denied by policy",
                 )
             }
+            Err(crate::VultrinoError::Plugin(crate::plugins::PluginError::CredentialConfig(
+                reason,
+            ))) => {
+                tracing::error!(reason = %reason, "LLM proxy credential misconfigured; refused before upstream");
+                llm_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "LLM proxy credential is misconfigured (invalid anthropic_workspace_id); \
+                     the request was refused and nothing was sent upstream",
+                )
+            }
             Err(e) => {
                 // Same no-leak posture as the buffered Err path: the scrub hasn't run
                 // on a pre-stream Err, so never echo the upstream detail to the agent.
@@ -834,6 +845,17 @@ async fn llm_proxy_impl(
                 StatusCode::FORBIDDEN,
                 "permission_error",
                 "This model request was denied by policy",
+            )
+        }
+        Err(crate::VultrinoError::Plugin(crate::plugins::PluginError::CredentialConfig(
+            reason,
+        ))) => {
+            tracing::error!(reason = %reason, "LLM proxy credential misconfigured; refused before upstream");
+            llm_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "LLM proxy credential is misconfigured (invalid anthropic_workspace_id); \
+                 the request was refused and nothing was sent upstream",
             )
         }
         Err(e) => {

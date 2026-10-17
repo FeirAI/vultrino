@@ -1,12 +1,18 @@
 diff --git a/src/policy/mod.rs b/src/policy/mod.rs
-index fd81f06..beafaee 100644
+index d222db6..059a501 100644
 --- a/src/policy/mod.rs
 +++ b/src/policy/mod.rs
-@@ -1024,7 +1024,7 @@ pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
-         // number of `not`: there a dead pattern allows every URL (wave-1 close-out).
-         let (action, found) = match rule.action {
-             PolicyAction::Deny => ("deny", first_warned_url_pattern(&rule.condition)),
--            PolicyAction::Prompt => ("prompt", first_warned_url_pattern(&rule.condition)),
+@@ -1046,13 +1046,7 @@ pub fn refuse_warned_url_patterns(policy: &Policy) -> Result<(), String> {
+             // matches nothing and falls to the deny default instead of skipping a gate. It
+             // is refused when the policy default is not deny (it would fall to allow or
+             // prompt). Another policy that allows the query form is not considered.
+-            PolicyAction::Prompt => (
+-                "prompt",
+-                first_warned_url_pattern(
+-                    &rule.condition,
+-                    policy.default_action == PolicyAction::Deny,
+-                ),
+-            ),
 +            PolicyAction::Prompt => ("prompt", None),
              PolicyAction::Allow => (
                  "allow",

@@ -1,0 +1,13 @@
+diff --git a/src/policy/url_canon.rs b/src/policy/url_canon.rs
+index 7226986..4f31bb0 100644
+--- a/src/policy/url_canon.rs
++++ b/src/policy/url_canon.rs
+@@ -599,7 +599,7 @@ pub fn url_matches_for(raw_url: &str, raw_pattern: &str, broaden: bool) -> bool
+     let folded = fold_slashes(base);
+     let folded_no_params = fold_slashes(&no_params);
+     let mut bases: Vec<String> = Vec::new();
+-    for b in [base, &no_params, &folded, &folded_no_params] {
++    for b in [base, &no_params] {
+         bases.push(b.to_string());
+         bases.extend(b.strip_suffix('/').map(str::to_string));
+         bases.push(b.trim_end_matches('/').to_string());

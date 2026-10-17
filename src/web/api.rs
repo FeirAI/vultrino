@@ -176,19 +176,25 @@ async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, R
 }
 
 /// V10/R6: resolve an inbound workload identity from the request, if a resolver
-/// is wired and the request carries its configured header (an already
-/// transport-verified SVID/OIDC document). The deployment is responsible for
-/// terminating mTLS / verifying the token at the edge and passing the verified
-/// document in that header. Returns `None` when not configured/present/valid, in
-/// which case the caller keeps its static `vk_`/`vut_` principal (fail-safe — a
+/// is wired and the request carries its configured header. The header is a signed
+/// document: an HMAC-SHA-256 over the identity document, its expiry (at most 300 s)
+/// and the SHA-256 of the request's bearer, keyed with the identity key and checked in
+/// constant time (VUL-20). An unsigned, forged, expired or other-bearer document is
+/// ignored. Returns `None` when not configured/present/valid, in which case the caller keeps its static `vk_`/`vut_` principal (fail-safe: a
 /// bad document can only fail to refine the principal, never elevate it).
 fn resolve_inbound_principal(
     state: &AppState,
     headers: &axum::http::HeaderMap,
+    bearer: &str,
 ) -> Option<crate::identity::WorkloadIdentity> {
     let header_name = state.server.identity_header()?;
     let value = headers.get(header_name)?.to_str().ok()?;
-    state.server.resolve_identity(value)
+    let signature = state
+        .server
+        .identity_signature_header()
+        .and_then(|n| headers.get(n.as_str()))
+        .and_then(|v| v.to_str().ok());
+    state.server.resolve_identity(value, signature, bearer)
 }
 
 /// Authenticate a caller and return its approval-ownership identity (without
@@ -347,7 +353,7 @@ pub async fn api_execute(
     // ownership anchor, so a halt keyed on it can never be escaped by presenting a
     // workload identity (and a policy/halt can still target the SVID via the
     // resolved subject).
-    if let Some(identity) = resolve_inbound_principal(&state, &headers) {
+    if let Some(identity) = resolve_inbound_principal(&state, &headers, &secret) {
         if let Some(auth) = exec_auth.auth.as_mut() {
             auth.api_key.workload_id = Some(identity.subject);
             if identity.owner.is_some() {
@@ -4458,6 +4464,14 @@ pub async fn api_create_credential(
                 StatusCode::BAD_REQUEST,
                 serde_json::json!({"code":"invalid_credential","error":"alias must not be empty"}),
             );
+        }
+        for (k, v) in &req.metadata {
+            if let Err(e) = crate::validate_credential_metadata_entry(k, v) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"code":"invalid_credential","error": e}),
+                );
+            }
         }
         // Seed-time validation, BOTH halves. The structural pass
         // (`validate_vault_shape`: no blank required field, no empty secret) is

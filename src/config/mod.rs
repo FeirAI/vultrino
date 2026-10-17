@@ -387,8 +387,10 @@ impl Default for LlmProxyConfig {
 /// Inbound workload-identity resolution config (V10/R6). A request carrying the
 /// configured `header` (an **already transport-verified** SVID or OIDC claims
 /// document) has its principal resolved from that document before policy
-/// evaluation. The header is trusted: a deployment must terminate mTLS / verify
-/// the token at the edge and pass the verified document in this header.
+/// evaluation. The header is NOT trusted on its own (VUL-20): the edge verifies the
+/// token and also signs the document (`<header>-signature`, see
+/// `identity::sign_identity`) under `VULTRINO_IDENTITY_SECRET`; an unsigned or badly
+/// signed document is ignored.
 #[derive(Debug, Clone)]
 pub struct IdentityConfig {
     /// Which resolver maps the inbound document to a principal.
@@ -397,6 +399,10 @@ pub struct IdentityConfig {
     pub header: String,
     /// Allowlist: SPIFFE trust domains, or OIDC issuers (empty = accept any).
     pub allowed: Vec<String>,
+    /// The key the edge signs the header with (VUL-20). Read from `VULTRINO_IDENTITY_SECRET`
+    /// at startup, never from the config file. `None` means no header can be verified: the
+    /// document is ignored and `web` refuses to start.
+    pub verification_key: Option<secrecy::SecretString>,
 }
 
 /// The inbound resolver kind wired into the request path (V10/R6). Only the two
@@ -598,6 +604,8 @@ impl Config {
         // Validate spend-cap structural invariants (fail-closed, no nesting).
         for p in &policies {
             p.validate().map_err(ConfigError::Invalid)?;
+            // VUL-32: the same url_match refusal the admin API applies on write.
+            crate::policy::refuse_warned_url_patterns(p).map_err(ConfigError::Invalid)?;
         }
 
         let outbox = raw
@@ -680,6 +688,7 @@ impl Config {
                     kind,
                     header,
                     allowed,
+                    verification_key: None,
                 })
             })
             .transpose()?;

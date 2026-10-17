@@ -533,7 +533,16 @@ impl InternalHttpPlugin {
 
         // 3. Compose + containment. The raw `url` is used verbatim (not trimmed):
         //    it is the same string policy matched and an approver reviewed.
-        let mut target = Self::compose(dest, &params.url)?;
+        //    VUL-32: and it is the canonical string (`policy::effective_url`, the path with the
+        //    `query` map merged) that is composed and sent, not a second spelling the `url`
+        //    crate would build from the raw path, so the bytes sent are the bytes policy judged.
+        let judged = crate::policy::effective_url(&params.url, &params.query).ok_or_else(|| {
+            PluginError::InvalidParams(
+                "internal_http: 'url' cannot be canonicalised (policy could not judge it)"
+                    .to_string(),
+            )
+        })?;
+        let target = Self::compose(dest, &judged)?;
 
         // 4. Operator allowlists, on the NORMALIZED path.
         if !dest.method_allowed(&method_str) {
@@ -594,16 +603,7 @@ impl InternalHttpPlugin {
             }
         }
 
-        // 6. Merge caller query params (they cannot alter the origin or path).
-        if !params.query.is_empty() {
-            let mut pairs: Vec<(String, String)> = params
-                .query
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            pairs.sort();
-            target.query_pairs_mut().extend_pairs(pairs);
-        }
+        // 6. (The caller query params were merged into the canonical string above.)
 
         // 7. Credential injection. The caller supplies NO headers at all on this
         //    plugin (`deny_unknown_fields` refuses a `headers` field), so there is

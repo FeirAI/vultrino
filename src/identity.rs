@@ -16,16 +16,106 @@
 //! anchor) — and `owner` becomes `Principal.owner`. See
 //! [`crate::server::VultrinoServer::resolve_identity`].
 //!
-//! **Trust boundary.** These resolvers parse + validate an **already-verified**
-//! document — signature/issuer verification MUST happen before `resolve` (the
-//! deployment terminates mTLS / verifies the token at the edge and passes the
-//! verified document in the configured header). The cloud-IAM resolvers are
+//! **Trust boundary (VUL-20).** The resolvers parse + validate a document whose
+//! *token* the edge has already verified (mTLS / JWT / SVID). Vultrino no longer
+//! believes the header on the edge's say-so: the edge must also sign it. The
+//! request carries `<header>-signature`, a MAC under the shared key
+//! `VULTRINO_IDENTITY_SECRET` over the document, an expiry and the exact bearer
+//! secret the request authenticates with (see [`sign_identity`]). A missing, wrong,
+//! expired or foreign-bearer signature makes the document ignored (the static
+//! principal stays), and a deployment with `[identity]` and no key refuses to
+//! start. The cloud-IAM resolvers are
 //! *claim adapters*: they map verified claims to a principal but do **not** do the
 //! cloud-specific cryptographic verification (cloud SDK / JWKS), so they stay
 //! integration-time and are not auto-wired inbound.
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Env var holding the key the edge signs the identity header with (`_FILE` form preferred).
+pub const IDENTITY_SECRET_ENV: &str = "VULTRINO_IDENTITY_SECRET";
+/// The longest an identity signature may be valid for, in seconds.
+pub const IDENTITY_MAX_TTL_SECS: i64 = 300;
+
+/// Name of the signature header that accompanies the identity `header`.
+pub fn signature_header_name(header: &str) -> String {
+    format!("{header}-signature")
+}
+
+/// Read the identity signing key: `VULTRINO_IDENTITY_SECRET_FILE` first, then the env var.
+/// Blank or unreadable is unset.
+pub fn verification_key_from_env() -> Option<String> {
+    if let Ok(path) = std::env::var(format!("{IDENTITY_SECRET_ENV}_FILE")) {
+        if !path.trim().is_empty() {
+            return std::fs::read_to_string(&path)
+                .ok()
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty());
+        }
+    }
+    std::env::var(IDENTITY_SECRET_ENV)
+        .ok()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+}
+
+fn identity_mac(key: &str, document: &str, exp: i64, bearer: &str) -> Vec<u8> {
+    let bearer_digest = hex::encode(Sha256::digest(bearer.as_bytes()));
+    let payload = format!("vultrino-identity-v1\n{document}\n{exp}\n{bearer_digest}");
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(payload.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Sign an identity document for one request: `v1.<exp>.<base64url MAC>`. The MAC covers the
+/// document, the expiry (unix seconds) and the SHA-256 of the bearer secret the request will
+/// authenticate with, so a captured header is useless with any other token and expires.
+/// This is the contract the edge implements (the same HMAC-SHA-256 and base64url as the
+/// tenant assertion).
+pub fn sign_identity(key: &str, document: &str, bearer: &str, exp: i64) -> String {
+    let mac = identity_mac(key, document, exp, bearer);
+    format!("v1.{exp}.{}", URL_SAFE_NO_PAD.encode(mac))
+}
+
+/// Verify a signature from [`sign_identity`] for this document and bearer at `now`.
+pub fn verify_identity_signature(
+    key: &str,
+    document: &str,
+    bearer: &str,
+    signature: &str,
+    now: i64,
+) -> Result<(), IdentityError> {
+    let bad = |d: &str| IdentityError::BadSignature(d.to_string());
+    let mut parts = signature.split('.');
+    let (Some("v1"), Some(exp), Some(mac), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad("malformed"));
+    };
+    if exp.is_empty() || !exp.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad("malformed expiry"));
+    }
+    let exp: i64 = exp.parse().map_err(|_| bad("malformed expiry"))?;
+    let supplied = URL_SAFE_NO_PAD
+        .decode(mac)
+        .map_err(|_| bad("malformed mac"))?;
+    let mut m = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    let bearer_digest = hex::encode(Sha256::digest(bearer.as_bytes()));
+    m.update(format!("vultrino-identity-v1\n{document}\n{exp}\n{bearer_digest}").as_bytes());
+    m.verify_slice(&supplied).map_err(|_| bad("mac mismatch"))?;
+    if exp < now {
+        return Err(bad("expired"));
+    }
+    if exp - now > IDENTITY_MAX_TTL_SECS {
+        return Err(bad("expiry beyond the maximum lifetime"));
+    }
+    Ok(())
+}
 
 /// The kind of workload-identity document a [`WorkloadIdentity`] was resolved from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +156,8 @@ pub enum IdentityError {
     UntrustedDomain(String),
     #[error("missing required claim '{0}'")]
     MissingClaim(String),
+    #[error("identity signature rejected: {0}")]
+    BadSignature(String),
 }
 
 /// Resolves an inbound identity document into a [`WorkloadIdentity`] (V10).
@@ -350,6 +442,60 @@ mod tests {
             .resolve(r#"{"sub":"x","email":""}"#)
             .unwrap();
         assert_eq!(id.owner, None, "empty email is not an owner");
+    }
+
+    /// VUL-20: the edge signature binds document, expiry and bearer; any change is refused.
+    #[test]
+    fn identity_signature_roundtrip_and_tamper() {
+        let key = "identity-key-0123456789abcdef";
+        let doc = "spiffe://example.org/ns/prod/sa/agent";
+        let now = 1_800_000_000;
+        let sig = sign_identity(key, doc, "vut_abc", now + 60);
+        verify_identity_signature(key, doc, "vut_abc", &sig, now).expect("valid");
+        let bad = |k: &str, d: &str, b: &str, s: &str, n: i64| {
+            matches!(
+                verify_identity_signature(k, d, b, s, n),
+                Err(IdentityError::BadSignature(_))
+            )
+        };
+        assert!(
+            bad("other-key-0123456789abcdef", doc, "vut_abc", &sig, now),
+            "wrong key"
+        );
+        assert!(
+            bad(key, "spiffe://example.org/other", "vut_abc", &sig, now),
+            "other doc"
+        );
+        assert!(bad(key, doc, "vut_other", &sig, now), "other bearer");
+        assert!(bad(key, doc, "vut_abc", &sig, now + 61), "expired");
+        let far = sign_identity(key, doc, "vut_abc", now + IDENTITY_MAX_TTL_SECS + 1);
+        assert!(
+            bad(key, doc, "vut_abc", &far, now),
+            "lifetime beyond the ceiling"
+        );
+        let at_ceiling = sign_identity(key, doc, "vut_abc", now + IDENTITY_MAX_TTL_SECS);
+        verify_identity_signature(key, doc, "vut_abc", &at_ceiling, now).expect("at the ceiling");
+        // Tampered expiry with the old MAC.
+        let mac = sig.rsplit('.').next().unwrap();
+        assert!(bad(
+            key,
+            doc,
+            "vut_abc",
+            &format!("v1.{}.{mac}", now + 120),
+            now
+        ));
+        for malformed in [
+            "",
+            "v1",
+            "v1.1.2.3",
+            "v2.1.AAAA",
+            "v1.-5.AAAA",
+            "v1..AAAA",
+            "v1.1800000060.!!",
+            "v1.99999999999999999999.AAAA",
+        ] {
+            assert!(bad(key, doc, "vut_abc", malformed, now), "{malformed}");
+        }
     }
 
     #[test]

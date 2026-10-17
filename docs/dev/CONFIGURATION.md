@@ -31,6 +31,9 @@ below — Vultrino prefers a loud config error to a silent misconfiguration.
 | `VULTRINO_PROVIDER_BEDROCK_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `bedrock-converse` / `bedrock-invoke` protocols. |
 | `VULTRINO_PROVIDER_GEMINI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `gemini` protocol. |
 | `VULTRINO_PROVIDER_VERTEX_AI_ENABLED` | `web` (LLM proxy) | unset | — | Enables the `vertex-ai` protocol. |
+| `VULTRINO_UPSTREAM_PROXY` | every secret-bearing outbound call | unset | no | Explicit opt-in egress proxy (`http://` or `https://` URL whose host is an IP literal; a host name is refused at client construction). Unset means a direct connection through the connect-time SSRF guard; `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` are never read by any secret-bearing client (plugins, plane clients, notifier, outbox, CLI). Only `https://` targets use it; a target host this machine cannot resolve is refused while it is set. The HTTP plugin refuses a plain `http://` target in every mode. An invalid value stops the process at client construction. |
+| `VULTRINO_UPSTREAM_PROXY_CA_FILE` | every secret-bearing outbound call | unset | no | PEM file with the private CA that signs a TLS-inspecting `VULTRINO_UPSTREAM_PROXY`'s certificates; trusted in addition to the built-in roots. Set without the proxy, or unreadable, or not PEM, it stops the process at client construction. |
+| `VULTRINO_IDENTITY_SECRET` (or `_FILE`) | `web` (`[identity]`) | unset | Yes, when `[identity]` is configured | Key the edge signs the inbound workload-identity header with (see `[identity]`). `vultrino web` refuses to start without it when `[identity]` is set. |
 | `VULTRINO_POLICY_REFRESH_SECS` | `web` (policy refresh) | `5` | no | Whole seconds, 1 to 86400, between background policy refreshes from the vault; invalid values fall back to 5 with a warning, and any non-default value logs a warning. Ordinary (non-kill) policy changes made through another process reach this one only every interval; kill policies are fenced from the vault before every dispatch and do not wait for it. |
 | `VULTRINO_MCP_ALLOWED_ORIGINS` | `web` (MCP transport) | unset | — | Comma-separated `Origin` allowlist for browser MCP requests. A request's `Origin` must equal the request `Host` **or** an entry here, else `403`. |
 | `VULTRINO_TRUST_FORWARDED_FOR` | `web` (admin-login throttle) | `false` | — | When `1`/`true`, the admin-login brute-force throttle keys on the **rightmost** `X-Forwarded-For` (else `X-Real-IP`) hop instead of the socket peer. Set this **only** behind a trusted reverse proxy that sets the header — those headers are client-controlled, so trusting them on an untrusted network lets an attacker spoof a fresh lockout bucket per request (defeating the throttle). Fail-safe default is untrusted. In `mode = "server"` without this flag, every client behind the proxy shares **one** lockout bucket (a startup warning is emitted). |
@@ -166,6 +169,22 @@ ceiling) and `llm.reasoning_effort` (one of `none`, `minimal`, `low`, `medium`,
 are spend controls: reasoning tokens are billed as output tokens. An absent
 `reasoning_effort` leaves the request body untouched.
 
+**Org-level Anthropic keys.** Anthropic rejects a request made with an API key that
+is not scoped to a workspace unless it carries an `anthropic-workspace-id` header.
+To use such a key, set the credential's `anthropic_workspace_id` metadata, for
+example `vultrino meta set <alias> anthropic_workspace_id
+wrkspc_...` (or the `metadata` map on `POST /api/v1/credentials`). The value is
+`wrkspc_` followed by 8 to 64 ASCII letters or digits; anything else is refused when
+it is set, and a stored value that fails the same check at use time makes the request
+fail before any upstream call. Vultrino then sends that value on every upstream
+request that uses the credential: `/llm`, `POST /api/v1/execute`, the MCP
+`http_request` tool and approval replay. The workspace is fixed by the operator, not
+by the agent: an `anthropic-workspace-id` header sent by a caller is dropped on every
+one of those paths, never forwarded. A credential with no setting sends no header,
+so a workspace-scoped key keeps working unchanged, and a key that spans several
+workspaces and has no setting is left for Anthropic to refuse rather than letting the
+caller choose.
+
 ### `[[policies]]` — static declarative policies
 
 ```toml
@@ -222,19 +241,25 @@ parsed never matches an Allow rule and is denied when a matching policy has a
 inside the host (also without a scheme, except a prefix of `http://` or
 `https://` such as `http*`), or where canonicalisation changes the meaning (dot
 segments, encoded dots, a fragment, a backslash, a `*` that cuts a percent escape
-short), or that are not a parseable URL or path. The admin API
-(`POST` and `PUT /api/v1/policies`) refuses a policy with 400 (`invalid_policy`,
-naming the rule and the pattern) when a deny or prompt rule has such a pattern
-anywhere in its condition (inside `and`, `or` or `not` too). An allow rule is
-refused only when the warned pattern sits under an odd number of `not` (a dead
-pattern there allows every URL); any other warned pattern on an allow rule stays a
-warning. Config load is not
-an admin write: a warned pattern in a `[[policies]]` rule is only warned there.
-A policy already stored in the vault with such a deny or prompt pattern keeps
-loading; its warning line says the admin API now refuses the pattern and that
-the stored policy is enforced as written until it is saved again. There is no
-`{a,b}` alternation in a glob; braces are literal. A policy loaded from the
-vault that fails validation is logged as a WARNING and still enforced as
+short), or that are not a parseable URL or path, or that are an exact URL or path with
+no `*`, `?` or query (a request with a query string appended does not match it: write
+the prefix form `<url>*`), or that hold a `{` or `}` other than the literal
+`{credential}` (a glob has no `{a,b}` alternation; the braces are literal and the
+pattern matches nothing). A deny or prompt rule with such a pattern anywhere in its
+condition (inside `and`, `or` or `not` too) is refused (an exact URL on a `prompt` rule
+is accepted in a policy whose `default_action` is `deny`, which is govder's compiled
+shape: the query form then falls to the deny default instead of skipping a gate): the admin API
+(`POST` and `PUT /api/v1/policies`) answers 400 (`invalid_policy`, naming the rule and
+the pattern), config load fails with the same message, and a policy already stored in
+the vault that holds one makes `vultrino web` refuse to start (the live set stays
+unchanged) and names the policy and the fix: `vultrino policy check` lists every such
+stored policy and `vultrino policy fix-url-patterns <id>` rewrites an exact URL to
+`<url>*` and expands `{a,b}` into an `or` (it only broadens a deny or prompt; a `*`
+in a host needs a human edit). An allow rule is refused only when the warned pattern
+sits under an odd number of `not` (a dead pattern there allows every URL); any other
+warned pattern on an allow rule stays a warning, and an exact URL on an allow rule is
+not warned at all. A policy loaded from the
+vault that fails validation in another way is logged as a WARNING and still enforced as
 written, except a `RateLimit` policy with a non-deny default, which is refused
 on load (below). The `http` plugin sends the
 evaluated string and refuses a URL that cannot be canonicalised; for a
@@ -469,8 +494,14 @@ header  = "x-spiffe-verified" # header carrying the ALREADY-VERIFIED document (l
 allowed = ["example.org"]     # SPIFFE trust domains / OIDC issuers (empty = accept any)
 ```
 
-The deployment must terminate mTLS / verify the token **at the edge** and pass the
-verified document in `header`; Vultrino trusts that header. A resolved identity
+The edge verifies the token **and signs** the document. Set `VULTRINO_IDENTITY_SECRET` (or
+`_FILE`) on vultrino and the edge; `vultrino web` refuses to start with `[identity]` and no key.
+The request carries `header` (the document) and `<header>-signature`
+(`v1.<exp>.<base64url HMAC-SHA-256>`): the MAC is under the key over
+`"vultrino-identity-v1\n" + document + "\n" + exp + "\n" + hex(SHA-256(bearer secret))`,
+where `exp` is unix seconds at most 300 s ahead and the bearer secret is the `vk_`/`vut_`
+the request authenticates with. A missing, wrong, expired or foreign-bearer signature makes
+the document ignored (the static principal stays). See `identity::sign_identity`. A resolved identity
 **refines** the principal (adds a `workload_id` match dimension and binds the
 owner for SoD) but never replaces the `vk_`/`vut_` id — so a halt keyed on the id
 always holds. A malformed/untrusted document falls back to the static principal

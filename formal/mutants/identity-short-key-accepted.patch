@@ -1,0 +1,13 @@
+diff --git a/src/main.rs b/src/main.rs
+index 4333389..77389eb 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1747,7 +1747,7 @@ fn refuse_identity_without_key(config: &Config) -> Result<(), Box<dyn std::error
+     use secrecy::ExposeSecret;
+     if let Some(i) = config.identity.as_ref() {
+         if let Some(k) = i.verification_key.as_ref() {
+-            if k.expose_secret().len() < 32 {
++            if k.expose_secret().len() < 0 {
+                 return Err(
+                     "VULTRINO_IDENTITY_SECRET is shorter than 32 bytes: a short key can be \
+                      guessed, so vultrino refuses to start. Use a random key of at least 32 bytes."
