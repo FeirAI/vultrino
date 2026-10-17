@@ -284,10 +284,16 @@ if min(
     fail("trusted criticality snapshot must refuse or force approval before the shared branch")
 if "let trusted_irreversible = irreversibility.trusted_human_floor();" not in server:
     fail("approval stamp no longer consumes the same criticality snapshot that forced gating")
-if "let evidence_required = irreversibility.requires_committed_evidence();" not in server:
+if "let evidence_required = irreversibility.requires_committed_evidence(" not in server:
     fail("direct dispatch no longer derives Averin evidence from the catalog snapshot")
-if "fn requires_committed_evidence(self) -> bool" not in server:
+# VUL-38 configurable floor: the relaxed floor may apply only with a live Averin client, on both the
+# direct path and approval resume (a floor read from config alone was a fail-open).
+if server.count("EffectiveEvidenceFloor::from_config(&self.config, self.averin.is_some())") < 2:
+    fail("the evidence floor must be derived from the config AND the live Averin client on direct and resume paths")
+if "fn requires_committed_evidence(self, floor: EffectiveEvidenceFloor, money: bool) -> bool" not in server:
     fail("committed-evidence selection is no longer a closed catalog classification")
+if "Self::HumanFloor | Self::AmbiguousCanonical => true," not in server:
+    fail("human-floor and ambiguous actions must require committed evidence whatever the floor")
 if "Some(CapabilityAuthorityClass::HumanFloor)" not in server or "Some(CapabilityAuthorityClass::AmbiguousCanonical)" not in server:
     fail("approval resume no longer selects Averin evidence from the frozen catalog class")
 if "async fn validate_required_evidence_preflight(" not in server:

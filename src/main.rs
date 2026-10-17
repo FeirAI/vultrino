@@ -220,6 +220,10 @@ enum Commands {
     /// KDF params. Distinct from shared-HMAC secret rotation (which is a config repoint).
     Rekey,
 
+    /// Consistent vault backup and restore (offline or under the exclusive vault lock).
+    #[command(subcommand)]
+    Vault(VaultCommands),
+
     /// Run the MCP server (for LLM integration)
     Mcp,
 
@@ -314,6 +318,43 @@ enum Commands {
     Policy {
         #[command(subcommand)]
         command: PolicyCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum VaultCommands {
+    /// Copy the snapshot, its .wal, the outbox and the averin stores together into a NEW empty
+    /// directory, with a manifest of SHA-256 sums. Holds the exclusive vault lock for the copy (a
+    /// running non-durable service waits for it, dispatches pause for that time); refuses at once
+    /// if the durable averin queue is in use, or while `<vault>.restore-pending` exists (an earlier
+    /// restore did not finish). Stop the service first for a durable deployment.
+    Backup {
+        /// Destination directory (must not exist or be empty)
+        dir: PathBuf,
+    },
+    /// Restore a backup made by `vault backup`. Verifies every checksum and opens the copy before
+    /// touching the target; refuses a partial backup; replaces an existing vault only with --force
+    /// (the old files are moved aside, not deleted). STOP THE SERVICE FIRST: a running non-durable
+    /// service holds the vault lock only per operation, so this command does not detect it.
+    /// A restore does not detect a rollback: restoring an older backup undoes every kill,
+    /// revocation and approval made after it, so re-apply those (and check Govder's kill state)
+    /// before starting the service.
+    Restore {
+        /// Directory holding the backup
+        dir: PathBuf,
+        /// Replace an existing vault
+        #[arg(long)]
+        force: bool,
+    },
+    /// Check that the vault opens. If it does not, and removing exactly the final .wal record makes
+    /// it open, say so; with --truncate-final cut that record out (kept in <wal>.damaged-<nanos>).
+    /// Damage anywhere else, or a wrong password, is refused and nothing is changed. A cut record
+    /// is a committed mutation that is lost: redo it (a kill, a revocation) afterwards. Stop the
+    /// service first.
+    Check {
+        /// Cut a damaged final record out of the .wal
+        #[arg(long)]
+        truncate_final: bool,
     },
 }
 
@@ -736,6 +777,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Rekey => {
             rekey_vault(config).await?;
         }
+        Commands::Vault(cmd) => {
+            vault_backup_cmd(config, cmd).await?;
+        }
         Commands::Mcp => {
             run_mcp_server(config).await?;
         }
@@ -1020,6 +1064,65 @@ fn get_new_storage_password() -> Result<SecretString, Box<dyn std::error::Error>
         return Err("new storage passwords do not match".into());
     }
     Ok(SecretString::from(first))
+}
+
+async fn vault_backup_cmd(
+    config: Config,
+    cmd: VaultCommands,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use vultrino::storage::vault_backup;
+    if !matches!(config.storage.backend, StorageBackendType::File) {
+        return Err("vault backup and restore support the file backend only".into());
+    }
+    let path = config
+        .storage
+        .file_path
+        .clone()
+        .unwrap_or_else(Config::default_storage_path);
+    let password = get_storage_password()?;
+    match cmd {
+        VaultCommands::Backup { dir } => {
+            let n = vault_backup::backup(&path, &dir, Some(&password)).await?;
+            println!(
+                "backed up {n} files from {} to {}",
+                path.display(),
+                dir.display()
+            );
+        }
+        VaultCommands::Check { truncate_final } => {
+            use vultrino::storage::vault_backup::CheckOutcome;
+            match vault_backup::check(&path, &password, truncate_final).await? {
+                CheckOutcome::Healthy => println!("vault ok: {}", path.display()),
+                CheckOutcome::FinalRecordDamaged {
+                    removed_bytes,
+                    saved_to: None,
+                } => {
+                    println!(
+                        "the vault does not open, but it does without its final .wal record \
+                         ({removed_bytes} bytes). Re-run with --truncate-final to cut it out."
+                    );
+                    std::process::exit(2);
+                }
+                CheckOutcome::FinalRecordDamaged {
+                    removed_bytes,
+                    saved_to: Some(side),
+                } => println!(
+                    "cut the damaged final .wal record ({removed_bytes} bytes), kept in {}. \
+                     Redo any kill or revocation that was in it.",
+                    side.display()
+                ),
+            }
+        }
+        VaultCommands::Restore { dir, force } => {
+            let n = vault_backup::restore(&dir, &path, force, Some(&password)).await?;
+            println!(
+                "restored {n} files from {} to {}",
+                dir.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Re-key the file-backed vault to a new master password (offline, single-sided). Opens the vault with

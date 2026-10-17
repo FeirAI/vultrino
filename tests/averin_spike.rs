@@ -61,6 +61,9 @@ fn spawn_averin() -> Averin {
     let port = free_port();
     // Three pairwise-distinct 32-byte seeds (R2: signing ≠ broker ≠ resource).
     let child = Command::new(&bin)
+        // averin defaults to production posture (keys, a database and a real seed required); this is a
+        // local single-process test, so it selects the explicit dev mode.
+        .env("AVERIN_DEV_MODE", "1")
         .env("AVERIN_SIGNING_SEED", "11".repeat(32))
         .env("AVERIN_BROKER_ISSUING_SEED", "22".repeat(32))
         .env("AVERIN_RESOURCE_SEED", "33".repeat(32))
@@ -108,6 +111,7 @@ fn client(base_url: &str, mode: AverinMode) -> AverinClient {
         max_seal_params_bytes: 128 * 1024,
         durable: false,
         d8_complete_evidence: false,
+        d8_evidence_floor: vultrino::averin::D8EvidenceFloor::default(),
     })
     .expect("client builds")
     .expect("client is Some when enabled")

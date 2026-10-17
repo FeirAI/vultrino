@@ -299,6 +299,51 @@ impl VaultIoStats {
     }
 }
 
+/// Take the vault lock exclusively through the writer-intent turnstile (VUL-06): hold the `.gate`
+/// file exclusively while waiting for the vault lock (which holds new readers out, see
+/// `FileStorage::pass_writer_gate`), then release the gate once the vault lock is held. Writers
+/// serialise on the gate; lock order is always gate then vault, and readers never hold the gate
+/// while waiting for the vault, so this cannot deadlock.
+macro_rules! lock_vault_exclusive {
+    ($s:expr, $flock:ident, $guard:ident) => {
+        let mut gate = $s.gate_file()?;
+        let gate_guard = gate.write().map_err(StorageError::Io)?;
+        let mut $flock = $s.lock_file()?;
+        let $guard = $flock.write().map_err(StorageError::Io)?;
+        drop(gate_guard);
+    };
+}
+
+thread_local! {
+    /// How many gated shared reads this thread is inside (debug builds only check it).
+    static GATED_READ_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the span of one gated shared read. A second gated read on the same thread, inside the
+/// first, can deadlock against a waiting writer (the writer holds the gate and waits for the first
+/// read's vault lock; the nested read waits on the gate), so debug builds assert it never happens.
+struct GatedReadScope;
+
+impl GatedReadScope {
+    fn enter() -> Self {
+        GATED_READ_DEPTH.with(|d| {
+            debug_assert_eq!(
+                d.get(),
+                0,
+                "nested gated vault read: it can deadlock against a waiting kill write (VUL-06)"
+            );
+            d.set(d.get() + 1);
+        });
+        GatedReadScope
+    }
+}
+
+impl Drop for GatedReadScope {
+    fn drop(&mut self) {
+        GATED_READ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// File-based storage with AES-256-GCM encryption
 pub struct FileStorage {
     /// I/O accounting (see [`VaultIoStats`]).
@@ -1143,6 +1188,15 @@ impl FileStorage {
         strict: bool,
     ) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
+        // A half-applied `vault restore` leaves this marker: the files may pair a snapshot with a
+        // log from another moment, so refuse until the restore is re-run (VUL-11).
+        if super::vault_backup::restore_pending_path(&path).exists() {
+            return Err(StorageError::Io(std::io::Error::other(format!(
+                "an interrupted `vultrino vault restore` left {}; re-run `vultrino vault restore \
+                 <backup-dir> --force` to finish it",
+                super::vault_backup::restore_pending_path(&path).display()
+            ))));
+        }
 
         // Ensure parent directory exists and is owner-only. Fail closed on chmod
         // failure — a world/group-readable vault parent undermines the 0600 file mode.
@@ -1214,8 +1268,7 @@ impl FileStorage {
         // create the same vault may have won while this one derived its key: re-check under the
         // lock and open what is there instead of overwriting it (a different salt would orphan it).
         let raced = {
-            let mut flock = storage.lock_file()?;
-            let _guard = flock.write().map_err(StorageError::Io)?;
+            lock_vault_exclusive!(storage, flock, _guard);
             if storage.path.exists() {
                 true
             } else {
@@ -1986,8 +2039,7 @@ impl FileStorage {
     /// Open-time step, under the exclusive lock: load the vault, then one-way migrate a pre-v10
     /// vault (back it up first) to the snapshot-plus-log format.
     fn bootstrap_locked(&self) -> Result<(), StorageError> {
-        let mut flock = self.lock_file()?;
-        let _guard = flock.write().map_err(StorageError::Io)?;
+        lock_vault_exclusive!(self, flock, _guard);
         let mut log = self.log.lock();
         let mut cache = self.cache.write();
         self.full_load_locked(&mut log, &mut cache, true)?;
@@ -2098,6 +2150,8 @@ impl FileStorage {
         &self,
         f: impl FnOnce(&StorageCache) -> T,
     ) -> Result<T, StorageError> {
+        let _scope = GatedReadScope::enter();
+        self.pass_writer_gate()?;
         let flock = self.lock_file()?;
         let _guard = flock.read().map_err(StorageError::Io)?;
         {
@@ -2112,6 +2166,32 @@ impl FileStorage {
         let cache = self.cache.read();
         Ok(f(&cache))
         // `_guard` dropped here releases the lock.
+    }
+
+    /// Open the writer-intent gate file (`.gate`, 0600). See [`lock_vault_exclusive`].
+    fn gate_file(&self) -> Result<fd_lock::RwLock<std::fs::File>, StorageError> {
+        let gate_path = self.path.with_extension("gate");
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        Ok(fd_lock::RwLock::new(opts.open(&gate_path)?))
+    }
+
+    /// Reader side of the writer-intent turnstile (VUL-06): take the gate shared and release it at
+    /// once, BEFORE the shared vault lock. A writer holding the gate exclusive (waiting for the
+    /// vault lock) therefore holds new readers here, so a stream of overlapping shared holders
+    /// cannot starve it. A reader that already passed the gate finishes normally. `flock` gives
+    /// no writer preference on the gate either, so taking the gate is fast in practice (readers
+    /// hold it for a few syscalls), not bounded. Not re-entrant: a locked read nested inside
+    /// another one can deadlock against a waiting writer, and debug builds assert it never happens.
+    fn pass_writer_gate(&self) -> Result<(), StorageError> {
+        let gate = self.gate_file()?;
+        let _pass = gate.read().map_err(StorageError::Io)?;
+        Ok(())
     }
 
     /// Open the sidecar `.lock` file (0600). Callers take it shared (`read`) or exclusive
@@ -2145,9 +2225,7 @@ impl FileStorage {
         f: impl FnOnce(&mut StorageCache) -> Result<T, StorageError>,
         force_compact: bool,
     ) -> Result<T, StorageError> {
-        let mut flock = self.lock_file()?;
-        // Blocks until no other process/thread holds the lock.
-        let _guard = flock.write().map_err(StorageError::Io)?;
+        lock_vault_exclusive!(self, flock, _guard);
         let mut log = self.log.lock();
         let mut cache = self.cache.write();
         self.sync_locked(&mut log, &mut cache, true)?;
@@ -2277,6 +2355,8 @@ impl FileStorage {
     }
 
     fn reload_blocking(&self) -> Result<(), StorageError> {
+        let _scope = GatedReadScope::enter();
+        self.pass_writer_gate()?;
         let flock = self.lock_file()?;
         let _guard = flock.read().map_err(StorageError::Io)?;
         let mut log = self.log.lock();
@@ -2341,8 +2421,7 @@ impl FileStorage {
     /// outbox fd-lock (taken inside [`OutboxStore::rekey_prepare`]) follows the same vault→outbox lock
     /// ordering the drain path uses, so it cannot deadlock.
     fn rekey_blocking(&self, new_password: &SecretString) -> Result<(), StorageError> {
-        let mut flock = self.lock_file()?;
-        let _guard = flock.write().map_err(StorageError::Io)?;
+        lock_vault_exclusive!(self, flock, _guard);
 
         // 1. Decrypt the vault with the CURRENT master key (authoritative on-disk state: the snapshot
         //    plus the whole log; fails closed on a newer-version vault via check_version).

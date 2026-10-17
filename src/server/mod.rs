@@ -149,14 +149,56 @@ where
 enum IrreversibilityResolution {
     Reversible,
     HumanFloor,
+    /// Declared partially-reversible and nothing stricter (VUL-38 evidence floor).
+    PartiallyReversible,
     Undeclared,
     AmbiguousCanonical,
     Unavailable,
 }
 
+/// The VUL-38 floor in force. `[averin] d8_evidence_floor` only applies with
+/// `d8_complete_evidence` on (the two-phase mode the fallback belongs to); with it off every
+/// partially-reversible action keeps the committed-evidence floor it always had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveEvidenceFloor {
+    MoneyAndIrreversible,
+    HumanFloor,
+}
+
+impl EffectiveEvidenceFloor {
+    /// `client_present` is whether a live Averin client was built from the config. Without
+    /// one there is no evidence path at all (no seal, no degraded alarm, no counter), so the
+    /// routine fallback is not available and the committed-evidence floor stands.
+    fn from_config(cfg: &crate::config::Config, client_present: bool) -> Self {
+        use crate::averin::D8EvidenceFloor;
+        if client_present
+            && cfg.averin.enabled
+            && cfg.averin.d8_complete_evidence
+            && cfg.averin.d8_evidence_floor == D8EvidenceFloor::MoneyAndIrreversible
+        {
+            Self::MoneyAndIrreversible
+        } else {
+            Self::HumanFloor
+        }
+    }
+}
+
+/// Vultrino's money definition for the VUL-38 floor: any of the action names the request
+/// carries is in the `money.*` namespace. (A catalog-declared irreversible action is the other
+/// half of the definition and is already `HumanFloor`.)
+fn is_money_action(names: &[Option<&str>]) -> bool {
+    names
+        .iter()
+        .flatten()
+        .any(|n| n.trim().to_ascii_lowercase().starts_with("money."))
+}
+
 impl IrreversibilityResolution {
     fn automatically_requires_approval(self) -> bool {
-        matches!(self, Self::HumanFloor | Self::AmbiguousCanonical)
+        matches!(
+            self,
+            Self::HumanFloor | Self::PartiallyReversible | Self::AmbiguousCanonical
+        )
     }
 
     /// Anything not proven reversible. Used for inconclusive-recipe refusal and
@@ -171,14 +213,25 @@ impl IrreversibilityResolution {
     /// posture keep the historical availability knobs (including Observe
     /// fail-open); only a declared human floor or an erased shared-canonical
     /// verb forces a committed use seal before dispatch.
-    fn requires_committed_evidence(self) -> bool {
-        matches!(self, Self::HumanFloor | Self::AmbiguousCanonical)
+    fn requires_committed_evidence(self, floor: EffectiveEvidenceFloor, money: bool) -> bool {
+        match self {
+            Self::HumanFloor | Self::AmbiguousCanonical => true,
+            Self::PartiallyReversible => money || floor == EffectiveEvidenceFloor::HumanFloor,
+            _ => false,
+        }
+    }
+
+    /// VUL-38: whether the one-phase fallback may run when Averin is unavailable. Money never
+    /// degrades, whatever its declaration; the other gate is `requires_committed_evidence`.
+    fn d8_fallback_ok(self, money: bool) -> bool {
+        matches!(self, Self::Reversible | Self::PartiallyReversible) && !money
     }
 
     fn authority_class(self) -> Option<CapabilityAuthorityClass> {
         match self {
             Self::Reversible => Some(CapabilityAuthorityClass::Reversible),
             Self::HumanFloor => Some(CapabilityAuthorityClass::HumanFloor),
+            Self::PartiallyReversible => Some(CapabilityAuthorityClass::PartiallyReversible),
             Self::Undeclared => Some(CapabilityAuthorityClass::Undeclared),
             Self::AmbiguousCanonical => Some(CapabilityAuthorityClass::AmbiguousCanonical),
             Self::Unavailable => None,
@@ -526,6 +579,12 @@ struct ActionPayload {
     /// binding. When true, a committed Averin use receipt is a precondition of
     /// plugin dispatch, independent of the ordinary Observe posture.
     evidence_required: bool,
+    /// True only when trusted catalog authority declares the action Reversible.
+    /// It is the sole class that may fall back to a one-phase seal when Averin is
+    /// unavailable (VUL-38). Undeclared, ambiguous and human-floor actions never
+    /// fall back. Not part of the permit binding: it is set from the same trusted
+    /// resolution as `evidence_required` and is read only at the D8 seam.
+    d8_fallback_ok: bool,
     /// The kill fence subject (P3-KILL), checked against the vault immediately
     /// before the plugin call. Not part of the permit binding: it can only refuse.
     kill_fence: KillFenceSubject,
@@ -1762,7 +1821,15 @@ impl VultrinoServer {
         // declared human-floor capability or an ambiguous shared canonical verb
         // forces a committed use seal. Both answers come from this one snapshot.
         let trusted_irreversible = irreversibility.trusted_human_floor();
-        let evidence_required = irreversibility.requires_committed_evidence();
+        let money = is_money_action(&[
+            Some(request.action.as_str()),
+            Some(full_action.as_str()),
+            action_label.as_deref(),
+        ]);
+        let evidence_required = irreversibility.requires_committed_evidence(
+            EffectiveEvidenceFloor::from_config(&self.config, self.averin.is_some()),
+            money,
+        );
 
         // VUL-05: the pure admission gate decides between direct execution,
         // human approval and refusal from the evaluation and `needs_approval`.
@@ -2069,6 +2136,7 @@ impl VultrinoServer {
             approved_execution: false,
             evidence_action: request.action.clone(),
             evidence_required,
+            d8_fallback_ok: irreversibility.d8_fallback_ok(money),
             kill_fence: KillFenceSubject {
                 principal: principal.clone(),
                 admitted_epoch,
@@ -2119,6 +2187,64 @@ impl VultrinoServer {
         }
     }
 
+    /// The D8 two-phase evidence seam shared by the buffered and streaming tails.
+    ///
+    /// VUL-38: a declared-Reversible action keeps running with a one-phase seal
+    /// ONLY when Averin is unavailable (connect/timeout failure, 5xx or 429).
+    /// Every other failure (an oversize bound, a malformed reply, a 4xx from a
+    /// live Averin, a Pop error) refuses, exactly as an irreversible, undeclared
+    /// or ambiguous action always does. The agent cannot choose the degraded path
+    /// by shaping its params, because the params bound is also checked before the
+    /// use token is consumed.
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_exact_or_degrade(
+        &self,
+        av: &Arc<crate::averin::AverinClient>,
+        token_id: &str,
+        credential_alias: &str,
+        evidence_action: &str,
+        params_bytes: Vec<u8>,
+        use_sequence_number: u32,
+        request_id: &str,
+        evidence_required: bool,
+        d8_fallback_ok: bool,
+    ) -> Result<Option<crate::averin::ExactUseEvidence>, RunError> {
+        match av
+            .begin_exact_use(
+                token_id,
+                credential_alias,
+                evidence_action,
+                &params_bytes,
+                request_id,
+            )
+            .await
+        {
+            Ok(evidence) => Ok(Some(evidence)),
+            Err(error) if d8_fallback_ok && !evidence_required && error.is_unavailable() => {
+                av.record_d8_degraded();
+                tracing::error!(
+                    target: "averin_seal",
+                    request_id = %request_id,
+                    error = %error,
+                    "AVERIN-D8-DEGRADED two-phase evidence unavailable for a reversible action; falling back to a one-phase seal"
+                );
+                self.seal_after_consume(
+                    av,
+                    token_id,
+                    params_bytes,
+                    use_sequence_number,
+                    request_id,
+                    evidence_required,
+                )
+                .await?;
+                Ok(None)
+            }
+            Err(error) => Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
+                "D8 before-act evidence failed: {error}; nothing ran"
+            )))),
+        }
+    }
+
     /// Validate the evidence prerequisites selected by trusted capability
     /// authority before a use token is consumed. A human-floor action may reach
     /// dispatch only with a concrete token, a live Averin client, bounded params,
@@ -2131,6 +2257,21 @@ impl VultrinoServer {
         params_len: usize,
     ) -> Result<(), RunError> {
         if !evidence_required {
+            // A routine action under D8 may degrade only when Averin is down. An
+            // oversize params body is the agent's doing, so refuse it before the
+            // token is consumed rather than letting it skip two-phase evidence.
+            if let Some(av) = self.averin.as_ref() {
+                if av.config().d8_complete_evidence
+                    && evidence_subject_id.is_some()
+                    && params_len > av.config().max_seal_params_bytes
+                {
+                    return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
+                        "D8 before-act evidence failed: parameters exceed the configured {} byte \
+                         evidence bound; nothing ran",
+                        av.config().max_seal_params_bytes
+                    ))));
+                }
+            }
             return Ok(());
         }
         let av = self.averin.as_ref().ok_or_else(|| {
@@ -2612,6 +2753,7 @@ impl VultrinoServer {
             approved_execution,
             evidence_action,
             evidence_required,
+            d8_fallback_ok,
             kill_fence,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
@@ -2774,21 +2916,20 @@ impl VultrinoServer {
             (&self.averin, evidence_subject_id, evidence_params)
         {
             if av.config().d8_complete_evidence || (approved_execution && evidence_required) {
-                let evidence = av
-                    .begin_exact_use(
+                exact_evidence = self
+                    .begin_exact_or_degrade(
+                        av,
                         tid,
                         &credential_alias,
                         &evidence_action,
-                        &params_bytes,
+                        params_bytes,
+                        use_sequence_number,
                         &request_id,
+                        evidence_required,
+                        d8_fallback_ok,
                     )
-                    .await
-                    .map_err(|error| {
-                        RunError::terminal(VultrinoError::PolicyDenied(format!(
-                            "D8 before-act evidence failed: {error}; nothing ran"
-                        )))
-                    })?;
-                exact_evidence = Some((av.clone(), evidence));
+                    .await?
+                    .map(|evidence| (av.clone(), evidence));
             } else {
                 // Plan 087 FIX 1 — the mode-dependent seal hook now lives in ONE shared
                 // helper so the buffered and streaming execute paths cannot drift.
@@ -3042,6 +3183,7 @@ impl VultrinoServer {
             approved_execution,
             evidence_action,
             evidence_required,
+            d8_fallback_ok,
             kill_fence,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
@@ -3187,21 +3329,20 @@ impl VultrinoServer {
             (&self.averin, evidence_subject_id, evidence_params)
         {
             if av.config().d8_complete_evidence || (approved_execution && evidence_required) {
-                let evidence = av
-                    .begin_exact_use(
+                exact_evidence = self
+                    .begin_exact_or_degrade(
+                        av,
                         tid,
                         &credential_alias,
                         &evidence_action,
-                        &params_bytes,
+                        params_bytes,
+                        use_sequence_number,
                         &request_id,
+                        evidence_required,
+                        d8_fallback_ok,
                     )
-                    .await
-                    .map_err(|error| {
-                        RunError::terminal(VultrinoError::PolicyDenied(format!(
-                            "D8 before-act evidence failed: {error}; nothing ran"
-                        )))
-                    })?;
-                exact_evidence = Some((av.clone(), evidence));
+                    .await?
+                    .map(|evidence| (av.clone(), evidence));
             } else {
                 self.seal_after_consume(
                     av,
@@ -3794,9 +3935,17 @@ impl VultrinoServer {
         // Prefer the frozen catalog class: undeclared approvals may carry the
         // broader trusted_irreversible stamp for recipe refusal without forcing
         // Averin evidence. Legacy rows without a class keep the stamp fail-closed.
+        let money = is_money_action(&[
+            Some(approval.action.as_str()),
+            approval.action_label.as_deref(),
+        ]);
+        let floor = EffectiveEvidenceFloor::from_config(&self.config, self.averin.is_some());
         let evidence_required = match approval.capability_authority() {
             Some(CapabilityAuthorityClass::HumanFloor)
             | Some(CapabilityAuthorityClass::AmbiguousCanonical) => true,
+            Some(CapabilityAuthorityClass::PartiallyReversible) => {
+                money || floor == EffectiveEvidenceFloor::HumanFloor
+            }
             Some(_) => false,
             None => approval.trusted_irreversible,
         };
@@ -3822,6 +3971,12 @@ impl VultrinoServer {
                 .clone()
                 .unwrap_or_else(|| approval.action.clone()),
             evidence_required,
+            d8_fallback_ok: !money
+                && matches!(
+                    approval.capability_authority(),
+                    Some(CapabilityAuthorityClass::Reversible)
+                        | Some(CapabilityAuthorityClass::PartiallyReversible)
+                ),
         };
         let authorized = permit.authorize(payload).map_err(|reason| {
             RunError::terminal(VultrinoError::PolicyDenied(format!(
@@ -4412,11 +4567,21 @@ impl VultrinoServer {
                 .collect();
             if matching.is_empty() {
                 IrreversibilityResolution::Undeclared
+            } else if matching.iter().any(|cap| {
+                // Irreversible, or a spelling nothing recognises: fail closed. A declared
+                // partially-reversible money.* action is money, so it is human floor too.
+                !matches!(
+                    cap.reversibility.trim(),
+                    "reversible" | "partially-reversible"
+                ) || (cap.reversibility.trim() == "partially-reversible"
+                    && is_money_action(&[Some(cap.action.as_str())]))
+            }) {
+                IrreversibilityResolution::HumanFloor
             } else if matching
                 .iter()
                 .any(|cap| crate::approval::reversibility_requires_human_floor(&cap.reversibility))
             {
-                IrreversibilityResolution::HumanFloor
+                IrreversibilityResolution::PartiallyReversible
             } else {
                 IrreversibilityResolution::Reversible
             }

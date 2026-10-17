@@ -240,7 +240,11 @@ pub fn reversibility_requires_human_floor(reversibility: &str) -> bool {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CapabilityAuthorityClass {
     Reversible,
+    /// Declared irreversible (or an unrecognised non-reversible spelling, fail closed).
     HumanFloor,
+    /// Declared partially-reversible and nothing stricter. Still a human-floor action for
+    /// approval; the VUL-38 evidence floor setting decides whether it may degrade.
+    PartiallyReversible,
     Undeclared,
     AmbiguousCanonical,
 }

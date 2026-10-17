@@ -15,7 +15,7 @@ use vultrino::approval::{
     ApprovalRequest, ApprovalStatus, ApproverClass, Decision, NewApproval, RequesterInfo,
 };
 use vultrino::auth::{AuthResult, NewUseToken, UseToken};
-use vultrino::averin::{AverinConfig, AverinMode};
+use vultrino::averin::{AverinConfig, AverinMode, D8EvidenceFloor};
 use vultrino::config::Config;
 use vultrino::govder::GovderConfig;
 use vultrino::plugins::{Plugin, PluginError, PluginRequest};
@@ -350,6 +350,50 @@ async fn open_approved_mutable_recipe_fixture_with_authority(
     authoritative_irreversible: bool,
     averin_mode: Option<AverinMode>,
 ) -> MutableRecipeApprovalFixture {
+    open_approved_fixture_d8(
+        catalog_reversibility,
+        authoritative_irreversible,
+        averin_mode,
+        false,
+        "http://127.0.0.1:9".to_string(),
+    )
+    .await
+}
+
+/// The same fixture with the FeirOS Solo posture selectable: `d8_complete_evidence` on and the
+/// Averin address chosen (a closed port models Averin being down).
+async fn open_approved_fixture_d8(
+    catalog_reversibility: &str,
+    authoritative_irreversible: bool,
+    averin_mode: Option<AverinMode>,
+    d8_complete_evidence: bool,
+    averin_base_url: String,
+) -> MutableRecipeApprovalFixture {
+    open_approved_fixture_floor(
+        None,
+        catalog_reversibility,
+        authoritative_irreversible,
+        averin_mode,
+        d8_complete_evidence,
+        D8EvidenceFloor::default(),
+        averin_base_url,
+    )
+    .await
+}
+
+/// The same again with the governed action label (`None` = the plain `count.run`) and the
+/// VUL-38 `[averin] d8_evidence_floor` chosen.
+#[allow(clippy::too_many_arguments)]
+async fn open_approved_fixture_floor(
+    label: Option<&str>,
+    catalog_reversibility: &str,
+    authoritative_irreversible: bool,
+    averin_mode: Option<AverinMode>,
+    d8_complete_evidence: bool,
+    floor: D8EvidenceFloor,
+    averin_base_url: String,
+) -> MutableRecipeApprovalFixture {
+    let action = label.unwrap_or("count.run");
     let one_teammate = serde_json::json!({
         "has_rule": true,
         "risk_tier": "High",
@@ -377,12 +421,20 @@ async fn open_approved_mutable_recipe_fixture_with_authority(
     config.govder = Some(govder);
     if let Some(mode) = averin_mode {
         config.averin = AverinConfig {
-            enabled: true,
-            base_url: "http://127.0.0.1:9".to_string(),
+            // An empty base_url models "no Averin client": an ENABLED block with no URL no longer
+            // starts (FEI-33), so that case is a disabled block with the D8 setting still on.
+            enabled: !averin_base_url.trim().is_empty(),
+            base_url: averin_base_url,
             resource_id: "orders-db".to_string(),
             mode,
+            d8_complete_evidence,
+            d8_evidence_floor: floor,
             ..AverinConfig::default()
         };
+    }
+    if let Some(label) = label {
+        config.action_labels =
+            std::collections::HashMap::from([(label.to_string(), "count.run".to_string())]);
     }
     let resolver = CredentialResolver::new(storage.clone());
     let server = VultrinoServer::new(config, storage.clone(), resolver);
@@ -393,7 +445,7 @@ async fn open_approved_mutable_recipe_fixture_with_authority(
     store_credential(&storage, "mutable-recipe-cred", false).await;
     set_count_capability_reversibility_for_credential(
         &storage,
-        "count.run",
+        action,
         "mutable-recipe-cred",
         catalog_reversibility,
     )
@@ -402,7 +454,7 @@ async fn open_approved_mutable_recipe_fixture_with_authority(
     let (_plaintext, mut token) = UseToken::create(NewUseToken {
         name: "recipe-bound-executor".to_string(),
         credential_scope: "mutable-recipe-cred".to_string(),
-        action_scope: Some("count.run".to_string()),
+        action_scope: Some(action.to_string()),
         max_uses: Some(1),
         require_approval: true,
         expires_in: None,
@@ -413,7 +465,7 @@ async fn open_approved_mutable_recipe_fixture_with_authority(
 
     let approval = match server
         .execute_gated(
-            count_request("mutable-recipe-cred"),
+            count_request_for_action("mutable-recipe-cred", action),
             ExecAuth::from_use_token(token),
         )
         .await
@@ -1010,6 +1062,283 @@ async fn reversible_approval_resume_remains_fail_open_when_observe_seal_is_missi
     assert!(resumed.executed);
     assert!(resumed.result_error.is_none());
     assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A fake Averin that counts the three D8 calls and answers like Averin.
+async fn start_counting_averin() -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use axum::routing::post;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Clone)]
+    struct St {
+        intents: Arc<AtomicUsize>,
+        outcomes: Arc<AtomicUsize>,
+    }
+    async fn grant() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({"grant_id": "g-1", "capability": "Y2Fw.sig"}))
+    }
+    async fn intent(
+        axum::extract::State(st): axum::extract::State<St>,
+    ) -> axum::Json<serde_json::Value> {
+        st.intents.fetch_add(1, Ordering::SeqCst);
+        axum::Json(serde_json::json!({"record": {"record_id": "intent-1"}}))
+    }
+    async fn outcome(
+        axum::extract::State(st): axum::extract::State<St>,
+    ) -> axum::Json<serde_json::Value> {
+        st.outcomes.fetch_add(1, Ordering::SeqCst);
+        axum::Json(serde_json::json!({"outcome_id": "outcome-1"}))
+    }
+    let intents = Arc::new(AtomicUsize::new(0));
+    let outcomes = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route("/v2/grants", post(grant))
+        .route("/v2/use-intent", post(intent))
+        .route("/v2/use-outcome", post(outcome))
+        .with_state(St {
+            intents: intents.clone(),
+            outcomes: outcomes.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), intents, outcomes)
+}
+
+/// VUL-38, the Solo posture (`d8_complete_evidence` on, Observe) with Averin DOWN: an approved
+/// irreversible action is refused before the plugin and a reversible one keeps running with a
+/// counted gap. Red before the fallback: the reversible action was refused too.
+#[tokio::test]
+async fn solo_posture_with_averin_down_refuses_irreversible_and_runs_reversible() {
+    let irreversible = open_approved_fixture_d8(
+        "irreversible",
+        true,
+        Some(AverinMode::Observe),
+        true,
+        "http://127.0.0.1:9".to_string(),
+    )
+    .await;
+    let resumed = irreversible
+        .server
+        .check_and_resume_approval(&irreversible.approval_id, None)
+        .await
+        .unwrap();
+    assert!(resumed
+        .result_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("D8 before-act evidence failed"));
+    assert_eq!(
+        irreversible.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+
+    let reversible = open_approved_fixture_d8(
+        "reversible",
+        false,
+        Some(AverinMode::Observe),
+        true,
+        "http://127.0.0.1:9".to_string(),
+    )
+    .await;
+    let resumed = reversible
+        .server
+        .check_and_resume_approval(&reversible.approval_id, None)
+        .await
+        .unwrap();
+    assert!(resumed.executed);
+    assert!(resumed.result_error.is_none(), "{resumed:?}");
+    assert_eq!(
+        reversible.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        reversible.server.averin().map(|a| a.metrics().d8_degraded),
+        Some(1),
+        "the gap must be counted"
+    );
+}
+
+/// VUL-38 configurable floor, Averin DOWN, Solo posture, approved resume. Default mode: money and
+/// irreversible are refused, a partially-reversible non-money write keeps running with a counted
+/// gap, money.notify (money-class partially-reversible) stays refused. human_floor: the write is
+/// refused too.
+async fn floor_run(
+    label: Option<&str>,
+    reversibility: &str,
+    floor: D8EvidenceFloor,
+) -> (bool, String, usize, u64) {
+    floor_run_url(label, reversibility, floor, "http://127.0.0.1:9").await
+}
+
+async fn floor_run_url(
+    label: Option<&str>,
+    reversibility: &str,
+    floor: D8EvidenceFloor,
+    base_url: &str,
+) -> (bool, String, usize, u64) {
+    let f = open_approved_fixture_floor(
+        label,
+        reversibility,
+        reversibility != "reversible",
+        Some(AverinMode::Observe),
+        true,
+        floor,
+        base_url.to_string(),
+    )
+    .await;
+    let resumed = f
+        .server
+        .check_and_resume_approval(&f.approval_id, None)
+        .await
+        .unwrap();
+    (
+        resumed.executed && resumed.result_error.is_none(),
+        resumed.result_error.unwrap_or_default(),
+        f.calls.load(std::sync::atomic::Ordering::SeqCst),
+        f.server.averin().map_or(0, |a| a.metrics().d8_degraded),
+    )
+}
+
+fn assert_floor_refused(r: &(bool, String, usize, u64), what: &str) {
+    assert!(!r.0, "{what} must be refused while Averin is down");
+    assert!(
+        r.1.contains("D8 before-act evidence failed"),
+        "{what}: {}",
+        r.1
+    );
+    assert_eq!((r.2, r.3), (0, 0), "{what}: nothing may run or degrade");
+}
+
+#[tokio::test]
+async fn default_floor_degrades_a_partially_reversible_write_but_refuses_money_and_irreversible() {
+    let d = D8EvidenceFloor::MoneyAndIrreversible;
+    let write = floor_run(Some("session.update"), "partially-reversible", d).await;
+    assert!(
+        write.0,
+        "a non-money partially-reversible write must keep running: {}",
+        write.1
+    );
+    assert_eq!((write.2, write.3), (1, 1), "the gap must be counted");
+    assert_floor_refused(
+        &floor_run(Some("session.cancel"), "irreversible", d).await,
+        "irreversible",
+    );
+    assert_floor_refused(
+        &floor_run(Some("money.refund"), "irreversible", d).await,
+        "money.refund",
+    );
+    assert_floor_refused(
+        &floor_run(Some("money.notify"), "partially-reversible", d).await,
+        "money.notify (partially-reversible, money class)",
+    );
+    // A reversible-class money action never degrades either.
+    assert_floor_refused(
+        &floor_run(Some("money.refund"), "reversible", d).await,
+        "money.refund (reversible, money class)",
+    );
+}
+
+/// With no Averin client (the fixture models it as a disabled block: an enabled block that cannot
+/// build a client refuses to start, FEI-33) there is no evidence path at all:
+/// the routine fallback must not run the action silently, in the default mode too.
+#[tokio::test]
+async fn default_floor_refuses_a_partially_reversible_write_when_no_averin_client_exists() {
+    let r = floor_run_url(
+        Some("session.update"),
+        "partially-reversible",
+        D8EvidenceFloor::MoneyAndIrreversible,
+        "",
+    )
+    .await;
+    assert!(!r.0, "must be refused with no evidence client");
+    assert_eq!((r.2, r.3), (0, 0), "nothing may run or degrade");
+}
+
+#[tokio::test]
+async fn human_floor_mode_refuses_every_partially_reversible_action() {
+    let h = D8EvidenceFloor::HumanFloor;
+    assert_floor_refused(
+        &floor_run(Some("session.update"), "partially-reversible", h).await,
+        "a partially-reversible write in human_floor mode",
+    );
+    assert_floor_refused(
+        &floor_run(Some("money.notify"), "partially-reversible", h).await,
+        "money.notify",
+    );
+    assert_floor_refused(
+        &floor_run(Some("session.cancel"), "irreversible", h).await,
+        "irreversible",
+    );
+    assert_floor_refused(
+        &floor_run(Some("money.refund"), "reversible", h).await,
+        "money.refund (reversible, money class)",
+    );
+    // Reversible keeps running in both modes.
+    let r = floor_run(Some("data.read"), "reversible", h).await;
+    assert!(r.0, "{}", r.1);
+    assert_eq!((r.2, r.3), (1, 1));
+}
+
+/// Without two-phase evidence the floor setting has no effect: a partially-reversible approved
+/// action keeps the committed-evidence requirement it always had, in either mode.
+#[tokio::test]
+async fn floor_setting_has_no_effect_without_d8_complete_evidence() {
+    for floor in [
+        D8EvidenceFloor::MoneyAndIrreversible,
+        D8EvidenceFloor::HumanFloor,
+    ] {
+        let f = open_approved_fixture_floor(
+            Some("session.update"),
+            "partially-reversible",
+            true,
+            Some(AverinMode::Observe),
+            false,
+            floor,
+            "http://127.0.0.1:9".to_string(),
+        )
+        .await;
+        let resumed = f
+            .server
+            .check_and_resume_approval(&f.approval_id, None)
+            .await
+            .unwrap();
+        assert!(
+            resumed.result_error.is_some(),
+            "{floor:?}: must refuse without committed evidence"
+        );
+        assert_eq!(f.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+/// VUL-38, the same posture with Averin UP: a reversible action still gets two-phase evidence
+/// (use-intent before, use-outcome after) and no degraded gap is counted.
+#[tokio::test]
+async fn solo_posture_with_averin_up_gives_reversible_two_phase_evidence() {
+    let (url, intents, outcomes) = start_counting_averin().await;
+    let fixture =
+        open_approved_fixture_d8("reversible", false, Some(AverinMode::Observe), true, url).await;
+    let resumed = fixture
+        .server
+        .check_and_resume_approval(&fixture.approval_id, None)
+        .await
+        .unwrap();
+    assert!(
+        resumed.executed && resumed.result_error.is_none(),
+        "{resumed:?}"
+    );
+    assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(intents.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(outcomes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.server.averin().map(|a| a.metrics().d8_degraded),
+        Some(0)
+    );
 }
 
 /// A missing exact label must not borrow the classification of a reversible

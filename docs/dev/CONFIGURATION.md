@@ -528,6 +528,42 @@ re-auth off: it lapses after a generous default execute-by window (24h) so a
 forgotten grant can't stay executable indefinitely. Set a positive
 `reauth_interval_secs` when you need a tighter bound.
 
+### `[averin]` evidence floor: `d8_evidence_floor` (VUL-38)
+
+```toml
+[averin]
+enabled = true
+d8_complete_evidence = true
+# "money_and_irreversible" (default) | "human_floor"
+d8_evidence_floor = "money_and_irreversible"
+```
+
+`d8_evidence_floor` decides which actions are refused while Averin cannot begin the two-phase
+use evidence (unreachable, timed out, a 5xx or a 429). It has an effect only with
+`d8_complete_evidence = true`; with that off, every action the catalog declares non-reversible
+keeps its committed-evidence requirement, as before. An unknown value is refused at config load.
+
+| Action | `money_and_irreversible` (default) | `human_floor` |
+|---|---|---|
+| declared irreversible | refused | refused |
+| money (see below), any declaration | refused | refused |
+| partially-reversible, not money | keeps running: one-phase seal, `AVERIN-D8-DEGRADED`, `d8_degraded` | refused |
+| reversible, not money | keeps running, same alarm | keeps running, same alarm |
+| no catalog declaration | refused | refused |
+
+Money, for Vultrino, is an action whose name is in the `money.*` namespace, or one its
+capability catalog declares irreversible. A partially-reversible action in the `money.*`
+namespace (for example `money.notify`) is therefore refused in both modes. A `money.*` name
+is read from the request's action, label and, for a non-reversible declaration, the catalog
+entry's own action; a reversible catalog entry named `money.*` that is requested under another
+label is not recognised as money. FeirOS's own money check (`isMoneyClass`) also counts a high
+risk hint that Vultrino's catalog does not carry, so the two planes can classify an action
+differently. The running mode is reported in `GET /api/v1/posture` under `averin`
+(`d8_evidence_floor`, and `d8_evidence_floor_effective`, which reads `human_floor` while
+`d8_complete_evidence` is off). An approval opened before this setting existed for a
+partially-reversible action is refused on resume (its recorded authority class no longer
+matches) and must be requested again.
+
 ### `[identity]` — inbound workload-identity resolution (V10/R6)
 
 ```toml

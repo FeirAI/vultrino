@@ -1,0 +1,15 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 0e1cfe6..0ba45b2 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -3186,8 +3186,8 @@ impl VultrinoServer {
+                         params_bytes,
+                         use_sequence_number,
+                         &request_id,
+-                        evidence_required,
+-                        d8_fallback_ok,
++                        false,
++                        true,
+                     )
+                     .await?
+                     .map(|evidence| (av.clone(), evidence));
