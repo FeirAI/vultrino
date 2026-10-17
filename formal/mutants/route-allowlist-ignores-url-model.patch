@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 14620ec..cc0482a 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -857,7 +857,7 @@ async fn llm_proxy_impl(
+     };
+     // The allowlist applies to the model the URL selects too, not only the body's.
+     if let UrlModel::Names { model, .. } = &route {
+-        if !capability.llm_model_allowed(Some(model)) {
++        if false && !capability.llm_model_allowed(Some(model)) {
+             return llm_error(
+                 StatusCode::FORBIDDEN,
+                 "permission_error",

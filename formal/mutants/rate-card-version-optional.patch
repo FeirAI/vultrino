@@ -1,0 +1,13 @@
+diff --git a/src/ratecard.rs b/src/ratecard.rs
+index 59f166c..7305337 100644
+--- a/src/ratecard.rs
++++ b/src/ratecard.rs
+@@ -120,7 +120,7 @@ impl RateCard {
+         let mut versions = std::collections::HashSet::new();
+         for wire in cards {
+             let version = wire.rate_card_version.clone();
+-            if version.is_empty() {
++            if false && version.is_empty() {
+                 return Err(RateCardError(
+                     "a rate card is missing rate_card_version".to_string(),
+                 ));

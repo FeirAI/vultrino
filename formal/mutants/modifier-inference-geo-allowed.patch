@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 14620ec..14eb59d 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -304,7 +304,7 @@ fn unpriced_modifier(body: &serde_json::Value) -> Option<String> {
+     }
+     // Anthropic data residency: `inference_geo` other than global bills a premium.
+     if let Some(v) = body.get("inference_geo") {
+-        if text(v).as_deref() != Some("global") {
++        if false && text(v).as_deref() != Some("global") {
+             return Some("inference_geo other than \"global\" carries a price premium the card does not hold".to_string());
+         }
+     }

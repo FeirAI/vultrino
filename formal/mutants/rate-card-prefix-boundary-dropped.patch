@@ -1,8 +1,8 @@
 diff --git a/src/ratecard.rs b/src/ratecard.rs
-index 0a98ea6..bc54778 100644
+index 59f166c..dfff464 100644
 --- a/src/ratecard.rs
 +++ b/src/ratecard.rs
-@@ -166,7 +166,7 @@ fn dated_under(prefix: &str, model: &str) -> bool {
+@@ -283,7 +283,7 @@ fn dated_under(prefix: &str, model: &str) -> bool {
          return false;
      };
      let mut chars = rest.chars();
@@ -10,4 +10,4 @@ index 0a98ea6..bc54778 100644
 +    chars.next().is_some()
  }
  
- /// The model a token meter event is booked under: when a card is configured, the model the
+ /// The model a token meter event is booked under. The model the provider served is what

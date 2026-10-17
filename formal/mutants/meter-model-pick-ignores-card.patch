@@ -1,13 +1,13 @@
 diff --git a/src/ratecard.rs b/src/ratecard.rs
-index 0a98ea6..b265f50 100644
+index 59f166c..1eca83d 100644
 --- a/src/ratecard.rs
 +++ b/src/ratecard.rs
-@@ -178,7 +178,7 @@ pub fn pick_meter_model(
+@@ -299,7 +299,7 @@ pub fn pick_meter_model(
      served: Option<&str>,
      requested: Option<&str>,
  ) -> Option<String> {
--    if let Some(card) = card {
-+    if let Some(card) = card.filter(|_| false) {
-         for m in [served, requested].into_iter().flatten() {
-             if card.covers(m) {
-                 return Some(m.to_string());
+-    let (Some(card), Some(served)) = (card, served) else {
++    let (Some(card), Some(served)) = (card.filter(|_| false), served) else {
+         return served.or(requested).map(str::to_string);
+     };
+     if card.covers(served) {

@@ -1,0 +1,13 @@
+diff --git a/src/ratecard.rs b/src/ratecard.rs
+index 59f166c..41732f1 100644
+--- a/src/ratecard.rs
++++ b/src/ratecard.rs
+@@ -207,7 +207,7 @@ impl RateCard {
+             let single = entry.price_micros_per_unit.is_some()
+                 && entry.input_price_micros_per_unit.is_none()
+                 && entry.output_price_micros_per_unit.is_none();
+-            if !both && !single {
++            if false && !both && !single {
+                 return Err(RateCardError(format!(
+                     "rate card {version:?} entry {name:?}: needs BOTH input_price_micros_per_unit and output_price_micros_per_unit, or a single price_micros_per_unit"
+                 )));

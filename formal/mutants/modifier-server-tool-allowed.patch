@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 14620ec..e3895ce 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -365,7 +365,7 @@ fn unpriced_modifier(body: &serde_json::Value) -> Option<String> {
+                 .get("type")
+                 .and_then(serde_json::Value::as_str)
+                 .is_some_and(|t| TOOL_TYPE_PREFIXES.iter().any(|p| t.starts_with(p)));
+-            if typed || TOOL_KEYS.iter().any(|k| obj.contains_key(*k)) {
++            if false && (typed || TOOL_KEYS.iter().any(|k| obj.contains_key(*k))) {
+                 return Some("a server-side tool (web search, code execution, file search, grounding) bills per use on top of tokens and is not metered".to_string());
+             }
+         }

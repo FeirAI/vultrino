@@ -1,0 +1,13 @@
+diff --git a/src/outbox.rs b/src/outbox.rs
+index 11a0f21..61acba6 100644
+--- a/src/outbox.rs
++++ b/src/outbox.rs
+@@ -353,7 +353,7 @@ pub fn parse_token_usage(raw_body: &[u8]) -> Option<TokenUsage> {
+                 input_tokens: prompt.saturating_add(read("toolUsePromptTokenCount").unwrap_or(0)),
+                 output_tokens: read("candidatesTokenCount")
+                     .unwrap_or(0)
+-                    .saturating_add(read("thoughtsTokenCount").unwrap_or(0)),
++                    .saturating_add(0),
+             });
+         }
+     }

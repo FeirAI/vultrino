@@ -1,0 +1,12 @@
+diff --git a/src/ratecard.rs b/src/ratecard.rs
+index 59f166c..7a846ea 100644
+--- a/src/ratecard.rs
++++ b/src/ratecard.rs
+@@ -78,7 +78,6 @@ struct WireCard {
+ }
+ 
+ #[derive(Deserialize)]
+-#[serde(deny_unknown_fields)]
+ struct WireEntry {
+     #[serde(default)]
+     model_ref: Option<String>,

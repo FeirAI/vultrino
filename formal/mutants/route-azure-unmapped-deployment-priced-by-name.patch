@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 14620ec..ec12339 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -274,7 +274,7 @@ fn url_model(
+                     )
+                 }
+             };
+-            match azure_deployments.get(&name) {
++            match Some(azure_deployments.get(&name).cloned().unwrap_or(name.clone())).as_ref() {
+                 Some(model) => UrlModel::Names {
+                     model: model.clone(),
+                     body_ok: Some(name),

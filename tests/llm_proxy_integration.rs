@@ -2689,6 +2689,7 @@ async fn proto_stack_at(
         llm: Some(LlmProxy {
             protocol: protocol.to_string(),
             provider_base: provider_base.to_string(),
+            allowed_models,
             ..Default::default()
         }),
         approval_preview: None,
@@ -3242,6 +3243,12 @@ async fn v2b_azure_deployments_are_priced_only_through_the_operators_map() {
     // deployment nor its model: refused, and the upstream sees nothing more.
     for (path, body) in [
         ("deployments/unknown/chat/completions", body.clone()),
+        // An unmapped deployment is not priced by its NAME, even when the name is a priced
+        // model's id.
+        (
+            "deployments/claude-haiku-4-5/chat/completions",
+            body.clone(),
+        ),
         ("deployments/shadow/chat/completions", body.clone()),
         (
             "deployments/prod-4o/chat/completions",
@@ -3257,6 +3264,38 @@ async fn v2b_azure_deployments_are_priced_only_through_the_operators_map() {
         assert_eq!(error_type(resp).await, "model_unpriced", "{path}");
     }
     assert_eq!(calls_of(&calls), 1);
+}
+
+#[tokio::test]
+async fn v2b_the_allowlist_applies_to_the_model_the_url_selects() {
+    // The body names the one allowed model; the path selects another, which the upstream
+    // serves. The gate is off here so only the allowlist can stop it.
+    let mut config = config_with_policies(vec![allow_policy("cred-*")]);
+    config.llm_proxy.require_priced_model = false;
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let (router, _storage, token, calls) = proto_stack_models(
+        config,
+        "gemini-2.5-flash",
+        &path,
+        "gemini",
+        GEMINI_BASE,
+        "VULTRINO_PROVIDER_GEMINI_ENABLED",
+        vec!["claude-haiku-4-5".to_string()],
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-2.5-flash:generateContent",
+            serde_json::json!({ "model": "claude-haiku-4-5", "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "permission_error");
+    assert_eq!(calls_of(&calls), 0);
 }
 
 #[tokio::test]
