@@ -105,8 +105,14 @@ Key facts (each load-bearing for the consumer's pricing):
 - `dims.model_ref` selects the rate card. Omitted (no phantom dim) when the model
   is unknown: the token event still emits, just without `model_ref`. It is present
   whenever the request named a model, for exact, streamed and estimated events alike. With a rate card configured
-  (`[llm_proxy] rate_card_path`) it is a model the card prices: the model the provider served
-  if covered, else the model the request named. An LLM-proxy request whose model the card does not
+  (`[llm_proxy] rate_card_path`) it is the model the provider served if the card prices it; the
+  requested model stands in only when the served id is a dated form of it (the request id followed
+  by `-` or `@` and more text) and the card prices the requested one. Any other served model is
+  booked under its own id, priced or not, so leria counts an unpriced one and holds its watermark
+  instead of booking the requested model's price. For Gemini, Vertex AI (`models/<id>`), Bedrock
+  (`model/<id>`) and Azure OpenAI (`deployments/<name>`, through `[llm_proxy.azure_deployments]`)
+  the requested model is the one the upstream URL selects, not the body's `model`, which the
+  upstream ignores. An LLM-proxy request whose model the card does not
   price is refused (`403 model_unpriced`) before any upstream call, because leria rejects an
   unpriced token event and the call would book $0 (see CONFIGURATION.md `[llm_proxy]`).
 - No `currency` field (usd is the consumer's single-base default).
@@ -126,11 +132,27 @@ Two provider shapes are recognized (both nested under top-level `usage`):
 - **Anthropic-style:** `usage.{input_tokens, output_tokens}` → input/output. Anthropic's
   `cache_creation_input_tokens` and `cache_read_input_tokens` are billed input that
   `input_tokens` does not include, so they are **added to the input count** (Bedrock
-  Converse's `cacheReadInputTokens` and `cacheWriteInputTokens` likewise). They are charged at
-  the full input price: the card has one input price per model and a cached read is cheaper at
-  the provider, so this over-counts rather than under-counts. OpenAI's `prompt_tokens` already
-  includes cached tokens and is left alone. In a stream the cache counts of `message_start`
-  are added (the largest value seen wins, never summed twice).
+  Converse's `cacheReadInputTokens` and `cacheWriteInputTokens` likewise). The card has one
+  input price per model, so they are booked as input tokens: a cache READ at 1x (the provider
+  bills about 0.1x, so a read is over-counted) and a cache WRITE at 2x, which covers both cache
+  lifetimes (the provider bills 1.25x for the 5-minute cache and 2x for the 1-hour cache, so a
+  write is not under-counted and a 5-minute write is over-counted by up to 1.6x). OpenAI's
+  `prompt_tokens` already includes cached tokens and is left alone. In a stream the cache counts
+  of `message_start` are added (the largest value seen wins, never summed twice).
+- **Gemini.** `usageMetadata` input is `promptTokenCount` plus `toolUsePromptTokenCount`; output
+  is `candidatesTokenCount` plus `thoughtsTokenCount` (thinking tokens bill as output). A block
+  with a prompt count and no candidates (a blocked response) still books its prompt tokens.
+
+**Prices the card cannot hold.** The card has one input and one output price per model. A request
+that sets a field which raises the provider's price beyond that is refused before the upstream
+call (`403 modifier_unpriced`): Anthropic `speed` other than `standard` (fast mode) and
+`inference_geo` other than `global`, a `service_tier` other than `auto`, `default`,
+`standard_only` or `flex`, Bedrock `performanceConfig.latency` other than `standard` and a
+`serviceTier` other than `default` or `flex`, and a server-side tool that bills per use on top of
+tokens (web search, code execution, code interpreter, file search, image generation, Google
+search and maps grounding). Not covered, so booked below the real price: the regional-endpoint
+premium of a Vertex or Bedrock deployment the operator points `provider_base` at, a price change
+the provider makes without a request field, and any modifier or tool this list does not name.
 
 Negative/float/oversized counts are rejected (`as_u64`), and a body missing a
 recognized count pair yields no token event. The `model` is taken from the

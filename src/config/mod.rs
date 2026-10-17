@@ -379,6 +379,11 @@ pub struct LlmProxyConfig {
     pub rate_card_path: Option<PathBuf>,
     /// The card read from `rate_card_path` (empty when none is configured).
     pub rate_card: crate::ratecard::RateCardHandle,
+    /// Azure OpenAI picks the model by deployment name, which only the operator knows:
+    /// `[llm_proxy.azure_deployments]` maps each deployment name to the model it serves
+    /// (a rate-card id). A deployment that is not mapped is refused while
+    /// `require_priced_model` is on, because its model cannot be priced.
+    pub azure_deployments: std::collections::HashMap<String, String>,
 }
 
 impl LlmProxyConfig {
@@ -410,6 +415,7 @@ impl Default for LlmProxyConfig {
             require_priced_model: true,
             rate_card_path: None,
             rate_card: crate::ratecard::RateCardHandle::unconfigured(),
+            azure_deployments: std::collections::HashMap::new(),
         }
     }
 }

@@ -31,14 +31,28 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   (the event carries whatever model the body names) but an unpriced model there is still
   rejected by leria as unpriced and books $0, so budgeted agents should reach models through
   `/llm` only (the capability and policy for the credential decide that). The gate reads the
-  model the request names (body `model`, or the id in a Gemini-style `models/<id>:` path);
-  it cannot know which model the provider really bills if it serves a different one. The
-  token event is then booked under the served model when the card prices it, else the
-  requested one, so a provider that silently serves a costlier unpriced model is booked at
-  the requested model's price. The card is read from a file: vultrino notices a change by
-  size and modified time, and the two planes agree only while both read the same bytes (the
-  posture `rate_card.sha256` is what a deploy check compares; vultrino does not compare it
-  itself). Cache tokens are charged at the full input price (an over-count for cached reads).
+  model the upstream URL selects where the URL picks it (Gemini and Vertex `models/<id>`,
+  Bedrock `model/<id>`, Azure `deployments/<name>` through `[llm_proxy.azure_deployments]`; a
+  deployment not in the map is refused), else the body's `model`; a body model that differs
+  from the URL's is refused. It cannot know which model the provider really bills if it
+  serves a different one: the token event is booked under the served model, priced or not
+  (the requested id stands in only for a dated form of it), so an unpriced served model is
+  counted by leria as unpriced and holds its watermark rather than being booked at another
+  model's price, but that call has already been made. The card cannot hold price modifiers:
+  a request with fast mode, a non-global `inference_geo`, a priority tier or a named
+  server-side tool is refused (`modifier_unpriced`); the regional-endpoint premium of a
+  Vertex or Bedrock deployment, and any modifier the refusal list does not name, are booked
+  at the base price (an under-count). Server-tool fees are refused, not metered. The card is
+  read from a file and a change can only NARROW coverage: vultrino serves the intersection
+  of the card it read at start and the latest good file until it restarts, because leria
+  reads the file only at start (so a model added to the file after leria started is refused
+  here and a model removed is refused at once). The posture `rate_card.sha256` is the start
+  card's fingerprint and `file_sha256` is the file now; `verify-posture` compares `sha256`
+  with leria's, and vultrino does not compare it itself. Vultrino's parser refuses what
+  leria's refuses (unknown fields, a missing or repeated `rate_card_version`, a one-sided
+  input or output price) and is stricter where they differ. Cache tokens are booked as input
+  tokens: a cache read at 1x (an over-count, the provider bills about 0.1x) and a cache write
+  at 2x (never below the provider's 1.25x or 2x, an over-count for the 5-minute cache).
 - **The meter emit is fail-open / out-of-band.** A failed `append_event` still does
   not fail the action it describes, and it mints no sequence, so the stored stream
   stays contiguous. It is no longer silent: every failed append is counted (reported

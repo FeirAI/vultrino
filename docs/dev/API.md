@@ -299,7 +299,7 @@ credential: `schema`, `plane`, `build` (`version`, `rustc`, `git_sha`, `git_dirt
 `RateLimit` condition and a non-deny default), `vault.format_version` (the version this binary writes; a vault is
 migrated when it is opened), `meter` (`append_failures_total`, `gap_pending`, `gap_markers_emitted`,
 `last_failure_at`: failed outbox appends, see [METERING.md](METERING.md)), `rate_card` (`require_priced_model`,
-`configured`, `sha256`: the fingerprint of the rate-card file, the same digest leria reports for the file; `entries`;
+`configured`, `sha256`: the fingerprint of the rate-card file as read at start, the same digest leria reports for the file; `file_sha256`: the file as last read successfully (it differs from `sha256` after the file changed, when coverage is the intersection of the two); `entries`;
 `last_error`: set when a changed file could not be used and the previous card still serves; the path is never reported).
 
 It cannot see other processes: whether a second vultrino shares the vault is checked by the verifier on the host.

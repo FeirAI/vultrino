@@ -270,7 +270,9 @@ const TEST_CARD: &str = r#"[{"rate_card_version":"t-1","entries":[
  {"model_ref":"gpt-3.5-turbo","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":2},
  {"model_ref":"x","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":2},
  {"model_ref":"claude-haiku-4-5","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":5},
- {"model_ref_prefix":"claude-haiku-4-5","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":5}
+ {"model_ref_prefix":"claude-haiku-4-5","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":5},
+ {"model_ref":"gemini-2.5-flash","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":3},
+ {"model_ref":"anthropic.claude-3-haiku-20240307-v1:0","asset":"tokens","input_price_micros_per_unit":1,"output_price_micros_per_unit":5}
 ]}]"#;
 
 /// [`build_stack`] without the shared test card: the config is used as given.
@@ -2599,7 +2601,7 @@ async fn anthropic_stack(
 
 /// [`anthropic_stack`] with the vault (and its sibling outbox) in `dir`.
 async fn anthropic_stack_at(
-    mut config: Config,
+    config: Config,
     served_model: &'static str,
     dir: &std::path::Path,
 ) -> (
@@ -2608,7 +2610,58 @@ async fn anthropic_stack_at(
     String,
     Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    unsafe { std::env::set_var("VULTRINO_PROVIDER_ANTHROPIC_ENABLED", "true") };
+    proto_stack_at(
+        config,
+        served_model,
+        dir,
+        "anthropic-messages",
+        "https://api.anthropic.com",
+        "VULTRINO_PROVIDER_ANTHROPIC_ENABLED",
+    )
+    .await
+}
+
+/// A counting-upstream stack behind an LLM channel of any `protocol` and `provider_base`.
+async fn proto_stack(
+    config: Config,
+    served_model: &'static str,
+    protocol: &str,
+    provider_base: &str,
+    env_flag: &str,
+) -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    proto_stack_at(
+        config,
+        served_model,
+        &path,
+        protocol,
+        provider_base,
+        env_flag,
+    )
+    .await
+}
+
+async fn proto_stack_at(
+    mut config: Config,
+    served_model: &'static str,
+    dir: &std::path::Path,
+    protocol: &str,
+    provider_base: &str,
+    env_flag: &str,
+) -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    unsafe { std::env::set_var(env_flag, "true") };
     if config.llm_proxy.rate_card_path.is_none() && config.llm_proxy.require_priced_model {
         config.llm_proxy = config
             .llm_proxy
@@ -2626,7 +2679,7 @@ async fn anthropic_stack_at(
     let cap = Capability {
         id: "cap-llm".to_string(),
         tool_name: "model_proxy".to_string(),
-        description: "anthropic channel".to_string(),
+        description: "counting channel".to_string(),
         action: "countllm.chat".to_string(),
         plugin: None,
         target: CapabilityTarget::default(),
@@ -2634,8 +2687,8 @@ async fn anthropic_stack_at(
         input_schema: serde_json::Value::Null,
         reversibility: "reversible".to_string(),
         llm: Some(LlmProxy {
-            protocol: "anthropic-messages".to_string(),
-            provider_base: "https://api.anthropic.com".to_string(),
+            protocol: protocol.to_string(),
+            provider_base: provider_base.to_string(),
             ..Default::default()
         }),
         approval_preview: None,
@@ -2883,8 +2936,8 @@ async fn v2b_buffered_anthropic_cache_tokens_are_counted_as_input() {
     assert_eq!(resp.status(), StatusCode::OK);
     let events = meter_events(&storage).await;
     let t = events.iter().find(|p| p["asset"] == "usd").unwrap();
-    // 10 plain + 100 cache creation + 1000 cache read.
-    assert_eq!(t["tokens"]["input_tokens"], 1110);
+    // 10 plain + 100 cache writes counted twice + 1000 cache reads.
+    assert_eq!(t["tokens"]["input_tokens"], 1210);
     assert_eq!(t["tokens"]["output_tokens"], 5);
 }
 
@@ -2915,7 +2968,7 @@ async fn v2b_streamed_anthropic_cache_tokens_are_counted_as_input() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
-    assert_eq!(t["tokens"]["input_tokens"], 1110);
+    assert_eq!(t["tokens"]["input_tokens"], 1210);
     assert_eq!(t["tokens"]["output_tokens"], 5);
     assert!(t["dims"].get("estimated").is_none());
 }
@@ -2968,6 +3021,311 @@ async fn v2b_a_streamed_token_event_names_a_priced_model_when_the_served_id_is_n
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
     assert_eq!(t["dims"]["model_ref"], "gpt-4o");
+}
+
+// ---------------------------------------------------------------------------
+// feir-ops#6 review round 1: the model the upstream URL selects is the one that is gated and
+// booked, and a request that sets a price the card cannot hold is refused.
+// ---------------------------------------------------------------------------
+
+const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com";
+const BEDROCK_BASE: &str = "https://bedrock-runtime.us-east-1.amazonaws.com";
+
+async fn gemini_stack(
+    config: Config,
+    served: &'static str,
+    base: &str,
+) -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    proto_stack(
+        config,
+        served,
+        "gemini",
+        base,
+        "VULTRINO_PROVIDER_GEMINI_ENABLED",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn v2b_the_model_in_the_path_decides_not_the_one_in_the_body() {
+    // The probe from the review: the body names a priced model, the path an unpriced one.
+    // The upstream serves the path's model and ignores the body field, so the request must
+    // be refused, not booked at the body model's price.
+    let (router, _storage, token, calls) = gemini_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+        GEMINI_BASE,
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-9-pro:generateContent",
+            serde_json::json!({ "model": "claude-haiku-4-5", "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+}
+
+#[tokio::test]
+async fn v2b_a_body_model_that_differs_from_a_priced_path_model_is_refused() {
+    // Both are priced, but they disagree: which one is billed is the upstream's choice, so
+    // the call cannot be shown to be priced as booked.
+    let (router, _storage, token, calls) = gemini_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        GEMINI_BASE,
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-2.5-flash:generateContent",
+            serde_json::json!({ "model": "claude-haiku-4-5", "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(calls_of(&calls), 0);
+}
+
+#[tokio::test]
+async fn v2b_a_priced_path_model_passes_and_is_booked_under_that_model() {
+    let (router, storage, token, calls) = gemini_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        GEMINI_BASE,
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1beta/models/gemini-2.5-flash:generateContent",
+            serde_json::json!({ "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+    let events = meter_events(&storage).await;
+    let t = events.iter().find(|p| p["asset"] == "usd").unwrap();
+    assert_eq!(t["dims"]["model_ref"], "gemini-2.5-flash");
+}
+
+#[tokio::test]
+async fn v2b_a_model_baked_into_provider_base_is_the_routed_model() {
+    // The capability's provider_base already names an unpriced model; the request path adds
+    // nothing about it and the body names a priced one.
+    let base = format!("{GEMINI_BASE}/v1beta/models/gemini-9-pro");
+    let (router, _storage, token, calls) = gemini_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+        &base,
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "generate",
+            serde_json::json!({ "model": "claude-haiku-4-5", "contents": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_type(resp).await, "model_unpriced");
+    assert_eq!(calls_of(&calls), 0);
+}
+
+#[tokio::test]
+async fn v2b_bedrock_takes_the_model_from_the_path_and_a_priced_one_passes() {
+    // A legitimate Bedrock call carries no model in the body; it used to be refused.
+    let (router, storage, token, calls) = proto_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "anthropic.claude-3-haiku-20240307-v1:0",
+        "bedrock-converse",
+        BEDROCK_BASE,
+        "VULTRINO_PROVIDER_BEDROCK_ENABLED",
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "model/anthropic.claude-3-haiku-20240307-v1%3A0/converse",
+            serde_json::json!({ "messages": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+    let events = meter_events(&storage).await;
+    let t = events.iter().find(|p| p["asset"] == "usd").unwrap();
+    assert_eq!(
+        t["dims"]["model_ref"],
+        "anthropic.claude-3-haiku-20240307-v1:0"
+    );
+}
+
+#[tokio::test]
+async fn v2b_bedrock_refuses_an_unpriced_path_model_whatever_the_body_says() {
+    let (router, _storage, token, calls) = proto_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+        "bedrock-converse",
+        BEDROCK_BASE,
+        "VULTRINO_PROVIDER_BEDROCK_ENABLED",
+    )
+    .await;
+    for (path, body) in [
+        (
+            "model/anthropic.claude-opus-9-v1%3A0/converse",
+            serde_json::json!({ "model": "claude-haiku-4-5", "messages": [] }),
+        ),
+        // No model segment at all: nothing to price.
+        (
+            "foundation-models/x",
+            serde_json::json!({ "model": "claude-haiku-4-5", "messages": [] }),
+        ),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), path, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(error_type(resp).await, "model_unpriced", "{path}");
+    }
+    assert_eq!(calls_of(&calls), 0);
+}
+
+#[tokio::test]
+async fn v2b_azure_deployments_are_priced_only_through_the_operators_map() {
+    let mut config = config_with_policies(vec![allow_policy("cred-*")]);
+    config
+        .llm_proxy
+        .azure_deployments
+        .insert("prod-4o".to_string(), "gpt-4o".to_string());
+    config
+        .llm_proxy
+        .azure_deployments
+        .insert("shadow".to_string(), "gpt-9-unpriced".to_string());
+    let (router, _storage, token, calls) = proto_stack(
+        config,
+        "gpt-4o",
+        "azure-openai",
+        "https://acme.openai.azure.com/openai",
+        "VULTRINO_PROVIDER_AZURE_OPENAI_ENABLED",
+    )
+    .await;
+    let body = serde_json::json!({ "messages": [] });
+    // Mapped to a priced model: passes.
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            "deployments/prod-4o/chat/completions",
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+    // Not in the map, mapped to an unpriced model, or a body model that is neither the
+    // deployment nor its model: refused, and the upstream sees nothing more.
+    for (path, body) in [
+        ("deployments/unknown/chat/completions", body.clone()),
+        ("deployments/shadow/chat/completions", body.clone()),
+        (
+            "deployments/prod-4o/chat/completions",
+            serde_json::json!({ "model": "claude-haiku-4-5", "messages": [] }),
+        ),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), path, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(error_type(resp).await, "model_unpriced", "{path}");
+    }
+    assert_eq!(calls_of(&calls), 1);
+}
+
+#[tokio::test]
+async fn v2b_a_served_model_that_is_not_a_dated_form_of_the_request_is_booked_under_its_own_id() {
+    // The probe from the review: the request named Haiku, the upstream served Opus (not on
+    // the card). The event must name the served model, so leria counts it unpriced and holds
+    // its watermark, instead of booking Opus spend at Haiku's price.
+    let (router, storage, token, _calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-opus-4-1-20250805",
+    )
+    .await;
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("claude-haiku-4-5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events = meter_events(&storage).await;
+    let t = events.iter().find(|p| p["asset"] == "usd").unwrap();
+    assert_eq!(t["dims"]["model_ref"], "claude-opus-4-1-20250805");
+}
+
+#[tokio::test]
+async fn v2b_a_request_that_sets_a_price_the_card_cannot_hold_is_refused_before_the_upstream() {
+    // Fast mode (a multiple of the card price), a regional inference geo, a priority tier
+    // and a metered server tool all reach a provider price the card has no entry for.
+    let (router, _storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let mut variants = Vec::new();
+    for (key, value) in [
+        ("speed", serde_json::json!("fast")),
+        ("inference_geo", serde_json::json!("us")),
+        ("service_tier", serde_json::json!("priority")),
+        (
+            "tools",
+            serde_json::json!([{"type": "web_search_20250305", "name": "web_search"}]),
+        ),
+    ] {
+        let mut body = messages("claude-haiku-4-5");
+        body[key] = value;
+        variants.push((key, body));
+    }
+    for (key, body) in variants {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), "v1/messages", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{key}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{key}");
+    }
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+    // Standard speed and the global geo are what the card prices.
+    let mut ok = messages("claude-haiku-4-5");
+    ok["speed"] = serde_json::json!("standard");
+    ok["inference_geo"] = serde_json::json!("global");
+    let resp = router
+        .oneshot(llm_req(Some(&token), "v1/messages", ok))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
 }
 
 // ---------------------------------------------------------------------------

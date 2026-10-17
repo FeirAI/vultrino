@@ -529,6 +529,7 @@ pub struct RawLlmProxyConfig {
     pub stream_max_line_bytes: Option<usize>,
     pub require_priced_model: Option<bool>,
     pub rate_card_path: Option<String>,
+    pub azure_deployments: Option<std::collections::HashMap<String, String>>,
 }
 
 impl From<RawLlmProxyConfig> for LlmProxyConfig {
@@ -554,6 +555,7 @@ impl From<RawLlmProxyConfig> for LlmProxyConfig {
             // The card itself is opened by `Config::from_raw`, which can fail.
             rate_card_path: None,
             rate_card: crate::ratecard::RateCardHandle::unconfigured(),
+            azure_deployments: raw.azure_deployments.unwrap_or_default(),
         }
     }
 }
@@ -1012,17 +1014,27 @@ mod tests {
         let card = dir.path().join("card.json");
         std::fs::write(
             &card,
-            r#"{"entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1}]}"#,
+            r#"{"rate_card_version":"t","entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1}]}"#,
         )
         .unwrap();
         let toml = format!(
-            "[llm_proxy]\nrequire_priced_model = false\nrate_card_path = {:?}\n",
+            "[llm_proxy]\nrequire_priced_model = false\nrate_card_path = {:?}\n\n[llm_proxy.azure_deployments]\nprod = \"m\"\n",
             card.to_str().unwrap()
         );
         let config = Config::parse(&toml).unwrap();
         assert!(!config.llm_proxy.require_priced_model);
         assert!(config.llm_proxy.rate_card.covers("m"));
         assert!(!config.llm_proxy.rate_card.covers("other"));
+        assert_eq!(
+            config
+                .llm_proxy
+                .azure_deployments
+                .get("prod")
+                .map(String::as_str),
+            Some("m")
+        );
+        // No table: no deployment is mapped.
+        assert!(Config::default().llm_proxy.azure_deployments.is_empty());
     }
 
     #[test]

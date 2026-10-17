@@ -90,13 +90,15 @@ pub(crate) fn build_posture(
             "format_version": crate::storage::STORAGE_VERSION,
         },
         // The priced-model gate. `sha256` is the fingerprint of the rate-card file read
-        // (the same file leria prices with, so a deploy check can compare the planes);
-        // `last_error` is set when a changed file could not be used and the previous card
+        // (the same file leria prices with, so a deploy check can compare the planes) as it
+        // was at START: a later edit only narrows coverage and shows up as `file_sha256`
+        // differing from `sha256`; `last_error` is set when a changed file could not be used and the previous card
         // is still serving. The path is never reported.
         "rate_card": {
             "require_priced_model": config.llm_proxy.require_priced_model,
             "configured": card.configured,
             "sha256": card.sha256,
+            "file_sha256": card.file_sha256,
             "entries": card.entries,
             "last_error": card.last_error,
         },
@@ -196,7 +198,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("card.json");
-        let doc = br#"{"entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1},
+        let doc = br#"{"rate_card_version":"p","entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1},
             {"model_ref_prefix":"m","asset":"tokens","price_micros_per_unit":1}]}"#;
         std::fs::write(&path, doc).unwrap();
         let mut cfg = Config::default();

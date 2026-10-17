@@ -619,15 +619,16 @@ impl crate::formal_kernel::Dispatch for ActionPayload {
     }
 }
 
-/// The model a request names, for metering: the JSON body's `model`, else a top-level
-/// `model` param, else `_feir_request_model`, which the LLM proxy sets when the model is
-/// carried in the URL path (Gemini `models/<id>:generateContent`).
+/// The model a request names, for metering: `_feir_request_model`, which the LLM proxy
+/// sets to the model it gated (the one the upstream URL selects where the URL picks it,
+/// else the body's), else the JSON body's `model`, else a top-level `model` param. The
+/// proxy's value comes first: for Gemini, Vertex, Bedrock and Azure the body's `model` is
+/// ignored by the upstream and must not decide what a call is booked under.
 fn request_model_of(params: &serde_json::Value) -> Option<String> {
     params
-        .get("body")
-        .and_then(|b| b.get("model"))
+        .get("_feir_request_model")
+        .or_else(|| params.get("body").and_then(|b| b.get("model")))
         .or_else(|| params.get("model"))
-        .or_else(|| params.get("_feir_request_model"))
         .and_then(|m| m.as_str())
         .map(str::to_string)
 }
@@ -9019,5 +9020,32 @@ mod durable_enqueue_tests {
         // Never touches the ordinary async 087 counters — this is a DIFFERENT failure mode.
         assert_eq!(av.metrics().failed, 0);
         assert_eq!(av.metrics().sealed, 0);
+    }
+}
+
+#[cfg(test)]
+mod routed_model_tests {
+    use super::request_model_of;
+    use serde_json::json;
+
+    #[test]
+    fn the_models_the_proxy_routed_wins_over_the_body_model() {
+        // For Gemini, Vertex, Bedrock and Azure the upstream ignores the body's model; the
+        // proxy records the one it gated and that is what the call is booked under.
+        let params = json!({
+            "body": {"model": "claude-haiku-4-5"},
+            "_feir_request_model": "gemini-9-pro",
+        });
+        assert_eq!(request_model_of(&params).as_deref(), Some("gemini-9-pro"));
+        // Without the proxy's value (a named tool, MCP) the body's model, then a param.
+        assert_eq!(
+            request_model_of(&json!({"body": {"model": "m"}})).as_deref(),
+            Some("m")
+        );
+        assert_eq!(
+            request_model_of(&json!({"model": "p"})).as_deref(),
+            Some("p")
+        );
+        assert_eq!(request_model_of(&json!({})), None);
     }
 }
