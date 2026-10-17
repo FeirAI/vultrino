@@ -859,7 +859,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "147753ad5c235fb7d8d93f69d570bd64cf0dd16a542a7a10f29ad6c03c9662a8"
+          "sha256": "9100c5db87260d355901301286e9432a3d783a1964675e18792d88b953952bf7"
         },
         {
           "path": "src/server/mod.rs",
@@ -2498,7 +2498,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "147753ad5c235fb7d8d93f69d570bd64cf0dd16a542a7a10f29ad6c03c9662a8"
+          "sha256": "9100c5db87260d355901301286e9432a3d783a1964675e18792d88b953952bf7"
         },
         {
           "path": "src/server/mod.rs",
@@ -3694,6 +3694,11 @@
         },
         {
           "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::resume_approved",
+          "sha256": "e805ff78c78bda642a69a073d3bb3862017c1f511c6d773124680c7f2e368cfc"
+        },
+        {
+          "path": "src/server/mod.rs",
           "symbol": "IrreversibilityResolution::d8_fallback_ok",
           "sha256": "aedee9d76bc3bb72d18988df0e86fdb33fd235a998065cc8c744b276047a4cb5"
         },
@@ -3734,7 +3739,8 @@
         "d8-floor-undeclared-degrades",
         "d8-floor-mode-ignored",
         "d8-floor-client-presence-dropped",
-        "d8-floor-money-fallback-allowed"
+        "d8-floor-money-fallback-direct",
+        "d8-floor-money-fallback-resume"
       ],
       "does_not_establish": "Only an action the trusted catalog declares Reversible or partially-reversible may degrade, and in the default mode only when it is not money; whether an operator declared the real side effect truthfully, or named a money action under money.*, is not checked, and a reversible catalog entry named money.* requested under another label is not recognised as money. Unavailable means a request error (connect or timeout), a 5xx or a 429; a live Averin that misbehaves in some other way refuses, which is the safe side. In the default mode a degraded partially-reversible write has no before-act record. The approved-resume path (including every partially-reversible case) is driven through the buffered tail in approval_token_integration and the direct path through both tails in d8_degraded_guard; the D8 evidence refusal of a declared non-reversible action on the streaming tail is not driven by any test; a fake Averin stands in for the real one, and the four-plane evidence-gate end-to-end is a separate run. The routine action's one-phase seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. An approval opened under an older build for a partially-reversible action is refused on resume. Any CI run other than the recorded one.",
       "evidence_run": "38676181898"
