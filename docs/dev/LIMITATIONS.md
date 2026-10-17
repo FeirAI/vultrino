@@ -430,8 +430,10 @@ kernels.
   non-strict posture, reversible declarations, and deployments with Averin
   disabled still have no record-existence guarantee. That split is the intended
   posture, not an oversight: actions the trusted catalog declares non-reversible
-  (money and irreversible actions) require committed two-phase evidence and are
-  refused while Averin is down; reversible actions keep running. With
+  (irreversible and partially-reversible actions, which is the human-floor class:
+  money, and in the Solo pack most write actions such as session create, update and
+  cancel, attendance update and learner messages) require committed two-phase
+  evidence and are refused while Averin is down; only reversible actions keep running. With
   `d8_complete_evidence = true` (the FeirOS Solo setting) a catalog-declared
   reversible action gets two-phase evidence while Averin is up. Only when Averin is
   unavailable (unreachable, timed out, a 5xx or a 429) does it still run, with a

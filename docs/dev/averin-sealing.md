@@ -443,7 +443,16 @@ dispatch, and a matching `/v2/use-outcome` after dispatch. The outer Vultrino
 use token remains the authorization envelope; it is not reused as the D8 grant.
 
 This mode is deliberately default-off and availability-coupled to Averin. A
-failed grant or intent write denies before the plugin can act. If a plugin
+failed grant or intent write denies before the plugin can act, with one
+exception (VUL-38): a catalog-declared Reversible action whose evidence cannot
+be begun because Averin is unavailable (unreachable, timed out, a 5xx or a 429)
+runs with a one-phase seal, logs `AVERIN-D8-DEGRADED` and counts `d8_degraded`.
+Every other class refuses while Averin is down: irreversible and
+partially-reversible (human-floor) actions, and actions with no catalog
+declaration. A 4xx from a live Averin and params over `max_seal_params_bytes`
+refuse for every class. A degraded action has no two-phase evidence, so D8
+completeness is not earned for it. The claim
+`d8-evidence-floor-routine-keeps-running` records what is tested. If a plugin
 returns an error, Vultrino records an `error` outcome; if an action completes
 but its outcome cannot be recorded, the client receives a committed error and
 verification retains the incomplete intent rather than overstating closure.

@@ -215,8 +215,10 @@ async fn drive(
     }
 }
 
-fn refused(o: &Outcome) {
+/// The run was refused for `reason` (a text the error must contain), before the plugin ran.
+fn refused(o: &Outcome, reason: &str) {
     assert!(!o.ran, "must refuse, ran instead");
+    assert!(o.error.contains(reason), "wrong refusal, wanted {reason:?}: {}", o.error);
     assert_eq!(o.plugin_calls, 0, "the plugin must not run: {}", o.error);
     assert_eq!(o.degraded, 0);
 }
@@ -245,14 +247,24 @@ async fn reversible_with_averin_overloaded_degrades() {
 #[tokio::test]
 async fn irreversible_with_averin_down_refuses_buffered_and_streaming() {
     for streaming in [false, true] {
-        refused(&drive(Some("irreversible"), DOWN, None, streaming).await);
+        // On the direct path a non-reversible action is human-floor: it goes to approval, which
+        // this instance does not have, so it is refused there, before D8 is reached. The D8
+        // refusal of a non-reversible action is shown on the approved resume, in
+        // approval_token_integration. Either way it never runs and never degrades.
+        refused(
+            &drive(Some("irreversible"), DOWN, None, streaming).await,
+            "requires human approval",
+        );
     }
 }
 
 #[tokio::test]
 async fn undeclared_with_averin_down_refuses_buffered_and_streaming() {
     for streaming in [false, true] {
-        refused(&drive(None, DOWN, None, streaming).await);
+        refused(
+            &drive(None, DOWN, None, streaming).await,
+            "D8 before-act evidence failed",
+        );
     }
 }
 
@@ -261,13 +273,8 @@ async fn reversible_with_a_live_averin_refusing_the_grant_is_refused() {
     for streaming in [false, true] {
         let (url, intents) = fake_averin(403).await;
         let o = drive(Some("reversible"), &url, None, streaming).await;
-        refused(&o);
+        refused(&o, "D8 before-act evidence failed");
         assert_eq!(intents.load(Ordering::SeqCst), 0);
-        assert!(
-            o.error.contains("D8 before-act evidence failed"),
-            "{}",
-            o.error
-        );
     }
 }
 
@@ -276,7 +283,7 @@ async fn reversible_with_params_over_the_evidence_bound_is_refused_before_the_to
     for streaming in [false, true] {
         let (url, intents) = fake_averin(200).await;
         let o = drive(Some("reversible"), &url, Some(4), streaming).await;
-        refused(&o);
+        refused(&o, "evidence bound");
         assert_eq!(intents.load(Ordering::SeqCst), 0);
         assert_eq!(o.uses, 0, "an oversize body must not spend the token");
     }
