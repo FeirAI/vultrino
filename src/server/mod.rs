@@ -1812,8 +1812,7 @@ impl VultrinoServer {
             Some(full_action.as_str()),
             action_label.as_deref(),
         ]);
-        let evidence_required = irreversibility
-            .requires_committed_evidence(
+        let evidence_required = irreversibility.requires_committed_evidence(
             EffectiveEvidenceFloor::from_config(&self.config, self.averin.is_some()),
             money,
         );

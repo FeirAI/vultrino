@@ -104,6 +104,25 @@ async fn drive(
     max_seal_params_bytes: Option<usize>,
     streaming: bool,
 ) -> Outcome {
+    drive_as(
+        reversibility,
+        averin_url,
+        max_seal_params_bytes,
+        streaming,
+        false,
+    )
+    .await
+}
+
+/// As `drive`; with `money_label` the request names the `money.refund` label, which the config
+/// maps onto the `mock.echo` plugin action and the catalog declares under that label.
+async fn drive_as(
+    reversibility: Option<&str>,
+    averin_url: &str,
+    max_seal_params_bytes: Option<usize>,
+    streaming: bool,
+    money_label: bool,
+) -> Outcome {
     let dir = tempdir().unwrap();
     let path = dir.path().join("store.enc");
     std::mem::forget(dir);
@@ -126,6 +145,12 @@ async fn drive(
         averin.max_seal_params_bytes = cap;
     }
     config.averin = averin;
+    if money_label {
+        config.action_labels = std::collections::HashMap::from([(
+            "money.refund".to_string(),
+            "mock.echo".to_string(),
+        )]);
+    }
     let server = VultrinoServer::new(
         config,
         storage.clone(),
@@ -152,7 +177,12 @@ async fn drive(
                 id: "cap-d8".to_string(),
                 tool_name: "mock_echo".to_string(),
                 description: "d8 guard fixture".to_string(),
-                action: "mock.echo".to_string(),
+                action: if money_label {
+                    "money.refund"
+                } else {
+                    "mock.echo"
+                }
+                .to_string(),
                 plugin: None,
                 target: vultrino::capability::CapabilityTarget::default(),
                 credential_ref: "api-cred".to_string(),
@@ -181,7 +211,12 @@ async fn drive(
     };
     let request = ExecuteRequest {
         credential: "api-cred".to_string(),
-        action: "mock.echo".to_string(),
+        action: if money_label {
+            "money.refund"
+        } else {
+            "mock.echo"
+        }
+        .to_string(),
         params: serde_json::json!({"hello": "world"}),
     };
     let result: Result<(), String> = if streaming {
@@ -218,7 +253,11 @@ async fn drive(
 /// The run was refused for `reason` (a text the error must contain), before the plugin ran.
 fn refused(o: &Outcome, reason: &str) {
     assert!(!o.ran, "must refuse, ran instead");
-    assert!(o.error.contains(reason), "wrong refusal, wanted {reason:?}: {}", o.error);
+    assert!(
+        o.error.contains(reason),
+        "wrong refusal, wanted {reason:?}: {}",
+        o.error
+    );
     assert_eq!(o.plugin_calls, 0, "the plugin must not run: {}", o.error);
     assert_eq!(o.degraded, 0);
 }
@@ -286,5 +325,16 @@ async fn reversible_with_params_over_the_evidence_bound_is_refused_before_the_to
         refused(&o, "evidence bound");
         assert_eq!(intents.load(Ordering::SeqCst), 0);
         assert_eq!(o.uses, 0, "an oversize body must not spend the token");
+    }
+}
+
+/// Money never degrades, whatever its declaration: a `money.refund` label declared Reversible and
+/// mapped onto a routine plugin verb is refused when Averin is down, on the direct path through
+/// both tails. (Without the money guard in `d8_fallback_ok` this would run one-phase.)
+#[tokio::test]
+async fn money_label_declared_reversible_with_averin_down_refuses_buffered_and_streaming() {
+    for streaming in [false, true] {
+        let o = drive_as(Some("reversible"), DOWN, None, streaming, true).await;
+        refused(&o, "D8 before-act evidence failed");
     }
 }
