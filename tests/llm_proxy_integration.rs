@@ -2649,12 +2649,39 @@ async fn proto_stack(
 }
 
 async fn proto_stack_at(
+    config: Config,
+    served_model: &'static str,
+    dir: &std::path::Path,
+    protocol: &str,
+    provider_base: &str,
+    env_flag: &str,
+) -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    proto_stack_models(
+        config,
+        served_model,
+        dir,
+        protocol,
+        provider_base,
+        env_flag,
+        Vec::new(),
+    )
+    .await
+}
+
+/// [`proto_stack_at`] with a per-model allowlist on the capability (empty = any model).
+async fn proto_stack_models(
     mut config: Config,
     served_model: &'static str,
     dir: &std::path::Path,
     protocol: &str,
     provider_base: &str,
     env_flag: &str,
+    allowed_models: Vec<String>,
 ) -> (
     axum::Router,
     Arc<dyn StorageBackend>,
