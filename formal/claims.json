@@ -3433,6 +3433,11 @@
           "path": "src/config/types.rs",
           "symbol": "ApprovalConfig::try_from",
           "sha256": "e71b438662c6839970b675b439ba017a5be0618a92bc90a3de605c2e1d084ccd"
+        },
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "run_callback_loop",
+          "sha256": "c333de97fe939b53474251566e61a9e643193abc6fd58404195661c881473be4"
         }
       ],
       "mutants": [
