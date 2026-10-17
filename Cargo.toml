@@ -61,7 +61,7 @@ ring = "0.17"
 
 # WASM runtime for plugins (optional so Kani 0.67's rustc 1.93 can verify
 # pure-kernel harnesses without pulling wasmtime's rustc-1.95 MSRV).
-wasmtime = { version = "48.0.4", optional = true }
+wasmtime = { version = "49.0.2", optional = true }
 wasmtime-wasi = { version = "48.0.4", optional = true }
 
 # OS integration (for future keychain support)
