@@ -716,6 +716,22 @@
     "workspace-id-format-check-removed": {
       "tier": "fast",
       "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "posture-workload-assertion-not-reported": {
+      "tier": "fast",
+      "claim": "secret-fingerprint-report"
+    },
+    "posture-workload-reports-only-first-secret": {
+      "tier": "fast",
+      "claim": "secret-fingerprint-report"
+    },
+    "averin-enabled-config-accepts-unusable-base-url": {
+      "tier": "fast",
+      "claim": "observe-receipt-gap-recorded"
+    },
+    "averin-enabled-server-start-ignores-client-error": {
+      "tier": "fast",
+      "claim": "observe-receipt-gap-recorded"
     }
   },
   "claims": [
@@ -2341,7 +2357,7 @@
         {
           "path": "src/main.rs",
           "symbol": "run_web_server",
-          "sha256": "257447edab9addf2e1e36783a1ab96b82d5689107e39f2f7ce4543da33a87eb6"
+          "sha256": "36ffcf25d3c521e2f74c7d7a99dfb00c86bbd226a1d0994271c101c0c42746b7"
         },
         {
           "path": "src/main.rs",
@@ -2351,7 +2367,7 @@
         {
           "path": "src/main.rs",
           "symbol": "run_mcp_server",
-          "sha256": "891779c621f0e0d318550a3745f8656d5cf162f1f36c477ba32e35c25e6dbf75"
+          "sha256": "1f5bfaabc470beae24351f4f7c68ee7e9265b981edae53bd7e1130bdaaa44d5f"
         }
       ],
       "mutants": [
@@ -3137,12 +3153,12 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "b404ecce4f8b7dbaf19afcd7bb82eb2ef699339d090f9256e72d52c6a059fac4"
+          "sha256": "57a04d0f610ed21ad63d9c96d0d149be10ce0610b8f59d9e1662b28ee00166c7"
         },
         {
           "path": "src/web/api.rs",
           "symbol": "api_posture",
-          "sha256": "3e91735e5717fcb0a343c6ff4747c200f63d52995f0f497a474e8bd943a02dfd"
+          "sha256": "4a678ddb19951c265eb234fcf3a21598dea30340a538bcf970da29813236259d"
         },
         {
           "path": "src/policy/types.rs",
@@ -3173,7 +3189,7 @@
     },
     {
       "id": "observe-receipt-gap-recorded",
-      "statement": "With [averin] enabled in Observe mode, every use receipt that does not reach Averin is recorded as an individual gap, not only counted: a failed or timed-out async seal, a seal dropped because the async fan-out was saturated, params over max_seal_params_bytes (async and durable paths), a failed local durable enqueue, a durable use receipt that exhausted its delivery attempts (a dead-lettered grant is not a receipt and records none), and a seal task lost before it recorded an outcome; each gap carries the token id, project, request id, use sequence number, one of six fixed reasons and a detail clipped to 200 characters, and never the params; the pending buffer holds at most 4096 gaps and a gap that does not fit is counted in receipt_gaps_overflowed; gaps returned for retry go back to the front in their original order; and flush_receipt_gaps_once appends each pending gap to the signed outbox as one evidence.receipt_gap event whose subject is the use token id, so the oldest gap is the first appended and a second flush appends nothing. The action itself is never blocked or failed by any of this. An [averin] block with enabled = true and an empty base_url or resource_id does not load (config error naming the field and that no receipt would be recorded), so Observe cannot run silently without a seal client; a disabled block is not judged.",
+      "statement": "With [averin] enabled in Observe mode, every use receipt that does not reach Averin is recorded as an individual gap, not only counted: a failed or timed-out async seal, a seal dropped because the async fan-out was saturated, params over max_seal_params_bytes (async and durable paths), a failed local durable enqueue, a durable use receipt that exhausted its delivery attempts (a dead-lettered grant is not a receipt and records none), and a seal task lost before it recorded an outcome; each gap carries the token id, project, request id, use sequence number, one of six fixed reasons and a detail clipped to 200 characters, and never the params; the pending buffer holds at most 4096 gaps and a gap that does not fit is counted in receipt_gaps_overflowed; gaps returned for retry go back to the front in their original order; and flush_receipt_gaps_once appends each pending gap to the signed outbox as one evidence.receipt_gap event whose subject is the use token id, so the oldest gap is the first appended and a second flush appends nothing. The action itself is never blocked or failed by any of this. An [averin] block with enabled = true and an empty resource_id, or a base_url that is empty, does not parse or is plain http:// to a public address, does not load (config error naming the field and that no receipt would be recorded), and VultrinoServer::try_new refuses to start when the seal client still cannot be built, so Observe cannot run silently without a seal client; a disabled block is not judged.",
       "method": "test",
       "artifacts": [
         "src/averin/mod.rs",
@@ -3228,7 +3244,12 @@
         {
           "path": "src/config/types.rs",
           "symbol": "AverinConfig::try_from",
-          "sha256": "d61a293177caf67c22b3933a445c50ba6daf202c87aa920bb9dffb6f8fc5d4bd"
+          "sha256": "41a0d7b17e4350357103451c3182a24f11a1da5197aa6c153cda496bd1d1a86e"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::try_new",
+          "sha256": "7c74d2e58847813e76e872fd8da38ec61f9b4d8898a34efc583968f5fe6fc356"
         }
       ],
       "mutants": [
@@ -3240,9 +3261,11 @@
         "receipt-gap-dead-letter-not-recorded",
         "receipt-gap-lost-task-not-recorded",
         "averin-enabled-config-accepts-empty-base-url",
-        "averin-enabled-config-accepts-empty-resource-id"
+        "averin-enabled-config-accepts-empty-resource-id",
+        "averin-enabled-config-accepts-unusable-base-url",
+        "averin-enabled-server-start-ignores-client-error"
       ],
-      "does_not_establish": "Gaps are held in memory and appended to the outbox every two seconds: a process that is killed before an append loses the gaps it had not yet written, and the counters with them. flush_receipt_gaps_once puts a gap back for retry when an outbox append fails, but no test makes an append fail, so that branch is not exercised here (the requeue order is). A gap says an action ran without a receipt; it does not say the action's own side effect succeeded, and it is not a proof that no other receipt is missing: a seal that Averin accepted but recorded wrongly, a seal that never started because Averin is disabled, undeclared actions, and receipts lost to a crash between the action and the seal enqueue are outside it. The on_execute (synchronous) Observe arms record gaps by the same call but are not exercised by a test here; only the production async and durable paths are. The outbox event reaches a consumer only if one polls or is pushed to; nothing here shows that anything alerts on it. The vacuity of the name filter: the detector selects tests whose name contains fei33_, so a renamed test drops out of it. The refusal covers the TOML block only: a block that parses but names an unreachable averin, or an AVERIN_API_KEY averin rejects, still starts, and every Observe action is then recorded as a receipt gap rather than refused. The gap is an outbox event, and the outbox prunes every event older than [outbox] retention_secs (2 days by default) whether or not it was delivered, so this claim does not keep a gap past that window: keeping it is the consumer's job (govder stores each gap before acknowledging the push, govder claim receipt-gap-durable-record), and a consumer that is down or unconfigured for longer than the window loses the gaps in it.",
+      "does_not_establish": "Gaps are held in memory and appended to the outbox every two seconds: a process that is killed before an append loses the gaps it had not yet written, and the counters with them. flush_receipt_gaps_once puts a gap back for retry when an outbox append fails, but no test makes an append fail, so that branch is not exercised here (the requeue order is). A gap says an action ran without a receipt; it does not say the action's own side effect succeeded, and it is not a proof that no other receipt is missing: a seal that Averin accepted but recorded wrongly, a seal that never started because Averin is disabled, undeclared actions, and receipts lost to a crash between the action and the seal enqueue are outside it. The on_execute (synchronous) Observe arms record gaps by the same call but are not exercised by a test here; only the production async and durable paths are. The outbox event reaches a consumer only if one polls or is pushed to; nothing here shows that anything alerts on it. The vacuity of the name filter: the detector selects tests whose name contains fei33_, so a renamed test drops out of it. The refusal covers a client that cannot be built: a block that builds but names an unreachable averin, or an AVERIN_API_KEY averin rejects, still starts, and every Observe action is then recorded as a receipt gap rather than refused. The gap is an outbox event, and the outbox prunes every event older than [outbox] retention_secs (2 days by default) whether or not it was delivered, so this claim does not keep a gap past that window: keeping it is the consumer's job (govder stores each gap before acknowledging the push, govder claim receipt-gap-durable-record), and a consumer that is down or unconfigured for longer than the window loses the gaps in it. The plain-http check resolves a host name when the config loads; a name that resolves to a public address only later is caught by the connect-time guard, not by the load refusal. The binary's three server constructions use try_new; the library's VultrinoServer::new panics instead of returning the error.",
       "evidence_run": "38694664010"
     },
     {
@@ -3308,17 +3331,19 @@
     },
     {
       "id": "secret-fingerprint-report",
-      "statement": "The secret-alignment fingerprint is the first 16 bytes (32 lowercase hex characters) of HMAC-SHA256 keyed by the secret over `feir-secret-alignment/v1:` followed by the relationship name, reproduces every vector of vectors/secret-fingerprint.v1.json (generated by an independent Python reference, owned by feir-os), is different for two relationships under one secret, and does not exist for an empty secret; and GET /api/v1/posture reports, per relationship, the fingerprints of the values vultrino is configured with: vultrino-outbox-poll (the [outbox] hmac_secret), vultrino-approval-push (the same secret, only while push delivery is enabled and has a URL), tenant-assertion (the secret it signs calls to govder with) averin-api-key (the AVERIN_API_KEY it sends to averin, only while the [averin] seal client is enabled) and approver-key (the key that verifies the broker's approver decisions, absent when that key is unset, equal to the shared key or blank), omits a relationship whose secret is unset, and carries no secret value in the body.",
+      "statement": "The secret-alignment fingerprint is the first 16 bytes (32 lowercase hex characters) of HMAC-SHA256 keyed by the secret over `feir-secret-alignment/v1:` followed by the relationship name, reproduces every vector of vectors/secret-fingerprint.v1.json (generated by an independent Python reference, owned by feir-os), is different for two relationships under one secret, and does not exist for an empty secret; and GET /api/v1/posture reports, per relationship, the fingerprints of the values vultrino is configured with: vultrino-outbox-poll (the [outbox] hmac_secret), vultrino-approval-push (the same secret, only while push delivery is enabled and has a URL), workload-assertion (one fingerprint per verifier secret the workload exchange accepts, the same comma-separated list it verifies with, so a rotation overlap reports both, and only while the exchange is configured and valid), tenant-assertion (the secret it signs calls to govder with), averin-api-key (the AVERIN_API_KEY it sends to averin, only while the [averin] seal client is enabled) and approver-key (the key that verifies the broker's approver decisions, absent when that key is unset, equal to the shared key or blank), omits a relationship whose secret is unset, and carries no secret value in the body.",
       "method": "differential-vectors",
       "artifacts": [
         "src/secret_fp.rs",
         "vectors/secret-fingerprint.v1.json",
-        "src/web/posture.rs"
+        "src/web/posture.rs",
+        "src/web/workload_exchange.rs",
+        "tests/workload_exchange_integration.rs"
       ],
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- secret_fp::tests web::posture::tests::report_carries_a_fingerprint_per_relationship_and_no_secret web::posture::tests::report_omits_the_push_relationship_when_the_outbox_does_not_push web::posture::tests::report_omits_unset_secrets_and_an_unusable_approver_key web::posture::tests::report_carries_the_averin_key_fingerprint_only_while_the_seal_client_is_on",
+      "detector": "cargo test --locked --no-default-features --lib -- secret_fp::tests web::posture::tests::report_carries_a_fingerprint_per_relationship_and_no_secret web::posture::tests::report_omits_the_push_relationship_when_the_outbox_does_not_push web::posture::tests::report_omits_unset_secrets_and_an_unusable_approver_key web::posture::tests::report_carries_the_averin_key_fingerprint_only_while_the_seal_client_is_on web::posture::tests::report_carries_a_workload_assertion_fingerprint_per_verifier_secret && cargo test --locked --no-default-features --test workload_exchange_integration -- --exact posture_reports_exactly_the_secrets_the_exchange_verifies_with",
       "covers": [
         {
           "path": "src/secret_fp.rs",
@@ -3328,12 +3353,17 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "secret_fingerprints",
-          "sha256": "82e4794c2ec294a4ad1518851833e294af6567267c63699035069aa9b282b1fe"
+          "sha256": "d75c549cdd2926422fcf7fad4c34a478e7fd6a2ed49217cb8e475193fa19efbe"
         },
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "b404ecce4f8b7dbaf19afcd7bb82eb2ef699339d090f9256e72d52c6a059fac4"
+          "sha256": "57a04d0f610ed21ad63d9c96d0d149be10ce0610b8f59d9e1662b28ee00166c7"
+        },
+        {
+          "path": "src/web/workload_exchange.rs",
+          "symbol": "WorkloadVerifier::fingerprints",
+          "sha256": "38a803d405eb6a98b005ee88b2ab5ca81d4bf0fc8b7f9285b0d4829b2f86ceeb"
         }
       ],
       "mutants": [
@@ -3341,9 +3371,11 @@
         "secret-fp-digest-not-truncated",
         "posture-push-fingerprint-while-not-pushing",
         "posture-unusable-approver-key-reported",
-        "posture-averin-key-reported-while-seal-client-off"
+        "posture-averin-key-reported-while-seal-client-off",
+        "posture-workload-assertion-not-reported",
+        "posture-workload-reports-only-first-secret"
       ],
-      "does_not_establish": "That two planes hold the same value: this is the report one plane makes, and the comparison is feir-os's verifier. The report reads the loaded configuration, so a value changed afterwards or read by another code path is not reflected; a vultrino whose outbox pushes somewhere other than govder still reports the push relationship, which the verifier then compares with govder's GOVDER_SIGNATURE_SECRET. The fingerprint is only as private as the secret is strong: someone who holds it can test guesses for a low-entropy secret offline, and the report is protected only by a global admin key. The route's key gate is covered by the posture-report claims, not here. The cross-plane check that real binaries emit what the verifier reads is govder's armed four-plane e2e (TestFourPlanePostureE2E, TestFourPlaneSecretMismatchE2E). The averin-api-key fingerprint says which key vultrino sends; that averin accepts it is checked by feir-os's verifier against averin's own report, and no four-plane run has a keyed averin.",
+      "does_not_establish": "That two planes hold the same value: this is the report one plane makes, and the comparison is feir-os's verifier. The report reads the loaded configuration, so a value changed afterwards or read by another code path is not reflected; a vultrino whose outbox pushes somewhere other than govder still reports the push relationship, which the verifier then compares with govder's GOVDER_SIGNATURE_SECRET. The fingerprint is only as private as the secret is strong: someone who holds it can test guesses for a low-entropy secret offline, and the report is protected only by a global admin key. The route's key gate is covered by the posture-report claims, not here. The cross-plane check that real binaries emit what the verifier reads is govder's armed four-plane e2e (TestFourPlanePostureE2E, TestFourPlaneSecretMismatchE2E). The averin-api-key fingerprint says which key vultrino sends; that averin accepts it is checked by feir-os's verifier against averin's own report, and no four-plane run has a keyed averin. The workload-assertion fingerprints say which verifier secrets vultrino accepts; that feir-runtime-edge holds one of them is the feir-os verifier's comparison, and no run here starts a real feir-runtime-edge against a real vultrino and feeds both reports to evaluate.jq (the integration test signs with the listed secrets itself).",
       "evidence_run": "38694664010"
     },
     {

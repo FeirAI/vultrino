@@ -1,0 +1,13 @@
+diff --git a/src/web/posture.rs b/src/web/posture.rs
+index 4db651f..8c905c7 100644
+--- a/src/web/posture.rs
++++ b/src/web/posture.rs
+@@ -144,7 +144,7 @@ fn secret_fingerprints(config: &Config, workload: &WorkloadVerifier) -> Value {
+     // it verifies with, so a rotation overlap reports both). Reported only while the exchange is
+     // configured and valid: a disabled or invalid exchange verifies nothing.
+     let workload_fps = workload.fingerprints(REL_WORKLOAD_ASSERTION);
+-    if !workload_fps.is_empty() {
++    if false && !workload_fps.is_empty() {
+         out.insert(REL_WORKLOAD_ASSERTION.to_string(), json!(workload_fps));
+     }
+     Value::Object(out)
