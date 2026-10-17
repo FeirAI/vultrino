@@ -308,6 +308,40 @@ fn cache_input_tokens(usage: &serde_json::Map<String, serde_json::Value>) -> u64
     reads.saturating_add(writes.saturating_mul(CACHE_WRITE_WEIGHT))
 }
 
+/// The input and output tokens of every entry of `usage.iterations` (Anthropic: one entry per
+/// sampling step the request ran, including the compaction and advisor steps that the
+/// top-level counts leave out), each entry's cache tokens included as in
+/// [`cache_input_tokens`]. An entry that is not an object, or a count that is not a whole
+/// non-negative number, adds nothing. Callers charge `max(top level, this sum)` per
+/// direction: the iterations list normally covers the top-level counts too, so the larger
+/// of the two never counts a step twice and never books below either figure.
+fn iterations_total(usage: &serde_json::Map<String, serde_json::Value>) -> (u64, u64) {
+    let mut input = 0u64;
+    let mut output = 0u64;
+    for entry in usage
+        .get("iterations")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_object)
+    {
+        let get = |k: &str| {
+            entry
+                .get(k)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        input = input
+            .saturating_add(get("input_tokens"))
+            .saturating_add(get("inputTokens"))
+            .saturating_add(cache_input_tokens(entry));
+        output = output
+            .saturating_add(get("output_tokens"))
+            .saturating_add(get("outputTokens"));
+    }
+    (input, output)
+}
+
 /// Parse a provider `usage` block from a **non-streamed** LLM response body
 /// (V13b). Best-effort: returns `None` for any body that isn't a JSON object
 /// carrying a recognized `usage` shape (a streamed response without a usage
@@ -373,17 +407,22 @@ pub fn parse_token_usage(raw_body: &[u8]) -> Option<TokenUsage> {
             output_tokens: output,
         });
     }
+    let (iter_input, iter_output) = iterations_total(usage);
     if let (Some(input), Some(output)) = (read("input_tokens"), read("output_tokens")) {
         return Some(TokenUsage {
-            input_tokens: input.saturating_add(cache_input_tokens(usage)),
-            output_tokens: output,
+            input_tokens: input
+                .saturating_add(cache_input_tokens(usage))
+                .max(iter_input),
+            output_tokens: output.max(iter_output),
         });
     }
     // Amazon Bedrock Converse uses camelCase counts.
     if let (Some(input), Some(output)) = (read("inputTokens"), read("outputTokens")) {
         return Some(TokenUsage {
-            input_tokens: input.saturating_add(cache_input_tokens(usage)),
-            output_tokens: output,
+            input_tokens: input
+                .saturating_add(cache_input_tokens(usage))
+                .max(iter_input),
+            output_tokens: output.max(iter_output),
         });
     }
     None
@@ -482,6 +521,10 @@ pub struct UsageAccumulator {
     /// `thoughtsTokenCount` (billed output, cumulative: largest wins).
     tool_prompt_tokens: u64,
     thoughts_tokens: u64,
+    /// The `usage.iterations` sums ([`iterations_total`]), cumulative on the provider side:
+    /// the largest seen wins. Charged as a floor on the totals.
+    iter_input: u64,
+    iter_output: u64,
     output_tokens: Option<u64>,
     model: Option<String>,
     /// Carry for a partial trailing SSE line split across chunks.
@@ -509,6 +552,8 @@ impl UsageAccumulator {
             cache_input_tokens: 0,
             tool_prompt_tokens: 0,
             thoughts_tokens: 0,
+            iter_input: 0,
+            iter_output: 0,
             output_tokens: None,
             model: None,
             line_buf: Vec::new(),
@@ -532,13 +577,14 @@ impl UsageAccumulator {
         self.input_tokens.map(|i| {
             i.saturating_add(self.cache_input_tokens)
                 .saturating_add(self.tool_prompt_tokens)
+                .max(self.iter_input)
         })
     }
 
     /// The output count to charge: the provider's count plus Gemini thinking tokens.
     fn output_total(&self) -> Option<u64> {
         self.output_tokens
-            .map(|o| o.saturating_add(self.thoughts_tokens))
+            .map(|o| o.saturating_add(self.thoughts_tokens).max(self.iter_output))
     }
 
     /// The model the stream itself reported, if any (without consuming it).
@@ -689,6 +735,9 @@ impl UsageAccumulator {
                 self.final_usage = true;
             }
             self.cache_input_tokens = self.cache_input_tokens.max(cache_input_tokens(obj));
+            let (iter_input, iter_output) = iterations_total(obj);
+            self.iter_input = self.iter_input.max(iter_input);
+            self.iter_output = self.iter_output.max(iter_output);
             self.tool_prompt_tokens = self.tool_prompt_tokens.max(
                 obj.get("toolUsePromptTokenCount")
                     .and_then(serde_json::Value::as_u64)
@@ -785,6 +834,7 @@ pub fn estimate_stream_usage(
             .div_ceil(ESTIMATE_BYTES_PER_TOKEN)
             .saturating_add(acc.cache_input_tokens)
             .saturating_add(acc.tool_prompt_tokens)
+            .max(acc.iter_input)
     });
     let generated = if acc.capped {
         acc.raw_bytes
@@ -800,7 +850,8 @@ pub fn estimate_stream_usage(
         output_tokens: output.max(
             acc.output_tokens
                 .unwrap_or(0)
-                .saturating_add(acc.thoughts_tokens),
+                .saturating_add(acc.thoughts_tokens)
+                .max(acc.iter_output),
         ),
     }
 }
@@ -1609,6 +1660,53 @@ mod tests {
         assert_eq!(usage.output_tokens, 5);
         let (usage, _) = acc.finish();
         assert_eq!(usage.unwrap().input_tokens, 1210);
+    }
+
+    #[test]
+    fn every_usage_iteration_is_counted_in_a_buffered_response() {
+        // Server-side compaction (and the advisor) run extra sampling steps that the
+        // top-level counts leave out and only `usage.iterations` reports.
+        let body = br#"{"usage":{"input_tokens":10,"output_tokens":5,"iterations":[
+            {"type":"compaction","input_tokens":50000,"output_tokens":2000},
+            {"type":"message","input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":100}]}}"#;
+        let u = parse_token_usage(body).unwrap();
+        // 50000 + (10 + 100 written counted twice); 2000 + 5.
+        assert_eq!(u.input_tokens, 50210);
+        assert_eq!(u.output_tokens, 2005);
+        // The top-level counts are the floor when they exceed the sum (nothing double counts).
+        let body = br#"{"usage":{"input_tokens":900,"output_tokens":90,"iterations":[
+            {"type":"message","input_tokens":10,"output_tokens":5}]}}"#;
+        let u = parse_token_usage(body).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (900, 90));
+        // A malformed entry counts nothing and does not stop the rest.
+        let body = br#"{"usage":{"input_tokens":1,"output_tokens":1,"iterations":[
+            7,{"input_tokens":-3,"output_tokens":"x"},{"input_tokens":20,"output_tokens":30}]}}"#;
+        let u = parse_token_usage(body).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (20, 30));
+    }
+
+    #[test]
+    fn every_usage_iteration_is_counted_in_a_streamed_response() {
+        let mut acc = UsageAccumulator::new(1 << 20);
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+        );
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5,\"iterations\":[{\"type\":\"compaction\",\"input_tokens\":50000,\"output_tokens\":2000},{\"type\":\"message\",\"input_tokens\":10,\"output_tokens\":5}]}}\n\n",
+        );
+        let usage = acc.snapshot().unwrap().0;
+        assert_eq!(usage.input_tokens, 50010);
+        assert_eq!(usage.output_tokens, 2005);
+        // A later event repeating the cumulative list is not added again.
+        feed(
+            &mut acc,
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5,\"iterations\":[{\"type\":\"compaction\",\"input_tokens\":50000,\"output_tokens\":2000},{\"type\":\"message\",\"input_tokens\":10,\"output_tokens\":5}]}}\n\n",
+        );
+        assert_eq!(acc.snapshot().unwrap().0.input_tokens, 50010);
+        // The estimate keeps what the iterations reported as a floor.
+        assert!(estimate_stream_usage(&acc, 0, None).input_tokens >= 50010);
     }
 
     #[test]

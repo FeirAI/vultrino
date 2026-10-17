@@ -3382,10 +3382,19 @@ async fn v2b_a_request_that_sets_a_price_the_card_cannot_hold_is_refused_before_
         assert_eq!(error_type(resp).await, "modifier_unpriced", "{key}");
     }
     assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
-    // Standard speed and the global geo are what the card prices.
-    let mut ok = messages("claude-haiku-4-5");
-    ok["speed"] = serde_json::json!("standard");
-    ok["inference_geo"] = serde_json::json!("global");
+    // Even the standard values are refused: no field outside the allowlist is admitted.
+    let mut std_values = messages("claude-haiku-4-5");
+    std_values["speed"] = serde_json::json!("standard");
+    std_values["inference_geo"] = serde_json::json!("global");
+    let resp = router
+        .clone()
+        .oneshot(llm_req(Some(&token), "v1/messages", std_values))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(calls_of(&calls), 0);
+    // A plain priced request passes.
+    let ok = messages("claude-haiku-4-5");
     let resp = router
         .oneshot(llm_req(Some(&token), "v1/messages", ok))
         .await
@@ -3515,14 +3524,198 @@ async fn v2b_gemini_camel_case_tier_and_billed_grounding_tools_are_refused() {
         assert_eq!(error_type(resp).await, "modifier_unpriced", "{name}");
     }
     assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
-    // Function declarations and url context bill tokens alone.
-    let ok = serde_json::json!({"contents": [], "tools": [{"functionDeclarations": []}, {"urlContext": {}}]});
+    // url context is not a plain function tool: refused. Function declarations pass.
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            route,
+            serde_json::json!({"contents": [], "tools": [{"urlContext": {}}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let ok = serde_json::json!({"contents": [], "tools": [{"functionDeclarations": []}]});
     let resp = router
         .oneshot(llm_req(Some(&token), route, ok))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(calls_of(&calls), 1);
+}
+
+/// POST like [`llm_req`] with an `anthropic-beta` header.
+fn llm_req_beta(token: &str, path: &str, beta: &str, body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/llm/{path}"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header("anthropic-beta", beta)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn v2b_round4_unknown_request_features_are_refused_before_the_upstream() {
+    // Server-side compaction in both request shapes, a field nobody priced, an unpriced
+    // beta, a typed server tool: all refused with modifier_unpriced and no upstream call.
+    let (router, _storage, token, calls) = anthropic_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "claude-haiku-4-5",
+    )
+    .await;
+    let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+    for (name, key, value) in [
+        (
+            "compaction (top-level)",
+            "compaction",
+            serde_json::json!({"type": "compact_20260112"}),
+        ),
+        (
+            "compaction (context_management)",
+            "context_management",
+            serde_json::json!({"edits": [{"type": "compact_20260112"}]}),
+        ),
+        (
+            "unknown field",
+            "a_field_added_next_year",
+            serde_json::json!(1),
+        ),
+        (
+            "tier in odd casing",
+            "Service_Tier",
+            serde_json::json!("priority"),
+        ),
+        (
+            "typed server tool",
+            "tools",
+            serde_json::json!([{"type": "web_search_20250305", "name": "web_search"}]),
+        ),
+        (
+            "untyped tool with a foreign key",
+            "tools",
+            serde_json::json!([{"name": "f", "input_schema": {}, "max_uses": 3}]),
+        ),
+    ] {
+        let mut body = messages("claude-haiku-4-5");
+        body[key] = value;
+        cases.push((name, body));
+    }
+    for (name, body) in cases {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), "v1/messages", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{name}");
+    }
+    for beta in [
+        "compact-2026-01-12",
+        "prompt-caching-2024-07-31,fast-mode-2026-02-01",
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(llm_req_beta(
+                &token,
+                "v1/messages",
+                beta,
+                messages("claude-haiku-4-5"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{beta}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{beta}");
+    }
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+    // A priced beta and a plain request still pass.
+    let resp = router
+        .clone()
+        .oneshot(llm_req_beta(
+            &token,
+            "v1/messages",
+            "prompt-caching-2024-07-31",
+            messages("claude-haiku-4-5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = router
+        .oneshot(llm_req(
+            Some(&token),
+            "v1/messages",
+            messages("claude-haiku-4-5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 2);
+}
+
+#[tokio::test]
+async fn v2b_round4_a_bedrock_tool_entry_with_extra_keys_is_refused() {
+    let (router, _storage, token, calls) = proto_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "anthropic.claude-3-haiku-20240307-v1:0",
+        "bedrock-converse",
+        BEDROCK_BASE,
+        "VULTRINO_PROVIDER_BEDROCK_ENABLED",
+    )
+    .await;
+    let route = "model/anthropic.claude-3-haiku-20240307-v1%3A0/converse";
+    for tool in [
+        serde_json::json!({"toolSpec": {"name": "f"}, "systemTool": {"name": "nova_grounding"}}),
+        serde_json::json!({"toolSpec": {"name": "f", "billed": true}}),
+        serde_json::json!({"systemTool": {"name": "nova_grounding"}}),
+    ] {
+        let body = serde_json::json!({"messages": [], "toolConfig": {"tools": [tool]}});
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), route, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{tool}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{tool}");
+    }
+    assert_eq!(calls_of(&calls), 0);
+    let ok = serde_json::json!({"messages": [], "toolConfig": {"tools": [{"toolSpec": {"name": "f", "inputSchema": {"json": {}}}}]}});
+    let resp = router
+        .oneshot(llm_req(Some(&token), route, ok))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+}
+
+#[tokio::test]
+async fn v2b_round4_gemini_service_tier_in_either_casing_is_refused() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let (router, _storage, token, calls) = proto_stack_models(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        &path,
+        "gemini",
+        GEMINI_BASE,
+        "VULTRINO_PROVIDER_GEMINI_ENABLED",
+        Vec::new(),
+    )
+    .await;
+    let route = "v1beta/models/gemini-2.5-flash:generateContent";
+    for key in ["serviceTier", "service_tier", "ServiceTier"] {
+        let mut body = serde_json::json!({"contents": []});
+        body[key] = serde_json::json!("standard");
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), route, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{key}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{key}");
+    }
+    assert_eq!(calls_of(&calls), 0);
 }
 
 #[tokio::test]
