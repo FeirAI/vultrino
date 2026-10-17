@@ -4020,6 +4020,71 @@
           "path": "src/web/llm_proxy.rs",
           "symbol": "unpriced_beta_header",
           "sha256": "65c7c6bbab7fadcf45b6dd3dd80a9d9a5f06551361ab60df5866469e03438b44"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "only_keys",
+          "sha256": "7eb68bb8d804cfde877a140add242cbbb548284327e5426a924ae075bf5a6daa"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "openai_chat_tool",
+          "sha256": "c9fc281102c46f5e1f300111cb287ed7224f4a746d469039749f757920fd4414"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "openai_responses_tool",
+          "sha256": "c2990a86a4bd5d6551f358756516feddcd794c6a37bc8d215bd2fd7a997e45f4"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "betas_priced",
+          "sha256": "cc573c141abd47f6abbdab00cf20342981e87c68fce6852d7c7a6fb783f042b3"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "ANTHROPIC_FIELDS",
+          "sha256": "19d49e91828e209e6f14c150b288e493babd1de719d83b0b773d9951fcb4bda6"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "ANTHROPIC_HOSTED_EXTRA",
+          "sha256": "4a627f83b193e19c78ccaf7377af3103778a028ee35ef8716483f8c7467ab09d"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "OPENAI_CHAT_FIELDS",
+          "sha256": "58ad381d6dcb02697e643050febe88627497495187982dc07923201fc1d9ada8"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "NVIDIA_EXTRA",
+          "sha256": "60061b3d272133e8311fc25c51b0eaa63909020aad08398e001324408f4e0d92"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "OPENAI_RESPONSES_FIELDS",
+          "sha256": "4a12c861cad46e2257a8c467a04535f7358d4ffe87a2b386de9179d186544576"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "GEMINI_FIELDS",
+          "sha256": "996d604ecf2358c4ab16898a8b579481e56c0cedf7e46b3c428009d34b891beb"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "CONVERSE_FIELDS",
+          "sha256": "d0711caf422e9b36cee050dac9cfec490fd6bce9981031f7e9372058ebf54f39"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "PRICED_BETAS",
+          "sha256": "a224abe3296a62f7f50960d7fd25de93885fce395e1021c7ab4566ab6bbb3c6f"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "ANTHROPIC_CLIENT_TOOL_TYPES",
+          "sha256": "da0b11e4fb45e98d7309247b82d3475f85fe0f1973d878502367cb02f4f6540b"
         }
       ],
       "mutants": [
