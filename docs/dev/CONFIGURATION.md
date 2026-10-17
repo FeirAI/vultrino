@@ -171,14 +171,19 @@ are spend controls: reasoning tokens are billed as output tokens. An absent
 
 **Org-level Anthropic keys.** Anthropic rejects a request made with an API key that
 is not scoped to a workspace unless it carries an `anthropic-workspace-id` header.
-To use such a key, set `llm.anthropic_workspace_id` on the capability (only on
-`llm.protocol` `anthropic-messages`; the value is `wrkspc_` followed by 8 to 64
-ASCII letters or digits, anything else is refused when the capability is written).
-Vultrino then sends `anthropic-workspace-id: <id>` on every upstream request for
-that channel. The workspace is fixed by the operator, not by the agent: a client
-that sends its own `anthropic-workspace-id` header has it dropped, never forwarded,
-and it cannot override the configured one. Without the setting no header is added,
-so workspace-scoped keys keep working unchanged.
+To use such a key, set the credential's `anthropic_workspace_id` metadata, for
+example `vultrino credentials metadata set <alias> anthropic_workspace_id
+wrkspc_...` (or the `metadata` map on `POST /api/v1/credentials`). The value is
+`wrkspc_` followed by 8 to 64 ASCII letters or digits; anything else is refused when
+it is set, and a stored value that fails the same check at use time makes the request
+fail before any upstream call. Vultrino then sends that value on every upstream
+request that uses the credential: `/llm`, `POST /api/v1/execute`, the MCP
+`http_request` tool and approval replay. The workspace is fixed by the operator, not
+by the agent: an `anthropic-workspace-id` header sent by a caller is dropped on every
+one of those paths, never forwarded. A credential with no setting sends no header,
+so a workspace-scoped key keeps working unchanged, and a key that spans several
+workspaces and has no setting is left for Anthropic to refuse rather than letting the
+caller choose.
 
 ### `[[policies]]` — static declarative policies
 

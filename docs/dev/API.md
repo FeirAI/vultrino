@@ -604,12 +604,16 @@ the buffered-vs-streaming branch, so a `{"stream": true}` request cannot evade i
   The Responses API does not read `max_tokens`, so injecting the wrong field would
   leave the per-call ceiling unenforced on a Responses request that omits its own
   limit.
-- **Anthropic workspace (gateway-owned):** when the capability sets
-  `llm.anthropic_workspace_id` (`wrkspc_` plus 8 to 64 ASCII letters or digits;
-  only on `llm.protocol` `anthropic-messages`, refused otherwise), Vultrino sends it
-  upstream as the `anthropic-workspace-id` header, which an org-level (not
-  workspace-scoped) Anthropic key requires. A client-sent `anthropic-workspace-id`
-  is dropped and cannot override it; with the field unset no header is added.
+- **Anthropic workspace (operator-owned, every path):** an org-level Anthropic key
+  (one not scoped to a single workspace) needs an `anthropic-workspace-id` header.
+  The workspace is stored on the credential as the `anthropic_workspace_id` metadata
+  key (`wrkspc_` plus 8 to 64 ASCII letters or digits; any other value is refused when
+  it is set). Before dispatch, Vultrino removes any `anthropic-workspace-id` the caller
+  sent (any case) and writes the credential's value, or none if the credential has
+  none. This holds on `/llm`, `POST /api/v1/execute`, the MCP `http_request` tool and
+  approval replay alike, because it is applied where every path reaches the plugin. A
+  caller therefore cannot pick a workspace with the same bearer on any of them.
+
 - **Reasoning effort (gateway-owned):** when the capability sets
   `llm.reasoning_effort` (one of `none`, `minimal`, `low`, `medium`, `high`),
   Vultrino WRITES it into the body, **overwriting a client-supplied value of any

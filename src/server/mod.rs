@@ -2763,6 +2763,11 @@ impl VultrinoServer {
             exact_evidence.as_ref(),
         )
         .await?;
+        // The workspace header is the operator's on every path (the credential's
+        // `anthropic_workspace_id` metadata, or none), never the caller's.
+        let mut params = params;
+        crate::plugins::apply_workspace_scope_to_params(&mut params, &credential.metadata)
+            .map_err(|e| RunError::terminal(e.into()))?;
         let plugin_request = crate::plugins::PluginRequest {
             credential,
             action: action_name.to_string(),
@@ -3165,6 +3170,11 @@ impl VultrinoServer {
             exact_evidence.as_ref(),
         )
         .await?;
+        // The workspace header is the operator's on every path (the credential's
+        // `anthropic_workspace_id` metadata, or none), never the caller's.
+        let mut params = params;
+        crate::plugins::apply_workspace_scope_to_params(&mut params, &credential.metadata)
+            .map_err(|e| RunError::terminal(e.into()))?;
         let plugin_request = crate::plugins::PluginRequest {
             credential,
             action: action_name.to_string(),
