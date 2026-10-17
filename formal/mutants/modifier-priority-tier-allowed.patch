@@ -1,13 +1,13 @@
 diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
-index 14620ec..a0041c8 100644
+index 751d1c0..0db5ab4 100644
 --- a/src/web/llm_proxy.rs
 +++ b/src/web/llm_proxy.rs
-@@ -313,7 +313,7 @@ fn unpriced_modifier(body: &serde_json::Value) -> Option<String> {
-     if let Some(v) = body.get("service_tier") {
-         if !matches!(
-             text(v).as_deref(),
--            Some("auto" | "default" | "standard_only" | "flex")
-+            Some("auto" | "default" | "standard_only" | "flex" | "priority")
-         ) {
-             return Some("a service_tier other than auto, default, standard_only or flex is priced above the card".to_string());
-         }
+@@ -320,7 +320,7 @@ fn unpriced_modifier(body: &serde_json::Value) -> Option<String> {
+             serde_json::Value::String(t) => {
+                 matches!(
+                     t.as_str(),
+-                    "auto" | "default" | "standard" | "standard_only" | "flex"
++                    "auto" | "default" | "standard" | "standard_only" | "flex" | "priority"
+                 )
+             }
+             serde_json::Value::Object(o) => matches!(

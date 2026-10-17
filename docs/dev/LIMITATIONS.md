@@ -39,10 +39,13 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   (the requested id stands in only for a dated form of it), so an unpriced served model is
   counted by leria as unpriced and holds its watermark rather than being booked at another
   model's price, but that call has already been made. The card cannot hold price modifiers:
-  a request with fast mode, a non-global `inference_geo`, a priority tier or a named
-  server-side tool is refused (`modifier_unpriced`); the regional-endpoint premium of a
-  Vertex or Bedrock deployment, and any modifier the refusal list does not name, are booked
-  at the base price (an under-count). Server-tool fees are refused, not metered. The card is
+  a request with fast mode, a non-global `inference_geo`, a priority tier (either
+  spelling), `fallbacks`, or any tool off the allowlist of token-only shapes (this includes the
+  advisor tool, which runs a second model) is refused (`modifier_unpriced`); the
+  regional-endpoint premium of a Vertex or Bedrock deployment, and any price-modifier field
+  the refusal list does not name, are booked at the base price (an under-count).
+  `usage.iterations` is not read, so extra-model usage is kept out by refusing the request,
+  not metered. Server-tool fees are refused, not metered. The card is
   read from a file and a change can only NARROW coverage: vultrino serves the intersection
   of the card it read at start and the latest good file until it restarts, because leria
   reads the file only at start (so a model added to the file after leria started is refused

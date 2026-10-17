@@ -146,13 +146,28 @@ Two provider shapes are recognized (both nested under top-level `usage`):
 **Prices the card cannot hold.** The card has one input and one output price per model. A request
 that sets a field which raises the provider's price beyond that is refused before the upstream
 call (`403 modifier_unpriced`): Anthropic `speed` other than `standard` (fast mode) and
-`inference_geo` other than `global`, a `service_tier` other than `auto`, `default`,
-`standard_only` or `flex`, Bedrock `performanceConfig.latency` other than `standard` and a
-`serviceTier` other than `default` or `flex`, and a server-side tool that bills per use on top of
-tokens (web search, code execution, code interpreter, file search, image generation, Google
-search and maps grounding). Not covered, so booked below the real price: the regional-endpoint
-premium of a Vertex or Bedrock deployment the operator points `provider_base` at, a price change
-the provider makes without a request field, and any modifier or tool this list does not name.
+`inference_geo` other than `global`, a `service_tier` or `serviceTier` (both spellings, Gemini's
+REST field is the camelCase one) string other than `auto`, `default`, `standard`, `standard_only`
+or `flex`, a Bedrock `serviceTier` object whose `type` is not `default` or `flex`, Bedrock
+`performanceConfig.latency` other than `standard`, `web_search_options`, and any tool that is not
+on an allowlist of shapes known to bill tokens alone (in `tools` and in Bedrock
+`toolConfig.tools`): `function` and `custom`, an Anthropic client tool (an `input_schema` and no
+server type), `bash_*`, `text_editor_*`, `memory_*`, `computer_*`, the free `web_fetch_*` and
+`tool_search_*`, Gemini `functionDeclarations` and `urlContext`, Bedrock `toolSpec` and
+`cachePoint`. Every other typed tool or tool key is refused, including web search, code
+execution, file search, Vertex grounding and any server tool a provider adds later.
+
+**Extra model calls inside one request.** The Anthropic advisor tool (`advisor_*`) runs a second
+model, billed at its own rates and reported only in `usage.iterations`; server-side `fallbacks`
+rerun a refused request on another model, and the refused attempt is billed but not in the
+returned usage. The token event books one model from the top-level usage, so a request that
+carries an `advisor_*` tool, `fallbacks` or `fallback_credit_token` is refused
+(`403 modifier_unpriced`). `usage.iterations` is not read: the proxy keeps these calls out by
+refusing the request, it does not meter them. Not covered, so booked below the real price: the
+regional-endpoint premium of a Vertex or Bedrock deployment the operator points `provider_base`
+at, a price change the provider makes without a request field, a modifier field this list does
+not name (the tool rule is an allowlist, the field list is not), and extra model usage a
+provider reports without any request field naming it.
 
 Negative/float/oversized counts are rejected (`as_u64`), and a body missing a
 recognized count pair yields no token event. The `model` is taken from the
