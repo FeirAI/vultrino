@@ -108,6 +108,7 @@ fn client(base_url: &str, mode: AverinMode) -> AverinClient {
         max_seal_params_bytes: 128 * 1024,
         durable: false,
         d8_complete_evidence: false,
+        d8_evidence_floor: vultrino::averin::D8EvidenceFloor::default(),
     })
     .expect("client builds")
     .expect("client is Some when enabled")
