@@ -63,7 +63,6 @@ pub struct RateCard {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WireCard {
     #[serde(default)]
     rate_card_version: String,
@@ -78,7 +77,6 @@ struct WireCard {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WireEntry {
     #[serde(default)]
     model_ref: Option<String>,
@@ -92,6 +90,47 @@ struct WireEntry {
     input_price_micros_per_unit: Option<i64>,
     #[serde(default)]
     output_price_micros_per_unit: Option<i64>,
+}
+
+/// The fields a card may carry (leria's `wireCard`).
+const CARD_FIELDS: &[&str] = &[
+    "rate_card_version",
+    "provider",
+    "entries",
+    "created_at",
+    "stale_after_s",
+];
+
+/// The fields an entry may carry (leria's `wireEntry`).
+const ENTRY_FIELDS: &[&str] = &[
+    "model_ref",
+    "model_ref_prefix",
+    "asset",
+    "price_micros_per_unit",
+    "input_price_micros_per_unit",
+    "output_price_micros_per_unit",
+];
+
+/// Refuse a card or an entry that carries a field leria does not know, as leria's decoder
+/// does (`DisallowUnknownFields`): a typo such as `output_price_micros_per_unti` must not be
+/// dropped silently. Wrong types are left to the deserialiser that follows.
+fn refuse_unknown_fields(card: &serde_json::Value) -> Result<(), RateCardError> {
+    let Some(obj) = card.as_object() else {
+        return Ok(());
+    };
+    if let Some(k) = obj.keys().find(|k| !CARD_FIELDS.contains(&k.as_str())) {
+        return Err(RateCardError(format!("unknown field {k:?} on a rate card")));
+    }
+    let entries = obj.get("entries").and_then(serde_json::Value::as_array);
+    for entry in entries.into_iter().flatten() {
+        let Some(fields) = entry.as_object() else {
+            continue;
+        };
+        if let Some(k) = fields.keys().find(|k| !ENTRY_FIELDS.contains(&k.as_str())) {
+            return Err(RateCardError(format!("unknown field {k:?} on an entry")));
+        }
+    }
+    Ok(())
 }
 
 /// Why a rate-card file was refused.
@@ -108,11 +147,19 @@ impl RateCard {
         if text.is_empty() {
             return Err(RateCardError("the file is empty".to_string()));
         }
-        let cards: Vec<WireCard> = if text.starts_with('[') {
+        let values: Vec<serde_json::Value> = if text.starts_with('[') {
             serde_json::from_str(text).map_err(|e| RateCardError(format!("bad JSON: {e}")))?
         } else {
             vec![serde_json::from_str(text).map_err(|e| RateCardError(format!("bad JSON: {e}")))?]
         };
+        let mut cards: Vec<WireCard> = Vec::with_capacity(values.len());
+        for value in values {
+            refuse_unknown_fields(&value)?;
+            cards.push(
+                serde_json::from_value(value)
+                    .map_err(|e| RateCardError(format!("bad rate card: {e}")))?,
+            );
+        }
         let mut card = RateCard {
             sha256: hex::encode(Sha256::digest(bytes)),
             ..Self::default()
