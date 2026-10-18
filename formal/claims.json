@@ -2417,6 +2417,16 @@
           "path": "src/plugins/http.rs",
           "symbol": "HttpPlugin::url_token_send_url",
           "sha256": "f5cb14330b41d0a40324d3b591bbeb2ed57f5442ae489ec363fc31dd075b0162"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "canonical_pattern_core",
+          "sha256": "a3e1c2c41bd5249ca137b6feb186b665758710ac323e6171ee5fc5699135c5ef"
+        },
+        {
+          "path": "src/policy/url_canon.rs",
+          "symbol": "url_matches_for",
+          "sha256": "1ed35070110d3bde856d03cc519a985c4d930b442f4fe02efcac667b909bdcec"
         }
       ],
       "mutants": [
@@ -3470,6 +3480,11 @@
           "path": "src/govder/mod.rs",
           "symbol": "approval_key_posture",
           "sha256": "72439a7caa60ec20787c4e7715ded056096b0c4026968cfe6fcdd944b868f0b8"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "upstream_proxy_configured",
+          "sha256": "11cd29be471c89c6ab73d3ea7d4ff1cc2e68c0531b565471a4cb33670bd2012b"
         }
       ],
       "mutants": [
