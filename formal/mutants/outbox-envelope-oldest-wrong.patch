@@ -1,0 +1,13 @@
+diff --git a/src/storage/outbox_store.rs b/src/storage/outbox_store.rs
+index f317dd3..9f7b5e1 100644
+--- a/src/storage/outbox_store.rs
++++ b/src/storage/outbox_store.rs
+@@ -631,7 +631,7 @@ impl OutboxStore {
+         crate::outbox::OutboxRetentionSnapshot {
+             loaded: self.loaded_once.load(Ordering::Acquire),
+             retained_events: c.outbox.len() as u64,
+-            oldest_sequence: c.outbox.keys().next().copied(),
++            oldest_sequence: c.outbox.keys().next_back().copied(),
+             last_sequence: c.outbox_seq,
+             cap_pruned_total: self.cap_pruned_total.load(Ordering::Relaxed),
+             cap_pruned_undelivered_total: self.cap_pruned_undelivered_total.load(Ordering::Relaxed),

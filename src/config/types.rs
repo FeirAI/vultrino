@@ -161,6 +161,7 @@ pub struct RawOutboxConfig {
     pub hmac_secret: Option<String>,
     pub max_attempts: Option<u32>,
     pub retention_secs: Option<u64>,
+    pub max_retained_events: Option<u64>,
 }
 
 impl std::fmt::Debug for RawOutboxConfig {
@@ -174,6 +175,7 @@ impl std::fmt::Debug for RawOutboxConfig {
             )
             .field("max_attempts", &self.max_attempts)
             .field("retention_secs", &self.retention_secs)
+            .field("max_retained_events", &self.max_retained_events)
             .finish()
     }
 }
@@ -203,6 +205,21 @@ impl TryFrom<RawOutboxConfig> for crate::outbox::OutboxConfig {
             }
         }
         let defaults = crate::outbox::OutboxConfig::default();
+        // A cap outside the range is refused, never clamped: too low silently shortens the outage
+        // window a consumer can survive, too high brings back the unbounded whole-file rewrite cost.
+        let max_retained_events = match raw.max_retained_events {
+            None => defaults.max_retained_events,
+            Some(n) => {
+                let lo = crate::outbox::MAX_RETAINED_EVENTS_MIN as u64;
+                let hi = crate::outbox::MAX_RETAINED_EVENTS_MAX as u64;
+                if n < lo || n > hi {
+                    return Err(ConfigError::Invalid(format!(
+                        "outbox: `max_retained_events` must be between {lo} and {hi} (got {n})"
+                    )));
+                }
+                n as usize
+            }
+        };
         Ok(Self {
             enabled,
             url: raw.url.filter(|s| !s.trim().is_empty()),
@@ -215,6 +232,7 @@ impl TryFrom<RawOutboxConfig> for crate::outbox::OutboxConfig {
                 .retention_secs
                 .filter(|r| *r > 0)
                 .unwrap_or(defaults.retention_secs),
+            max_retained_events,
         })
     }
 }
@@ -1297,6 +1315,7 @@ action = "deny"
             hmac_secret: Some("top-secret-key".to_string()),
             max_attempts: Some(3),
             retention_secs: Some(10),
+            max_retained_events: None,
         };
         let dbg = format!("{raw:?}");
         assert!(
@@ -1350,6 +1369,24 @@ action = "deny"
             Config::parse("[outbox]\nenabled = false\nurl = \"https://x\"\nhmac_secret = \"s\"")
                 .unwrap();
         assert!(!off.outbox.enabled);
+    }
+
+    #[test]
+    fn max_retained_below_floor_refused() {
+        let parse = |n: &str| Config::parse(&format!("[outbox]\nmax_retained_events = {n}"));
+        // Default when unset.
+        assert_eq!(Config::parse("").unwrap().outbox.max_retained_events, 2000);
+        // The bounds themselves are accepted.
+        assert_eq!(parse("100").unwrap().outbox.max_retained_events, 100);
+        assert_eq!(parse("100000").unwrap().outbox.max_retained_events, 100_000);
+        // Outside the range is refused, not clamped.
+        for bad in ["0", "99", "100001", "5000000000"] {
+            let err = parse(bad).expect_err(bad);
+            assert!(
+                err.to_string().contains("max_retained_events"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]

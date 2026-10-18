@@ -2845,6 +2845,7 @@ async fn test_admin_metrics_reflects_outbox_delivery_counters() {
         hmac_secret: Some("s".to_string()),
         max_attempts: 3,
         retention_secs: 3600,
+        max_retained_events: 2000,
     };
     let client = reqwest::Client::new();
     vultrino::server::deliver_outbox_once(
@@ -9346,4 +9347,143 @@ async fn approval_link_token_never_reaches_debug_request_logs() {
         !logged.contains(secret) && !logged.contains("token="),
         "capability token reached the logs: {logged}"
     );
+}
+
+#[tokio::test]
+async fn events_envelope_reports_oldest_and_last_sequence() {
+    // The envelope carries unsigned retention hints so a poller can tell, without a signed hole,
+    // that the cap pruned events it had not read: `oldest_sequence` is the lowest retained and
+    // `last_sequence` the highest ever assigned (it survives pruning).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let auth_manager = AuthManager::new();
+    let (key, api_key) = auth_manager
+        .create_api_key("admin-key", "admin", None)
+        .unwrap();
+    storage.store_api_key(&api_key).await.unwrap();
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        Config::default(),
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+    let feed = |router: axum::Router, key: String| async move {
+        let resp = router
+            .oneshot(admin_req(
+                "GET",
+                "/api/v1/events?after=0",
+                &key,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()
+    };
+
+    let empty = feed(router.clone(), key.clone()).await;
+    assert!(empty["oldest_sequence"].is_null(), "{empty}");
+    assert_eq!(empty["last_sequence"], 0);
+
+    for _ in 0..5 {
+        storage
+            .append_event("a", "meter.observed", serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    let full = feed(router.clone(), key.clone()).await;
+    assert_eq!(full["oldest_sequence"], 1);
+    assert_eq!(full["last_sequence"], 5);
+
+    // The cap prunes the 3 oldest; the hints move, the first event is seq 4. One of the pruned
+    // events was delivered, so the two counters differ.
+    storage
+        .record_event_delivery(2, true, None, 8)
+        .await
+        .unwrap();
+    assert_eq!(storage.gc_outbox(u64::MAX, 2).await.unwrap(), 3);
+    let capped = feed(router.clone(), key.clone()).await;
+    assert_eq!(capped["oldest_sequence"], 4, "{capped}");
+    assert_eq!(capped["last_sequence"], 5, "last survives the prune");
+    assert_eq!(capped["events"][0]["body"]["sequence"], 4);
+
+    // Posture reports the cap and the counters.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/posture",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let posture: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(posture["outbox"]["max_retained_events"], 2000);
+    assert_eq!(posture["outbox"]["retained_events"], 2);
+    assert_eq!(posture["outbox"]["oldest_sequence"], 4);
+    assert_eq!(posture["outbox"]["last_sequence"], 5);
+    assert_eq!(posture["outbox"]["cap_pruned_total"], 3);
+    assert_eq!(posture["outbox"]["cap_pruned_undelivered_total"], 2);
+    assert_eq!(posture["outbox"]["snapshot_loaded"], true);
+    assert_eq!(posture["outbox"]["cap_blocked_total"], 0);
+
+    // Metrics reports the same numbers under `outbox`.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/metrics",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let metrics: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(metrics["outbox"]["max_retained_events"], 2000);
+    assert_eq!(metrics["outbox"]["retained_events"], 2);
+    assert_eq!(metrics["outbox"]["cap_pruned_total"], 3);
+    assert_eq!(metrics["outbox"]["cap_pruned_undelivered_total"], 2);
+
+    // The age stage then prunes every delivered event: the outbox is empty, but the envelope
+    // still reports last_sequence 5 (so a poller at 4 sees an empty page with last_sequence >
+    // cursor) and oldest_sequence null.
+    for seq in [4, 5] {
+        storage
+            .record_event_delivery(seq, true, None, 8)
+            .await
+            .unwrap();
+    }
+    assert_eq!(storage.gc_outbox(0, 2000).await.unwrap(), 2);
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/events?after=4",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let emptied: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(emptied["oldest_sequence"].is_null(), "{emptied}");
+    assert_eq!(emptied["last_sequence"], 5, "{emptied}");
+    assert_eq!(emptied["events"].as_array().unwrap().len(), 0);
 }

@@ -366,6 +366,7 @@ async fn delegate_decision_delivers_signed_webhook_to_govder_consumer() {
         hmac_secret: Some(WEBHOOK_SECRET.to_string()),
         max_attempts: 3,
         retention_secs: 3600,
+        max_retained_events: 2000,
     };
 
     let mint_resp = router
@@ -572,6 +573,7 @@ async fn delegate_decision_cross_plane_to_govder() {
         hmac_secret: Some(secret),
         max_attempts: 3,
         retention_secs: 3600,
+        max_retained_events: 2000,
     };
     let client = reqwest::Client::new();
     let metrics = vultrino::server::OutboxMetrics::default();

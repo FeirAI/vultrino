@@ -1,0 +1,13 @@
+diff --git a/src/storage/outbox_store.rs b/src/storage/outbox_store.rs
+index f317dd3..569be7c 100644
+--- a/src/storage/outbox_store.rs
++++ b/src/storage/outbox_store.rs
+@@ -567,7 +567,7 @@ impl OutboxStore {
+             })
+             .await?;
+         if outcome.cap_blocked {
+-            self.cap_blocked_total.fetch_add(1, Ordering::Relaxed);
++            self.cap_blocked_total.fetch_add(0, Ordering::Relaxed);
+             tracing::warn!(
+                 max_retained,
+                 pruned = outcome.cap.pruned,

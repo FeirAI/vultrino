@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 92c1c3e..dfeff9d 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -5573,7 +5573,7 @@ pub async fn deliver_outbox_periodically(
+         if last_gc.elapsed() >= gc_every {
+             last_gc = tokio::time::Instant::now();
+             if let Err(e) = storage
+-                .gc_outbox(config.retention_secs, config.max_retained_events)
++                .gc_outbox(config.retention_secs, usize::MAX)
+                 .await
+             {
+                 warn!(error = %e, "outbox GC failed");

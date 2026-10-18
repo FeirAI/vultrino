@@ -1,13 +1,13 @@
 diff --git a/src/web/api.rs b/src/web/api.rs
-index 1fdf8fd..d5240b5 100644
+index 1a78833..496e212 100644
 --- a/src/web/api.rs
 +++ b/src/web/api.rs
-@@ -4056,7 +4056,7 @@ pub async fn api_list_events(
+@@ -4077,7 +4077,7 @@ pub async fn api_list_events(
                  Json(serde_json::json!({
                      "events": bodies,
                      "next_cursor": next,
 -                    "meter_gap_pending": gap_pending,
 +                    "meter_gap_pending": 0,
+                     "oldest_sequence": retention.oldest_sequence,
+                     "last_sequence": retention.last_sequence,
                  })),
-             )
-                 .into_response()

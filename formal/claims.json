@@ -1006,6 +1006,26 @@
     "posture-averin-api-key-configured-hardcoded-false": {
       "tier": "full"
     },
+    "outbox-cap-ignored": {
+      "tier": "fast",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-cap-prunes-protected": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-cap-off-by-one": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-cap-not-counted": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-envelope-oldest-wrong": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
     "llm-credential-refusal-removed": {
       "tier": "fast"
     },
@@ -1026,6 +1046,34 @@
     },
     "llm-resume-refusal-removed": {
       "tier": "full"
+    },
+    "outbox-gc-loop-cap-unwired": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-last-sequence-highest-retained": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-cap-pruned-total-undelivered": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-cap-blocked-not-counted": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-snapshot-unloaded-cache": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-page-skips-reload": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-snapshot-loaded-hardcoded": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
     }
   },
   "claims": [
@@ -3464,12 +3512,12 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
+          "sha256": "58581bf0692279478156d9e3128179db3e161ffaa5c280fd96f4bde963df455b"
         },
         {
           "path": "src/web/api.rs",
           "symbol": "api_posture",
-          "sha256": "91d8b763c8d02940f8ad082e10d0d0161e52380f3c9ef5e0041683ece1f7e94c"
+          "sha256": "9022beb16c9a1fb6fe856561f9fdd7af488970b58fe97476d8a57d3e98a28bd3"
         },
         {
           "path": "src/policy/types.rs",
@@ -3585,12 +3633,12 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
+          "sha256": "58581bf0692279478156d9e3128179db3e161ffaa5c280fd96f4bde963df455b"
         },
         {
           "path": "src/web/api.rs",
           "symbol": "api_list_events",
-          "sha256": "a51947db235844cd779f5dddf1afe187ced1dc421b3c0bd87c022add2aa039be"
+          "sha256": "df53d49bf52085d033bbfb0db122567023789254554fac8e9e60d36dc7510f9d"
         },
         {
           "path": "src/server/mod.rs",
@@ -3606,6 +3654,71 @@
         "meter-emit-stops-after-first-failure"
       ],
       "does_not_establish": "The counters and the pending marker are held in memory: if the process exits before an append succeeds again the marker is never written, and a consumer's stale watermark is the only remaining signal. Failures are produced by one injected fault (an unwritable temp path), not by a real full disk or a failing fsync. Only the direct append path is counted; events staged in the vault and drained later are retried by the reconciler instead. That a consumer acts on the marker is the leria claim for its poller, not this one. Says nothing about events lost while the process is down or about the outbox being tampered with. Failed appends do not fail the metered call: vultrino keeps admitting calls during an outage, and the pending count is the only in-band signal until the marker (so the fail-open choice stands and the consumer's watermark is the control). The count is in the unsigned envelope. That the consumer acts on it is the leria claim meter-lost-marker-holds-as-of."
+    },
+    {
+      "id": "outbox-retention-bounded",
+      "statement": "The signed outbox store keeps at most outbox.max_retained_events events (the store's GC; the timed loop wiring is covered by a separate sentence below). In the unit tests of the real outbox store, with the age window switched off so only the cap acts: when more events are retained than the cap, the GC prunes the oldest events beyond it whatever their delivery state (a pending, a dead-lettered and a delivered event are all pruned) and keeps a contiguous suffix of exactly the cap; it never prunes at or past an event whose staged-intent dedup id is still protected (it prunes only the events below it, and proceeds once the intent is cleared); a pass at or under the cap prunes nothing; a pass counts what it pruned by delivery state and by event type and adds them to the per-process counters cap_pruned_total and cap_pruned_undelivered_total; the cap still applies when the age cutoff cannot be represented. Below the cap an undelivered pending or dead-lettered event is still never pruned by the age stage. A poller whose cursor is behind the cap sees a sequence hole (its next event is above cursor + 1). Config load refuses max_retained_events below 100 or above 100000 and defaults it to 2000. In the web smoke test, GET /api/v1/events carries the unsigned hints oldest_sequence (null when nothing is retained) and last_sequence (which survives pruning, including when the age stage prunes every delivered event so that nothing is retained, oldest_sequence is null and last_sequence is still the highest assigned), and GET /api/v1/posture and GET /api/v1/metrics report max_retained_events, retained_events, oldest_sequence, last_sequence, cap_pruned_total and cap_pruned_undelivered_total (the two differ when a pruned event was delivered: the second counts events the push target had not acked, not events nobody read), cap_blocked_total (GC passes where a staged intent that was never cleared stopped the cap) and snapshot_loaded (true once this process has read the outbox file; the first report of a process that has not touched the outbox loads it instead of reporting an empty cache, and is false when that load fails, e.g. on an undecryptable file, so the other fields are then not to be trusted). The first page served by a fresh store over an existing file (a restart before the delivery loop has run) reloads the file, so it carries the retained events and the real last_sequence rather than an empty page with last_sequence 0. The page and the retention hints of GET /api/v1/events come from one read of the cache (list_events_page). The delivery loop's GC runs on wall-clock time and, driven at a 1 ms interval in a test, caps an outbox above max_retained_events to exactly the cap.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/outbox_store.rs",
+        "src/storage/file.rs",
+        "src/config/types.rs",
+        "src/web/api.rs",
+        "src/web/posture.rs",
+        "src/server/mod.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact storage::outbox_store::tests::cap_prunes_oldest_beyond_max_even_when_undelivered storage::outbox_store::tests::cap_stops_at_a_staged_intent storage::outbox_store::tests::cap_counts_pruned_by_state_and_type storage::outbox_store::tests::a_poller_behind_the_cap_sees_a_hole storage::outbox_store::tests::the_cap_applies_when_the_age_window_is_unrepresentable storage::outbox_store::tests::last_sequence_survives_the_age_stage_emptying_the_outbox storage::outbox_store::tests::cap_counters_tell_delivered_from_undelivered_prunes storage::outbox_store::tests::cap_blocked_by_a_staged_intent_is_counted storage::outbox_store::tests::a_process_that_never_touched_the_outbox_reports_the_real_retention storage::outbox_store::tests::the_first_page_after_a_restart_reloads_the_file storage::outbox_store::tests::a_snapshot_over_an_unreadable_outbox_file_reports_not_loaded server::durable_enqueue_tests::the_delivery_loop_gc_enforces_the_retention_cap storage::outbox_store::tests::gc_below_the_cap_never_prunes_an_undelivered_pending_event storage::outbox_store::tests::gc_below_the_cap_never_prunes_a_dead_lettered_event config::types::tests::max_retained_below_floor_refused && cargo test --locked --no-default-features --test web_smoke -- --exact events_envelope_reports_oldest_and_last_sequence",
+      "covers": [
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::gc_capped",
+          "sha256": "3d797742cf21eebcdabf11ea0cf3aa5f590197903bd7f892e53285974c564235"
+        },
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::retention_snapshot",
+          "sha256": "25f6041322c04dd6d0280225059d7082f5058536580b63d25b37126d66ace300"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_list_events",
+          "sha256": "df53d49bf52085d033bbfb0db122567023789254554fac8e9e60d36dc7510f9d"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "deliver_outbox_periodically",
+          "sha256": "5af6b5520a50099c8dd4b95fa6a40133316210aef55df76047079d1a69da8cd8"
+        },
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::list_after_with_retention",
+          "sha256": "bcbf290460e7df4b567ff9c40c154dd309bd0d295df23ffbac6f132fef02b2e1"
+        },
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::snapshot_of",
+          "sha256": "ff783111efa582008e1acc38fe4c561bd26251f4a7f200831e58d0b3aaea6e0e"
+        }
+      ],
+      "mutants": [
+        "outbox-cap-ignored",
+        "outbox-cap-prunes-protected",
+        "outbox-cap-off-by-one",
+        "outbox-cap-not-counted",
+        "outbox-envelope-oldest-wrong",
+        "outbox-gc-loop-cap-unwired",
+        "outbox-last-sequence-highest-retained",
+        "outbox-cap-pruned-total-undelivered",
+        "outbox-cap-blocked-not-counted",
+        "outbox-snapshot-unloaded-cache",
+        "outbox-page-skips-reload",
+        "outbox-snapshot-loaded-hardcoded"
+      ],
+      "does_not_establish": "Example tests over small outboxes, not a property over every event mix. Per-operation cost is still O(retained) because every outbox operation rewrites the whole file; the cap bounds it, it does not make it constant, and no timing is measured here. A consumer that is down longer than the cap window loses the events it had not read: the cap drops events whether or not they were delivered (an undelivered approval event pruned this way is lost, counted but not recovered), and nothing here shows that a consumer detects or acts on the hole (that is the consumer's claim). Vultrino cannot tell whether a poller read an event: Delivered means the push target (govder) acked it, not that leria read it, and in poll-only mode nothing is ever Delivered, so cap_pruned_undelivered_total is a delivery count, not an unread-loss count. The counters are per process and reset on restart, and oldest_sequence and last_sequence are unsigned hints read from this process's cache (the signed sequence hole is the authoritative signal). The hints are taken in the same read as the page, but no test races an append against the read. The GC runs when 60 delivery intervals of wall-clock time have passed since the last GC, checked after each delivery pass, so a delivery pass stretched by a hung push target (up to 64 POSTs of 15 s) delays it by that long and the retained count can exceed the cap by what is appended meanwhile. The GC loop is driven by one test at a 1 ms interval with delivery disabled, not with a hung target. The posture and metrics reports are checked in one process with one outbox, not under concurrent writers or a second process. Says nothing about a vultrino outbox reset (both files gone)."
     },
     {
       "id": "stream-usage-charged-without-trailer",
@@ -4169,7 +4282,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
+          "sha256": "58581bf0692279478156d9e3128179db3e161ffaa5c280fd96f4bde963df455b"
         },
         {
           "path": "src/web/llm_proxy.rs",
@@ -4772,7 +4885,7 @@
         "averin-enabled-config-accepts-unusable-base-url",
         "averin-enabled-server-start-ignores-client-error"
       ],
-      "does_not_establish": "Gaps are held in memory and appended to the outbox every two seconds: a process that is killed before an append loses the gaps it had not yet written, and the counters with them. flush_receipt_gaps_once puts a gap back for retry when an outbox append fails, but no test makes an append fail, so that branch is not exercised here (the requeue order is). A gap says an action ran without a receipt; it does not say the action's own side effect succeeded, and it is not a proof that no other receipt is missing: a seal that Averin accepted but recorded wrongly, a seal that never started because Averin is disabled, undeclared actions, and receipts lost to a crash between the action and the seal enqueue are outside it. The on_execute (synchronous) Observe arms record gaps by the same call but are not exercised by a test here; only the production async and durable paths are. The outbox event reaches a consumer only if one polls or is pushed to; nothing here shows that anything alerts on it. The vacuity of the name filter: the detector selects tests whose name contains fei33_, so a renamed test drops out of it. The refusal covers a client that cannot be built: a block that builds but names an unreachable averin, or an AVERIN_API_KEY averin rejects, still starts, and every Observe action is then recorded as a receipt gap rather than refused. The gap is an outbox event, and the outbox prunes every event older than [outbox] retention_secs (2 days by default) whether or not it was delivered, so this claim does not keep a gap past that window: keeping it is the consumer's job (govder stores each gap before acknowledging the push, govder claim receipt-gap-durable-record), and a consumer that is down or unconfigured for longer than the window loses the gaps in it. The plain-http check resolves a host name when the config loads; a name that resolves to a public address only later is caught by the connect-time guard, not by the load refusal. The binary's three server constructions use try_new; the library's VultrinoServer::new panics instead of returning the error.",
+      "does_not_establish": "Gaps are held in memory and appended to the outbox every two seconds: a process that is killed before an append loses the gaps it had not yet written, and the counters with them. flush_receipt_gaps_once puts a gap back for retry when an outbox append fails, but no test makes an append fail, so that branch is not exercised here (the requeue order is). A gap says an action ran without a receipt; it does not say the action's own side effect succeeded, and it is not a proof that no other receipt is missing: a seal that Averin accepted but recorded wrongly, a seal that never started because Averin is disabled, undeclared actions, and receipts lost to a crash between the action and the seal enqueue are outside it. The on_execute (synchronous) Observe arms record gaps by the same call but are not exercised by a test here; only the production async and durable paths are. The outbox event reaches a consumer only if one polls or is pushed to; nothing here shows that anything alerts on it. The vacuity of the name filter: the detector selects tests whose name contains fei33_, so a renamed test drops out of it. The refusal covers a client that cannot be built: a block that builds but names an unreachable averin, or an AVERIN_API_KEY averin rejects, still starts, and every Observe action is then recorded as a receipt gap rather than refused. The gap is an outbox event, and the outbox prunes a delivered event older than [outbox] retention_secs (2 days by default) and the oldest events beyond [outbox] max_retained_events whether or not they were delivered, so a gap survives only the shorter of the two windows (about an hour at the default cap on a busy host) and an undelivered gap beyond the cap is dropped; this claim does not keep a gap past that window: keeping it is the consumer's job (govder stores each gap before acknowledging the push, govder claim receipt-gap-durable-record), and a consumer that is down or unconfigured for longer than the shorter window loses the gaps in it. The plain-http check resolves a host name when the config loads; a name that resolves to a public address only later is caught by the connect-time guard, not by the load refusal. The binary's three server constructions use try_new; the library's VultrinoServer::new panics instead of returning the error.",
       "evidence_run": "38694664010"
     },
     {
@@ -4866,7 +4979,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
+          "sha256": "58581bf0692279478156d9e3128179db3e161ffaa5c280fd96f4bde963df455b"
         },
         {
           "path": "src/web/workload_exchange.rs",
