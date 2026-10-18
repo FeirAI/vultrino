@@ -1,0 +1,24 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 9aead1e..a1fe4bf 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -4509,14 +4509,11 @@ impl VultrinoServer {
+                     &approval.action,
+                 )
+                 .resolved(&approval.credential, &approval.action);
+-                return Err(self.refuse(
+-                    &rctx,
+-                    RefusalClass::NotGranted,
+-                    VultrinoError::PolicyDenied(
+-                        "This approval was requested by a different principal; you are not \
+-                         authorized to access it"
+-                            .to_string(),
+-                    ),
++                let _ = &rctx;
++                return Err(VultrinoError::PolicyDenied(
++                    "This approval was requested by a different principal; you are not \
++                     authorized to access it"
++                        .to_string(),
+                 ));
+             }
+         }

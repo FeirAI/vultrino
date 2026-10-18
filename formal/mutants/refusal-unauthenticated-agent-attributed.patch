@@ -1,0 +1,13 @@
+diff --git a/src/refusal.rs b/src/refusal.rs
+index 27406d2..9c5a199 100644
+--- a/src/refusal.rs
++++ b/src/refusal.rs
+@@ -178,7 +178,7 @@ impl RefusalCtx {
+     pub fn new(entry: RefusalEntry, principal: Option<(&str, Option<&str>)>, action: &str) -> Self {
+         Self {
+             entry,
+-            agent: principal.map(|(id, label)| agent_name(id, label)),
++            agent: Some(principal.map_or_else(|| "vultrino:local".to_string(), |(id, label)| agent_name(id, label))),
+             credential: None,
+             action: action.to_string(),
+         }

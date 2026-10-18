@@ -1,0 +1,15 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 9aead1e..f82f29d 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -2416,6 +2416,10 @@ impl VultrinoServer {
+     pub fn note_gateway_refusal(&self, ctx: &RefusalCtx, class: RefusalClass) {
+         if let Some(av) = self.averin.as_ref() {
+             av.note_refusal(ctx, class);
++            // Mutant: seal on the request path, so averin's latency becomes the refusal's.
++            tokio::task::block_in_place(|| {
++                tokio::runtime::Handle::current().block_on(av.drain_refusals_once())
++            });
+         }
+     }
+ 

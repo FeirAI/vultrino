@@ -1,0 +1,19 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index ee7da7a..dff5fef 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -160,14 +160,6 @@ async fn resolve_exec_auth(
+             // feir-ops#1: a valid token that is revoked, expired or used up is a refusal of the
+             // agent it belongs to (the stored row), sealed as `token_unusable`. A secret that does
+             // not resolve to a stored token is unauthenticated and noted nowhere.
+-            state.server.note_gateway_refusal(
+-                &crate::refusal::RefusalCtx::new(
+-                    crate::refusal::RefusalEntry::Execute,
+-                    Some((token.id.as_str(), token.agent_label.as_deref())),
+-                    presented_action,
+-                ),
+-                crate::refusal::RefusalClass::TokenUnusable,
+-            );
+             return Err(error_response(
+                 StatusCode::FORBIDDEN,
+                 "token_unusable",

@@ -1,0 +1,17 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 9aead1e..4704fea 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -1738,10 +1738,8 @@ impl VultrinoServer {
+             context = context.with_auth(auth_result);
+ 
+             if !auth_result.has_permission(Permission::Execute) {
+-                return Err(self.refuse(
+-                    &rctx,
+-                    RefusalClass::NotGranted,
+-                    VultrinoError::PolicyDenied("Missing 'execute' permission".to_string()),
++                return Err(VultrinoError::PolicyDenied(
++                    "Missing 'execute' permission".to_string(),
+                 ));
+             }
+             if !auth_result.can_access_credential(&request.credential) {

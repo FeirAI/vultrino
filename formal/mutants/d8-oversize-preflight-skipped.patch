@@ -1,13 +1,13 @@
 diff --git a/src/server/mod.rs b/src/server/mod.rs
-index 0e1cfe6..6125ff1 100644
+index 9aead1e..50af8c1 100644
 --- a/src/server/mod.rs
 +++ b/src/server/mod.rs
-@@ -2145,7 +2145,7 @@ impl VultrinoServer {
+@@ -2587,7 +2587,7 @@ impl VultrinoServer {
              if let Some(av) = self.averin.as_ref() {
                  if av.config().d8_complete_evidence
                      && evidence_subject_id.is_some()
 -                    && params_len > av.config().max_seal_params_bytes
 +                    && params_len > usize::MAX
                  {
-                     return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
-                         "D8 before-act evidence failed: parameters exceed the configured {} byte \
+                     return Err(RunError::refused(
+                         RefusalClass::DecisionUnavailable,

@@ -1,13 +1,13 @@
 diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
-index 751d1c0..2f8745c 100644
+index 38b540d..311b081 100644
 --- a/src/web/llm_proxy.rs
 +++ b/src/web/llm_proxy.rs
-@@ -863,7 +863,7 @@ async fn llm_proxy_impl(
+@@ -1535,7 +1535,7 @@ async fn llm_proxy_impl(
              ),
              UrlModel::Names { .. }
          );
 -    if !url_picks_model && !capability.llm_model_allowed(requested_model) {
 +    if !capability.llm_model_allowed(requested_model) {
-         return llm_error(
-             StatusCode::FORBIDDEN,
-             "permission_error",
+         note_llm_refusal(
+             &state,
+             &exec_auth,

@@ -1,0 +1,16 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 9aead1e..b3af5f1 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -2422,9 +2422,8 @@ impl VultrinoServer {
+     /// The [`RunError`] form of [`Self::refuse`]: notes the refusal the error is tagged with, once,
+     /// and clears the tag so an outer boundary does not note it again.
+     fn note_run_refusal(&self, ctx: &RefusalCtx, mut error: RunError) -> RunError {
+-        if let Some(class) = error.class.take() {
+-            self.note_gateway_refusal(ctx, class);
+-        }
++        let _ = ctx;
++        error.class.take();
+         error
+     }
+ 

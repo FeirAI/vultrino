@@ -1,0 +1,18 @@
+diff --git a/src/refusal.rs b/src/refusal.rs
+index 27406d2..9810669 100644
+--- a/src/refusal.rs
++++ b/src/refusal.rs
+@@ -356,12 +356,7 @@ impl Bucket {
+ 
+     fn try_take(&mut self, now: Instant) -> bool {
+         self.refill(now);
+-        if self.tokens >= 1.0 {
+-            self.tokens -= 1.0;
+-            true
+-        } else {
+-            false
+-        }
++        true
+     }
+ }
+ 

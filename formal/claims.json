@@ -1074,6 +1074,66 @@
     "outbox-snapshot-loaded-hardcoded": {
       "tier": "full",
       "claim": "outbox-retention-bounded"
+    },
+    "refusal-skips-use-token-action-scope-site": {
+      "tier": "fast"
+    },
+    "refusal-mcp-unknown-tool-not-noted": {
+      "tier": "full"
+    },
+    "refusal-llm-unpriced-not-noted": {
+      "tier": "full"
+    },
+    "refusal-approval-poll-not-noted": {
+      "tier": "full"
+    },
+    "refusal-dispatch-boundary-not-noted": {
+      "tier": "full"
+    },
+    "refusal-token-unusable-edge-not-noted": {
+      "tier": "full"
+    },
+    "refusal-note-awaits-the-seal": {
+      "tier": "fast"
+    },
+    "refusal-window-not-coalesced": {
+      "tier": "fast"
+    },
+    "refusal-bucket-not-enforced": {
+      "tier": "full"
+    },
+    "refusal-summary-loses-counts": {
+      "tier": "full"
+    },
+    "refusal-gap-dropped": {
+      "tier": "fast"
+    },
+    "refusal-gap-outcome-hardcoded": {
+      "tier": "full"
+    },
+    "refusal-name-secret-shape-admitted": {
+      "tier": "fast"
+    },
+    "refusal-noted-in-the-observe-branch": {
+      "tier": "fast"
+    },
+    "refusal-unauthenticated-agent-attributed": {
+      "tier": "full"
+    },
+    "refusal-permission-site-bypasses-the-seam": {
+      "tier": "fast"
+    },
+    "refusal-rate-limit-reported-as-policy-deny": {
+      "tier": "fast"
+    },
+    "refusal-halt-reported-as-rule": {
+      "tier": "full"
+    },
+    "refusal-spend-cap-reported-as-policy-deny": {
+      "tier": "full"
+    },
+    "refusal-class-spelling-drift": {
+      "tier": "fast"
     }
   },
   "claims": [
@@ -1226,12 +1286,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
+          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "5413c2aec031e35771fd684576b53126f3f35bb9faa12d16014b1177cefe12b6"
+          "sha256": "a103743f902d48b5547539b2e7d3d9e9b6987f2a4abdcb0a87e1c0d96ae56806"
         },
         {
           "path": "src/server/mod.rs",
@@ -1241,12 +1301,12 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_for_admission",
-          "sha256": "84e02be4a345e9933ba72a17d28ba5356f79ad1ab20556475a8152424279c852"
+          "sha256": "332e08210b0cb2ee35f1a76560fb5b552c4fd78039e9f9d09443f00eadcdeb64"
         },
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_readonly_for_admission",
-          "sha256": "42dc02260fceb9dd1bb90cb4f8817819916516200c1d22b2d657b7b514071437"
+          "sha256": "b2c67c8f24babefe4a6b940a4dc58f47f87bbd1242e88fdea08ae67fec4f0fbe"
         },
         {
           "path": "src/policy/mod.rs",
@@ -2247,7 +2307,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "172a6dce9f9239fb35a561b98c9607646cb13aff8ba4e91c592ccd0fd79479e9"
+          "sha256": "0cd57935ba39f51824083812bdb2fa8f39faf0b20f5467d5670b1221878476db"
         },
         {
           "path": "src/policy/precedence.rs",
@@ -2394,7 +2454,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "172a6dce9f9239fb35a561b98c9607646cb13aff8ba4e91c592ccd0fd79479e9"
+          "sha256": "0cd57935ba39f51824083812bdb2fa8f39faf0b20f5467d5670b1221878476db"
         },
         {
           "path": "src/plugins/http.rs",
@@ -2700,7 +2760,7 @@
         {
           "path": "src/main.rs",
           "symbol": "run_web_server",
-          "sha256": "36ffcf25d3c521e2f74c7d7a99dfb00c86bbd226a1d0994271c101c0c42746b7"
+          "sha256": "b1fe3165c92e1ef73d077c96bc062669e77e1f538e14e561ca6c8a4b17d9cf1f"
         },
         {
           "path": "src/main.rs",
@@ -2710,7 +2770,7 @@
         {
           "path": "src/main.rs",
           "symbol": "run_mcp_server",
-          "sha256": "1f5bfaabc470beae24351f4f7c68ee7e9265b981edae53bd7e1130bdaaa44d5f"
+          "sha256": "8b526533fe60b87303da778adf39f2d1e85600d0229506b80921526d18bf6eca"
         }
       ],
       "mutants": [
@@ -2841,32 +2901,32 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::kill_fence_before_dispatch",
-          "sha256": "11675da4166f8995fc9c650e79db70adc3262b8b8482f4d6c88e35222e14d4bd"
+          "sha256": "011c8224e511745340dca72626d0e86fcafc95a9bcb2dbeef87e46280eb8e41b"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::kill_fence_refuses_open",
-          "sha256": "352037fd74f5a2ca24a76c021615ca7a297ef04cc70b6109e341d178eb6b895c"
+          "sha256": "f7dfb5c0dad969553a875bc72c55398d1c84937f354b864a2c337d112dba85d1"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "5413c2aec031e35771fd684576b53126f3f35bb9faa12d16014b1177cefe12b6"
+          "sha256": "a103743f902d48b5547539b2e7d3d9e9b6987f2a4abdcb0a87e1c0d96ae56806"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
+          "sha256": "c34f06634831b9547052b1cb3fdc247e6ce5759723fe610378558f3633345e25"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+          "sha256": "a9668db4c2c95f1868edc0cbc53de95877e5699901bfb09977cdff7b43f3eb89"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
+          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
         },
         {
           "path": "src/server/mod.rs",
@@ -3512,7 +3572,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "58581bf0692279478156d9e3128179db3e161ffaa5c280fd96f4bde963df455b"
+          "sha256": "0152ccd188ed83bc634061e3e810ff037b3bfc5666f3687580082dad071e7b32"
         },
         {
           "path": "src/web/api.rs",
@@ -3560,7 +3620,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::allow_tier_matches",
-          "sha256": "d36fc9b31dc98c4bc53575a48a7d75cd0b368ccc64f09622b9be151a4296c1bc"
+          "sha256": "70e645bb6d84a3be452cef28c8d6babcdf68f02c1757d5b9326ac2e0fed1a53a"
         },
         {
           "path": "src/policy/mod.rs",
@@ -3575,7 +3635,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "172a6dce9f9239fb35a561b98c9607646cb13aff8ba4e91c592ccd0fd79479e9"
+          "sha256": "0cd57935ba39f51824083812bdb2fa8f39faf0b20f5467d5670b1221878476db"
         }
       ],
       "mutants": [
@@ -3633,7 +3693,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "58581bf0692279478156d9e3128179db3e161ffaa5c280fd96f4bde963df455b"
+          "sha256": "0152ccd188ed83bc634061e3e810ff037b3bfc5666f3687580082dad071e7b32"
         },
         {
           "path": "src/web/api.rs",
@@ -3772,7 +3832,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
+          "sha256": "c34f06634831b9547052b1cb3fdc247e6ce5759723fe610378558f3633345e25"
         }
       ],
       "mutants": [
@@ -3846,7 +3906,7 @@
         {
           "path": "src/averin/mod.rs",
           "symbol": "AverinClient::new",
-          "sha256": "246df8cebbfaa08092c994829b69a41254befcfefe9c438e771457cbd2279a5d"
+          "sha256": "5042c6559b28eaec60e41df7d5115a61cfda7abcde5adb8016d19b553830b4a2"
         },
         {
           "path": "src/plain_http.rs",
@@ -4151,7 +4211,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "172a6dce9f9239fb35a561b98c9607646cb13aff8ba4e91c592ccd0fd79479e9"
+          "sha256": "0cd57935ba39f51824083812bdb2fa8f39faf0b20f5467d5670b1221878476db"
         },
         {
           "path": "src/policy/url_canon.rs",
@@ -4219,7 +4279,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+          "sha256": "a9668db4c2c95f1868edc0cbc53de95877e5699901bfb09977cdff7b43f3eb89"
         }
       ],
       "mutants": [
@@ -4252,7 +4312,7 @@
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "llm_proxy_impl",
-          "sha256": "0f298edb53dd55826b69c2313907fea3dd807d370b3939cc61e800fd2e9bd97d"
+          "sha256": "d22159335dbe203287c0430e965cbb464185996f7e7aebf8d1cf4939d1542fbe"
         },
         {
           "path": "src/ratecard.rs",
@@ -4282,7 +4342,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "58581bf0692279478156d9e3128179db3e161ffaa5c280fd96f4bde963df455b"
+          "sha256": "0152ccd188ed83bc634061e3e810ff037b3bfc5666f3687580082dad071e7b32"
         },
         {
           "path": "src/web/llm_proxy.rs",
@@ -4732,22 +4792,22 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+          "sha256": "a9668db4c2c95f1868edc0cbc53de95877e5699901bfb09977cdff7b43f3eb89"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
+          "sha256": "c34f06634831b9547052b1cb3fdc247e6ce5759723fe610378558f3633345e25"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::begin_exact_or_degrade",
-          "sha256": "41cc02dd86729a86241c42395ea7ea5205fb909ba73898e3895e0dccbc81f6a4"
+          "sha256": "19fdb61d6cfd4ba8c5002c5a419672757d6a1ebfa172affad3b5defbc324ccfb"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::validate_required_evidence_preflight",
-          "sha256": "f60f62658cfef73e98715d9b802265a40245ff44fe15140a5effac9af5ce1155"
+          "sha256": "1b32a4a5a962c73c0e7794049d22876688f2340b1579801fe702b6e4bf7e0bbf"
         },
         {
           "path": "src/averin/mod.rs",
@@ -4757,7 +4817,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "5413c2aec031e35771fd684576b53126f3f35bb9faa12d16014b1177cefe12b6"
+          "sha256": "a103743f902d48b5547539b2e7d3d9e9b6987f2a4abdcb0a87e1c0d96ae56806"
         },
         {
           "path": "src/server/mod.rs",
@@ -4782,12 +4842,12 @@
         {
           "path": "src/config/types.rs",
           "symbol": "TryFrom<RawAverinConfig> for crate::averin::AverinConfig::try_from",
-          "sha256": "1c5f660536711549e99b29901628016d8ac932216fcf2ca8db307978208af2ed"
+          "sha256": "d9a6704b94b0d869267d3bc96973bf204520a6ac059b5d83fbb9ad2ad23dae1a"
         },
         {
           "path": "src/averin/mod.rs",
           "symbol": "Default for AverinConfig::default",
-          "sha256": "85e032ae98d8589521480d6b23016311b77669af0c3bfb15e74e499ea8308627"
+          "sha256": "ce2421b305b51ace792080d48edf36c99457431f43aed3887ff41974f28abbbe"
         }
       ],
       "mutants": [
@@ -4824,7 +4884,7 @@
         {
           "path": "src/averin/mod.rs",
           "symbol": "AverinClient::record_receipt_gap",
-          "sha256": "a341536f9b3066e713406ad4d8c362a27900c06c23b323f04b21b73c07f5fcd9"
+          "sha256": "e4066a947db390fbc39d93942e49350be94fa2cf384773ca75c73007887431bd"
         },
         {
           "path": "src/averin/mod.rs",
@@ -4854,7 +4914,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "flush_receipt_gaps_once",
-          "sha256": "04503f3ed512865ee2499f19118f50f544c1018f2ef31975e3c6d7c429fe1e5d"
+          "sha256": "afedc8069f74ffd6bf9d8346574f6404774dedd266f9e1547f6246e61b4ad599"
         },
         {
           "path": "src/server/mod.rs",
@@ -4864,7 +4924,7 @@
         {
           "path": "src/config/types.rs",
           "symbol": "AverinConfig::try_from",
-          "sha256": "1c5f660536711549e99b29901628016d8ac932216fcf2ca8db307978208af2ed"
+          "sha256": "d9a6704b94b0d869267d3bc96973bf204520a6ac059b5d83fbb9ad2ad23dae1a"
         },
         {
           "path": "src/server/mod.rs",
@@ -4979,7 +5039,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "58581bf0692279478156d9e3128179db3e161ffaa5c280fd96f4bde963df455b"
+          "sha256": "0152ccd188ed83bc634061e3e810ff037b3bfc5666f3687580082dad071e7b32"
         },
         {
           "path": "src/web/workload_exchange.rs",
@@ -5022,37 +5082,37 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::refuse_llm_credential_off_channel",
-          "sha256": "cb2fe7b6d038f2cde1d9438829802a1bee62a49f54511f9d04b6a6209bae7b0b"
+          "sha256": "ab3c11ebd94ab739d76ebb052bae37a8fc6ae3fef76bc64c71f5a2fe380c353d"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::execute_gated_llm_channel",
-          "sha256": "3fef435047e1b44894dec6896ff23cba502ed772f8da93e23ec20e484c8db260"
+          "sha256": "9414b16dfcca4b68be8ad9a61c9de3525631f773c16773fd246e71412e566060"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::execute_gated_streaming_llm_channel",
-          "sha256": "83c0c5fd1b14d59580bbe15b362c6eac60f1eb38fb34f668ff754fb5216e16f1"
+          "sha256": "0956f11e0791d152c313e92a6f0ec44f0918aa2b895934a8d338ba20086696b2"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
+          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "5413c2aec031e35771fd684576b53126f3f35bb9faa12d16014b1177cefe12b6"
+          "sha256": "a103743f902d48b5547539b2e7d3d9e9b6987f2a4abdcb0a87e1c0d96ae56806"
         },
         {
           "path": "src/web/api.rs",
           "symbol": "api_execute",
-          "sha256": "36dc28413c1c1ea90f1f6d45a43532d7216c5c1ef418e838da83e47906a48d1e"
+          "sha256": "830497c6e51e6c3a0e4e598a7c564c89c940a814f427df0e676994c411e8fabc"
         },
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "llm_proxy_impl",
-          "sha256": "0f298edb53dd55826b69c2313907fea3dd807d370b3939cc61e800fd2e9bd97d"
+          "sha256": "d22159335dbe203287c0430e965cbb464185996f7e7aebf8d1cf4939d1542fbe"
         }
       ],
       "mutants": [
@@ -5065,6 +5125,397 @@
         "llm-resume-refusal-removed"
       ],
       "does_not_establish": "That the unreadable-catalog refusal is exercised (no test injects a storage failure; the branch is a plain early return). That a provider key stored a second time as a credential that no LLM-proxy capability references is refused: it is an ordinary credential governed only by its policies. That the MCP named-tool path is driven by its own test for this refusal: named tools reach the same prepare_execution check, but only execute and http_request are driven here. Resume is driven only for an approval opened before the credential backed an LLM channel; a /llm-opened approval is refused by the same unconditional check but is not separately driven. A capability whose credential_ref names no existing credential is matched by spelling only. The resolver is read once per LLM capability per generic dispatch; a credential created or renamed after the catalog read is judged by the state at that read. One extra catalog read per generic dispatch is the cost. Model, price and token limits on /llm itself are covered by their own tests, not this claim."
+    },
+    {
+      "id": "refusal-sealed-every-entry-point",
+      "statement": "While [averin] is enabled, a refusal of an authenticated agent is noted exactly once and sealed as one gateway-refusal record (closed reason class, entry point, sanitized agent and action, the resolved credential alias when it is resolved) on each of the four entry points: POST /api/v1/execute (not_granted for the principal's credential scope and for its action scope, policy_deny, kill_fence, rate_limit, cross_tenant, token_unusable, llm_channel_only, capability_undeclared, approval_unavailable, and decision_unavailable at the buffered and the streaming dispatch tail), MCP tools/call (a tool not available to a use token, an unknown tool, a policy deny through the shared gate), POST /llm (no channel granted, a model not permitted, an unpriced model, an unusable token) and the approval poll by a principal that does not own the approval (approval_resume). The upstream plugin runs for none of them. The dispatch-time refusals are noted by the boundary that holds the payload's principal and are cleared once noted, so an outer boundary never notes one twice.",
+      "method": "test",
+      "artifacts": [
+        "src/refusal.rs",
+        "src/server/mod.rs",
+        "src/mcp/server.rs",
+        "src/web/api.rs",
+        "src/web/llm_proxy.rs",
+        "tests/refusals_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test refusals_integration refusal_table_",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::refuse",
+          "sha256": "0052bde81b8c8b0c1d6862eb6fb893c3039eb8f9818520a39dff6c2c3ce6f427"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::note_gateway_refusal",
+          "sha256": "d995eee0498fe75fbef5ec949825655cdced9443dfccee3c59716155ee77f208"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::note_run_refusal",
+          "sha256": "061d16f3e4d0d0140b971fb47d430f556265fc31fabda01726b74842fa00ac76"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::prepare_execution",
+          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::resume_approved",
+          "sha256": "a103743f902d48b5547539b2e7d3d9e9b6987f2a4abdcb0a87e1c0d96ae56806"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::resume_refusal_ctx",
+          "sha256": "d2edfd6568787df8ad07392cc2a3c199f709ce99ede031ac3c2f8917a5eb9aae"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::execute_gated_inner",
+          "sha256": "416cbbb65ffe2a66b674d17eb8ceea014fec162b4e621d458a6a143f41e5d1b2"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::execute_gated_streaming_inner",
+          "sha256": "109a3bfbaf6afcec7a0a9aa431b8516ce93bccb34e251c47742875e77e09eb0f"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::check_and_resume_approval",
+          "sha256": "65b82b30fcce77834151e93ebb3c40ca5503e6359dd27e9372be598d318d0a73"
+        },
+        {
+          "path": "src/mcp/server.rs",
+          "symbol": "McpServer::note_refusal_for_args",
+          "sha256": "85598be6a9684f43be139ecf3a81e018e5d74f2b277fcb1fef14b543a89ee747"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "resolve_exec_auth",
+          "sha256": "0a5d85ac3b0a8d4dcaea8c3ac0aa754b493ccf717adbd12c4927d17a2d1847e7"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "note_llm_refusal",
+          "sha256": "8f9536ee6c00d952f3b0958dce6f344da8e4e6240ebe5a3048d2037440bda96e"
+        }
+      ],
+      "mutants": [
+        "refusal-skips-use-token-action-scope-site",
+        "refusal-mcp-unknown-tool-not-noted",
+        "refusal-llm-unpriced-not-noted",
+        "refusal-approval-poll-not-noted",
+        "refusal-dispatch-boundary-not-noted",
+        "refusal-token-unusable-edge-not-noted"
+      ],
+      "does_not_establish": "That every refusal site is driven by a test: the table drives the classes and entry points listed in the statement against a stub averin, and not the dispatch-time kill fence, the evidence refusals of the approval-resume path, the MCP read tools' permission refusals, a provider-disabled /llm refusal, a spend cap through the gateway, or a refusal on the marketing plugin's internal calls. That a refusal is sealed: the table drains the stub, it does not show a real averin accepts the body (averin's own tests and the vendored vocabulary pin that), and no four-plane run covers it here. That unauthenticated attempts are recorded (they are not). That a record survives a crash between the refusal and the next drain. That a refusal is the right class for a case the 14 classes do not name: evidence the gateway could not obtain is sealed as decision_unavailable."
+    },
+    {
+      "id": "refusal-never-blocks",
+      "statement": "Noting a gateway refusal is synchronous and does no network I/O: the status and body a caller gets for a refusal are byte-identical with [averin] off, with a healthy averin, with an unreachable averin and with an averin that never answers (and in RequireEvidence mode with the hung one), no refusal waits for averin, and the hung averin is never contacted from a request. The records are posted only by the background drain.",
+      "method": "test",
+      "artifacts": [
+        "src/refusal.rs",
+        "src/averin/mod.rs",
+        "src/server/mod.rs",
+        "tests/refusals_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test refusals_integration refusal_never_blocks_",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::note_gateway_refusal",
+          "sha256": "d995eee0498fe75fbef5ec949825655cdced9443dfccee3c59716155ee77f208"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalRecorder::note_at",
+          "sha256": "8f742eb0574c54aff71e1752bbbf3632a2f1d5641f6d0cfcfa766ff516091db7"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::note_refusal",
+          "sha256": "9bc6ad3eed1dfd6bb0ef9428c2cff8c3540c8551e94d71c4aa414694791d07e4"
+        }
+      ],
+      "mutants": [
+        "refusal-note-awaits-the-seal"
+      ],
+      "does_not_establish": "A latency bound: the tests allow a refusal 1.5 seconds against a stub that would hold it for two, so a seal on the request path that answered quickly would not be caught. That noting costs nothing under contention: it takes one mutex, and a very large number of concurrent refusals is not measured. That the drain itself is never slow (it runs in its own task on its own permit pool, and a tarpitted averin holds those permits until the client timeout). That memory stays bounded (see the budget claim)."
+    },
+    {
+      "id": "refusal-coalesced-and-budgeted",
+      "statement": "A storm of gateway refusals cannot grow the record count without bound and the attempt counts stay exact: 1000 identical refusals (same agent, action, reason class and entry point) inside one window are two records, the first sealed at the next drain with 1 attempt and one tail record when the window closes with the other 999, sealed once and not again; 50 distinct-action refusals under a burst of 3 produce 3 records and the other 47 are counted into the summary; refusals beyond the bucket merge into one summary record that takes the next token, carries exact per-class counts, and has agent vultrino:multiple when more than one agent is in it; at most 1024 windows are open at once and 512 records wait; a window tail and a first refusal each take one bucket token, and a waiting summary has first claim on the next token.",
+      "method": "test",
+      "artifacts": [
+        "src/refusal.rs",
+        "src/averin/mod.rs",
+        "tests/refusals_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- refusal::tests:: && cargo test --locked --no-default-features --test refusals_integration refusal_coalesced_ refusal_budget_",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalRecorder::note_at",
+          "sha256": "8f742eb0574c54aff71e1752bbbf3632a2f1d5641f6d0cfcfa766ff516091db7"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalRecorder::admit",
+          "sha256": "471154a6921528fc74284356dba53480e8e0e1de6078991e43bf63a7c38c4a63"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalRecorder::take_due_at",
+          "sha256": "44374af3b4e6c5112c1b7bd031db2c2e39c2b0f4d95d199959c1e7e56c4c8b49"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "Bucket::try_take",
+          "sha256": "b1e0de9c4f6b4eeef176867ae7ebe9d583d9782cbff14c5a9ee92274f0bbbd51"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "Summary::merge",
+          "sha256": "28f57710e3d9c4e0a1c52f30cfcd8640d2179bf5ac5f86ac571905ecec8383fc"
+        }
+      ],
+      "mutants": [
+        "refusal-window-not-coalesced",
+        "refusal-bucket-not-enforced",
+        "refusal-summary-loses-counts"
+      ],
+      "does_not_establish": "The summary record being sealed by a running process: the unit tests drive the recorder with an injected clock, and the integration tests stop at the empty bucket (they do not wait an hour for a token). That the bound holds across a restart: the buckets and windows are in memory and a restart resets them. The worst-case record count per month (about 15000 at the defaults) is arithmetic on the defaults, not a measured size, and averin's per-month size cap is averin's to enforce. That counts are exact after a crash. Coalescing hides per-attempt timing and the individual params by design."
+    },
+    {
+      "id": "refusal-gap-recorded",
+      "statement": "When averin cannot seal a refusal record the refusal still stands and the loss is recorded: with averin unreachable, the refusal is returned unchanged and the record is retried on the next two drain ticks and then becomes one evidence.receipt_gap outbox event with kind refusal, outcome refused_not_sealed, reason refusal_seal_failed and the refused agent as the subject, never action_ran_without_receipt; an overloaded averin (503) is retried with the same idempotency key on each tick, three ticks in all, then one gap, then no further attempt; an averin that rejects the body (4xx) is one attempt and one gap; the unsealed counter counts it; the upstream plugin never ran.",
+      "method": "test",
+      "artifacts": [
+        "src/refusal.rs",
+        "src/averin/mod.rs",
+        "src/server/mod.rs",
+        "tests/refusals_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test refusals_integration refusal_gap_",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::drain_refusals_once",
+          "sha256": "cb64d8375e4bc58322272e0a91ea95220ef26b41ecfee7de60f9d9df5c58fa80"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::refusal_unsealed",
+          "sha256": "0b5105047409dacc3b7463c6d96378f094f4f1b43a724de58e97b528ea333c01"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "GapKind::outcome",
+          "sha256": "93fed1aa9aebf8d7d8bb34b21d3d5883bf8944b6ed114048bc3911e07c1f9a5c"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "flush_receipt_gaps_once",
+          "sha256": "afedc8069f74ffd6bf9d8346574f6404774dedd266f9e1547f6246e61b4ad599"
+        }
+      ],
+      "mutants": [
+        "refusal-gap-dropped",
+        "refusal-gap-outcome-hardcoded"
+      ],
+      "does_not_establish": "That the gap reaches a consumer: it is an outbox event with the outbox's retention limits (a consumer must store it, govder does for receipt gaps and its handling of the new kind is govder's to test), and nothing alerts on it. The retry and gap logic against a real averin. A crash loses the pending records with no gap. The refusal_budget_overflow gap (a record dropped past the 512 pending bound) is produced by the same function but not driven by an integration test (the unit test covers the bound)."
+    },
+    {
+      "id": "refusal-no-secret-or-payload",
+      "statement": "A gateway refusal record carries only closed fields: the agent, a sanitized action, the resolved credential alias when there is one, the reason class, the entry point, the attempt count and the two times. Canary strings placed in the request URL, in the request body, in the bearer (the use token secret and an API key) and in vultrino's free-text refusal reasons do not appear in any sealed body, a name outside [A-Za-z0-9._:-]{1,128} or containing vk_ or vut_ is sealed as invalid_name, and no key outside the closed set is posted.",
+      "method": "test",
+      "artifacts": [
+        "src/refusal.rs",
+        "src/averin/mod.rs",
+        "tests/refusals_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- refusal::tests::names_outside_the_plain_set_become_invalid_name && cargo test --locked --no-default-features --test refusals_integration refusal_no_secret_",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/refusal.rs",
+          "symbol": "sanitize_name",
+          "sha256": "c4922fb4e03894e971435b69a8dfd76d9704277a561427e7a83b9cc5eb958c6f"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalCtx::sanitized",
+          "sha256": "7aca04a98d635285d320de2b9bb1810a81e5599d97ad005bd5832f9c2fb759ab"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::seal_refusal",
+          "sha256": "ef1d209e031555150a61959a1fa87a943c4f51776e263d5f410bbfbe08a822e8"
+        }
+      ],
+      "mutants": [
+        "refusal-name-secret-shape-admitted"
+      ],
+      "does_not_establish": "That no secret can reach the record: a plain identifier that merely looks like a secret to a human, and the real value of an API key an agent put into its own action name without a vk_ or vut_ prefix, is stored verbatim in a permanent record (the agent chose it). The canaries are three strings and two bearers, not every secret shape. That averin does not add anything: the body is what vultrino sends, and averin's own record builder is its own claim."
+    },
+    {
+      "id": "not-a-refusal-notes-nothing",
+      "statement": "Cases that are not a gateway refusal of an authenticated agent note nothing: a Deny that a tenant's observe mode lets run (the action runs, once), a Prompt routed to approval (202, an approval opened), an MCP tools/list, a secret that resolves to no stored principal on execute, MCP and /llm (401 or an error), a local caller with no principal, and a refusal while [averin] seal_refusals is off (counted, never posted).",
+      "method": "test",
+      "artifacts": [
+        "src/refusal.rs",
+        "src/server/mod.rs",
+        "tests/refusals_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- refusal::tests::no_principal_notes_nothing && cargo test --locked --no-default-features --test refusals_integration not_a_refusal_ refusal_off_by_config_",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::prepare_execution",
+          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalCtx::new",
+          "sha256": "ce6054e2c951999f78f3eef64f4f89a3e5a5b07ce2a03923f4e8dc5b9cce3e7e"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalRecorder::note_at",
+          "sha256": "8f742eb0574c54aff71e1752bbbf3632a2f1d5641f6d0cfcfa766ff516091db7"
+        }
+      ],
+      "mutants": [
+        "refusal-noted-in-the-observe-branch",
+        "refusal-unauthenticated-agent-attributed"
+      ],
+      "does_not_establish": "Every other path that is not a refusal (a plugin that is not loaded, invalid params, a plugin error, an expired approval, a human deny): none is driven. That an observe downgrade is reported elsewhere (policy.observed_denial is unchanged and not tested here)."
+    },
+    {
+      "id": "refusal-census-every-gate-site-goes-through-the-seam",
+      "statement": "Every VultrinoError::PolicyDenied, PolicyUnavailable and LlmChannelOnly that src/server/mod.rs constructs (outside its test modules) is an argument of the refusal seam (refuse, RunError::refused or RunError::refused_retryable), or is one of the named sites that are not a refusal of an agent (the gate-rule fetch errors, which both callers note, the permit kernel error, which its one caller notes, and the committed D8 outcome error raised after the action ran); a new site that skips the seam fails the test. The MCP server names its entry point on every execute_gated call and the /llm proxy calls the channel entries.",
+      "method": "test",
+      "artifacts": [
+        "src/server/mod.rs",
+        "src/mcp/server.rs",
+        "src/web/llm_proxy.rs",
+        "tests/refusals_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test refusals_integration refusal_census_",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::refuse",
+          "sha256": "0052bde81b8c8b0c1d6862eb6fb893c3039eb8f9818520a39dff6c2c3ce6f427"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::direct_admission",
+          "sha256": "6650757976a97f795330c7a66345d7f57797a941ae369cb2176ff88e03618e39"
+        }
+      ],
+      "mutants": [
+        "refusal-permission-site-bypasses-the-seam"
+      ],
+      "does_not_establish": "A source scan, not a proof: it looks at the 260 characters before each construction for a seam call with no statement end between, so a site that builds the error, stores it and returns it later, or a refusal built in another file or from another error type (for example a Plugin error that is in fact a refusal), is not seen. It does not check that the class given is the right one, and it does not cover src/web or src/mcp, which only consume these errors."
+    },
+    {
+      "id": "refusal-reason-class-typed",
+      "statement": "The reason class of a policy refusal comes from a typed cause the engine reports where it decides, never from the message text: a kill switch is kill_fence, a matching deny rule, the default of a policy, the engine default and an uncanonicalisable URL under a URL rule are policy_deny, an exhausted top-level rate limit is rate_limit and an over-cap spend is spend_cap, an Allow or Prompt carries no cause, and a rate-limited and a halted agent are sealed with those classes through POST /api/v1/execute.",
+      "method": "test",
+      "artifacts": [
+        "src/policy/mod.rs",
+        "src/policy/deny_cause_tests.rs",
+        "src/refusal.rs",
+        "tests/refusals_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- policy::deny_cause_tests && cargo test --locked --no-default-features --test refusals_integration refusal_table_execute_rate_limit refusal_table_execute_kill_fence",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::evaluate_inner",
+          "sha256": "0cd57935ba39f51824083812bdb2fa8f39faf0b20f5467d5670b1221878476db"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::allow_tier_matches",
+          "sha256": "70e645bb6d84a3be452cef28c8d6babcdf68f02c1757d5b9326ac2e0fed1a53a"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "DenyCause::refusal_class",
+          "sha256": "e07163da8e265e9b1e9336d58b8292a50fba87514d4517e1df41ebc94ca743d5"
+        }
+      ],
+      "mutants": [
+        "refusal-rate-limit-reported-as-policy-deny",
+        "refusal-halt-reported-as-rule",
+        "refusal-spend-cap-reported-as-policy-deny"
+      ],
+      "does_not_establish": "That the attribution is right for a guard nested under or or not (the nested rate limit is evaluated inline and reported as policy_deny), for two guards at once (the spend cap wins), or for the resume path's read-only evaluation (it uses the same function but the class is not driven by a test). That the decision itself is right: precedence is covered by its own claims, and this one only reports which branch decided."
+    },
+    {
+      "id": "refusal-vocabulary-pinned",
+      "statement": "The 14 reason classes and 4 entry points vultrino seals are exactly the lists in the vendored copy of averin's vectors/refusal-classes.v1.json (pinned by vectors/vectors.lock, owner averin), in the same order and spelling.",
+      "method": "test",
+      "artifacts": [
+        "src/refusal.rs",
+        "vectors/refusal-classes.v1.json"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- refusal::tests::vocabulary_matches_the_vendored_averin_file",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalClass::as_str",
+          "sha256": "d14c2813c778b80f81ae5156c57ee6f95f03f8b116078a9aee6816ede31730c8"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalEntry::as_str",
+          "sha256": "429f9a0b7dd132dad6dd2acc01110ef1f53dae027afc8b1d5b0c4160c3c702a1"
+        }
+      ],
+      "mutants": [
+        "refusal-class-spelling-drift"
+      ],
+      "does_not_establish": "That averin's server accepts these values (its own test pins its copy of the file to the same bytes through the cross-repo vector lock, which is checked by a different job), or that a future class is added in lockstep: the comparison is with this repository's copy of the file."
     }
   ]
 }

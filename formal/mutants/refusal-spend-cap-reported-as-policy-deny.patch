@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 9f13158..8446ebf 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -875,7 +875,7 @@ impl PolicyEngine {
+                     if self.spend_within_cap(input.spend, asset, *per_action_max, record) {
+                         matched = true;
+                     } else {
+-                        guard_hint.set(Some(DenyCause::SpendCap));
++                        guard_hint.set(None);
+                     }
+                     continue;
+                 }

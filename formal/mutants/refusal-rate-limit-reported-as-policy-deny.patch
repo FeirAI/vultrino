@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 9f13158..8c31993 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -907,7 +907,7 @@ impl PolicyEngine {
+             &guards,
+         );
+         if !admitted && guard_hint.get().is_none() {
+-            guard_hint.set(Some(DenyCause::RateLimit));
++            guard_hint.set(None);
+         }
+         admitted
+     }
