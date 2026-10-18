@@ -1005,6 +1005,26 @@
     },
     "posture-averin-api-key-configured-hardcoded-false": {
       "tier": "full"
+    },
+    "outbox-cap-ignored": {
+      "tier": "fast",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-cap-prunes-protected": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-cap-off-by-one": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-cap-not-counted": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-envelope-oldest-wrong": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
     }
   },
   "claims": [
@@ -3433,12 +3453,12 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
+          "sha256": "72dfc555bd8dfa5f916842399048b4cddb3deaf30ecf5a26d269ba6ed3246fc4"
         },
         {
           "path": "src/web/api.rs",
           "symbol": "api_posture",
-          "sha256": "91d8b763c8d02940f8ad082e10d0d0161e52380f3c9ef5e0041683ece1f7e94c"
+          "sha256": "9022beb16c9a1fb6fe856561f9fdd7af488970b58fe97476d8a57d3e98a28bd3"
         },
         {
           "path": "src/policy/types.rs",
@@ -3549,12 +3569,12 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
+          "sha256": "72dfc555bd8dfa5f916842399048b4cddb3deaf30ecf5a26d269ba6ed3246fc4"
         },
         {
           "path": "src/web/api.rs",
           "symbol": "api_list_events",
-          "sha256": "a51947db235844cd779f5dddf1afe187ced1dc421b3c0bd87c022add2aa039be"
+          "sha256": "673ca21e0b566df91ad3ed116a2a62420b0fd110262947a33b24c63625ee3c23"
         },
         {
           "path": "src/server/mod.rs",
@@ -3570,6 +3590,49 @@
         "meter-emit-stops-after-first-failure"
       ],
       "does_not_establish": "The counters and the pending marker are held in memory: if the process exits before an append succeeds again the marker is never written, and a consumer's stale watermark is the only remaining signal. Failures are produced by one injected fault (an unwritable temp path), not by a real full disk or a failing fsync. Only the direct append path is counted; events staged in the vault and drained later are retried by the reconciler instead. That a consumer acts on the marker is the leria claim for its poller, not this one. Says nothing about events lost while the process is down or about the outbox being tampered with. Failed appends do not fail the metered call: vultrino keeps admitting calls during an outage, and the pending count is the only in-band signal until the marker (so the fail-open choice stands and the consumer's watermark is the control). The count is in the unsigned envelope. That the consumer acts on it is the leria claim meter-lost-marker-holds-as-of."
+    },
+    {
+      "id": "outbox-retention-bounded",
+      "statement": "The signed outbox keeps at most outbox.max_retained_events events. In the unit tests of the real outbox store, with the age window switched off so only the cap acts: when more events are retained than the cap, the GC prunes the oldest events beyond it whatever their delivery state (a pending, a dead-lettered and a delivered event are all pruned) and keeps a contiguous suffix of exactly the cap; it never prunes at or past an event whose staged-intent dedup id is still protected (it prunes only the events below it, and proceeds once the intent is cleared); a pass at or under the cap prunes nothing; a pass counts what it pruned by delivery state and by event type and adds them to the per-process counters cap_pruned_total and cap_pruned_undelivered_total; the cap still applies when the age cutoff cannot be represented. Below the cap an undelivered pending or dead-lettered event is still never pruned by the age stage. A poller whose cursor is behind the cap sees a sequence hole (its next event is above cursor + 1). Config load refuses max_retained_events below 100 or above 100000 and defaults it to 2000. In the web smoke test, GET /api/v1/events carries the unsigned hints oldest_sequence (null when nothing is retained) and last_sequence (which survives pruning), and GET /api/v1/posture and GET /api/v1/metrics report max_retained_events, retained_events, oldest_sequence, last_sequence, cap_pruned_total and cap_pruned_undelivered_total.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/outbox_store.rs",
+        "src/storage/file.rs",
+        "src/config/types.rs",
+        "src/web/api.rs",
+        "src/web/posture.rs",
+        "src/server/mod.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact storage::outbox_store::tests::cap_prunes_oldest_beyond_max_even_when_undelivered storage::outbox_store::tests::cap_stops_at_a_staged_intent storage::outbox_store::tests::cap_counts_pruned_by_state_and_type storage::outbox_store::tests::a_poller_behind_the_cap_sees_a_hole storage::outbox_store::tests::the_cap_applies_when_the_age_window_is_unrepresentable storage::outbox_store::tests::gc_below_the_cap_never_prunes_an_undelivered_pending_event storage::outbox_store::tests::gc_below_the_cap_never_prunes_a_dead_lettered_event config::types::tests::max_retained_below_floor_refused && cargo test --locked --no-default-features --test web_smoke -- --exact events_envelope_reports_oldest_and_last_sequence",
+      "covers": [
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::gc_capped",
+          "sha256": "703dbec838208eed5a0b7c23bfb05fc1670f05f637a6a1913a880fbeb0dae954"
+        },
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::retention_snapshot",
+          "sha256": "d6f5e94762cacbb6e381d58052cef55447bab7a1690d0810970680ef5726fd88"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_list_events",
+          "sha256": "673ca21e0b566df91ad3ed116a2a62420b0fd110262947a33b24c63625ee3c23"
+        }
+      ],
+      "mutants": [
+        "outbox-cap-ignored",
+        "outbox-cap-prunes-protected",
+        "outbox-cap-off-by-one",
+        "outbox-cap-not-counted",
+        "outbox-envelope-oldest-wrong"
+      ],
+      "does_not_establish": "Example tests over small outboxes, not a property over every event mix. Per-operation cost is still O(retained) because every outbox operation rewrites the whole file; the cap bounds it, it does not make it constant, and no timing is measured here. A consumer that is down longer than the cap window loses the events it had not read: the cap drops unread and undelivered events (an undelivered approval event pruned this way is lost, counted but not recovered), and nothing here shows that a consumer detects or acts on the hole (that is the consumer's claim). The counters are per process and reset on restart, and oldest_sequence and last_sequence are unsigned hints read from this process's cache (the signed sequence hole is the authoritative signal). The GC runs every 60 delivery ticks, so the retained count can exceed the cap by what is appended between ticks. The timed GC loop itself is not run by these tests. The posture and metrics reports are checked in one process with one outbox, not under concurrent writers or a second process. Says nothing about a vultrino outbox reset (both files gone)."
     },
     {
       "id": "stream-usage-charged-without-trailer",
@@ -4133,7 +4196,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
+          "sha256": "72dfc555bd8dfa5f916842399048b4cddb3deaf30ecf5a26d269ba6ed3246fc4"
         },
         {
           "path": "src/web/llm_proxy.rs",
@@ -4830,7 +4893,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
+          "sha256": "72dfc555bd8dfa5f916842399048b4cddb3deaf30ecf5a26d269ba6ed3246fc4"
         },
         {
           "path": "src/web/workload_exchange.rs",
