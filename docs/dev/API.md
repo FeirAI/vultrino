@@ -439,14 +439,15 @@ delivery uses, plus its `Govder-Signature` when a signing secret is configured):
 `[outbox] max_retained_events` events and prunes the oldest beyond that, delivered or not, so
 a poller whose cursor is below `oldest_sequence - 1`, or whose page is empty while
 `last_sequence` is above its cursor, may have lost events. Like `meter_gap_pending` these are
-unsigned hints, read from the process cache separately from the page, so a concurrent append can
-make them momentarily wrong in the direction of a false alarm; the hole in the signed sequences
-is the authoritative signal. Vultrino cannot tell whether a poller read an event:
+unsigned hints, taken from the same cache read as the page; they are unsigned, and the signed hole
+is authoritative. Vultrino cannot tell whether a poller read an event:
 `cap_pruned_undelivered_total` counts events the push target had not acked (in poll-only mode,
 every prune), not events no poller read. `GET
 /api/v1/posture` (`outbox`) and `GET /api/v1/metrics` (`outbox`) report `max_retained_events`,
-`retained_events`, `oldest_sequence`, `last_sequence`, `cap_pruned_total` and
-`cap_pruned_undelivered_total` (counters are per process).
+`retained_events`, `oldest_sequence`, `last_sequence`, `cap_pruned_total`,
+`cap_pruned_undelivered_total`, `cap_blocked_total` (GC passes where an uncleared staged intent
+stopped the cap) and `snapshot_loaded` (counters are per process). `snapshot_loaded` is `false`
+when the outbox file could not be read; the other outbox fields are then not to be trusted.
 
 `meter_gap_pending` is the number of failed event appends not yet announced by a
 `meter.lost` marker. A poller must not treat an idle page as caught up while it is

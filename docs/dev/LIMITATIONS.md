@@ -572,9 +572,10 @@ kernels.
   (`outbox.enabled = false`) nothing is ever `Delivered`. `cap_pruned_undelivered_total` therefore
   counts events the push target had not acked, not unread events, and leria's hole detection is the
   only unread-loss signal. An undelivered approval event pruned this way is lost (counted, not
-  recovered). The GC runs every 60 delivery passes, not on a wall-clock timer, so a hung push
-  target stretches the interval and the retained count can exceed the cap by more than the
-  steady-state rate times 5 minutes. The counters are per process and reset on restart, and the
+  recovered). The GC runs once 60 delivery intervals of wall-clock time (about 5 minutes) have
+  passed since the last GC, checked after each delivery pass, so a pass stretched by a hung push
+  target delays it and the retained count can exceed the cap by more than the steady-state rate
+  times 5 minutes. The counters are per process and reset on restart, and the
   hints are unsigned.
 - **An `internal_http` capability's HTTP verb is operator authority, and the agent
   may not send one.** The transport requires `method`, so a capability registered

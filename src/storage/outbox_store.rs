@@ -1524,6 +1524,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_first_page_after_a_restart_reloads_the_file() {
+        let (s, dir) = store();
+        for subj in ["A", "B", "C"] {
+            s.append(subj, "t", serde_json::json!({})).await.unwrap();
+        }
+        // A fresh store over the existing file (a restart before the delivery loop has run).
+        let key = Arc::new(MasterKey::from_bytes(vec![7u8; 32]).unwrap());
+        let fresh = OutboxStore::new(dir.path().join("outbox.enc"), key);
+        let (page, snap) = fresh.list_after_with_retention(0, 100).await.unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "not an empty page from a never-loaded cache"
+        );
+        assert_eq!(snap.last_sequence, 3);
+        assert_eq!(snap.oldest_sequence, Some(1));
+        assert!(snap.loaded);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_over_an_unreadable_outbox_file_reports_not_loaded() {
+        let (s, dir) = store();
+        s.append("A", "t", serde_json::json!({})).await.unwrap();
+        // Corrupt the file (not a valid ciphertext) and open a fresh store over it.
+        std::fs::write(dir.path().join("outbox.enc"), b"not an encrypted outbox").unwrap();
+        let key = Arc::new(MasterKey::from_bytes(vec![7u8; 32]).unwrap());
+        let fresh = OutboxStore::new(dir.path().join("outbox.enc"), key);
+        let snap = fresh.retention_snapshot();
+        assert!(
+            !snap.loaded,
+            "the load failed, the other fields are not to be trusted"
+        );
+    }
+
+    #[tokio::test]
     async fn a_poller_behind_the_cap_sees_a_hole() {
         let (s, _d) = store();
         for i in 0..5 {
