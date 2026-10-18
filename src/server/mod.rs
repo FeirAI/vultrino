@@ -6730,6 +6730,28 @@ mod permit_binding_tests;
 
 #[cfg(test)]
 mod tests {
+    /// The money_and_irreversible floor needs a live Averin client, not only the config flags:
+    /// an enabled, two-phase, money_and_irreversible config with no client built has no evidence
+    /// path, so the floor must stay human_floor (fail closed). `VultrinoServer::new` refuses to
+    /// start an enabled block without a client (FEI-33), so this seam is reachable only here.
+    #[test]
+    fn effective_floor_needs_a_live_client_not_only_the_config_flags() {
+        use super::EffectiveEvidenceFloor as F;
+        use crate::averin::D8EvidenceFloor;
+        let mut cfg = crate::config::Config::default();
+        cfg.averin.enabled = true;
+        cfg.averin.d8_complete_evidence = true;
+        cfg.averin.d8_evidence_floor = D8EvidenceFloor::MoneyAndIrreversible;
+        assert_eq!(F::from_config(&cfg, true), F::MoneyAndIrreversible);
+        assert_eq!(
+            F::from_config(&cfg, false),
+            F::HumanFloor,
+            "no live client: the routine fallback has no evidence path"
+        );
+        cfg.averin.d8_evidence_floor = D8EvidenceFloor::HumanFloor;
+        assert_eq!(F::from_config(&cfg, true), F::HumanFloor);
+    }
+
     /// Wave-1 close-out: the policy refresh interval parses whole seconds in 1..=86400
     /// only, and the "applied within the refresh window" message quotes the effective
     /// interval, not the compiled default.
