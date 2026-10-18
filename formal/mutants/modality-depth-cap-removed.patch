@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 6d4fcab..36d126e 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -747,7 +747,7 @@ fn is_priced_mime(v: Option<&serde_json::Value>) -> bool {
+ 
+ /// How deep the Gemini body walk goes before it refuses (fail closed): a body nested deeper
+ /// than this cannot exhaust the stack and cannot hide a part below the walk.
+-const MODALITY_WALK_MAX_DEPTH: usize = 64;
++const MODALITY_WALK_MAX_DEPTH: usize = usize::MAX;
+ 
+ /// Walk a Gemini request value at any depth, treating a single object and an array the same
+ /// (Google's parser accepts one object for a repeated field, and the proxy forwards the value

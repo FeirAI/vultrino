@@ -1,13 +1,13 @@
 diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
-index 74eb177..8ae4802 100644
+index 6d4fcab..e023968 100644
 --- a/src/web/llm_proxy.rs
 +++ b/src/web/llm_proxy.rs
-@@ -725,7 +725,7 @@ fn field_is_priced(kind: Kind, dialect: Dialect, value: &serde_json::Value) -> b
- fn is_av_mime(v: &serde_json::Value) -> bool {
-     v.as_str().is_some_and(|m| {
-         let m = m.trim().to_ascii_lowercase();
--        m.starts_with("audio/") || m.starts_with("video/")
-+        m.starts_with("image/")
+@@ -741,7 +741,7 @@ const PRICED_MEDIA_TYPES: &[&str] = &[
+ fn is_priced_mime(v: Option<&serde_json::Value>) -> bool {
+     v.and_then(serde_json::Value::as_str).is_some_and(|m| {
+         let m = m.to_ascii_lowercase();
+-        PRICED_MEDIA_TYPES.contains(&m.as_str()) || m.starts_with("text/")
++        PRICED_MEDIA_TYPES.contains(&m.as_str()) || m.starts_with("text/") || m.starts_with("audio/")
      })
  }
  

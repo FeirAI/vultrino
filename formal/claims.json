@@ -935,6 +935,26 @@
     },
     "vault-backup-ignores-restore-pending": {
       "tier": "full"
+    },
+    "modality-allowlist-removed": {
+      "tier": "fast",
+      "claim": "unpriced-model-refused"
+    },
+    "modality-walk-arrays-only": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modality-missing-mime-admitted": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modality-empty-modalities-admitted": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modality-depth-cap-removed": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
     }
   },
   "claims": [
@@ -4008,7 +4028,7 @@
     },
     {
       "id": "unpriced-model-refused",
-      "statement": "An LLM-proxy request whose model the rate card does not price is refused with 403 model_unpriced before any upstream call, because leria rejects an unpriced token event and the call would book $0 so a budget cap would never trip. With the shipped default [llm_proxy] require_priced_model = true and a rate card read from rate_card_path (the file leria reads): a model the card lacks is refused for a buffered and a streamed request and the test upstream sees no request and no meter event is written; a request with a body that names no model is refused; with no card configured every model-bearing call is refused; a priced model passes and is metered; a dated id passes only through an explicit model_ref_prefix entry, the prefix followed by - or @ and more text (claude-haiku-4-5-20251001 and claude-haiku-4-5@20251001 pass, claude-haiku-4-50, the bare prefix and an id with no prefix entry do not); an entry of another asset than tokens, a zero or negative token price, an empty or malformed file and a card with no token entry are refused when the file is read; the operator opt-out require_priced_model = false lets an unpriced model through; an unreadable file is a startup error. The model that is gated, checked against the allowlist and booked is the one the resolved upstream URL selects where the URL picks it, not the body's: Gemini and Vertex AI take models/<id> (a model baked into provider_base counts; two model segments, or none outside the OpenAI-compatible endpoint, are refused), Bedrock takes the percent-decoded model/<id> (a Bedrock call with no body model passes when the path model is priced; no model segment is refused), Azure OpenAI takes deployments/<name> (or the body model as the deployment name on the v1 API) through the operator's [llm_proxy.azure_deployments] map and an unmapped deployment is refused even when its name is a priced model's id; a body model that differs from the URL's model is refused; with the URL naming an unpriced model and the body a priced one the request is refused and the upstream is not called; the capability allowlist is applied to the URL's model where the URL selects it (a Gemini, Vertex or Bedrock call whose body names no model passes an allowlist that lists the path model and is refused when it does not; an Azure call passes when the allowlist lists the mapped model or the deployment name) and to the body's model where the body picks it. A request that the proxy cannot show to bill tokens alone is refused with 403 modifier_unpriced before any upstream call, by an ALLOWLIST (default-deny), per provider protocol (anthropic-messages, openai-chat and nvidia, openai-responses, azure-openai, gemini and vertex-ai including the OpenAI-compatible and Anthropic-on-Vertex bodies, bedrock-converse, bedrock-invoke; any other protocol admits no field): (1) every top-level request field must be on the protocol's table of fields that cannot change the price per token (model, messages, system, max_tokens, sampling parameters, stop sequences, stream, metadata, tools, tool_choice and the like); any other field, including compaction, context_management, fallbacks, speed, inference_geo, web_search_options, guardrailConfig and a service tier in any casing (service_tier, serviceTier, ServiceTier), is refused, and a body that is not a JSON object is refused; the card format has no entry for a priced variant, so only a code change widens a table; (2) the anthropic-beta header (every line, comma separated) and a body anthropic_beta (Bedrock InvokeModel, Vertex Anthropic) may name only betas on a priced list, any other value is refused; (3) a tool must be exactly a plain client tool of the protocol (Anthropic: an untyped or custom object with name, input_schema and no key beyond description, cache_control and strict, or an exact versioned client type bash, text_editor, memory or computer; OpenAI chat and responses: function or custom with the documented keys only; Gemini: functionDeclarations entries; Bedrock Converse: toolSpec or cachePoint with the documented keys only, in toolConfig.tools); server tools, advisor, web search and fetch, tool search, code execution, file search, grounding, urlContext, a typed tool not on the list and a tool with a foreign key are refused.; (4) inside admitted fields, nested modality markers are refused too: a Gemini contents part with inlineData, inline_data, fileData or file_data whose mimeType or mime_type is audio/* or video/* (any casing), a Gemini generationConfig or generation_config responseModalities or response_modalities that names anything but TEXT, and an OpenAI chat or responses input_audio content part (an audio output request, the modalities and audio fields, is refused by the top-level table); each is refused for a buffered and a streamed request with no upstream call, while a plain text request, an image part and TEXT-only modalities pass. Other nested options are not inspected. A plain priced request passes. GET /api/v1/posture reports rate_card.require_priced_model, configured, entries, last_error, sha256 (of the card read at start, the digest leria reports for the same file), file_sha256 (the file as last read) and never the path.",
+      "statement": "An LLM-proxy request whose model the rate card does not price is refused with 403 model_unpriced before any upstream call, because leria rejects an unpriced token event and the call would book $0 so a budget cap would never trip. With the shipped default [llm_proxy] require_priced_model = true and a rate card read from rate_card_path (the file leria reads): a model the card lacks is refused for a buffered and a streamed request and the test upstream sees no request and no meter event is written; a request with a body that names no model is refused; with no card configured every model-bearing call is refused; a priced model passes and is metered; a dated id passes only through an explicit model_ref_prefix entry, the prefix followed by - or @ and more text (claude-haiku-4-5-20251001 and claude-haiku-4-5@20251001 pass, claude-haiku-4-50, the bare prefix and an id with no prefix entry do not); an entry of another asset than tokens, a zero or negative token price, an empty or malformed file and a card with no token entry are refused when the file is read; the operator opt-out require_priced_model = false lets an unpriced model through; an unreadable file is a startup error. The model that is gated, checked against the allowlist and booked is the one the resolved upstream URL selects where the URL picks it, not the body's: Gemini and Vertex AI take models/<id> (a model baked into provider_base counts; two model segments, or none outside the OpenAI-compatible endpoint, are refused), Bedrock takes the percent-decoded model/<id> (a Bedrock call with no body model passes when the path model is priced; no model segment is refused), Azure OpenAI takes deployments/<name> (or the body model as the deployment name on the v1 API) through the operator's [llm_proxy.azure_deployments] map and an unmapped deployment is refused even when its name is a priced model's id; a body model that differs from the URL's model is refused; with the URL naming an unpriced model and the body a priced one the request is refused and the upstream is not called; the capability allowlist is applied to the URL's model where the URL selects it (a Gemini, Vertex or Bedrock call whose body names no model passes an allowlist that lists the path model and is refused when it does not; an Azure call passes when the allowlist lists the mapped model or the deployment name) and to the body's model where the body picks it. A request that the proxy cannot show to bill tokens alone is refused with 403 modifier_unpriced before any upstream call, by an ALLOWLIST (default-deny), per provider protocol (anthropic-messages, openai-chat and nvidia, openai-responses, azure-openai, gemini and vertex-ai including the OpenAI-compatible and Anthropic-on-Vertex bodies, bedrock-converse, bedrock-invoke; any other protocol admits no field): (1) every top-level request field must be on the protocol's table of fields that cannot change the price per token (model, messages, system, max_tokens, sampling parameters, stop sequences, stream, metadata, tools, tool_choice and the like); any other field, including compaction, context_management, fallbacks, speed, inference_geo, web_search_options, guardrailConfig and a service tier in any casing (service_tier, serviceTier, ServiceTier), is refused, and a body that is not a JSON object is refused; the card format has no entry for a priced variant, so only a code change widens a table; (2) the anthropic-beta header (every line, comma separated) and a body anthropic_beta (Bedrock InvokeModel, Vertex Anthropic) may name only betas on a priced list, any other value is refused; (3) a tool must be exactly a plain client tool of the protocol (Anthropic: an untyped or custom object with name, input_schema and no key beyond description, cache_control and strict, or an exact versioned client type bash, text_editor, memory or computer; OpenAI chat and responses: function or custom with the documented keys only; Gemini: functionDeclarations entries; Bedrock Converse: toolSpec or cachePoint with the documented keys only, in toolConfig.tools); server tools, advisor, web search and fetch, tool search, code execution, file search, grounding, urlContext, a typed tool not on the list and a tool with a foreign key are refused.; (4) inside admitted fields, the media and modality markers are an ALLOWLIST checked over the whole body, buffered and streamed, with no upstream call: for a Gemini or Vertex AI body the proxy walks every array element and every object value at any depth (a single object is read like an array, as Google's parser does, so contents, parts, systemInstruction and functionResponse parts are all reached), and an object under inlineData, inline_data, fileData or file_data is admitted only if it is an object whose mimeType or mime_type (every one present, at least one present) is a string that is image/png, image/jpeg, image/webp, image/heic, image/heif, image/gif, application/pdf or a text/* type; a missing, non-string or any other media type (audio and video, application/octet-stream, the YouTube file_uri form with no media type) is refused; a responseModalities or response_modalities at any depth must be a non-empty array of exactly TEXT entries (an empty array, a non-array and any other entry are refused; an absent field is admitted); a body nested deeper than 64 levels is refused; for an OpenAI chat, responses or Azure body each messages or input entry (an array or a single object) and each content part (an array or a single object) must be of type text, image_url, input_text, input_image, output_text or refusal (an entry may also be a plain string, or of a conversation item type message, function_call, function_call_output, custom_tool_call, custom_tool_call_output, reasoning or item_reference), and a message carrying an audio object is refused (input_audio, file, a part with no type and any other type are refused; an audio output request, the modalities and audio fields, is refused by the top-level table); a plain text request, image parts, a PDF part, TEXT-only modalities and a request with no modalities field pass. Other nested options are not inspected. A plain priced request passes. GET /api/v1/posture reports rate_card.require_priced_model, configured, entries, last_error, sha256 (of the card read at start, the digest leria reports for the same file), file_sha256 (the file as last read) and never the path.",
       "method": "test",
       "artifacts": [
         "src/ratecard.rs",
@@ -4161,12 +4181,52 @@
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "modality_marker",
-          "sha256": "1a0ce65112d5aa6f2eb94b921c20a59035744ade21f3ac7624ab58dc535f8ee4"
+          "sha256": "bffe825bfe021ad03896e82191137d6d5b0e0386093da60742732e8df0e13ef2"
         },
         {
           "path": "src/web/llm_proxy.rs",
-          "symbol": "is_av_mime",
-          "sha256": "041b446604d9e59f6644a0ec8b855409c55556bd41da755d0cc57bf95e93d6ef"
+          "symbol": "PRICED_MEDIA_TYPES",
+          "sha256": "8300c52367632959b6ebe73f1b2be63cfe59762d7ce810e0f9071db104bc4f49"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "is_priced_mime",
+          "sha256": "562edbdc2b0c6c28392210f3405a1a882747a66ff65875d8d7ece261faaac4cb"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "MODALITY_WALK_MAX_DEPTH",
+          "sha256": "ee1af51a284a188ac3da333292792b08ff4ffe6a58f12050de5b05c698c1f6c1"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "gemini_media_marker",
+          "sha256": "b8cd53312791530db2b79078ed2b1f71986ffc38babae7f679fd73dd9f1bc44c"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "gemini_map_marker",
+          "sha256": "1cf8b2f47a9060412ed39358f7f1ce747dda2f92efdfdc01938c2f34738dfc87"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "OPENAI_PRICED_PART_TYPES",
+          "sha256": "d845272831c8881da2d4e86117c0f2872b36787e1552206275bace1f19ad2a1d"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "OPENAI_PRICED_ITEM_TYPES",
+          "sha256": "ce270896681e263bcc2717b91b79a7feaa89d6eb8f5af6845908ebd57ff6f3c3"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "openai_items",
+          "sha256": "1fa828eeaa4457613ba315e18cfe6e5cabf921ac536a82f3544b5e9e2aa210bb"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "openai_content_marker",
+          "sha256": "80c6542de93c3efa73097f0e174ca52d4534f80d0378f7d97a216844424174fa"
         }
       ],
       "mutants": [
@@ -4194,9 +4254,14 @@
         "modality-check-removed",
         "modality-response-modalities-unchecked",
         "modality-input-audio-unchecked",
-        "modality-gemini-av-mime-unchecked"
+        "modality-gemini-av-mime-unchecked",
+        "modality-allowlist-removed",
+        "modality-walk-arrays-only",
+        "modality-missing-mime-admitted",
+        "modality-empty-modalities-admitted",
+        "modality-depth-cap-removed"
       ],
-      "does_not_establish": "Only the /llm proxy is gated: a model call through POST /api/v1/execute, an MCP http.request or a named tool is not refused here (leria still rejects its unpriced token event and books $0). The model is the one the upstream URL or the body names; it does not show which model the provider bills if it serves a different one (the token event then carries the served id, see llm-token-event-complete-and-priced). Azure deployment names are mapped to models by the operator, and a wrong map entry prices the wrong model. The allowlist is checked on top-level field names and on tool and beta values; the contents of an allowed field (for example generationConfig, thinking, response_format, inferenceConfig, metadata) are not inspected, except the modality markers named in the statement (a Gemini part whose media type is not audio or video but is billed higher, an OpenAI audio field nested elsewhere, and any other nested option are not inspected), so a provider that prices a nested option is booked at the base price (an under-count) until its table entry is reviewed; a field on a table is a human pricing judgment, not a proof. The OpenAI-Beta header and the other forwarded provider headers are not on a beta allowlist. The regional-endpoint premium of a Vertex or Bedrock deployment reached through provider_base and a price the provider changes without a request field are booked at the base price. The card is read for coverage only: prices are not checked beyond being positive, the file is not compared with the copy leria loaded (the posture fingerprint is what a deploy check compares), a change is noticed by size and modified time, and a file edited back to the same size within the filesystem's timestamp granularity is not re-read. Staleness of a card is not enforced. What happens when the file changes after start is rate-card-reload-only-narrows. The upstream is a test double, not a live provider."
+      "does_not_establish": "Only the /llm proxy is gated: a model call through POST /api/v1/execute, an MCP http.request or a named tool is not refused here (leria still rejects its unpriced token event and books $0). The model is the one the upstream URL or the body names; it does not show which model the provider bills if it serves a different one (the token event then carries the served id, see llm-token-event-complete-and-priced). Azure deployment names are mapped to models by the operator, and a wrong map entry prices the wrong model. The allowlist is checked on top-level field names and on tool and beta values; the contents of an allowed field (for example generationConfig, thinking, response_format, inferenceConfig, metadata) are not inspected, except the media and modality markers named in the statement (any other nested option is not inspected). The media allowlist assumes that image, PDF and text input bill at the model's token rate, because the rate card holds one input and one output price per model: a provider that prices image or document input differently is booked at the base price (an under-count) until that type is removed from the list. A request with no responseModalities is admitted, and the default output modality of a model is priced only through that model's card entry. The walk reads keys by name anywhere in a Gemini body, so a tool argument that happens to use one of those key names is refused too (fail closed); the OpenAI check reads only the messages and input entries and their content parts, and an OpenAI item type outside the list (a server tool call replayed as input, for example) is refused until priced, so a provider that prices a nested option is booked at the base price (an under-count) until its table entry is reviewed; a field on a table is a human pricing judgment, not a proof. The OpenAI-Beta header and the other forwarded provider headers are not on a beta allowlist. The regional-endpoint premium of a Vertex or Bedrock deployment reached through provider_base and a price the provider changes without a request field are booked at the base price. The card is read for coverage only: prices are not checked beyond being positive, the file is not compared with the copy leria loaded (the posture fingerprint is what a deploy check compares), a change is noticed by size and modified time, and a file edited back to the same size within the filesystem's timestamp granularity is not re-read. Staleness of a card is not enforced. What happens when the file changes after start is rate-card-reload-only-narrows. The upstream is a test double, not a live provider."
     },
     {
       "id": "llm-token-event-complete-and-priced",

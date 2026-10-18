@@ -1,13 +1,13 @@
 diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
-index 74eb177..a8713f3 100644
+index 6d4fcab..52be53d 100644
 --- a/src/web/llm_proxy.rs
 +++ b/src/web/llm_proxy.rs
-@@ -760,7 +760,7 @@ fn modality_marker(
+@@ -799,7 +799,7 @@ fn gemini_map_marker(
+                     ));
                  }
              }
-             for cfg in ["generationConfig", "generation_config"] {
--                for key in ["responseModalities", "response_modalities"] {
-+                for key in ["nonexistentModalities"] {
-                     match obj.get(cfg).and_then(|c| c.get(key)) {
-                         None => {}
-                         Some(Value::Array(list))
+-            "responseModalities" | "response_modalities" => {
++            "nonexistentModalities" => {
+                 let text_only = value.as_array().is_some_and(|list| {
+                     !list.is_empty() && list.iter().all(|m| m.as_str() == Some("TEXT"))
+                 });

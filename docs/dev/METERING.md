@@ -157,11 +157,22 @@ refuses the rest before the upstream call (`403 modifier_unpriced`, default-deny
   refused. The contents of an allowed field are not inspected, except the modality markers
   below.
 - Modalities: features priced above the base token rate are refused until the card prices
-  them. Inside admitted fields the proxy refuses a Gemini part with `inlineData` or `fileData`
-  (also `inline_data`, `file_data`) whose media type is `audio/*` or `video/*`, a Gemini
-  `responseModalities` (or `response_modalities`) naming anything but `TEXT`, and an OpenAI
-  `input_audio` content part; an audio output request (`modalities`, `audio`) is refused as an
-  unlisted field. Other nested options are not inspected (bounded).
+  them. Inside admitted fields this is an allowlist over the whole body, not a denylist. For
+  Gemini and Vertex AI the proxy walks every array element and object value at any depth (a
+  single object is read like an array, as Google's parser does) and admits an `inlineData` or
+  `fileData` object (also `inline_data`, `file_data`) only when its `mimeType` or `mime_type`
+  is a string that is `image/png`, `image/jpeg`, `image/webp`, `image/heic`, `image/heif`,
+  `image/gif`, `application/pdf` or `text/*`; a missing or any other media type (audio, video,
+  a `fileUri` with no type) is refused. A `responseModalities` (or `response_modalities`) must
+  be a non-empty array of exactly `TEXT`; an absent field is admitted, and a model's default
+  output modality is priced only through that model's card entry. A body nested deeper than 64
+  levels is refused. For OpenAI chat, responses and Azure bodies each `messages` or `input`
+  entry and each content part must be `text`, `image_url`, `input_text`, `input_image`,
+  `output_text` or `refusal` (a conversation item type such as `message` or `function_call` is
+  also fine); `input_audio`, `file`, a part with no type and a message carrying `audio` are
+  refused. An audio output request (`modalities`, `audio`) is refused as an unlisted field.
+  Image, PDF and text input are admitted on the assumption that they bill at the model's token
+  rate; other nested options are not inspected (bounded).
 - Betas: the `anthropic-beta` header (every line, comma separated) and a body `anthropic_beta`
   (Bedrock InvokeModel, Vertex Anthropic) may name only betas on a short list of those that do
   not change a token's price; any other value is refused, so the header is never forwarded with

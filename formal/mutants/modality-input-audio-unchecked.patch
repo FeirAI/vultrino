@@ -1,13 +1,13 @@
 diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
-index 74eb177..6a21ba6 100644
+index 6d4fcab..b92055c 100644
 --- a/src/web/llm_proxy.rs
 +++ b/src/web/llm_proxy.rs
-@@ -787,7 +787,7 @@ fn modality_marker(
-                     .filter_map(|m| m.get("content").and_then(Value::as_array))
-                     .flatten()
-                     .chain(items.iter())
--                    .any(|part| part.get("type").and_then(Value::as_str) == Some("input_audio"));
-+                    .any(|part| part.get("type").and_then(Value::as_str) == Some("input_audio_x"));
-                 if has_audio {
+@@ -895,7 +895,7 @@ fn openai_content_marker(obj: &serde_json::Map<String, serde_json::Value>) -> Op
+                 let ok = part
+                     .get("type")
+                     .and_then(Value::as_str)
+-                    .is_some_and(|t| OPENAI_PRICED_PART_TYPES.contains(&t));
++                    .is_some();
+                 if !ok {
                      return Some(
-                         "an `input_audio` content part bills above the token rate".to_string(),
+                         "a content part that is not text or an image (for example `input_audio`) bills above the token rate or cannot be priced"

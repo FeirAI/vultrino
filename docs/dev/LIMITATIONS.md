@@ -45,9 +45,10 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   `context_management`, `fallbacks`, fast mode, `inference_geo`, any service tier in any
   casing, search options and server tools. Operators widen the allowlist only by a code change
   (the rate card has no entry for a priced variant); a pricing decision, not a setting. The
-  contents of an allowed field are not inspected, except the nested modality markers (Gemini
-  audio or video parts and non-TEXT response modalities, OpenAI `input_audio` parts), which
-  are refused; other nested options stay uninspected, and the regional-endpoint premium of a Vertex
+  contents of an allowed field are not inspected, except the media and modality markers (a
+  Gemini `inlineData` or `fileData` part is admitted only for image, PDF or text media types,
+  found at any depth in any object or array shape; `responseModalities` must be exactly
+  `TEXT`; an OpenAI content part must be text or an image), which are refused otherwise; other nested options stay uninspected, and the regional-endpoint premium of a Vertex
   or Bedrock deployment is booked at the base price (an under-count). Every entry of
   `usage.iterations` is counted (the larger of the top-level figure and the sum of the entries,
   per direction), at the request model's price. Server-tool fees are refused, not metered. The card is

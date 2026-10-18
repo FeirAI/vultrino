@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 6d4fcab..6069915 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -759,7 +759,7 @@ fn gemini_media_marker(v: &serde_json::Value, depth: usize) -> Option<String> {
+     use serde_json::Value;
+     match v {
+         Value::Array(items) => items.iter().find_map(|i| gemini_media_marker(i, depth + 1)),
+-        Value::Object(map) => gemini_map_marker(map, depth),
++        Value::Object(_) => None,
+         _ => None,
+     }
+     .or_else(|| {
