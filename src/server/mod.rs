@@ -1564,17 +1564,6 @@ impl VultrinoServer {
         // surfaced to the approver/audit.
         let credential = self.resolver.resolve(&request.credential).await?;
 
-        // LLM credentials are /llm-only. A credential that backs an LLM-proxy
-        // capability carries model spend; the generic dispatch paths (`/api/v1/execute`,
-        // MCP `http_request`, named tools) skip the /llm model allowlist, priced-model
-        // gate, price-modifier allowlist and output-token cap, so they must never reach
-        // it. Refused here, before policy evaluation, approval, use-token consumption or
-        // any evidence; an unreadable catalog also refuses (fail closed).
-        if !via_llm_channel {
-            self.refuse_llm_credential_off_channel(&credential.alias, &request.credential)
-                .await?;
-        }
-
         let (canonical_action, action_label) = self.config.resolve_action(&request.action);
         let (plugin_name, action_name) = parse_action(&canonical_action)?;
         let full_action = format!("{}.{}", plugin_name, action_name);
@@ -1643,6 +1632,20 @@ impl VultrinoServer {
                 .await;
                 return Err(VultrinoError::PolicyDenied(reason));
             }
+        }
+
+        // LLM credentials are /llm-only. A credential that backs an LLM-proxy
+        // capability carries model spend; the generic dispatch paths (`/api/v1/execute`,
+        // MCP `http_request`, named tools) skip the /llm model allowlist, priced-model
+        // gate, price-modifier allowlist and output-token cap, so they must never reach
+        // it. Matched on credential identity (id), not spelling. Placed AFTER the use-token
+        // scope check and the V11 tenant gate so a cross-tenant or out-of-scope attempt
+        // keeps its own error, detect event and counter and learns nothing about the
+        // credential; still before policy evaluation, approval, use-token consumption,
+        // evidence or any upstream call. An unreadable catalog or resolver refuses.
+        if !via_llm_channel {
+            self.refuse_llm_credential_off_channel(&credential, &request.credential)
+                .await?;
         }
 
         // Evaluate policy (URL / method / rate limits / principal / spend). A
@@ -3732,6 +3735,15 @@ impl VultrinoServer {
             parse_action(&approval.action).map_err(RunError::terminal)?;
         let mut context = RequestContext::new();
 
+        // LLM credentials are /llm-only. The approval record does not say which channel
+        // opened it, and an /llm call that was routed to approval has no client left to
+        // receive a resumed response, so an approval on an LLM credential is never
+        // resumed (fail closed). This also covers approvals opened through execute before
+        // the /llm-only rule existed.
+        self.refuse_llm_credential_off_channel(&credential, &approval.credential)
+            .await
+            .map_err(RunError::terminal)?;
+
         // Revalidate the exact credential record before consulting any later
         // authority.  The approval names an alias for usability, but the human
         // authorized the id/type/revision/tenant that alias resolved to at open.
@@ -4553,48 +4565,68 @@ impl VultrinoServer {
         })
     }
 
-    /// Trusted irreversibility for D3 floors: resolve from stored capability metadata
-    /// (not requester-authored params). Production strict mode binds the executing
-    /// credential as well as the canonical action or Govder label.
-    /// Refuse (403 `PolicyDenied`) a credential that backs any LLM-proxy capability
-    /// when the request did not arrive through `/llm`. Matches on the resolved alias
-    /// and on the alias as presented. A catalog that cannot be read refuses too.
+    /// Refuse (HTTP 403 `llm_credential_channel_only`, `VultrinoError::LlmChannelOnly`) a
+    /// credential that backs any LLM-proxy capability when the request did not arrive
+    /// through `/llm`. Compares credential identity: each LLM capability's
+    /// `credential_ref` is resolved through the same resolver execution uses and refused
+    /// when it yields the same credential id as `credential`. The spelling comparison
+    /// (against the resolved alias and the presented string) is kept as well, so the check
+    /// is never weaker than before. A reference that does not exist is skipped (it can
+    /// match only by spelling); any other resolver error, or an unreadable catalog,
+    /// refuses (fail closed).
     async fn refuse_llm_credential_off_channel(
         &self,
-        resolved_alias: &str,
+        credential: &Credential,
         presented: &str,
     ) -> Result<(), VultrinoError> {
-        if let Err(error) = self.storage.reload().await {
-            tracing::error!(%error, "capability catalog reload failed while checking for an LLM credential");
-            return Err(VultrinoError::PolicyUnavailable(
-                "the capability catalog is unavailable, so Vultrino cannot establish whether \
-                 this credential is an LLM channel; nothing was executed"
-                    .to_string(),
-            ));
-        }
-        let caps = self.storage.list_capabilities().await.map_err(|error| {
-            tracing::error!(%error, "capability lookup failed while checking for an LLM credential");
+        let unavailable = || {
             VultrinoError::PolicyUnavailable(
                 "the capability catalog is unavailable, so Vultrino cannot establish whether \
                  this credential is an LLM channel; nothing was executed"
                     .to_string(),
             )
+        };
+        if let Err(error) = self.storage.reload().await {
+            tracing::error!(%error, "capability catalog reload failed while checking for an LLM credential");
+            return Err(unavailable());
+        }
+        let caps = self.storage.list_capabilities().await.map_err(|error| {
+            tracing::error!(%error, "capability lookup failed while checking for an LLM credential");
+            unavailable()
         })?;
-        let (a, b) = (resolved_alias.trim(), presented.trim());
-        if caps.iter().any(|cap| {
-            cap.is_llm_proxy() && {
-                let c = cap.credential_ref.trim();
-                c == a || c == b
+        let (a, b) = (credential.alias.trim(), presented.trim());
+        let mut is_llm = false;
+        for cap in caps.iter().filter(|cap| cap.is_llm_proxy()) {
+            let c = cap.credential_ref.trim();
+            if c == a || c == b {
+                is_llm = true;
+                break;
             }
-        }) {
+            match self.resolver.resolve(c).await {
+                Ok(referenced) if referenced.id == credential.id => {
+                    is_llm = true;
+                    break;
+                }
+                Ok(_) | Err(VultrinoError::CredentialNotFound(_)) => {}
+                Err(error) => {
+                    tracing::error!(%error, "credential lookup failed while checking for an LLM credential");
+                    return Err(unavailable());
+                }
+            }
+        }
+        if is_llm {
             return Err(VultrinoError::LlmChannelOnly(format!(
-                "credential '{resolved_alias}' is an LLM provider credential and is usable only \
-                 through the /llm proxy; nothing was executed"
+                "credential '{}' is an LLM provider credential and is usable only \
+                 through the /llm proxy; nothing was executed",
+                credential.alias
             )));
         }
         Ok(())
     }
 
+    /// Trusted irreversibility for D3 floors: resolve from stored capability metadata
+    /// (not requester-authored params). Production strict mode binds the executing
+    /// credential as well as the canonical action or Govder label.
     async fn resolve_irreversibility_for_action(
         &self,
         credential_alias: &str,

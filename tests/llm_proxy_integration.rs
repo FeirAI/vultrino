@@ -2339,3 +2339,106 @@ async fn non_llm_credential_via_execute_and_mcp_still_works_and_llm_still_works(
     let resp = st.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "streamed /llm still works");
 }
+
+// ---------------------------------------------------------------------------
+// Credential IDENTITY, not spelling: a capability may reference its credential by the
+// vault id, which the resolver accepts and /llm resolves. The refusal must hold for any
+// spelling of the same credential, in both directions.
+// ---------------------------------------------------------------------------
+
+async fn execute_status_with(st: &WsStack, bearer: &str, cred: &str) -> StatusCode {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/execute")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "credential": cred,
+                "method": "POST",
+                "url": "https://api.anthropic.com/v1/messages",
+                "body": { "model": "claude-haiku-4-5", "max_tokens": 16, "messages": [] },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    st.router.clone().oneshot(req).await.unwrap().status()
+}
+
+async fn cred_id(st: &WsStack, alias: &str) -> String {
+    st.storage
+        .get_by_alias(alias)
+        .await
+        .unwrap()
+        .expect("credential")
+        .id
+        .to_string()
+}
+
+/// Re-point the channel capability's `credential_ref`.
+async fn repoint_llm_cap(st: &WsStack, credential_ref: &str) {
+    let mut cap = st
+        .storage
+        .list_capabilities()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == "cap-llm")
+        .unwrap();
+    cap.credential_ref = credential_ref.to_string();
+    st.storage.store_capability(&cap).await.unwrap();
+}
+
+async fn assert_refused_everywhere(st: &WsStack, presented: &str) {
+    let (full, tok) = UseToken::create(NewUseToken {
+        name: "once".to_string(),
+        credential_scope: "*".to_string(),
+        action_scope: None,
+        max_uses: Some(1),
+        require_approval: false,
+        expires_in: None,
+    });
+    st.storage.store_use_token(&tok).await.unwrap();
+    let wide = mint_token(&st.storage, "*", None).await;
+    for bearer in [wide, full] {
+        assert_eq!(
+            execute_status_with(st, &bearer, presented).await,
+            StatusCode::FORBIDDEN,
+            "execute with {presented:?} must be refused"
+        );
+    }
+    let err = via_mcp_cred(st, presented, None)
+        .await
+        .expect_err("MCP http_request must be refused");
+    assert!(err.contains("/llm"), "{err}");
+    assert_eq!(calls(st), 0, "the upstream must see nothing");
+    assert!(meter_events(&st.storage).await.is_empty());
+    let uses = st
+        .storage
+        .list_use_tokens()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == tok.id)
+        .unwrap()
+        .uses;
+    assert_eq!(
+        uses, 0,
+        "a refused request must not consume the one-use token"
+    );
+}
+
+#[tokio::test]
+async fn llm_credential_capability_by_id_alias_request_is_refused() {
+    let st = ws_stack(None).await;
+    let id = cred_id(&st, "cred-anthropic").await;
+    repoint_llm_cap(&st, &id).await;
+    assert_refused_everywhere(&st, "cred-anthropic").await;
+}
+
+#[tokio::test]
+async fn llm_credential_capability_by_alias_id_request_is_refused() {
+    let st = ws_stack(None).await;
+    let id = cred_id(&st, "cred-anthropic").await;
+    assert_refused_everywhere(&st, &id).await;
+}

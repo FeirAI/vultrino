@@ -7069,3 +7069,141 @@ async fn approval_open_refuses_invalid_stored_workspace_without_side_effects() {
         "no approval may be opened"
     );
 }
+
+fn llm_capability_for(credential_ref: &str) -> vultrino::capability::Capability {
+    use vultrino::capability::{Capability, CapabilityTarget, LlmProxy};
+    Capability {
+        id: "cap-llm".to_string(),
+        tool_name: "model_proxy".to_string(),
+        description: "llm channel".to_string(),
+        action: "mock.echo".to_string(),
+        plugin: None,
+        target: CapabilityTarget::default(),
+        credential_ref: credential_ref.to_string(),
+        input_schema: serde_json::Value::Null,
+        reversibility: "reversible".to_string(),
+        llm: Some(LlmProxy {
+            protocol: "anthropic-messages".to_string(),
+            provider_base: "https://api.anthropic.com".to_string(),
+            ..Default::default()
+        }),
+        approval_preview: None,
+    }
+}
+
+#[tokio::test]
+async fn llm_credential_refusal_keeps_tenant_and_scope_gates_first() {
+    // A team-a LLM credential. The LLM-channel refusal must come AFTER the use-token
+    // scope check and the V11 tenant gate: a cross-tenant attempt keeps its own error,
+    // detect event and counter (and learns nothing about the credential), and an
+    // out-of-scope token gets the not-scoped error.
+    let (server, storage) = setup_tenants(false, vec![]).await;
+    let cred = Credential::new(
+        "llm-cred".to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new("secret"),
+            header_name: "x-api-key".to_string(),
+            header_prefix: String::new(),
+        },
+    )
+    .with_metadata("tenant", "team-a");
+    storage.store(&cred).await.unwrap();
+    storage
+        .store_capability(&llm_capability_for("llm-cred"))
+        .await
+        .unwrap();
+
+    // team-b, scoped '*': cross-tenant error, not the LLM-channel error.
+    let token = tenant_token("team-b");
+    storage.store_use_token(&token).await.unwrap();
+    let err = server
+        .execute_gated(echo_request("llm-cred"), tenant_auth(&token))
+        .await
+        .unwrap_err();
+    match &err {
+        vultrino::VultrinoError::PolicyDenied(m) => {
+            assert!(m.contains("belongs to tenant"), "{m}");
+        }
+        other => panic!("expected the cross-tenant PolicyDenied, got {other:?}"),
+    }
+    let events = storage.list_events_after(0, 100).await.unwrap();
+    assert!(
+        events.iter().any(|e| {
+            e.event_type == vultrino::outbox::EVENT_POLICY_DENIED
+                && e.payload["kind"] == "cross_tenant_isolation"
+                && e.payload["credential"] == "llm-cred"
+        }),
+        "cross-tenant detect event must be emitted for an LLM credential"
+    );
+
+    // A token not scoped to the credential: the not-scoped error.
+    let mut scoped = tenant_token("team-a");
+    scoped.credential_scope = "other-*".to_string();
+    storage.store_use_token(&scoped).await.unwrap();
+    let err = server
+        .execute_gated(echo_request("llm-cred"), tenant_auth(&scoped))
+        .await
+        .unwrap_err();
+    match &err {
+        vultrino::VultrinoError::PolicyDenied(m) => {
+            assert!(
+                m.contains("not scoped to credential") || m.contains("Access denied to credential"),
+                "{m}"
+            );
+        }
+        other => panic!("expected the not-scoped PolicyDenied, got {other:?}"),
+    }
+
+    // The right tenant and scope reaches the LLM-channel refusal.
+    let ok = tenant_token("team-a");
+    storage.store_use_token(&ok).await.unwrap();
+    let err = server
+        .execute_gated(echo_request("llm-cred"), tenant_auth(&ok))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, vultrino::VultrinoError::LlmChannelOnly(_)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn llm_credential_approval_is_not_resumed() {
+    // An approval opened on a credential before it backed an LLM channel (or opened
+    // through /llm, which has no client to receive a resumed response) never runs.
+    use vultrino::policy::{Policy, PolicyAction};
+    let mut prompt_policy = Policy::deny_all("gate-it", "gated-*");
+    prompt_policy.default_action = PolicyAction::Prompt;
+    let (server, storage) = setup_deny_mode(vec![prompt_policy]).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.plugins().register(Arc::new(CountingPlugin {
+        calls: calls.clone(),
+    }));
+    store_credential(&storage, "gated-cred", false).await;
+    let approval_id = match server
+        .execute_gated(echo_request("gated-cred"), ExecAuth::default())
+        .await
+        .unwrap()
+    {
+        ExecutionOutcome::Pending(a) => a.id,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    storage
+        .store_capability(&llm_capability_for("gated-cred"))
+        .await
+        .unwrap();
+    approve(&storage, &approval_id).await;
+    let resumed = server
+        .check_and_resume_approval(&approval_id, None)
+        .await
+        .unwrap();
+    assert!(
+        resumed
+            .result_error
+            .as_deref()
+            .is_some_and(|e| e.contains("/llm")),
+        "resume must refuse an LLM credential: {:?}",
+        resumed.result_error
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
