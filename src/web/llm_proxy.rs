@@ -721,80 +721,206 @@ fn field_is_priced(kind: Kind, dialect: Dialect, value: &serde_json::Value) -> b
     }
 }
 
-/// Whether a media type names audio or video content (case-insensitive).
-fn is_av_mime(v: &serde_json::Value) -> bool {
-    v.as_str().is_some_and(|m| {
-        let m = m.trim().to_ascii_lowercase();
-        m.starts_with("audio/") || m.starts_with("video/")
+/// Media types a Gemini `inlineData` or `fileData` part may carry: those that bill at the
+/// model's token rate (images, PDF, text). Anything else, including audio, video and a type
+/// the provider adds next year, is refused until the card prices it. Matching is exact on the
+/// lowercased string (no trimming, no parameters), so a spelling the proxy does not recognise
+/// is refused rather than forwarded.
+const PRICED_MEDIA_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+    "image/gif",
+    "application/pdf",
+];
+
+/// Whether a media type value is a string on [`PRICED_MEDIA_TYPES`] or a `text/*` type. A
+/// missing, non-string or any other value is not priced.
+fn is_priced_mime(v: Option<&serde_json::Value>) -> bool {
+    v.and_then(serde_json::Value::as_str).is_some_and(|m| {
+        let m = m.to_ascii_lowercase();
+        PRICED_MEDIA_TYPES.contains(&m.as_str()) || m.starts_with("text/")
     })
 }
 
+/// How deep the Gemini body walk goes before it refuses (fail closed): a body nested deeper
+/// than this cannot exhaust the stack and cannot hide a part below the walk.
+const MODALITY_WALK_MAX_DEPTH: usize = 64;
+
+/// Walk a Gemini request value at any depth, treating a single object and an array the same
+/// (Google's parser accepts one object for a repeated field, and the proxy forwards the value
+/// as parsed). An object under `inlineData`, `inline_data`, `fileData` or `file_data` must be
+/// an object whose `mimeType` / `mime_type` is on the priced list, and a `responseModalities`
+/// or `response_modalities` must be a non-empty array of exactly `TEXT`; anything else is a
+/// marker. Returns what was found.
+fn gemini_media_marker(v: &serde_json::Value, depth: usize) -> Option<String> {
+    use serde_json::Value;
+    match v {
+        Value::Array(items) => items.iter().find_map(|i| gemini_media_marker(i, depth + 1)),
+        Value::Object(map) => gemini_map_marker(map, depth),
+        _ => None,
+    }
+    .or_else(|| {
+        (depth > MODALITY_WALK_MAX_DEPTH).then(|| {
+            format!(
+                "the request nests deeper than {MODALITY_WALK_MAX_DEPTH} levels, so its media parts cannot be checked"
+            )
+        })
+    })
+}
+
+/// [`gemini_media_marker`] for one object (the body itself, or any object inside it).
+fn gemini_map_marker(
+    map: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> Option<String> {
+    use serde_json::Value;
+    if depth > MODALITY_WALK_MAX_DEPTH {
+        return Some(format!(
+            "the request nests deeper than {MODALITY_WALK_MAX_DEPTH} levels, so its media parts cannot be checked"
+        ));
+    }
+    for (key, value) in map {
+        match key.as_str() {
+            "inlineData" | "inline_data" | "fileData" | "file_data" => {
+                // Every media type key present must be priced, and one must be present.
+                let priced = value.as_object().is_some_and(|media| {
+                    let types: Vec<_> = ["mimeType", "mime_type"]
+                        .iter()
+                        .filter_map(|k| media.get(*k))
+                        .collect();
+                    !types.is_empty() && types.into_iter().all(|t| is_priced_mime(Some(t)))
+                });
+                if !priced {
+                    return Some(format!(
+                        "a `{key}` part whose media type is missing or is not an image, PDF or text type bills above the token rate or cannot be priced"
+                    ));
+                }
+            }
+            "responseModalities" | "response_modalities" => {
+                let text_only = value.as_array().is_some_and(|list| {
+                    !list.is_empty() && list.iter().all(|m| m.as_str() == Some("TEXT"))
+                });
+                if !text_only {
+                    return Some(format!(
+                        "`{key}` is empty or names an output modality other than TEXT, which bills above the token rate"
+                    ));
+                }
+            }
+            _ => {}
+        }
+        if let Value::Array(_) | Value::Object(_) = value {
+            if let Some(found) = gemini_media_marker(value, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Content part types of an OpenAI chat or responses request that bill at the token rate.
+const OPENAI_PRICED_PART_TYPES: &[&str] = &[
+    "text",
+    "image_url",
+    "input_text",
+    "input_image",
+    "output_text",
+    "refusal",
+];
+
+/// Responses input item types that are plain conversation turns (no server-side tool run).
+const OPENAI_PRICED_ITEM_TYPES: &[&str] = &[
+    "message",
+    "function_call",
+    "function_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "reasoning",
+    "item_reference",
+];
+
+/// The conversation items of an OpenAI-shaped body (`messages` or `input`), where a single
+/// object is read like a one-element array. A plain string input is text.
+fn openai_items(v: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match v {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        serde_json::Value::Object(_) => vec![v],
+        _ => Vec::new(),
+    }
+}
+
+/// An OpenAI chat or responses content part, or item, outside the token-rate allowlist: a
+/// part type other than text and image, a message that carries an `audio` reference, or an
+/// item of a type that runs something server side.
+fn openai_content_marker(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    use serde_json::Value;
+    for key in ["messages", "input"] {
+        let Some(value) = obj.get(key) else { continue };
+        for item in openai_items(value) {
+            let item = match item {
+                Value::String(_) => continue,
+                Value::Object(item) => item,
+                _ => {
+                    return Some(format!(
+                        "an entry of `{key}` that is not an object or a string cannot be shown to bill tokens alone"
+                    ))
+                }
+            };
+            if item.contains_key("audio") {
+                return Some(
+                    "a message carrying an `audio` object bills above the token rate".to_string(),
+                );
+            }
+            let item_type = item.get("type");
+            if let Some(t) = item_type {
+                let known = t.as_str().is_some_and(|t| {
+                    OPENAI_PRICED_ITEM_TYPES.contains(&t) || OPENAI_PRICED_PART_TYPES.contains(&t)
+                });
+                if !known {
+                    return Some(format!(
+                        "the `{key}` entry type {t} is not one the card prices at the token rate"
+                    ));
+                }
+            }
+            let parts = match item.get("content") {
+                Some(c @ (Value::Array(_) | Value::Object(_))) => openai_items(c),
+                _ => Vec::new(),
+            };
+            for part in parts {
+                if matches!(part, Value::String(_)) {
+                    continue;
+                }
+                let ok = part
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| OPENAI_PRICED_PART_TYPES.contains(&t));
+                if !ok {
+                    return Some(
+                        "a content part that is not text or an image (for example `input_audio`) bills above the token rate or cannot be priced"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
 /// A nested modality marker that bills above the base token rate inside an otherwise
-/// admitted field: a Gemini part with audio or video media (inline or by file reference), a
-/// Gemini `responseModalities` that names anything but TEXT, or an OpenAI `input_audio`
-/// content part. Only these markers are inspected; other nested options are not (bounded).
+/// admitted field, or that the proxy cannot show bills at it. Gemini: a recursive walk of the
+/// whole body (see [`gemini_media_marker`]). OpenAI chat, responses and Azure: a content part
+/// or item outside the token-rate allowlist (see [`openai_content_marker`]). Only these are
+/// inspected; other nested options are not (bounded).
 fn modality_marker(
     dialect: Dialect,
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
-    use serde_json::Value;
     match dialect {
-        Dialect::Gemini => {
-            if let Some(Value::Array(contents)) = obj.get("contents") {
-                for part in contents
-                    .iter()
-                    .filter_map(|c| c.get("parts").and_then(Value::as_array))
-                    .flatten()
-                {
-                    for key in ["inlineData", "inline_data", "fileData", "file_data"] {
-                        let Some(media) = part.get(key) else { continue };
-                        if ["mimeType", "mime_type"]
-                            .iter()
-                            .any(|k| media.get(k).is_some_and(is_av_mime))
-                        {
-                            return Some(format!(
-                                "a `{key}` part with audio or video content bills above the token rate"
-                            ));
-                        }
-                    }
-                }
-            }
-            for cfg in ["generationConfig", "generation_config"] {
-                for key in ["responseModalities", "response_modalities"] {
-                    match obj.get(cfg).and_then(|c| c.get(key)) {
-                        None => {}
-                        Some(Value::Array(list))
-                            if list.iter().all(|m| {
-                                m.as_str().is_some_and(|m| m.eq_ignore_ascii_case("text"))
-                            }) => {}
-                        Some(_) => {
-                            return Some(format!(
-                                "`{cfg}.{key}` names an output modality other than TEXT, which bills above the token rate"
-                            ))
-                        }
-                    }
-                }
-            }
-            None
-        }
+        Dialect::Gemini => gemini_map_marker(obj, 0),
         Dialect::OpenAiChat | Dialect::OpenAiResponses | Dialect::Azure => {
-            for key in ["messages", "input"] {
-                let Some(Value::Array(items)) = obj.get(key) else {
-                    continue;
-                };
-                let has_audio = items
-                    .iter()
-                    .filter_map(|m| m.get("content").and_then(Value::as_array))
-                    .flatten()
-                    .chain(items.iter())
-                    .any(|part| part.get("type").and_then(Value::as_str) == Some("input_audio"));
-                if has_audio {
-                    return Some(
-                        "an `input_audio` content part bills above the token rate".to_string(),
-                    );
-                }
-            }
-            None
+            openai_content_marker(obj)
         }
         Dialect::Anthropic | Dialect::Converse => None,
     }

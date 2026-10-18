@@ -3969,6 +3969,215 @@ async fn v2b_gemini_audio_video_parts_and_non_text_output_modalities_are_refused
     assert_eq!(calls_of(&calls), 3);
 }
 
+// ---- V2b round 5: the modality walk is an allowlist over the whole body ------------------
+
+fn nested(depth: usize) -> serde_json::Value {
+    let mut v = serde_json::json!({"leaf": 1});
+    for _ in 0..depth {
+        v = serde_json::json!({ "a": v });
+    }
+    v
+}
+
+#[tokio::test]
+async fn v2b_gemini_media_allowlist_walks_the_whole_body_in_every_shape() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let (router, _storage, token, calls) = proto_stack_models(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        &path,
+        "gemini",
+        GEMINI_BASE,
+        "VULTRINO_PROVIDER_GEMINI_ENABLED",
+        Vec::new(),
+    )
+    .await;
+    let wav = serde_json::json!({"inline_data": {"mime_type": "audio/wav", "data": "AA=="}});
+    let bodies = vec![
+        (
+            "contents as one object",
+            serde_json::json!({"contents": {"parts": {"inline_data": {"mime_type": "audio/wav", "data": "AA=="}}}}),
+        ),
+        (
+            "contents as object with a parts array",
+            serde_json::json!({"contents": {"parts": [wav.clone()]}}),
+        ),
+        (
+            "contents array with parts as one object",
+            serde_json::json!({"contents": [{"parts": wav.clone()}]}),
+        ),
+        (
+            "systemInstruction audio part",
+            serde_json::json!({"contents": [], "systemInstruction": {"parts": [wav.clone()]}}),
+        ),
+        (
+            "system_instruction audio part as one object",
+            serde_json::json!({"contents": [], "system_instruction": {"parts": wav.clone()}}),
+        ),
+        (
+            "functionResponse audio part",
+            serde_json::json!({"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "f", "response": {"x": 1}, "parts": [wav.clone()]}}]}]}),
+        ),
+        (
+            "fileData with no media type (YouTube form)",
+            serde_json::json!({"contents": [{"parts": [{"file_data": {"file_uri": "https://www.youtube.com/watch?v=abc"}}]}]}),
+        ),
+        (
+            "fileData octet-stream",
+            serde_json::json!({"contents": [{"parts": [{"fileData": {"mimeType": "application/octet-stream", "fileUri": "gs://b/x"}}]}]}),
+        ),
+        (
+            "inlineData with a non-string media type",
+            serde_json::json!({"contents": [{"parts": [{"inlineData": {"mimeType": 7, "data": "AA=="}}]}]}),
+        ),
+        (
+            "inlineData that is not an object",
+            serde_json::json!({"contents": [{"parts": [{"inlineData": "AA=="}]}]}),
+        ),
+        (
+            "one priced and one unpriced media type key",
+            serde_json::json!({"contents": [{"parts": [{"inlineData": {"mimeType": "image/png", "mime_type": "audio/wav", "data": "AA=="}}]}]}),
+        ),
+        (
+            "empty responseModalities",
+            serde_json::json!({"contents": [], "generationConfig": {"responseModalities": []}}),
+        ),
+        (
+            "responseModalities that is not an array",
+            serde_json::json!({"contents": [], "generation_config": {"response_modalities": "TEXT"}}),
+        ),
+        (
+            "body nested beyond the depth cap of the walk",
+            serde_json::json!({"contents": [], "generationConfig": nested(70)}),
+        ),
+    ];
+    for route in [
+        "v1beta/models/gemini-2.5-flash:generateContent",
+        "v1beta/models/gemini-2.5-flash:streamGenerateContent",
+    ] {
+        for (name, body) in &bodies {
+            let resp = router
+                .clone()
+                .oneshot(llm_req(Some(&token), route, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{route} {name}");
+            assert_eq!(
+                error_type(resp).await,
+                "modifier_unpriced",
+                "{route} {name}"
+            );
+        }
+    }
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+    // Priced media, TEXT-only modalities, an absent field and a moderately nested body pass.
+    let admitted = vec![
+        serde_json::json!({"contents": [{"parts": [{"text": "hi"}]}]}),
+        serde_json::json!({"contents": [{"parts": [{"inlineData": {"mimeType": "image/jpeg", "data": "AA=="}}]}]}),
+        serde_json::json!({"contents": {"parts": {"inline_data": {"mime_type": "image/webp", "data": "AA=="}}}}),
+        serde_json::json!({"contents": [{"parts": [{"fileData": {"mimeType": "application/pdf", "fileUri": "gs://b/x.pdf"}}]}]}),
+        serde_json::json!({"contents": [{"parts": [{"inlineData": {"mimeType": "text/plain", "data": "AA=="}}]}]}),
+        serde_json::json!({"contents": [], "generationConfig": {"responseModalities": ["TEXT"]}}),
+        serde_json::json!({"contents": [], "generationConfig": nested(20)}),
+    ];
+    for body in &admitted {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(
+                Some(&token),
+                "v1beta/models/gemini-2.5-flash:generateContent",
+                body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{body}");
+    }
+    assert_eq!(calls_of(&calls), admitted.len());
+}
+
+#[tokio::test]
+async fn v2b_openai_content_parts_are_an_allowlist_in_every_shape() {
+    let mut config = config_with_policies(vec![allow_policy("cred-*")]);
+    config
+        .llm_proxy
+        .azure_deployments
+        .insert("prod-4o".to_string(), "gpt-4o".to_string());
+    let (router, _storage, token, calls) = proto_stack(
+        config,
+        "gpt-4o",
+        "azure-openai",
+        "https://acme.openai.azure.com/openai",
+        "VULTRINO_PROVIDER_AZURE_OPENAI_ENABLED",
+    )
+    .await;
+    let route = "deployments/prod-4o/chat/completions";
+    let audio = serde_json::json!({"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}});
+    let bodies = vec![
+        (
+            "messages as one object, content array",
+            serde_json::json!({"messages": {"role": "user", "content": [audio.clone()]}}),
+        ),
+        (
+            "content as one object",
+            serde_json::json!({"messages": [{"role": "user", "content": audio.clone()}]}),
+        ),
+        (
+            "messages and content as one object",
+            serde_json::json!({"messages": {"role": "user", "content": audio.clone()}}),
+        ),
+        (
+            "input_audio streamed",
+            serde_json::json!({"stream": true, "messages": [{"role": "user", "content": [audio.clone()]}]}),
+        ),
+        (
+            "file part",
+            serde_json::json!({"messages": [{"role": "user", "content": [{"type": "file", "file": {"file_id": "f"}}]}]}),
+        ),
+        (
+            "part with no type",
+            serde_json::json!({"messages": [{"role": "user", "content": [{"input_audio": {"data": "AA=="}}]}]}),
+        ),
+        (
+            "part with a non-string type",
+            serde_json::json!({"messages": [{"role": "user", "content": [{"type": 3}]}]}),
+        ),
+        (
+            "message carrying an audio object",
+            serde_json::json!({"messages": [{"role": "assistant", "audio": {"id": "a"}}]}),
+        ),
+        (
+            "bare audio item",
+            serde_json::json!({"messages": [], "input": [audio.clone()]}),
+        ),
+    ];
+    for (name, body) in bodies {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), route, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{name}");
+    }
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+    let admitted = vec![
+        serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}),
+        serde_json::json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "https://x/y.png"}}]}]}),
+        serde_json::json!({"messages": {"role": "user", "content": {"type": "text", "text": "hi"}}}),
+    ];
+    for body in &admitted {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), route, body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{body}");
+    }
+    assert_eq!(calls_of(&calls), admitted.len());
+}
+
 #[tokio::test]
 async fn v2b_openai_input_audio_and_audio_output_requests_are_refused() {
     let mut config = config_with_policies(vec![allow_policy("cred-*")]);
