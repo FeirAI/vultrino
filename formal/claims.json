@@ -3871,6 +3871,21 @@
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::execute_gated_streaming_llm_channel",
           "sha256": "83c0c5fd1b14d59580bbe15b362c6eac60f1eb38fb34f668ff754fb5216e16f1"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::prepare_execution",
+          "sha256": "988296b828e918f533d0ca2ce2552341c1145a3dcaaf28190543666cfdb3e131"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_execute",
+          "sha256": "36dc28413c1c1ea90f1f6d45a43532d7216c5c1ef418e838da83e47906a48d1e"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "llm_proxy_impl",
+          "sha256": "f941ef904b9805ce694243377e230784877e5ddda6262a92bd2e84e509216444"
         }
       ],
       "mutants": [
