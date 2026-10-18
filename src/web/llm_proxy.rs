@@ -740,9 +740,46 @@ const PRICED_MEDIA_TYPES: &[&str] = &[
 /// Whether a media type value is a string on [`PRICED_MEDIA_TYPES`] or a `text/*` type. A
 /// missing, non-string or any other value is not priced.
 fn is_priced_mime(v: Option<&serde_json::Value>) -> bool {
-    v.and_then(serde_json::Value::as_str).is_some_and(|m| {
-        let m = m.to_ascii_lowercase();
-        PRICED_MEDIA_TYPES.contains(&m.as_str()) || m.starts_with("text/")
+    v.and_then(serde_json::Value::as_str)
+        .is_some_and(is_priced_mime_str)
+}
+
+/// [`is_priced_mime`] for a string already taken out of its value.
+fn is_priced_mime_str(m: &str) -> bool {
+    let m = m.to_ascii_lowercase();
+    PRICED_MEDIA_TYPES.contains(&m.as_str()) || m.starts_with("text/")
+}
+
+/// Whether an OpenAI image URL may be forwarded. A `data:` URL (any casing, leading
+/// whitespace ignored) declares its media type between `data:` and the first `;` or `,`
+/// (trimmed): it is admitted only when that type is priced, so a `data:audio/wav` or
+/// `data:video/mp4` URL, or one with no media type, is refused (fail closed). Any other URL
+/// (https and the like) is fetched by the provider and is not inspected.
+fn image_url_priced(url: &str) -> bool {
+    let url = url.trim_start();
+    let Some(head) = url.get(..5) else {
+        return true;
+    };
+    if !head.eq_ignore_ascii_case("data:") {
+        return true;
+    }
+    let rest = &url[5..];
+    let end = rest.find([';', ',']).unwrap_or(rest.len());
+    is_priced_mime_str(rest[..end].trim())
+}
+
+/// A marker for an `image_url` part (chat: a string or an object with `url`) or an
+/// `input_image` part (a string) whose data URL carries an unpriced media type.
+fn image_part_marker(part: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    use serde_json::Value;
+    let url = match part.get("image_url") {
+        Some(Value::String(u)) => Some(u.as_str()),
+        Some(Value::Object(o)) => o.get("url").and_then(Value::as_str),
+        _ => None,
+    }?;
+    (!image_url_priced(url)).then(|| {
+        "an image part whose data URL declares a media type that is not an image, PDF or text type (audio, video or none) bills above the token rate or cannot be priced"
+            .to_string()
     })
 }
 
@@ -785,6 +822,14 @@ fn gemini_map_marker(
     }
     for (key, value) in map {
         match key.as_str() {
+            // A JSON null is read like an absent key.
+            "inlineData"
+            | "inline_data"
+            | "fileData"
+            | "file_data"
+            | "responseModalities"
+            | "response_modalities"
+                if value.is_null() => {}
             "inlineData" | "inline_data" | "fileData" | "file_data" => {
                 // Every media type key present must be priced, and one must be present.
                 let priced = value.as_object().is_some_and(|media| {
@@ -869,12 +914,15 @@ fn openai_content_marker(obj: &serde_json::Map<String, serde_json::Value>) -> Op
                     ))
                 }
             };
-            if item.contains_key("audio") {
+            if item.get("audio").is_some_and(|a| !a.is_null()) {
                 return Some(
                     "a message carrying an `audio` object bills above the token rate".to_string(),
                 );
             }
-            let item_type = item.get("type");
+            if let Some(found) = image_part_marker(item) {
+                return Some(found);
+            }
+            let item_type = item.get("type").filter(|t| !t.is_null());
             if let Some(t) = item_type {
                 let known = t.as_str().is_some_and(|t| {
                     OPENAI_PRICED_ITEM_TYPES.contains(&t) || OPENAI_PRICED_PART_TYPES.contains(&t)
@@ -897,7 +945,11 @@ fn openai_content_marker(obj: &serde_json::Map<String, serde_json::Value>) -> Op
                     .get("type")
                     .and_then(Value::as_str)
                     .is_some_and(|t| OPENAI_PRICED_PART_TYPES.contains(&t));
-                if !ok {
+                if ok {
+                    if let Some(found) = part.as_object().and_then(image_part_marker) {
+                        return Some(found);
+                    }
+                } else {
                     return Some(
                         "a content part that is not text or an image (for example `input_audio`) bills above the token rate or cannot be priced"
                             .to_string(),

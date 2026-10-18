@@ -4241,3 +4241,151 @@ async fn v2b_openai_input_audio_and_audio_output_requests_are_refused() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(calls_of(&calls), 1);
 }
+
+// ---- V2b final round: data-URL media type on image parts, null as absent -----------------
+
+#[tokio::test]
+async fn v2b_openai_compat_data_url_media_type_is_checked_on_gemini_and_vertex_routes() {
+    for (protocol, base, flag) in [
+        (
+            "gemini",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "VULTRINO_PROVIDER_GEMINI_ENABLED",
+        ),
+        (
+            "vertex-ai",
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/endpoints/openapi",
+            "VULTRINO_PROVIDER_VERTEX_AI_ENABLED",
+        ),
+    ] {
+        let (router, _storage, token, calls) = proto_stack(
+            config_with_policies(vec![allow_policy("cred-*")]),
+            "gemini-2.5-flash",
+            protocol,
+            base,
+            flag,
+        )
+        .await;
+        let chat = |url: serde_json::Value, stream: bool| {
+            serde_json::json!({"model": "gemini-2.5-flash", "stream": stream, "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"}, {"type": "image_url", "image_url": url}]}]})
+        };
+        let refused = |name: &'static str, body: serde_json::Value| (name, body);
+        let mut bodies = Vec::new();
+        for stream in [false, true] {
+            bodies.push(refused(
+                "data:audio/wav",
+                chat(
+                    serde_json::json!({"url": "data:audio/wav;base64,AA=="}),
+                    stream,
+                ),
+            ));
+            bodies.push(refused(
+                "data:video/mp4 as a string",
+                chat(serde_json::json!("data:video/mp4;base64,AA=="), stream),
+            ));
+            bodies.push(refused(
+                "no media type",
+                chat(serde_json::json!({"url": "data:;base64,AA=="}), stream),
+            ));
+            bodies.push(refused(
+                "upper case scheme and type",
+                chat(
+                    serde_json::json!({"url": "DATA: Audio/WAV ;base64,AA=="}),
+                    stream,
+                ),
+            ));
+            bodies.push(refused(
+                "input_image part",
+                serde_json::json!({"model": "gemini-2.5-flash", "stream": stream, "messages": [{"role": "user", "content": [
+                    {"type": "input_image", "image_url": "data:video/mp4;base64,AA=="}]}]}),
+            ));
+        }
+        for (name, body) in bodies {
+            let resp = router
+                .clone()
+                .oneshot(llm_req(Some(&token), "chat/completions", body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{protocol} {name}");
+            assert_eq!(
+                error_type(resp).await,
+                "modifier_unpriced",
+                "{protocol} {name}"
+            );
+        }
+        assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+        let mut admitted = 0;
+        for stream in [false, true] {
+            for url in [
+                serde_json::json!({"url": "data:image/png;base64,AA=="}),
+                serde_json::json!("DATA:IMAGE/JPEG;base64,AA=="),
+                serde_json::json!({"url": "https://x.example/y.png"}),
+            ] {
+                let resp = router
+                    .clone()
+                    .oneshot(llm_req(Some(&token), "chat/completions", chat(url, stream)))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{protocol} {stream}");
+                admitted += 1;
+            }
+        }
+        assert_eq!(calls_of(&calls), admitted);
+    }
+}
+
+#[tokio::test]
+async fn v2b_null_is_read_like_an_absent_key() {
+    let mut config = config_with_policies(vec![allow_policy("cred-*")]);
+    config
+        .llm_proxy
+        .azure_deployments
+        .insert("prod-4o".to_string(), "gpt-4o".to_string());
+    let (router, _storage, token, calls) = proto_stack(
+        config,
+        "gpt-4o",
+        "azure-openai",
+        "https://acme.openai.azure.com/openai",
+        "VULTRINO_PROVIDER_AZURE_OPENAI_ENABLED",
+    )
+    .await;
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            "deployments/prod-4o/chat/completions",
+            serde_json::json!({"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok", "audio": null}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "assistant audio: null");
+    assert_eq!(calls_of(&calls), 1);
+
+    let (router, _storage, token, calls) = gemini_stack(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        GEMINI_BASE,
+    )
+    .await;
+    let bodies = [
+        serde_json::json!({"contents": [], "generationConfig": {"responseModalities": null}}),
+        serde_json::json!({"contents": [], "generationConfig": {"response_modalities": null}}),
+        serde_json::json!({"contents": [{"parts": [{"text": "hi", "inlineData": null, "inline_data": null, "fileData": null, "file_data": null}]}]}),
+    ];
+    for body in &bodies {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(
+                Some(&token),
+                "v1beta/models/gemini-2.5-flash:generateContent",
+                body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{body}");
+    }
+    assert_eq!(calls_of(&calls), bodies.len());
+}
