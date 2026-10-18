@@ -2328,4 +2328,14 @@ async fn non_llm_credential_via_execute_and_mcp_still_works_and_llm_still_works(
     // The channel itself is untouched.
     let (status, _) = via_llm(&st, None).await;
     assert_eq!(status, StatusCode::OK);
+    // And the streaming branch of the channel.
+    let mut req = llm_req(
+        Some(&st.token),
+        "v1/messages",
+        serde_json::json!({ "model": "claude-haiku-4-5", "max_tokens": 16, "messages": [], "stream": true }),
+    );
+    req.headers_mut()
+        .insert("anthropic-version", "2023-06-01".parse().unwrap());
+    let resp = st.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "streamed /llm still works");
 }

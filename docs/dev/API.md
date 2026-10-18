@@ -111,8 +111,8 @@ the request carries its header, the resolved subject refines the principal.
 
 **Errors:** `401 missing_api_key` / `invalid_api_key` / `invalid_token`;
 `403 token_unusable` (revoked/expired/exhausted use token);
-`400 execute_error` (policy denied, credential not found, SSRF block, plugin error
-— the message carries the reason);
+`400 execute_error` (policy denied, credential not found, SSRF block, plugin error;
+the message carries the reason);
 `403 llm_credential_channel_only` (the credential backs an LLM-proxy capability and is
 usable only through `/llm`; refused before policy, approval, use-token consumption or
 any upstream call).
