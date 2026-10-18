@@ -291,7 +291,7 @@ require_approval + dual_control; `checkpoint` = require_approval (multi-use).
 
 What this process enforces right now, for the deploy-time posture verifier in feir-os
 (`deploy/vps/deploy.sh verify-posture`). Needs a global (untenanted) admin key; a tenant-scoped key gets 403.
-Read-only. The body holds booleans, counts, identifiers and build provenance only, never a key, a rule or a
+Read-only. The body holds booleans, counts, identifiers, build provenance and secret fingerprints only, never a key, a rule or a
 credential: `schema`, `plane`, `build` (`version`, `rustc`, `git_sha`, `git_dirty`), `approvals`
 (`enabled`, `enforce_separation_of_duty`), `approver_identity` (`govder_configured`, `key_configured`,
 `key_distinct_from_govder_key`, `shared_key_escape`), `engine` (`default_deny`, `tenants_in_observe_mode`,
@@ -300,7 +300,17 @@ credential: `schema`, `plane`, `build` (`version`, `rustc`, `git_sha`, `git_dirt
 migrated when it is opened), `meter` (`append_failures_total`, `gap_pending`, `gap_markers_emitted`,
 `last_failure_at`: failed outbox appends, see [METERING.md](METERING.md)), `rate_card` (`require_priced_model`,
 `configured`, `sha256`: the fingerprint of the rate-card file as read at start, the same digest leria reports for the file; `file_sha256`: the file as last read successfully (it differs from `sha256` after the file changed, when coverage is the intersection of the two); `entries`;
-`last_error`: set when a changed file could not be used and the previous card still serves; the path is never reported).
+`last_error`: set when a changed file could not be used and the previous card still serves; the path is never reported),
+and `secret_fingerprints`: an object from relationship name to a list of keyed
+fingerprints of the shared secrets this process holds, for `vultrino-outbox-poll` and `vultrino-approval-push` (the
+`[outbox] hmac_secret`, one value fingerprinted once per relationship), `workload-assertion` (one fingerprint per verifier secret the workload exchange accepts, the same
+list it verifies with, so a rotation overlap reports both; present only while the exchange is configured),
+`tenant-assertion` (the secret it signs
+calls to govder with) and `approver-key` (the key that verifies the broker's signed approver decisions; absent when
+that key is not usable). A fingerprint is the first 16 bytes of HMAC-SHA256 keyed by the secret over
+`feir-secret-alignment/v1:<relationship>`: not the secret, but only as private as the secret is strong. An unset
+secret omits its relationship. feir-os's verifier compares the pairs across planes so a misaligned secret fails a
+deploy instead of surfacing later as refusals.
 
 It cannot see other processes: whether a second vultrino shares the vault is checked by the verifier on the host.
 `git_sha` is the commit the build script saw (`VULTRINO_BUILD_SHA` overrides it; an archive build reports `unknown`).
@@ -726,7 +736,10 @@ request notification, the one-time approve/deny URLs.
 `approval.requested`, `approval.approved`, `approval.denied`, `approval.escalated`,
 `approval.expired`, `agent.halted`, `policy.changed`, `capability.changed`,
 `policy.denied`, `policy.observed_denial`, `credential.rotated`,
-`credential.revoked`, `meter.observed`.
+`credential.revoked`, `meter.observed`, `evidence.receipt_gap` (an Observe-mode action ran but
+its evidence receipt did not reach Averin; subject = the use token id; payload = token id, project,
+request id, use sequence number, reason code, clipped detail, `at`, `outcome`; never params. Like every
+event it is pruned after `[outbox] retention_secs`, delivered or not, so a consumer must store it: govder does).
 
 Admin audit (observability item 4 / #17) — ids-only `{actor, target_id, verb}`
 payload (see `admin_audit_payload`), emitted best-effort after a successful

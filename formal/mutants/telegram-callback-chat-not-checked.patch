@@ -1,0 +1,14 @@
+diff --git a/src/approval/telegram_callbacks.rs b/src/approval/telegram_callbacks.rs
+index 401f981..2c486bd 100644
+--- a/src/approval/telegram_callbacks.rs
++++ b/src/approval/telegram_callbacks.rs
+@@ -223,8 +223,7 @@ pub async fn handle_callback_query(
+ ) -> CallbackOutcome {
+     // 1. Only presses on a button in the configured chat.
+     match q.message.as_ref().map(|m| m.chat.id) {
+-        Some(chat) if chat == cb.chat_id => {}
+-        _ => return refused("This button is not in the approvals chat; nothing was recorded."),
++        _ => {}
+     }
+     // 2. Only our own buttons.
+     let Some((approve, approval_id)) = q.data.as_deref().and_then(parse_callback_data) else {

@@ -1,0 +1,13 @@
+diff --git a/src/config/types.rs b/src/config/types.rs
+index 1f9d77e..f3caf97 100644
+--- a/src/config/types.rs
++++ b/src/config/types.rs
+@@ -827,7 +827,7 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
+                             )
+                             .map_err(ConfigError::Invalid)?,
+                         )
+-                    } else if !t.approvers.is_empty() {
++                    } else if false && !t.approvers.is_empty() {
+                         return Err(ConfigError::Invalid(
+                             "approvals.telegram.approvers is set but callback_decisions is not true; \
+                              the table would be ignored and every verdict would still be recorded as \

@@ -25,6 +25,7 @@ pub mod policy;
 pub mod ratecard;
 pub mod revocation;
 pub mod router;
+pub mod secret_fp;
 pub mod server;
 pub mod session;
 pub mod storage;

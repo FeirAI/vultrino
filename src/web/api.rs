@@ -3703,6 +3703,7 @@ pub async fn api_posture(admin: AdminApiAuth, State(state): State<AppState>) -> 
         &state.config,
         engine.default_deny(),
         &policies,
+        &state.workload_verifier,
         &state.storage.meter_loss(),
     );
     (StatusCode::OK, Json(report)).into_response()

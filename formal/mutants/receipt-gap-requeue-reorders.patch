@@ -1,0 +1,13 @@
+diff --git a/src/averin/mod.rs b/src/averin/mod.rs
+index 8f70357..60973be 100644
+--- a/src/averin/mod.rs
++++ b/src/averin/mod.rs
+@@ -622,7 +622,7 @@ impl AverinClient {
+     /// `receipt_gaps_overflowed`, never silently discarded.
+     pub(crate) fn requeue_receipt_gaps(&self, gaps: Vec<ReceiptGap>) {
+         let mut q = self.pending_gaps.lock();
+-        for gap in gaps.into_iter().rev() {
++        for gap in gaps.into_iter() {
+             if q.len() >= MAX_PENDING_RECEIPT_GAPS {
+                 self.metrics
+                     .receipt_gaps_overflowed

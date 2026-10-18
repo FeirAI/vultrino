@@ -421,7 +421,9 @@ async fn open_approved_fixture_floor(
     config.govder = Some(govder);
     if let Some(mode) = averin_mode {
         config.averin = AverinConfig {
-            enabled: true,
+            // An empty base_url models "no Averin client": an ENABLED block with no URL no longer
+            // starts (FEI-33), so that case is a disabled block with the D8 setting still on.
+            enabled: !averin_base_url.trim().is_empty(),
             base_url: averin_base_url,
             resource_id: "orders-db".to_string(),
             mode,
@@ -1242,7 +1244,8 @@ async fn default_floor_degrades_a_partially_reversible_write_but_refuses_money_a
     );
 }
 
-/// With no Averin client (empty base_url, so none is built) there is no evidence path at all:
+/// With no Averin client (the fixture models it as a disabled block: an enabled block that cannot
+/// build a client refuses to start, FEI-33) there is no evidence path at all:
 /// the routine fallback must not run the action silently, in the default mode too.
 #[tokio::test]
 async fn default_floor_refuses_a_partially_reversible_write_when_no_averin_client_exists() {

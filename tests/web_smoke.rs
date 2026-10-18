@@ -2378,6 +2378,77 @@ async fn test_out_of_band_decide_without_named_identity_is_refused() {
 }
 
 #[tokio::test]
+async fn fei16_decision_links_cannot_complete_a_two_person_action() {
+    // A decision link carries no identity: every click is recorded as the one configured
+    // oob_approver_identity, so a second click is the SAME approver and is refused as a
+    // duplicate. Two link clicks therefore never satisfy a two-person rule (fail closed). One link
+    // click plus ONE sign-off under another identity still does, and may be the same person (see
+    // approval::tests::fei16_a_link_is_one_unknown_identity...). Per-person attribution is the
+    // Telegram callback mode ([approvals.telegram] callback_decisions), or the Approvals screen.
+    let (router, storage) = build_router().await;
+
+    let (approval, token) = ApprovalRequest::open(NewApproval {
+        credential: "stripe-prod".to_string(),
+        action: "http.request".to_string(),
+        params: serde_json::json!({"method": "post", "url": "https://api.stripe.com/v1/refunds"}),
+        requester: RequesterInfo::local(),
+        use_token_id: None,
+        principal_id: None,
+        agent_label: None,
+        tenant: None,
+        workload_id: None,
+        preview: None,
+        action_label: None,
+        dual_control: true,
+        criticality: vultrino::approval::CriticalityClass::Medium,
+        trusted_irreversible: None,
+        escalate_after: chrono::Duration::minutes(30),
+        escalate_window: chrono::Duration::minutes(30),
+        oob_identity: Some("oncall".to_string()),
+        reauth_interval_secs: None,
+        required_approvals: 2,
+        approval_rule: None,
+    });
+    storage.store_approval(&approval).await.unwrap();
+
+    let click = |router: axum::Router| {
+        let form = format!("token={}&decision=approve", urlencoding::encode(&token));
+        let id = approval.id.clone();
+        async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/approvals/{id}/decide"))
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(form))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let first = click(router.clone()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = click(router.clone()).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = body_string(second).await;
+    assert!(
+        second_body.contains("could not be updated"),
+        "the second click must be refused: {second_body}"
+    );
+
+    let stored = storage.get_approval(&approval.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.status(),
+        vultrino::approval::ApprovalStatus::Pending,
+        "two link clicks must not satisfy a two-person action"
+    );
+    assert_eq!(stored.signoffs().len(), 1, "one identity, one sign-off");
+    assert_eq!(stored.signoffs()[0].approver_identity, "oncall");
+}
+
+#[tokio::test]
 async fn test_admin_halt_agent_installs_kill_and_lists_sessions() {
     let (router, storage, server, key) = build_admin_router().await;
 

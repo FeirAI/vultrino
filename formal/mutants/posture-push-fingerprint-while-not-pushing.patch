@@ -1,0 +1,14 @@
+diff --git a/src/web/posture.rs b/src/web/posture.rs
+index c1a181d..1dea959 100644
+--- a/src/web/posture.rs
++++ b/src/web/posture.rs
+@@ -104,7 +104,8 @@ fn secret_fingerprints(config: &Config) -> Value {
+             .url
+             .as_deref()
+             .is_some_and(|u| !u.trim().is_empty());
+-    add(REL_APPROVAL_PUSH, outbox.filter(|_| pushing));
++    let _ = pushing;
++    add(REL_APPROVAL_PUSH, outbox);
+     // Reported only while the seal client is on: AVERIN_API_KEY is read but never sent otherwise.
+     add(
+         REL_AVERIN_API_KEY,
