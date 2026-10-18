@@ -110,10 +110,10 @@ jobs:
   formal-fast:
     name: formal register and fast mutants
     runs-on: ubuntu-latest
-    # About 20 minutes with a warm cache; a cold dependency build (a Cargo.lock
-    # change, or a new cache key) adds several minutes. 30 was hit on main on
-    # 2026-10-08 (issue #47).
-    timeout-minutes: 60
+    # About 56 minutes on main with 105 fast-tier mutants (measured); a cold
+    # dependency build (a Cargo.lock change, or a new cache key) adds several
+    # minutes. 30 and then 60 were hit (issue #47, PR #74 runs).
+    timeout-minutes: 90
     env:
       # One target dir under the workspace so rust-cache keeps the dependency
       # build; the mutant scratch worktree reuses it through --cargo-target-dir

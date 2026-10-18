@@ -545,13 +545,13 @@
       "tier": "fast"
     },
     "posture-averin-key-reported-while-seal-client-off": {
-      "tier": "fast"
+      "tier": "full"
     },
     "averin-enabled-config-accepts-empty-base-url": {
-      "tier": "fast"
+      "tier": "full"
     },
     "averin-enabled-config-accepts-empty-resource-id": {
-      "tier": "fast"
+      "tier": "full"
     },
     "url-exact-prompt-refused-in-default-deny": {
       "tier": "full",
@@ -718,15 +718,15 @@
       "claim": "anthropic-workspace-id-operator-owned"
     },
     "posture-workload-assertion-not-reported": {
-      "tier": "fast",
+      "tier": "full",
       "claim": "secret-fingerprint-report"
     },
     "posture-workload-reports-only-first-secret": {
-      "tier": "fast",
+      "tier": "full",
       "claim": "secret-fingerprint-report"
     },
     "averin-enabled-config-accepts-unusable-base-url": {
-      "tier": "fast",
+      "tier": "full",
       "claim": "observe-receipt-gap-recorded"
     },
     "averin-enabled-server-start-ignores-client-error": {
@@ -773,10 +773,10 @@
       "tier": "full"
     },
     "posture-averin-api-key-configured-not-reported": {
-      "tier": "fast"
+      "tier": "full"
     },
     "posture-averin-api-key-configured-hardcoded-false": {
-      "tier": "fast"
+      "tier": "full"
     }
   },
   "claims": [
