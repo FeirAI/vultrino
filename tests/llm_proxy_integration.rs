@@ -2743,6 +2743,12 @@ async fn oa_via_llm(
             .insert("openai-organization", ATTACKER_ORG.parse().unwrap());
         req.headers_mut()
             .insert("openai-project", ATTACKER_PROJECT.parse().unwrap());
+        req.headers_mut().insert(
+            "x-goog-user-project",
+            "attacker-gcp-project".parse().unwrap(),
+        );
+        req.headers_mut()
+            .insert("x-goog-api-client", "sdk/1".parse().unwrap());
     }
     let resp = st.router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
@@ -2839,6 +2845,23 @@ async fn openai_org_project_llm_injects_stored_and_drops_client_values() {
             assert_eq!(oa_count(&h, "openai-organization"), 1, "{ctx}");
             assert_eq!(oa_count(&h, "openai-project"), 1, "{ctx}");
             assert_eq!(h["openai-beta"], "assistants=v2", "{ctx}");
+        }
+    }
+}
+
+/// The Google quota and billing project is the key's own: a client-sent
+/// `x-goog-user-project` never reaches the upstream, on any /llm route, buffered or
+/// streamed. Other allowlisted provider headers still ride along.
+#[tokio::test]
+async fn openai_org_project_llm_client_x_goog_user_project_never_reaches_upstream() {
+    for protocol in ["openai-chat", "openai-responses"] {
+        for stream in [false, true] {
+            let st = oa_stack(protocol, None, None).await;
+            let (status, h) = oa_via_llm(&st, protocol, stream, true).await;
+            let ctx = format!("{protocol} stream={stream}: {h}");
+            assert_eq!(status, StatusCode::OK, "{ctx}");
+            assert_eq!(oa_count(&h, "x-goog-user-project"), 0, "{ctx}");
+            assert_eq!(h["x-goog-api-client"], "sdk/1", "{ctx}");
         }
     }
 }

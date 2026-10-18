@@ -100,11 +100,15 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
 ///   organization and project that are billed and scoped, so they are the
 ///   operator's (credential metadata), injected downstream, never the client's.
 ///   The same goes for `anthropic-workspace-id`.
+/// - `x-goog-user-project` is NOT forwarded either: it picks the Google quota and
+///   billing project on Vertex AI and Gemini channels (and their OpenAI-compatible
+///   routes), so a client value is dropped and the request uses the key's own
+///   project, the same as an unset gateway setting. A gateway-owned Google project
+///   setting is not offered yet.
 const FORWARDED_PROVIDER_HEADERS: &[&str] = &[
     "anthropic-version",
     "anthropic-beta",
     "openai-beta",
-    "x-goog-user-project",
     "x-goog-api-client",
     "x-ms-client-request-id",
 ];

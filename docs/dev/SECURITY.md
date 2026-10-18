@@ -358,8 +358,9 @@ header of any of those names, in any case, is removed on `/llm` (chat, responses
 every other protocol, buffered and streamed), `POST /api/v1/execute`, the MCP
 `http_request` tool and approval replay; the `/llm` forwarded-header allowlist no longer
 includes the two OpenAI headers. A credential with no setting sends no header, so a key
-that spans several organizations or projects is left for the provider to refuse rather
-than letting the agent pick. A stored value that fails its format check is a credential
+that spans several organizations or projects is billed and scoped by OpenAI to the key
+owner's default organization and project (OpenAI does not refuse such a request), and
+the agent no longer picks. A stored value that fails its format check is a credential
 configuration error: the request is refused before any upstream call and before a use
 token is consumed. Bounds: the format check is a sanity check on the header value, not
 OpenAI's or Anthropic's own validation, and a header that is neither of these three

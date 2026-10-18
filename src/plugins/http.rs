@@ -1042,7 +1042,8 @@ impl HttpPlugin {
         Ok(url)
     }
 
-    /// Parse the request params and make the `anthropic-workspace-id` header the
+    /// Parse the request params and make the gateway-owned provider scope headers
+    /// (`anthropic-workspace-id`, `openai-organization`, `openai-project`) the
     /// operator's: any caller-supplied one is dropped and the credential's own value
     /// (metadata), if any, is written. This is the plugin-level seam, so it holds for
     /// every caller of the plugin, whatever the path that reached it.

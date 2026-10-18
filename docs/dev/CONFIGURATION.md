@@ -206,8 +206,9 @@ call. Vultrino sends the stored value on `/llm` (chat and responses, buffered an
 streamed), `POST /api/v1/execute`, the MCP `http_request` tool and approval replay, and
 drops any `openai-organization` or `openai-project` a caller sent, whatever the case.
 A credential with no setting sends neither header, so a key that spans several
-organizations or projects is left for OpenAI to refuse rather than letting the agent
-choose which one is billed. This applies to any credential, so it also removes the two
+organizations or projects is billed and scoped by OpenAI to the key owner's default
+organization and project; OpenAI does not refuse such a request, and the agent no
+longer chooses which one is billed. This applies to any credential, so it also removes the two
 headers on an Azure OpenAI route, where they are not used.
 
 ### `[[policies]]` — static declarative policies
