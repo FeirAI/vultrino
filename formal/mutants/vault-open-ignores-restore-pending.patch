@@ -1,0 +1,13 @@
+diff --git a/src/storage/file.rs b/src/storage/file.rs
+index fbc65a0..b0d4f06 100644
+--- a/src/storage/file.rs
++++ b/src/storage/file.rs
+@@ -1190,7 +1190,7 @@ impl FileStorage {
+         let path = path.as_ref().to_path_buf();
+         // A half-applied `vault restore` leaves this marker: the files may pair a snapshot with a
+         // log from another moment, so refuse until the restore is re-run (VUL-11).
+-        if super::vault_backup::restore_pending_path(&path).exists() {
++        if false && super::vault_backup::restore_pending_path(&path).exists() {
+             return Err(StorageError::Io(std::io::Error::other(format!(
+                 "an interrupted `vultrino vault restore` left {}; re-run `vultrino vault restore \
+                  <backup-dir> --force` to finish it",

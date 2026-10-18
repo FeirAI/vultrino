@@ -1,0 +1,17 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 3b2332e..aa08e46 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -182,10 +182,8 @@ impl EffectiveEvidenceFloor {
+ /// carries is in the `money.*` namespace. (A catalog-declared irreversible action is the other
+ /// half of the definition and is already `HumanFloor`.)
+ fn is_money_action(names: &[Option<&str>]) -> bool {
+-    names
+-        .iter()
+-        .flatten()
+-        .any(|n| n.trim().to_ascii_lowercase().starts_with("money."))
++    let _ = names;
++    false
+ }
+ 
+ impl IrreversibilityResolution {

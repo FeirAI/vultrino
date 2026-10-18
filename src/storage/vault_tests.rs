@@ -1680,3 +1680,110 @@ async fn a_second_outage_gets_its_own_marker() {
     assert_eq!(markers.len(), 2);
     assert!(markers.iter().all(|m| m.payload["lost_count"] == 1));
 }
+
+// ---- VUL-06: a waiting kill write is not starved by a stream of shared-lock fence reads ----
+
+/// Run `f` on its own thread with a current-thread runtime, as the fence tests above do.
+fn on_thread<T: Send + 'static>(
+    f: impl FnOnce(&tokio::runtime::Runtime) -> T + Send + 'static,
+) -> std::sync::mpsc::Receiver<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _ = tx.send(f(&rt));
+    });
+    rx
+}
+
+#[tokio::test]
+async fn a_waiting_kill_write_holds_new_fence_readers_behind_it() {
+    // A dispatch is in flight (shared lock held). The kill write arrives and waits for it. A
+    // fence read that starts AFTER the writer must queue behind the writer, not slip in beside
+    // the in-flight holder; with a plain flock it would complete at once and, repeated, starve
+    // the writer. When the holder leaves, the kill commits first and the late reader sees it.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let writer = std::sync::Arc::new(open(&path).await);
+    let reader = std::sync::Arc::new(open(&path).await);
+    let holder = open(&path).await;
+    let epoch0 = reader.kill_fence_epoch().await;
+    let flock = holder.lock_file().unwrap();
+    let guard = flock.read().unwrap();
+
+    let w = std::sync::Arc::clone(&writer);
+    let wrx = on_thread(move |rt| {
+        rt.block_on(w.store_policy(&kill("k-starve", "gh-*")))
+            .is_ok()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        wrx.try_recv().is_err(),
+        "the kill write must wait for the in-flight holder"
+    );
+
+    let r = std::sync::Arc::clone(&reader);
+    let rrx = on_thread(move |rt| {
+        matches!(
+            rt.block_on(r.kill_fence_check(&q("gh-main", epoch0)))
+                .unwrap(),
+            KillFenceVerdict::Halted { .. }
+        )
+    });
+    assert!(
+        rrx.recv_timeout(std::time::Duration::from_millis(400))
+            .is_err(),
+        "a fence read that starts after a waiting kill write must queue behind it"
+    );
+    drop(guard);
+    assert_eq!(
+        wrx.recv_timeout(std::time::Duration::from_secs(10)),
+        Ok(true)
+    );
+    assert_eq!(
+        rrx.recv_timeout(std::time::Duration::from_secs(10)),
+        Ok(true),
+        "the reader that queued behind the kill sees it"
+    );
+}
+
+#[tokio::test]
+async fn a_kill_write_completes_in_bounded_time_under_a_stream_of_fence_reads() {
+    // Eight handles loop fence reads continuously for the whole test; a kill write on a ninth
+    // must still complete within a bound, and every read after it sees the kill.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.enc");
+    let writer = open(&path).await;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut loops = vec![];
+    for _ in 0..8 {
+        let h = open(&path).await;
+        let stop = std::sync::Arc::clone(&stop);
+        loops.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                rt.block_on(h.kill_fence_check(&q("gh-main", 0))).unwrap();
+                n += 1;
+            }
+            n
+        }));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    writer
+        .store_policy(&kill("k-bounded", "gh-*"))
+        .await
+        .unwrap();
+    let waited = started.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let reads: u64 = loops.into_iter().map(|t| t.join().unwrap()).sum();
+    assert!(reads > 0, "the readers must have been running");
+    assert!(
+        waited < std::time::Duration::from_secs(5),
+        "the kill write waited {waited:?} behind {reads} fence reads"
+    );
+}

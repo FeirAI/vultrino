@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 3b2332e..916fa2d 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -219,7 +219,7 @@ impl IrreversibilityResolution {
+     /// VUL-38: whether the one-phase fallback may run when Averin is unavailable. Money never
+     /// degrades, whatever its declaration; the other gate is `requires_committed_evidence`.
+     fn d8_fallback_ok(self, money: bool) -> bool {
+-        matches!(self, Self::Reversible | Self::PartiallyReversible) && !money
++        matches!(self, Self::Reversible | Self::PartiallyReversible | Self::Undeclared) && !money
+     }
+ 
+     fn authority_class(self) -> Option<CapabilityAuthorityClass> {

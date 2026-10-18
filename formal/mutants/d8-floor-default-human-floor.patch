@@ -1,0 +1,30 @@
+diff --git a/src/averin/mod.rs b/src/averin/mod.rs
+index c9600d9..94c2c70 100644
+--- a/src/averin/mod.rs
++++ b/src/averin/mod.rs
+@@ -317,7 +317,7 @@ impl Default for AverinConfig {
+             // per-deployment opt-in, never a default flip.
+             durable: false,
+             d8_complete_evidence: false,
+-            d8_evidence_floor: D8EvidenceFloor::MoneyAndIrreversible,
++            d8_evidence_floor: D8EvidenceFloor::HumanFloor,
+         }
+     }
+ }
+diff --git a/src/config/types.rs b/src/config/types.rs
+index 156f44f..827cf03 100644
+--- a/src/config/types.rs
++++ b/src/config/types.rs
+@@ -613,10 +613,10 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
+             }
+         };
+         let d8_evidence_floor = match raw.d8_evidence_floor.as_deref() {
+-            None | Some("money_and_irreversible") => {
++            None | Some("human_floor") => crate::averin::D8EvidenceFloor::HumanFloor,
++            Some("money_and_irreversible") => {
+                 crate::averin::D8EvidenceFloor::MoneyAndIrreversible
+             }
+-            Some("human_floor") => crate::averin::D8EvidenceFloor::HumanFloor,
+             Some(other) => {
+                 return Err(ConfigError::Invalid(format!(
+                     "unknown [averin] d8_evidence_floor {other:?}; expected \

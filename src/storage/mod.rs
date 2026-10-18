@@ -9,6 +9,7 @@ mod outbox_model;
 mod outbox_store;
 mod popkey_store;
 mod social;
+pub mod vault_backup;
 mod vault_log;
 
 pub use averin_deadletter::{AverinDeadLetterStore, QuarantineRecord, QuarantineStatus};

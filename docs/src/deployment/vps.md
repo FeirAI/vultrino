@@ -205,7 +205,29 @@ directory); both go into the backup together, and the services must be stopped w
 the backup is taken (a copy of a running vault can pair a snapshot with a log from a
 different moment). Restore both files from the same backup.
 
-### Backup
+### Backup with `vultrino vault backup`
+
+With the service stopped (or at least no process holding the vault), copy the whole
+vault set consistently and have the copy checked:
+
+```bash
+sudo -u vultrino vultrino vault backup /var/backups/vultrino/$(date +%Y%m%d)
+sudo -u vultrino vultrino vault restore /var/backups/vultrino/YYYYMMDD --force
+```
+
+`backup` takes the exclusive vault lock and writes a manifest with a SHA-256 per file;
+`restore` verifies every checksum and opens the copy before it touches the vault, refuses
+a backup that lacks the `.wal`, and moves the old files aside (`*.pre-restore-*`) when
+`--force` replaces them. Keep `config.toml` and the password with the backup; the vault is
+useless without them.
+
+Restoring an older backup silently undoes every kill, revocation and approval made after
+it, and the tool cannot detect that. Before starting the service again, re-apply the kills
+and revocations made after the backup time and check Govder's kill state. `backup` refuses
+while `<vault>.restore-pending` exists (an earlier restore did not finish): re-run the
+restore from a known-good backup first.
+
+### Backup by hand
 ```bash
 sudo systemctl stop vultrino-web
 sudo tar -czf vultrino-backup-$(date +%Y%m%d).tar.gz \
