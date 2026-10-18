@@ -688,8 +688,9 @@ CONFIGURATION, `[averin]`). What that does and does not give you:
 - **Not driven here.** The dispatch-time kill-fence refusal and the evidence refusals of the
   approval-resume path are tagged and noted by the same boundary but have no test of their own; the
   entry point x class table drives the admission gate on `execute`, MCP, `/llm` and the approval
-  poll, and the buffered and streaming dispatch tails for the evidence refusal. No test runs a real
-  averin; the stub stands in for it.
+  poll, and the buffered and streaming dispatch tails for the evidence refusal. The CI tests use a
+  stub averin. One `#[ignore]` test (`tests/refusals_real_averin.rs`) runs a real averin-server built
+  from the averin branch, by hand: it is not a CI gate.
 
 ## Rate-limit windows are per-process and per-replica (vultrino#6)
 
