@@ -1,0 +1,13 @@
+diff --git a/src/storage/outbox_store.rs b/src/storage/outbox_store.rs
+index 74dc5f2..e0675d5 100644
+--- a/src/storage/outbox_store.rs
++++ b/src/storage/outbox_store.rs
+@@ -629,7 +629,7 @@ impl OutboxStore {
+ 
+     fn snapshot_of(&self, c: &OutboxCache) -> crate::outbox::OutboxRetentionSnapshot {
+         crate::outbox::OutboxRetentionSnapshot {
+-            loaded: self.loaded_once.load(Ordering::Acquire),
++            loaded: true,
+             retained_events: c.outbox.len() as u64,
+             oldest_sequence: c.outbox.keys().next().copied(),
+             last_sequence: c.outbox_seq,
