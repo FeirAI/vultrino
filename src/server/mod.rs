@@ -5365,7 +5365,9 @@ pub const APPROVAL_SWEEP_SECS: u64 = 15;
 /// Default interval for the background event-outbox delivery pass (V9).
 pub const OUTBOX_DELIVERY_SECS: u64 = 5;
 
-/// Run GC on this many delivery passes (so it isn't on the hot delivery path).
+/// Run GC once this many delivery intervals of wall-clock time have passed since the last GC (so it
+/// isn't on the hot delivery path). Measured in time, not passes: a hung push target stretches a
+/// pass (up to 64 POSTs of 15 s each), and the cap must not wait for a pass count.
 const OUTBOX_GC_EVERY: u64 = 60;
 
 /// Default interval for the background intent-staged-event reconcile (D1). Short, since it only does
@@ -5561,15 +5563,19 @@ pub async fn deliver_outbox_periodically(
     .timeout(std::time::Duration::from_secs(15))
     .build()
     .unwrap_or_default();
-    let mut ticks: u64 = 0;
+    let gc_every = interval.saturating_mul(OUTBOX_GC_EVERY as u32);
+    let mut last_gc = tokio::time::Instant::now();
     loop {
         tokio::time::sleep(interval).await;
         if let Err(e) = deliver_outbox_once(&storage, &config, &client, &metrics).await {
             warn!(error = %e, "outbox delivery pass failed");
         }
-        ticks = ticks.wrapping_add(1);
-        if ticks.is_multiple_of(OUTBOX_GC_EVERY) {
-            if let Err(e) = storage.gc_outbox(config.retention_secs).await {
+        if last_gc.elapsed() >= gc_every {
+            last_gc = tokio::time::Instant::now();
+            if let Err(e) = storage
+                .gc_outbox(config.retention_secs, config.max_retained_events)
+                .await
+            {
                 warn!(error = %e, "outbox GC failed");
             }
             // Same tick: bound the vault's unbounded maps (#2) — shed terminal approval result
@@ -9547,6 +9553,49 @@ mod durable_enqueue_tests {
         );
         // Flushing again records nothing new.
         assert_eq!(super::flush_receipt_gaps_once(&storage, &av).await, 0);
+    }
+
+    /// The delivery loop is what turns the retention cap on: the GC tick it runs must pass the
+    /// configured `max_retained_events` (a 1 ms interval makes the 60-interval GC due in ~60 ms).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_delivery_loop_gc_enforces_the_retention_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = secrecy::SecretString::from("test-password");
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::FileStorage::new(dir.path().join("store.enc"), &password)
+                .await
+                .unwrap(),
+        );
+        for i in 0..130 {
+            storage
+                .append_event(&format!("s{i}"), "meter.observed", serde_json::json!({}))
+                .await
+                .unwrap();
+        }
+        let config = crate::outbox::OutboxConfig {
+            max_retained_events: 100,
+            ..Default::default()
+        };
+        let task = tokio::spawn(super::deliver_outbox_periodically(
+            storage.clone(),
+            config,
+            Duration::from_millis(1),
+            Arc::new(super::OutboxMetrics::default()),
+        ));
+        let mut retained = 130;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            retained = storage.outbox_retention().retained_events;
+            if retained <= 100 {
+                break;
+            }
+        }
+        task.abort();
+        assert_eq!(
+            retained, 100,
+            "the loop's GC must cap the outbox at max_retained_events"
+        );
+        assert_eq!(storage.outbox_retention().oldest_sequence, Some(31));
     }
 
     /// FEI-33: the oversize durable drop is an individual gap event too.

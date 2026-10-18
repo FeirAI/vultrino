@@ -682,6 +682,24 @@ pub trait StorageBackend: Send + Sync {
         crate::outbox::MeterLossSnapshot::default()
     }
 
+    /// Retention view of the outbox: retained count, oldest and last sequence, and the cap-prune
+    /// counters. Reads the in-memory cache, never the file. The default reports zeros.
+    fn outbox_retention(&self) -> crate::outbox::OutboxRetentionSnapshot {
+        crate::outbox::OutboxRetentionSnapshot::default()
+    }
+
+    /// One page of events after a cursor together with the retention snapshot taken from the same
+    /// read, so the unsigned hints on the events envelope are consistent with the page. The default
+    /// reads them separately (a backend that keeps no outbox has nothing to skew).
+    async fn list_events_page(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<(Vec<OutboxEvent>, crate::outbox::OutboxRetentionSnapshot), StorageError> {
+        let events = self.list_events_after(after, limit).await?;
+        Ok((events, self.outbox_retention()))
+    }
+
     /// The next deliverable pending events (V9): the earliest still-pending event
     /// per subject (so per-subject ordering is preserved — a later event for a
     /// subject is withheld until its earlier one is delivered), ascending by
@@ -747,7 +765,14 @@ pub trait StorageBackend: Send + Sync {
     /// disabled. The window is therefore the replay + dead-letter-resolution SLA;
     /// dropping a not-yet-delivered event past the window is surfaced via a log
     /// warning rather than failing silently. Returns the number pruned.
-    async fn gc_outbox(&self, _retention_secs: u64) -> Result<usize, StorageError> {
+    ///
+    /// `max_retained` is the hard count cap (`outbox.max_retained_events`): events beyond it are
+    /// pruned oldest-first whatever their delivery state, never past a staged intent.
+    async fn gc_outbox(
+        &self,
+        _retention_secs: u64,
+        _max_retained: usize,
+    ) -> Result<usize, StorageError> {
         Ok(0)
     }
 

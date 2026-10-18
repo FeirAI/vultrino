@@ -1,0 +1,13 @@
+diff --git a/src/storage/outbox_store.rs b/src/storage/outbox_store.rs
+index 9d8779c..8dac605 100644
+--- a/src/storage/outbox_store.rs
++++ b/src/storage/outbox_store.rs
+@@ -512,7 +512,7 @@ impl OutboxStore {
+                 }
+ 
+                 // Stage 2: the count cap, over what the age stage left.
+-                let excess = c.outbox.len().saturating_sub(max_retained);
++                let excess = c.outbox.len().saturating_sub(max_retained + 1);
+                 if excess > 0 {
+                     let doomed: Vec<u64> = c
+                         .outbox

@@ -3539,7 +3539,29 @@ impl StorageBackend for FileStorage {
         self.outbox.replay_dead_letter(sequence).await
     }
 
-    async fn gc_outbox(&self, retention_secs: u64) -> Result<usize, StorageError> {
+    async fn list_events_page(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<
+        (
+            Vec<crate::outbox::OutboxEvent>,
+            crate::outbox::OutboxRetentionSnapshot,
+        ),
+        StorageError,
+    > {
+        self.outbox.list_after_with_retention(after, limit).await
+    }
+
+    fn outbox_retention(&self) -> crate::outbox::OutboxRetentionSnapshot {
+        self.outbox.retention_snapshot()
+    }
+
+    async fn gc_outbox(
+        &self,
+        retention_secs: u64,
+        max_retained: usize,
+    ) -> Result<usize, StorageError> {
         // Protect the dedup_ids of any still-staged intents from GC: an outbox event must not be pruned
         // while its vault-side intent is uncleared, or a re-drain after the prune would duplicate it
         // (enforces the no-duplicate invariant, not just bounds the window). reload() FIRST so the
@@ -3553,7 +3575,11 @@ impl StorageBackend for FileStorage {
                 .map(|e| e.dedup_id.clone())
                 .collect()
         };
-        self.outbox.gc(retention_secs, &protected).await
+        Ok(self
+            .outbox
+            .gc_capped(retention_secs, max_retained, &protected)
+            .await?
+            .total())
     }
 
     async fn gc_vault(&self) -> Result<(usize, usize), StorageError> {

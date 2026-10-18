@@ -1,0 +1,12 @@
+diff --git a/src/storage/outbox_store.rs b/src/storage/outbox_store.rs
+index f317dd3..859209b 100644
+--- a/src/storage/outbox_store.rs
++++ b/src/storage/outbox_store.rs
+@@ -552,7 +552,6 @@ impl OutboxStore {
+                         .outbox
+                         .iter()
+                         .take(excess)
+-                        .take_while(|(_, e)| !is_protected(e))
+                         .map(|(seq, _)| *seq)
+                         .collect();
+                     out.cap_blocked = doomed.len() < excess;

@@ -433,6 +433,7 @@ url            = "https://consumer.example/webhook"
 hmac_secret    = "shared-signing-secret"
 max_attempts   = 8           # default 8 (deliveries before dead-letter)
 retention_secs = 604800      # default 7 days (replay window for DELIVERED events)
+max_retained_events = 2000   # default 2000, accepted 100 to 100000 (hard cap on retained events)
 ```
 
 | Key | Default | Notes |
@@ -442,6 +443,7 @@ retention_secs = 604800      # default 7 days (replay window for DELIVERED event
 | `hmac_secret` | — | **Required when delivery is enabled** — deliveries are signed (`Govder-Signature`). Hard error if missing. Redacted from any debug/config dump. |
 | `max_attempts` | `8` | A `0`/absent value falls back to the default. |
 | `retention_secs` | `604800` | GC window for delivered events. |
+| `max_retained_events` | `2000` | Hard cap on retained events. A value below 100 or above 100000 is refused at config load. When more events are retained, the GC runs once 60 delivery intervals of wall-clock time (about 5 minutes) have passed since the last GC, checked after each delivery pass (so a pass stretched by a hung push target delays it), and prunes the **oldest** ones **whatever their delivery state**, never past an event whose staged intent is not yet cleared. A consumer that is down longer than the cap window loses the events it had not read and sees a hole in the signed sequences. Pruned events are counted by state and type and reported as `cap_pruned_total` and `cap_pruned_undelivered_total` in posture and metrics, together with `cap_blocked_total` (GC passes where an uncleared staged intent stopped the cap) and `snapshot_loaded` (when `false`, the outbox file could not be read and the other outbox fields are not to be trusted); a prune that includes events the push target had not acked logs ERROR, a prune of only acked events logs INFO. Vultrino cannot tell whether a poller read an event: in push mode `Delivered` means govder acked it, not that leria read it, in poll-only mode nothing is ever `Delivered`, and leria's hole detection is the only unread-loss signal. Every outbox operation rewrites the whole file, so a smaller cap is a faster outbox and a shorter outage window. |
 
 This is the feed the leria metering plane polls (`meter.observed`); see
 [METERING.md](METERING.md).

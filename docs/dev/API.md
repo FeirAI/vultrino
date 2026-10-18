@@ -413,7 +413,7 @@ and a dead-letter transition `error!`-logs, both previously silent.
 
 | Method | Path | Result |
 |--------|------|--------|
-| `GET` | `/api/v1/events?after=N&limit=M` | Events with `sequence > after`, in order, gap-free. `limit` default 100, capped 1000. |
+| `GET` | `/api/v1/events?after=N&limit=M` | Events with `sequence > after`, in order, gap-free within the retained window (the cap can prune older events, see below). `limit` default 100, capped 1000. |
 | `GET` | `/api/v1/events/dead` | The dead-letter queue (up to 1000). |
 | `POST` | `/api/v1/events/{sequence}/replay` | Requeue a dead-lettered event; `200 {requeued}` / `404 not_dead_lettered`. |
 | `POST` | `/api/v1/events/dead/replay` | Bulk-requeue EVERY currently dead-lettered event (up to the same 1000-event page); best-effort per event. `200 {requeued: [seq, …], failed: [seq, …], total: N}`. |
@@ -428,9 +428,26 @@ delivery uses, plus its `Govder-Signature` when a signing secret is configured):
       "signature": "sha256=…" }
   ],
   "next_cursor": 42,
-  "meter_gap_pending": 0
+  "meter_gap_pending": 0,
+  "oldest_sequence": 1,
+  "last_sequence": 42
 }
 ```
+
+`oldest_sequence` (null when nothing is retained) is the lowest retained sequence and
+`last_sequence` the highest ever assigned. The outbox keeps at most
+`[outbox] max_retained_events` events and prunes the oldest beyond that, delivered or not, so
+a poller whose cursor is below `oldest_sequence - 1`, or whose page is empty while
+`last_sequence` is above its cursor, may have lost events. Like `meter_gap_pending` these are
+unsigned hints, taken from the same cache read as the page; they are unsigned, and the signed hole
+is authoritative. Vultrino cannot tell whether a poller read an event:
+`cap_pruned_undelivered_total` counts events the push target had not acked (in poll-only mode,
+every prune), not events no poller read. `GET
+/api/v1/posture` (`outbox`) and `GET /api/v1/metrics` (`outbox`) report `max_retained_events`,
+`retained_events`, `oldest_sequence`, `last_sequence`, `cap_pruned_total`,
+`cap_pruned_undelivered_total`, `cap_blocked_total` (GC passes where an uncleared staged intent
+stopped the cap) and `snapshot_loaded` (counters are per process). `snapshot_loaded` is `false`
+when the outbox file could not be read; the other outbox fields are then not to be trusted.
 
 `meter_gap_pending` is the number of failed event appends not yet announced by a
 `meter.lost` marker. A poller must not treat an idle page as caught up while it is
@@ -765,7 +782,9 @@ request notification, the one-time approve/deny URLs.
 `credential.revoked`, `meter.observed`, `evidence.receipt_gap` (an Observe-mode action ran but
 its evidence receipt did not reach Averin; subject = the use token id; payload = token id, project,
 request id, use sequence number, reason code, clipped detail, `at`, `outcome`; never params. Like every
-event it is pruned after `[outbox] retention_secs`, delivered or not, so a consumer must store it: govder does).
+event it is pruned after `[outbox] retention_secs` once delivered, and by the `max_retained_events` cap
+whether or not delivered, so it survives the shorter of the two windows (about an hour at the default
+cap on a busy host) and an undelivered gap beyond the cap is dropped; a consumer must store it: govder does).
 
 Admin audit (observability item 4 / #17) — ids-only `{actor, target_id, verb}`
 payload (see `admin_audit_payload`), emitted best-effort after a successful

@@ -3710,6 +3710,7 @@ pub async fn api_posture(admin: AdminApiAuth, State(state): State<AppState>) -> 
         &policies,
         &state.workload_verifier,
         &state.storage.meter_loss(),
+        &state.storage.outbox_retention(),
     );
     (StatusCode::OK, Json(report)).into_response()
 }
@@ -3969,6 +3970,7 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
     // in-memory, like `unauthorized_attempts` above; shared with the
     // background delivery loop via `VultrinoServer::outbox_metrics()`.
     let outbox = state.server.outbox_metrics().snapshot();
+    let retention = state.storage.outbox_retention();
 
     // Plan 087 — averin fail-open seal counters. Only present when `[averin]` is
     // enabled (otherwise the seal-client is `None`), so with the production
@@ -3996,6 +3998,14 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
             "failed": outbox.failed,
             "dead_lettered": outbox.dead_lettered,
             "last_delivered_sequence": outbox.last_delivered_sequence,
+            "max_retained_events": state.config.outbox.max_retained_events,
+            "retained_events": retention.retained_events,
+            "oldest_sequence": retention.oldest_sequence,
+            "last_sequence": retention.last_sequence,
+            "cap_pruned_total": retention.cap_pruned_total,
+            "cap_pruned_undelivered_total": retention.cap_pruned_undelivered_total,
+            "cap_blocked_total": retention.cap_blocked_total,
+            "snapshot_loaded": retention.loaded,
         },
     });
     // Plan 087 — insert the seal counters ONLY when [averin] is enabled, so the
@@ -4036,8 +4046,8 @@ pub async fn api_list_events(
         return resp;
     }
     let limit = q.limit.unwrap_or(100).min(1000);
-    match state.storage.list_events_after(q.after, limit).await {
-        Ok(events) => {
+    match state.storage.list_events_page(q.after, limit).await {
+        Ok((events, retention)) => {
             // The next cursor is the highest sequence returned (or the request's
             // `after` if none) — what the consumer persists for the next poll.
             let next = events.last().map(|e| e.sequence).unwrap_or(q.after);
@@ -4063,12 +4073,20 @@ pub async fn api_list_events(
             // by a `meter.lost` marker. While this is non-zero the feed is known to be
             // missing events, so a consumer must not treat an idle page as "caught up".
             let gap_pending = state.storage.meter_loss().gap_pending;
+            // Retention hints (unsigned, like `meter_gap_pending`): the lowest retained and the
+            // highest assigned sequence. A poller whose cursor is below `oldest_sequence - 1`, or
+            // whose page is empty while `last_sequence > cursor`, may have lost events to the cap.
+            // The signed sequence hole stays the authoritative signal. The hints come from the
+            // same read as the page (`list_events_page`), so a concurrent append or GC cannot skew
+            // them against it.
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "events": bodies,
                     "next_cursor": next,
                     "meter_gap_pending": gap_pending,
+                    "oldest_sequence": retention.oldest_sequence,
+                    "last_sequence": retention.last_sequence,
                 })),
             )
                 .into_response()

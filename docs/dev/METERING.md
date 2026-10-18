@@ -9,7 +9,7 @@ emit sites).
 
 This capability is **standalone-useful**: any consumer that polls
 `GET /api/v1/events` (or receives the push delivery) gets a signed, ordered,
-gap-free stream of per-call usage. The cross-plane integration with the leria
+gap-free (within the retained window, see the honest bounds below) stream of per-call usage. The cross-plane integration with the leria
 metering plane is described in [INTEGRATION.md](INTEGRATION.md); the wire shape is
 the same either way.
 
@@ -284,7 +284,7 @@ There is **no push fan-out**. A second consumer (e.g. a metering plane that isn'
 the push target) **polls** `GET /api/v1/events?after=N&limit=M` (admin-gated). The
 `meter.observed` events live in the same monotonic event log the replay endpoint
 serves — appended under the storage lock, gap-free by `sequence` — so a poller
-reads them gap-free, and the poll path returns the same `delivery_body` +
+reads them gap-free within the retained window (the count cap can prune older events, see below), and the poll path returns the same `delivery_body` +
 `Govder-Signature` envelope a push delivery carries (so a replayed event is
 verified exactly like a pushed one).
 
@@ -293,7 +293,7 @@ your poll interval.
 
 ## Honest bounds of the meter-loss guarantee
 
-There are **two distinct loss modes**, and the gap detector covers only one:
+There are **three distinct loss modes**, and the sequence-gap detector covers two of them:
 
 - **Lost-in-transit delivery** → a minted event whose *delivery* is lost leaves a
   hole in the gap-free replayed sequence; a consumer's sequence-gap detector
@@ -303,6 +303,14 @@ There are **two distinct loss modes**, and the gap detector covers only one:
   append mints **no** sequence and the stored stream stays contiguous - **there is no
   hole to detect.** Sequence-gap detection is therefore **not** the compensation for
   a failed append; the `meter.lost` marker below is.
+- **Pruned by the retention cap** -> the outbox prunes the oldest events beyond
+  `[outbox] max_retained_events` (default 2000) whatever their delivery state, so a poller that
+  was down for longer than the cap window (about an hour at the default cap on a busy host) finds
+  a hole in the signed sequences. This is detected as a signed hole (and by the unsigned
+  `oldest_sequence` / `last_sequence` hints), but the lost events are not recoverable: the
+  consumer must hold (leria's meter-lost hold) and the spend in the pruned events is never
+  booked. Vultrino cannot tell whether a poller read an event, so it does not count unread
+  loss; leria's hole detection is the only unread-loss signal.
 
 ### Failed appends are counted and announced (VUL-02)
 

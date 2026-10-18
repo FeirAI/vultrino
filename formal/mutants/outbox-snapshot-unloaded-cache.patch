@@ -1,0 +1,13 @@
+diff --git a/src/storage/outbox_store.rs b/src/storage/outbox_store.rs
+index f317dd3..7dc5025 100644
+--- a/src/storage/outbox_store.rs
++++ b/src/storage/outbox_store.rs
+@@ -611,7 +611,7 @@ impl OutboxStore {
+     /// healthy-looking empty cache; if that load fails, `loaded` is false and the other fields are
+     /// not to be trusted.
+     pub fn retention_snapshot(&self) -> crate::outbox::OutboxRetentionSnapshot {
+-        if !self.loaded_once.load(Ordering::Acquire) {
++        if false && !self.loaded_once.load(Ordering::Acquire) {
+             use tokio::runtime::{Handle, RuntimeFlavor};
+             let r = match Handle::try_current().map(|h| h.runtime_flavor()) {
+                 Ok(RuntimeFlavor::MultiThread) => {

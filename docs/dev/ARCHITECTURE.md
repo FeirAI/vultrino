@@ -300,8 +300,10 @@ An append-only event log in the vault with a process-global **monotonic
 
 - **Per-subject ordering:** the delivery worker never delivers a later event for a
   subject while an earlier one for that subject is still undelivered.
-- **Gap-free replay:** a consumer replays strictly after its last-seen `sequence`
-  via `GET /api/v1/events?after=N` with no gaps/dupes.
+- **Gap-free replay of the retained window:** a consumer replays strictly after its last-seen
+  `sequence` via `GET /api/v1/events?after=N` with no gaps/dupes among the retained events. The
+  count cap (`outbox.max_retained_events`) prunes the oldest events whatever their delivery state,
+  so a consumer that falls behind the cap window sees a sequence hole.
 - **Dead-letter queue:** an event that fails `max_attempts` times is parked
   (`DeadLettered`) and operator-replayable.
 - **Signed:** every push delivery carries `Govder-Signature: sha256=<hex>` =
