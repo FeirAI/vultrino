@@ -323,9 +323,10 @@ use Kind::{Betas, ConverseToolConfig, GeminiToolConfig, LegacyFunctions, Plain, 
 // THE ALLOWLIST. Every top-level request field the proxy admits, per protocol, and nothing
 // else. A field on one of these tables is one whose top-level presence cannot change what a
 // token costs (the rate card holds one input and one output price per model), with one
-// bounded exception: the gate also inspects the nested modality markers in
-// `modality_marker` (Gemini audio/video parts and non-TEXT response modalities, OpenAI
-// `input_audio` parts), because those bill above the token rate inside an admitted field.
+// bounded exception: the gate also inspects the nested media and modality markers in
+// `modality_marker` (a Gemini media part admitted only for image, PDF and text types, found
+// at any depth; `responseModalities` exactly TEXT; an OpenAI content part only text or
+// image), because audio and video bill above the token rate inside an admitted field.
 // Other nested options are NOT inspected (bounded). ADDING A FIELD TO A
 // TABLE IS A PRICING DECISION: do it only after reading the provider's price list for what
 // the field switches on, and add a test that fails without it. A field not listed here
