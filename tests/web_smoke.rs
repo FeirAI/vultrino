@@ -9413,10 +9413,10 @@ async fn events_envelope_reports_oldest_and_last_sequence() {
 
     // The cap prunes the 3 oldest; the hints move, the first event is seq 4. One of the pruned
     // events was delivered, so the two counters differ.
-    assert!(storage
+    storage
         .record_event_delivery(2, true, None, 8)
         .await
-        .unwrap());
+        .unwrap();
     assert_eq!(storage.gc_outbox(u64::MAX, 2).await.unwrap(), 3);
     let capped = feed(router.clone(), key.clone()).await;
     assert_eq!(capped["oldest_sequence"], 4, "{capped}");
@@ -9447,6 +9447,7 @@ async fn events_envelope_reports_oldest_and_last_sequence() {
 
     // Metrics reports the same numbers under `outbox`.
     let resp = router
+        .clone()
         .oneshot(admin_req(
             "GET",
             "/api/v1/metrics",
@@ -9466,10 +9467,10 @@ async fn events_envelope_reports_oldest_and_last_sequence() {
     // still reports last_sequence 5 (so a poller at 4 sees an empty page with last_sequence >
     // cursor) and oldest_sequence null.
     for seq in [4, 5] {
-        assert!(storage
+        storage
             .record_event_delivery(seq, true, None, 8)
             .await
-            .unwrap());
+            .unwrap();
     }
     assert_eq!(storage.gc_outbox(0, 2000).await.unwrap(), 2);
     let resp = router

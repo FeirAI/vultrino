@@ -1,13 +1,13 @@
 diff --git a/src/storage/outbox_store.rs b/src/storage/outbox_store.rs
-index 9d8779c..4541e8e 100644
+index f317dd3..e15f96c 100644
 --- a/src/storage/outbox_store.rs
 +++ b/src/storage/outbox_store.rs
-@@ -533,7 +533,7 @@ impl OutboxStore {
-             .await?;
+@@ -578,7 +578,7 @@ impl OutboxStore {
+         }
          if outcome.cap.pruned > 0 {
              self.cap_pruned_total
 -                .fetch_add(outcome.cap.pruned as u64, Ordering::Relaxed);
 +                .fetch_add(0, Ordering::Relaxed);
              self.cap_pruned_undelivered_total
                  .fetch_add(outcome.cap.undelivered() as u64, Ordering::Relaxed);
-             tracing::error!(
+             let undelivered = outcome.cap.undelivered();
