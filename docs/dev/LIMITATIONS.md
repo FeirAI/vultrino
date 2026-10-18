@@ -48,7 +48,7 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   contents of an allowed field are not inspected, except the media and modality markers (a
   Gemini `inlineData` or `fileData` part is admitted only for image, PDF or text media types,
   found at any depth in any object or array shape; `responseModalities` must be exactly
-  `TEXT`; an OpenAI content part must be text or an image), which are refused otherwise; other nested options stay uninspected, and the regional-endpoint premium of a Vertex
+  `TEXT`; an OpenAI content part must be text or an image, and a `data:` image URL must declare a priced media type), which are refused otherwise; the declared media type is what is checked: inline bytes and provider-fetched URLs (http(s), `gs://`, Files API, YouTube `fileUri`) are not inspected, and the `output` arrays of `function_call_output` and `custom_tool_call_output` items are not scanned; an OpenAI `file` or `input_file` part (a PDF included) is refused until allowlisted, so a PDF part passes only on Gemini; an entry with no type is admitted and only its content parts are checked; other nested options stay uninspected, and the regional-endpoint premium of a Vertex
   or Bedrock deployment is booked at the base price (an under-count). Every entry of
   `usage.iterations` is counted (the larger of the top-level figure and the sum of the entries,
   per direction), at the request model's price. Server-tool fees are refused, not metered. The card is

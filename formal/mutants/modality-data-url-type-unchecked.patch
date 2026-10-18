@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 45d02b2..d077ae3 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -765,7 +765,7 @@ fn image_url_priced(url: &str) -> bool {
+     }
+     let rest = &url[5..];
+     let end = rest.find([';', ',']).unwrap_or(rest.len());
+-    is_priced_mime_str(rest[..end].trim())
++    rest[..end].len() < usize::MAX
+ }
+ 
+ /// A marker for an `image_url` part (chat: a string or an object with `url`) or an

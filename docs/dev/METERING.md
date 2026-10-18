@@ -169,8 +169,17 @@ refuses the rest before the upstream call (`403 modifier_unpriced`, default-deny
   levels is refused. For OpenAI chat, responses and Azure bodies each `messages` or `input`
   entry and each content part must be `text`, `image_url`, `input_text`, `input_image`,
   `output_text` or `refusal` (a conversation item type such as `message` or `function_call` is
-  also fine); `input_audio`, `file`, a part with no type and a message carrying `audio` are
-  refused. An audio output request (`modalities`, `audio`) is refused as an unlisted field.
+  also fine; an entry with no type is admitted and only its content parts are checked);
+  `input_audio`, `file`, `input_file` (a PDF included, so a PDF part passes only on Gemini), a
+  part with no type and a message carrying `audio` are refused. An `image_url` (string or
+  `url`) or `input_image` part whose URL starts with `data:` (any casing) is admitted only when
+  the media type between `data:` and the first `;` or `,` is one of the priced types above, so
+  `data:audio/wav`, `data:video/mp4` and a typeless `data:` URL are refused on every OpenAI
+  dialect, including the Gemini and Vertex AI OpenAI-compatible route; an https URL is admitted.
+  A JSON `null` is read like an absent key (`audio`, `inlineData`, `fileData`,
+  `responseModalities`). Only the declared media type is checked: inline bytes and URLs the
+  provider fetches (http(s), `gs://`, Files API, YouTube `fileUri`) are not inspected, and the
+  `output` arrays of `function_call_output` and `custom_tool_call_output` items are not scanned. An audio output request (`modalities`, `audio`) is refused as an unlisted field.
   Image, PDF and text input are admitted on the assumption that they bill at the model's token
   rate; other nested options are not inspected (bounded).
 - Betas: the `anthropic-beta` header (every line, comma separated) and a body `anthropic_beta`
