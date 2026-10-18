@@ -1,9 +1,9 @@
 diff --git a/src/server/mod.rs b/src/server/mod.rs
-index 1483cfc..407f7e5 100644
+index 046d2d7..95a32da 100644
 --- a/src/server/mod.rs
 +++ b/src/server/mod.rs
-@@ -2588,9 +2588,6 @@ impl VultrinoServer {
-         // `anthropic_workspace_id` metadata, or none), never the caller's. Applied
+@@ -2953,9 +2953,6 @@ impl VultrinoServer {
+         // metadata, or none), never the caller's. Applied
          // in the preflight, so a bad stored value is refused before any use token
          // is consumed or D8 evidence begun, and evidence binds the dispatched params.
 -        let mut params = params;
@@ -12,7 +12,7 @@ index 1483cfc..407f7e5 100644
  
          // Serialize once before token consumption. Trusted human-floor actions
          // fail closed here if no evidence path/grant exists; reversible actions
-@@ -2770,6 +2767,9 @@ impl VultrinoServer {
+@@ -3129,6 +3126,9 @@ impl VultrinoServer {
              exact_evidence.as_ref(),
          )
          .await?;

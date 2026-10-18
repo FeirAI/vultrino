@@ -1094,6 +1094,10 @@
     "outbox-snapshot-loaded-hardcoded": {
       "tier": "full",
       "claim": "outbox-retention-bounded"
+    },
+    "llm-x-goog-user-project-forwarded": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
     }
   },
   "claims": [
@@ -1246,7 +1250,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
+          "sha256": "934cd66017dd93b85284c9cb7e92d6857133b7ab18c2f3c9828e2efd66ffceef"
         },
         {
           "path": "src/server/mod.rs",
@@ -2876,17 +2880,17 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
+          "sha256": "feb16191ec18bdc75a9c1acc4fe2d4e9c27051af2396197bde91307e4088b704"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+          "sha256": "c2959c40c277bbb4a6d0e5ce1dbefd45978aa0d3913ac7ee3ffec32cdc0de140"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
+          "sha256": "934cd66017dd93b85284c9cb7e92d6857133b7ab18c2f3c9828e2efd66ffceef"
         },
         {
           "path": "src/server/mod.rs",
@@ -3727,7 +3731,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
+          "sha256": "feb16191ec18bdc75a9c1acc4fe2d4e9c27051af2396197bde91307e4088b704"
         }
       ],
       "mutants": [
@@ -4174,7 +4178,22 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+          "sha256": "c2959c40c277bbb4a6d0e5ce1dbefd45978aa0d3913ac7ee3ffec32cdc0de140"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "metadata_format_error",
+          "sha256": "6c769d631c74d98e674107561167054e16e204f01b59f22570f87eb0c66233cc"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "GATEWAY_OWNED_SCOPES",
+          "sha256": "aeb2aaf5cdd06c5e3e72fc6dbe52fe2630df053c6298d1dfa86f268a734d9670"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "is_gateway_owned_header",
+          "sha256": "9deaa1ae1a2426f43bf8637d3da463a931d2e5763bf44fdbcb746e4ecce6d04f"
         }
       ],
       "mutants": [
@@ -4189,7 +4208,7 @@
     },
     {
       "id": "openai-org-project-operator-owned",
-      "statement": "The OpenAI organization and project on an outgoing request are the operator's, never the caller's, on every path that reaches a plugin: /llm (openai-chat and openai-responses, buffered and streamed), POST /api/v1/execute, the MCP http_request tool and approval replay. They are stored on the credential (metadata keys openai_organization_id and openai_project_id). Before dispatch, any caller-supplied openai-organization or openai-project header (any case) is removed from the request, and the credential's value for each, if it has one, is written; a credential with none sends none, so the caller cannot choose which organization or project is billed with the same bearer on any of these paths. The /llm forwarded-header allowlist no longer includes either header. The http plugin repeats the same removal and write on its own parameters. The organization id must be org- and the project id proj_, each followed by 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no plugin run and no meter event) instead of being written into a header. The refusal is a credential configuration error: /llm answers 500 with a message naming the misconfigured metadata key, never the stored value.",
+      "statement": "The OpenAI organization and project on an outgoing request are the operator's, never the caller's, on every path that reaches a plugin: /llm (openai-chat and openai-responses, buffered and streamed), POST /api/v1/execute, the MCP http_request tool and approval replay. They are stored on the credential (metadata keys openai_organization_id and openai_project_id). Before dispatch, any caller-supplied openai-organization or openai-project header (any case) is removed from the request, and the credential's value for each, if it has one, is written; a credential with none sends none, so the caller cannot choose which organization or project is billed with the same bearer on any of these paths. The /llm forwarded-header allowlist no longer includes either header. The http plugin repeats the same removal and write on its own parameters. The organization id must be org- and the project id proj_, each followed by 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no plugin run and no meter event) instead of being written into a header. The refusal is a credential configuration error: /llm answers 500 with a message naming the misconfigured metadata key, never the stored value. A client-sent x-goog-user-project header is also dropped on every /llm route (buffered and streamed), because it picks the Google quota and billing project on Vertex AI and Gemini channels and their OpenAI-compatible routes; the request then uses the key's own project, the same as an unset gateway setting.",
       "method": "test",
       "artifacts": [
         "src/plugins/mod.rs",
@@ -4243,7 +4262,32 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+          "sha256": "c2959c40c277bbb4a6d0e5ce1dbefd45978aa0d3913ac7ee3ffec32cdc0de140"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "metadata_format_error",
+          "sha256": "6c769d631c74d98e674107561167054e16e204f01b59f22570f87eb0c66233cc"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "GATEWAY_OWNED_SCOPES",
+          "sha256": "aeb2aaf5cdd06c5e3e72fc6dbe52fe2630df053c6298d1dfa86f268a734d9670"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "is_gateway_owned_header",
+          "sha256": "9deaa1ae1a2426f43bf8637d3da463a931d2e5763bf44fdbcb746e4ecce6d04f"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "FORWARDED_PROVIDER_HEADERS",
+          "sha256": "13782789121b740aa7e1f28ab5bd3ee948de947639308c6ef9477b054483be27"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "forward_provider_headers",
+          "sha256": "0251da6e0e53f8d678a1f99518a540be605a18a6649e0e086a076ecf4ba1418a"
         }
       ],
       "mutants": [
@@ -4251,9 +4295,10 @@
         "openai-scope-plugin-strip-removed",
         "openai-scope-not-injected",
         "openai-scope-use-time-recheck-removed",
-        "openai-id-format-check-removed"
+        "openai-id-format-check-removed",
+        "llm-x-goog-user-project-forwarded"
       ],
-      "does_not_establish": "That OpenAI accepts the configured organization or project id, that the id belongs to the key, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential with a multi-organization key and no setting sends no header, so OpenAI decides what that does. The streaming path is driven for injection and removal on /llm; approval replay and the approval-open refusal reuse the Anthropic workspace claim's helper calls and are covered by its approval test, not by an OpenAI-specific one. The header removal applies to every credential and route, so it also removes the two headers on an Azure OpenAI route, where nothing sets them. Other plugins (internal_http, WASM) get the server-side removal but have no injection of their own. Only the three headers named in the gateway-owned table are owned; any other provider header (for example x-goog-user-project) is still forwarded from the client on /llm. The format check is an operator-facing sanity check, not OpenAI's own validation, and the ceiling of 64 characters is this gateway's choice."
+      "does_not_establish": "That OpenAI accepts the configured organization or project id, that the id belongs to the key, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential with a multi-organization key and no setting sends no header, and OpenAI then bills and scopes the request to the key owner's default organization and project; it does not refuse it. The streaming path is driven for injection and removal on /llm; approval replay and the approval-open refusal reuse the Anthropic workspace claim's helper calls and are covered by its approval test, not by an OpenAI-specific one. The header removal applies to every credential and route, so it also removes the two headers on an Azure OpenAI route, where nothing sets them. Other plugins (internal_http, WASM) get the server-side removal but have no injection of their own. Only the three headers named in the gateway-owned table are operator-set; x-goog-user-project is dropped on /llm but there is no gateway-owned Google project setting yet (not offered, see LIMITATIONS), so a multi-project Google key always uses its own project, and the drop is on /llm only: POST /api/v1/execute and the MCP http_request tool still pass a caller-sent x-goog-user-project through. The x-goog-user-project test drives the openai-chat and openai-responses routes with a stub plugin, not a live Vertex AI or Gemini route; the allowlist is shared by every /llm protocol. Any other allowlisted provider header is still forwarded from the client on /llm. The format check is an operator-facing sanity check, not OpenAI's own validation, and the ceiling of 64 characters is this gateway's choice."
     },
     {
       "id": "unpriced-model-refused",
@@ -4755,12 +4800,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+          "sha256": "c2959c40c277bbb4a6d0e5ce1dbefd45978aa0d3913ac7ee3ffec32cdc0de140"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
+          "sha256": "feb16191ec18bdc75a9c1acc4fe2d4e9c27051af2396197bde91307e4088b704"
         },
         {
           "path": "src/server/mod.rs",
@@ -5060,7 +5105,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
+          "sha256": "934cd66017dd93b85284c9cb7e92d6857133b7ab18c2f3c9828e2efd66ffceef"
         },
         {
           "path": "src/server/mod.rs",
