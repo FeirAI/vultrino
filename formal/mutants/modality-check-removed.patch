@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 74eb177..2b72130 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -833,7 +833,7 @@ fn unpriced_modifier(protocol: &str, upstream: &str, body: &serde_json::Value) -
+             Some(_) => {}
+         }
+     }
+-    modality_marker(dialect, obj).map(|m| {
++    None::<String>.map(|m: String| {
+         format!("{m} for {protocol} (unpriced modalities are refused until the card prices them)")
+     })
+ }

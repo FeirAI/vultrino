@@ -154,7 +154,14 @@ refuses the rest before the upstream call (`403 modifier_unpriced`, default-deny
   `speed`, `inference_geo`, `web_search_options`, Bedrock `performanceConfig` and
   `guardrailConfig`, and a service tier under any name or casing (`service_tier`, `serviceTier`,
   `ServiceTier`), even with a value that looks standard. A body that is not a JSON object is
-  refused. The contents of an allowed field are not inspected.
+  refused. The contents of an allowed field are not inspected, except the modality markers
+  below.
+- Modalities: features priced above the base token rate are refused until the card prices
+  them. Inside admitted fields the proxy refuses a Gemini part with `inlineData` or `fileData`
+  (also `inline_data`, `file_data`) whose media type is `audio/*` or `video/*`, a Gemini
+  `responseModalities` (or `response_modalities`) naming anything but `TEXT`, and an OpenAI
+  `input_audio` content part; an audio output request (`modalities`, `audio`) is refused as an
+  unlisted field. Other nested options are not inspected (bounded).
 - Betas: the `anthropic-beta` header (every line, comma separated) and a body `anthropic_beta`
   (Bedrock InvokeModel, Vertex Anthropic) may name only betas on a short list of those that do
   not change a token's price; any other value is refused, so the header is never forwarded with
