@@ -117,6 +117,22 @@ pub struct MeterLossSnapshot {
     pub last_lost_at: Option<DateTime<Utc>>,
 }
 
+/// Retention view of the outbox, for `/api/v1/posture`, `/api/v1/metrics` and the events
+/// envelope. Counters are per process and reset on restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct OutboxRetentionSnapshot {
+    /// Events currently retained (as of this process's last read of the outbox).
+    pub retained_events: u64,
+    /// Lowest retained sequence, `None` when nothing is retained.
+    pub oldest_sequence: Option<u64>,
+    /// Highest sequence ever assigned (survives pruning).
+    pub last_sequence: u64,
+    /// Events pruned by the `max_retained_events` cap since this process started.
+    pub cap_pruned_total: u64,
+    /// The subset of those that were never Delivered.
+    pub cap_pruned_undelivered_total: u64,
+}
+
 /// Build the [`EVENT_METER_LOST`] payload.
 pub fn meter_lost_payload(
     lost_count: u64,
@@ -1035,7 +1051,20 @@ pub struct OutboxConfig {
     /// re-encrypts the whole retention-bounded log — a shorter window is a smaller per-append cost.
     /// Lower it for tighter storage, raise it for a longer replay window for a slow/offline consumer.
     pub retention_secs: u64,
+    /// Hard cap on retained events (`outbox.max_retained_events`). Every outbox operation rewrites
+    /// the whole file, so its cost grows with the retained count; when more than this many events
+    /// are retained the GC prunes the OLDEST ones whatever their delivery state (never past a
+    /// staged intent). A consumer that falls behind the cap sees a sequence hole. Config load
+    /// refuses values outside [`MAX_RETAINED_EVENTS_MIN`], [`MAX_RETAINED_EVENTS_MAX`].
+    pub max_retained_events: usize,
 }
+
+/// Lowest accepted `outbox.max_retained_events`.
+pub const MAX_RETAINED_EVENTS_MIN: usize = 100;
+/// Highest accepted `outbox.max_retained_events`.
+pub const MAX_RETAINED_EVENTS_MAX: usize = 100_000;
+/// Default `outbox.max_retained_events`.
+pub const MAX_RETAINED_EVENTS_DEFAULT: usize = 2000;
 
 impl std::fmt::Debug for OutboxConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1049,6 +1078,7 @@ impl std::fmt::Debug for OutboxConfig {
             )
             .field("max_attempts", &self.max_attempts)
             .field("retention_secs", &self.retention_secs)
+            .field("max_retained_events", &self.max_retained_events)
             .finish()
     }
 }
@@ -1065,6 +1095,7 @@ impl Default for OutboxConfig {
             // events are never pruned (fail-closed), so this only trims the delivered replay tail;
             // operators needing a longer window raise `outbox.retention_secs` in config.
             retention_secs: 2 * 24 * 3600, // 2 days
+            max_retained_events: MAX_RETAINED_EVENTS_DEFAULT,
         }
     }
 }
@@ -1492,6 +1523,7 @@ mod tests {
             hmac_secret: Some("super-secret-signing-key".to_string()),
             max_attempts: 3,
             retention_secs: 10,
+            max_retained_events: 2000,
         };
         let dbg = format!("{cfg:?}");
         assert!(

@@ -492,6 +492,15 @@ kernels.
   `receipt_gaps_overflowed` but not recorded individually. A process that dies between the
   action and the enqueue of its seal leaves neither a receipt nor a gap. A gap names an action
   that ran without a receipt; it does not say whether the action's own side effect succeeded.
+  **The outbox is capped, and the cap drops unread events.** `[outbox] max_retained_events`
+  (default 2000) bounds the retained events because every outbox operation rewrites the whole
+  file, so its cost is O(retained), bounded by the cap but not constant. The GC tick prunes the
+  oldest events beyond the cap whether or not they were delivered or read (never past a staged
+  intent). A consumer that is down for longer than the cap window loses the events it had not
+  read, and sees a hole in the signed sequences (and in the `oldest_sequence` hint); detecting
+  it and acting on it is the consumer's job. An undelivered approval event pruned this way is
+  lost (counted, not recovered). The counters are per process and reset on restart, and the
+  hints are unsigned.
   **The gap event is not a permanent record on vultrino's side.** The outbox prunes every event
   older than `[outbox] retention_secs` (default **2 days**), delivered or not, so a gap nobody
   consumed in that window is gone. The consumer is govder: it receives the signed push on its

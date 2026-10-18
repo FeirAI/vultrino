@@ -425,9 +425,21 @@ delivery uses, plus its `Govder-Signature` when a signing secret is configured):
       "signature": "sha256=…" }
   ],
   "next_cursor": 42,
-  "meter_gap_pending": 0
+  "meter_gap_pending": 0,
+  "oldest_sequence": 1,
+  "last_sequence": 42
 }
 ```
+
+`oldest_sequence` (null when nothing is retained) is the lowest retained sequence and
+`last_sequence` the highest ever assigned. The outbox keeps at most
+`[outbox] max_retained_events` events and prunes the oldest beyond that, delivered or not, so
+a poller whose cursor is below `oldest_sequence - 1`, or whose page is empty while
+`last_sequence` is above its cursor, has lost events. Like `meter_gap_pending` these are
+unsigned hints; the hole in the signed sequences is the authoritative signal. `GET
+/api/v1/posture` (`outbox`) and `GET /api/v1/metrics` (`outbox`) report `max_retained_events`,
+`retained_events`, `oldest_sequence`, `last_sequence`, `cap_pruned_total` and
+`cap_pruned_undelivered_total` (counters are per process).
 
 `meter_gap_pending` is the number of failed event appends not yet announced by a
 `meter.lost` marker. A poller must not treat an idle page as caught up while it is

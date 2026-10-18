@@ -61,6 +61,53 @@ pub struct OutboxStore {
     loss: Mutex<LossState>,
     lost_total: AtomicU64,
     markers_emitted: AtomicU64,
+    /// Events pruned by the count cap since this process started (never reset).
+    cap_pruned_total: AtomicU64,
+    /// The subset of those that were not Delivered (unread by any consumer).
+    cap_pruned_undelivered_total: AtomicU64,
+}
+
+/// What one GC pass pruned.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GcOutcome {
+    /// Delivered events pruned by the retention window.
+    pub age_pruned: usize,
+    /// Events pruned by the count cap.
+    pub cap: CapPruned,
+}
+
+impl GcOutcome {
+    pub fn total(&self) -> usize {
+        self.age_pruned + self.cap.pruned
+    }
+}
+
+/// Events pruned by the count cap in one pass, counted by delivery state and event type.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CapPruned {
+    pub pruned: usize,
+    /// Keys: `pending`, `delivered`, `dead_lettered`.
+    pub by_state: std::collections::BTreeMap<String, u64>,
+    pub by_type: std::collections::BTreeMap<String, u64>,
+}
+
+impl CapPruned {
+    fn record(&mut self, e: &OutboxEvent) {
+        self.pruned += 1;
+        let state = match e.delivery {
+            DeliveryState::Pending => "pending",
+            DeliveryState::Delivered => "delivered",
+            DeliveryState::DeadLettered => "dead_lettered",
+        };
+        *self.by_state.entry(state.to_string()).or_insert(0) += 1;
+        *self.by_type.entry(e.event_type.clone()).or_insert(0) += 1;
+    }
+
+    /// Pruned events that no consumer had acknowledged.
+    pub fn undelivered(&self) -> usize {
+        self.pruned
+            .saturating_sub(self.by_state.get("delivered").copied().unwrap_or(0) as usize)
+    }
 }
 
 /// Failed appends waiting for the next successful append to carry a `meter.lost` marker.
@@ -99,6 +146,8 @@ impl OutboxStore {
             loss: Mutex::new(LossState::default()),
             lost_total: AtomicU64::new(0),
             markers_emitted: AtomicU64::new(0),
+            cap_pruned_total: AtomicU64::new(0),
+            cap_pruned_undelivered_total: AtomicU64::new(0),
         }
     }
 
@@ -380,84 +429,137 @@ impl OutboxStore {
         .await
     }
 
-    /// Prune a contiguous PREFIX of events older than the retention window (by sequence, so the
-    /// retained suffix is gap-free regardless of clock skew). `protected_dedup_ids` are the dedup_ids of
-    /// vault-side intents NOT yet cleared: an outbox event carrying such a dedup_id is NEVER pruned (the
-    /// prefix prune STOPS below it), so its dedup record outlives the intent. This ENFORCES the
-    /// no-duplicate invariant against the GC-vs-redrain window — without it, a delivered event could be
-    /// pruned while its intent lingered, and a later re-drain would re-append the same logical event with
-    /// a fresh sequence (a phantom duplicate). Returns the count pruned; warns if a pruned event was
-    /// never Delivered (the window is the delivery/dead-letter SLA).
+    /// Age-only GC (no count cap): see [`Self::gc_capped`]. Kept for callers and tests that
+    /// exercise the delivered-age prune on its own. Returns the count pruned.
     pub async fn gc(
         &self,
         retention_secs: u64,
         protected_dedup_ids: &HashSet<String>,
     ) -> Result<usize, StorageError> {
+        Ok(self
+            .gc_capped(retention_secs, usize::MAX, protected_dedup_ids)
+            .await?
+            .total())
+    }
+
+    /// Prune a contiguous PREFIX of events (by sequence, so the retained suffix is gap-free
+    /// regardless of clock skew), in two stages inside ONE locked write:
+    ///
+    /// 1. Age: events older than the retention window that are Delivered (below the cap, an
+    ///    undelivered event is never pruned: vultrino#4, fail-closed).
+    /// 2. Cap: if more than `max_retained` events remain, the OLDEST ones beyond the cap are
+    ///    pruned whatever their delivery state. This bounds the per-operation cost, which is
+    ///    O(retained) because every mutation rewrites the whole file. The loss is counted by state
+    ///    and type, logged at ERROR, and visible to a poller as a sequence hole.
+    ///
+    /// `protected_dedup_ids` are the dedup_ids of vault-side intents NOT yet cleared: an outbox event
+    /// carrying such a dedup_id is NEVER pruned by either stage (the prefix prune STOPS below it), so
+    /// its dedup record outlives the intent. Without that, a re-drain would re-append the same
+    /// logical event with a fresh sequence (a phantom duplicate).
+    pub async fn gc_capped(
+        &self,
+        retention_secs: u64,
+        max_retained: usize,
+        protected_dedup_ids: &HashSet<String>,
+    ) -> Result<GcOutcome, StorageError> {
         // Overflow-safe: a huge retention_secs would panic `Utc::now() - Duration::seconds(secs)`
         // (chrono DateTime add overflow). Use checked arithmetic; an un-representable cutoff means
-        // "the window is effectively infinite" → prune nothing.
+        // "the window is effectively infinite" -> the age stage prunes nothing (the cap still applies).
         let secs = i64::try_from(retention_secs).unwrap_or(i64::MAX);
-        let cutoff = match chrono::Duration::try_seconds(secs)
-            .and_then(|d| Utc::now().checked_sub_signed(d))
-        {
-            Some(c) => c,
-            None => return Ok(0),
-        };
+        let cutoff =
+            chrono::Duration::try_seconds(secs).and_then(|d| Utc::now().checked_sub_signed(d));
         // Clone into the (move) closure; the protected set is small (only undrained intents, normally 0).
         let protected = protected_dedup_ids.clone();
-        self.locked_mutate(move |c| {
-            // Stop the prefix prune at the first event that is young, NOT YET DELIVERED, or still
-            // protected by a staged intent — keeping the retained suffix gap-free, the dedup record
-            // alive, AND (vultrino#4, fail-closed) never dropping an undelivered event. retention is
-            // the *delivered*-replay window: a Pending/DeadLettered event carries an unshipped signed
-            // billing/audit record, so pruning it on age would LOSE data. It survives until it
-            // resolves (delivered or operator-replayed then delivered), matching the OutboxConfig
-            // doc contract. Trade-off: a stalled delivery pipeline lets the log grow past retention
-            // — surfaced below so the growth is observable rather than silent.
-            let prune_below = c
-                .outbox
-                .iter()
-                .take_while(|(_, e)| {
-                    e.created_at < cutoff
-                        && e.delivery == DeliveryState::Delivered
-                        && !e.dedup_id.as_deref().is_some_and(|d| protected.contains(d))
-                })
-                .map(|(seq, _)| *seq)
-                .last();
+        let outcome = self
+            .locked_mutate(move |c| {
+                let is_protected =
+                    |e: &OutboxEvent| e.dedup_id.as_deref().is_some_and(|d| protected.contains(d));
+                let mut out = GcOutcome::default();
 
-            // Bounded-growth alarm: count events retained PAST the window solely because they are
-            // undelivered. A persistent non-zero count means delivery is stalled and the outbox is
-            // growing — alertable, so this fail-closed retention can't silently reintroduce the
-            // write-amplification the split was meant to bound.
-            let stuck_undelivered = c
-                .outbox
-                .values()
-                .filter(|e| e.created_at < cutoff && e.delivery != DeliveryState::Delivered)
-                .count();
-            if stuck_undelivered > 0 {
-                tracing::warn!(
-                    count = stuck_undelivered,
-                    "outbox retains events older than the retention window because they are undelivered \
-                     (pending/dead-lettered); delivery may be stalled and the log will grow until they resolve"
-                );
-            }
+                if let Some(cutoff) = cutoff {
+                    // Stage 1: stop at the first event that is young, NOT YET DELIVERED, or still
+                    // protected by a staged intent. Retention is the *delivered*-replay window.
+                    let prune_below = c
+                        .outbox
+                        .iter()
+                        .take_while(|(_, e)| {
+                            e.created_at < cutoff
+                                && e.delivery == DeliveryState::Delivered
+                                && !is_protected(e)
+                        })
+                        .map(|(seq, _)| *seq)
+                        .last();
 
-            let Some(prune_below) = prune_below else {
-                return Ok((0usize, false));
-            };
-            let mut pruned = 0usize;
-            c.outbox.retain(|seq, _| {
-                if *seq <= prune_below {
-                    pruned += 1;
-                    false
-                } else {
-                    true
+                    // Bounded-growth alarm: events retained PAST the window solely because they are
+                    // undelivered (delivery stalled; the cap below bounds the growth).
+                    let stuck_undelivered = c
+                        .outbox
+                        .values()
+                        .filter(|e| e.created_at < cutoff && e.delivery != DeliveryState::Delivered)
+                        .count();
+                    if stuck_undelivered > 0 {
+                        tracing::warn!(
+                            count = stuck_undelivered,
+                            "outbox retains events older than the retention window because they are undelivered \
+                             (pending/dead-lettered); delivery may be stalled and the log grows until the retention cap"
+                        );
+                    }
+                    if let Some(below) = prune_below {
+                        let before = c.outbox.len();
+                        c.outbox.retain(|seq, _| *seq > below);
+                        out.age_pruned = before - c.outbox.len();
+                    }
                 }
-            });
-            // Only the prune mutated the map; a tick with nothing to prune returned above (no write).
-            Ok((pruned, pruned > 0))
-        })
-        .await
+
+                // Stage 2: the count cap, over what the age stage left.
+                let excess = c.outbox.len().saturating_sub(max_retained);
+                if excess > 0 {
+                    let doomed: Vec<u64> = c
+                        .outbox
+                        .iter()
+                        .take(excess)
+                        .take_while(|(_, e)| !is_protected(e))
+                        .map(|(seq, _)| *seq)
+                        .collect();
+                    for seq in doomed {
+                        if let Some(e) = c.outbox.remove(&seq) {
+                            out.cap.record(&e);
+                        }
+                    }
+                }
+                let dirty = out.total() > 0;
+                Ok((out, dirty))
+            })
+            .await?;
+        if outcome.cap.pruned > 0 {
+            self.cap_pruned_total
+                .fetch_add(outcome.cap.pruned as u64, Ordering::Relaxed);
+            self.cap_pruned_undelivered_total
+                .fetch_add(outcome.cap.undelivered() as u64, Ordering::Relaxed);
+            tracing::error!(
+                pruned = outcome.cap.pruned,
+                max_retained,
+                by_state = ?outcome.cap.by_state,
+                by_type = ?outcome.cap.by_type,
+                "outbox retention cap pruned the oldest events beyond max_retained_events; unread events \
+                 are lost to a slow consumer (it sees a sequence hole)"
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// Retention view for posture, metrics and the events envelope. Reads the in-memory cache
+    /// (refreshed by every operation of this process and by the delivery loop), so it never
+    /// touches the file and is cheap enough for `/health`-class endpoints.
+    pub fn retention_snapshot(&self) -> crate::outbox::OutboxRetentionSnapshot {
+        let c = self.cache.read();
+        crate::outbox::OutboxRetentionSnapshot {
+            retained_events: c.outbox.len() as u64,
+            oldest_sequence: c.outbox.keys().next().copied(),
+            last_sequence: c.outbox_seq,
+            cap_pruned_total: self.cap_pruned_total.load(Ordering::Relaxed),
+            cap_pruned_undelivered_total: self.cap_pruned_undelivered_total.load(Ordering::Relaxed),
+        }
     }
 
     // ---- internal persistence (mirrors FileStorage's locked_mutate / reload on the outbox file) ----
@@ -918,7 +1020,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_never_prunes_an_undelivered_pending_event() {
+    async fn gc_below_the_cap_never_prunes_an_undelivered_pending_event() {
+        // Below the count cap (`gc` is the age stage alone, no cap).
         // vultrino#4 (fail-closed): retention is the DELIVERED replay window. An old still-Pending
         // event carries an unshipped signed record, so the prefix prune must STOP below it — and the
         // gap-free suffix behind it (even later delivered events) is retained too.
@@ -950,7 +1053,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_never_prunes_a_dead_lettered_event() {
+    async fn gc_below_the_cap_never_prunes_a_dead_lettered_event() {
+        // Below the count cap (`gc` is the age stage alone, no cap).
         // vultrino#4: a dead-lettered event is also "undelivered" — it must survive GC so an operator
         // can still replay it, even past the retention window.
         let (s, _d) = store();
@@ -1149,5 +1253,154 @@ mod tests {
             s2.list_after(0, 10).await,
             Err(StorageError::UnsupportedVersion { .. })
         ));
+    }
+
+    // ---- the count cap (max_retained_events) ----
+
+    /// Retention so long the age stage cannot fire: only the cap acts.
+    const NO_AGE: u64 = u64::MAX;
+
+    async fn seqs(s: &OutboxStore) -> Vec<u64> {
+        s.list_after(0, 1000)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.sequence)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn cap_prunes_oldest_beyond_max_even_when_undelivered() {
+        let (s, _d) = store();
+        for subj in ["A", "B", "C", "D", "E", "F"] {
+            s.append(subj, "t", serde_json::json!({})).await.unwrap();
+        }
+        // seq 1 stays pending, seq 2 is dead-lettered, seq 3 is delivered, 4..6 pending.
+        s.record_delivery(2, false, Some("boom".into()), 1)
+            .await
+            .unwrap();
+        s.record_delivery(3, true, None, 8).await.unwrap();
+        assert_eq!(s.list_dead_letter(10).await.unwrap().len(), 1);
+
+        let out = s.gc_capped(NO_AGE, 3, &HashSet::new()).await.unwrap();
+        assert_eq!(out.age_pruned, 0);
+        assert_eq!(out.cap.pruned, 3, "the 3 oldest beyond the cap go");
+        assert_eq!(
+            seqs(&s).await,
+            vec![4, 5, 6],
+            "a contiguous suffix is kept, the pending and dead-lettered heads are gone"
+        );
+        assert!(s.list_dead_letter(10).await.unwrap().is_empty());
+        // At or under the cap nothing is pruned and nothing is written.
+        let again = s.gc_capped(NO_AGE, 3, &HashSet::new()).await.unwrap();
+        assert_eq!(again.total(), 0);
+        assert_eq!(seqs(&s).await, vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn cap_stops_at_a_staged_intent() {
+        let (s, _d) = store();
+        s.append("A", "t", serde_json::json!({})).await.unwrap(); // 1
+        s.append_deduped("d2", "B", "t", serde_json::json!({}))
+            .await
+            .unwrap(); // 2, staged intent
+        for subj in ["C", "D", "E"] {
+            s.append(subj, "t", serde_json::json!({})).await.unwrap(); // 3..5
+        }
+        let mut protected = HashSet::new();
+        protected.insert("d2".to_string());
+        // Cap 2 would prune 1..3, but the prune never passes the protected seq 2.
+        let out = s.gc_capped(NO_AGE, 2, &protected).await.unwrap();
+        assert_eq!(out.cap.pruned, 1, "only seq 1, below the staged intent");
+        assert_eq!(seqs(&s).await, vec![2, 3, 4, 5]);
+        // Once the intent is cleared the cap proceeds.
+        let out = s.gc_capped(NO_AGE, 2, &HashSet::new()).await.unwrap();
+        assert_eq!(out.cap.pruned, 2);
+        assert_eq!(seqs(&s).await, vec![4, 5]);
+    }
+
+    #[tokio::test]
+    async fn cap_counts_pruned_by_state_and_type() {
+        let (s, _d) = store();
+        s.append("A", "meter.observed", serde_json::json!({}))
+            .await
+            .unwrap(); // 1 pending
+        s.append("B", "approval.requested", serde_json::json!({}))
+            .await
+            .unwrap(); // 2 dead-lettered
+        s.append("C", "meter.observed", serde_json::json!({}))
+            .await
+            .unwrap(); // 3 delivered
+        s.append("D", "policy.denied", serde_json::json!({}))
+            .await
+            .unwrap(); // 4 kept
+        s.append("E", "meter.observed", serde_json::json!({}))
+            .await
+            .unwrap(); // 5 kept
+        s.record_delivery(2, false, Some("x".into()), 1)
+            .await
+            .unwrap();
+        s.record_delivery(3, true, None, 8).await.unwrap();
+
+        let before = s.retention_snapshot();
+        assert_eq!(before.cap_pruned_total, 0);
+        let out = s.gc_capped(NO_AGE, 2, &HashSet::new()).await.unwrap();
+        assert_eq!(out.cap.pruned, 3);
+        assert_eq!(out.cap.by_state.get("pending"), Some(&1));
+        assert_eq!(out.cap.by_state.get("dead_lettered"), Some(&1));
+        assert_eq!(out.cap.by_state.get("delivered"), Some(&1));
+        assert_eq!(out.cap.by_type.get("meter.observed"), Some(&2));
+        assert_eq!(out.cap.by_type.get("approval.requested"), Some(&1));
+        assert_eq!(out.cap.undelivered(), 2);
+        let snap = s.retention_snapshot();
+        assert_eq!(snap.cap_pruned_total, 3);
+        assert_eq!(snap.cap_pruned_undelivered_total, 2);
+        assert_eq!(snap.retained_events, 2);
+        assert_eq!(snap.oldest_sequence, Some(4));
+        assert_eq!(snap.last_sequence, 5);
+    }
+
+    #[tokio::test]
+    async fn a_poller_behind_the_cap_sees_a_hole() {
+        let (s, _d) = store();
+        for i in 0..5 {
+            s.append("A", "meter.observed", serde_json::json!({ "i": i }))
+                .await
+                .unwrap();
+        }
+        // The poller has read seq 1 and is about to ask for seq 2.
+        let cursor = s.list_after(0, 1).await.unwrap()[0].sequence;
+        assert_eq!(cursor, 1);
+        s.gc_capped(NO_AGE, 2, &HashSet::new()).await.unwrap();
+        let page = s.list_after(cursor, 100).await.unwrap();
+        let first = page[0].sequence;
+        assert_eq!(first, 4, "retained suffix starts at 4");
+        assert!(first > cursor + 1, "seq 2 and 3 are a visible hole");
+        // The retained suffix itself is contiguous.
+        assert_eq!(
+            page.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        let snap = s.retention_snapshot();
+        assert_eq!(snap.oldest_sequence, Some(4));
+        assert_eq!(snap.last_sequence, 5);
+    }
+
+    #[tokio::test]
+    async fn the_cap_applies_when_the_age_window_is_unrepresentable() {
+        // A huge retention_secs makes the age cutoff un-representable (age stage off); the cap must
+        // still bound the outbox.
+        let (s, _d) = store();
+        for _ in 0..4 {
+            s.append("A", "t", serde_json::json!({})).await.unwrap();
+        }
+        assert_eq!(s.gc(u64::MAX, &HashSet::new()).await.unwrap(), 0);
+        assert_eq!(
+            s.gc_capped(u64::MAX, 1, &HashSet::new())
+                .await
+                .unwrap()
+                .total(),
+            3
+        );
     }
 }

@@ -5439,7 +5439,10 @@ pub async fn deliver_outbox_periodically(
         }
         ticks = ticks.wrapping_add(1);
         if ticks.is_multiple_of(OUTBOX_GC_EVERY) {
-            if let Err(e) = storage.gc_outbox(config.retention_secs).await {
+            if let Err(e) = storage
+                .gc_outbox(config.retention_secs, config.max_retained_events)
+                .await
+            {
                 warn!(error = %e, "outbox GC failed");
             }
             // Same tick: bound the vault's unbounded maps (#2) — shed terminal approval result

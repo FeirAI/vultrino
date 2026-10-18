@@ -236,6 +236,7 @@ url = "https://govder.example.com/vultrino/events"  # delivery endpoint
 hmac_secret = "shared-signing-secret"                # required to push (deliveries are signed)
 max_attempts = 8                                      # retries before dead-lettering (default 8)
 retention_secs = 604800                               # replay window, default 7 days
+max_retained_events = 2000                            # hard cap on retained events (100 to 100000, default 2000)
 ```
 
 - **Ordered + monotonic.** Every event gets a process-global, gap-free
@@ -259,7 +260,8 @@ retention_secs = 604800                               # replay window, default 7
   `POST /api/v1/events/{sequence}/replay` — it stops blocking its subject.
 - Events are appended even when push is unconfigured (still replayable via the
   API). GC prunes the oldest contiguous prefix past `retention_secs` (keeping the
-  retained window gap-free); the window is the replay + dead-letter-resolution SLA.
+  retained window gap-free); the window is the replay + dead-letter-resolution SLA. A hard cap,
+  `max_retained_events`, also prunes the oldest events beyond it whatever their delivery state.
 
 ### Inbound Workload Identity (V10)
 

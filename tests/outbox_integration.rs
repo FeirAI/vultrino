@@ -226,7 +226,7 @@ async fn test_gc_prunes_old_events() {
         .await
         .unwrap();
     // retention 0 → cutoff is "now", and these were created strictly before → pruned.
-    let pruned = storage.gc_outbox(0).await.unwrap();
+    let pruned = storage.gc_outbox(0, usize::MAX).await.unwrap();
     assert_eq!(pruned, 2);
     assert!(storage.list_events_after(0, 100).await.unwrap().is_empty());
 }
@@ -275,6 +275,7 @@ async fn test_signed_delivery_end_to_end_and_marks_delivered() {
         hmac_secret: Some(secret.to_string()),
         max_attempts: 3,
         retention_secs: 3600,
+        max_retained_events: 2000,
     };
 
     let seq = storage
@@ -342,6 +343,7 @@ async fn test_disabled_outbox_does_not_deliver_or_consume_events() {
         hmac_secret: Some("shared-hmac-secret".to_string()),
         max_attempts: 3,
         retention_secs: 3600,
+        max_retained_events: 2000,
     };
     let metrics = vultrino::server::OutboxMetrics::default();
 
@@ -384,6 +386,7 @@ async fn test_failed_delivery_is_recorded_and_backed_off() {
         hmac_secret: Some("s".to_string()),
         max_attempts: 3,
         retention_secs: 3600,
+        max_retained_events: 2000,
     };
     let seq = storage
         .append_event("A", "e", serde_json::json!({}))
@@ -447,6 +450,7 @@ async fn test_dead_letter_via_deliver_outbox_once_increments_counter() {
         hmac_secret: Some("s".to_string()),
         max_attempts: 1,
         retention_secs: 3600,
+        max_retained_events: 2000,
     };
     storage
         .append_event("A", "e", serde_json::json!({}))

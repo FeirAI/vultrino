@@ -24,6 +24,7 @@ pub(crate) fn build_posture(
     policies: &[Policy],
     workload: &WorkloadVerifier,
     meter: &crate::outbox::MeterLossSnapshot,
+    retention: &crate::outbox::OutboxRetentionSnapshot,
 ) -> Value {
     let secret_fingerprints = secret_fingerprints(config, workload);
     // Same condition the server uses to build its Averin client.
@@ -148,6 +149,18 @@ pub(crate) fn build_posture(
             "gap_markers_emitted": meter.markers_emitted,
             "last_failure_at": meter.last_lost_at,
         },
+        // Outbox retention: the count cap, what is retained now and how many events the cap has
+        // pruned (the unread ones are lost to a slow consumer, which sees a sequence hole). The
+        // counters are per process. A non-zero `cap_pruned_undelivered_total` means a consumer
+        // fell behind the cap window.
+        "outbox": {
+            "max_retained_events": config.outbox.max_retained_events,
+            "retained_events": retention.retained_events,
+            "oldest_sequence": retention.oldest_sequence,
+            "last_sequence": retention.last_sequence,
+            "cap_pruned_total": retention.cap_pruned_total,
+            "cap_pruned_undelivered_total": retention.cap_pruned_undelivered_total,
+        },
         // FEI-40: keyed fingerprints of the shared secrets this process holds, per relationship
         // (see crate::secret_fp). The verifier compares them with the other planes' to find a
         // misaligned pair at deploy time. Never a secret value.
@@ -244,6 +257,7 @@ mod tests {
             &policies,
             &WorkloadVerifier::Disabled,
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(
             v["policies"]["rate_limit_default_not_deny"],
@@ -259,6 +273,7 @@ mod tests {
             true,
             &[],
             &WorkloadVerifier::Disabled,
+            &Default::default(),
             &Default::default(),
         );
         assert_eq!(v["averin"]["d8_evidence_floor"], "money_and_irreversible");
@@ -276,6 +291,7 @@ mod tests {
             &[],
             &WorkloadVerifier::Disabled,
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(v["averin"]["d8_evidence_floor"], "human_floor");
         assert_eq!(v["averin"]["d8_evidence_floor_effective"], "human_floor");
@@ -289,6 +305,7 @@ mod tests {
             true,
             &[],
             &WorkloadVerifier::Disabled,
+            &Default::default(),
             &Default::default(),
         );
         assert_eq!(
@@ -316,6 +333,7 @@ mod tests {
                 &[],
                 &WorkloadVerifier::Disabled,
                 &Default::default(),
+                &Default::default(),
             );
             assert_eq!(v["averin"]["d8_evidence_floor_effective"], "human_floor");
         }
@@ -329,6 +347,7 @@ mod tests {
             &[],
             &WorkloadVerifier::Disabled,
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(v["engine"]["default_deny"], false);
         let v = build_posture(
@@ -336,6 +355,7 @@ mod tests {
             true,
             &[],
             &WorkloadVerifier::Disabled,
+            &Default::default(),
             &Default::default(),
         );
         assert_eq!(v["engine"]["default_deny"], true);
@@ -349,6 +369,7 @@ mod tests {
             &[],
             &WorkloadVerifier::Disabled,
             &crate::outbox::MeterLossSnapshot::default(),
+            &Default::default(),
         );
         assert_eq!(healthy["meter"]["append_failures_total"], 0);
         assert_eq!(healthy["meter"]["gap_pending"], 0);
@@ -364,6 +385,7 @@ mod tests {
                 markers_emitted: 1,
                 last_lost_at: Some(chrono::Utc::now()),
             },
+            &Default::default(),
         );
         assert_eq!(failing["meter"]["append_failures_total"], 4);
         assert_eq!(failing["meter"]["gap_pending"], 2);
@@ -380,6 +402,7 @@ mod tests {
             true,
             &[],
             &WorkloadVerifier::Disabled,
+            &Default::default(),
             &Default::default(),
         );
         assert_eq!(v["rate_card"]["require_priced_model"], true);
@@ -399,6 +422,7 @@ mod tests {
             true,
             &[],
             &WorkloadVerifier::Disabled,
+            &Default::default(),
             &Default::default(),
         );
         assert_eq!(v["rate_card"]["require_priced_model"], false);
@@ -425,6 +449,7 @@ mod tests {
             &[],
             &WorkloadVerifier::Disabled,
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(v["engine"]["tenants_in_observe_mode"], json!(["a", "b"]));
         assert_eq!(v["engine"]["unlisted_tenant_mode"], "enforce");
@@ -438,6 +463,7 @@ mod tests {
             &[],
             &WorkloadVerifier::Disabled,
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(v["approvals"]["enforce_separation_of_duty"], false);
         let mut cfg = Config::default();
@@ -447,6 +473,7 @@ mod tests {
             true,
             &[],
             &WorkloadVerifier::Disabled,
+            &Default::default(),
             &Default::default(),
         );
         assert_eq!(v["approvals"]["enforce_separation_of_duty"], true);
@@ -497,6 +524,7 @@ mod tests {
                 &[],
                 &WorkloadVerifier::Disabled,
                 &Default::default(),
+                &Default::default(),
             );
             let a = &v["approver_identity"];
             assert_eq!(a["govder_configured"], true);
@@ -537,6 +565,7 @@ mod tests {
             &[],
             &WorkloadVerifier::Disabled,
             &Default::default(),
+            &Default::default(),
         );
         let fp = &v["secret_fingerprints"];
         assert_eq!(
@@ -574,6 +603,7 @@ mod tests {
             &[],
             &WorkloadVerifier::Disabled,
             &Default::default(),
+            &Default::default(),
         );
         assert!(v["secret_fingerprints"]
             .get("vultrino-outbox-poll")
@@ -588,6 +618,7 @@ mod tests {
             &[],
             &WorkloadVerifier::Disabled,
             &Default::default(),
+            &Default::default(),
         );
         assert!(v["secret_fingerprints"]
             .get("vultrino-approval-push")
@@ -598,6 +629,7 @@ mod tests {
             true,
             &[],
             &WorkloadVerifier::Disabled,
+            &Default::default(),
             &Default::default(),
         );
         assert!(v["secret_fingerprints"]
@@ -619,6 +651,7 @@ mod tests {
             &[],
             &WorkloadVerifier::Disabled,
             &Default::default(),
+            &Default::default(),
         );
         assert!(v["secret_fingerprints"].get("averin-api-key").is_none());
         cfg.averin.enabled = true;
@@ -627,6 +660,7 @@ mod tests {
             true,
             &[],
             &WorkloadVerifier::Disabled,
+            &Default::default(),
             &Default::default(),
         );
         assert_eq!(
@@ -640,6 +674,7 @@ mod tests {
             true,
             &[],
             &WorkloadVerifier::Disabled,
+            &Default::default(),
             &Default::default(),
         );
         assert!(v["secret_fingerprints"].get("averin-api-key").is_none());
@@ -658,6 +693,7 @@ mod tests {
                 &[],
                 &WorkloadVerifier::Disabled,
                 &Default::default(),
+                &Default::default(),
             )["averin"]["api_key_configured"]
                 .clone()
         };
@@ -673,6 +709,7 @@ mod tests {
             true,
             &[],
             &WorkloadVerifier::Disabled,
+            &Default::default(),
             &Default::default(),
         );
         assert!(!v.to_string().contains("averin-project-bearer"));
@@ -693,6 +730,7 @@ mod tests {
             &[],
             &WorkloadVerifier::Disabled,
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(v["secret_fingerprints"], json!({}));
         let cfg = Config {
@@ -704,6 +742,7 @@ mod tests {
             true,
             &[],
             &WorkloadVerifier::Disabled,
+            &Default::default(),
             &Default::default(),
         );
         assert!(v["secret_fingerprints"].get("approver-key").is_none());
@@ -728,6 +767,7 @@ mod tests {
             &[],
             &verifier,
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(
             v["secret_fingerprints"][rel],
@@ -742,10 +782,18 @@ mod tests {
             &[],
             &WorkloadVerifier::Disabled,
             &Default::default(),
+            &Default::default(),
         );
         assert!(v["secret_fingerprints"].get(rel).is_none());
         let invalid = WorkloadVerifier::Invalid("workload assertion verifier is not configured");
-        let v = build_posture(&Config::default(), true, &[], &invalid, &Default::default());
+        let v = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &invalid,
+            &Default::default(),
+            &Default::default(),
+        );
         assert!(v["secret_fingerprints"].get(rel).is_none());
     }
 }
